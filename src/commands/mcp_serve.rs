@@ -25,6 +25,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
 use crate::cli::McpServeArgs;
 use crate::errors::ExitCode;
+use crate::services::ai_launcher::AIToolType;
 use crate::services::context_ingest::{IngestOptions, ingest_project};
 use crate::services::nickname_registry;
 use crate::services::session_transcript::resolve_session;
@@ -175,6 +176,16 @@ fn initialize_result() -> Value {
 }
 
 fn tools_list_result() -> Value {
+    // Single source of truth for the cli enum — keyed off `AIToolType::all()`
+    // so a new tool just needs a variant there and a resolver in
+    // `session_transcript`.
+    let cli_names: Vec<&str> = AIToolType::all().iter().map(|t| t.as_str()).collect();
+    let cli_names_human = cli_names
+        .iter()
+        .map(|s| format!("'{s}'"))
+        .collect::<Vec<_>>()
+        .join(", ");
+
     json!({
         "tools": [
             {
@@ -185,8 +196,8 @@ fn tools_list_result() -> Value {
                     "properties": {
                         "cli": {
                             "type": "string",
-                            "description": "Filter to a specific CLI: 'claude' or 'codex'. Omit to list all.",
-                            "enum": ["claude", "codex"]
+                            "description": format!("Filter to a specific CLI: {cli_names_human}. Omit to list all."),
+                            "enum": cli_names.clone(),
                         }
                     }
                 }
@@ -203,8 +214,8 @@ fn tools_list_result() -> Value {
                         },
                         "cli": {
                             "type": "string",
-                            "description": "Which peer CLI to read from: 'claude' or 'codex'.",
-                            "enum": ["claude", "codex"]
+                            "description": format!("Which peer CLI to read from: {cli_names_human}."),
+                            "enum": cli_names,
                         },
                         "session_id": {
                             "type": "string",
@@ -330,9 +341,14 @@ async fn handle_get_session(
         let cli = args.get("cli").and_then(|v| v.as_str()).ok_or_else(|| {
             "Missing required argument: provide either 'nickname' or 'cli'".to_string()
         })?;
-        if cli != "claude" && cli != "codex" {
+        if AIToolType::parse(cli).is_none() {
             return Err(format!(
-                "Unsupported cli '{cli}'. Only 'claude' and 'codex' are available."
+                "Unsupported cli '{cli}'. Valid values: {}.",
+                AIToolType::all()
+                    .iter()
+                    .map(|t| format!("'{}'", t.as_str()))
+                    .collect::<Vec<_>>()
+                    .join(", ")
             ));
         }
         let session_id = args

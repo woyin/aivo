@@ -67,11 +67,18 @@ pub async fn maybe_enable_share(
             enable_share_codex(args, cwd, &aivo_exe, nickname),
             ShareCleanup::empty(),
         )),
-        other => {
+        // Pi / Gemini / OpenCode can't be MCP clients from aivo (no
+        // ephemeral injection path — see `session_transcript` module doc).
+        // Their sessions are still *readable* by a peer claude/codex via the
+        // nickname registered in `run.rs`, so we skip wiring but print an
+        // accurate status line.
+        AIToolType::Pi | AIToolType::Gemini | AIToolType::Opencode => {
             eprintln!(
-                "  {} --as has no effect for {} (claude/codex only); launching normally.",
-                style::yellow("!"),
-                other.as_str()
+                "  {} {}: nickname '{}' is registered; peer claude/codex can read this session via MCP. {} cannot call MCP servers from aivo (no ephemeral injection path).",
+                style::arrow_symbol(),
+                tool.as_str(),
+                nickname,
+                tool.as_str()
             );
             Ok((args, ShareCleanup::empty()))
         }

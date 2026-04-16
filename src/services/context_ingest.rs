@@ -202,18 +202,35 @@ async fn ingest_codex(canonical_root: &str, cap: Option<usize>) -> Vec<Thread> {
 // ---------------------------------------------------------------------------
 
 async fn ingest_gemini(canonical_root: &str, cap: Option<usize>) -> Vec<Thread> {
+    let paths = gemini_matching_session_files(canonical_root).await;
+    let mut out = Vec::new();
+    for path in paths {
+        if let Some(n) = cap
+            && out.len() >= n
+        {
+            break;
+        }
+        if let Some(thread) = extract_gemini_thread(&path).await {
+            out.push(thread);
+        }
+    }
+    out
+}
+
+/// Return every Gemini `session-*.json` path whose parent `chats/` dir
+/// belongs to this canonical project, sorted newest-first by mtime.
+///
+/// Two layouts are in the wild under `~/.gemini/tmp/`: `<hash>/chats/`
+/// (default) and `<friendly-name>/chats/` (older or configured). We can't
+/// recognize the latter from the directory name, so we scan every dir,
+/// peek at one session per dir to learn its `projectHash`, and only keep
+/// dirs whose hash matches `sha256(canonical_root)`.
+pub(crate) async fn gemini_matching_session_files(canonical_root: &str) -> Vec<PathBuf> {
     let home = match system_env::home_dir() {
         Some(h) => h,
         None => return Vec::new(),
     };
-    // Match Gemini's getProjectHash: sha256(absolute_path) hex.
     let project_hash = hex_sha256(canonical_root.as_bytes());
-
-    // Two layouts in the wild: <hash>/chats/ (default) and <friendly-name>/chats/
-    // (older versions or projects with a configured name). We can't recognize
-    // the latter from the directory name alone, so scan every dir under
-    // ~/.gemini/tmp/, peek at one session per dir to learn its projectHash,
-    // and only collect dirs whose hash matches our target.
     let tmp_root = home.join(".gemini").join("tmp");
     if !tmp_root.exists() {
         return Vec::new();
@@ -249,26 +266,13 @@ async fn ingest_gemini(canonical_root: &str, cap: Option<usize>) -> Vec<Thread> 
         if chat_files.is_empty() {
             continue;
         }
-        // Cheap probe: read one session file's projectHash.
         if !gemini_dir_matches(&chat_files[0].0, &project_hash).await {
             continue;
         }
         entries.extend(chat_files);
     }
     entries.sort_by(|a, b| b.1.cmp(&a.1));
-
-    let mut out = Vec::new();
-    for (path, _) in entries {
-        if let Some(n) = cap
-            && out.len() >= n
-        {
-            break;
-        }
-        if let Some(thread) = extract_gemini_thread(&path).await {
-            out.push(thread);
-        }
-    }
-    out
+    entries.into_iter().map(|(p, _)| p).collect()
 }
 
 async fn extract_gemini_thread(path: &Path) -> Option<Thread> {
@@ -370,7 +374,7 @@ async fn gemini_dir_matches(sample_path: &Path, target_hash: &str) -> bool {
 /// - user (`type:"user"`) is an array of `{text}` blocks
 ///
 /// We accept both forms.
-fn extract_gemini_content(content: Option<&Value>) -> Option<String> {
+pub(crate) fn extract_gemini_content(content: Option<&Value>) -> Option<String> {
     let v = content?;
     if let Some(s) = v.as_str() {
         return Some(s.to_string());
@@ -396,20 +400,23 @@ fn extract_gemini_content(content: Option<&Value>) -> Option<String> {
 // Pi: ~/.pi/agent/sessions/--<cwd-slashes-as-dashes>--/*.jsonl
 // ---------------------------------------------------------------------------
 
-async fn ingest_pi(canonical_root: &str, cap: Option<usize>) -> Vec<Thread> {
-    let home = match system_env::home_dir() {
-        Some(h) => h,
-        None => return Vec::new(),
-    };
+/// Pi's per-cwd session directory. Returns `None` if HOME is unavailable.
+pub(crate) fn pi_session_dir(canonical_root: &str) -> Option<PathBuf> {
+    let home = system_env::home_dir()?;
     let encoded = format!("--{}--", canonical_root.trim_matches('/').replace('/', "-"));
-    let session_dir = home
-        .join(".pi")
-        .join("agent")
-        .join("sessions")
-        .join(&encoded);
-    if !session_dir.exists() {
-        return Vec::new();
-    }
+    Some(
+        home.join(".pi")
+            .join("agent")
+            .join("sessions")
+            .join(encoded),
+    )
+}
+
+async fn ingest_pi(canonical_root: &str, cap: Option<usize>) -> Vec<Thread> {
+    let session_dir = match pi_session_dir(canonical_root) {
+        Some(d) if d.exists() => d,
+        _ => return Vec::new(),
+    };
 
     let files = list_jsonl_newest_first(&session_dir).await;
     let mut out = Vec::new();
@@ -495,7 +502,7 @@ async fn extract_pi_thread(path: &Path) -> Option<Thread> {
 }
 
 /// Pi message content is an array of blocks; text blocks carry `text`.
-fn extract_pi_text(message: &Value) -> Option<String> {
+pub(crate) fn extract_pi_text(message: &Value) -> Option<String> {
     let arr = message.get("content")?.as_array()?;
     let mut buf = String::new();
     for block in arr {
