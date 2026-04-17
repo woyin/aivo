@@ -28,7 +28,10 @@ pub(crate) struct OpenAIChatRequest {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub(crate) struct OpenAIChatMessage {
     pub role: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    // Serialize even when None so that assistant tool_call messages emit
+    // `"content": null`. Strict OpenAI-compatible providers (e.g. Cloudflare
+    // Workers AI) require the field to be present.
+    #[serde(default)]
     pub content: Option<OpenAIMessageContent>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_calls: Option<Vec<OpenAIChatToolCall>>,

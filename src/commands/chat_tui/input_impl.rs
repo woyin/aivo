@@ -66,42 +66,52 @@ impl ChatTuiApp {
     }
 
     pub(super) fn cursor_up(&mut self) {
+        use unicode_width::UnicodeWidthStr;
         let before = &self.draft[..self.cursor];
         let Some(prev_nl) = before.rfind('\n') else {
             return;
         };
-        let col = before[prev_nl + 1..].chars().count();
+        let col = UnicodeWidthStr::width(&before[prev_nl + 1..]);
         let before_prev = &before[..prev_nl];
         let prev_line_start = before_prev.rfind('\n').map(|pos| pos + 1).unwrap_or(0);
-        let prev_line_len = before_prev[prev_line_start..].chars().count();
-        let target_col = col.min(prev_line_len);
-        self.cursor = prev_line_start;
-        for _ in 0..target_col {
-            self.cursor_right();
-        }
+        self.advance_cursor_to_visual_col(prev_line_start, col);
     }
 
     pub(super) fn cursor_down(&mut self) {
+        use unicode_width::UnicodeWidthStr;
         let before = &self.draft[..self.cursor];
         let col = if let Some(prev_nl) = before.rfind('\n') {
-            before[prev_nl + 1..].chars().count()
+            UnicodeWidthStr::width(&before[prev_nl + 1..])
         } else {
-            before.chars().count()
+            UnicodeWidthStr::width(before)
         };
         let after = &self.draft[self.cursor..];
         let Some(next_nl_offset) = after.find('\n') else {
             return;
         };
         let next_line_start = self.cursor + next_nl_offset + 1;
-        let after_next = &self.draft[next_line_start..];
-        let next_line_len = after_next
-            .find('\n')
-            .map(|pos| after_next[..pos].chars().count())
-            .unwrap_or_else(|| after_next.chars().count());
-        let target_col = col.min(next_line_len);
-        self.cursor = next_line_start;
-        for _ in 0..target_col {
-            self.cursor_right();
+        self.advance_cursor_to_visual_col(next_line_start, col);
+    }
+
+    fn advance_cursor_to_visual_col(&mut self, line_start: usize, target_col: usize) {
+        use unicode_width::UnicodeWidthStr;
+        self.cursor = line_start;
+        let mut acc_width = 0usize;
+        while self.cursor < self.draft.len() {
+            let rest = &self.draft[self.cursor..];
+            if rest.starts_with('\n') {
+                break;
+            }
+            let mut next_end = self.cursor + 1;
+            while next_end < self.draft.len() && !self.draft.is_char_boundary(next_end) {
+                next_end += 1;
+            }
+            let segment_width = UnicodeWidthStr::width(&self.draft[self.cursor..next_end]);
+            if acc_width + segment_width > target_col {
+                break;
+            }
+            acc_width += segment_width;
+            self.cursor = next_end;
         }
     }
 

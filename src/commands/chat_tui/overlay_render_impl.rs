@@ -230,8 +230,8 @@ impl ChatTuiApp {
         };
         let search_width = chunks[0].width.max(1);
         let title_label = "Sessions";
-        let esc_width = status_label.chars().count() as u16;
-        let title_width = title_label.chars().count() as u16;
+        let esc_width = display_width(&status_label) as u16;
+        let title_width = display_width(title_label) as u16;
         let middle_padding = search_width.saturating_sub(title_width + esc_width).max(1);
         let mut header_spans = vec![Span::styled(
             title_label,

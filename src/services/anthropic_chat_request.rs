@@ -210,7 +210,14 @@ fn convert_content_blocks(
             }));
         }
     } else if !tool_calls.is_empty() {
-        let content = Value::String(text_parts.join("\n"));
+        // Per OpenAI spec, content must be null (not "") when tool_calls is
+        // present without text. Strict OpenAI-compatible providers reject the
+        // empty-string form.
+        let content = if text_parts.is_empty() {
+            Value::Null
+        } else {
+            Value::String(text_parts.join("\n"))
+        };
         let mut msg = json!({"role": role, "content": content, "tool_calls": tool_calls});
         if config.include_reasoning_content {
             if role == "assistant" && config.require_non_empty_reasoning_content {

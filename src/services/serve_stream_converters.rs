@@ -4,6 +4,33 @@ use std::collections::HashMap;
 
 use crate::services::http_utils::{current_unix_ts, sse_data_payload};
 
+/// Drains the next complete SSE line from `pending`, returning its text
+/// with the trailing `\r` stripped. Returns `None` when no newline is in
+/// the buffer. Newlines (0x0A) never appear inside a multi-byte UTF-8
+/// sequence, so each complete line is valid UTF-8.
+fn drain_sse_line(pending: &mut Vec<u8>) -> Option<String> {
+    let pos = pending.iter().position(|&b| b == b'\n')?;
+    let line = String::from_utf8_lossy(&pending[..pos]).into_owned();
+    pending.drain(..=pos);
+    Some(line.trim_end_matches('\r').to_string())
+}
+
+/// Decodes any remaining bytes in `pending` as a trailing SSE line and
+/// returns the trimmed text if non-empty. Consumes the buffer.
+fn drain_sse_tail(pending: &mut Vec<u8>) -> Option<String> {
+    if pending.is_empty() {
+        return None;
+    }
+    let tail = String::from_utf8_lossy(pending).into_owned();
+    pending.clear();
+    let trimmed = tail.trim_end_matches('\r').trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
 #[derive(Default)]
 struct AnthropicToolCallState {
     id: String,
@@ -11,7 +38,7 @@ struct AnthropicToolCallState {
 }
 
 pub(crate) struct AnthropicToOpenAIStreamConverter {
-    pending: String,
+    pending: Vec<u8>,
     id: String,
     model: String,
     fallback_model: String,
@@ -27,7 +54,7 @@ pub(crate) struct AnthropicToOpenAIStreamConverter {
 }
 
 pub(crate) struct GeminiToOpenAIStreamConverter {
-    pending: String,
+    pending: Vec<u8>,
     id: String,
     model: String,
     created: u64,
@@ -43,7 +70,7 @@ pub(crate) struct GeminiToOpenAIStreamConverter {
 impl AnthropicToOpenAIStreamConverter {
     pub(crate) fn new(fallback_model: &str) -> Self {
         Self {
-            pending: String::new(),
+            pending: Vec::new(),
             id: "chatcmpl-aivo".to_string(),
             model: String::new(),
             fallback_model: fallback_model.to_string(),
@@ -60,12 +87,10 @@ impl AnthropicToOpenAIStreamConverter {
     }
 
     pub(crate) fn push_bytes(&mut self, chunk: &[u8]) -> Result<String> {
-        self.pending.push_str(&String::from_utf8_lossy(chunk));
+        self.pending.extend_from_slice(chunk);
         let mut output = String::new();
 
-        while let Some(pos) = self.pending.find('\n') {
-            let line = self.pending[..pos].trim_end_matches('\r').to_string();
-            self.pending = self.pending[pos + 1..].to_string();
+        while let Some(line) = drain_sse_line(&mut self.pending) {
             self.process_line(&line, &mut output)?;
         }
 
@@ -75,9 +100,7 @@ impl AnthropicToOpenAIStreamConverter {
     pub(crate) fn finish(&mut self) -> Result<String> {
         let mut output = String::new();
 
-        let tail = self.pending.trim_end_matches('\r').trim().to_string();
-        self.pending.clear();
-        if !tail.is_empty() {
+        if let Some(tail) = drain_sse_tail(&mut self.pending) {
             self.process_line(&tail, &mut output)?;
         }
 
@@ -348,7 +371,7 @@ impl AnthropicToOpenAIStreamConverter {
 impl GeminiToOpenAIStreamConverter {
     pub(crate) fn new(model: &str) -> Self {
         Self {
-            pending: String::new(),
+            pending: Vec::new(),
             id: "chatcmpl-aivo".to_string(),
             model: model.to_string(),
             created: current_unix_ts(),
@@ -363,12 +386,10 @@ impl GeminiToOpenAIStreamConverter {
     }
 
     pub(crate) fn push_bytes(&mut self, chunk: &[u8]) -> Result<String> {
-        self.pending.push_str(&String::from_utf8_lossy(chunk));
+        self.pending.extend_from_slice(chunk);
         let mut output = String::new();
 
-        while let Some(pos) = self.pending.find('\n') {
-            let line = self.pending[..pos].trim_end_matches('\r').to_string();
-            self.pending = self.pending[pos + 1..].to_string();
+        while let Some(line) = drain_sse_line(&mut self.pending) {
             self.process_line(&line, &mut output)?;
         }
 
@@ -378,9 +399,7 @@ impl GeminiToOpenAIStreamConverter {
     pub(crate) fn finish(&mut self) -> Result<String> {
         let mut output = String::new();
 
-        let tail = self.pending.trim_end_matches('\r').trim().to_string();
-        self.pending.clear();
-        if !tail.is_empty() {
+        if let Some(tail) = drain_sse_tail(&mut self.pending) {
             self.process_line(&tail, &mut output)?;
         }
 

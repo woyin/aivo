@@ -702,18 +702,26 @@ impl ConfigContext {
 
         let tmp_path = self.config_path.with_extension("json.tmp");
 
-        tokio::fs::write(&tmp_path, &data)
-            .await
-            .with_context(|| format!("Failed to write temp config file: {:?}", tmp_path))?;
-
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let metadata = tokio::fs::metadata(&tmp_path).await?;
-            let mut permissions = metadata.permissions();
-            permissions.set_mode(0o600);
-            tokio::fs::set_permissions(&tmp_path, permissions).await?;
-        }
+        // Create the temp file with restrictive permissions from the start so
+        // no window exists where the encrypted config is world-readable.
+        let tmp_path_for_write = tmp_path.clone();
+        tokio::task::spawn_blocking(move || -> std::io::Result<()> {
+            use std::io::Write;
+            let mut opts = OpenOptions::new();
+            opts.write(true).create(true).truncate(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                opts.mode(0o600);
+            }
+            let mut file = opts.open(&tmp_path_for_write)?;
+            file.write_all(data.as_bytes())?;
+            file.sync_all()?;
+            Ok(())
+        })
+        .await
+        .context("Join error writing temp config file")?
+        .with_context(|| format!("Failed to write temp config file: {:?}", tmp_path))?;
 
         tokio::fs::rename(&tmp_path, &self.config_path)
             .await
