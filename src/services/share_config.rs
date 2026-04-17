@@ -32,20 +32,42 @@ const CODEX_STARTUP_TIMEOUT_SEC: i64 = 10;
 /// RAII guard holding ephemeral resources for the child tool's lifetime.
 /// Dropping deletes temp files and nickname registrations.
 pub struct ShareCleanup {
-    _claude_mcp_config: Option<NamedTempFile>,
+    claude_mcp_config: Option<NamedTempFile>,
     _registry_guard: Option<nickname_registry::RegistryGuard>,
 }
 
 impl ShareCleanup {
     pub fn empty() -> Self {
         Self {
-            _claude_mcp_config: None,
+            claude_mcp_config: None,
             _registry_guard: None,
         }
     }
 
     pub fn set_registry_guard(&mut self, guard: nickname_registry::RegistryGuard) {
         self._registry_guard = Some(guard);
+    }
+}
+
+impl Drop for ShareCleanup {
+    fn drop(&mut self) {
+        // `NamedTempFile`'s default drop silently swallows removal errors.
+        // Call `close()` explicitly so a stuck temp config (permission
+        // change, already-unlinked, etc.) is surfaced in debug builds —
+        // release builds still stay quiet to avoid noisy user output.
+        if let Some(tempfile) = self.claude_mcp_config.take() {
+            // `close()` consumes `tempfile`, so the path must be captured
+            // beforehand — but only in debug builds where we use it.
+            #[cfg(debug_assertions)]
+            let path = tempfile.path().to_path_buf();
+            if let Err(_err) = tempfile.close() {
+                #[cfg(debug_assertions)]
+                eprintln!(
+                    "aivo: failed to remove temp MCP config {}: {_err}",
+                    path.display()
+                );
+            }
+        }
     }
 }
 
@@ -145,7 +167,7 @@ fn enable_share_claude(
     Ok((
         new_args,
         ShareCleanup {
-            _claude_mcp_config: Some(temp),
+            claude_mcp_config: Some(temp),
             _registry_guard: None,
         },
     ))

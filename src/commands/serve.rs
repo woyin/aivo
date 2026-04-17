@@ -72,6 +72,16 @@ impl ServeCommand {
             }
             other => other,
         };
+
+        // CORS + no auth on a non-loopback bind lets any webpage the user
+        // visits burn their provider quota via cross-origin requests.
+        if cors && auth_token.is_none() && host_binds_publicly(&host) {
+            eprintln!(
+                "{} serve is bound to {} with --cors and no --auth-token; any site could use this key. Add --auth-token or bind to 127.0.0.1.",
+                style::yellow("Warning:"),
+                host,
+            );
+        }
         let key = match key_override {
             Some(k) => k,
             None => {
@@ -268,6 +278,19 @@ impl ServeCommand {
     }
 }
 
+/// True when the bind host reaches beyond loopback — i.e. any network
+/// interface or an explicit non-loopback address. Used to gate warnings
+/// that only matter when the server is actually exposed.
+fn host_binds_publicly(bind_host: &str) -> bool {
+    if bind_host == "0.0.0.0" || bind_host == "::" {
+        return true;
+    }
+    match bind_host.trim_matches(['[', ']']).parse::<IpAddr>() {
+        Ok(ip) => !ip.is_loopback(),
+        Err(_) => !bind_host.eq_ignore_ascii_case("localhost"),
+    }
+}
+
 fn is_self_proxy_target(base_url: &str, port: u16, bind_host: &str) -> bool {
     let Ok(url) = reqwest::Url::parse(base_url) else {
         return false;
@@ -305,7 +328,21 @@ fn is_self_proxy_target(base_url: &str, port: u16, bind_host: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::is_self_proxy_target;
+    use super::{host_binds_publicly, is_self_proxy_target};
+
+    #[test]
+    fn host_binds_publicly_recognizes_loopback_and_non_loopback() {
+        assert!(host_binds_publicly("0.0.0.0"));
+        assert!(host_binds_publicly("::"));
+        assert!(host_binds_publicly("192.168.1.10"));
+        assert!(host_binds_publicly("example.com"));
+
+        assert!(!host_binds_publicly("127.0.0.1"));
+        assert!(!host_binds_publicly("::1"));
+        assert!(!host_binds_publicly("[::1]"));
+        assert!(!host_binds_publicly("localhost"));
+        assert!(!host_binds_publicly("LOCALHOST"));
+    }
 
     #[test]
     fn detects_localhost_self_proxy() {

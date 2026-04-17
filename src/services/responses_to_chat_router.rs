@@ -674,6 +674,9 @@ async fn forward_anthropic_protocol(
     force_non_streaming: bool,
 ) -> Result<AttemptOutcome<Value>> {
     let mut body_with_cache = body.clone();
+    // Only inject cache_control for Claude models — other providers don't
+    // honor it (e.g. Gemini uses a different caching model) and strict ones
+    // reject the unknown field outright.
     if body_with_cache
         .get("model")
         .and_then(|m| m.as_str())

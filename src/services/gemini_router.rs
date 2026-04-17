@@ -164,6 +164,9 @@ async fn forward_to_provider(
 
         let (status, body_text, parsed) = match protocol {
             ProviderProtocol::Anthropic => {
+                // Only inject cache_control for Claude models — other providers
+                // don't honor it (e.g. Gemini has a different caching model) and
+                // strict ones reject the unknown field outright.
                 if req_body
                     .get("model")
                     .and_then(|m| m.as_str())

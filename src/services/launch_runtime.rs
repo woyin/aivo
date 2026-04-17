@@ -314,7 +314,9 @@ fn ensure_loopback_no_proxy(env: &mut HashMap<String, String>) {
             .filter(|s| !s.is_empty())
             .collect();
         for host in LOOPBACK_HOSTS {
-            if !entries.iter().any(|e| e == host) {
+            // Case-insensitive check: a pre-existing `LOCALHOST` or
+            // `127.0.0.1` entry should not get duplicated with `localhost`.
+            if !entries.iter().any(|e| e.eq_ignore_ascii_case(host)) {
                 entries.push((*host).to_string());
             }
         }
@@ -751,6 +753,28 @@ mod tests {
         );
         assert_eq!(
             no_proxy.matches("localhost").count(),
+            1,
+            "NO_PROXY={no_proxy}"
+        );
+    }
+
+    #[test]
+    fn set_local_base_url_treats_existing_loopback_entries_case_insensitively() {
+        use super::set_local_base_url;
+        let mut env = HashMap::from([("NO_PROXY".to_string(), "LOCALHOST,127.0.0.1".to_string())]);
+        set_local_base_url(&mut env, "ANTHROPIC_BASE_URL", 9999);
+
+        let no_proxy = env.get("NO_PROXY").unwrap();
+        // Existing uppercase LOCALHOST should be preserved without a
+        // duplicate lowercase `localhost` appended.
+        assert!(no_proxy.contains("LOCALHOST"), "NO_PROXY={no_proxy}");
+        assert_eq!(
+            no_proxy.to_ascii_lowercase().matches("localhost").count(),
+            1,
+            "NO_PROXY={no_proxy}"
+        );
+        assert_eq!(
+            no_proxy.matches("127.0.0.1").count(),
             1,
             "NO_PROXY={no_proxy}"
         );
