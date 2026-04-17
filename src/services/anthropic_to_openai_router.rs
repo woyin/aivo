@@ -605,6 +605,9 @@ fn anthropic_to_openai(body: &Value, requires_reasoning_content: bool) -> Result
             include_reasoning_content: true,
             require_non_empty_reasoning_content: requires_reasoning_content,
             stringify_other_tool_result_content: true,
+            // OpenAIChatRequest round-trip below strips non-text parts, so
+            // building multimodal arrays upstream would be wasted work.
+            tool_result_supports_multimodal: false,
             fallback_tool_arguments_json: "{}",
         },
     );

@@ -235,6 +235,7 @@ fn anthropic_to_openai_chat(body: &Value) -> Value {
             include_reasoning_content: false,
             require_non_empty_reasoning_content: false,
             stringify_other_tool_result_content: false,
+            tool_result_supports_multimodal: true,
             fallback_tool_arguments_json: "",
         },
     )

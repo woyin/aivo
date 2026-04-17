@@ -12,6 +12,12 @@ pub struct AnthropicToOpenAIConfig {
     pub include_reasoning_content: bool,
     pub require_non_empty_reasoning_content: bool,
     pub stringify_other_tool_result_content: bool,
+    /// When true, `tool_result` blocks containing images emit an OpenAI
+    /// multimodal content array (`[{type:text,...},{type:image_url,...}]`).
+    /// When false, image parts are stripped and only text is kept — the
+    /// legacy behavior, safe for providers that reject array content in
+    /// `role: tool` messages.
+    pub tool_result_supports_multimodal: bool,
     pub fallback_tool_arguments_json: &'static str,
 }
 
@@ -137,7 +143,7 @@ fn convert_content_blocks(
     let mut text_parts: Vec<String> = Vec::new();
     let mut thinking_parts: Vec<String> = Vec::new();
     let mut tool_calls: Vec<Value> = Vec::new();
-    let mut tool_results: Vec<(String, String)> = Vec::new();
+    let mut tool_results: Vec<(String, Value)> = Vec::new();
 
     for block in blocks {
         let block_type = block.get("type").and_then(|t| t.as_str()).unwrap_or("");
@@ -185,16 +191,7 @@ fn convert_content_blocks(
                     .and_then(|i| i.as_str())
                     .unwrap_or("")
                     .to_string();
-                let content = match block.get("content") {
-                    Some(Value::String(s)) => s.clone(),
-                    Some(Value::Array(parts)) => parts
-                        .iter()
-                        .filter_map(|p| p.get("text").and_then(|t| t.as_str()))
-                        .collect::<Vec<_>>()
-                        .join("\n"),
-                    Some(v) if config.stringify_other_tool_result_content => v.to_string(),
-                    _ => String::new(),
-                };
+                let content = convert_tool_result_content(block.get("content"), config);
                 tool_results.push((tool_use_id, content));
             }
             _ => {}
@@ -246,6 +243,75 @@ fn convert_content_blocks(
     }
 }
 
+/// Convert an Anthropic `tool_result.content` into OpenAI `role: tool`
+/// message content. Emits a plain string when all parts are text, or a
+/// multimodal array when image parts are present and the config opts in.
+fn convert_tool_result_content(content: Option<&Value>, config: &AnthropicToOpenAIConfig) -> Value {
+    let parts = match content {
+        Some(Value::String(s)) => return Value::String(s.clone()),
+        Some(Value::Array(parts)) => parts,
+        Some(v) if config.stringify_other_tool_result_content => {
+            return Value::String(v.to_string());
+        }
+        _ => return Value::String(String::new()),
+    };
+
+    if config.tool_result_supports_multimodal && parts.iter().any(is_image_block) {
+        let openai_parts: Vec<Value> = parts.iter().filter_map(convert_tool_result_part).collect();
+        if !openai_parts.is_empty() {
+            return Value::Array(openai_parts);
+        }
+    }
+
+    let text = parts
+        .iter()
+        .filter_map(|p| p.get("text").and_then(|t| t.as_str()))
+        .collect::<Vec<_>>()
+        .join("\n");
+    Value::String(text)
+}
+
+fn is_image_block(part: &Value) -> bool {
+    part.get("type").and_then(|t| t.as_str()) == Some("image")
+}
+
+/// Translate a single Anthropic `tool_result` part into its OpenAI shape.
+/// Returns `None` for unknown/malformed blocks so they are skipped rather
+/// than breaking the whole conversion.
+fn convert_tool_result_part(part: &Value) -> Option<Value> {
+    match part.get("type").and_then(|t| t.as_str())? {
+        "text" => {
+            let text = part.get("text").and_then(|t| t.as_str())?;
+            Some(json!({"type": "text", "text": text}))
+        }
+        "image" => {
+            let source = part.get("source")?;
+            match source.get("type").and_then(|t| t.as_str())? {
+                "base64" => {
+                    let media = source
+                        .get("media_type")
+                        .and_then(|t| t.as_str())
+                        .unwrap_or("image/png");
+                    let data = source.get("data").and_then(|t| t.as_str())?;
+                    Some(json!({
+                        "type": "image_url",
+                        "image_url": {"url": format!("data:{media};base64,{data}")},
+                    }))
+                }
+                "url" => {
+                    let url = source.get("url").and_then(|t| t.as_str())?;
+                    Some(json!({
+                        "type": "image_url",
+                        "image_url": {"url": url},
+                    }))
+                }
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -258,6 +324,7 @@ mod tests {
             include_reasoning_content: false,
             require_non_empty_reasoning_content: false,
             stringify_other_tool_result_content: false,
+            tool_result_supports_multimodal: true,
             fallback_tool_arguments_json: "{}",
         }
     }
@@ -288,9 +355,72 @@ mod tests {
     }
 
     #[test]
-    fn tool_result_image_blocks_are_text_extracted_only() {
+    fn tool_result_preserves_image_blocks_as_multimodal() {
+        let body = json!({
+            "model": "claude-sonnet-4-5",
+            "messages": [{
+                "role": "user",
+                "content": [{
+                    "type": "tool_result",
+                    "tool_use_id": "toolu_1",
+                    "content": [
+                        {"type": "text", "text": "Screenshot taken"},
+                        {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "abc"}}
+                    ]
+                }]
+            }]
+        });
+        let req = convert_anthropic_to_openai_request(&body, &test_config());
+        let tool_msg = &req["messages"][0];
+        assert_eq!(tool_msg["role"], "tool");
+        let content = tool_msg["content"].as_array().expect("multimodal array");
+        assert_eq!(content.len(), 2);
+        assert_eq!(
+            content[0],
+            json!({"type": "text", "text": "Screenshot taken"})
+        );
+        assert_eq!(
+            content[1],
+            json!({
+                "type": "image_url",
+                "image_url": {"url": "data:image/png;base64,abc"},
+            })
+        );
+    }
+
+    #[test]
+    fn tool_result_url_source_image_preserved_as_image_url() {
+        let body = json!({
+            "model": "claude-sonnet-4-5",
+            "messages": [{
+                "role": "user",
+                "content": [{
+                    "type": "tool_result",
+                    "tool_use_id": "toolu_1",
+                    "content": [
+                        {"type": "image", "source": {"type": "url", "url": "https://example.com/x.png"}}
+                    ]
+                }]
+            }]
+        });
+        let req = convert_anthropic_to_openai_request(&body, &test_config());
+        let content = req["messages"][0]["content"]
+            .as_array()
+            .expect("multimodal array");
+        assert_eq!(content.len(), 1);
+        assert_eq!(
+            content[0],
+            json!({
+                "type": "image_url",
+                "image_url": {"url": "https://example.com/x.png"},
+            })
+        );
+    }
+
+    #[test]
+    fn tool_result_drops_images_when_multimodal_disabled() {
         let config = AnthropicToOpenAIConfig {
-            stringify_other_tool_result_content: false,
+            tool_result_supports_multimodal: false,
             ..test_config()
         };
         let body = json!({
@@ -308,9 +438,23 @@ mod tests {
             }]
         });
         let req = convert_anthropic_to_openai_request(&body, &config);
-        let tool_msg = &req["messages"][0];
-        assert_eq!(tool_msg["role"], "tool");
-        // Only text content extracted — image block is silently dropped
-        assert_eq!(tool_msg["content"], "Screenshot taken");
+        assert_eq!(req["messages"][0]["content"], "Screenshot taken");
+    }
+
+    #[test]
+    fn tool_result_pure_text_stays_string() {
+        let body = json!({
+            "model": "claude-sonnet-4-5",
+            "messages": [{
+                "role": "user",
+                "content": [{
+                    "type": "tool_result",
+                    "tool_use_id": "toolu_1",
+                    "content": [{"type": "text", "text": "ok"}]
+                }]
+            }]
+        });
+        let req = convert_anthropic_to_openai_request(&body, &test_config());
+        assert_eq!(req["messages"][0]["content"], "ok");
     }
 }
