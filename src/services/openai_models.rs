@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use serde_json::{Map, Value};
+use serde_json::{Map, Value, json};
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub(crate) struct OpenAIChatRequest {
@@ -79,7 +79,9 @@ impl OpenAIContentPart {
     fn is_text_only(&self) -> bool {
         match self {
             Self::Text(_) => true,
-            Self::Object(part) => part.image_url.is_none() && part.extra.is_empty(),
+            Self::Object(part) => {
+                part.image_url.is_none() && (part.extra.is_empty() || part.has_only_text_metadata())
+            }
         }
     }
 }
@@ -100,6 +102,23 @@ pub(crate) struct OpenAIContentPartObject {
     // `stringify_message_content` would silently drop their payloads.
     #[serde(default, flatten)]
     pub extra: Map<String, Value>,
+}
+
+impl OpenAIContentPartObject {
+    fn has_only_text_metadata(&self) -> bool {
+        self.is_text_like_kind() && self.extra.keys().all(|key| is_text_part_metadata_key(key))
+    }
+
+    fn is_text_like_kind(&self) -> bool {
+        matches!(
+            self.kind.as_deref(),
+            None | Some("text") | Some("input_text") | Some("output_text")
+        )
+    }
+}
+
+fn is_text_part_metadata_key(key: &str) -> bool {
+    matches!(key, "annotations" | "cache_control")
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -194,7 +213,7 @@ pub(crate) enum ResponsesRequestInputItem {
         arguments: String,
     },
     #[serde(rename = "function_call_output")]
-    FunctionCallOutput { call_id: String, output: String },
+    FunctionCallOutput { call_id: String, output: Value },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -213,12 +232,20 @@ impl ResponsesMessageContent {
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 pub(crate) struct ResponsesMessagePart {
     #[serde(rename = "type")]
     pub kind: String,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub text: Option<String>,
+    #[serde(default, flatten)]
+    pub extra: Map<String, Value>,
+}
+
+impl ResponsesMessagePart {
+    fn is_effectively_empty(&self) -> bool {
+        self.text.as_deref().unwrap_or_default().is_empty() && self.extra.is_empty()
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -440,6 +467,115 @@ fn content_is_pure_text(content: &OpenAIMessageContent) -> bool {
     }
 }
 
+fn responses_text_kind_for_role(role: &str) -> &'static str {
+    if role == "assistant" {
+        "output_text"
+    } else {
+        "input_text"
+    }
+}
+
+fn convert_openai_content_to_responses(
+    content: &OpenAIMessageContent,
+    role: &str,
+) -> ResponsesMessageContent {
+    match content {
+        OpenAIMessageContent::Text(text) => {
+            if role == "assistant" {
+                ResponsesMessageContent::Parts(vec![ResponsesMessagePart {
+                    kind: "output_text".to_string(),
+                    text: Some(text.clone()),
+                    extra: Map::new(),
+                }])
+            } else {
+                ResponsesMessageContent::Text(text.clone())
+            }
+        }
+        OpenAIMessageContent::Parts(parts) => ResponsesMessageContent::Parts(
+            parts
+                .iter()
+                .map(|part| convert_openai_part_to_responses(part, role))
+                .collect(),
+        ),
+    }
+}
+
+fn convert_openai_part_to_responses(part: &OpenAIContentPart, role: &str) -> ResponsesMessagePart {
+    let text_kind = responses_text_kind_for_role(role).to_string();
+    match part {
+        OpenAIContentPart::Text(text) => ResponsesMessagePart {
+            kind: text_kind,
+            text: Some(text.clone()),
+            extra: Map::new(),
+        },
+        OpenAIContentPart::Object(obj) => {
+            let mut extra = obj.extra.clone();
+
+            if let Some(image_url) = &obj.image_url {
+                extra.insert("image_url".to_string(), json!(image_url.url));
+                return ResponsesMessagePart {
+                    kind: "input_image".to_string(),
+                    text: obj.text.clone(),
+                    extra,
+                };
+            }
+
+            if let Some(file) = extra.remove("file") {
+                if let Some(file_obj) = file.as_object() {
+                    if let Some(filename) = file_obj.get("filename") {
+                        extra.insert("filename".to_string(), filename.clone());
+                    }
+                    if let Some(file_data) = file_obj.get("file_data") {
+                        extra.insert("file_data".to_string(), file_data.clone());
+                    }
+                } else {
+                    extra.insert("file".to_string(), file);
+                }
+                return ResponsesMessagePart {
+                    kind: "input_file".to_string(),
+                    text: obj.text.clone(),
+                    extra,
+                };
+            }
+
+            let kind = match obj.kind.as_deref() {
+                Some("text") | Some("input_text") | Some("output_text") | None => text_kind,
+                Some(kind) => kind.to_string(),
+            };
+
+            ResponsesMessagePart {
+                kind,
+                text: obj.text.clone(),
+                extra,
+            }
+        }
+    }
+}
+
+fn convert_tool_output(content: Option<&OpenAIMessageContent>) -> Value {
+    let Some(content) = content else {
+        return json!("");
+    };
+    if content_is_pure_text(content) {
+        return json!(content.flatten_text());
+    }
+    // `content_is_pure_text` returns true unconditionally for `Text`, so we
+    // can only land here with `Parts`.
+    let OpenAIMessageContent::Parts(parts) = content else {
+        return json!(content.flatten_text());
+    };
+    serde_json::to_value(parts).unwrap_or_else(|_| json!(content.flatten_text()))
+}
+
+fn responses_content_is_empty(content: &ResponsesMessageContent) -> bool {
+    match content {
+        ResponsesMessageContent::Text(text) => text.is_empty(),
+        ResponsesMessageContent::Parts(parts) => {
+            parts.iter().all(ResponsesMessagePart::is_effectively_empty)
+        }
+    }
+}
+
 fn default_openai_model() -> String {
     "gpt-4o".to_string()
 }
@@ -466,15 +602,18 @@ pub(crate) fn convert_chat_to_responses_request(
                 }
             }
             "assistant" => {
-                let content = flatten_openai_message_text(message);
+                let content = message
+                    .content
+                    .as_ref()
+                    .map(|content| convert_openai_content_to_responses(content, "assistant"));
                 if let Some(tool_calls) = &message.tool_calls {
-                    if !content.is_empty() {
+                    if let Some(content) = content
+                        .as_ref()
+                        .filter(|content| !responses_content_is_empty(content))
+                    {
                         input.push(ResponsesRequestInputItem::Message {
                             role: "assistant".to_string(),
-                            content: ResponsesMessageContent::Parts(vec![ResponsesMessagePart {
-                                kind: "output_text".to_string(),
-                                text: Some(content),
-                            }]),
+                            content: content.clone(),
                         });
                     }
                     for tool_call in tool_calls {
@@ -489,23 +628,24 @@ pub(crate) fn convert_chat_to_responses_request(
                 } else {
                     input.push(ResponsesRequestInputItem::Message {
                         role: "assistant".to_string(),
-                        content: ResponsesMessageContent::Parts(vec![ResponsesMessagePart {
-                            kind: "output_text".to_string(),
-                            text: Some(content),
-                        }]),
+                        content: content.unwrap_or_else(|| ResponsesMessageContent::Parts(vec![])),
                     });
                 }
             }
             "tool" => {
                 input.push(ResponsesRequestInputItem::FunctionCallOutput {
                     call_id: message.tool_call_id.clone().unwrap_or_default(),
-                    output: flatten_openai_message_text(message),
+                    output: convert_tool_output(message.content.as_ref()),
                 });
             }
             role => {
                 input.push(ResponsesRequestInputItem::Message {
                     role: role.to_string(),
-                    content: ResponsesMessageContent::Text(flatten_openai_message_text(message)),
+                    content: message
+                        .content
+                        .as_ref()
+                        .map(|content| convert_openai_content_to_responses(content, role))
+                        .unwrap_or_else(|| ResponsesMessageContent::Text(String::new())),
                 });
             }
         }
@@ -853,6 +993,44 @@ mod tests {
     }
 
     #[test]
+    fn stringify_flattens_text_parts_with_metadata_only_extras() {
+        let mut req = OpenAIChatRequest {
+            model: "gpt-4o".to_string(),
+            messages: vec![OpenAIChatMessage {
+                role: "user".to_string(),
+                content: Some(OpenAIMessageContent::Parts(vec![
+                    OpenAIContentPart::Object(
+                        serde_json::from_value(json!({
+                            "type": "text",
+                            "text": "hello",
+                            "cache_control": {"type": "ephemeral"},
+                        }))
+                        .unwrap(),
+                    ),
+                ])),
+                tool_calls: None,
+                tool_call_id: None,
+                reasoning_content: None,
+            }],
+            stream: false,
+            max_tokens: None,
+            temperature: None,
+            top_p: None,
+            tools: None,
+            tool_choice: None,
+            reasoning_effort: None,
+            extra: Map::new(),
+        };
+
+        stringify_message_content(&mut req);
+
+        assert_eq!(
+            req.messages[0].content,
+            Some(OpenAIMessageContent::Text("hello".to_string()))
+        );
+    }
+
+    #[test]
     fn test_convert_chat_to_responses_request_maps_messages_tools_and_reasoning() {
         let request = OpenAIChatRequest {
             model: "gpt-4o".to_string(),
@@ -938,6 +1116,7 @@ mod tests {
                 content: ResponsesMessageContent::Parts(vec![ResponsesMessagePart {
                     kind: "output_text".to_string(),
                     text: Some("Working on it".to_string()),
+                    extra: Map::new(),
                 }]),
             }
         );
@@ -945,7 +1124,141 @@ mod tests {
             responses.input[3],
             ResponsesRequestInputItem::FunctionCallOutput {
                 call_id: "call_1".to_string(),
-                output: "file.txt".to_string(),
+                output: json!("file.txt"),
+            }
+        );
+    }
+
+    #[test]
+    fn convert_chat_to_responses_request_preserves_non_text_tool_output() {
+        let request = OpenAIChatRequest {
+            model: "gpt-4o".to_string(),
+            messages: vec![OpenAIChatMessage {
+                role: "tool".to_string(),
+                content: Some(OpenAIMessageContent::Parts(vec![
+                    OpenAIContentPart::Object(OpenAIContentPartObject {
+                        kind: Some("text".to_string()),
+                        text: Some("Screenshot taken".to_string()),
+                        ..Default::default()
+                    }),
+                    OpenAIContentPart::Object(OpenAIContentPartObject {
+                        kind: Some("image_url".to_string()),
+                        image_url: Some(OpenAIImageUrl {
+                            url: "data:image/png;base64,abc".to_string(),
+                        }),
+                        ..Default::default()
+                    }),
+                ])),
+                tool_calls: None,
+                tool_call_id: Some("call_1".to_string()),
+                reasoning_content: None,
+            }],
+            stream: false,
+            max_tokens: None,
+            temperature: None,
+            top_p: None,
+            tools: None,
+            tool_choice: None,
+            reasoning_effort: None,
+            extra: Map::new(),
+        };
+
+        let responses = convert_chat_to_responses_request(&request);
+
+        assert_eq!(
+            responses.input[0],
+            ResponsesRequestInputItem::FunctionCallOutput {
+                call_id: "call_1".to_string(),
+                output: json!([
+                    {"type": "text", "text": "Screenshot taken"},
+                    {"type": "image_url", "image_url": {"url": "data:image/png;base64,abc"}}
+                ]),
+            }
+        );
+    }
+
+    #[test]
+    fn convert_chat_to_responses_request_maps_image_and_file_parts() {
+        let request = OpenAIChatRequest {
+            model: "gpt-4o".to_string(),
+            messages: vec![OpenAIChatMessage {
+                role: "user".to_string(),
+                content: Some(OpenAIMessageContent::Parts(vec![
+                    OpenAIContentPart::Object(OpenAIContentPartObject {
+                        kind: Some("text".to_string()),
+                        text: Some("See attached".to_string()),
+                        ..Default::default()
+                    }),
+                    OpenAIContentPart::Object(OpenAIContentPartObject {
+                        kind: Some("image_url".to_string()),
+                        image_url: Some(OpenAIImageUrl {
+                            url: "https://example.com/x.png".to_string(),
+                        }),
+                        ..Default::default()
+                    }),
+                    OpenAIContentPart::Object(
+                        serde_json::from_value(json!({
+                            "type": "file",
+                            "file": {
+                                "filename": "report.pdf",
+                                "file_data": "data:application/pdf;base64,abc"
+                            }
+                        }))
+                        .unwrap(),
+                    ),
+                ])),
+                tool_calls: None,
+                tool_call_id: None,
+                reasoning_content: None,
+            }],
+            stream: false,
+            max_tokens: None,
+            temperature: None,
+            top_p: None,
+            tools: None,
+            tool_choice: None,
+            reasoning_effort: None,
+            extra: Map::new(),
+        };
+
+        let responses = convert_chat_to_responses_request(&request);
+
+        assert_eq!(
+            responses.input[0],
+            ResponsesRequestInputItem::Message {
+                role: "user".to_string(),
+                content: ResponsesMessageContent::Parts(vec![
+                    ResponsesMessagePart {
+                        kind: "input_text".to_string(),
+                        text: Some("See attached".to_string()),
+                        extra: Map::new(),
+                    },
+                    ResponsesMessagePart {
+                        kind: "input_image".to_string(),
+                        text: None,
+                        extra: {
+                            let mut extra = Map::new();
+                            extra.insert(
+                                "image_url".to_string(),
+                                json!("https://example.com/x.png"),
+                            );
+                            extra
+                        },
+                    },
+                    ResponsesMessagePart {
+                        kind: "input_file".to_string(),
+                        text: None,
+                        extra: {
+                            let mut extra = Map::new();
+                            extra.insert("filename".to_string(), json!("report.pdf"));
+                            extra.insert(
+                                "file_data".to_string(),
+                                json!("data:application/pdf;base64,abc"),
+                            );
+                            extra
+                        },
+                    },
+                ]),
             }
         );
     }

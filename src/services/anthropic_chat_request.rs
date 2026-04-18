@@ -1,5 +1,6 @@
 //! Shared Anthropic Messages API -> OpenAI Chat Completions request conversion.
 
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use serde_json::{Value, json};
 
 pub type ModelTransform = fn(&str) -> String;
@@ -288,11 +289,15 @@ fn convert_tool_result_part(part: &Value) -> Option<Value> {
             let source = part.get("source")?;
             match source.get("type").and_then(|t| t.as_str())? {
                 "base64" => {
-                    // `media_type` is required by Anthropic's schema; drop the
-                    // part if it's missing rather than guessing a format and
-                    // mislabeling the payload.
-                    let media = source.get("media_type").and_then(|t| t.as_str())?;
                     let data = source.get("data").and_then(|t| t.as_str())?;
+                    // Prefer the explicit schema field, but keep the prior
+                    // best-effort behavior for buggy producers so images don't
+                    // disappear entirely on the bridge.
+                    let media = source
+                        .get("media_type")
+                        .and_then(|t| t.as_str())
+                        .or_else(|| sniff_base64_image_media_type(data))
+                        .unwrap_or("image/png");
                     Some(json!({
                         "type": "image_url",
                         "image_url": {"url": format!("data:{media};base64,{data}")},
@@ -308,6 +313,38 @@ fn convert_tool_result_part(part: &Value) -> Option<Value> {
                 _ => None,
             }
         }
+        _ => None,
+    }
+}
+
+fn sniff_base64_image_media_type(data: &str) -> Option<&'static str> {
+    // Only the first 12 decoded bytes are needed to identify any of the four
+    // magic patterns below. 16 base64 chars decode to 12 bytes and are always
+    // 4-aligned, so decoding just that prefix avoids allocating the full
+    // image buffer (can be MBs) every time we sniff. `get` rather than direct
+    // slice so a non-ASCII (and therefore invalid) input fails sniffing
+    // cleanly instead of panicking on a codepoint boundary.
+    let prefix = data.get(..16).unwrap_or(data);
+    let bytes = BASE64.decode(prefix).ok()?;
+    match bytes.as_slice() {
+        [0x89, b'P', b'N', b'G', ..] => Some("image/png"),
+        [0xFF, 0xD8, 0xFF, ..] => Some("image/jpeg"),
+        [b'G', b'I', b'F', b'8', ..] => Some("image/gif"),
+        [
+            b'R',
+            b'I',
+            b'F',
+            b'F',
+            _,
+            _,
+            _,
+            _,
+            b'W',
+            b'E',
+            b'B',
+            b'P',
+            ..,
+        ] => Some("image/webp"),
         _ => None,
     }
 }
@@ -384,6 +421,36 @@ mod tests {
             json!({
                 "type": "image_url",
                 "image_url": {"url": "data:image/png;base64,abc"},
+            })
+        );
+    }
+
+    #[test]
+    fn tool_result_missing_media_type_keeps_image_with_sniffed_or_default_media() {
+        let body = json!({
+            "model": "claude-sonnet-4-5",
+            "messages": [{
+                "role": "user",
+                "content": [{
+                    "type": "tool_result",
+                    "tool_use_id": "toolu_1",
+                    "content": [
+                        // JPEG magic bytes: FF D8 FF
+                        {"type": "image", "source": {"type": "base64", "data": "/9j/"}}
+                    ]
+                }]
+            }]
+        });
+        let req = convert_anthropic_to_openai_request(&body, &test_config());
+        let content = req["messages"][0]["content"]
+            .as_array()
+            .expect("multimodal array");
+        assert_eq!(content.len(), 1);
+        assert_eq!(
+            content[0],
+            json!({
+                "type": "image_url",
+                "image_url": {"url": "data:image/jpeg;base64,/9j/"},
             })
         );
     }
