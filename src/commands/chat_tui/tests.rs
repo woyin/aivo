@@ -402,6 +402,119 @@ fn test_kill_to_end_of_line() {
     assert_eq!(app.cursor, 2);
 }
 
+#[tokio::test]
+async fn test_ctrl_c_clears_prompt_without_exiting() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.draft = "hello world".to_string();
+    app.cursor = app.draft.len();
+    app.draft_attachments.push(MessageAttachment {
+        name: "notes.md".to_string(),
+        mime_type: "text/markdown".to_string(),
+        storage: AttachmentStorage::FileRef {
+            path: "./notes.md".to_string(),
+        },
+    });
+
+    let should_exit = app
+        .handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL))
+        .await
+        .unwrap();
+
+    assert!(!should_exit);
+    assert!(app.draft.is_empty());
+    assert!(app.draft_attachments.is_empty());
+    assert_eq!(app.cursor, 0);
+    assert!(!app.pending_clear_screen);
+}
+
+#[tokio::test]
+async fn test_ctrl_c_exits_when_prompt_empty() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+
+    let should_exit = app
+        .handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL))
+        .await
+        .unwrap();
+
+    assert!(should_exit);
+}
+
+#[tokio::test]
+async fn test_ctrl_c_clears_attachment_only_prompt() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.draft_attachments.push(MessageAttachment {
+        name: "image.png".to_string(),
+        mime_type: "image/png".to_string(),
+        storage: AttachmentStorage::FileRef {
+            path: "./image.png".to_string(),
+        },
+    });
+
+    let should_exit = app
+        .handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL))
+        .await
+        .unwrap();
+
+    assert!(!should_exit);
+    assert!(app.draft_attachments.is_empty());
+}
+
+#[tokio::test]
+async fn test_ctrl_c_clears_history_navigation_state() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.draft_history = vec!["older".to_string(), "newer".to_string()];
+    app.history_prev();
+    assert!(app.draft_history_index.is_some());
+    assert!(!app.draft.is_empty());
+
+    app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL))
+        .await
+        .unwrap();
+
+    assert!(app.draft.is_empty());
+    assert!(app.draft_history_index.is_none());
+    assert!(app.draft_history_stash.is_none());
+}
+
+#[tokio::test]
+async fn test_ctrl_c_exits_when_overlay_open() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.draft = "hidden behind overlay".to_string();
+    app.cursor = app.draft.len();
+    app.overlay = Overlay::Help;
+
+    let should_exit = app
+        .handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL))
+        .await
+        .unwrap();
+
+    assert!(should_exit);
+    assert_eq!(app.draft, "hidden behind overlay");
+}
+
+#[tokio::test]
+async fn test_ctrl_l_requests_clear_screen_without_touching_prompt() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.draft = "hello world".to_string();
+    app.cursor = app.draft.len();
+
+    let should_exit = app
+        .handle_key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::CONTROL))
+        .await
+        .unwrap();
+
+    assert!(!should_exit);
+    assert!(app.pending_clear_screen);
+    assert_eq!(app.draft, "hello world");
+    assert_eq!(app.cursor, "hello world".len());
+}
+
 fn make_test_app(
     tx: tokio::sync::mpsc::UnboundedSender<RuntimeEvent>,
     rx: tokio::sync::mpsc::UnboundedReceiver<RuntimeEvent>,
@@ -455,6 +568,7 @@ fn make_test_app(
         reduce_motion: false,
         frame_tick: 0,
         picker_hitbox: None,
+        pending_clear_screen: false,
     }
 }
 

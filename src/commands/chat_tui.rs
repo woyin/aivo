@@ -128,6 +128,7 @@ impl ChatTuiApp {
             reduce_motion: reduce_motion_requested(),
             frame_tick: 0,
             picker_hitbox: None,
+            pending_clear_screen: false,
         })
     }
 }

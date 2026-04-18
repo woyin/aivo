@@ -65,12 +65,7 @@ impl ChatTuiApp {
 
     pub(super) fn clear_for_resume_loading(&mut self) {
         self.history.clear();
-        self.draft.clear();
-        self.draft_attachments.clear();
-        self.cursor = 0;
-        self.command_menu.reset();
-        self.draft_history_index = None;
-        self.draft_history_stash = None;
+        self.reset_composer();
         self.pending_response.clear();
         self.pending_reasoning.clear();
         self.pending_submit = None;

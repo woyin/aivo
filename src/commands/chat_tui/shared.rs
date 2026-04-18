@@ -635,4 +635,5 @@ pub(super) struct ChatTuiApp {
     pub(super) reduce_motion: bool,
     pub(super) frame_tick: usize,
     pub(super) picker_hitbox: Option<PickerHitbox>,
+    pub(super) pending_clear_screen: bool,
 }

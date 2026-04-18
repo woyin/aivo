@@ -10,6 +10,12 @@ enum OverlayKeyAction {
 impl ChatTuiApp {
     pub(super) async fn handle_key(&mut self, key: KeyEvent) -> Result<bool> {
         if matches!(key.code, KeyCode::Char('c')) && key.modifiers.contains(KeyModifiers::CONTROL) {
+            if matches!(self.overlay, Overlay::None)
+                && (!self.draft.is_empty() || !self.draft_attachments.is_empty())
+            {
+                self.reset_composer();
+                return Ok(false);
+            }
             return Ok(true);
         }
 
@@ -281,9 +287,7 @@ impl ChatTuiApp {
                 }
             }
             KeyCode::Char('l') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.draft.clear();
-                self.cursor = 0;
-                self.command_menu.reset();
+                self.pending_clear_screen = true;
             }
             KeyCode::Char('w') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.leave_history_navigation();

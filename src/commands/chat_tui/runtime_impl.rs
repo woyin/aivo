@@ -229,17 +229,21 @@ impl ChatTuiApp {
         }
     }
 
-    pub(super) fn start_new_chat(&mut self) {
-        self.discard_resume_state();
-        self.cancel_inflight_request();
-        self.overlay = Overlay::None;
-        self.history.clear();
+    pub(super) fn reset_composer(&mut self) {
         self.draft.clear();
         self.draft_attachments.clear();
         self.cursor = 0;
         self.command_menu.reset();
         self.draft_history_index = None;
         self.draft_history_stash = None;
+    }
+
+    pub(super) fn start_new_chat(&mut self) {
+        self.discard_resume_state();
+        self.cancel_inflight_request();
+        self.overlay = Overlay::None;
+        self.history.clear();
+        self.reset_composer();
         self.pending_response.clear();
         self.pending_reasoning.clear();
         self.pending_submit = None;
