@@ -385,11 +385,7 @@ async fn walk_files_with_size(
 }
 
 fn print_progress(current: usize, total: usize, step: Option<(usize, usize)>) {
-    let pct = if total > 0 {
-        (current * 100) / total
-    } else {
-        0
-    };
+    let pct = (current * 100).checked_div(total).unwrap_or(0);
     let step_prefix = match step {
         Some((i, n)) => format!("({i}/{n}) "),
         None => String::new(),

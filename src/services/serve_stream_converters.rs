@@ -300,15 +300,13 @@ impl AnthropicToOpenAIStreamConverter {
                     self.emit_finish(output, map_anthropic_stop_reason(stop_reason));
                 }
             }
-            "message_stop" => {
-                if !self.finished {
-                    let finish_reason = if self.saw_tool_call {
-                        "tool_calls"
-                    } else {
-                        "stop"
-                    };
-                    self.emit_finish(output, finish_reason);
-                }
+            "message_stop" if !self.finished => {
+                let finish_reason = if self.saw_tool_call {
+                    "tool_calls"
+                } else {
+                    "stop"
+                };
+                self.emit_finish(output, finish_reason);
             }
             _ => {}
         }

@@ -147,13 +147,11 @@ impl FuzzySelect {
                         selection = count - 1;
                     }
                 }
-                key if is_next_key(&key) => {
-                    if count > 0 {
-                        if selection < count - 1 {
-                            selection += 1;
-                        } else {
-                            selection = 0;
-                        }
+                key if is_next_key(&key) && count > 0 => {
+                    if selection < count - 1 {
+                        selection += 1;
+                    } else {
+                        selection = 0;
                     }
                 }
                 Key::Enter => {
@@ -167,19 +165,15 @@ impl FuzzySelect {
                     term.show_cursor()?;
                     return Ok(None);
                 }
-                Key::Backspace => {
-                    if !query.is_empty() {
-                        query.pop();
-                        selection = 0;
-                        page_start = 0;
-                    }
+                Key::Backspace if !query.is_empty() => {
+                    query.pop();
+                    selection = 0;
+                    page_start = 0;
                 }
-                Key::Char(c) => {
-                    if !c.is_control() {
-                        query.push(c);
-                        selection = 0;
-                        page_start = 0;
-                    }
+                Key::Char(c) if !c.is_control() => {
+                    query.push(c);
+                    selection = 0;
+                    page_start = 0;
                 }
                 _ => {}
             }

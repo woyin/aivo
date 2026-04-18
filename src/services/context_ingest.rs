@@ -132,7 +132,7 @@ pub async fn ingest_project(project_root: &Path, opts: IngestOptions) -> Result<
         let cutoff = Utc::now() - chrono::Duration::days(days);
         threads.retain(|t| t.updated_at >= cutoff);
     }
-    threads.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+    threads.sort_by_key(|t| std::cmp::Reverse(t.updated_at));
     Ok(threads)
 }
 
@@ -271,7 +271,7 @@ pub(crate) async fn gemini_matching_session_files(canonical_root: &str) -> Vec<P
         }
         entries.extend(chat_files);
     }
-    entries.sort_by(|a, b| b.1.cmp(&a.1));
+    entries.sort_by_key(|e| std::cmp::Reverse(e.1));
     entries.into_iter().map(|(p, _)| p).collect()
 }
 
@@ -314,10 +314,8 @@ async fn extract_gemini_thread(path: &Path) -> Option<Thread> {
             last_timestamp = Some(parsed.with_timezone(&Utc));
         }
         match kind {
-            "user" => {
-                if first_user.is_none() {
-                    first_user = Some(text);
-                }
+            "user" if first_user.is_none() => {
+                first_user = Some(text);
             }
             "gemini" => {
                 last_assistant = Some(text);
@@ -497,10 +495,8 @@ async fn extract_pi_thread(path: &Path) -> Option<Thread> {
             None => continue,
         };
         match role {
-            "user" => {
-                if first_user.is_none() {
-                    first_user = Some(text);
-                }
+            "user" if first_user.is_none() => {
+                first_user = Some(text);
             }
             "assistant" => {
                 last_assistant = Some(text);
@@ -653,10 +649,8 @@ fn opencode_extract_session(
             None => continue,
         };
         match role.as_str() {
-            "user" => {
-                if first_user.is_none() {
-                    first_user = Some(text);
-                }
+            "user" if first_user.is_none() => {
+                first_user = Some(text);
             }
             "assistant" => {
                 last_assistant = Some(text);
@@ -699,7 +693,7 @@ pub(crate) async fn list_jsonl_newest_first(dir: &Path) -> Vec<PathBuf> {
             .unwrap_or(SystemTime::UNIX_EPOCH);
         entries.push((path, mtime));
     }
-    entries.sort_by(|a, b| b.1.cmp(&a.1));
+    entries.sort_by_key(|e| std::cmp::Reverse(e.1));
     entries.into_iter().map(|(p, _)| p).collect()
 }
 
@@ -725,7 +719,7 @@ pub(crate) async fn walk_jsonl_newest_first(root: &Path) -> Vec<PathBuf> {
             }
         }
     }
-    entries.sort_by(|a, b| b.1.cmp(&a.1));
+    entries.sort_by_key(|e| std::cmp::Reverse(e.1));
     entries.into_iter().map(|(p, _)| p).collect()
 }
 
@@ -811,10 +805,8 @@ async fn extract_claude_thread(path: &Path) -> Option<Thread> {
         }
 
         match kind {
-            "user" => {
-                if first_user.is_none() {
-                    first_user = Some(text);
-                }
+            "user" if first_user.is_none() => {
+                first_user = Some(text);
             }
             "assistant" => {
                 last_assistant = Some(text);
@@ -891,10 +883,8 @@ async fn extract_codex_thread(path: &Path, project_root: &str) -> Option<Thread>
                 None => continue,
             };
             match role {
-                "user" => {
-                    if first_user.is_none() {
-                        first_user = Some(text);
-                    }
+                "user" if first_user.is_none() => {
+                    first_user = Some(text);
                 }
                 "assistant" => {
                     last_assistant = Some(text);

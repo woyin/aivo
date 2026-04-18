@@ -77,12 +77,10 @@ fn term_read_secret(prompt: &str) -> std::io::Result<String> {
                     let _ = stdout.flush();
                     break Ok(input);
                 }
-                KeyCode::Backspace => {
-                    if !input.is_empty() {
-                        input.pop();
-                        let _ = write!(stdout, "\x08 \x08");
-                        let _ = stdout.flush();
-                    }
+                KeyCode::Backspace if !input.is_empty() => {
+                    input.pop();
+                    let _ = write!(stdout, "\x08 \x08");
+                    let _ = stdout.flush();
                 }
                 KeyCode::Char('c') if modifiers.contains(KeyModifiers::CONTROL) => {
                     let _ = write!(stdout, "\r\n");

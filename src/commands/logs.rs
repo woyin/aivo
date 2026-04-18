@@ -81,7 +81,7 @@ impl LogsCommand {
                 rows.push((source.source, source.count));
             }
         }
-        rows.sort_by(|a, b| b.1.cmp(&a.1));
+        rows.sort_by_key(|r| std::cmp::Reverse(r.1));
 
         let name_width = rows.iter().map(|(n, _)| n.len()).max().unwrap_or(0);
         let max_count = rows.iter().map(|(_, c)| *c).max().unwrap_or(0);

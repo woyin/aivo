@@ -409,7 +409,7 @@ fn filter_models<'a>(
         })
         .map(|(name, tok)| (name.clone(), *tok))
         .collect();
-    rows.sort_by(|a, b| b.1.cmp(&a.1));
+    rows.sort_by_key(|r| std::cmp::Reverse(r.1));
     rows
 }
 
@@ -436,7 +436,7 @@ fn build_overview_json(
     search: Option<&str>,
 ) -> Value {
     let mut tool_rows: Vec<(&String, &ToolTokenSummary)> = tool_tokens.iter().collect();
-    tool_rows.sort_by(|a, b| b.1.total_tokens().cmp(&a.1.total_tokens()));
+    tool_rows.sort_by_key(|r| std::cmp::Reverse(r.1.total_tokens()));
     let by_tool: Vec<Value> = tool_rows
         .into_iter()
         .map(|(name, t)| {

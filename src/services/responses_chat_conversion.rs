@@ -87,10 +87,10 @@ pub(crate) fn sanitize_input_content(body: &mut Value) {
         for part in parts.iter_mut() {
             let part_type = part.get("type").and_then(|t| t.as_str()).unwrap_or("");
             match part_type {
-                "output_text" | "input_text" | "" => {
-                    if !part.get("text").is_some_and(|t| t.is_string()) {
-                        part["text"] = json!("");
-                    }
+                "output_text" | "input_text" | ""
+                    if !part.get("text").is_some_and(|t| t.is_string()) =>
+                {
+                    part["text"] = json!("");
                 }
                 _ => {}
             }
