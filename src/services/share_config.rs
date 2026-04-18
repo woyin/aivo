@@ -55,17 +55,20 @@ impl Drop for ShareCleanup {
         // Call `close()` explicitly so a stuck temp config (permission
         // change, already-unlinked, etc.) is surfaced in debug builds —
         // release builds still stay quiet to avoid noisy user output.
+        // (Sibling helper: `context_ingest::warn_unreadable_session` does
+        // essentially the same debug-only path+error log; consolidate if a
+        // third site appears.)
         if let Some(tempfile) = self.claude_mcp_config.take() {
-            // `close()` consumes `tempfile`, so the path must be captured
-            // beforehand — but only in debug builds where we use it.
-            #[cfg(debug_assertions)]
+            // `close()` consumes `tempfile`, so capture the path up front.
             let path = tempfile.path().to_path_buf();
-            if let Err(_err) = tempfile.close() {
+            if let Err(err) = tempfile.close() {
                 #[cfg(debug_assertions)]
                 eprintln!(
-                    "aivo: failed to remove temp MCP config {}: {_err}",
+                    "aivo: failed to remove temp MCP config {}: {err}",
                     path.display()
                 );
+                #[cfg(not(debug_assertions))]
+                let _ = (path, err);
             }
         }
     }

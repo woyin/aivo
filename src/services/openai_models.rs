@@ -79,7 +79,7 @@ impl OpenAIContentPart {
     fn is_text_only(&self) -> bool {
         match self {
             Self::Text(_) => true,
-            Self::Object(part) => part.image_url.is_none(),
+            Self::Object(part) => part.image_url.is_none() && part.extra.is_empty(),
         }
     }
 }
@@ -95,6 +95,11 @@ pub(crate) struct OpenAIContentPartObject {
     pub text: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub image_url: Option<OpenAIImageUrl>,
+    // Catch-all for content-part kinds we don't have typed fields for
+    // (e.g. `input_audio`, `file`). Without this, the typed round-trip in
+    // `stringify_message_content` would silently drop their payloads.
+    #[serde(default, flatten)]
+    pub extra: Map<String, Value>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -721,6 +726,7 @@ mod tests {
                             kind: Some("text".to_string()),
                             text: Some("Screenshot taken".to_string()),
                             image_url: None,
+                            ..Default::default()
                         }),
                         OpenAIContentPart::Object(OpenAIContentPartObject {
                             kind: Some("image_url".to_string()),
@@ -728,6 +734,7 @@ mod tests {
                             image_url: Some(OpenAIImageUrl {
                                 url: "data:image/png;base64,abc".to_string(),
                             }),
+                            ..Default::default()
                         }),
                     ])),
                     tool_calls: None,
@@ -785,6 +792,64 @@ mod tests {
         // Round-trip back to JSON and confirm fields survive.
         let back = serde_json::to_value(&part).unwrap();
         assert_eq!(back, raw);
+    }
+
+    #[test]
+    fn content_part_object_preserves_unknown_kinds_through_serde_roundtrip() {
+        // Unknown content-part kinds (e.g. `input_audio`, `file`) must survive
+        // the typed round-trip; the `extra` flatten field is what keeps their
+        // payloads from being silently dropped.
+        let raw = json!({
+            "type": "input_audio",
+            "input_audio": {"data": "ZmFrZQ==", "format": "wav"},
+        });
+        let part: OpenAIContentPart = serde_json::from_value(raw.clone()).unwrap();
+        let back = serde_json::to_value(&part).unwrap();
+        assert_eq!(back, raw);
+    }
+
+    #[test]
+    fn stringify_skips_messages_with_unknown_content_kinds() {
+        // A message carrying a non-text, non-image kind (audio, file, etc.)
+        // must not be flattened to a string — that would lose the payload
+        // even though the typed struct no longer does.
+        let mut req = OpenAIChatRequest {
+            model: "gpt-4o".to_string(),
+            messages: vec![OpenAIChatMessage {
+                role: "user".to_string(),
+                content: Some(OpenAIMessageContent::Parts(vec![
+                    OpenAIContentPart::Object(
+                        serde_json::from_value(json!({
+                            "type": "input_audio",
+                            "input_audio": {"data": "ZmFrZQ==", "format": "wav"},
+                        }))
+                        .unwrap(),
+                    ),
+                ])),
+                tool_calls: None,
+                tool_call_id: None,
+                reasoning_content: None,
+            }],
+            stream: false,
+            max_tokens: None,
+            temperature: None,
+            top_p: None,
+            tools: None,
+            tool_choice: None,
+            reasoning_effort: None,
+            extra: Map::new(),
+        };
+
+        stringify_message_content(&mut req);
+
+        match &req.messages[0].content {
+            Some(OpenAIMessageContent::Parts(parts)) => {
+                let serialized = serde_json::to_value(&parts[0]).unwrap();
+                assert_eq!(serialized["type"], "input_audio");
+                assert_eq!(serialized["input_audio"]["format"], "wav");
+            }
+            other => panic!("expected Parts preserved, got {other:?}"),
+        }
     }
 
     #[test]

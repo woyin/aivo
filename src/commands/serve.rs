@@ -73,13 +73,19 @@ impl ServeCommand {
             other => other,
         };
 
-        // CORS + no auth on a non-loopback bind lets any webpage the user
-        // visits burn their provider quota via cross-origin requests.
-        if cors && auth_token.is_none() && host_binds_publicly(&host) {
+        // `--cors` is not required for the risk — it just widens the attacker
+        // pool from network-reachable hosts to any webpage the user visits.
+        if auth_token.is_none() && host_binds_publicly(&host) {
+            let amplifier = if cors {
+                " with --cors, so any webpage the user visits can use it too"
+            } else {
+                ""
+            };
             eprintln!(
-                "{} serve is bound to {} with --cors and no --auth-token; any site could use this key. Add --auth-token or bind to 127.0.0.1.",
+                "{} serve is bound to {} with no --auth-token; anyone who can reach this host could use this key{}. Add --auth-token or bind to 127.0.0.1.",
                 style::yellow("Warning:"),
                 host,
+                amplifier,
             );
         }
         let key = match key_override {

@@ -1650,7 +1650,7 @@ data: [DONE]\n";
                 {"role": "user", "content": [{"type": "text", "text": "hello"}, {"type": "text", "text": "world"}]},
                 {"role": "assistant", "content": "already a string"},
                 {"role": "user", "content": ["plain", "strings"]},
-                {"role": "user", "content": [{"type": "image", "source": {}}]}
+                {"role": "user", "content": [{"type": "image_url", "image_url": {"url": "data:image/png;base64,abc"}}]}
             ]
         });
 
@@ -1660,8 +1660,11 @@ data: [DONE]\n";
         assert_eq!(messages[0]["content"], "hello\nworld");
         assert_eq!(messages[1]["content"], "already a string");
         assert_eq!(messages[2]["content"], "plain\nstrings");
-        // Array with no extractable text → empty string (not null)
-        assert_eq!(messages[3]["content"], "");
+        // Array carrying a non-text kind stays as an array — flattening
+        // would silently erase the payload, and strict providers should
+        // fail loudly rather than receive corrupted data.
+        assert!(messages[3]["content"].is_array());
+        assert_eq!(messages[3]["content"][0]["type"], "image_url");
     }
 
     #[test]

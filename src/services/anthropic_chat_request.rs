@@ -288,10 +288,10 @@ fn convert_tool_result_part(part: &Value) -> Option<Value> {
             let source = part.get("source")?;
             match source.get("type").and_then(|t| t.as_str())? {
                 "base64" => {
-                    let media = source
-                        .get("media_type")
-                        .and_then(|t| t.as_str())
-                        .unwrap_or("image/png");
+                    // `media_type` is required by Anthropic's schema; drop the
+                    // part if it's missing rather than guessing a format and
+                    // mislabeling the payload.
+                    let media = source.get("media_type").and_then(|t| t.as_str())?;
                     let data = source.get("data").and_then(|t| t.as_str())?;
                     Some(json!({
                         "type": "image_url",
