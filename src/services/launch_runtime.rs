@@ -40,6 +40,11 @@ pub(crate) struct LaunchRuntimeState {
     pub(crate) pi_agent_dir: Option<String>,
     pub(crate) codex_oauth_sync: Option<CodexOAuthSync>,
     pub(crate) gemini_oauth_sync: Option<GeminiOAuthSync>,
+    /// Holds the temp dir that backs `GEMINI_CLI_SYSTEM_SETTINGS_PATH`
+    /// for non-OAuth gemini launches. Dropping it deletes the settings
+    /// override file; must outlive the spawned gemini process.
+    #[allow(dead_code)] // kept alive solely for its Drop impl
+    pub(crate) gemini_system_settings: Option<tempfile::TempDir>,
 }
 
 pub(crate) async fn prepare_runtime_env(
@@ -80,11 +85,13 @@ pub(crate) async fn prepare_runtime_env(
         let (port, active) = start_gemini_router(&env).await?;
         router_protocol = Some(active);
         set_local_base_url(&mut env, "GOOGLE_GEMINI_BASE_URL", port);
+        clear_node_proxy_env(&mut env);
     }
 
     if tool == AIToolType::Gemini && env.contains_key("AIVO_USE_GEMINI_COPILOT_ROUTER") {
         let port = start_gemini_copilot_router(&env).await?;
         set_local_base_url(&mut env, "GOOGLE_GEMINI_BASE_URL", port);
+        clear_node_proxy_env(&mut env);
     }
 
     if tool == AIToolType::Opencode && env.contains_key("AIVO_USE_OPENCODE_COPILOT_ROUTER") {
@@ -128,6 +135,13 @@ pub(crate) async fn prepare_runtime_env(
             None
         };
 
+    let gemini_system_settings =
+        if tool == AIToolType::Gemini && env.contains_key("AIVO_GEMINI_FORCE_API_KEY_AUTH") {
+            Some(prepare_gemini_api_key_settings_override(&mut env).await?)
+        } else {
+            None
+        };
+
     Ok(LaunchRuntimeState {
         env,
         router_protocol,
@@ -135,6 +149,7 @@ pub(crate) async fn prepare_runtime_env(
         pi_agent_dir,
         codex_oauth_sync,
         gemini_oauth_sync,
+        gemini_system_settings,
     })
 }
 
@@ -281,6 +296,48 @@ async fn prepare_gemini_oauth_shadow(env: &mut HashMap<String, String>) -> Resul
         shadow,
         original: creds,
     })
+}
+
+/// Writes a gemini-cli *system-scope* settings file containing just
+/// `security.auth.selectedType = "gemini-api-key"` and points
+/// `GEMINI_CLI_SYSTEM_SETTINGS_PATH` at it. The CLI merges system over
+/// user over defaults, so this forces the `USE_GEMINI` auth path (which
+/// honors `GEMINI_API_KEY` + `GOOGLE_GEMINI_BASE_URL`) even when the
+/// user's `~/.gemini/settings.json` has a stale `oauth-personal`
+/// selection from a prior Google login. Without this,
+/// `configuredAuthType || getAuthTypeFromEnv()` in gemini-cli returns
+/// `LOGIN_WITH_GOOGLE` and every request bypasses aivo's router.
+///
+/// The user's real settings file is never read, copied, or written by
+/// aivo; in-session edits (theme, vim mode, MCP server tweaks, model
+/// preferences) persist to `~/.gemini/` as usual. Auto-fallbacks via
+/// `activateFallbackMode` use `isTemporary=true` in gemini-cli and so
+/// skip the user-scope `model.name` write, which is the only automatic
+/// write path that could leak an aivo-injected model back into the
+/// user's defaults.
+async fn prepare_gemini_api_key_settings_override(
+    env: &mut HashMap<String, String>,
+) -> Result<tempfile::TempDir> {
+    use anyhow::Context;
+    env.remove("AIVO_GEMINI_FORCE_API_KEY_AUTH");
+
+    let dir = tempfile::Builder::new()
+        .prefix("aivo-gemini-settings-")
+        .tempdir()
+        .context("create aivo gemini settings override temp dir")?;
+    let path = dir.path().join("settings.json");
+    tokio::fs::write(
+        &path,
+        br#"{"security":{"auth":{"selectedType":"gemini-api-key"}}}"#.as_slice(),
+    )
+    .await
+    .context("write aivo gemini system settings override")?;
+
+    env.insert(
+        "GEMINI_CLI_SYSTEM_SETTINGS_PATH".to_string(),
+        path.to_string_lossy().to_string(),
+    );
+    Ok(dir)
 }
 
 /// Reads the shadow `oauth_creds.json` back after gemini exits and, if any
@@ -585,6 +642,30 @@ fn patch_opencode_config_content(env: &mut HashMap<String, String>, port: u16) {
         let patched = content.replace(PLACEHOLDER_LOOPBACK_URL, &real_url);
         env.insert("OPENCODE_CONFIG_CONTENT".to_string(), patched);
         ensure_loopback_no_proxy(env);
+    }
+}
+
+/// Clears every HTTP proxy env var the spawned gemini might honor, in
+/// both casings. Needed because gemini reads them, installs a global
+/// undici `ProxyAgent`, and from then on every `fetch` — including to
+/// our `http://127.0.0.1:<port>` router — is sent through the proxy
+/// regardless of `NO_PROXY`. Setting the vars to empty strings (rather
+/// than removing them) is enough because the lookups use `||` chains
+/// that treat `""` as falsy.
+///
+/// `ALL_PROXY` isn't on gemini-cli's primary lookup path, but the
+/// bundled `proxy-from-env` library and various sub-deps (gaxios,
+/// googleapis) do consult it, so we clear it too for defense in depth.
+fn clear_node_proxy_env(env: &mut HashMap<String, String>) {
+    for var in [
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "ALL_PROXY",
+        "http_proxy",
+        "https_proxy",
+        "all_proxy",
+    ] {
+        env.insert(var.to_string(), String::new());
     }
 }
 
@@ -901,7 +982,10 @@ async fn start_responses_to_chat_copilot_router(env: &HashMap<String, String>) -
 
 #[cfg(test)]
 mod tests {
-    use super::patch_opencode_config_content;
+    use super::{
+        clear_node_proxy_env, patch_opencode_config_content,
+        prepare_gemini_api_key_settings_override,
+    };
     use std::collections::HashMap;
 
     #[test]
@@ -1081,5 +1165,74 @@ mod tests {
         let no_proxy = env.get("NO_PROXY").expect("NO_PROXY should be set");
         assert!(no_proxy.contains("127.0.0.1"));
         assert!(no_proxy.contains("localhost"));
+    }
+
+    #[test]
+    fn clear_node_proxy_env_empties_known_proxy_vars() {
+        // Needed for gemini-cli: it builds a global undici ProxyAgent from
+        // HTTP(S)_PROXY and then routes every fetch through it, including to
+        // our loopback router. NO_PROXY is ignored by ProxyAgent, so the only
+        // way to prevent this is to hide the proxy vars from the child. We
+        // also clear ALL_PROXY because gemini's bundled `proxy-from-env`
+        // lookup consults it as a fallback.
+        let mut env = HashMap::from([
+            ("HTTP_PROXY".to_string(), "http://proxy:8080".to_string()),
+            ("HTTPS_PROXY".to_string(), "http://proxy:8080".to_string()),
+            ("ALL_PROXY".to_string(), "http://proxy:8080".to_string()),
+            ("http_proxy".to_string(), "http://proxy:8080".to_string()),
+            ("https_proxy".to_string(), "http://proxy:8080".to_string()),
+            ("all_proxy".to_string(), "http://proxy:8080".to_string()),
+            ("PATH".to_string(), "/usr/bin".to_string()),
+        ]);
+        clear_node_proxy_env(&mut env);
+        for var in [
+            "HTTP_PROXY",
+            "HTTPS_PROXY",
+            "ALL_PROXY",
+            "http_proxy",
+            "https_proxy",
+            "all_proxy",
+        ] {
+            assert_eq!(env.get(var), Some(&String::new()), "{var} should be empty");
+        }
+        assert_eq!(
+            env.get("PATH"),
+            Some(&"/usr/bin".to_string()),
+            "unrelated vars untouched"
+        );
+    }
+
+    #[tokio::test]
+    async fn prepare_gemini_api_key_settings_override_pins_selected_type() {
+        let mut env = HashMap::from([(
+            "AIVO_GEMINI_FORCE_API_KEY_AUTH".to_string(),
+            "1".to_string(),
+        )]);
+        let dir = prepare_gemini_api_key_settings_override(&mut env)
+            .await
+            .unwrap();
+
+        // Sentinel consumed — must not leak to the spawned child.
+        assert!(!env.contains_key("AIVO_GEMINI_FORCE_API_KEY_AUTH"));
+
+        // Child sees a system-scope settings override path. Because
+        // system-scope wins over user-scope in gemini-cli's merge, this
+        // pins selectedType regardless of any stale `oauth-personal` in
+        // the user's real ~/.gemini/settings.json.
+        let path = env.get("GEMINI_CLI_SYSTEM_SETTINGS_PATH").unwrap();
+        let parsed: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+        assert_eq!(
+            parsed["security"]["auth"]["selectedType"].as_str(),
+            Some("gemini-api-key")
+        );
+
+        // We deliberately don't redirect GEMINI_CLI_HOME — user's real
+        // ~/.gemini/ stays the gemini-cli user-scope root so in-session
+        // edits (theme, vim mode, MCP tweaks) persist normally.
+        assert!(!env.contains_key("GEMINI_CLI_HOME"));
+
+        drop(dir);
+        assert!(!std::path::Path::new(path).exists());
     }
 }

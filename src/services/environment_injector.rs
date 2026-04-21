@@ -498,6 +498,12 @@ impl EnvironmentInjector {
             env.insert("GEMINI_MODEL".to_string(), gemini_model);
         }
 
+        // Signal to launch_runtime::prepare_gemini_api_key_settings_override.
+        env.insert(
+            "AIVO_GEMINI_FORCE_API_KEY_AUTH".to_string(),
+            "1".to_string(),
+        );
+
         env
     }
 
@@ -1988,6 +1994,57 @@ mod tests {
         // No router-mode indicators — OAuth is always native Google.
         assert!(!env.contains_key("AIVO_USE_GEMINI_ROUTER"));
         assert!(!env.contains_key("AIVO_USE_GEMINI_COPILOT_ROUTER"));
+    }
+
+    #[test]
+    fn for_gemini_non_oauth_sets_force_api_key_auth_sentinel() {
+        // Regression guard: without this sentinel, a user's stale
+        // `oauth-personal` entry in ~/.gemini/settings.json wins over
+        // GEMINI_API_KEY and every request lands at Google.
+        let injector = EnvironmentInjector::new();
+
+        for (label, base_url) in [
+            ("routed non-google", "http://localhost:8080"),
+            ("direct google", "https://generativelanguage.googleapis.com"),
+            ("copilot", "copilot"),
+        ] {
+            let mut key = test_key();
+            key.base_url = base_url.to_string();
+            let env = injector.for_gemini(&key, None);
+            assert_eq!(
+                env.get("AIVO_GEMINI_FORCE_API_KEY_AUTH"),
+                Some(&"1".to_string()),
+                "{label}: sentinel must be set for non-OAuth keys"
+            );
+        }
+    }
+
+    #[test]
+    fn for_gemini_oauth_does_not_set_force_api_key_auth_sentinel() {
+        use crate::services::gemini_oauth::{GEMINI_OAUTH_SENTINEL, GeminiOAuthCredential};
+        let creds = GeminiOAuthCredential {
+            access_token: "at".into(),
+            refresh_token: "rt".into(),
+            id_token: None,
+            scope: "s".into(),
+            token_type: "Bearer".into(),
+            expiry_date: 0,
+            email: None,
+            last_refresh: chrono::Utc::now(),
+        };
+        let key = ApiKey::new_with_protocol(
+            "gid".into(),
+            "alice".into(),
+            GEMINI_OAUTH_SENTINEL.into(),
+            None,
+            creds.to_json().unwrap(),
+        );
+        let injector = EnvironmentInjector::new();
+        let env = injector.for_gemini(&key, None);
+        assert!(
+            !env.contains_key("AIVO_GEMINI_FORCE_API_KEY_AUTH"),
+            "OAuth keys already use Google-OAuth auth; forcing api-key would break them"
+        );
     }
 
     #[test]
