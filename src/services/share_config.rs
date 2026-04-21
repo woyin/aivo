@@ -21,7 +21,6 @@ use tempfile::NamedTempFile;
 
 use crate::services::ai_launcher::AIToolType;
 use crate::services::nickname_registry;
-use crate::style;
 
 /// Codex startup timeout (seconds) we register for the aivo MCP entry.
 /// Read: `mcp-serve` boots in ~100ms on a warm build; 10s leaves headroom
@@ -95,16 +94,9 @@ pub async fn maybe_enable_share(
         // Pi / Gemini / OpenCode can't be MCP clients from aivo (no
         // ephemeral injection path — see `session_transcript` module doc).
         // Their sessions are still *readable* by a peer claude/codex via the
-        // nickname registered in `run.rs`, so we skip wiring but print an
-        // accurate status line.
+        // nickname registered in `run.rs`, so we skip wiring and return args
+        // unchanged.
         AIToolType::Pi | AIToolType::Gemini | AIToolType::Opencode => {
-            eprintln!(
-                "  {} {}: nickname '{}' is registered; peer claude/codex can read this session via MCP. {} cannot call MCP servers from aivo (no ephemeral injection path).",
-                style::arrow_symbol(),
-                tool.as_str(),
-                nickname,
-                tool.as_str()
-            );
             Ok((args, ShareCleanup::empty()))
         }
     }
@@ -162,11 +154,6 @@ fn enable_share_claude(
     new_args.push(temp.path().to_string_lossy().to_string());
     new_args.extend(args);
 
-    eprintln!(
-        "  {} --as: injected ephemeral MCP config for Claude",
-        style::arrow_symbol()
-    );
-
     Ok((
         new_args,
         ShareCleanup {
@@ -219,11 +206,6 @@ fn enable_share_codex(
         new_args.push(value.clone());
     }
     new_args.extend(args);
-
-    eprintln!(
-        "  {} --as: injected MCP server via codex -c overrides (config.toml untouched)",
-        style::arrow_symbol()
-    );
 
     new_args
 }
