@@ -180,6 +180,35 @@ impl ApiKey {
         }
     }
 
+    /// Short "why you can't use this key here" hint for pickers (e.g. ``needs
+    /// `aivo run claude` ``). Returns `None` for non-OAuth keys.
+    pub fn oauth_run_requirement(&self) -> Option<&'static str> {
+        if self.is_claude_oauth() {
+            Some("needs `aivo run claude`")
+        } else if self.is_codex_oauth() {
+            Some("needs `aivo run codex`")
+        } else if self.is_gemini_oauth() {
+            Some("needs `aivo run gemini`")
+        } else {
+            None
+        }
+    }
+
+    /// "Claude Code" / "Codex ChatGPT" / "Gemini", or generic "OAuth" for
+    /// non-OAuth keys so callers can unconditionally use it in messages
+    /// guarded by `is_any_oauth`.
+    pub fn oauth_kind_label(&self) -> &'static str {
+        if self.is_claude_oauth() {
+            "Claude Code"
+        } else if self.is_codex_oauth() {
+            "Codex ChatGPT"
+        } else if self.is_gemini_oauth() {
+            "Gemini"
+        } else {
+            "OAuth"
+        }
+    }
+
     /// True when this entry is a GitHub Copilot device-token login.
     pub fn is_copilot(&self) -> bool {
         crate::services::provider_profile::is_copilot_base(&self.base_url)

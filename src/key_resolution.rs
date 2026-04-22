@@ -3,6 +3,7 @@ use std::process;
 
 use crate::commands;
 use crate::errors::ExitCode;
+use crate::services::key_compat::KeyCompatContext;
 use crate::services::session_store::{ApiKey, SessionStore};
 use crate::style;
 
@@ -34,13 +35,14 @@ pub(crate) async fn resolve_key_override(
     session_store: &SessionStore,
     key_flag: Option<&str>,
     mode: KeyLookupMode,
+    compat: KeyCompatContext,
 ) -> anyhow::Result<KeyResolution> {
     match key_flag {
-        Some("") => prompt_temporary_key_override(session_store).await,
+        Some("") => prompt_temporary_key_override(session_store, compat).await,
         Some(key_id_or_name) => resolve_by_id_or_name_or_pick(session_store, key_id_or_name).await,
         None => match mode {
             KeyLookupMode::RequireActiveOrPrompt => {
-                match resolve_active_key_or_prompt(session_store).await {
+                match resolve_active_key_or_prompt(session_store, compat).await {
                     Some(key) => Ok(KeyResolution::Selected(key)),
                     None => Ok(KeyResolution::MissingAuth),
                 }
@@ -93,7 +95,7 @@ pub(crate) async fn resolve_by_id_or_name_or_pick(
                 style::cyan(key_id_or_name)
             );
             let prompt = format!("Select key '{}'", key_id_or_name);
-            match commands::keys::prompt_pick_key_without_activation(&matches, &prompt, 0)? {
+            match commands::keys::prompt_pick_key_without_activation(&matches, &[], &prompt, 0)? {
                 Some(key) => Ok(KeyResolution::Selected(key)),
                 None => Ok(KeyResolution::Cancelled),
             }
@@ -103,6 +105,7 @@ pub(crate) async fn resolve_by_id_or_name_or_pick(
 
 async fn prompt_temporary_key_override(
     session_store: &SessionStore,
+    compat: KeyCompatContext,
 ) -> anyhow::Result<KeyResolution> {
     let all_keys = session_store.get_keys().await?;
     if all_keys.is_empty() {
@@ -139,8 +142,10 @@ async fn prompt_temporary_key_override(
         })
         .unwrap_or(0);
 
+    let annotations = compat.annotations_for(&all_keys);
     match commands::keys::prompt_pick_key_without_activation(
         &all_keys,
+        &annotations,
         "Select a key",
         default_idx,
     )? {
@@ -149,7 +154,10 @@ async fn prompt_temporary_key_override(
     }
 }
 
-async fn resolve_active_key_or_prompt(session_store: &SessionStore) -> Option<ApiKey> {
+async fn resolve_active_key_or_prompt(
+    session_store: &SessionStore,
+    compat: KeyCompatContext,
+) -> Option<ApiKey> {
     // Try last-used selection first
     if let Ok(Some(last_sel)) = session_store.get_last_selection().await
         && let Ok(Some(key)) = session_store.get_key_by_id(&last_sel.key_id).await
@@ -190,7 +198,16 @@ async fn resolve_active_key_or_prompt(session_store: &SessionStore) -> Option<Ap
         return None;
     }
 
-    match commands::keys::prompt_select_key(session_store, &all_keys, "Select a key", 0).await {
+    let annotations = compat.annotations_for(&all_keys);
+    match commands::keys::prompt_select_key(
+        session_store,
+        &all_keys,
+        &annotations,
+        "Select a key",
+        0,
+    )
+    .await
+    {
         Ok(Some(key)) => {
             eprintln!();
             Some(key)
@@ -208,7 +225,7 @@ async fn resolve_active_key_or_prompt(session_store: &SessionStore) -> Option<Ap
 
 #[cfg(test)]
 mod tests {
-    use super::{KeyLookupMode, KeyResolution, resolve_key_override};
+    use super::{KeyCompatContext, KeyLookupMode, KeyResolution, resolve_key_override};
     use crate::services::session_store::SessionStore;
     use tempfile::TempDir;
 
@@ -232,8 +249,13 @@ mod tests {
             .unwrap();
         store.set_active_key(&id).await.unwrap();
 
-        let resolved =
-            resolve_key_override(&store, None, KeyLookupMode::PreferActiveAllowNone).await;
+        let resolved = resolve_key_override(
+            &store,
+            None,
+            KeyLookupMode::PreferActiveAllowNone,
+            KeyCompatContext::None,
+        )
+        .await;
 
         match resolved.unwrap() {
             KeyResolution::Selected(key) => assert_eq!(key.id, id),
@@ -247,8 +269,13 @@ mod tests {
 
         // resolve_key_override alone doesn't create the starter key;
         // that's handled by main.rs before dispatching commands.
-        let resolved =
-            resolve_key_override(&store, None, KeyLookupMode::PreferActiveAllowNone).await;
+        let resolved = resolve_key_override(
+            &store,
+            None,
+            KeyLookupMode::PreferActiveAllowNone,
+            KeyCompatContext::None,
+        )
+        .await;
 
         assert!(matches!(resolved.unwrap(), KeyResolution::MissingAuth));
     }
@@ -261,8 +288,13 @@ mod tests {
         let (starter, _) = store.ensure_starter_key().await.unwrap();
         store.set_active_key(&starter.id).await.unwrap();
 
-        let resolved =
-            resolve_key_override(&store, None, KeyLookupMode::PreferActiveAllowNone).await;
+        let resolved = resolve_key_override(
+            &store,
+            None,
+            KeyLookupMode::PreferActiveAllowNone,
+            KeyCompatContext::None,
+        )
+        .await;
 
         match resolved.unwrap() {
             KeyResolution::Selected(key) => {

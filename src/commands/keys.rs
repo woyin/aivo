@@ -1999,7 +1999,7 @@ impl KeysCommand {
                             style::yellow("Note:"),
                             key_id_or_name
                         );
-                        prompt_pick_key(&name_matches, prompt, 0)?
+                        prompt_pick_key(&name_matches, &[], prompt, 0)?
                     }
                 }
             }
@@ -2007,7 +2007,7 @@ impl KeysCommand {
             let default_idx = active_key_id
                 .and_then(|id| all_keys.iter().position(|k| k.id == id))
                 .unwrap_or(0);
-            prompt_pick_key(&all_keys, prompt, default_idx)?
+            prompt_pick_key(&all_keys, &[], prompt, default_idx)?
         };
 
         match selected {
@@ -2076,24 +2076,34 @@ pub(crate) fn format_key_choice(key: &ApiKey) -> String {
     )
 }
 
-// Prompts the user to select a key from the given list.
-fn prompt_pick_key(keys: &[ApiKey], prompt: &str, default: usize) -> Result<Option<ApiKey>> {
-    let choices: Vec<String> = keys.iter().map(format_key_choice).collect();
-    let selection = FuzzySelect::new()
-        .with_prompt(prompt)
-        .items(&choices)
-        .default(default)
-        .interact_opt()?;
-    Ok(selection.map(|idx| keys[idx].clone()))
-}
-
-// Prompts the user to select a key from the given list without changing the active key.
-pub(crate) fn prompt_pick_key_without_activation(
+// Prompts the user to select a key from the given list. `annotations`
+// parallels `keys`: `Some(reason)` disables that row and shows the reason
+// as a dim suffix. Pass `&[]` for no annotations.
+fn prompt_pick_key(
     keys: &[ApiKey],
+    annotations: &[Option<String>],
     prompt: &str,
     default: usize,
 ) -> Result<Option<ApiKey>> {
-    match prompt_pick_key(keys, prompt, default)? {
+    let choices: Vec<String> = keys.iter().map(format_key_choice).collect();
+    let mut picker = FuzzySelect::new()
+        .with_prompt(prompt)
+        .items(&choices)
+        .default(default);
+    if !annotations.is_empty() {
+        picker = picker.annotations(annotations.to_vec());
+    }
+    let selection = picker.interact_opt()?;
+    Ok(selection.map(|idx| keys[idx].clone()))
+}
+
+pub(crate) fn prompt_pick_key_without_activation(
+    keys: &[ApiKey],
+    annotations: &[Option<String>],
+    prompt: &str,
+    default: usize,
+) -> Result<Option<ApiKey>> {
+    match prompt_pick_key(keys, annotations, prompt, default)? {
         Some(mut key) => {
             SessionStore::decrypt_key_secret(&mut key)?;
             Ok(Some(key))
@@ -2102,16 +2112,16 @@ pub(crate) fn prompt_pick_key_without_activation(
     }
 }
 
-// Prompts the user to select a key from the given list and activates it.
-// Returns `Ok(Some(key))` if selected, `Ok(None)` if cancelled.
+// Picks a key from `keys` and activates it. Returns `Ok(None)` if cancelled.
 #[allow(dead_code)] // used by binary crate (key_resolution.rs)
 pub(crate) async fn prompt_select_key(
     session_store: &SessionStore,
     keys: &[ApiKey],
+    annotations: &[Option<String>],
     prompt: &str,
     default: usize,
 ) -> Result<Option<ApiKey>> {
-    match prompt_pick_key(keys, prompt, default)? {
+    match prompt_pick_key(keys, annotations, prompt, default)? {
         Some(mut key) => {
             SessionStore::decrypt_key_secret(&mut key)?;
             session_store.set_active_key(&key.id).await?;
@@ -2126,6 +2136,53 @@ pub(crate) async fn prompt_select_key(
         }
         None => Ok(None),
     }
+}
+
+/// Offers a picker of compatible keys when `bad_key` is an OAuth credential
+/// the current command can't use. OAuth keys stay visible but are disabled
+/// with an inline reason. `context_phrase` is the user-visible command name
+/// inserted into messages (e.g. `"aivo chat"` or `"aivo run codex"`).
+///
+/// Returns `Ok(Some(new_key))` when the user picks a replacement; `Ok(None)`
+/// when there's no TTY, no eligible key, or the user cancelled — callers
+/// should exit with `ExitCode::UserError`.
+pub(crate) async fn swap_incompatible_key(
+    session_store: &SessionStore,
+    bad_key: &ApiKey,
+    compat: crate::services::key_compat::KeyCompatContext,
+    context_phrase: &str,
+) -> Result<Option<ApiKey>> {
+    use std::io::IsTerminal;
+
+    let all_keys = session_store.get_keys().await?;
+    let annotations = compat.annotations_for(&all_keys);
+    let has_eligible = annotations.iter().any(Option::is_none);
+
+    if !has_eligible || !std::io::stderr().is_terminal() {
+        eprintln!(
+            "{} Key '{}' is a {} OAuth account — `{}` can't use it.",
+            style::red("Error:"),
+            bad_key.display_name(),
+            bad_key.oauth_kind_label(),
+            context_phrase,
+        );
+        eprintln!(
+            "  {} Use `{}` or select a regular API key.",
+            style::dim("hint:"),
+            bad_key.oauth_tool_hint(),
+        );
+        return Ok(None);
+    }
+
+    eprintln!(
+        "{} Key '{}' is a {} OAuth account — pick a regular API key for `{}`.",
+        style::yellow("Note:"),
+        bad_key.display_name(),
+        bad_key.oauth_kind_label(),
+        context_phrase,
+    );
+
+    prompt_pick_key_without_activation(&all_keys, &annotations, "Select a key", 0)
 }
 
 #[cfg(test)]

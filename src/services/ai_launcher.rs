@@ -75,6 +75,20 @@ impl AIToolType {
         ]
     }
 
+    /// Returns `Some(reason)` when `key` is an OAuth credential that can't be
+    /// used to launch this tool (e.g. a Codex OAuth key for `aivo run claude`),
+    /// or `None` when the key is compatible.
+    pub fn oauth_incompat_reason(&self, key: &ApiKey) -> Option<&'static str> {
+        let matches_tool = (*self == AIToolType::Claude && key.is_claude_oauth())
+            || (*self == AIToolType::Codex && key.is_codex_oauth())
+            || (*self == AIToolType::Gemini && key.is_gemini_oauth());
+        if matches_tool {
+            None
+        } else {
+            key.oauth_run_requirement()
+        }
+    }
+
     /// Returns installation instructions for the tool (platform-appropriate).
     pub fn install_hint(&self) -> &'static str {
         #[cfg(unix)]

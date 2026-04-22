@@ -191,7 +191,7 @@ impl StartCommand {
                             crate::style::cyan(key_id_or_name)
                         );
                         let prompt = format!("Select key '{}'", key_id_or_name);
-                        match prompt_pick_key_without_activation(&matches, &prompt, 0)? {
+                        match prompt_pick_key_without_activation(&matches, &[], &prompt, 0)? {
                             Some(key) => key,
                             None => anyhow::bail!("Cancelled."),
                         }
@@ -233,7 +233,7 @@ impl StartCommand {
                     interactive: false,
                 })
             }
-            _ => match prompt_pick_key_without_activation(&keys, "Select key", 0)? {
+            _ => match prompt_pick_key_without_activation(&keys, &[], "Select key", 0)? {
                 Some(key) => Ok(Resolved {
                     value: key,
                     interactive: true,
@@ -272,7 +272,7 @@ impl StartCommand {
                             .and_then(|active_id| keys.iter().position(|key| &key.id == active_id))
                     })
                     .unwrap_or(0);
-                match prompt_pick_key_without_activation(&keys, "Select key", default_idx)? {
+                match prompt_pick_key_without_activation(&keys, &[], "Select key", default_idx)? {
                     Some(key) => Ok(Resolved {
                         value: key,
                         interactive: true,

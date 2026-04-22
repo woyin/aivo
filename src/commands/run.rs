@@ -201,50 +201,24 @@ impl RunCommand {
             }
         };
 
-        // Codex ChatGPT OAuth keys carry serialized tokens — only `aivo run
-        // codex` knows how to project them into a shadow CODEX_HOME. Claude
-        // Code OAuth keys carry a serialized token — only `aivo run claude`
-        // sets CLAUDE_CODE_OAUTH_TOKEN. For every other tool, refuse early
-        // with a clear message instead of sending a JSON blob as an API key.
-        if let Some(ref key) = key_override {
-            if key.is_codex_oauth() && ai_tool != AIToolType::Codex {
-                eprintln!(
-                    "{} Key '{}' is a Codex ChatGPT OAuth account and can only be used with 'aivo run codex'.",
-                    style::red("Error:"),
-                    key.display_name()
-                );
-                eprintln!(
-                    "  {} Add or select a regular API key for {}.",
-                    style::dim("hint:"),
-                    tool
-                );
-                return Ok(ExitCode::UserError);
-            }
-            if key.is_claude_oauth() && ai_tool != AIToolType::Claude {
-                eprintln!(
-                    "{} Key '{}' is a Claude Code OAuth account and can only be used with 'aivo run claude'.",
-                    style::red("Error:"),
-                    key.display_name()
-                );
-                eprintln!(
-                    "  {} Add or select a regular API key for {}.",
-                    style::dim("hint:"),
-                    tool
-                );
-                return Ok(ExitCode::UserError);
-            }
-            if key.is_gemini_oauth() && ai_tool != AIToolType::Gemini {
-                eprintln!(
-                    "{} Key '{}' is a Gemini OAuth account and can only be used with 'aivo run gemini'.",
-                    style::red("Error:"),
-                    key.display_name()
-                );
-                eprintln!(
-                    "  {} Add or select a regular API key for {}.",
-                    style::dim("hint:"),
-                    tool
-                );
-                return Ok(ExitCode::UserError);
+        // OAuth keys carry serialized tokens only the matching native CLI can
+        // consume (shadow CODEX_HOME, CLAUDE_CODE_OAUTH_TOKEN, shadow
+        // GEMINI_CLI_HOME); every other tool would see an unusable JSON blob.
+        let mut key_override = key_override;
+        if let Some(ref key) = key_override
+            && ai_tool.oauth_incompat_reason(key).is_some()
+        {
+            let context_phrase = format!("aivo run {}", ai_tool.as_str());
+            match crate::commands::keys::swap_incompatible_key(
+                &self.session_store,
+                key,
+                crate::services::key_compat::KeyCompatContext::Tool(ai_tool),
+                &context_phrase,
+            )
+            .await?
+            {
+                Some(new_key) => key_override = Some(new_key),
+                None => return Ok(ExitCode::UserError),
             }
         }
 

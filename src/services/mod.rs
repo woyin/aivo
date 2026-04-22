@@ -28,6 +28,7 @@ pub mod gemini_oauth_callback;
 pub mod gemini_router;
 pub mod global_stats;
 pub mod http_utils;
+pub mod key_compat;
 pub mod known_providers;
 pub mod last_selection;
 pub mod launch_args;

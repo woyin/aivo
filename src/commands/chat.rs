@@ -208,55 +208,21 @@ impl ChatCommand {
             },
         };
 
-        // Chat needs a direct chat-completions endpoint; Codex ChatGPT OAuth
-        // keys talk to a private ChatGPT backend only the native codex CLI
-        // knows how to address. Refuse early with a pointer to `aivo run
-        // codex`.
-        if key.is_codex_oauth() {
-            eprintln!(
-                "{} Key '{}' is a Codex ChatGPT OAuth account — `aivo chat` can't use it.",
-                style::red("Error:"),
-                key.display_name()
-            );
-            eprintln!(
-                "  {} Use `aivo run codex` to start an interactive Codex session, or select a regular API key first.",
-                style::dim("hint:")
-            );
-            return Ok(ExitCode::UserError);
-        }
-
-        // Claude Code OAuth tokens target Anthropic's subscription backend
-        // via `CLAUDE_CODE_OAUTH_TOKEN` (injected by the native `claude`
-        // CLI), not the `/v1/messages` or chat-completions endpoints that
-        // `aivo chat` speaks. Refuse early with a pointer to
-        // `aivo run claude`.
-        if key.is_claude_oauth() {
-            eprintln!(
-                "{} Key '{}' is a Claude Code OAuth account — `aivo chat` can't use it.",
-                style::red("Error:"),
-                key.display_name()
-            );
-            eprintln!(
-                "  {} Use `aivo run claude` to start an interactive Claude Code session, or select a regular API key first.",
-                style::dim("hint:")
-            );
-            return Ok(ExitCode::UserError);
-        }
-
-        // Gemini OAuth credentials target Google's code-assist backend via a
-        // shadow GEMINI_CLI_HOME the native `gemini` CLI reads — not the
-        // generateContent endpoints aivo chat speaks.
-        if key.is_gemini_oauth() {
-            eprintln!(
-                "{} Key '{}' is a Gemini OAuth account — `aivo chat` can't use it.",
-                style::red("Error:"),
-                key.display_name()
-            );
-            eprintln!(
-                "  {} Use `aivo run gemini` to start an interactive Gemini session, or select a regular API key first.",
-                style::dim("hint:")
-            );
-            return Ok(ExitCode::UserError);
+        // OAuth entries target subscription backends only the native CLIs can
+        // speak — plain /v1/chat/completions, /v1/messages, and
+        // generateContent endpoints reject them.
+        if key.is_any_oauth() {
+            key = match crate::commands::keys::swap_incompatible_key(
+                &self.session_store,
+                &key,
+                crate::services::key_compat::KeyCompatContext::Chat,
+                "aivo chat",
+            )
+            .await?
+            {
+                Some(k) => k,
+                None => return Ok(ExitCode::UserError),
+            };
         }
 
         let client = crate::services::http_utils::router_http_client();

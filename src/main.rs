@@ -24,6 +24,8 @@ use commands::{
 };
 use errors::ExitCode;
 use key_resolution::{KeyLookupMode, KeyResolution, key_or_exit, resolve_key_override};
+use services::ai_launcher::AIToolType;
+use services::key_compat::KeyCompatContext;
 use services::{AILauncher, EnvironmentInjector, SessionStore};
 
 /// Known AI tool names that can be used as shortcut aliases for `run`.
@@ -161,6 +163,7 @@ async fn main() {
                     &session_store,
                     chat_args.key.as_deref(),
                     KeyLookupMode::RequireActiveOrPrompt,
+                    KeyCompatContext::Chat,
                 )
                 .await,
             );
@@ -244,11 +247,18 @@ async fn main() {
                 let command = RunCommand::new(session_store.clone(), ai_launcher, models_cache);
 
                 let key_explicit = key_flag.is_some();
+                let compat = run_args
+                    .tool
+                    .as_deref()
+                    .and_then(AIToolType::parse)
+                    .map(KeyCompatContext::Tool)
+                    .unwrap_or(KeyCompatContext::None);
                 let key_override = key_or_exit(
                     resolve_key_override(
                         &session_store,
                         key_flag.as_deref(),
                         KeyLookupMode::RequireActiveOrPrompt,
+                        compat,
                     )
                     .await,
                 );
@@ -318,6 +328,7 @@ async fn main() {
                     &session_store,
                     models_args.key.as_deref(),
                     KeyLookupMode::RequireActiveOrPrompt,
+                    KeyCompatContext::None,
                 )
                 .await,
             );
@@ -337,6 +348,7 @@ async fn main() {
                 &session_store,
                 serve_args.key.as_deref(),
                 KeyLookupMode::PreferActiveAllowNone,
+                KeyCompatContext::None,
             )
             .await
             {

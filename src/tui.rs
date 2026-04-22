@@ -9,6 +9,11 @@ impl Default for FuzzySelect {
 pub struct FuzzySelect {
     prompt: String,
     items: Vec<String>,
+    /// Optional per-item annotation. `Some(s)` marks the item as disabled and
+    /// renders `s` as a dim suffix; `None` leaves it selectable. When this vec
+    /// is empty or shorter than `items`, missing entries are treated as
+    /// enabled.
+    annotations: Vec<Option<String>>,
     default: usize,
 }
 
@@ -17,6 +22,7 @@ impl FuzzySelect {
         Self {
             prompt: "Select".to_string(),
             items: Vec::new(),
+            annotations: Vec::new(),
             default: 0,
         }
     }
@@ -31,9 +37,28 @@ impl FuzzySelect {
         self
     }
 
+    /// Per-item annotations. `annotations[i] = Some(reason)` disables the item
+    /// and renders `reason` as a dim suffix; `None` (or a shorter vec) leaves
+    /// the item selectable.
+    pub fn annotations(mut self, annotations: Vec<Option<String>>) -> Self {
+        self.annotations = annotations;
+        self
+    }
+
     pub fn default(mut self, default: usize) -> Self {
         self.default = default;
         self
+    }
+
+    fn is_disabled(&self, idx: usize) -> bool {
+        self.annotations
+            .get(idx)
+            .map(Option::is_some)
+            .unwrap_or(false)
+    }
+
+    fn annotation(&self, idx: usize) -> Option<&str> {
+        self.annotations.get(idx).and_then(Option::as_deref)
     }
 
     pub fn interact_opt(self) -> std::io::Result<Option<usize>> {
@@ -42,6 +67,14 @@ impl FuzzySelect {
 
         let mut query = String::new();
         let mut selection = self.default.min(self.items.len().saturating_sub(1));
+        // If the default index lands on a disabled item, nudge forward to the
+        // first enabled one so the picker opens on a usable row. Falls back to
+        // the original default if every item is disabled.
+        if self.is_disabled(selection)
+            && let Some(first_enabled) = (0..self.items.len()).find(|&i| !self.is_disabled(i))
+        {
+            selection = first_enabled;
+        }
         let mut page_start = 0;
         let page_size = 10;
 
@@ -65,10 +98,23 @@ impl FuzzySelect {
                 selection = count.saturating_sub(1);
             }
 
+            if count > 0 && self.is_disabled(filtered[selection].0) {
+                selection =
+                    next_enabled_filtered(&filtered, selection, true, |i| self.is_disabled(i));
+            }
+
             if selection < page_start {
                 page_start = selection;
             } else if selection >= page_start + page_size {
                 page_start = selection.saturating_sub(page_size).saturating_add(1);
+            }
+
+            // Pin the window to the bottom when selection is near the end so
+            // trailing disabled rows stay visible — navigation skips them, so
+            // `selection` alone can't pull `page_start` far enough to show
+            // them (the user would otherwise see "↓ N more below" forever).
+            if count > page_size && count.saturating_sub(selection) < page_size {
+                page_start = count.saturating_sub(page_size);
             }
 
             if page_start > count.saturating_sub(1) {
@@ -100,19 +146,32 @@ impl FuzzySelect {
                     ))?;
                     lines += 1;
                 }
-                for (i, (_, item)) in filtered.iter().enumerate().take(end_idx).skip(page_start) {
+                for (i, (orig_idx, item)) in
+                    filtered.iter().enumerate().take(end_idx).skip(page_start)
+                {
                     let is_selected = i == selection;
+                    let disabled = self.is_disabled(*orig_idx);
                     let symbol = if is_selected {
                         crate::style::cyan(">")
                     } else {
                         " ".to_string()
                     };
-                    let styled_item = if is_selected {
+                    let styled_item = if disabled {
+                        // Strip ANSI baked into `item` by callers (e.g.
+                        // `format_key_choice` paints the short-id cyan and the
+                        // base-url dim) so the outer yellow applies
+                        // uniformly instead of getting overridden mid-string.
+                        crate::style::yellow(console::strip_ansi_codes(item))
+                    } else if is_selected {
                         crate::style::cyan(item)
                     } else {
                         crate::style::dim(item)
                     };
-                    let line = format!("{} {}", symbol, styled_item);
+                    let suffix = self
+                        .annotation(*orig_idx)
+                        .map(|reason| format!("  {}", crate::style::dim(format!("({reason})"))))
+                        .unwrap_or_default();
+                    let line = format!("{} {}{}", symbol, styled_item, suffix);
                     term.write_line(&truncate_to_width(&line, term_width))?;
                     lines += 1;
                 }
@@ -140,25 +199,27 @@ impl FuzzySelect {
             term.clear_last_lines(1 + items_drawn)?;
 
             match key {
-                key if is_previous_key(&key) => {
-                    if selection > 0 {
-                        selection -= 1;
-                    } else if count > 0 {
-                        selection = count - 1;
-                    }
+                key if is_previous_key(&key) && count > 0 => {
+                    selection =
+                        next_enabled_filtered(&filtered, selection, false, |i| self.is_disabled(i));
                 }
                 key if is_next_key(&key) && count > 0 => {
-                    if selection < count - 1 {
-                        selection += 1;
-                    } else {
-                        selection = 0;
-                    }
+                    selection =
+                        next_enabled_filtered(&filtered, selection, true, |i| self.is_disabled(i));
                 }
                 Key::Enter => {
-                    term.show_cursor()?;
                     if count > 0 {
-                        return Ok(Some(filtered[selection].0));
+                        let orig_idx = filtered[selection].0;
+                        if self.is_disabled(orig_idx) {
+                            // Safety net — only reachable if every filtered
+                            // row is disabled, in which case there's nothing
+                            // to select. Ignore the keypress.
+                            continue;
+                        }
+                        term.show_cursor()?;
+                        return Ok(Some(orig_idx));
                     }
+                    term.show_cursor()?;
                     return Ok(None);
                 }
                 Key::Escape | Key::CtrlC => {
@@ -179,6 +240,37 @@ impl FuzzySelect {
             }
         }
     }
+}
+
+/// Advances `selection` within `filtered` until it lands on an enabled row,
+/// skipping any disabled rows. The search wraps; if every row in `filtered`
+/// is disabled, `selection` is returned unchanged. `forward` controls whether
+/// the scan moves Down (`true`) or Up (`false`).
+///
+/// `selection` and the return value are both indices into `filtered`;
+/// `is_disabled` receives the original item index (`filtered[i].0`).
+fn next_enabled_filtered(
+    filtered: &[(usize, &String)],
+    selection: usize,
+    forward: bool,
+    is_disabled: impl Fn(usize) -> bool,
+) -> usize {
+    let count = filtered.len();
+    if count == 0 {
+        return 0;
+    }
+    let start = selection.min(count - 1);
+    for step in 1..=count {
+        let idx = if forward {
+            (start + step) % count
+        } else {
+            (start + count - (step % count)) % count
+        };
+        if !is_disabled(filtered[idx].0) {
+            return idx;
+        }
+    }
+    start
 }
 
 fn is_previous_key(key: &Key) -> bool {
@@ -280,8 +372,68 @@ pub(crate) fn matches_fuzzy(query: &str, target: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_next_key, is_previous_key, score_match};
+    use super::{is_next_key, is_previous_key, next_enabled_filtered, score_match};
     use console::Key;
+
+    fn filtered_fixture(items: &[&'static str]) -> Vec<(usize, &'static String)> {
+        // `next_enabled_filtered` only reads the original index, but the
+        // signature expects `&String` — leak short static strings to get
+        // stable references for the test harness.
+        items
+            .iter()
+            .enumerate()
+            .map(|(i, s)| {
+                let owned: &'static String = Box::leak(Box::new((*s).to_string()));
+                (i, owned)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn next_enabled_skips_disabled_going_forward() {
+        let filtered = filtered_fixture(&["a", "b", "c", "d"]);
+        // Items 1 and 2 disabled — Down from 0 should land on 3.
+        let disabled = |i: usize| i == 1 || i == 2;
+        assert_eq!(next_enabled_filtered(&filtered, 0, true, disabled), 3);
+    }
+
+    #[test]
+    fn next_enabled_skips_disabled_going_backward() {
+        let filtered = filtered_fixture(&["a", "b", "c", "d"]);
+        // Items 1 and 2 disabled — Up from 3 should land on 0.
+        let disabled = |i: usize| i == 1 || i == 2;
+        assert_eq!(next_enabled_filtered(&filtered, 3, false, disabled), 0);
+    }
+
+    #[test]
+    fn next_enabled_wraps_around() {
+        let filtered = filtered_fixture(&["a", "b", "c"]);
+        // Only item 0 enabled — Down from 0 should wrap back to 0.
+        let only_first_enabled = |i: usize| i != 0;
+        assert_eq!(
+            next_enabled_filtered(&filtered, 0, true, only_first_enabled),
+            0
+        );
+        // Up from 0 should also return 0.
+        assert_eq!(
+            next_enabled_filtered(&filtered, 0, false, only_first_enabled),
+            0
+        );
+    }
+
+    #[test]
+    fn next_enabled_keeps_selection_when_all_disabled() {
+        let filtered = filtered_fixture(&["a", "b", "c"]);
+        let all_disabled = |_: usize| true;
+        assert_eq!(next_enabled_filtered(&filtered, 1, true, all_disabled), 1);
+        assert_eq!(next_enabled_filtered(&filtered, 1, false, all_disabled), 1);
+    }
+
+    #[test]
+    fn next_enabled_handles_empty_slice() {
+        let filtered: Vec<(usize, &String)> = Vec::new();
+        assert_eq!(next_enabled_filtered(&filtered, 0, true, |_| false), 0);
+    }
 
     #[test]
     fn recognizes_application_cursor_mode_arrows() {
