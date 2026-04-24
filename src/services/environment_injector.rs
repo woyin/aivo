@@ -113,7 +113,9 @@ impl EnvironmentInjector {
             Some(ClaudeProviderProtocol::Anthropic) => ProviderProtocol::Anthropic,
             Some(ClaudeProviderProtocol::Openai) => ProviderProtocol::Openai,
             Some(ClaudeProviderProtocol::Google) => ProviderProtocol::Google,
-            None => provider_profile_for_key(key).default_protocol,
+            None => {
+                provider_profile_for_key(key).upstream_protocol_for_cli(ProviderProtocol::Anthropic)
+            }
         }
     }
 
@@ -122,7 +124,9 @@ impl EnvironmentInjector {
             Some(GeminiProviderProtocol::Google) => ProviderProtocol::Google,
             Some(GeminiProviderProtocol::Openai) => ProviderProtocol::Openai,
             Some(GeminiProviderProtocol::Anthropic) => ProviderProtocol::Anthropic,
-            None => provider_profile_for_key(key).default_protocol,
+            None => {
+                provider_profile_for_key(key).upstream_protocol_for_cli(ProviderProtocol::Google)
+            }
         }
     }
 
@@ -262,7 +266,10 @@ impl EnvironmentInjector {
             ConnectionMode::Copilot
         } else if profile.serve_flags.is_openrouter {
             ConnectionMode::OpenRouter
-        } else if Self::use_direct_anthropic_for_claude(key) {
+        } else if Self::use_direct_anthropic_for_claude(key) && !profile.serve_flags.is_starter {
+            // Starter must route through the local router — it's the only
+            // place device_fingerprint::maybe_with_starter_headers runs.
+            // Direct mode would skip the X-Aivo-* headers and 403 at the gateway.
             let base_url = key.base_url.trim_end_matches('/');
             let base_url = base_url.strip_suffix("/v1").unwrap_or(base_url);
             ConnectionMode::Direct {
@@ -360,9 +367,11 @@ impl EnvironmentInjector {
             ConnectionMode::Ollama
         } else if profile.serve_flags.is_copilot {
             ConnectionMode::Copilot
-        } else if !Self::use_direct_openai_for_codex(key) {
+        } else if !Self::use_direct_openai_for_codex(key) || profile.serve_flags.is_starter {
+            // See for_claude: starter must route through the local router so
+            // device_fingerprint headers attach.
             ConnectionMode::Routed {
-                protocol: profile.default_protocol,
+                protocol: profile.upstream_protocol_for_cli(ProviderProtocol::ResponsesApi),
             }
         } else {
             ConnectionMode::Direct {
@@ -459,7 +468,9 @@ impl EnvironmentInjector {
             ConnectionMode::Ollama
         } else if profile.serve_flags.is_copilot {
             ConnectionMode::Copilot
-        } else if Self::use_google_native_for_gemini(key) {
+        } else if Self::use_google_native_for_gemini(key) && !profile.serve_flags.is_starter {
+            // See for_claude: starter must route through the local router so
+            // device_fingerprint headers attach.
             ConnectionMode::Direct {
                 base_url: strip_google_version_suffix(&key.base_url).to_string(),
             }
@@ -843,6 +854,30 @@ mod tests {
     }
 
     #[test]
+    fn test_for_claude_starter_with_anthropic_pin_uses_router_not_direct() {
+        // Regression: if the starter key's claude_protocol pin is Anthropic
+        // (because upstream_protocol_for_cli prefers client-native for
+        // Openai-default hosts), use_direct_anthropic_for_claude returns true
+        // — but Direct mode bypasses device_fingerprint injection, so the
+        // gateway 403s. Force Routed mode for starter regardless.
+        let injector = EnvironmentInjector::new();
+        let mut key = test_key();
+        key.base_url = AIVO_STARTER_SENTINEL.to_string();
+        key.claude_protocol = Some(ClaudeProviderProtocol::Anthropic);
+        let env = injector.for_claude(&key, None);
+
+        assert_eq!(
+            env.get("AIVO_USE_ANTHROPIC_TO_OPENAI_ROUTER"),
+            Some(&"1".to_string()),
+            "starter must always route through the local router"
+        );
+        assert_eq!(
+            env.get("ANTHROPIC_BASE_URL"),
+            Some(&PLACEHOLDER_LOOPBACK_URL.to_string()),
+        );
+    }
+
+    #[test]
     fn test_for_claude_anthropic_native_direct() {
         // Official Anthropic endpoints bypass all routers.
         let injector = EnvironmentInjector::new();
@@ -1062,6 +1097,41 @@ mod tests {
         assert_eq!(
             env.get("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"),
             Some(&"1".to_string())
+        );
+    }
+
+    #[test]
+    fn test_for_claude_unknown_endpoint_targets_anthropic_upstream() {
+        // Regression for the protocol-native default: an unknown host should
+        // forward Anthropic upstream so a multi-protocol gateway sees the
+        // client's native protocol. Protocol fallback handles OpenAI-only
+        // hosts via 404 downgrade.
+        let injector = EnvironmentInjector::new();
+        let mut key = test_key();
+        key.base_url = "https://api.example-gateway.dev".to_string();
+        // No claude_protocol pinned.
+        let env = injector.for_claude(&key, None);
+
+        assert_eq!(
+            env.get("AIVO_ANTHROPIC_TO_OPENAI_ROUTER_UPSTREAM_PROTOCOL"),
+            Some(&"anthropic".to_string()),
+            "unknown host + Claude should target Anthropic upstream",
+        );
+    }
+
+    #[test]
+    fn test_for_claude_openai_endpoint_targets_anthropic_upstream() {
+        // Even for api.openai.com: Claude Code is already emitting /v1/messages,
+        // so we forward that as-is. Protocol fallback handles the one-shot 404
+        // and the key pin sticks for subsequent launches.
+        let injector = EnvironmentInjector::new();
+        let mut key = test_key();
+        key.base_url = "https://api.openai.com/v1".to_string();
+        let env = injector.for_claude(&key, None);
+
+        assert_eq!(
+            env.get("AIVO_ANTHROPIC_TO_OPENAI_ROUTER_UPSTREAM_PROTOCOL"),
+            Some(&"anthropic".to_string()),
         );
     }
 
@@ -1292,6 +1362,44 @@ mod tests {
     }
 
     #[test]
+    fn test_for_codex_unknown_endpoint_targets_responses_upstream() {
+        // Unknown host + Codex should target the Responses API upstream so a
+        // multi-protocol gateway sees Codex's native protocol. Protocol
+        // fallback downgrades on 404 for plain Chat-Completions-only hosts.
+        let injector = EnvironmentInjector::new();
+        let mut key = test_key();
+        key.base_url = "https://api.example-gateway.dev".to_string();
+        let env = injector.for_codex(&key, None);
+
+        assert_eq!(
+            env.get("AIVO_RESPONSES_TO_CHAT_ROUTER_UPSTREAM_PROTOCOL"),
+            Some(&"responses".to_string()),
+        );
+    }
+
+    #[test]
+    fn test_for_codex_starter_with_direct_mode_uses_router_not_direct() {
+        // Defense-in-depth: mirrors the Claude/Gemini starter guard. Even if
+        // codex_mode is pinned to Direct, a starter key must route through
+        // the local router so device fingerprint headers attach.
+        let injector = EnvironmentInjector::new();
+        let mut key = test_key();
+        key.base_url = AIVO_STARTER_SENTINEL.to_string();
+        key.codex_mode = Some(OpenAICompatibilityMode::Direct);
+        let env = injector.for_codex(&key, None);
+
+        assert_eq!(
+            env.get("AIVO_USE_RESPONSES_TO_CHAT_ROUTER"),
+            Some(&"1".to_string()),
+            "starter must always route through the local router"
+        );
+        assert_eq!(
+            env.get("OPENAI_BASE_URL"),
+            Some(&PLACEHOLDER_LOOPBACK_URL.to_string()),
+        );
+    }
+
+    #[test]
     fn test_for_codex_official_openai_direct() {
         let injector = EnvironmentInjector::new();
         let mut key = test_key();
@@ -1408,6 +1516,27 @@ mod tests {
     }
 
     #[test]
+    fn test_for_gemini_starter_with_google_pin_uses_router_not_direct() {
+        // Same regression as Claude: starter must always route through the
+        // Gemini router so device fingerprint headers attach.
+        let injector = EnvironmentInjector::new();
+        let mut key = test_key();
+        key.base_url = AIVO_STARTER_SENTINEL.to_string();
+        key.gemini_protocol = Some(GeminiProviderProtocol::Google);
+        let env = injector.for_gemini(&key, None);
+
+        assert_eq!(
+            env.get("AIVO_USE_GEMINI_ROUTER"),
+            Some(&"1".to_string()),
+            "starter must always route through the local Gemini router"
+        );
+        assert_eq!(
+            env.get("GOOGLE_GEMINI_BASE_URL"),
+            Some(&PLACEHOLDER_LOOPBACK_URL.to_string()),
+        );
+    }
+
+    #[test]
     fn test_for_gemini_native_google_no_router() {
         let injector = EnvironmentInjector::new();
         let mut key = test_key();
@@ -1496,6 +1625,20 @@ mod tests {
         assert_eq!(
             env.get("GOOGLE_GEMINI_BASE_URL"),
             Some(&PLACEHOLDER_LOOPBACK_URL.to_string())
+        );
+    }
+
+    #[test]
+    fn test_for_gemini_unknown_endpoint_targets_google_upstream() {
+        let injector = EnvironmentInjector::new();
+        let mut key = test_key();
+        key.base_url = "https://api.example-gateway.dev".to_string();
+        let env = injector.for_gemini(&key, None);
+
+        assert_eq!(
+            env.get("AIVO_GEMINI_ROUTER_UPSTREAM_PROTOCOL"),
+            Some(&"google".to_string()),
+            "unknown host + Gemini should target Google upstream",
         );
     }
 

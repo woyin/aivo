@@ -93,6 +93,25 @@ pub struct ProviderProfile {
     pub serve_flags: ServeFlags,
 }
 
+impl ProviderProfile {
+    /// Upstream protocol to use when no per-key user override is set.
+    ///
+    /// Returns `cli_native` when we'd otherwise blindly pick an OpenAI
+    /// variant — most hosts are OpenAI-compatible or could be multi-protocol
+    /// gateways, and forwarding the CLI's native protocol lets a smart
+    /// gateway route natively while plain OpenAI-only hosts self-correct via
+    /// protocol fallback (one 4xx, learned and persisted to the key pin).
+    /// Known non-OpenAI hosts (Anthropic/Google) keep their exact protocol
+    /// so cross-CLI use (e.g. Claude → Google host) avoids a multi-hop
+    /// fallback chain.
+    pub fn upstream_protocol_for_cli(&self, cli_native: ProviderProtocol) -> ProviderProtocol {
+        match self.default_protocol {
+            ProviderProtocol::Anthropic | ProviderProtocol::Google => self.default_protocol,
+            ProviderProtocol::Openai | ProviderProtocol::ResponsesApi => cli_native,
+        }
+    }
+}
+
 pub static MINIMAX_MODELS: &[&str] = &[
     "minimax-m2.7",
     "minimax-m2.7-highspeed",
@@ -331,6 +350,45 @@ mod tests {
         assert_eq!(
             profile.model_listing_strategy,
             ModelListingStrategy::AivoStarter
+        );
+    }
+
+    #[test]
+    fn upstream_protocol_prefers_cli_native_for_starter() {
+        // Starter has default_protocol=Openai — same treatment as any other
+        // Openai-flavored host. Anthropic/Responses/Google get tried first;
+        // protocol fallback handles the 403 on paths whose auth isn't wired.
+        let profile = provider_profile_for_base_url("aivo-starter");
+        assert!(profile.serve_flags.is_starter);
+        assert_eq!(
+            profile.upstream_protocol_for_cli(ProviderProtocol::Anthropic),
+            ProviderProtocol::Anthropic,
+        );
+        assert_eq!(
+            profile.upstream_protocol_for_cli(ProviderProtocol::Google),
+            ProviderProtocol::Google,
+        );
+    }
+
+    #[test]
+    fn upstream_protocol_prefers_cli_native_for_generic_openai_host() {
+        let profile = provider_profile_for_base_url("https://api.example.com/v1");
+        assert_eq!(
+            profile.upstream_protocol_for_cli(ProviderProtocol::Anthropic),
+            ProviderProtocol::Anthropic,
+        );
+        assert_eq!(
+            profile.upstream_protocol_for_cli(ProviderProtocol::Google),
+            ProviderProtocol::Google,
+        );
+    }
+
+    #[test]
+    fn upstream_protocol_keeps_known_anthropic_host() {
+        let profile = provider_profile_for_base_url("https://api.anthropic.com");
+        assert_eq!(
+            profile.upstream_protocol_for_cli(ProviderProtocol::Google),
+            ProviderProtocol::Anthropic,
         );
     }
 

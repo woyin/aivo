@@ -785,7 +785,8 @@ async fn refresh_path_from_shell() {
 }
 
 fn preferred_claude_protocol(base_url: &str) -> ClaudeProviderProtocol {
-    match provider_profile_for_base_url(base_url).default_protocol {
+    let profile = provider_profile_for_base_url(base_url);
+    match profile.upstream_protocol_for_cli(ProviderProtocol::Anthropic) {
         ProviderProtocol::Anthropic => ClaudeProviderProtocol::Anthropic,
         ProviderProtocol::Google => ClaudeProviderProtocol::Google,
         ProviderProtocol::Openai | ProviderProtocol::ResponsesApi => ClaudeProviderProtocol::Openai,
@@ -801,7 +802,8 @@ fn preferred_codex_mode(base_url: &str) -> OpenAICompatibilityMode {
 }
 
 fn preferred_gemini_protocol(base_url: &str) -> GeminiProviderProtocol {
-    match provider_profile_for_base_url(base_url).default_protocol {
+    let profile = provider_profile_for_base_url(base_url);
+    match profile.upstream_protocol_for_cli(ProviderProtocol::Google) {
         ProviderProtocol::Google => GeminiProviderProtocol::Google,
         ProviderProtocol::Anthropic => GeminiProviderProtocol::Anthropic,
         ProviderProtocol::Openai | ProviderProtocol::ResponsesApi => GeminiProviderProtocol::Openai,
@@ -855,19 +857,22 @@ mod tests {
     }
 
     #[test]
-    fn test_preferred_claude_protocol_for_openai_compatible_urls() {
-        assert_eq!(
-            preferred_claude_protocol("https://api.openai.com/v1"),
-            ClaudeProviderProtocol::Openai
-        );
-        assert_eq!(
-            preferred_claude_protocol("https://ai-gateway.vercel.sh/v1"),
-            ClaudeProviderProtocol::Openai
-        );
-        assert_eq!(
-            preferred_claude_protocol("https://example.com/openai"),
-            ClaudeProviderProtocol::Openai
-        );
+    fn test_preferred_claude_protocol_for_openai_compatible_hosts_picks_anthropic() {
+        // Claude Code emits /v1/messages; forward that as-is to any host whose
+        // default protocol is OpenAI (known or inferred). Protocol fallback
+        // downgrades on 404 and learns the pin for next launch. Saves the
+        // multi-hop chain vs. a cold-start against gateway-like hosts.
+        for url in [
+            "https://api.openai.com/v1",
+            "https://ai-gateway.vercel.sh/v1",
+            "https://example.com/openai",
+        ] {
+            assert_eq!(
+                preferred_claude_protocol(url),
+                ClaudeProviderProtocol::Anthropic,
+                "expected Anthropic upstream for {url}"
+            );
+        }
     }
 
     #[test]
@@ -883,15 +888,27 @@ mod tests {
     }
 
     #[test]
-    fn test_preferred_gemini_protocol() {
+    fn test_preferred_gemini_protocol_keeps_native_google_host() {
         assert_eq!(
             preferred_gemini_protocol("https://generativelanguage.googleapis.com/v1beta"),
             GeminiProviderProtocol::Google
         );
-        assert_eq!(
-            preferred_gemini_protocol("https://api.openai.com/v1"),
-            GeminiProviderProtocol::Openai
-        );
+    }
+
+    #[test]
+    fn test_preferred_gemini_protocol_for_openai_compatible_hosts_picks_google() {
+        // Gemini CLI's native protocol is Google; forward it as-is for any
+        // host whose default protocol is OpenAI. Fallback handles the rest.
+        for url in [
+            "https://api.openai.com/v1",
+            "https://ai-gateway.vercel.sh/v1",
+        ] {
+            assert_eq!(
+                preferred_gemini_protocol(url),
+                GeminiProviderProtocol::Google,
+                "expected Google upstream for {url}"
+            );
+        }
     }
 
     #[test]
