@@ -44,7 +44,7 @@ pub fn protocol_candidates(active_route: &AtomicU8) -> Vec<(ProviderProtocol, Pa
     out
 }
 
-/// If this was a fallback attempt (attempt > 0), store the winning route and log.
+/// If this was a fallback attempt (attempt > 0), store the winning route.
 pub fn commit_protocol_switch(
     active_route: &AtomicU8,
     protocol: ProviderProtocol,
@@ -53,11 +53,6 @@ pub fn commit_protocol_switch(
 ) {
     if attempt > 0 {
         active_route.store(encode_route(protocol, variant), Ordering::Relaxed);
-        eprintln!(
-            "  • Route auto-switched to {} ({} path)",
-            protocol.as_str(),
-            variant.as_str()
-        );
     }
 }
 

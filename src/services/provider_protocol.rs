@@ -71,13 +71,6 @@ impl ProviderProtocol {
 }
 
 impl PathVariant {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Default => "default",
-            Self::Stripped => "stripped",
-        }
-    }
-
     /// Apply the variant to a default `/v1`-prefixed path. `Stripped` removes a
     /// leading `/v1`; `Default` returns the path unchanged.
     pub fn apply(self, default_path: &str) -> &str {
