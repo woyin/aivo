@@ -1,6 +1,6 @@
 {
   "name": "@yuanchuan/aivo",
-  "version": "0.19.2",
+  "version": "0.19.3",
   "description": "npm wrapper for the aivo CLI",
   "license": "MIT",
   "repository": {

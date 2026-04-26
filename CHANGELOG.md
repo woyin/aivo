@@ -1,5 +1,15 @@
 # Changelog
 
+## v0.19.3
+
+### Improvements
+
+- `aivo stats --since DURATION`: time-windowed reports (e.g. `--since 7d`, `--since 24h`)
+- Claude Code: per-task model overrides for individual slots
+- CLI: drop custom short-flag pre-expander, rely on clap POSIX bundling
+- Gemini: handle `thoughtSignature` for gemini-3
+
+
 ## v0.19.2
 
 ### Features
