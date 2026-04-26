@@ -27,6 +27,7 @@ use key_resolution::{
     KeyLookupMode, KeyResolution, key_or_exit, resolve_image_key_override, resolve_key_override,
 };
 use services::ai_launcher::AIToolType;
+use services::environment_injector::ClaudeSlotFlags;
 use services::key_compat::KeyCompatContext;
 use services::{AILauncher, EnvironmentInjector, SessionStore};
 
@@ -81,7 +82,7 @@ async fn main() {
         && let Some(cmd) = &args.command
     {
         match cmd {
-            Commands::Run(_) => RunCommand::print_help(),
+            Commands::Run(run_args) => RunCommand::print_help(run_args.tool.as_deref()),
             Commands::Keys(_) => KeysCommand::print_help(),
             Commands::Chat(_) => ChatCommand::print_help(),
             Commands::Image(_) => {
@@ -233,6 +234,13 @@ async fn main() {
             // puts --model into args instead of parsing it as an aivo flag).
             let extracted = extract_aivo_flags(
                 run_args.model,
+                ClaudeSlotFlags {
+                    reasoning: run_args.reasoning_model,
+                    subagent: run_args.subagent_model,
+                    haiku: run_args.haiku_model,
+                    sonnet: run_args.sonnet_model,
+                    opus: run_args.opus_model,
+                },
                 run_args.key,
                 run_args.debug,
                 run_args.dry_run,
@@ -241,7 +249,19 @@ async fn main() {
                 run_args.envs,
                 &run_args.args,
             );
-            let model = resolve_model_alias(&session_store, extracted.model).await;
+            // Resolve aliases for main + 6 slot models against a single
+            // in-memory snapshot of the alias map, instead of paying one disk
+            // read per call (worst case 7).
+            let aliases = session_store.get_aliases().await.unwrap_or_default();
+            let resolve = |m: Option<String>| resolve_alias_in_memory(&aliases, m);
+            let model = resolve(extracted.model);
+            let slots = ClaudeSlotFlags {
+                reasoning: resolve(extracted.slots.reasoning),
+                subagent: resolve(extracted.slots.subagent),
+                haiku: resolve(extracted.slots.haiku),
+                sonnet: resolve(extracted.slots.sonnet),
+                opus: resolve(extracted.slots.opus),
+            };
             let key_flag = extracted.key_flag;
             let debug = extracted.debug;
             let dry_run = extracted.dry_run;
@@ -354,6 +374,7 @@ async fn main() {
                         refresh,
                         model,
                         model_flag_explicit,
+                        slots,
                         env,
                         key_override,
                         context_selector,
@@ -702,9 +723,32 @@ async fn resolve_model_alias(
     }
 }
 
+/// Like `resolve_model_alias` but resolves against a pre-loaded alias map so
+/// callers with many lookups (the run command resolves up to 7 model fields)
+/// don't pay one disk read per call. Falls back to the input on any error.
+fn resolve_alias_in_memory(
+    aliases: &std::collections::HashMap<String, String>,
+    model: Option<String>,
+) -> Option<String> {
+    let m = match model {
+        Some(ref m) if !m.is_empty() => m,
+        other => return other,
+    };
+    let mut current = m.to_string();
+    let mut seen = std::collections::HashSet::new();
+    while let Some(target) = aliases.get(&current) {
+        if !seen.insert(current.clone()) {
+            return model; // cycle — return the original input
+        }
+        current = target.clone();
+    }
+    Some(current)
+}
+
 /// Result of extracting aivo-specific flags from clap's trailing passthrough args.
 struct ExtractedFlags {
     model: Option<String>,
+    slots: ClaudeSlotFlags,
     key_flag: Option<String>,
     debug: bool,
     dry_run: bool,
@@ -725,6 +769,7 @@ struct ExtractedFlags {
 #[allow(clippy::too_many_arguments)]
 fn extract_aivo_flags(
     initial_model: Option<String>,
+    initial_slots: ClaudeSlotFlags,
     initial_key: Option<String>,
     initial_debug: bool,
     initial_dry_run: bool,
@@ -756,6 +801,13 @@ fn extract_aivo_flags(
     let mut as_name = initial_as_name;
     let mut context: Option<String> = None;
     let mut env_strings = initial_envs;
+    let ClaudeSlotFlags {
+        reasoning: mut reasoning_model,
+        subagent: mut subagent_model,
+        haiku: mut haiku_model,
+        sonnet: mut sonnet_model,
+        opus: mut opus_model,
+    } = initial_slots;
     let mut remaining_args: Vec<String> = Vec::new();
 
     // Flush flag-lookalike values back into remaining_args before processing passthrough.
@@ -767,6 +819,23 @@ fn extract_aivo_flags(
         remaining_args.push(v.clone());
         key_flag = Some((false, String::new()));
     }
+    // Same protection for the per-slot Claude flags: a model name never starts
+    // with `-`, so if clap handed us one, the user mistyped a flag (e.g.
+    // `--haiku-model --opus-model X`). Push it back to passthrough and treat
+    // the slot as bare so the next pass can re-parse it as the intended flag.
+    let mut sanitize_slot = |slot: &mut Option<String>| {
+        if let Some(ref v) = *slot
+            && v.starts_with('-')
+        {
+            remaining_args.push(v.clone());
+            *slot = Some(String::new());
+        }
+    };
+    sanitize_slot(&mut reasoning_model);
+    sanitize_slot(&mut subagent_model);
+    sanitize_slot(&mut haiku_model);
+    sanitize_slot(&mut sonnet_model);
+    sanitize_slot(&mut opus_model);
 
     let mut model: Option<String> = model.map(|(_, v)| v);
     let mut key_flag: Option<String> = key_flag.map(|(_, v)| v);
@@ -834,6 +903,71 @@ fn extract_aivo_flags(
         } else if (arg == "--env" || arg == "-e") && i + 1 < passthrough_args.len() {
             env_strings.push(passthrough_args[i + 1].clone());
             i += 1;
+        } else if let Some(value) = arg.strip_prefix("--reasoning-model=") {
+            if !value.is_empty() && reasoning_model.is_none() {
+                reasoning_model = Some(value.to_string());
+            } else {
+                remaining_args.push(arg.clone());
+            }
+        } else if arg == "--reasoning-model" && reasoning_model.is_none() {
+            if i + 1 < passthrough_args.len() && !passthrough_args[i + 1].starts_with('-') {
+                reasoning_model = Some(passthrough_args[i + 1].clone());
+                i += 1;
+            } else {
+                reasoning_model = Some(String::new());
+            }
+        } else if let Some(value) = arg.strip_prefix("--subagent-model=") {
+            if !value.is_empty() && subagent_model.is_none() {
+                subagent_model = Some(value.to_string());
+            } else {
+                remaining_args.push(arg.clone());
+            }
+        } else if arg == "--subagent-model" && subagent_model.is_none() {
+            if i + 1 < passthrough_args.len() && !passthrough_args[i + 1].starts_with('-') {
+                subagent_model = Some(passthrough_args[i + 1].clone());
+                i += 1;
+            } else {
+                subagent_model = Some(String::new());
+            }
+        } else if let Some(value) = arg.strip_prefix("--haiku-model=") {
+            if !value.is_empty() && haiku_model.is_none() {
+                haiku_model = Some(value.to_string());
+            } else {
+                remaining_args.push(arg.clone());
+            }
+        } else if arg == "--haiku-model" && haiku_model.is_none() {
+            if i + 1 < passthrough_args.len() && !passthrough_args[i + 1].starts_with('-') {
+                haiku_model = Some(passthrough_args[i + 1].clone());
+                i += 1;
+            } else {
+                haiku_model = Some(String::new());
+            }
+        } else if let Some(value) = arg.strip_prefix("--sonnet-model=") {
+            if !value.is_empty() && sonnet_model.is_none() {
+                sonnet_model = Some(value.to_string());
+            } else {
+                remaining_args.push(arg.clone());
+            }
+        } else if arg == "--sonnet-model" && sonnet_model.is_none() {
+            if i + 1 < passthrough_args.len() && !passthrough_args[i + 1].starts_with('-') {
+                sonnet_model = Some(passthrough_args[i + 1].clone());
+                i += 1;
+            } else {
+                sonnet_model = Some(String::new());
+            }
+        } else if let Some(value) = arg.strip_prefix("--opus-model=") {
+            if !value.is_empty() && opus_model.is_none() {
+                opus_model = Some(value.to_string());
+            } else {
+                remaining_args.push(arg.clone());
+            }
+        } else if arg == "--opus-model" && opus_model.is_none() {
+            if i + 1 < passthrough_args.len() && !passthrough_args[i + 1].starts_with('-') {
+                opus_model = Some(passthrough_args[i + 1].clone());
+                i += 1;
+            } else {
+                opus_model = Some(String::new());
+            }
         } else {
             remaining_args.push(arg.clone());
         }
@@ -842,6 +976,13 @@ fn extract_aivo_flags(
 
     ExtractedFlags {
         model,
+        slots: ClaudeSlotFlags {
+            reasoning: reasoning_model,
+            subagent: subagent_model,
+            haiku: haiku_model,
+            sonnet: sonnet_model,
+            opus: opus_model,
+        },
         key_flag,
         debug,
         dry_run,
@@ -865,6 +1006,7 @@ mod tests {
     fn model_inline_form() {
         let r = extract_aivo_flags(
             None,
+            ClaudeSlotFlags::default(),
             None,
             false,
             false,
@@ -881,6 +1023,7 @@ mod tests {
     fn model_space_form() {
         let r = extract_aivo_flags(
             None,
+            ClaudeSlotFlags::default(),
             None,
             false,
             false,
@@ -897,6 +1040,7 @@ mod tests {
     fn model_short_form() {
         let r = extract_aivo_flags(
             None,
+            ClaudeSlotFlags::default(),
             None,
             false,
             false,
@@ -913,6 +1057,7 @@ mod tests {
     fn model_no_value_triggers_picker() {
         let r = extract_aivo_flags(
             None,
+            ClaudeSlotFlags::default(),
             None,
             false,
             false,
@@ -929,6 +1074,7 @@ mod tests {
         // Clap swallowed `--resume` as the value of -m
         let r = extract_aivo_flags(
             Some("--resume".to_string()),
+            ClaudeSlotFlags::default(),
             None,
             false,
             false,
@@ -946,6 +1092,7 @@ mod tests {
         // clap parsed --model correctly; a second --model in passthrough should pass through
         let r = extract_aivo_flags(
             Some("gpt-4o".to_string()),
+            ClaudeSlotFlags::default(),
             None,
             false,
             false,
@@ -962,6 +1109,7 @@ mod tests {
     fn key_inline_form() {
         let r = extract_aivo_flags(
             None,
+            ClaudeSlotFlags::default(),
             None,
             false,
             false,
@@ -977,6 +1125,7 @@ mod tests {
     fn key_space_form() {
         let r = extract_aivo_flags(
             None,
+            ClaudeSlotFlags::default(),
             None,
             false,
             false,
@@ -992,6 +1141,7 @@ mod tests {
     fn key_short_form() {
         let r = extract_aivo_flags(
             None,
+            ClaudeSlotFlags::default(),
             None,
             false,
             false,
@@ -1007,6 +1157,7 @@ mod tests {
     fn key_flag_as_value_corrected() {
         let r = extract_aivo_flags(
             None,
+            ClaudeSlotFlags::default(),
             Some("--something".to_string()),
             false,
             false,
@@ -1023,6 +1174,7 @@ mod tests {
     fn key_no_value_triggers_picker() {
         let r = extract_aivo_flags(
             None,
+            ClaudeSlotFlags::default(),
             None,
             false,
             false,
@@ -1038,6 +1190,7 @@ mod tests {
     fn debug_flag() {
         let r = extract_aivo_flags(
             None,
+            ClaudeSlotFlags::default(),
             None,
             false,
             false,
@@ -1052,7 +1205,17 @@ mod tests {
 
     #[test]
     fn debug_already_set_preserved() {
-        let r = extract_aivo_flags(None, None, true, false, false, None, vec![], &[]);
+        let r = extract_aivo_flags(
+            None,
+            ClaudeSlotFlags::default(),
+            None,
+            true,
+            false,
+            false,
+            None,
+            vec![],
+            &[],
+        );
         assert!(r.debug);
     }
 
@@ -1060,6 +1223,7 @@ mod tests {
     fn dry_run_flag() {
         let r = extract_aivo_flags(
             None,
+            ClaudeSlotFlags::default(),
             None,
             false,
             false,
@@ -1075,6 +1239,7 @@ mod tests {
     fn env_inline_form() {
         let r = extract_aivo_flags(
             None,
+            ClaudeSlotFlags::default(),
             None,
             false,
             false,
@@ -1090,6 +1255,7 @@ mod tests {
     fn env_short_inline_form() {
         let r = extract_aivo_flags(
             None,
+            ClaudeSlotFlags::default(),
             None,
             false,
             false,
@@ -1105,6 +1271,7 @@ mod tests {
     fn env_space_form() {
         let r = extract_aivo_flags(
             None,
+            ClaudeSlotFlags::default(),
             None,
             false,
             false,
@@ -1120,6 +1287,7 @@ mod tests {
     fn env_short_space_form() {
         let r = extract_aivo_flags(
             None,
+            ClaudeSlotFlags::default(),
             None,
             false,
             false,
@@ -1135,6 +1303,7 @@ mod tests {
     fn initial_envs_preserved() {
         let r = extract_aivo_flags(
             None,
+            ClaudeSlotFlags::default(),
             None,
             false,
             false,
@@ -1150,6 +1319,7 @@ mod tests {
     fn unknown_args_pass_through() {
         let r = extract_aivo_flags(
             None,
+            ClaudeSlotFlags::default(),
             None,
             false,
             false,
@@ -1166,6 +1336,7 @@ mod tests {
     fn mixed_flags() {
         let r = extract_aivo_flags(
             None,
+            ClaudeSlotFlags::default(),
             None,
             false,
             false,
@@ -1222,6 +1393,7 @@ mod tests {
     fn prompt_passes_through_extraction() {
         let r = extract_aivo_flags(
             None,
+            ClaudeSlotFlags::default(),
             None,
             false,
             false,
@@ -1238,6 +1410,7 @@ mod tests {
     fn prompt_preserved_with_model_flag() {
         let r = extract_aivo_flags(
             None,
+            ClaudeSlotFlags::default(),
             None,
             false,
             false,
@@ -1254,6 +1427,7 @@ mod tests {
     fn multi_word_unquoted_args_pass_through() {
         let r = extract_aivo_flags(
             None,
+            ClaudeSlotFlags::default(),
             None,
             false,
             false,

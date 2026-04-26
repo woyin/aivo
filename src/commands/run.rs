@@ -13,6 +13,7 @@ use crate::errors::ExitCode;
 use crate::services::ai_launcher::{AILauncher, AIToolType, LaunchOptions};
 use crate::services::context_ingest::{IngestOptions, ingest_project};
 use crate::services::context_render::{RenderedContext, render_single_session};
+use crate::services::environment_injector::{ClaudeModelOverrides, ClaudeSlotFlags};
 use crate::services::http_utils;
 use crate::services::models_cache::ModelsCache;
 use crate::services::nickname_registry;
@@ -53,9 +54,11 @@ impl RunCommand {
     }
 
     /// Resolves the model to use when --model flag is provided.
-    /// --model <value> → use as-is. --model (no value) → show picker.
-    /// No --model flag → returns None (let the tool use its own default).
-    /// Returns None when the picker was cancelled or no flag was given.
+    /// --model <value> → use as-is. --model (no value) → show picker with
+    /// the given header. No --model flag → returns `UseDefault` (let the tool
+    /// use its own default). The `prompt` lets callers render per-slot
+    /// headers like `"Step 2 of 3 — fast model"`.
+    #[allow(clippy::too_many_arguments)]
     async fn resolve_model(
         &self,
         client: &Client,
@@ -64,13 +67,11 @@ impl RunCommand {
         explicit_model_flag: bool,
         refresh: bool,
         tool: AIToolType,
+        prompt: &str,
     ) -> Result<ModelOutcome> {
         match flag_model {
-            // No --model flag → don't override, let the tool use its default
             None => return Ok(ModelOutcome::UseDefault),
-            // --model <value> → use it as-is
             Some(ref m) if !m.is_empty() => return Ok(ModelOutcome::Model(m.clone())),
-            // --model with no value → show picker
             Some(_) => {}
         }
 
@@ -87,9 +88,6 @@ impl RunCommand {
             return Ok(ModelOutcome::UseDefault);
         }
 
-        // Fetch the full catalog and annotate non-chat models as disabled
-        // instead of hiding them. Users running `aivo run claude` see image /
-        // audio / embedding entries with a dim reason, not silently filtered.
         let models_list =
             crate::commands::models::fetch_all_models_cached(client, key, &self.cache, refresh)
                 .await
@@ -100,8 +98,7 @@ impl RunCommand {
             // /v1/models endpoint — e.g. Codex ChatGPT OAuth). Skip the
             // picker and let the tool use its own default rather than
             // blocking the launch. Only explain this when the user
-            // explicitly asked for a picker; the implicit picker on first
-            // launch falls through silently.
+            // explicitly asked for a picker.
             if explicit_model_flag {
                 crate::commands::print_no_model_list_hint();
             }
@@ -109,10 +106,79 @@ impl RunCommand {
         }
 
         let annotations = crate::services::model_compat::text_chat_annotations(&models_list);
-        match crate::commands::models::prompt_model_picker(models_list, Some(tool), annotations) {
+        match crate::commands::models::prompt_model_picker(
+            models_list,
+            Some(tool),
+            annotations,
+            prompt,
+        ) {
             Some(m) => Ok(ModelOutcome::Model(m)),
             None => Ok(ModelOutcome::Cancelled),
         }
+    }
+
+    /// Resolves the three Claude per-slot model overrides. Each slot follows
+    /// the same `--model` semantics: `None` → leave unset, `Some(non-empty)` →
+    /// use as-is, `Some("")` → show a picker. Bare-flag pickers are batched
+    /// into a single sequential flow with a `"Step N of M — <slot>"` header.
+    /// ESC at any picker step aborts the whole launch (parity with `-m`).
+    /// Walks the per-slot Claude model flags. For each slot: leave unset,
+    /// take the explicit value as-is, or open a sequential picker (with a
+    /// `Step N of M — <slot>` header) for bare flags. ESC at any picker step
+    /// aborts the launch (parity with `-m`).
+    async fn resolve_claude_overrides(
+        &self,
+        client: &Client,
+        key: &ApiKey,
+        flags: ClaudeSlotFlags,
+        refresh: bool,
+    ) -> Result<Option<ClaudeModelOverrides>> {
+        let slots = [
+            ("reasoning model", flags.reasoning),
+            ("subagent model", flags.subagent),
+            ("haiku family model", flags.haiku),
+            ("sonnet family model", flags.sonnet),
+            ("opus family model", flags.opus),
+        ];
+        let total_pickers = slots
+            .iter()
+            .filter(|(_, v)| matches!(v, Some(s) if s.is_empty()))
+            .count();
+
+        let mut resolved: [Option<String>; 5] = [None, None, None, None, None];
+        let mut step = 0usize;
+        for (idx, (label, value)) in slots.into_iter().enumerate() {
+            let prompt = if matches!(value, Some(ref s) if s.is_empty()) {
+                step += 1;
+                format!("Step {step} of {total_pickers} — {label}")
+            } else {
+                String::new()
+            };
+            let outcome = self
+                .resolve_model(
+                    client,
+                    key,
+                    value,
+                    true,
+                    refresh,
+                    AIToolType::Claude,
+                    &prompt,
+                )
+                .await?;
+            match outcome {
+                ModelOutcome::Cancelled => return Ok(None),
+                ModelOutcome::Model(m) => resolved[idx] = Some(m),
+                ModelOutcome::UseDefault => {}
+            }
+        }
+        let [reasoning, subagent, haiku, sonnet, opus] = resolved;
+        Ok(Some(ClaudeModelOverrides {
+            reasoning,
+            subagent,
+            haiku,
+            sonnet,
+            opus,
+        }))
     }
 
     /// Executes the run command with the specified AI tool
@@ -126,6 +192,7 @@ impl RunCommand {
         refresh: bool,
         model: Option<String>,
         explicit_model_flag: bool,
+        slots: ClaudeSlotFlags,
         env: Option<HashMap<String, String>>,
         key_override: Option<ApiKey>,
         context_selector: Option<String>,
@@ -140,6 +207,7 @@ impl RunCommand {
                 refresh,
                 model,
                 explicit_model_flag,
+                slots,
                 env,
                 key_override,
                 context_selector,
@@ -165,6 +233,7 @@ impl RunCommand {
         refresh: bool,
         model: Option<String>,
         explicit_model_flag: bool,
+        slots: ClaudeSlotFlags,
         env: Option<HashMap<String, String>>,
         key_override: Option<ApiKey>,
         context_selector: Option<String>,
@@ -173,14 +242,14 @@ impl RunCommand {
         let tool = match tool {
             Some(t) => t,
             None => {
-                Self::print_help();
+                Self::print_help(None);
                 return Ok(ExitCode::UserError);
             }
         };
 
         // Handle help flags
         if tool == "--help" || tool == "-h" {
-            Self::print_help();
+            Self::print_help(None);
             return Ok(ExitCode::Success);
         }
 
@@ -233,7 +302,15 @@ impl RunCommand {
         let client = http_utils::router_http_client();
         let resolved_model = if let Some(ref key) = key_override {
             let outcome = self
-                .resolve_model(&client, key, model, explicit_model_flag, refresh, ai_tool)
+                .resolve_model(
+                    &client,
+                    key,
+                    model,
+                    explicit_model_flag,
+                    refresh,
+                    ai_tool,
+                    "Select model",
+                )
                 .await?;
             match outcome {
                 ModelOutcome::Cancelled => return Ok(ExitCode::Success),
@@ -253,6 +330,28 @@ impl RunCommand {
                 .set_last_selection(key, tool, resolved_model.as_deref())
                 .await;
         }
+
+        let claude_overrides = match ai_tool {
+            AIToolType::Claude if slots.any_set() => {
+                let key = key_override
+                    .as_ref()
+                    .expect("key_override is required (validated above)");
+                match self
+                    .resolve_claude_overrides(&client, key, slots, refresh)
+                    .await?
+                {
+                    Some(o) => o,
+                    None => return Ok(ExitCode::Success),
+                }
+            }
+            AIToolType::Claude => ClaudeModelOverrides::default(),
+            _ => {
+                // Non-Claude tool: warn once per set slot flag and forget them.
+                // Running pickers we'd throw away would be wasted UI.
+                warn_slot_flags_ignored(ai_tool, &slots);
+                ClaudeModelOverrides::default()
+            }
+        };
 
         let launch_model = resolve_model_placeholder(resolved_model);
 
@@ -324,6 +423,7 @@ impl RunCommand {
             args,
             debug,
             model: launch_model,
+            claude_overrides,
             env,
             key_override,
         };
@@ -341,8 +441,11 @@ impl RunCommand {
         })
     }
 
-    /// Shows usage information
-    pub fn print_help() {
+    /// Shows usage information. When `tool` is `Some("claude")` (or `None`,
+    /// generic help) the Claude-only slot flags are listed; for other tools
+    /// they're hidden because `--haiku-model` etc. only apply to Claude.
+    pub fn print_help(tool: Option<&str>) {
+        let show_claude_slots = tool.map(|t| t == "claude").unwrap_or(true);
         println!("{} aivo run [tool] [args...]", style::bold("Usage:"));
         println!();
         println!(
@@ -369,6 +472,28 @@ impl RunCommand {
             );
         };
         print_opt("-m, --model <model>", "Specify AI model to use");
+        if show_claude_slots {
+            print_opt(
+                "--reasoning-model <m>",
+                "Claude only: override reasoning slot (bare = picker)",
+            );
+            print_opt(
+                "--subagent-model <m>",
+                "Claude only: override subagent slot (bare = picker)",
+            );
+            print_opt(
+                "--haiku-model <m>",
+                "Claude only: what `/model haiku` resolves to (bare = picker)",
+            );
+            print_opt(
+                "--sonnet-model <m>",
+                "Claude only: what `/model sonnet` resolves to (bare = picker)",
+            );
+            print_opt(
+                "--opus-model <m>",
+                "Claude only: what `/model opus` resolves to (bare = picker)",
+            );
+        }
         print_opt(
             "-k, --key <id|name>",
             "Select API key by ID or name (-k opens key picker)",
@@ -411,6 +536,27 @@ impl RunCommand {
         println!("  {}", style::dim("aivo claude \"fix the login bug\""));
         println!("  {}", style::dim("aivo codex \"refactor this function\""));
         println!("  {}", style::dim("aivo gemini \"explain this code\""));
+    }
+}
+
+/// Emits one stderr line per Claude-only slot flag set when running a
+/// non-Claude tool. Forgiving by design — preserves the launch.
+fn warn_slot_flags_ignored(tool: AIToolType, slots: &ClaudeSlotFlags) {
+    for (set, flag) in [
+        (slots.reasoning.is_some(), "--reasoning-model"),
+        (slots.subagent.is_some(), "--subagent-model"),
+        (slots.haiku.is_some(), "--haiku-model"),
+        (slots.sonnet.is_some(), "--sonnet-model"),
+        (slots.opus.is_some(), "--opus-model"),
+    ] {
+        if set {
+            eprintln!(
+                "  {} {} is ignored for {}",
+                style::yellow("!"),
+                flag,
+                tool.as_str(),
+            );
+        }
     }
 }
 

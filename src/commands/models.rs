@@ -961,6 +961,7 @@ pub(crate) fn prompt_model_picker(
     models: Vec<String>,
     tool: Option<AIToolType>,
     annotations: Vec<Option<String>>,
+    prompt: &str,
 ) -> Option<String> {
     use crate::constants;
     use crate::tui::FuzzySelect;
@@ -983,7 +984,7 @@ pub(crate) fn prompt_model_picker(
     }
 
     let selected = FuzzySelect::new()
-        .with_prompt("Select model")
+        .with_prompt(prompt)
         .items(&items)
         .annotations(row_annotations)
         .default(0)

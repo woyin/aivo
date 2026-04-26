@@ -11,7 +11,7 @@ use tokio::process::Command;
 use tokio::signal;
 
 use crate::errors::{CLIError, ErrorCategory};
-use crate::services::environment_injector::EnvironmentInjector;
+use crate::services::environment_injector::{ClaudeModelOverrides, EnvironmentInjector};
 use crate::services::launch_args::{
     build_preview_notes, build_runtime_args, inject_codex_provider_config, merge_preview_env,
     preview_args, rewrite_codex_preview_env,
@@ -118,6 +118,10 @@ pub struct LaunchOptions {
     pub args: Vec<String>,
     pub debug: bool,
     pub model: Option<String>,
+    /// Claude-only per-slot model overrides for the six addressable slots.
+    /// Ignored — with a single stderr warning per set slot — when `tool` is
+    /// not `Claude`.
+    pub claude_overrides: ClaudeModelOverrides,
     pub env: Option<HashMap<String, String>>,
     /// Temporary key override for this launch (does not persist to config)
     pub key_override: Option<ApiKey>,
@@ -501,6 +505,7 @@ impl AILauncher {
             &key,
             model.as_deref(),
             opencode_models.as_deref(),
+            &options.claude_overrides,
         );
         Ok(ResolvedLaunchContext {
             key,
@@ -663,9 +668,15 @@ impl AILauncher {
         key: &ApiKey,
         model: Option<&str>,
         opencode_models: Option<&[String]>,
+        claude_overrides: &ClaudeModelOverrides,
     ) -> ToolConfig {
+        // claude_overrides is non-empty only on the Claude path; for other
+        // tools the run command warns up-front and never populates it.
         let env_vars = match tool {
-            AIToolType::Claude => self.env_injector.for_claude(key, model),
+            AIToolType::Claude => {
+                self.env_injector
+                    .for_claude_with_overrides(key, model, claude_overrides)
+            }
             AIToolType::Codex => self.env_injector.for_codex(key, model),
             AIToolType::Gemini => self.env_injector.for_gemini(key, model),
             AIToolType::Opencode => self.env_injector.for_opencode(key, model, opencode_models),

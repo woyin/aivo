@@ -42,6 +42,43 @@ enum ConnectionMode {
 #[derive(Debug, Clone, Default)]
 pub struct EnvironmentInjector;
 
+/// Raw CLI slot values for Claude per-task models, before alias/picker
+/// resolution. `None` means the flag was absent; `Some("")` means a bare flag
+/// (open the picker); `Some("name")` is an explicit model. The shape mirrors
+/// `ClaudeModelOverrides` so the resolver can fill into the same field
+/// positions.
+#[derive(Debug, Clone, Default)]
+pub struct ClaudeSlotFlags {
+    pub reasoning: Option<String>,
+    pub subagent: Option<String>,
+    pub haiku: Option<String>,
+    pub sonnet: Option<String>,
+    pub opus: Option<String>,
+}
+
+impl ClaudeSlotFlags {
+    pub fn any_set(&self) -> bool {
+        self.reasoning.is_some()
+            || self.subagent.is_some()
+            || self.haiku.is_some()
+            || self.sonnet.is_some()
+            || self.opus.is_some()
+    }
+}
+
+/// Per-slot model overrides for Claude. `None` means "no override — keep
+/// whatever the main `model` argument fanned out". `Some(value)` replaces
+/// that slot's env var. The deprecated `ANTHROPIC_SMALL_FAST_MODEL` slot is
+/// intentionally absent; users override haiku-class routing via `haiku`.
+#[derive(Debug, Clone, Default)]
+pub struct ClaudeModelOverrides {
+    pub reasoning: Option<String>,
+    pub subagent: Option<String>,
+    pub haiku: Option<String>,
+    pub sonnet: Option<String>,
+    pub opus: Option<String>,
+}
+
 /// Strips the API version suffix (`/v1beta`, `/v1`) and trailing slashes from
 /// a Google base URL.  Tools whose SDKs append their own `apiVersion` path
 /// (Gemini CLI) would produce a double path like `/v1beta/v1beta/models/…`
@@ -238,8 +275,26 @@ impl EnvironmentInjector {
         env
     }
 
-    /// Prepares environment variables for Claude CLI
+    /// `for_claude_with_overrides` with no per-slot overrides. Used by the
+    /// in-tree and integration test suites; production callers go through
+    /// the overrides-aware entry point directly. `#[cfg(test)]` doesn't fit
+    /// here because integration tests live in a separate crate that sees
+    /// only the non-test build of this lib.
+    #[allow(dead_code)]
     pub fn for_claude(&self, key: &ApiKey, model: Option<&str>) -> HashMap<String, String> {
+        self.for_claude_with_overrides(key, model, &ClaudeModelOverrides::default())
+    }
+
+    /// Prepares environment variables for Claude CLI with optional per-slot
+    /// model overrides. The main `model` (if provided) still fans out into all
+    /// seven `ANTHROPIC_*` slots; `overrides` then selectively replaces any of
+    /// the fast / reasoning / subagent / haiku / sonnet / opus slots.
+    pub fn for_claude_with_overrides(
+        &self,
+        key: &ApiKey,
+        model: Option<&str>,
+        overrides: &ClaudeModelOverrides,
+    ) -> HashMap<String, String> {
         if key.is_claude_oauth() {
             let _ = model;
             let mut env = HashMap::new();
@@ -319,10 +374,9 @@ impl EnvironmentInjector {
                 model.to_string()
             };
             env.insert("ANTHROPIC_MODEL".to_string(), anthropic_model.clone());
-            env.insert(
-                "ANTHROPIC_SMALL_FAST_MODEL".to_string(),
-                anthropic_model.clone(),
-            );
+            // ANTHROPIC_SMALL_FAST_MODEL is intentionally omitted: it's
+            // deprecated in favor of ANTHROPIC_DEFAULT_HAIKU_MODEL (set below).
+            // See https://code.claude.com/docs/en/env-vars.md.
             env.insert(
                 "ANTHROPIC_DEFAULT_HAIKU_MODEL".to_string(),
                 anthropic_model.clone(),
@@ -343,6 +397,32 @@ impl EnvironmentInjector {
                 "CLAUDE_CODE_SUBAGENT_MODEL".to_string(),
                 anthropic_model.clone(),
             );
+        }
+
+        // Per-slot overrides win over the fan-out from `model`. Each slot is
+        // normalized through the same anthropic_native_model_name() pass when
+        // talking to a native Anthropic endpoint so e.g. `claude-sonnet-4.6`
+        // becomes `claude-sonnet-4-6`.
+        let normalize = |v: &str| {
+            if matches!(mode, ConnectionMode::Direct { .. }) {
+                anthropic_native_model_name(v)
+            } else {
+                v.to_string()
+            }
+        };
+        for (env_var, value) in [
+            ("ANTHROPIC_REASONING_MODEL", overrides.reasoning.as_deref()),
+            ("CLAUDE_CODE_SUBAGENT_MODEL", overrides.subagent.as_deref()),
+            ("ANTHROPIC_DEFAULT_HAIKU_MODEL", overrides.haiku.as_deref()),
+            (
+                "ANTHROPIC_DEFAULT_SONNET_MODEL",
+                overrides.sonnet.as_deref(),
+            ),
+            ("ANTHROPIC_DEFAULT_OPUS_MODEL", overrides.opus.as_deref()),
+        ] {
+            if let Some(v) = value {
+                env.insert(env_var.to_string(), normalize(v));
+            }
         }
 
         env
@@ -1232,10 +1312,9 @@ mod tests {
             env.get("ANTHROPIC_MODEL"),
             Some(&"claude-3-opus".to_string())
         );
-        assert_eq!(
-            env.get("ANTHROPIC_SMALL_FAST_MODEL"),
-            Some(&"claude-3-opus".to_string())
-        );
+        // The deprecated ANTHROPIC_SMALL_FAST_MODEL is intentionally NOT set;
+        // ANTHROPIC_DEFAULT_HAIKU_MODEL covers the same routing.
+        assert!(!env.contains_key("ANTHROPIC_SMALL_FAST_MODEL"));
         assert_eq!(
             env.get("ANTHROPIC_DEFAULT_HAIKU_MODEL"),
             Some(&"claude-3-opus".to_string())
@@ -1251,6 +1330,135 @@ mod tests {
         assert_eq!(
             env.get("ANTHROPIC_REASONING_MODEL"),
             Some(&"claude-3-opus".to_string())
+        );
+    }
+
+    #[test]
+    fn for_claude_per_slot_overrides_replace_only_targeted_slots() {
+        let injector = EnvironmentInjector::new();
+        let key = test_key();
+        let overrides = ClaudeModelOverrides {
+            haiku: Some("custom-haiku".to_string()),
+            ..Default::default()
+        };
+
+        let env = injector.for_claude_with_overrides(&key, Some("claude-opus-4-7"), &overrides);
+
+        assert_eq!(
+            env.get("ANTHROPIC_MODEL"),
+            Some(&"claude-opus-4-7".to_string()),
+            "main slot keeps the -m value",
+        );
+        assert_eq!(
+            env.get("ANTHROPIC_DEFAULT_HAIKU_MODEL"),
+            Some(&"custom-haiku".to_string()),
+            "haiku family slot is overridden",
+        );
+        // Deprecated ANTHROPIC_SMALL_FAST_MODEL must not be set anywhere.
+        assert!(!env.contains_key("ANTHROPIC_SMALL_FAST_MODEL"));
+        // The other slots fanned out from -m and stay on opus.
+        for slot in [
+            "ANTHROPIC_DEFAULT_SONNET_MODEL",
+            "ANTHROPIC_DEFAULT_OPUS_MODEL",
+            "ANTHROPIC_REASONING_MODEL",
+            "CLAUDE_CODE_SUBAGENT_MODEL",
+        ] {
+            assert_eq!(
+                env.get(slot),
+                Some(&"claude-opus-4-7".to_string()),
+                "unrelated slot {slot} keeps the fanned-out -m value",
+            );
+        }
+    }
+
+    #[test]
+    fn for_claude_per_slot_overrides_without_main_only_set_named_slots() {
+        let injector = EnvironmentInjector::new();
+        let key = test_key();
+        let overrides = ClaudeModelOverrides {
+            sonnet: Some("custom-sonnet".to_string()),
+            ..Default::default()
+        };
+
+        let env = injector.for_claude_with_overrides(&key, None, &overrides);
+
+        // No -m → no fan-out. Only the explicitly overridden slots are set.
+        assert!(!env.contains_key("ANTHROPIC_MODEL"));
+        assert!(!env.contains_key("ANTHROPIC_DEFAULT_HAIKU_MODEL"));
+        assert!(!env.contains_key("ANTHROPIC_DEFAULT_OPUS_MODEL"));
+        assert!(!env.contains_key("ANTHROPIC_REASONING_MODEL"));
+        assert!(!env.contains_key("CLAUDE_CODE_SUBAGENT_MODEL"));
+        assert!(!env.contains_key("ANTHROPIC_SMALL_FAST_MODEL"));
+        assert_eq!(
+            env.get("ANTHROPIC_DEFAULT_SONNET_MODEL"),
+            Some(&"custom-sonnet".to_string()),
+        );
+    }
+
+    #[test]
+    fn for_claude_never_writes_deprecated_small_fast_model_slot() {
+        // Regression guard: aivo must not propagate the deprecated
+        // ANTHROPIC_SMALL_FAST_MODEL env var. Anthropic replaced it with
+        // ANTHROPIC_DEFAULT_HAIKU_MODEL, which is what we set instead.
+        let injector = EnvironmentInjector::new();
+        let key = test_key();
+        let env = injector.for_claude(&key, Some("claude-opus-4-7"));
+        assert!(!env.contains_key("ANTHROPIC_SMALL_FAST_MODEL"));
+        assert_eq!(
+            env.get("ANTHROPIC_DEFAULT_HAIKU_MODEL"),
+            Some(&"claude-opus-4-7".to_string()),
+        );
+    }
+
+    #[test]
+    fn for_claude_family_default_overrides_target_distinct_env_vars() {
+        // Each of haiku/sonnet/opus must land in its own ANTHROPIC_DEFAULT_*_MODEL
+        // slot — these are the slots Claude Code's `/model` UI exposes, so a
+        // typo would silently misroute one slot to another's env var.
+        let injector = EnvironmentInjector::new();
+        let key = test_key();
+        let overrides = ClaudeModelOverrides {
+            haiku: Some("h-model".to_string()),
+            sonnet: Some("s-model".to_string()),
+            opus: Some("o-model".to_string()),
+            ..Default::default()
+        };
+
+        let env = injector.for_claude_with_overrides(&key, None, &overrides);
+
+        assert_eq!(
+            env.get("ANTHROPIC_DEFAULT_HAIKU_MODEL"),
+            Some(&"h-model".to_string())
+        );
+        assert_eq!(
+            env.get("ANTHROPIC_DEFAULT_SONNET_MODEL"),
+            Some(&"s-model".to_string())
+        );
+        assert_eq!(
+            env.get("ANTHROPIC_DEFAULT_OPUS_MODEL"),
+            Some(&"o-model".to_string())
+        );
+    }
+
+    #[test]
+    fn for_claude_per_slot_overrides_normalize_in_direct_mode() {
+        // Direct Anthropic mode normalizes dotted versions like 4.6 → 4-6.
+        // Per-slot overrides should pass through the same normalization so a
+        // user passing `--reasoning-model claude-sonnet-4.6` doesn't get a
+        // 404 from the native Anthropic endpoint.
+        let injector = EnvironmentInjector::new();
+        let key = test_api_key("https://api.anthropic.com"); // → Direct mode.
+        let overrides = ClaudeModelOverrides {
+            reasoning: Some("claude-sonnet-4.6".to_string()),
+            ..Default::default()
+        };
+
+        let env = injector.for_claude_with_overrides(&key, None, &overrides);
+
+        assert_eq!(
+            env.get("ANTHROPIC_REASONING_MODEL"),
+            Some(&"claude-sonnet-4-6".to_string()),
+            "dotted version should be normalized for Direct mode",
         );
     }
 

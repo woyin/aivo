@@ -240,7 +240,12 @@ impl ChatCommand {
 
                 let annotations =
                     crate::services::model_compat::text_chat_annotations(&models_list);
-                match crate::commands::models::prompt_model_picker(models_list, None, annotations) {
+                match crate::commands::models::prompt_model_picker(
+                    models_list,
+                    None,
+                    annotations,
+                    "Select model",
+                ) {
                     Some(selected) => {
                         self.session_store
                             .set_chat_model(&key.id, &selected)

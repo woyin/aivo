@@ -116,6 +116,7 @@ impl StartCommand {
                     args: Vec::new(),
                     debug: args.debug,
                     model: launch_model,
+                    claude_overrides: Default::default(),
                     env: (!env.is_empty()).then_some(env),
                     key_override: Some(key.value),
                 })
@@ -147,6 +148,7 @@ impl StartCommand {
                 args: Vec::new(),
                 debug: args.debug,
                 model: launch_model,
+                claude_overrides: Default::default(),
                 env: (!env.is_empty()).then_some(env),
                 key_override: Some(key.value),
             })
@@ -397,7 +399,12 @@ impl StartCommand {
         }
 
         let annotations = crate::services::model_compat::text_chat_annotations(&models);
-        match crate::commands::models::prompt_model_picker(models, Some(tool), annotations) {
+        match crate::commands::models::prompt_model_picker(
+            models,
+            Some(tool),
+            annotations,
+            "Select model",
+        ) {
             Some(selected) => Ok(Resolved {
                 value: Some(selected),
                 interactive: true,

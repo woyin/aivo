@@ -152,6 +152,34 @@ pub struct RunArgs {
     #[arg(short, long, value_name = "MODEL", num_args = 0..=1, default_missing_value = "")]
     pub model: Option<String>,
 
+    /// Claude only: override the reasoning/thinking model slot
+    /// (ANTHROPIC_REASONING_MODEL). Bare flag opens a picker.
+    #[arg(long = "reasoning-model", value_name = "MODEL", num_args = 0..=1, default_missing_value = "")]
+    pub reasoning_model: Option<String>,
+
+    /// Claude only: override the subagent model slot
+    /// (CLAUDE_CODE_SUBAGENT_MODEL). Bare flag opens a picker.
+    #[arg(long = "subagent-model", value_name = "MODEL", num_args = 0..=1, default_missing_value = "")]
+    pub subagent_model: Option<String>,
+
+    /// Claude only: override the Haiku family-default slot
+    /// (ANTHROPIC_DEFAULT_HAIKU_MODEL) — what Claude's `/model haiku` resolves to.
+    /// Bare flag opens a picker.
+    #[arg(long = "haiku-model", value_name = "MODEL", num_args = 0..=1, default_missing_value = "")]
+    pub haiku_model: Option<String>,
+
+    /// Claude only: override the Sonnet family-default slot
+    /// (ANTHROPIC_DEFAULT_SONNET_MODEL) — what Claude's `/model sonnet` resolves to.
+    /// Bare flag opens a picker.
+    #[arg(long = "sonnet-model", value_name = "MODEL", num_args = 0..=1, default_missing_value = "")]
+    pub sonnet_model: Option<String>,
+
+    /// Claude only: override the Opus family-default slot
+    /// (ANTHROPIC_DEFAULT_OPUS_MODEL) — what Claude's `/model opus` resolves to.
+    /// Bare flag opens a picker.
+    #[arg(long = "opus-model", value_name = "MODEL", num_args = 0..=1, default_missing_value = "")]
+    pub opus_model: Option<String>,
+
     /// Select API key by ID or name
     #[arg(
         short = 'k',

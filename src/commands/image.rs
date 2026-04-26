@@ -293,6 +293,7 @@ async fn pick_image_model_interactively(
         all_models,
         None,
         Vec::new(),
+        "Select model",
     ))
 }
 
