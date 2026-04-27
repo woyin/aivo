@@ -649,11 +649,15 @@ async fn handle_anthropic_to_upstream(
     if config.strip_cache_control {
         crate::services::anthropic_route_pipeline::strip_cache_control(&mut simplified);
     }
-    // Map Anthropic thinking config to OpenAI reasoning_effort
-    if let Some(thinking) = body.get("thinking")
-        && thinking.get("type").and_then(|t| t.as_str()) == Some("enabled")
+    // Map Anthropic thinking config to OpenAI reasoning_effort, preserving
+    // the caller's `budget_tokens` granularity instead of always collapsing
+    // to "high". Boundaries match `effort::CanonicalEffort::from_anthropic_budget_tokens`.
+    if !simplified
+        .as_object()
+        .is_some_and(|m| m.contains_key("reasoning_effort"))
+        && let Some(effort) = crate::services::effort::extract_anthropic_effort(&body)
     {
-        simplified["reasoning_effort"] = json!("high");
+        simplified["reasoning_effort"] = json!(effort.to_openai_effort());
     }
     cap_max_tokens_field(&mut simplified, config.max_tokens_cap);
     let requested_stream = simplified

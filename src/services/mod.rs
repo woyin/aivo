@@ -21,6 +21,7 @@ pub mod context_render;
 pub mod copilot_auth;
 pub mod copilot_router;
 pub mod device_fingerprint;
+pub mod effort;
 pub mod environment_injector;
 pub mod gemini_home_shadow;
 pub mod gemini_oauth;

@@ -6,6 +6,7 @@ use crate::constants::CONTENT_TYPE_JSON;
 use crate::services::anthropic_route_pipeline::inject_chat_completions_cache_control;
 use crate::services::copilot_auth::CopilotTokenManager;
 use crate::services::device_fingerprint;
+use crate::services::effort::gpt5_chat_completions_rejects_tools_with_none_reasoning;
 use crate::services::http_debug::LoggedSend;
 use crate::services::http_utils;
 use crate::services::model_names::{
@@ -154,6 +155,21 @@ pub(crate) async fn send_openai_chat(
 ) -> Result<RouterResponse> {
     normalize_openai_request_model(body, context.is_openrouter, context.is_copilot);
     migrate_max_tokens_for_reasoning_models(body);
+    // Surface OpenAI's GPT-5.4 Chat Completions restriction (no tools when
+    // reasoning_effort is "none") with a clear local 400 instead of letting
+    // the upstream reject and producing a generic error the user has to
+    // decode. The Responses API lifts this restriction; only Chat
+    // Completions is affected here.
+    if gpt5_chat_completions_rejects_tools_with_none_reasoning(body) {
+        let body = serde_json::to_vec(&serde_json::json!({
+            "error": {
+                "message": "GPT-5.4+ Chat Completions does not support tools with reasoning_effort: \"none\". Switch to a higher effort or use the Responses API.",
+                "type": "invalid_request_error",
+                "code": "tools_require_reasoning_effort"
+            }
+        }))?;
+        return Ok(RouterResponse::buffered(400, "application/json", body));
+    }
 
     let url = http_utils::build_target_url(&context.upstream_base_url, "/v1/chat/completions");
     let initiator = if context.is_copilot {

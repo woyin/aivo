@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
 
+use crate::services::effort::{extract_openai_effort, gemini_thinking_config};
 use crate::services::http_utils::current_unix_ts;
 use crate::services::model_names::google_native_model_name;
 
@@ -455,6 +456,16 @@ pub fn convert_openai_chat_to_gemini_request(body: &Value, config: &OpenAIToGemi
     }
     if let Some(v) = body.get("stop") {
         generation.insert("stopSequences".to_string(), v.clone());
+    }
+    // OpenAI `reasoning_effort` → Gemini 3 `thinkingConfig.thinking_level`.
+    // Without this, callers asking for "high" reasoning silently get Gemini's
+    // dynamic-thinking default. `thinking_level` is Gemini-3-only; older
+    // models ignore it (current code has no Gemini-2.5 thinkingBudget path).
+    if !generation.contains_key("thinkingConfig")
+        && let Some(effort) = extract_openai_effort(body)
+        && let Some(cfg) = gemini_thinking_config(effort)
+    {
+        generation.insert("thinkingConfig".to_string(), cfg);
     }
     if !generation.is_empty() {
         request["generationConfig"] = Value::Object(generation);
@@ -1895,6 +1906,46 @@ mod tests {
         super::write_string_atomic(&path, "{\"x\":\"1\"}");
         super::write_string_atomic(&path, "{\"x\":\"2\"}");
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "{\"x\":\"2\"}");
+    }
+
+    #[test]
+    fn openai_reasoning_effort_high_maps_to_gemini_thinking_level() {
+        let body = json!({
+            "model": "gemini-3-pro-preview",
+            "messages": [{"role": "user", "content": "hi"}],
+            "reasoning_effort": "high"
+        });
+        let req = convert_openai_chat_to_gemini_request(
+            &body,
+            &OpenAIToGeminiConfig {
+                default_model: "gemini-3-pro-preview",
+            },
+        );
+        assert_eq!(
+            req["generationConfig"]["thinkingConfig"]["thinking_level"],
+            "high"
+        );
+    }
+
+    #[test]
+    fn openai_reasoning_effort_minimal_omits_gemini_thinking_config() {
+        let body = json!({
+            "model": "gemini-3-pro-preview",
+            "messages": [{"role": "user", "content": "hi"}],
+            "reasoning_effort": "minimal"
+        });
+        let req = convert_openai_chat_to_gemini_request(
+            &body,
+            &OpenAIToGeminiConfig {
+                default_model: "gemini-3-pro-preview",
+            },
+        );
+        assert!(
+            req["generationConfig"]
+                .as_object()
+                .map(|m| !m.contains_key("thinkingConfig"))
+                .unwrap_or(true)
+        );
     }
 
     #[test]

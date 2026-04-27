@@ -1,5 +1,6 @@
 use serde_json::{Value, json};
 
+use crate::services::effort::{anthropic_thinking_config, extract_openai_effort};
 use crate::services::http_utils::current_unix_ts;
 use crate::services::openai_models::{
     OpenAIChatChoice, OpenAIChatResponse, OpenAIChatResponseMessage, OpenAIChatToolCall,
@@ -114,6 +115,28 @@ pub fn convert_openai_chat_to_anthropic_request(
                     _ => tc.clone(),
                 };
             }
+        }
+    }
+
+    // OpenAI `reasoning_effort` / `reasoning.effort` → Anthropic effort fields.
+    // Without this, callers explicitly opting into reasoning silently get
+    // Anthropic's default thinking off — invisible regression for anyone
+    // routing Codex / GPT-5 prompts through a Claude upstream. We emit
+    // `thinking.budget_tokens` (for backwards compat with Claude 3.x's
+    // extended-thinking surface) and `output_config.effort` (the newer
+    // Claude 4 surface). Both are request-level; Anthropic uses whichever
+    // it understands and ignores unknown fields.
+    if let Some(effort) = extract_openai_effort(body) {
+        if !req.as_object().is_some_and(|m| m.contains_key("thinking"))
+            && let Some(thinking) = anthropic_thinking_config(effort)
+        {
+            req["thinking"] = thinking;
+        }
+        if !req
+            .as_object()
+            .is_some_and(|m| m.contains_key("output_config"))
+        {
+            req["output_config"] = json!({ "effort": effort.to_anthropic_effort() });
         }
     }
 
@@ -1311,6 +1334,58 @@ mod tests {
             content.iter().all(|b| b["type"] != "thinking"),
             "explicit empty extension must suppress reasoning_content fallback"
         );
+    }
+
+    #[test]
+    fn openai_reasoning_effort_high_maps_to_anthropic_thinking_and_output_config() {
+        let body = json!({
+            "model": "claude-opus-4-7",
+            "messages": [{"role": "user", "content": "hi"}],
+            "reasoning_effort": "high"
+        });
+        let req = convert_openai_chat_to_anthropic_request(
+            &body,
+            &OpenAIToAnthropicChatConfig {
+                default_model: "claude-opus-4-7",
+            },
+        );
+        assert_eq!(req["thinking"]["type"], "enabled");
+        assert_eq!(req["thinking"]["budget_tokens"], 16384);
+        assert_eq!(req["output_config"]["effort"], "high");
+    }
+
+    #[test]
+    fn openai_reasoning_effort_xhigh_maps_to_anthropic_max_effort() {
+        let body = json!({
+            "model": "claude-opus-4-7",
+            "messages": [{"role": "user", "content": "hi"}],
+            "reasoning_effort": "xhigh"
+        });
+        let req = convert_openai_chat_to_anthropic_request(
+            &body,
+            &OpenAIToAnthropicChatConfig {
+                default_model: "claude-opus-4-7",
+            },
+        );
+        assert_eq!(req["thinking"]["budget_tokens"], 32000);
+        assert_eq!(req["output_config"]["effort"], "max");
+    }
+
+    #[test]
+    fn openai_reasoning_effort_none_does_not_enable_anthropic_thinking() {
+        let body = json!({
+            "model": "claude-opus-4-7",
+            "messages": [{"role": "user", "content": "hi"}],
+            "reasoning_effort": "none"
+        });
+        let req = convert_openai_chat_to_anthropic_request(
+            &body,
+            &OpenAIToAnthropicChatConfig {
+                default_model: "claude-opus-4-7",
+            },
+        );
+        assert!(req.get("thinking").is_none());
+        assert_eq!(req["output_config"]["effort"], "low");
     }
 
     #[test]
