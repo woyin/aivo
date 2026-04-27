@@ -397,10 +397,26 @@ pub fn convert_openai_chat_to_gemini_request(body: &Value, config: &OpenAIToGemi
                 })
             })
             .collect();
+        // Translate well-known OpenAI / Responses-API server tools to their
+        // Gemini equivalents instead of dropping. Unknown server tools are
+        // silently skipped (no Gemini equivalent).
+        let mut gemini_tool_groups: Vec<Value> = Vec::new();
         if !declarations.is_empty() {
-            request["tools"] = json!([{
-                "functionDeclarations": declarations
-            }]);
+            gemini_tool_groups.push(json!({ "functionDeclarations": declarations }));
+        }
+        for tool in tools {
+            match tool.get("type").and_then(|v| v.as_str()) {
+                Some("web_search") | Some("web_search_preview") => {
+                    gemini_tool_groups.push(json!({ "googleSearch": {} }));
+                }
+                Some("code_interpreter") => {
+                    gemini_tool_groups.push(json!({ "codeExecution": {} }));
+                }
+                _ => {}
+            }
+        }
+        if !gemini_tool_groups.is_empty() {
+            request["tools"] = Value::Array(gemini_tool_groups);
         }
     }
 
@@ -1946,6 +1962,66 @@ mod tests {
                 .map(|m| !m.contains_key("thinkingConfig"))
                 .unwrap_or(true)
         );
+    }
+
+    #[test]
+    fn web_search_tool_translates_to_gemini_google_search() {
+        let body = json!({
+            "model": "gemini-3-pro-preview",
+            "messages": [{"role": "user", "content": "search"}],
+            "tools": [{"type": "web_search"}]
+        });
+        let req = convert_openai_chat_to_gemini_request(
+            &body,
+            &OpenAIToGeminiConfig {
+                default_model: "gemini-3-pro-preview",
+            },
+        );
+        let tool_groups = req["tools"].as_array().expect("tool groups present");
+        assert!(tool_groups.iter().any(|g| g.get("googleSearch").is_some()));
+    }
+
+    #[test]
+    fn code_interpreter_tool_translates_to_gemini_code_execution() {
+        let body = json!({
+            "model": "gemini-3-pro-preview",
+            "messages": [{"role": "user", "content": "compute"}],
+            "tools": [{"type": "code_interpreter"}]
+        });
+        let req = convert_openai_chat_to_gemini_request(
+            &body,
+            &OpenAIToGeminiConfig {
+                default_model: "gemini-3-pro-preview",
+            },
+        );
+        let tool_groups = req["tools"].as_array().expect("tool groups present");
+        assert!(tool_groups.iter().any(|g| g.get("codeExecution").is_some()));
+    }
+
+    #[test]
+    fn function_and_web_search_tools_appear_in_separate_groups() {
+        let body = json!({
+            "model": "gemini-3-pro-preview",
+            "messages": [{"role": "user", "content": "x"}],
+            "tools": [
+                {"type": "function", "function": {"name": "calc", "description": "", "parameters": {"type": "object"}}},
+                {"type": "web_search"}
+            ]
+        });
+        let req = convert_openai_chat_to_gemini_request(
+            &body,
+            &OpenAIToGeminiConfig {
+                default_model: "gemini-3-pro-preview",
+            },
+        );
+        let groups = req["tools"].as_array().unwrap();
+        assert_eq!(groups.len(), 2);
+        assert!(
+            groups
+                .iter()
+                .any(|g| g.get("functionDeclarations").is_some())
+        );
+        assert!(groups.iter().any(|g| g.get("googleSearch").is_some()));
     }
 
     #[test]

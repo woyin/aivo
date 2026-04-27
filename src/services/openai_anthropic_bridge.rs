@@ -40,6 +40,47 @@ fn is_anthropic_server_block_type(t: &str) -> bool {
     ANTHROPIC_SERVER_BLOCK_TYPES.contains(&t)
 }
 
+/// Convert an OpenAI / Responses-API tool entry into an Anthropic tool entry.
+/// Handles:
+/// - `{type: "function", function: {…}}` → standard Anthropic custom tool
+/// - `{type: "web_search" | "web_search_preview"}` → Anthropic
+///   `web_search_20260209` server tool
+/// - `{type: "code_interpreter"}` → Anthropic `code_execution_20260120`
+///
+/// Unknown server-tool types are dropped (they have no Anthropic equivalent).
+fn translate_openai_tool_to_anthropic(tool: &Value) -> Option<Value> {
+    let kind = tool.get("type").and_then(|v| v.as_str())?;
+    match kind {
+        "function" => Some(json!({
+            "name": tool.get("function").and_then(|f| f.get("name")).cloned().unwrap_or_default(),
+            "description": tool.get("function").and_then(|f| f.get("description")).cloned().unwrap_or(json!("")),
+            "input_schema": tool.get("function").and_then(|f| f.get("parameters")).cloned().unwrap_or(json!({}))
+        })),
+        "web_search" | "web_search_preview" => {
+            let mut anthropic = json!({
+                "type": "web_search_20260209",
+                "name": "web_search",
+            });
+            for key in [
+                "allowed_domains",
+                "blocked_domains",
+                "max_uses",
+                "user_location",
+            ] {
+                if let Some(value) = tool.get(key) {
+                    anthropic[key] = value.clone();
+                }
+            }
+            Some(anthropic)
+        }
+        "code_interpreter" => Some(json!({
+            "type": "code_execution_20260120",
+            "name": "code_execution",
+        })),
+        _ => None,
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct OpenAIToAnthropicChatConfig {
     pub default_model: &'static str,
@@ -101,14 +142,7 @@ pub fn convert_openai_chat_to_anthropic_request(
     if let Some(tools) = body.get("tools").and_then(|t| t.as_array()) {
         let anthropic_tools: Vec<Value> = tools
             .iter()
-            .filter(|tool| tool.get("type").and_then(|v| v.as_str()) == Some("function"))
-            .map(|tool| {
-                json!({
-                    "name": tool.get("function").and_then(|f| f.get("name")).cloned().unwrap_or_default(),
-                    "description": tool.get("function").and_then(|f| f.get("description")).cloned().unwrap_or(json!("")),
-                    "input_schema": tool.get("function").and_then(|f| f.get("parameters")).cloned().unwrap_or(json!({}))
-                })
-            })
+            .filter_map(translate_openai_tool_to_anthropic)
             .collect();
         if !anthropic_tools.is_empty() {
             req["tools"] = Value::Array(anthropic_tools);
@@ -1506,6 +1540,96 @@ mod tests {
             })
             .count();
         assert_eq!(server_block_count, 2);
+    }
+
+    #[test]
+    fn web_search_tool_translates_to_anthropic_native_server_tool() {
+        let body = json!({
+            "model": "claude-opus-4-7",
+            "messages": [{"role": "user", "content": "search for X"}],
+            "tools": [
+                {"type": "web_search"},
+                {"type": "function", "function": {"name": "calc", "description": "calc", "parameters": {"type": "object"}}}
+            ]
+        });
+        let req = convert_openai_chat_to_anthropic_request(
+            &body,
+            &OpenAIToAnthropicChatConfig {
+                default_model: "claude-opus-4-7",
+            },
+        );
+        let tools = req["tools"].as_array().unwrap();
+        let by_type: Vec<&str> = tools
+            .iter()
+            .map(|t| {
+                t.get("type")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_else(|| t["name"].as_str().unwrap_or(""))
+            })
+            .collect();
+        assert!(by_type.contains(&"web_search_20260209"));
+        assert!(by_type.contains(&"calc"));
+    }
+
+    #[test]
+    fn web_search_tool_passes_domain_and_max_uses_constraints_through() {
+        let body = json!({
+            "model": "claude-opus-4-7",
+            "messages": [{"role": "user", "content": "x"}],
+            "tools": [{
+                "type": "web_search",
+                "allowed_domains": ["example.com"],
+                "max_uses": 5
+            }]
+        });
+        let req = convert_openai_chat_to_anthropic_request(
+            &body,
+            &OpenAIToAnthropicChatConfig {
+                default_model: "claude-opus-4-7",
+            },
+        );
+        let tool = &req["tools"][0];
+        assert_eq!(tool["type"], "web_search_20260209");
+        assert_eq!(tool["allowed_domains"][0], "example.com");
+        assert_eq!(tool["max_uses"], 5);
+    }
+
+    #[test]
+    fn code_interpreter_tool_translates_to_anthropic_code_execution() {
+        let body = json!({
+            "model": "claude-opus-4-7",
+            "messages": [{"role": "user", "content": "compute"}],
+            "tools": [{"type": "code_interpreter"}]
+        });
+        let req = convert_openai_chat_to_anthropic_request(
+            &body,
+            &OpenAIToAnthropicChatConfig {
+                default_model: "claude-opus-4-7",
+            },
+        );
+        assert_eq!(req["tools"][0]["type"], "code_execution_20260120");
+    }
+
+    #[test]
+    fn unknown_server_tool_types_are_dropped_silently() {
+        let body = json!({
+            "model": "claude-opus-4-7",
+            "messages": [{"role": "user", "content": "x"}],
+            "tools": [
+                {"type": "computer_use"},
+                {"type": "file_search"},
+                {"type": "function", "function": {"name": "f", "description": "", "parameters": {}}}
+            ]
+        });
+        let req = convert_openai_chat_to_anthropic_request(
+            &body,
+            &OpenAIToAnthropicChatConfig {
+                default_model: "claude-opus-4-7",
+            },
+        );
+        let tools = req["tools"].as_array().unwrap();
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0]["name"], "f");
     }
 
     #[test]
