@@ -190,11 +190,13 @@ pub fn convert_anthropic_to_openai_chat_response(resp: &Value, fallback_model: &
         "tool_use" => "tool_calls",
         "max_tokens" => "length",
         "refusal" => "content_filter",
-        // "stop_sequence" is "we hit a configured stop string" — semantically
-        // closer to OpenAI "stop" than to "length" or "content_filter".
-        // "pause_turn" is multi-turn extended thinking; OpenAI has no exact
-        // analogue, so report "stop" and rely on the extension field below
-        // for callers that need the distinction.
+        // "pause_turn" means Claude is pausing the assistant turn pending
+        // external work (typically a tool result). When we already have
+        // tool_calls in the response, map to "tool_calls" so OpenAI-shaped
+        // clients keep the agentic loop alive instead of treating the
+        // conversation as terminated. With no tool_calls present (e.g.,
+        // server-side tool execution we currently drop), fall back to "stop".
+        "pause_turn" if !tool_calls.is_empty() => "tool_calls",
         "stop_sequence" | "end_turn" | "pause_turn" => "stop",
         _ => "stop",
     };
@@ -1061,6 +1063,31 @@ mod tests {
         assert_eq!(chat["choices"][0]["finish_reason"], "stop");
         // Extension field still preserves the exact reason for callers that need it.
         assert_eq!(chat["choices"][0]["_anthropic_stop_reason"], "pause_turn");
+    }
+
+    #[test]
+    fn convert_anthropic_to_openai_stop_reason_pause_turn_with_tool_use_maps_to_tool_calls() {
+        // pause_turn + tool_use blocks: Claude is pausing for a tool result,
+        // not terminating. Map to "tool_calls" so OpenAI clients keep the
+        // agentic loop alive instead of treating the conversation as over.
+        let resp = json!({
+            "id": "msg_x",
+            "model": "claude-sonnet-4",
+            "content": [
+                {"type": "text", "text": "Looking that up…"},
+                {"type": "tool_use", "id": "toolu_1", "name": "search", "input": {"q": "x"}}
+            ],
+            "stop_reason": "pause_turn",
+            "usage": {"input_tokens": 1, "output_tokens": 1}
+        });
+        let chat = convert_anthropic_to_openai_chat_response(&resp, "claude-sonnet-4");
+        assert_eq!(chat["choices"][0]["finish_reason"], "tool_calls");
+        assert_eq!(chat["choices"][0]["_anthropic_stop_reason"], "pause_turn");
+        let tcs = chat["choices"][0]["message"]["tool_calls"]
+            .as_array()
+            .expect("tool_calls present");
+        assert_eq!(tcs.len(), 1);
+        assert_eq!(tcs[0]["function"]["name"], "search");
     }
 
     #[test]
