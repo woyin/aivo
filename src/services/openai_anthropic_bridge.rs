@@ -1,5 +1,8 @@
 use serde_json::{Value, json};
 
+use crate::services::bridge_defaults::{
+    BRIDGE_DEFAULT_ANTHROPIC_MAX_TOKENS, BRIDGE_FALLBACK_OPENAI_RESPONSE_ID,
+};
 use crate::services::effort::{anthropic_thinking_config, extract_openai_effort};
 use crate::services::http_utils::current_unix_ts;
 use crate::services::openai_models::{
@@ -114,7 +117,7 @@ pub fn convert_openai_chat_to_anthropic_request(
             .unwrap_or(config.default_model),
         "messages": messages,
         "stream": body.get("stream").cloned().unwrap_or(json!(false)),
-        "max_tokens": body.get("max_tokens").cloned().unwrap_or(json!(4096)),
+        "max_tokens": body.get("max_tokens").cloned().unwrap_or(json!(BRIDGE_DEFAULT_ANTHROPIC_MAX_TOKENS)),
     });
 
     if !system_blocks.is_empty() {
@@ -343,7 +346,7 @@ pub fn convert_anthropic_to_openai_chat_response(resp: &Value, fallback_model: &
         id: resp
             .get("id")
             .and_then(|v| v.as_str())
-            .unwrap_or("chatcmpl-aivo")
+            .unwrap_or(BRIDGE_FALLBACK_OPENAI_RESPONSE_ID)
             .to_string(),
         object: "chat.completion".to_string(),
         created: Some(
@@ -1109,7 +1112,7 @@ mod tests {
         );
         assert!(converted["messages"].as_array().unwrap().is_empty());
         assert_eq!(converted["model"], "gpt-4o");
-        assert_eq!(converted["max_tokens"], 4096);
+        assert_eq!(converted["max_tokens"], BRIDGE_DEFAULT_ANTHROPIC_MAX_TOKENS);
     }
 
     #[test]

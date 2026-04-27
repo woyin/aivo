@@ -2,6 +2,7 @@ use anyhow::Result;
 use serde_json::{Value, json};
 use std::collections::HashMap;
 
+use crate::services::bridge_defaults::BRIDGE_FALLBACK_OPENAI_RESPONSE_ID;
 use crate::services::http_utils::{current_unix_ts, sse_data_payload};
 use crate::services::openai_anthropic_bridge::ANTHROPIC_THINKING_EXT;
 
@@ -95,7 +96,7 @@ impl AnthropicToOpenAIStreamConverter {
     pub(crate) fn new(fallback_model: &str) -> Self {
         Self {
             pending: Vec::new(),
-            id: "chatcmpl-aivo".to_string(),
+            id: BRIDGE_FALLBACK_OPENAI_RESPONSE_ID.to_string(),
             model: String::new(),
             fallback_model: fallback_model.to_string(),
             created: current_unix_ts(),
@@ -483,7 +484,7 @@ impl GeminiToOpenAIStreamConverter {
     pub(crate) fn new(model: &str) -> Self {
         Self {
             pending: Vec::new(),
-            id: "chatcmpl-aivo".to_string(),
+            id: BRIDGE_FALLBACK_OPENAI_RESPONSE_ID.to_string(),
             model: model.to_string(),
             created: current_unix_ts(),
             role_sent: false,

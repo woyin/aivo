@@ -733,10 +733,9 @@ pub(crate) fn convert_responses_to_chat_response(resp: &ResponsesResponse) -> Op
     };
 
     OpenAIChatResponse {
-        id: resp
-            .id
-            .clone()
-            .unwrap_or_else(|| "chatcmpl-aivo".to_string()),
+        id: resp.id.clone().unwrap_or_else(|| {
+            crate::services::bridge_defaults::BRIDGE_FALLBACK_OPENAI_RESPONSE_ID.to_string()
+        }),
         object: "chat.completion".to_string(),
         created: None,
         model: resp.model.clone().unwrap_or_else(|| "unknown".to_string()),

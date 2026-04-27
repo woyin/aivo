@@ -9,6 +9,7 @@ pub mod anthropic_router;
 pub mod anthropic_to_openai_router;
 pub mod api_key_store;
 pub mod atomic_write;
+pub mod bridge_defaults;
 pub mod browser_open;
 pub mod chat_session_store;
 pub mod claude_oauth;

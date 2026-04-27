@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
 
+use crate::services::bridge_defaults::BRIDGE_FALLBACK_OPENAI_RESPONSE_ID;
 use crate::services::effort::{extract_openai_effort, gemini_thinking_config};
 use crate::services::http_utils::current_unix_ts;
 use crate::services::model_names::google_native_model_name;
@@ -355,7 +356,10 @@ pub fn convert_openai_chat_to_gemini_request(body: &Value, config: &OpenAIToGemi
                         .and_then(|r| r.as_str())
                         == Some("tool")
                     {
-                        let next = iter.next().expect("peeked tool message");
+                        // peek+next must succeed by Iterator contract, but
+                        // a defensive break keeps the loop robust to
+                        // future refactors that touch the iterator type.
+                        let Some(next) = iter.next() else { break };
                         parts.push(build_tool_response_part(next, &tool_names_by_call_id));
                     }
                     contents.push(json!({ "role": "user", "parts": parts }));
@@ -614,7 +618,7 @@ pub fn convert_gemini_to_openai_chat_response(resp: &Value, fallback_model: &str
     }
 
     json!({
-        "id": resp.get("responseId").cloned().unwrap_or(json!("chatcmpl-aivo")),
+        "id": resp.get("responseId").cloned().unwrap_or_else(|| json!(BRIDGE_FALLBACK_OPENAI_RESPONSE_ID)),
         "object": "chat.completion",
         "created": current_unix_ts(),
         "model": fallback_model,
