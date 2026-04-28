@@ -1,45 +1,14 @@
 # Changelog
 
-## v0.19.5
-
-### Fixes
-
-- Fallback: only latch Responses-API as unsupported on endpoint-missing (404/405/415/501); transient 429/5xx no longer permanently disables it
-- Fallback: clear stale `responses_api_supported = false` written by older builds on first launch
-- Fallback: persist learned path variant alongside protocol so stripped-path wins are remembered across launches
-- Fallback: auto-clear in-memory pin after 5 consecutive non-2xx responses so mid-session upstream changes recover without `aivo keys reset-route`
-- Bridge: forward `image_url` parts in OpenAI→Anthropic conversion (was silently dropping vision input)
-- Bridge: forward `image_url` parts in OpenAI→Gemini conversion (`inlineData` for `data:` URIs, `fileData` for HTTP URLs)
-- Bridge: forward `input_image` / `input_file` parts in Responses→Chat fallback (was reducing to text only)
-- Bridge: unique fallback IDs for Anthropic `tool_use` blocks without `id` (were colliding on `call_0`)
-- Bridge: expand Anthropic `stop_reason` mapping (`refusal` → `content_filter`; preserve original on `_anthropic_stop_reason` extension field)
-- Bridge: expand Gemini `finishReason` mapping (`RECITATION` → `content_filter`)
-- Launcher: replace `unsafe { std::env::set_var("PATH") }` with a `OnceLock`-backed value passed via `Command::env`
-- Gemini: persist `thoughtSignature` to disk so process restarts don't trigger "missing thought_signature" 400s mid-session
-
-### Features
-
-- `aivo keys reset-route <name>`: clear learned protocol/path routing for a key so the next launch re-probes
-- Bridge: forward `top_k` (Anthropic, Gemini), `seed` and `response_format: json_object` (Gemini) where the target supports them
-- Bridge: strip `cache_control` for providers that reject it (Bedrock-style hosts auto-detected)
-
-### Internal
-
-- Rename `test-fast-crypto` Cargo feature to `__internal_test_fast_crypto` so a transitive dependency can't accidentally re-enable reduced-PBKDF2 crypto
-
-
 ## v0.19.4
 
-### Features
+### Improvements
 
-- `--debug`: rewrite as JSONL HTTP request/response logger
-- Fallback: surface learned route in `aivo info`
-
-### Fixes
-
-- Fallback: bail on terminal errors instead of probing
-- Fallback: persist learned protocol pin to stop wasted probes on retries
-- Gemini: group parallel tool responses into a single user turn
+- Fallback: persistent learned protocol/path routing with smarter Responses-API detection
+- Bridge: forward image/file parts and dropped sampling params; safer `tool_use` IDs, stop-reason mapping, and `cache_control` handling
+- Gemini: persist `thoughtSignature` across restarts; group parallel tool responses into one user turn
+- Claude: `--1m`/`--2m` flags (and `--max-context=1m|2m`) append the canonical `[Nm]` suffix to set max context window
+- `aivo keys reset-route <name>` to clear learned routing; `--debug` rewritten as JSONL HTTP logger
 
 
 ## v0.19.3
