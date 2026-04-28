@@ -79,6 +79,7 @@ aivo claude --model llama3.2
 | [keys](#keys) | Manage API keys (add, use, rm, cat, edit, ping) |
 | [models](#models) | List available models from the active provider |
 | [chat](#chat) | Interactive chat TUI or one-shot `-x` mode |
+| [image](#image) | Generate images from a text prompt |
 | [serve](#serve) | Local OpenAI-compatible API server |
 | [alias](#alias) | Create short names for models |
 | [info](#info) | Show system info, keys, tools, and directory state |
@@ -150,6 +151,37 @@ Inject extra environment variables into the child process:
 
 ```bash
 aivo claude --env BASH_DEFAULT_TIMEOUT_MS=60000
+```
+
+#### Claude per-slot model overrides
+
+Pin a different model to one of Claude Code's named slots without touching the others. Bare flag opens the model picker:
+
+```bash
+aivo claude --reasoning-model claude-opus-4-6
+aivo claude --subagent-model claude-haiku-4-5
+aivo claude --haiku-model    claude-haiku-4-5
+aivo claude --sonnet-model   claude-sonnet-4-6
+aivo claude --opus-model                       # picker
+```
+
+#### `--1m` / `--2m` / `--max-context`
+
+Claude only. Append the canonical `[1m]`/`[2m]` suffix to the resolved model so Claude Code uses the 1M or 2M context window:
+
+```bash
+aivo claude --1m
+aivo claude --max-context=2m
+aivo claude -m claude-sonnet-4-6 --1m          # equivalent to -m 'claude-sonnet-4-6[1m]'
+```
+
+#### `--debug`
+
+JSONL HTTP logger. Records every upstream request/response from this launch to a file (default path printed at startup, or pass an explicit path):
+
+```bash
+aivo claude --debug
+aivo claude --debug=/tmp/aivo-http.jsonl
 ```
 
 #### `--context, -c`
@@ -388,6 +420,26 @@ Inside the chat TUI:
 | `/help` | Open command help |
 | `/exit` | Leave chat |
 | `//message` | Send a literal leading slash |
+
+## image
+
+Generate images from a text prompt against the active provider's image API (e.g. `gpt-image-1`, `dall-e-3`, Gemini image models). Experimental.
+
+```bash
+aivo image "a red panda in space"
+aivo image "logo sketch" -m dall-e-3 -o logo.png
+```
+
+#### Common flags
+
+```bash
+aivo image "..." --model gpt-image-1
+aivo image "..." --key openrouter
+aivo image "..." --output ./out/{ts}-{model}.png   # path or template
+aivo image "..." --size 1792x1024 --quality hd
+aivo image "..." --url                              # print provider URL, skip download
+aivo image "..." --json                             # machine-readable
+```
 
 ## serve
 
@@ -629,6 +681,16 @@ Show the heaviest native session files:
 
 ```bash
 aivo stats --top-sessions
+```
+
+#### `--since <DURATION>`
+
+Filter to a recent time window. Accepts `Nm`, `Nh`, `Nd`, `Nw`:
+
+```bash
+aivo stats --since 7d
+aivo stats claude --since 24h
+aivo stats --since 2w
 ```
 
 #### `--json`
