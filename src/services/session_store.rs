@@ -585,6 +585,42 @@ fn default_chat_session_id() -> String {
     "legacy".to_string()
 }
 
+/// One entry in the alias map. Model aliases stay as JSON strings so that
+/// pre-Bundle configs deserialize unchanged; Bundle aliases serialize as a
+/// tagged-by-shape object. `Bundle` is listed first so a JSON object hits it
+/// before falling through to `Model` for any string.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(untagged)]
+pub enum AliasValue {
+    Bundle(BundleAlias),
+    Model(String),
+}
+
+/// A preset launch — `tool` is one of the known AI tool names, and `args` is a
+/// raw passthrough that gets spliced into the run argv (with conflict-filtering
+/// against the user's own flags).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct BundleAlias {
+    pub tool: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+}
+
+impl std::fmt::Display for AliasValue {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AliasValue::Model(m) => f.write_str(m),
+            AliasValue::Bundle(b) => {
+                f.write_str(&b.tool)?;
+                for arg in &b.args {
+                    write!(f, " {}", arg)?;
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
 /// Stored configuration
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct StoredConfig {
@@ -613,9 +649,13 @@ pub struct StoredConfig {
         skip_serializing_if = "UsageStats::is_empty"
     )]
     pub stats: UsageStats,
-    /// Model aliases (e.g. "fast" -> "claude-haiku-4-5")
+    /// Aliases. Two flavors share one namespace:
+    /// - Model alias: short name → model name (e.g. "fast" → "claude-haiku-4-5"),
+    ///   serialized as a JSON string for back-compat with pre-Bundle configs.
+    /// - Bundle alias: short name → preset launch (tool + args), serialized as
+    ///   `{"tool": "claude", "args": ["--key", "work", "--model", "fast"]}`.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
-    pub aliases: HashMap<String, String>,
+    pub aliases: HashMap<String, AliasValue>,
     /// Global last-used key/tool/model selection.
     #[serde(
         rename = "last_selection",
@@ -1343,25 +1383,55 @@ impl SessionStore {
         self.sessions.remove_sessions_for_key(key_id).await
     }
 
-    // ── Model aliases ─────────────────────────────────────────────────────
+    // ── Aliases ───────────────────────────────────────────────────────────
 
-    /// Returns all model aliases.
+    /// Returns just the model aliases (Bundle entries filtered out). Model
+    /// resolution paths use this directly so they never have to know Bundle
+    /// exists.
     pub async fn get_aliases(&self) -> Result<HashMap<String, String>> {
+        let config = self.ctx.load().await?;
+        Ok(config
+            .aliases
+            .into_iter()
+            .filter_map(|(k, v)| match v {
+                AliasValue::Model(m) => Some((k, m)),
+                AliasValue::Bundle(_) => None,
+            })
+            .collect())
+    }
+
+    /// Returns the full alias map — both Model and Bundle entries — for
+    /// listing in the alias command.
+    pub async fn list_alias_values(&self) -> Result<HashMap<String, AliasValue>> {
         let config = self.ctx.load().await?;
         Ok(config.aliases)
     }
 
-    /// Sets a model alias. Returns the previous value if it existed.
-    pub async fn set_alias(&self, name: String, model: String) -> Result<Option<String>> {
+    /// Sets a Model alias. Returns the previous value if it existed (which may
+    /// have been a Bundle — the call replaces it either way).
+    pub async fn set_alias(&self, name: String, model: String) -> Result<Option<AliasValue>> {
         let _lock = self.ctx.acquire_config_lock()?;
         let mut config = self.ctx.load().await?;
-        let prev = config.aliases.insert(name, model);
+        let prev = config.aliases.insert(name, AliasValue::Model(model));
         self.ctx.save_raw(&config).await?;
         Ok(prev)
     }
 
-    /// Removes a model alias. Returns the removed value if it existed.
-    pub async fn remove_alias(&self, name: &str) -> Result<Option<String>> {
+    /// Sets a Bundle alias. Returns the previous value if it existed.
+    pub async fn set_bundle(
+        &self,
+        name: String,
+        bundle: BundleAlias,
+    ) -> Result<Option<AliasValue>> {
+        let _lock = self.ctx.acquire_config_lock()?;
+        let mut config = self.ctx.load().await?;
+        let prev = config.aliases.insert(name, AliasValue::Bundle(bundle));
+        self.ctx.save_raw(&config).await?;
+        Ok(prev)
+    }
+
+    /// Removes an alias of either kind. Returns the removed value if it existed.
+    pub async fn remove_alias(&self, name: &str) -> Result<Option<AliasValue>> {
         let _lock = self.ctx.acquire_config_lock()?;
         let mut config = self.ctx.load().await?;
         let removed = config.aliases.remove(name);
@@ -1371,8 +1441,9 @@ impl SessionStore {
         Ok(removed)
     }
 
-    /// Resolves a model name through aliases, with cycle detection.
-    /// Returns the final resolved model name.
+    /// Resolves a model name through Model aliases, with cycle detection.
+    /// Bundle entries are ignored (they're not models). Returns the final
+    /// resolved model name.
     pub async fn resolve_alias(&self, model: &str) -> Result<String> {
         let aliases = self.get_aliases().await?;
         let mut current = model.to_string();
@@ -2268,13 +2339,53 @@ mod tests {
         assert_eq!(key.opencode_mode, Some(OpenAICompatibilityMode::Direct));
         assert_eq!(key.pi_mode, Some(OpenAICompatibilityMode::Direct));
 
-        assert_eq!(config.aliases.get("fast").unwrap(), "claude-haiku-4-5");
+        assert_eq!(
+            config.aliases.get("fast").unwrap(),
+            &AliasValue::Model("claude-haiku-4-5".to_string())
+        );
 
         // Global last_selection (new format) loaded directly
         let sel = config.last_selection.unwrap();
         assert_eq!(sel.tool, "claude");
 
         assert!(config.starter_key_dismissed);
+    }
+
+    /// Aliases of both shapes (string for Model, object for Bundle) must
+    /// deserialize side-by-side, and the round-trip must preserve both.
+    #[test]
+    fn aliases_mixed_model_and_bundle_round_trip() {
+        let json = r#"{
+            "api_keys": [],
+            "aliases": {
+                "fast": "claude-haiku-4-5",
+                "quick": {
+                    "tool": "claude",
+                    "args": ["--key", "work", "--model", "fast"]
+                }
+            }
+        }"#;
+
+        let config: StoredConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            config.aliases.get("fast").unwrap(),
+            &AliasValue::Model("claude-haiku-4-5".to_string())
+        );
+        let bundle = match config.aliases.get("quick").unwrap() {
+            AliasValue::Bundle(b) => b,
+            other => panic!("expected Bundle, got {other:?}"),
+        };
+        assert_eq!(bundle.tool, "claude");
+        assert_eq!(bundle.args, vec!["--key", "work", "--model", "fast"]);
+
+        // Round-trip: re-serialize and re-load, both shapes preserved.
+        let reserialized = serde_json::to_string(&config).unwrap();
+        let reloaded: StoredConfig = serde_json::from_str(&reserialized).unwrap();
+        assert_eq!(reloaded.aliases, config.aliases);
+        // Sanity: the JSON should keep `fast` as a bare string, not promote it
+        // to an object — that's how legacy configs stay readable.
+        assert!(reserialized.contains(r#""fast":"claude-haiku-4-5""#));
+        assert!(reserialized.contains(r#""tool":"claude""#));
     }
 
     /// The legacy field name "responsesApiSupported" must still deserialize into

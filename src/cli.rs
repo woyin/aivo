@@ -55,6 +55,9 @@ pub enum Commands {
     /// Serve an OpenAI-compatible API that proxies to the active provider
     Serve(ServeArgs),
 
+    /// Create, list, or remove model aliases
+    Alias(AliasArgs),
+
     /// Show system info, keys, tools, and directory state
     #[command(alias = "ls")]
     Info(InfoArgs),
@@ -76,16 +79,22 @@ pub enum Commands {
     McpServe(McpServeArgs),
 }
 
-/// Arguments for `aivo models alias`
+/// Arguments for `aivo alias`
 #[derive(Args, Debug, Clone)]
 pub struct AliasArgs {
-    /// Alias assignment (name=model) or name for rm
+    /// Alias name, `name=model` shorthand, or the `rm` keyword.
     #[arg(value_name = "NAME[=MODEL]")]
     pub assignment: Option<String>,
 
-    /// Model target when using `aivo models alias name model` form
-    #[arg(value_name = "MODEL")]
-    pub value: Option<String>,
+    /// Trailing tokens. For Model alias positional form (`name model`): one
+    /// token. For Bundle aliases (`name <tool> [args...]`): tool plus its
+    /// preset args. For `rm <name>`: the name to remove. Empty for listing.
+    #[arg(
+        value_name = "ARGS",
+        trailing_var_arg = true,
+        allow_hyphen_values = true
+    )]
+    pub rest: Vec<String>,
 
     /// Remove an alias
     #[arg(long, short)]
@@ -248,9 +257,6 @@ pub struct RunArgs {
 /// Arguments for the models command
 #[derive(Args, Debug, Clone)]
 pub struct ModelsArgs {
-    #[command(subcommand)]
-    pub subcommand: Option<ModelsSubcommand>,
-
     /// Select API key by ID or name
     #[arg(
         short = 'k',
@@ -272,13 +278,6 @@ pub struct ModelsArgs {
     /// Output { provider, is_static, models[] } as JSON (pipe to `jq` to filter)
     #[arg(long)]
     pub json: bool,
-}
-
-/// Subcommands of `aivo models`.
-#[derive(Subcommand, Debug, Clone)]
-pub enum ModelsSubcommand {
-    /// Create, list, or remove model aliases
-    Alias(AliasArgs),
 }
 
 /// Arguments for the serve command

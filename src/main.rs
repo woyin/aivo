@@ -16,12 +16,13 @@ mod style;
 mod tui;
 mod version;
 
-use cli::{Cli, Commands, ModelsSubcommand};
+use cli::{Cli, Commands};
 use commands::{
     AliasCommand, ChatCommand, ContextCommand, ImageCommand, InfoCommand, KeysCommand, LogsCommand,
     McpServeCommand, ModelsCommand, RunCommand, ServeCommand, ServeParams, StartCommand,
     StartFlowArgs, StatsCommand, UpdateCommand,
 };
+use constants::{KNOWN_TOOLS, RESERVED_ALIAS_NAMES};
 use errors::ExitCode;
 use key_resolution::{
     KeyLookupMode, KeyResolution, key_or_exit, resolve_image_key_override, resolve_key_override,
@@ -29,10 +30,8 @@ use key_resolution::{
 use services::ai_launcher::AIToolType;
 use services::environment_injector::ClaudeSlotFlags;
 use services::key_compat::KeyCompatContext;
+use services::session_store::{AliasValue, BundleAlias};
 use services::{AILauncher, EnvironmentInjector, SessionStore};
-
-/// Known AI tool names that can be used as shortcut aliases for `run`.
-const TOOL_ALIASES: &[&str] = &["claude", "codex", "gemini", "opencode", "pi"];
 
 /// Refuses to run a `__internal_test_fast_crypto`-built binary against real user config.
 ///
@@ -87,16 +86,25 @@ async fn maybe_init_http_debug(value: &Option<String>) {
 async fn main() {
     fast_crypto_guard();
     let raw_args: Vec<String> = std::env::args().collect();
-    let args = Cli::parse_from(rewrite_cli_args(raw_args));
 
-    // Handle --version and subcommand --help early, before any service initialization.
+    // Initialize services. Bundle aliases need to be loaded *before* CLI
+    // parsing because `aivo <bundle>` and `aivo run <bundle>` are expanded by
+    // `rewrite_cli_args` ahead of clap.
+    let session_store = SessionStore::new();
+    let bundle_index = if needs_bundle_lookup(&raw_args) {
+        load_bundle_index(&session_store).await
+    } else {
+        std::collections::HashMap::new()
+    };
+
+    let args = Cli::parse_from(rewrite_cli_args(raw_args, &bundle_index));
+
+    // Handle --version and subcommand --help early, before any further service initialization.
     if args.version {
         print_version();
         process::exit(0);
     }
 
-    // Initialize services
-    let session_store = SessionStore::new();
     let models_cache = services::ModelsCache::new();
 
     if args.help
@@ -110,11 +118,9 @@ async fn main() {
                 ImageCommand::print_help();
                 ImageCommand::print_active_selection(&session_store).await;
             }
-            Commands::Models(models_args) => match &models_args.subcommand {
-                Some(ModelsSubcommand::Alias(_)) => AliasCommand::print_help(),
-                None => ModelsCommand::print_help(),
-            },
+            Commands::Models(_) => ModelsCommand::print_help(),
             Commands::Serve(_) => ServeCommand::print_help(),
+            Commands::Alias(_) => AliasCommand::print_help(),
             Commands::Info(_) => InfoCommand::print_help(),
             Commands::Logs(_) => LogsCommand::print_help(),
             Commands::Stats(_) => StatsCommand::print_help(),
@@ -158,6 +164,11 @@ async fn main() {
 
     // Route to command handler
     let exit_code = match command {
+        Commands::Alias(alias_args) => {
+            let command = AliasCommand::new(session_store);
+            command.execute(alias_args).await
+        }
+
         Commands::Keys(keys_args) => {
             let command = KeysCommand::new(session_store);
             command.execute(keys_args).await
@@ -444,29 +455,24 @@ async fn main() {
         }
 
         Commands::Models(models_args) => {
-            if let Some(ModelsSubcommand::Alias(alias_args)) = models_args.subcommand {
-                let command = AliasCommand::new(session_store);
-                command.execute(alias_args).await
-            } else {
-                let key_override = key_or_exit(
-                    resolve_key_override(
-                        &session_store,
-                        models_args.key.as_deref(),
-                        KeyLookupMode::RequireActiveOrPrompt,
-                        KeyCompatContext::None,
-                    )
-                    .await,
-                );
-                let command = ModelsCommand::new(session_store, models_cache);
-                command
-                    .execute(
-                        key_override,
-                        models_args.refresh,
-                        models_args.search,
-                        models_args.json,
-                    )
-                    .await
-            }
+            let key_override = key_or_exit(
+                resolve_key_override(
+                    &session_store,
+                    models_args.key.as_deref(),
+                    KeyLookupMode::RequireActiveOrPrompt,
+                    KeyCompatContext::None,
+                )
+                .await,
+            );
+            let command = ModelsCommand::new(session_store, models_cache);
+            command
+                .execute(
+                    key_override,
+                    models_args.refresh,
+                    models_args.search,
+                    models_args.json,
+                )
+                .await
         }
 
         Commands::Serve(serve_args) => {
@@ -562,12 +568,15 @@ async fn main() {
     process::exit(exit_code.code());
 }
 
-fn rewrite_cli_args(raw_args: Vec<String>) -> Vec<String> {
+fn rewrite_cli_args(
+    raw_args: Vec<String>,
+    bundles: &std::collections::HashMap<String, BundleAlias>,
+) -> Vec<String> {
     if raw_args.len() <= 1 {
         return raw_args;
     }
 
-    if TOOL_ALIASES.contains(&raw_args[1].as_str()) {
+    if KNOWN_TOOLS.contains(&raw_args[1].as_str()) {
         let mut rewritten = vec![raw_args[0].clone(), "run".to_string()];
         rewritten.extend_from_slice(&raw_args[1..]);
         return rewritten;
@@ -585,23 +594,134 @@ fn rewrite_cli_args(raw_args: Vec<String>) -> Vec<String> {
         return rewritten;
     }
 
-    if raw_args[1] == "alias" {
-        let mut rewritten = vec![
-            raw_args[0].clone(),
-            "models".to_string(),
-            "alias".to_string(),
-        ];
-        rewritten.extend_from_slice(&raw_args[2..]);
-        return rewritten;
-    }
-
     if raw_args[1] == "-x" || raw_args[1] == "--execute" {
         let mut rewritten = vec![raw_args[0].clone(), "chat".to_string()];
         rewritten.extend_from_slice(&raw_args[1..]);
         return rewritten;
     }
 
+    // `aivo run <bundle> [user-args...]` — expand the bundle, dropping flags
+    // the user already supplied so user wins on conflicts.
+    if raw_args[1] == "run"
+        && raw_args.len() > 2
+        && let Some(bundle) = bundles.get(&raw_args[2])
+    {
+        return expand_bundle(&raw_args[0], bundle, &raw_args[3..]);
+    }
+
+    // `aivo <bundle> [user-args...]` — top-level shortcut, expanded if and
+    // only if the first arg doesn't collide with a built-in name. Reserved
+    // names are validated at `alias add`, so a Bundle entry here is always
+    // safe to expand.
+    if !raw_args[1].starts_with('-')
+        && !RESERVED_ALIAS_NAMES.contains(&raw_args[1].as_str())
+        && let Some(bundle) = bundles.get(&raw_args[1])
+    {
+        return expand_bundle(&raw_args[0], bundle, &raw_args[2..]);
+    }
+
     raw_args
+}
+
+/// Builds the final argv for a Bundle launch:
+///   `<argv0> run <bundle.tool> <filtered_bundle_args...> <user_args...>`
+/// `filtered_bundle_args` is the bundle's stored args minus any flag the user
+/// has already typed — bundle args fill in gaps; user wins on conflicts.
+fn expand_bundle(argv0: &str, bundle: &BundleAlias, user_args: &[String]) -> Vec<String> {
+    let filtered = merge_bundle_with_user(&bundle.args, user_args);
+    let mut out = Vec::with_capacity(3 + filtered.len() + user_args.len());
+    out.push(argv0.to_string());
+    out.push("run".to_string());
+    out.push(bundle.tool.clone());
+    out.extend(filtered);
+    out.extend_from_slice(user_args);
+    out
+}
+
+/// Filter a bundle's preset args against the user's typed args. Drops any
+/// flag (and its value) from the bundle that the user has also supplied —
+/// keyed on the *canonical* long name so `-k` cancels bundle's `--key`,
+/// `--1m` cancels bundle's `--max-context`, etc.
+fn merge_bundle_with_user(bundle_args: &[String], user_args: &[String]) -> Vec<String> {
+    let user_flags: std::collections::HashSet<String> = user_args
+        .iter()
+        .filter_map(|a| canonical_flag_name(a))
+        .collect();
+
+    let mut out: Vec<String> = Vec::with_capacity(bundle_args.len());
+    let mut i = 0;
+    while i < bundle_args.len() {
+        let arg = &bundle_args[i];
+        match canonical_flag_name(arg) {
+            Some(name) if user_flags.contains(&name) => {
+                // Skip the flag itself, plus its value when written as
+                // `--flag value` (no `=`) and the next token isn't another flag.
+                let consumes_value = !arg.contains('=')
+                    && i + 1 < bundle_args.len()
+                    && !bundle_args[i + 1].starts_with('-');
+                i += if consumes_value { 2 } else { 1 };
+            }
+            _ => {
+                out.push(arg.clone());
+                i += 1;
+            }
+        }
+    }
+    out
+}
+
+/// Canonicalize a flag's name so short and long forms compare equal in
+/// bundle-merging. Returns `None` for non-flag args (positional values,
+/// prompt text, etc.).
+fn canonical_flag_name(arg: &str) -> Option<String> {
+    if !arg.starts_with('-') {
+        return None;
+    }
+    let raw = arg.split_once('=').map(|(f, _)| f).unwrap_or(arg);
+    let canon = match raw {
+        "--1m" | "--2m" => "--max-context",
+        "-k" => "--key",
+        "-m" => "--model",
+        "-r" => "--refresh",
+        "-e" => "--env",
+        "-c" => "--context",
+        s => s,
+    };
+    Some(canon.to_string())
+}
+
+/// Returns true if `raw_args[1]` could plausibly be a Bundle alias name —
+/// i.e. it's worth paying for a config read to find out. False for built-in
+/// commands, tool shortcuts, and bare flags.
+fn needs_bundle_lookup(raw_args: &[String]) -> bool {
+    let Some(arg1) = raw_args.get(1) else {
+        return false;
+    };
+    if arg1.starts_with('-') {
+        return false;
+    }
+    if arg1 == "run" {
+        return true;
+    }
+    !RESERVED_ALIAS_NAMES.contains(&arg1.as_str())
+}
+
+/// Snapshot of Bundle aliases for `rewrite_cli_args`. Errors during load are
+/// swallowed — a startup-time alias read failure must never stop the user
+/// from invoking a non-bundle command.
+async fn load_bundle_index(
+    session_store: &SessionStore,
+) -> std::collections::HashMap<String, BundleAlias> {
+    session_store
+        .list_alias_values()
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|(k, v)| match v {
+            AliasValue::Bundle(b) => Some((k, b)),
+            AliasValue::Model(_) => None,
+        })
+        .collect()
 }
 
 /// Prints help information
@@ -626,6 +746,7 @@ fn print_help() {
     print_cmd("serve", "Start a local OpenAI-compatible API server");
     print_cmd("keys", "Manage API keys (use, rm, add, cat, edit)");
     print_cmd("models", "List available models from the active provider");
+    print_cmd("alias", "Create, list, or remove model aliases");
     print_cmd("info", "Show system info, keys, tools, and directory state");
     print_cmd("logs", "Show recent local logs from chat, run, and serve");
     print_cmd("stats", "Show usage statistics");
@@ -642,7 +763,6 @@ fn print_help() {
     };
     print_shortcut("use", "keys use");
     print_shortcut("ping", "keys ping");
-    print_shortcut("alias", "models alias");
     print_shortcut("-x", "chat -x (one-shot; reads stdin when no value)");
     print_shortcut("claude/codex/gemini/opencode/pi", " run <tool>");
     println!();
@@ -1639,10 +1759,30 @@ mod tests {
         assert_eq!(r.remaining_args, args(&["--agent-name", "foo", "file.ts"]));
     }
 
+    fn no_bundles() -> std::collections::HashMap<String, BundleAlias> {
+        std::collections::HashMap::new()
+    }
+
+    fn one_bundle(
+        name: &str,
+        tool: &str,
+        args: &[&str],
+    ) -> std::collections::HashMap<String, BundleAlias> {
+        let mut m = std::collections::HashMap::new();
+        m.insert(
+            name.to_string(),
+            BundleAlias {
+                tool: tool.to_string(),
+                args: args.iter().map(|s| s.to_string()).collect(),
+            },
+        );
+        m
+    }
+
     #[test]
     fn rewrite_injects_chat_for_top_level_execute() {
         assert_eq!(
-            rewrite_cli_args(args(&["aivo", "-x", "hello"])),
+            rewrite_cli_args(args(&["aivo", "-x", "hello"]), &no_bundles()),
             args(&["aivo", "chat", "-x", "hello"])
         );
     }
@@ -1650,7 +1790,7 @@ mod tests {
     #[test]
     fn rewrite_injects_chat_for_long_execute() {
         assert_eq!(
-            rewrite_cli_args(args(&["aivo", "--execute", "hello"])),
+            rewrite_cli_args(args(&["aivo", "--execute", "hello"]), &no_bundles()),
             args(&["aivo", "chat", "--execute", "hello"])
         );
     }
@@ -1658,7 +1798,7 @@ mod tests {
     #[test]
     fn rewrite_keeps_explicit_chat() {
         assert_eq!(
-            rewrite_cli_args(args(&["aivo", "chat", "-x", "hello"])),
+            rewrite_cli_args(args(&["aivo", "chat", "-x", "hello"]), &no_bundles()),
             args(&["aivo", "chat", "-x", "hello"])
         );
     }
@@ -1666,9 +1806,132 @@ mod tests {
     #[test]
     fn rewrite_keeps_tool_alias_precedence() {
         assert_eq!(
-            rewrite_cli_args(args(&["aivo", "claude", "--model", "gpt-5"])),
+            rewrite_cli_args(args(&["aivo", "claude", "--model", "gpt-5"]), &no_bundles()),
             args(&["aivo", "run", "claude", "--model", "gpt-5"])
         );
+    }
+
+    #[test]
+    fn bundle_top_level_expands() {
+        let bundles = one_bundle("quick", "claude", &["--key", "work", "--model", "fast"]);
+        assert_eq!(
+            rewrite_cli_args(args(&["aivo", "quick"]), &bundles),
+            args(&["aivo", "run", "claude", "--key", "work", "--model", "fast"])
+        );
+    }
+
+    #[test]
+    fn bundle_via_run_expands() {
+        let bundles = one_bundle("quick", "claude", &["--key", "work", "--model", "fast"]);
+        assert_eq!(
+            rewrite_cli_args(args(&["aivo", "run", "quick"]), &bundles),
+            args(&["aivo", "run", "claude", "--key", "work", "--model", "fast"])
+        );
+    }
+
+    #[test]
+    fn bundle_user_flag_overrides_bundle() {
+        // User's --model wins; bundle's --key still applies.
+        let bundles = one_bundle(
+            "quick",
+            "claude",
+            &["--key", "work", "--model", "fast", "--max-context", "1m"],
+        );
+        let result = rewrite_cli_args(args(&["aivo", "quick", "--model", "other"]), &bundles);
+        // Expected: bundle args minus --model fast, then user args
+        assert_eq!(
+            result,
+            args(&[
+                "aivo",
+                "run",
+                "claude",
+                "--key",
+                "work",
+                "--max-context",
+                "1m",
+                "--model",
+                "other"
+            ])
+        );
+    }
+
+    #[test]
+    fn bundle_short_flag_cancels_long_in_bundle() {
+        let bundles = one_bundle("quick", "claude", &["--key", "work", "--model", "fast"]);
+        let result = rewrite_cli_args(args(&["aivo", "quick", "-k", "play"]), &bundles);
+        // Bundle's --key was canceled by user's -k
+        assert_eq!(
+            result,
+            args(&["aivo", "run", "claude", "--model", "fast", "-k", "play"])
+        );
+    }
+
+    #[test]
+    fn bundle_one_m_cancels_max_context() {
+        let bundles = one_bundle("quick", "claude", &["--max-context", "1m"]);
+        let result = rewrite_cli_args(args(&["aivo", "quick", "--1m"]), &bundles);
+        assert_eq!(result, args(&["aivo", "run", "claude", "--1m"]));
+    }
+
+    #[test]
+    fn bundle_inline_flag_cancels_bundle_flag() {
+        let bundles = one_bundle("quick", "claude", &["--model", "fast"]);
+        let result = rewrite_cli_args(args(&["aivo", "quick", "--model=other"]), &bundles);
+        assert_eq!(result, args(&["aivo", "run", "claude", "--model=other"]));
+    }
+
+    #[test]
+    fn bundle_passes_through_positional_args() {
+        let bundles = one_bundle("quick", "claude", &["--key", "work"]);
+        let result = rewrite_cli_args(args(&["aivo", "quick", "fix", "the", "bug"]), &bundles);
+        assert_eq!(
+            result,
+            args(&[
+                "aivo", "run", "claude", "--key", "work", "fix", "the", "bug"
+            ])
+        );
+    }
+
+    #[test]
+    fn bundle_keeps_value_with_separate_flag() {
+        // `--debug` in bundle (no value); user passes `--debug=path`.
+        // Since user's `--debug=path` exists, bundle's `--debug` is filtered.
+        let bundles = one_bundle("dbg", "claude", &["--debug"]);
+        let result = rewrite_cli_args(args(&["aivo", "dbg", "--debug=/tmp/x"]), &bundles);
+        assert_eq!(result, args(&["aivo", "run", "claude", "--debug=/tmp/x"]));
+    }
+
+    #[test]
+    fn bundle_named_after_reserved_does_not_expand_top_level() {
+        // Even if a Bundle entry exists for "claude" (shouldn't happen — alias
+        // creation rejects it — but we're defending against tampering), the
+        // top-level path *must* keep the existing tool-alias rewrite. Reserved
+        // names are filtered out before the bundle lookup.
+        let bundles = one_bundle("claude", "codex", &["--key", "x"]);
+        assert_eq!(
+            rewrite_cli_args(args(&["aivo", "claude"]), &bundles),
+            args(&["aivo", "run", "claude"])
+        );
+    }
+
+    #[test]
+    fn canonical_flag_name_normalizes_short_and_alt_forms() {
+        assert_eq!(canonical_flag_name("-k"), Some("--key".to_string()));
+        assert_eq!(canonical_flag_name("--key"), Some("--key".to_string()));
+        assert_eq!(canonical_flag_name("--key=foo"), Some("--key".to_string()));
+        assert_eq!(
+            canonical_flag_name("--1m"),
+            Some("--max-context".to_string())
+        );
+        assert_eq!(
+            canonical_flag_name("--2m"),
+            Some("--max-context".to_string())
+        );
+        assert_eq!(
+            canonical_flag_name("--unknown"),
+            Some("--unknown".to_string())
+        );
+        assert_eq!(canonical_flag_name("positional"), None);
     }
 
     #[test]

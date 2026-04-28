@@ -23,3 +23,40 @@ pub const AIVO_STARTER_EMPTY_SECRET: &str = "";
 /// Not a secret — raises the bar from "copy a URL" to "implement the protocol."
 pub const AIVO_STARTER_SIGNING_KEY: &str =
     "39de0d498e4c6fe7f28f7ccc9956e8e34978188a7d2e122fe3c512fe22863f35";
+
+/// AI tool names recognized as positional arguments to `aivo run` and as the
+/// first token of a Bundle alias's launch line (e.g. `aivo alias quick claude
+/// --key work`). Also doubles as the top-level shortcut list (`aivo claude
+/// ...` → `aivo run claude ...`).
+pub const KNOWN_TOOLS: &[&str] = &["claude", "codex", "gemini", "opencode", "pi"];
+
+/// Names a user must not register as an alias because they collide with
+/// built-in commands or shortcuts and would shadow `aivo <name>` / `aivo run
+/// <name>` dispatch. Includes top-level subcommands, the `ls` info alias, the
+/// shortcut keywords (`use`, `ping`), and the known tool names.
+pub const RESERVED_ALIAS_NAMES: &[&str] = &[
+    // Top-level subcommands
+    "run",
+    "keys",
+    "chat",
+    "image",
+    "models",
+    "serve",
+    "alias",
+    "info",
+    "ls",
+    "logs",
+    "stats",
+    "update",
+    "context",
+    "mcp-serve",
+    // Shortcut keywords rewritten in `rewrite_cli_args`
+    "use",
+    "ping",
+    // AI tools (also rewritten as shortcuts)
+    "claude",
+    "codex",
+    "gemini",
+    "opencode",
+    "pi",
+];

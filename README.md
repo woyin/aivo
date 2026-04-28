@@ -78,7 +78,7 @@ aivo claude --model llama3.2
 | [run](#run) | Launch an AI tool (claude, codex, gemini, opencode, pi) |
 | [keys](#keys) | Manage API keys (add, use, rm, cat, edit, ping) |
 | [models](#models) | List available models from the active provider |
-| [models alias](#models-alias) | Create short names for models |
+| [alias](#alias) | Create short names for models |
 | [chat](#chat) | Interactive chat TUI or one-shot `-x` mode |
 | [image](#image) | Generate images from a text prompt |
 | [serve](#serve) | Local OpenAI-compatible API server |
@@ -517,41 +517,76 @@ aivo serve --auth-token                  # auto-generated token
 aivo serve --auth-token my-secret        # specific token
 ```
 
-## models alias
+## alias
 
-Create short names for models. Aliases work anywhere a model name is accepted.
+Create short names. Two flavors share one namespace:
 
-```bash
-aivo models alias                        # list all aliases
-```
-
-#### Create an alias
+- **Model alias** — short name → model name, accepted anywhere `-m`/`--model` works.
+- **Launch alias** — short name → preset (tool + flags), invoked via `aivo run <name>` or just `aivo <name>`.
 
 ```bash
-aivo models alias fast=claude-haiku-4-5
-aivo models alias best claude-sonnet-4-6 # alternative syntax
+aivo alias                                                 # list all aliases
 ```
 
-Then use it in place of the full model name:
+#### Model aliases
+
+```bash
+aivo alias fast=claude-haiku-4-5
+aivo alias best claude-sonnet-4-6                          # positional form
+```
+
+Use anywhere a model name is accepted:
 
 ```bash
 aivo claude -m fast
 aivo chat -m best
 ```
 
-#### Remove an alias
+#### Launch aliases
+
+When the first arg after the name is a known tool (`claude`, `codex`, `gemini`, `opencode`, `pi`), the alias becomes a launch preset:
 
 ```bash
-aivo models alias rm fast
+aivo alias quick claude --key work --model fast --max-context 1m
+aivo alias dev   codex  --key openrouter --model claude-sonnet-4-6
+```
+
+Run them:
+
+```bash
+aivo run quick                    # full form
+aivo quick                        # top-level shortcut
+```
+
+Override individual flags by re-typing them on the command line — explicit user flags win over the bundle's preset. `-k`/`--key`, `-m`/`--model`, and `--1m`/`--2m`/`--max-context` are recognized as equivalent for the override:
+
+```bash
+aivo run quick --model other      # bundle's --model swapped out, --key still applies
+aivo quick -k personal            # bundle's --key overridden via short form
+```
+
+A launch alias's `--model` can itself reference a model alias — `quick --model fast` resolves through `fast` to `claude-haiku-4-5`.
+
+#### Remove an alias
+
+`rm` works for both kinds:
+
+```bash
+aivo alias rm fast
+aivo alias rm quick
 ```
 
 #### `--json`
 
-Output the alias list as JSON:
+Output the alias list as JSON. Model entries are JSON strings; launch entries are `{"tool": ..., "args": [...]}` objects:
 
 ```bash
-aivo models alias --json
+aivo alias --json
 ```
+
+#### Reserved names
+
+Alias names that collide with built-in subcommands, shortcut keywords (`use`, `ping`), or AI tool names (`claude`, `codex`, etc.) are rejected at definition time so they don't shadow `aivo <name>` dispatch.
 
 ## info
 

@@ -1,15 +1,18 @@
 /**
- * AliasCommand handler — manage model aliases.
+ * AliasCommand handler — manage aliases.
  *
- * Aliases map short names (e.g. "fast") to full model names
- * (e.g. "claude-haiku-4-5"). They are resolved at routing time
- * by any command that accepts --model.
+ * Two flavors share the same namespace:
+ * - Model alias: short name → model name (e.g. "fast" → "claude-haiku-4-5"),
+ *   resolved by any command that accepts --model.
+ * - Bundle alias: short name → preset launch (tool + args), resolved by
+ *   `aivo run <bundle>` and the `aivo <bundle>` shortcut.
  */
 use anyhow::Result;
 
 use crate::cli::AliasArgs;
+use crate::constants::{KNOWN_TOOLS, RESERVED_ALIAS_NAMES};
 use crate::errors::ExitCode;
-use crate::services::session_store::SessionStore;
+use crate::services::session_store::{AliasValue, BundleAlias, SessionStore};
 use crate::style;
 
 pub struct AliasCommand {
@@ -42,34 +45,35 @@ impl AliasCommand {
                 anyhow::bail!("--json only applies to listing aliases");
             }
             let name = if rm_keyword {
-                args.value.as_deref()
+                args.rest.first().map(String::as_str)
             } else {
                 args.assignment.as_deref()
             };
             return self.remove_alias(name).await;
         }
 
-        // `aivo models alias name=model` or `aivo models alias name model`
+        // `aivo alias name=model`, `aivo alias name model`, or
+        // `aivo alias name <tool> [args...]` (Bundle).
         if let Some(ref assignment) = args.assignment {
             if args.json {
                 anyhow::bail!("--json only applies to listing aliases");
             }
-            return self.set_alias(assignment, args.value.as_deref()).await;
+            return self.set_alias(assignment, &args.rest).await;
         }
 
-        // `aivo models alias` — list all
+        // `aivo alias` — list all
         self.list_aliases(args.json).await
     }
 
     async fn list_aliases(&self, json: bool) -> Result<ExitCode> {
-        let aliases = self.session_store.get_aliases().await?;
+        let aliases = self.session_store.list_alias_values().await?;
 
         if json {
             let mut entries: Vec<_> = aliases.into_iter().collect();
             entries.sort_by(|a, b| a.0.cmp(&b.0));
             let payload: serde_json::Map<String, serde_json::Value> = entries
                 .into_iter()
-                .map(|(name, model)| (name, serde_json::Value::String(model)))
+                .map(|(name, value)| (name, serde_json::to_value(&value).unwrap_or_default()))
                 .collect();
             println!("{}", serde_json::to_string_pretty(&payload)?);
             return Ok(ExitCode::Success);
@@ -80,7 +84,13 @@ impl AliasCommand {
             println!();
             println!(
                 "{}",
-                style::dim("Create one with: aivo models alias fast=claude-haiku-4-5")
+                style::dim("Create a model alias:  aivo alias fast=claude-haiku-4-5")
+            );
+            println!(
+                "{}",
+                style::dim(
+                    "Create a launch alias: aivo alias quick claude --key work --model fast"
+                )
             );
             return Ok(ExitCode::Success);
         }
@@ -88,41 +98,89 @@ impl AliasCommand {
         let mut entries: Vec<_> = aliases.into_iter().collect();
         entries.sort_by(|a, b| a.0.cmp(&b.0));
 
+        // Pad raw strings *before* styling — `{:width$}` counts ANSI escape
+        // bytes as part of the string length, so applying width to a styled
+        // string produces wrong visual alignment.
         let max_name = entries.iter().map(|(n, _)| n.len()).max().unwrap_or(0);
-        for (name, model) in &entries {
+        const KIND_WIDTH: usize = 6; // "launch"
+        for (name, value) in &entries {
+            let kind = match value {
+                AliasValue::Model(_) => "model",
+                AliasValue::Bundle(_) => "launch",
+            };
+            let padded_name = format!("{:<width$}", name, width = max_name);
+            let padded_kind = format!("{:<width$}", kind, width = KIND_WIDTH);
             println!(
-                "{:width$} {} {}",
-                style::cyan(name),
+                "{}  {}  {} {}",
+                style::cyan(padded_name),
+                style::dim(padded_kind),
                 style::dim("->"),
-                model,
-                width = max_name
+                value,
             );
         }
         Ok(ExitCode::Success)
     }
 
-    async fn set_alias(&self, assignment: &str, extra_value: Option<&str>) -> Result<ExitCode> {
-        let (name, model) = if let Some((n, m)) = assignment.split_once('=') {
-            (n.to_string(), m.to_string())
-        } else if let Some(val) = extra_value {
-            (assignment.to_string(), val.to_string())
-        } else {
+    async fn set_alias(&self, assignment: &str, rest: &[String]) -> Result<ExitCode> {
+        // `name=model` shorthand: Model alias only, rejects extra trailing args.
+        if let Some((name, model)) = assignment.split_once('=') {
+            if !rest.is_empty() {
+                eprintln!(
+                    "{} `name=model` shorthand cannot mix with trailing args. Use `aivo alias {} {}` instead.",
+                    style::red("Error:"),
+                    name,
+                    rest.join(" ")
+                );
+                return Ok(ExitCode::UserError);
+            }
+            return self.set_model_alias(name, model).await;
+        }
+
+        let name = assignment;
+        let Some(first) = rest.first() else {
             eprintln!(
-                "{} Expected format: aivo models alias name=model",
+                "{} Expected:  aivo alias <name>=<model>  |  aivo alias <name> <model>  |  aivo alias <name> <tool> [args...]",
                 style::red("Error:")
             );
             return Ok(ExitCode::UserError);
         };
 
-        if name.is_empty() || model.is_empty() {
+        // Bundle: first trailing token is a known tool name.
+        if KNOWN_TOOLS.contains(&first.as_str()) {
+            let bundle = BundleAlias {
+                tool: first.clone(),
+                args: rest[1..].to_vec(),
+            };
+            return self.set_bundle_alias(name, bundle).await;
+        }
+
+        // Otherwise positional Model alias: `name model` (single trailing token).
+        if rest.len() == 1 {
+            return self.set_model_alias(name, first).await;
+        }
+
+        eprintln!(
+            "{} To create a launch alias, the first arg after the name must be a tool ({}). Got '{}'.",
+            style::red("Error:"),
+            KNOWN_TOOLS.join(", "),
+            first
+        );
+        Ok(ExitCode::UserError)
+    }
+
+    async fn set_model_alias(&self, name: &str, model: &str) -> Result<ExitCode> {
+        if model.is_empty() {
             eprintln!(
-                "{} Both alias name and model must be non-empty",
+                "{} Model alias target must not be empty",
                 style::red("Error:")
             );
             return Ok(ExitCode::UserError);
         }
+        if let Err(msg) = validate_alias_name(name) {
+            eprintln!("{} {}", style::red("Error:"), msg);
+            return Ok(ExitCode::UserError);
+        }
 
-        // Check for self-reference
         if name == model {
             eprintln!(
                 "{} Alias cannot point to itself: {}",
@@ -132,10 +190,11 @@ impl AliasCommand {
             return Ok(ExitCode::UserError);
         }
 
-        // Check for circular aliases
+        // Cycle check operates only on the Model-alias subgraph; Bundle entries
+        // are not chainable through `--model` resolution.
         let mut aliases = self.session_store.get_aliases().await?;
-        aliases.insert(name.clone(), model.clone());
-        if has_cycle(&aliases, &name) {
+        aliases.insert(name.to_string(), model.to_string());
+        if has_cycle(&aliases, name) {
             eprintln!(
                 "{} This would create a circular alias chain",
                 style::red("Error:")
@@ -145,23 +204,23 @@ impl AliasCommand {
 
         let prev = self
             .session_store
-            .set_alias(name.clone(), model.clone())
+            .set_alias(name.to_string(), model.to_string())
             .await?;
-        match prev {
-            Some(old) => println!(
-                "Updated {} {} {} (was {})",
-                style::cyan(&name),
-                style::dim("->"),
-                model,
-                style::dim(&old)
-            ),
-            None => println!(
-                "Created {} {} {}",
-                style::cyan(&name),
-                style::dim("->"),
-                model
-            ),
+        report_set(name, &AliasValue::Model(model.to_string()), prev);
+        Ok(ExitCode::Success)
+    }
+
+    async fn set_bundle_alias(&self, name: &str, bundle: BundleAlias) -> Result<ExitCode> {
+        if let Err(msg) = validate_alias_name(name) {
+            eprintln!("{} {}", style::red("Error:"), msg);
+            return Ok(ExitCode::UserError);
         }
+        // Tool already validated by KNOWN_TOOLS check at the call site.
+        let prev = self
+            .session_store
+            .set_bundle(name.to_string(), bundle.clone())
+            .await?;
+        report_set(name, &AliasValue::Bundle(bundle), prev);
         Ok(ExitCode::Success)
     }
 
@@ -169,21 +228,18 @@ impl AliasCommand {
         let name = match name {
             Some(n) => n,
             None => {
-                eprintln!(
-                    "{} Expected: aivo models alias rm <name>",
-                    style::red("Error:")
-                );
+                eprintln!("{} Expected: aivo alias rm <name>", style::red("Error:"));
                 return Ok(ExitCode::UserError);
             }
         };
 
         match self.session_store.remove_alias(name).await? {
-            Some(model) => {
+            Some(value) => {
                 println!(
                     "Removed {} {} {}",
                     style::cyan(name),
                     style::dim("->"),
-                    style::dim(&model)
+                    style::dim(value.to_string())
                 );
                 Ok(ExitCode::Success)
             }
@@ -195,45 +251,99 @@ impl AliasCommand {
     }
 
     pub fn print_help() {
-        println!("{} aivo models alias [name=model]", style::bold("Usage:"));
+        println!(
+            "{} aivo alias [name[=model] | name <tool> [args...]]",
+            style::bold("Usage:")
+        );
         println!();
-        println!("{}", style::dim("Create, list, or remove model aliases."));
+        println!(
+            "{}",
+            style::dim("Create, list, or remove aliases. Two flavors share one namespace:")
+        );
+        println!(
+            "{}",
+            style::dim(
+                "  model — short name → model name; works wherever -m / --model is accepted."
+            )
+        );
+        println!(
+            "{}",
+            style::dim("  launch — short name → preset (tool + flags); run via `aivo run <name>`.")
+        );
         println!();
         println!("{}", style::bold("Actions:"));
         let print_row = |label: &str, desc: &str| {
             println!(
                 "  {}{}",
-                style::cyan(format!("{:<14}", label)),
+                style::cyan(format!("{:<22}", label)),
                 style::dim(desc)
             );
         };
         print_row("(no args)", "List all aliases");
-        print_row("name=model", "Create or update an alias");
-        print_row("name model", "Create or update an alias");
-        print_row("rm <name>", "Remove an alias");
+        print_row("name=model", "Create or update a model alias");
+        print_row("name model", "Create or update a model alias (positional)");
+        print_row("name <tool> [args...]", "Create or update a launch alias");
+        print_row("rm <name>", "Remove an alias of either kind");
         println!();
         println!("{}", style::bold("Options:"));
         let print_opt = |flag: &str, desc: &str| {
             println!(
                 "  {}{}",
-                style::cyan(format!("{:<14}", flag)),
+                style::cyan(format!("{:<22}", flag)),
                 style::dim(desc)
             );
         };
         print_opt("--json", "Output alias list as JSON (listing only)");
         println!();
         println!("{}", style::bold("Examples:"));
+        println!("  {}", style::dim("aivo alias fast=claude-haiku-4-5"));
+        println!("  {}", style::dim("aivo alias best claude-sonnet-4-6"));
         println!(
             "  {}",
-            style::dim("aivo models alias fast=claude-haiku-4-5")
+            style::dim("aivo alias quick claude --key work --model fast --max-context 1m")
         );
+        println!("  {}", style::dim("aivo run quick"));
         println!(
             "  {}",
-            style::dim("aivo models alias best claude-sonnet-4-6")
+            style::dim("aivo run quick --model other  # override one flag")
         );
-        println!("  {}", style::dim("aivo models alias rm fast"));
-        println!("  {}", style::dim("aivo models alias"));
-        println!("  {}", style::dim("aivo models alias --json"));
+        println!("  {}", style::dim("aivo alias rm quick"));
+        println!("  {}", style::dim("aivo alias --json"));
+    }
+}
+
+fn validate_alias_name(name: &str) -> Result<(), String> {
+    if name.is_empty() {
+        return Err("Alias name must not be empty".to_string());
+    }
+    if name.starts_with('-') || name.contains('=') || name.contains(char::is_whitespace) {
+        return Err(format!(
+            "Alias name '{name}' must not start with '-', contain '=', or contain whitespace"
+        ));
+    }
+    if RESERVED_ALIAS_NAMES.contains(&name) {
+        return Err(format!(
+            "'{name}' is reserved (collides with a built-in command, shortcut, or tool name). Pick a different alias name."
+        ));
+    }
+    Ok(())
+}
+
+fn report_set(name: &str, new_value: &AliasValue, prev: Option<AliasValue>) {
+    match prev {
+        Some(old) => println!(
+            "Updated {} {} {} (was {})",
+            style::cyan(name),
+            style::dim("->"),
+            new_value,
+            style::dim(old.to_string())
+        ),
+        None => println!(
+            "Created {} {} {}",
+            style::cyan(name),
+            style::dim("->"),
+            new_value
+        ),
     }
 }
 
@@ -315,6 +425,7 @@ mod tests {
 
     #[tokio::test]
     async fn remove_alias_returns_old_value() {
+        use crate::services::session_store::AliasValue;
         let dir = tempfile::TempDir::new().unwrap();
         let store = SessionStore::with_path(dir.path().join("config.json"));
 
@@ -323,7 +434,7 @@ mod tests {
             .await
             .unwrap();
         let removed = store.remove_alias("fast").await.unwrap();
-        assert_eq!(removed, Some("haiku".to_string()));
+        assert_eq!(removed, Some(AliasValue::Model("haiku".to_string())));
 
         let removed_again = store.remove_alias("fast").await.unwrap();
         assert_eq!(removed_again, None);
@@ -372,5 +483,78 @@ mod tests {
 
         let resolved = store.resolve_alias("claude-sonnet-4-6").await.unwrap();
         assert_eq!(resolved, "claude-sonnet-4-6");
+    }
+
+    #[test]
+    fn validate_alias_name_accepts_normal_names() {
+        assert!(validate_alias_name("fast").is_ok());
+        assert!(validate_alias_name("k25").is_ok());
+        assert!(validate_alias_name("my-alias").is_ok());
+    }
+
+    #[test]
+    fn validate_alias_name_rejects_reserved_names() {
+        for reserved in &["claude", "run", "alias", "use", "ping", "ls"] {
+            assert!(
+                validate_alias_name(reserved).is_err(),
+                "expected '{reserved}' to be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_alias_name_rejects_bad_shapes() {
+        assert!(validate_alias_name("").is_err());
+        assert!(validate_alias_name("--flag").is_err());
+        assert!(validate_alias_name("name=value").is_err());
+        assert!(validate_alias_name("has space").is_err());
+    }
+
+    #[tokio::test]
+    async fn set_bundle_alias_round_trip() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = SessionStore::with_path(dir.path().join("config.json"));
+
+        let bundle = BundleAlias {
+            tool: "claude".to_string(),
+            args: vec![
+                "--key".to_string(),
+                "work".to_string(),
+                "--model".to_string(),
+                "fast".to_string(),
+            ],
+        };
+        store
+            .set_bundle("quick".to_string(), bundle.clone())
+            .await
+            .unwrap();
+
+        let all = store.list_alias_values().await.unwrap();
+        assert_eq!(all.get("quick"), Some(&AliasValue::Bundle(bundle)));
+
+        // get_aliases() filters out bundle entries, so model resolution paths
+        // never see them.
+        let model_aliases = store.get_aliases().await.unwrap();
+        assert!(!model_aliases.contains_key("quick"));
+    }
+
+    #[tokio::test]
+    async fn set_bundle_then_overwrite_with_model_returns_prev_bundle() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = SessionStore::with_path(dir.path().join("config.json"));
+
+        let bundle = BundleAlias {
+            tool: "claude".to_string(),
+            args: vec![],
+        };
+        store
+            .set_bundle("dev".to_string(), bundle.clone())
+            .await
+            .unwrap();
+        let prev = store
+            .set_alias("dev".to_string(), "claude-sonnet".to_string())
+            .await
+            .unwrap();
+        assert_eq!(prev, Some(AliasValue::Bundle(bundle)));
     }
 }
