@@ -1,13 +1,12 @@
 # aivo
 
-A lightweight CLI for managing API keys and running Claude Code, Codex, Gemini, OpenCode, and Pi CLI across providers.
+A CLI for managing API keys and running Claude Code, Codex, Gemini, OpenCode, and Pi across providers.
 
 ## What it does
 
-- Securely manages multiple API keys for different providers.
-- Runs `claude`, `codex`, `gemini`, `opencode`, and `pi` CLI tools seamlessly.
-- Bridges context across tools — each CLI can see the others' recent work on the same project, and Claude/Codex can read each other mid-conversation.
-- Provides a simple chat TUI and a one-shot `-x` mode.
+- Stores multiple provider API keys, encrypted at rest.
+- Runs `claude`, `codex`, `gemini`, `opencode`, and `pi` against any saved key.
+- Includes a chat TUI and a one-shot `-x` mode.
 - Can expose the active provider as a local OpenAI-compatible server.
 
 ## Install
@@ -24,7 +23,7 @@ Install script:
 curl -fsSL https://getaivo.dev/install.sh | bash
 ```
 
-Via npm (only recommended for windows users):
+Via npm (recommended for Windows users):
 
 ```bash
 npm install -g @yuanchuan/aivo
@@ -35,7 +34,7 @@ Or download a binary from [GitHub Releases](https://github.com/yuanchuan/aivo/re
 
 ## Quick Start
 
-aivo ships with a free built-in provider (`aivo/starter`) that is activated automatically on first run — no API key needed:
+aivo ships with a free built-in provider (`aivo/starter`) that activates on first run — no API key needed:
 
 ```bash
 aivo -x hello
@@ -67,7 +66,7 @@ Use local models via Ollama.
 ```bash
 aivo keys add        # pick "Ollama" from the provider list
 
-# auto pull the model if not present
+# auto-pulls the model if not present
 aivo claude --model llama3.2
 ```
 
@@ -208,8 +207,7 @@ Cross-tool MCP is enabled by default — each tool auto-registers under its CLI 
 
 #### `aivo run`
 
-Without a tool name, `aivo run` uses the interactive start flow, which remembers your last key + tool selection globally,
-so next time you run `aivo run`, it will skip the selection step and go straight to launching the tool.
+Without a tool name, `aivo run` opens the interactive start flow and remembers your last key + tool selection. The next `aivo run` skips the picker and launches that tool directly.
 
 ```bash
 aivo run
@@ -443,7 +441,7 @@ aivo image "..." --json                             # machine-readable
 
 ## serve
 
-`aivo serve` exposes the active provider as a local OpenAI-compatible endpoint. Handy for scripts and tools that already speak the OpenAI API.
+`aivo serve` exposes the active provider as a local OpenAI-compatible endpoint, for scripts and tools that already speak the OpenAI API.
 
 ```bash
 aivo serve                               # http://127.0.0.1:24860
@@ -590,7 +588,7 @@ Alias names that collide with built-in subcommands, shortcut keywords (`use`, `p
 
 ## info
 
-Show a compact overview of saved keys, installed tools, the last remembered tool/model selection, and the cached model count for the active key. (`ls` is accepted as an alias.)
+Show an overview of saved keys, installed tools, the last remembered tool/model selection, and the cached model count for the active key. (`ls` is accepted as an alias.)
 
 ```bash
 aivo info

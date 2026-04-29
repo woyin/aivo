@@ -1,6 +1,6 @@
 [package]
 name = "aivo"
-version = "0.19.4"
+version = "0.19.5"
 edition = "2024"
 authors = ["yuanchuan"]
 description = "A lightweight CLI for managing API keys and running Claude Code, Codex, and Gemini CLI across providers"

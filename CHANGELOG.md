@@ -1,5 +1,16 @@
 # Changelog
 
+## v0.19.5
+
+### Improvements
+
+- Extended `alias` support to launch tool, not only model
+- Added Poolside provider preset
+- Improved `--max-context` flag parsing to handle more formats and edge cases
+- Force non-streamed upstream for Inception Mercury when tools are in use
+- Fixed `alias rm <name>` parsing
+
+
 ## v0.19.4
 
 ### Improvements
