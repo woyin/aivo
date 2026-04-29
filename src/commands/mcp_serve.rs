@@ -16,6 +16,7 @@
 //! The server exits cleanly on stdin EOF — its lifetime is bound to the
 //! parent tool's MCP-client process.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
@@ -272,39 +273,80 @@ async fn handle_list_sessions(
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
 
-    let threads = ingest_project(project_root, IngestOptions::default())
-        .await
-        .map_err(|e| format!("Failed to enumerate sessions: {e}"))?;
+    let threads = ingest_project(
+        project_root,
+        IngestOptions {
+            max_age_days: None,
+            ..IngestOptions::default()
+        },
+    )
+    .await
+    .map_err(|e| format!("Failed to enumerate sessions: {e}"))?;
 
-    // Load active nickname entries so we can annotate matching sessions.
+    // Load active nickname entries and resolve each to a concrete session id so
+    // same-CLI peers do not collapse onto the same newest transcript.
     let registry_entries = match registry_root {
         Some(root) => nickname_registry::list_active(root).await,
         None => Vec::new(),
     };
+    let nickname_by_session_id =
+        resolve_nickname_session_ids(project_root, registry_entries.as_slice()).await;
 
     let items: Vec<Value> = threads
         .into_iter()
         .filter(|t| cli_filter.as_deref().is_none_or(|c| t.cli == c))
         .map(|t| {
-            // A session matches a registry entry if the CLI matches and the
-            // session was updated at or after the entry's started_at.
-            let nickname = registry_entries
-                .iter()
-                .find(|e| e.cli == t.cli && t.updated_at >= e.started_at)
-                .map(|e| Value::String(e.nickname.clone()));
-
             json!({
                 "cli": t.cli,
                 "session_id": t.session_id,
                 "topic": t.topic,
                 "updated_at": t.updated_at.to_rfc3339(),
                 "source_path": t.source_path,
-                "nickname": nickname.unwrap_or(Value::Null),
+                "nickname": nickname_by_session_id
+                    .get(&t.session_id)
+                    .cloned()
+                    .map(Value::String)
+                    .unwrap_or(Value::Null),
             })
         })
         .collect();
 
     Ok(json!({ "sessions": items }))
+}
+
+async fn resolve_nickname_session_ids(
+    project_root: &std::path::Path,
+    registry_entries: &[nickname_registry::RegistryEntry],
+) -> HashMap<String, String> {
+    let mut entries = registry_entries.to_vec();
+    entries.sort_by(|a, b| {
+        b.started_at
+            .cmp(&a.started_at)
+            .then_with(|| a.nickname.cmp(&b.nickname))
+    });
+
+    let mut nickname_by_session_id = HashMap::new();
+    let mut claimed_session_ids = Vec::new();
+
+    for entry in entries {
+        let resolved = resolve_session(
+            project_root,
+            &entry.cli,
+            None,
+            &claimed_session_ids,
+            Some(entry.started_at),
+            1,
+        )
+        .await;
+        let Ok(Some(transcript)) = resolved else {
+            continue;
+        };
+
+        claimed_session_ids.push(transcript.session_id.clone());
+        nickname_by_session_id.insert(transcript.session_id, entry.nickname);
+    }
+
+    nickname_by_session_id
 }
 
 async fn handle_get_session(

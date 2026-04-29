@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use aivo::services::context_ingest::encode_claude_dir;
+use chrono::{Duration, SecondsFormat, Utc};
 use serde_json::{Value, json};
 
 /// Returns the path to the aivo binary to test against. Prefers the current
@@ -28,18 +29,23 @@ fn aivo_exe() -> PathBuf {
 }
 
 /// Writes a fixture Claude session JSONL for the given encoded-cwd dir.
-fn seed_claude(home: &Path, cwd: &str, session_id: &str, lines: &[&str]) {
+fn seed_claude<S: AsRef<str>>(home: &Path, cwd: &str, session_id: &str, lines: &[S]) {
     let dir = home
         .join(".claude")
         .join("projects")
         .join(encode_claude_dir(cwd));
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join(format!("{session_id}.jsonl"));
-    std::fs::write(path, lines.join("\n")).unwrap();
+    let body = lines
+        .iter()
+        .map(|line| line.as_ref())
+        .collect::<Vec<_>>()
+        .join("\n");
+    std::fs::write(path, body).unwrap();
 }
 
 /// Writes a fixture Codex rollout JSONL.
-fn seed_codex(home: &Path, cwd: &str, session_id: &str, extra_lines: &[&str]) {
+fn seed_codex<S: AsRef<str>>(home: &Path, cwd: &str, session_id: &str, extra_lines: &[S]) {
     let dir = home
         .join(".codex")
         .join("sessions")
@@ -50,14 +56,20 @@ fn seed_codex(home: &Path, cwd: &str, session_id: &str, extra_lines: &[&str]) {
     let path = dir.join(format!("rollout-{session_id}.jsonl"));
     // Escape backslashes so Windows-style paths stay valid JSON.
     let cwd_json = cwd.replace('\\', "\\\\");
+    let meta_timestamp = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
     let mut lines: Vec<String> = Vec::new();
     lines.push(format!(
-        r#"{{"type":"session_meta","timestamp":"2026-04-15T10:00:00Z","payload":{{"id":"{sid}","cwd":"{cwd}"}}}}"#,
+        r#"{{"type":"session_meta","timestamp":"{timestamp}","payload":{{"id":"{sid}","cwd":"{cwd}"}}}}"#,
+        timestamp = meta_timestamp,
         sid = session_id,
         cwd = cwd_json
     ));
-    lines.extend(extra_lines.iter().map(|s| s.to_string()));
+    lines.extend(extra_lines.iter().map(|s| s.as_ref().to_string()));
     std::fs::write(path, lines.join("\n")).unwrap();
+}
+
+fn ts_minutes_ago(minutes: i64) -> String {
+    (Utc::now() - Duration::minutes(minutes)).to_rfc3339_opts(SecondsFormat::Secs, true)
 }
 
 /// Spawn `aivo mcp-serve --cwd <cwd>` with HOME overridden to `home`.
@@ -114,24 +126,36 @@ fn initialize_tools_list_and_get_session_end_to_end() {
     let home = home_dir.path();
     let project_dir = tempfile::TempDir::new().unwrap();
     let project_root = std::fs::canonicalize(project_dir.path()).unwrap();
+    let claude_user_ts = ts_minutes_ago(4);
+    let claude_assistant_ts = ts_minutes_ago(3);
+    let codex_user_ts = ts_minutes_ago(2);
+    let codex_assistant_ts = ts_minutes_ago(1);
 
     // Seed Claude + Codex fixtures scoped to this project.
     seed_claude(
         home,
         &project_root.to_string_lossy(),
         "sid-abc-1234",
-        &[
-            r#"{"type":"user","sessionId":"sid-abc-1234","isSidechain":false,"timestamp":"2026-04-15T10:00:00Z","message":{"content":"Please review my pagination helper in handlers/users.go."}}"#,
-            r#"{"type":"assistant","sessionId":"sid-abc-1234","isSidechain":false,"timestamp":"2026-04-15T10:01:00Z","message":{"content":[{"type":"text","text":"Found two bugs: (1) empty cursor returns 500, (2) limit > 1000 is not clamped."}]}}"#,
+        &vec![
+            format!(
+                r#"{{"type":"user","sessionId":"sid-abc-1234","isSidechain":false,"timestamp":"{claude_user_ts}","message":{{"content":"Please review my pagination helper in handlers/users.go."}}}}"#
+            ),
+            format!(
+                r#"{{"type":"assistant","sessionId":"sid-abc-1234","isSidechain":false,"timestamp":"{claude_assistant_ts}","message":{{"content":[{{"type":"text","text":"Found two bugs: (1) empty cursor returns 500, (2) limit > 1000 is not clamped."}}]}}}}"#
+            ),
         ],
     );
     seed_codex(
         home,
         &project_root.to_string_lossy(),
         "codex-xyz-9999",
-        &[
-            r#"{"type":"response_item","timestamp":"2026-04-15T10:05:00Z","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"Please review the pagination patch in handlers/users.go for correctness."}]}}"#,
-            r#"{"type":"response_item","timestamp":"2026-04-15T10:06:00Z","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"LGTM overall but there is one nit: empty cursor still 500s."}]}}"#,
+        &vec![
+            format!(
+                r#"{{"type":"response_item","timestamp":"{codex_user_ts}","payload":{{"type":"message","role":"user","content":[{{"type":"input_text","text":"Please review the pagination patch in handlers/users.go for correctness."}}]}}}}"#
+            ),
+            format!(
+                r#"{{"type":"response_item","timestamp":"{codex_assistant_ts}","payload":{{"type":"message","role":"assistant","content":[{{"type":"output_text","text":"LGTM overall but there is one nit: empty cursor still 500s."}}]}}}}"#
+            ),
         ],
     );
 
@@ -227,23 +251,35 @@ fn mcp_serve_list_sessions_filters_by_cli() {
     let home = home_dir.path();
     let project_dir = tempfile::TempDir::new().unwrap();
     let project_root = std::fs::canonicalize(project_dir.path()).unwrap();
+    let claude_user_ts = ts_minutes_ago(4);
+    let claude_assistant_ts = ts_minutes_ago(3);
+    let codex_user_ts = ts_minutes_ago(2);
+    let codex_assistant_ts = ts_minutes_ago(1);
 
     seed_claude(
         home,
         &project_root.to_string_lossy(),
         "sid-only-claude",
-        &[
-            r#"{"type":"user","sessionId":"sid-only-claude","isSidechain":false,"message":{"content":"Hi there, this is a substantive turn."}}"#,
-            r#"{"type":"assistant","sessionId":"sid-only-claude","isSidechain":false,"message":{"content":[{"type":"text","text":"Understood — ready to help."}]}}"#,
+        &vec![
+            format!(
+                r#"{{"type":"user","sessionId":"sid-only-claude","isSidechain":false,"timestamp":"{claude_user_ts}","message":{{"content":"Hi there, this is a substantive turn."}}}}"#
+            ),
+            format!(
+                r#"{{"type":"assistant","sessionId":"sid-only-claude","isSidechain":false,"timestamp":"{claude_assistant_ts}","message":{{"content":[{{"type":"text","text":"Understood — ready to help."}}]}}}}"#
+            ),
         ],
     );
     seed_codex(
         home,
         &project_root.to_string_lossy(),
         "codex-sess",
-        &[
-            r#"{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"Could you please review the user-facing pagination helper for correctness?"}]}}"#,
-            r#"{"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Done — looks good, no blockers found. Shipping recommended."}]}}"#,
+        &vec![
+            format!(
+                r#"{{"type":"response_item","timestamp":"{codex_user_ts}","payload":{{"type":"message","role":"user","content":[{{"type":"input_text","text":"Could you please review the user-facing pagination helper for correctness?"}}]}}}}"#
+            ),
+            format!(
+                r#"{{"type":"response_item","timestamp":"{codex_assistant_ts}","payload":{{"type":"message","role":"assistant","content":[{{"type":"output_text","text":"Done — looks good, no blockers found. Shipping recommended."}}]}}}}"#
+            ),
         ],
     );
 
@@ -307,6 +343,12 @@ fn three_window_same_cli_peer_lookup_via_exclude_session_ids() {
     let project_dir = tempfile::TempDir::new().unwrap();
     let project_root = std::fs::canonicalize(project_dir.path()).unwrap();
     let cwd_str = project_root.to_string_lossy().to_string();
+    let peer_user_ts = ts_minutes_ago(40);
+    let peer_assistant_ts = ts_minutes_ago(39);
+    let caller_user_ts = ts_minutes_ago(10);
+    let caller_assistant_ts = ts_minutes_ago(9);
+    let codex_user_ts = ts_minutes_ago(8);
+    let codex_assistant_ts = ts_minutes_ago(7);
 
     // Two Claude sessions. Write peer first so it has the OLDER mtime; the
     // caller is written last and is therefore the "newest", matching the
@@ -316,9 +358,13 @@ fn three_window_same_cli_peer_lookup_via_exclude_session_ids() {
         home,
         &cwd_str,
         "sid-peer-BBBB",
-        &[
-            r#"{"type":"user","sessionId":"sid-peer-BBBB","isSidechain":false,"timestamp":"2026-04-15T10:00:00Z","message":{"content":"This is the PEER session doing unrelated work on parser cleanup."}}"#,
-            r#"{"type":"assistant","sessionId":"sid-peer-BBBB","isSidechain":false,"timestamp":"2026-04-15T10:00:30Z","message":{"content":[{"type":"text","text":"I'll refactor the parser function signatures."}]}}"#,
+        &vec![
+            format!(
+                r#"{{"type":"user","sessionId":"sid-peer-BBBB","isSidechain":false,"timestamp":"{peer_user_ts}","message":{{"content":"This is the PEER session doing unrelated work on parser cleanup."}}}}"#
+            ),
+            format!(
+                r#"{{"type":"assistant","sessionId":"sid-peer-BBBB","isSidechain":false,"timestamp":"{peer_assistant_ts}","message":{{"content":[{{"type":"text","text":"I'll refactor the parser function signatures."}}]}}}}"#
+            ),
         ],
     );
     // Small sleep so mtimes differ on fast filesystems.
@@ -327,9 +373,13 @@ fn three_window_same_cli_peer_lookup_via_exclude_session_ids() {
         home,
         &cwd_str,
         "sid-caller-AAAA",
-        &[
-            r#"{"type":"user","sessionId":"sid-caller-AAAA","isSidechain":false,"timestamp":"2026-04-15T11:00:00Z","message":{"content":"This is the CALLER session asking about the other window."}}"#,
-            r#"{"type":"assistant","sessionId":"sid-caller-AAAA","isSidechain":false,"timestamp":"2026-04-15T11:00:30Z","message":{"content":[{"type":"text","text":"OK, let me check what the other claude is doing."}]}}"#,
+        &vec![
+            format!(
+                r#"{{"type":"user","sessionId":"sid-caller-AAAA","isSidechain":false,"timestamp":"{caller_user_ts}","message":{{"content":"This is the CALLER session asking about the other window."}}}}"#
+            ),
+            format!(
+                r#"{{"type":"assistant","sessionId":"sid-caller-AAAA","isSidechain":false,"timestamp":"{caller_assistant_ts}","message":{{"content":[{{"type":"text","text":"OK, let me check what the other claude is doing."}}]}}}}"#
+            ),
         ],
     );
     // Codex session so list_sessions also has cross-CLI content.
@@ -337,9 +387,13 @@ fn three_window_same_cli_peer_lookup_via_exclude_session_ids() {
         home,
         &cwd_str,
         "codex-zzz",
-        &[
-            r#"{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"Please review the new pagination patch thoroughly end-to-end."}]}}"#,
-            r#"{"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Found two findings: empty cursor still 500s; limit is not clamped."}]}}"#,
+        &vec![
+            format!(
+                r#"{{"type":"response_item","timestamp":"{codex_user_ts}","payload":{{"type":"message","role":"user","content":[{{"type":"input_text","text":"Please review the new pagination patch thoroughly end-to-end."}}]}}}}"#
+            ),
+            format!(
+                r#"{{"type":"response_item","timestamp":"{codex_assistant_ts}","payload":{{"type":"message","role":"assistant","content":[{{"type":"output_text","text":"Found two findings: empty cursor still 500s; limit is not clamped."}}]}}}}"#
+            ),
         ],
     );
 
@@ -455,6 +509,15 @@ fn nickname_based_peer_lookup() {
     let project_root = std::fs::canonicalize(project_dir.path()).unwrap();
     let cwd_str = project_root.to_string_lossy().to_string();
     let pid = std::process::id();
+    let reviewer_user_ts = ts_minutes_ago(40);
+    let reviewer_assistant_ts = ts_minutes_ago(39);
+    let architect_user_ts = ts_minutes_ago(10);
+    let architect_assistant_ts = ts_minutes_ago(9);
+    let coder_user_ts = ts_minutes_ago(38);
+    let coder_assistant_ts = ts_minutes_ago(37);
+    let reviewer_started_at = ts_minutes_ago(41);
+    let architect_started_at = ts_minutes_ago(11);
+    let coder_started_at = ts_minutes_ago(41);
 
     // -- Seed sessions --
     // Reviewer's claude session (registered at 09:59, session timestamps at 10:00)
@@ -462,9 +525,13 @@ fn nickname_based_peer_lookup() {
         home,
         &cwd_str,
         "sid-reviewer-001",
-        &[
-            r#"{"type":"user","sessionId":"sid-reviewer-001","isSidechain":false,"timestamp":"2026-04-15T10:00:00Z","message":{"content":"Please review the authentication middleware for security issues and edge cases."}}"#,
-            r#"{"type":"assistant","sessionId":"sid-reviewer-001","isSidechain":false,"timestamp":"2026-04-15T10:00:30Z","message":{"content":[{"type":"text","text":"Found three issues in the auth middleware: token expiry is not checked, CORS headers are missing, and the rate limiter is disabled."}]}}"#,
+        &vec![
+            format!(
+                r#"{{"type":"user","sessionId":"sid-reviewer-001","isSidechain":false,"timestamp":"{reviewer_user_ts}","message":{{"content":"Please review the authentication middleware for security issues and edge cases."}}}}"#
+            ),
+            format!(
+                r#"{{"type":"assistant","sessionId":"sid-reviewer-001","isSidechain":false,"timestamp":"{reviewer_assistant_ts}","message":{{"content":[{{"type":"text","text":"Found three issues in the auth middleware: token expiry is not checked, CORS headers are missing, and the rate limiter is disabled."}}]}}}}"#
+            ),
         ],
     );
 
@@ -476,9 +543,13 @@ fn nickname_based_peer_lookup() {
         home,
         &cwd_str,
         "sid-architect-002",
-        &[
-            r#"{"type":"user","sessionId":"sid-architect-002","isSidechain":false,"timestamp":"2026-04-15T10:30:00Z","message":{"content":"Design the database schema for the new notification service including tables and indexes."}}"#,
-            r#"{"type":"assistant","sessionId":"sid-architect-002","isSidechain":false,"timestamp":"2026-04-15T10:30:30Z","message":{"content":[{"type":"text","text":"Here is the schema: notifications table with id, user_id, type, payload, read_at, created_at columns and a composite index on (user_id, read_at)."}]}}"#,
+        &vec![
+            format!(
+                r#"{{"type":"user","sessionId":"sid-architect-002","isSidechain":false,"timestamp":"{architect_user_ts}","message":{{"content":"Design the database schema for the new notification service including tables and indexes."}}}}"#
+            ),
+            format!(
+                r#"{{"type":"assistant","sessionId":"sid-architect-002","isSidechain":false,"timestamp":"{architect_assistant_ts}","message":{{"content":[{{"type":"text","text":"Here is the schema: notifications table with id, user_id, type, payload, read_at, created_at columns and a composite index on (user_id, read_at)."}}]}}}}"#
+            ),
         ],
     );
 
@@ -487,9 +558,13 @@ fn nickname_based_peer_lookup() {
         home,
         &cwd_str,
         "codex-coder-003",
-        &[
-            r#"{"type":"response_item","timestamp":"2026-04-15T10:00:30Z","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"Implement the pagination helper function in handlers/users.go with cursor-based pagination."}]}}"#,
-            r#"{"type":"response_item","timestamp":"2026-04-15T10:01:00Z","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Done — implemented cursor-based pagination with proper empty-cursor handling and limit clamping to 1000."}]}}"#,
+        &vec![
+            format!(
+                r#"{{"type":"response_item","timestamp":"{coder_user_ts}","payload":{{"type":"message","role":"user","content":[{{"type":"input_text","text":"Implement the pagination helper function in handlers/users.go with cursor-based pagination."}}]}}}}"#
+            ),
+            format!(
+                r#"{{"type":"response_item","timestamp":"{coder_assistant_ts}","payload":{{"type":"message","role":"assistant","content":[{{"type":"output_text","text":"Done — implemented cursor-based pagination with proper empty-cursor handling and limit clamping to 1000."}}]}}}}"#
+            ),
         ],
     );
 
@@ -501,7 +576,7 @@ fn nickname_based_peer_lookup() {
         "reviewer",
         "claude",
         pid,
-        "2026-04-15T09:59:00Z",
+        &reviewer_started_at,
     );
     write_registry_entry(
         home,
@@ -509,16 +584,9 @@ fn nickname_based_peer_lookup() {
         "architect",
         "claude",
         pid,
-        "2026-04-15T10:29:00Z",
+        &architect_started_at,
     );
-    write_registry_entry(
-        home,
-        &cwd_str,
-        "coder",
-        "codex",
-        pid,
-        "2026-04-15T09:59:00Z",
-    );
+    write_registry_entry(home, &cwd_str, "coder", "codex", pid, &coder_started_at);
 
     // -- Spawn server (no --nickname / --caller-cli — registry is pre-seeded) --
     let (mut child, mut send, mut recv) = spawn_server(home, &project_root);
@@ -550,6 +618,16 @@ fn nickname_based_peer_lookup() {
         has_nickname,
         "expected at least one session with a nickname annotation, got: {sessions:?}"
     );
+    let reviewer_session = sessions
+        .iter()
+        .find(|s| s["nickname"] == "reviewer")
+        .expect("reviewer nickname annotation");
+    assert_eq!(reviewer_session["session_id"], "sid-reviewer-001");
+    let architect_session = sessions
+        .iter()
+        .find(|s| s["nickname"] == "architect")
+        .expect("architect nickname annotation");
+    assert_eq!(architect_session["session_id"], "sid-architect-002");
 
     // 3. get_session(nickname="coder") — should return the codex transcript
     send(
