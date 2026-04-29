@@ -26,6 +26,41 @@ pub struct AnthropicToOpenAIConfig {
     pub fallback_tool_arguments_json: &'static str,
 }
 
+/// True if a tool definition is an Anthropic server-side built-in
+/// (`web_search_*`, `code_execution_*`, `computer_*`, `bash_*`,
+/// `text_editor_*`, `web_fetch_*`, `mcp_*`). These have no `input_schema`
+/// and can't be executed by an OpenAI-compatible upstream, so we drop them
+/// during the bridge to avoid 400s on the empty schema.
+pub(crate) fn is_anthropic_server_tool(tool: &Value) -> bool {
+    let Some(t) = tool.get("type").and_then(|v| v.as_str()) else {
+        return false;
+    };
+    !matches!(t, "" | "custom" | "function")
+}
+
+/// Convert an Anthropic tool's `input_schema` into an OpenAI-compatible
+/// `parameters` object. Strict OpenAI validators reject `{}` or a schema
+/// without `type` ("schema must be a JSON Schema of type 'object'"), so we
+/// always emit a usable object schema.
+pub(crate) fn tool_parameters_from_input_schema(input_schema: Option<&Value>) -> Value {
+    let default = || json!({"type": "object", "properties": {}});
+    match input_schema {
+        None | Some(Value::Null) => default(),
+        Some(Value::Object(map)) if map.is_empty() => default(),
+        Some(v) => {
+            if v.get("type").is_none() {
+                let mut owned = v.clone();
+                if let Some(obj) = owned.as_object_mut() {
+                    obj.insert("type".to_string(), json!("object"));
+                }
+                owned
+            } else {
+                v.clone()
+            }
+        }
+    }
+}
+
 pub fn convert_anthropic_to_openai_request(
     body: &Value,
     config: &AnthropicToOpenAIConfig,
@@ -138,13 +173,14 @@ pub fn convert_anthropic_to_openai_request(
     if let Some(tools) = body.get("tools").and_then(|t| t.as_array()) {
         let openai_tools: Vec<Value> = tools
             .iter()
+            .filter(|t| !is_anthropic_server_tool(t))
             .map(|tool| {
                 json!({
                     "type": "function",
                     "function": {
                         "name": tool.get("name").cloned().unwrap_or_default(),
                         "description": tool.get("description").cloned().unwrap_or(json!("")),
-                        "parameters": tool.get("input_schema").cloned().unwrap_or(json!({})),
+                        "parameters": tool_parameters_from_input_schema(tool.get("input_schema")),
                     }
                 })
             })
@@ -796,5 +832,92 @@ mod tests {
         });
         let req = convert_anthropic_to_openai_request(&body, &test_config());
         assert_eq!(req["messages"][0]["content"], "ok");
+    }
+
+    #[test]
+    fn drops_anthropic_server_side_tools() {
+        let body = json!({
+            "model": "claude-sonnet-4-5",
+            "messages": [{"role": "user", "content": "search the web"}],
+            "tools": [
+                {"type": "web_search_20250305", "name": "web_search"},
+                {"name": "ls", "description": "list", "input_schema": {"type": "object"}}
+            ]
+        });
+        let req = convert_anthropic_to_openai_request(&body, &test_config());
+        let tools = req["tools"].as_array().expect("tools array");
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0]["function"]["name"], "ls");
+    }
+
+    #[test]
+    fn omits_tools_field_when_only_server_side_tools_present() {
+        let body = json!({
+            "model": "claude-sonnet-4-5",
+            "messages": [{"role": "user", "content": "search the web"}],
+            "tools": [{"type": "web_search_20250305", "name": "web_search"}]
+        });
+        let req = convert_anthropic_to_openai_request(&body, &test_config());
+        assert!(req.get("tools").is_none());
+    }
+
+    #[test]
+    fn missing_input_schema_emits_valid_object_schema() {
+        let body = json!({
+            "model": "claude-sonnet-4-5",
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [{"name": "noop", "description": "no args"}]
+        });
+        let req = convert_anthropic_to_openai_request(&body, &test_config());
+        let params = &req["tools"][0]["function"]["parameters"];
+        assert_eq!(params["type"], "object");
+        assert!(params.get("properties").is_some());
+    }
+
+    #[test]
+    fn empty_input_schema_emits_valid_object_schema() {
+        let body = json!({
+            "model": "claude-sonnet-4-5",
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [{"name": "noop", "description": "no args", "input_schema": {}}]
+        });
+        let req = convert_anthropic_to_openai_request(&body, &test_config());
+        let params = &req["tools"][0]["function"]["parameters"];
+        assert_eq!(params["type"], "object");
+    }
+
+    #[test]
+    fn input_schema_without_type_gets_type_object_added() {
+        let body = json!({
+            "model": "claude-sonnet-4-5",
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [{
+                "name": "ls",
+                "description": "list",
+                "input_schema": {"properties": {"path": {"type": "string"}}}
+            }]
+        });
+        let req = convert_anthropic_to_openai_request(&body, &test_config());
+        let params = &req["tools"][0]["function"]["parameters"];
+        assert_eq!(params["type"], "object");
+        assert_eq!(params["properties"]["path"]["type"], "string");
+    }
+
+    #[test]
+    fn explicit_custom_tool_type_is_kept() {
+        let body = json!({
+            "model": "claude-sonnet-4-5",
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [{
+                "type": "custom",
+                "name": "ls",
+                "description": "list",
+                "input_schema": {"type": "object"}
+            }]
+        });
+        let req = convert_anthropic_to_openai_request(&body, &test_config());
+        let tools = req["tools"].as_array().expect("tools array");
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0]["function"]["name"], "ls");
     }
 }

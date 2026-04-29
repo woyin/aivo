@@ -10,7 +10,8 @@ use std::sync::Arc;
 
 use crate::constants::CONTENT_TYPE_JSON;
 use crate::services::anthropic_chat_request::{
-    AnthropicToOpenAIConfig, convert_anthropic_to_openai_request,
+    AnthropicToOpenAIConfig, convert_anthropic_to_openai_request, is_anthropic_server_tool,
+    tool_parameters_from_input_schema,
 };
 use crate::services::anthropic_chat_response::{
     OpenAIToAnthropicConfig, UsageValueMode, convert_openai_to_anthropic_message,
@@ -381,20 +382,25 @@ fn anthropic_to_responses(body: &Value) -> Value {
         req["top_p"] = v.clone();
     }
 
-    // Tools: input_schema → parameters
+    // Tools: input_schema → parameters. Drop Anthropic server-side tools
+    // (web_search_*, etc.) — Copilot's Responses upstream can't execute
+    // them and rejects their empty schemas with 400.
     if let Some(tools) = body.get("tools").and_then(|t| t.as_array()) {
         let converted: Vec<Value> = tools
             .iter()
+            .filter(|t| !is_anthropic_server_tool(t))
             .map(|t| {
                 json!({
                     "type": "function",
                     "name": t["name"],
                     "description": t.get("description").unwrap_or(&json!("")),
-                    "parameters": t.get("input_schema").unwrap_or(&json!({}))
+                    "parameters": tool_parameters_from_input_schema(t.get("input_schema"))
                 })
             })
             .collect();
-        req["tools"] = json!(converted);
+        if !converted.is_empty() {
+            req["tools"] = json!(converted);
+        }
     }
 
     // tool_choice: auto→auto, any→required, tool→{type:"function",function:{name}}
@@ -701,6 +707,51 @@ mod tests {
         assert_eq!(tools[0]["type"], "function");
         assert_eq!(tools[0]["name"], "get_weather");
         assert_eq!(tools[0]["parameters"]["type"], "object");
+    }
+
+    #[test]
+    fn test_anthropic_to_responses_drops_server_tools() {
+        let body = json!({
+            "model": "claude-sonnet-4",
+            "max_tokens": 1024,
+            "messages": [{"role": "user", "content": "Hi"}],
+            "tools": [
+                {"type": "web_search_20250305", "name": "web_search"},
+                {
+                    "name": "get_weather",
+                    "description": "",
+                    "input_schema": {"type": "object", "properties": {"location": {"type": "string"}}}
+                }
+            ]
+        });
+        let result = anthropic_to_responses(&body);
+        let tools = result["tools"].as_array().unwrap();
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0]["name"], "get_weather");
+    }
+
+    #[test]
+    fn test_anthropic_to_responses_only_server_tools_omits_field() {
+        let body = json!({
+            "model": "claude-sonnet-4",
+            "max_tokens": 1024,
+            "messages": [{"role": "user", "content": "Hi"}],
+            "tools": [{"type": "web_search_20250305", "name": "web_search"}]
+        });
+        let result = anthropic_to_responses(&body);
+        assert!(result.get("tools").is_none());
+    }
+
+    #[test]
+    fn test_anthropic_to_responses_normalizes_empty_schema() {
+        let body = json!({
+            "model": "claude-sonnet-4",
+            "max_tokens": 1024,
+            "messages": [{"role": "user", "content": "Hi"}],
+            "tools": [{"name": "noop", "description": "no args", "input_schema": {}}]
+        });
+        let result = anthropic_to_responses(&body);
+        assert_eq!(result["tools"][0]["parameters"]["type"], "object");
     }
 
     #[test]
