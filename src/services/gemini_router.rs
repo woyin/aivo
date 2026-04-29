@@ -5,6 +5,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
 use crate::constants::CONTENT_TYPE_JSON;
+use crate::services::anthropic_chat_request::ensure_assistant_reasoning_content_in_chat_request;
 use crate::services::anthropic_route_pipeline::inject_chat_completions_cache_control;
 use crate::services::copilot_auth::CopilotTokenManager;
 use crate::services::device_fingerprint;
@@ -23,7 +24,7 @@ use crate::services::openai_gemini_bridge::{
 use crate::services::protocol_fallback::{
     AttemptOutcome, classify_attempt, commit_protocol_switch, protocol_candidates,
 };
-use crate::services::provider_protocol::{ProviderProtocol, is_terminal_upstream_error};
+use crate::services::provider_protocol::{ProviderProtocol, classify_failed_attempt};
 
 #[derive(Clone)]
 pub struct GeminiRouterConfig {
@@ -61,6 +62,15 @@ struct GeminiRouterState {
     client: Arc<reqwest::Client>,
     active_protocol: Arc<AtomicU8>,
     request_succeeded: Arc<AtomicBool>,
+    /// Set by the cascade when an upstream returned an authoritative response
+    /// (2xx success or 4xx with a parseable LLM-API error envelope). Used by
+    /// `persist_runtime_discoveries` to persist `gemini_path_variant` even
+    /// when no 2xx was seen.
+    saw_authoritative_response: Arc<AtomicBool>,
+    /// Set by the cascade when an upstream returned an error envelope matching
+    /// the `requires_reasoning_content` quirk. Persisted to `ApiKey` so future
+    /// launches inject strict mode without hardcoding the host.
+    learned_requires_reasoning: Arc<AtomicBool>,
 }
 
 impl GeminiRouter {
@@ -74,21 +84,34 @@ impl GeminiRouter {
         u16,
         Arc<AtomicU8>,
         Arc<AtomicBool>,
+        Arc<AtomicBool>,
+        Arc<AtomicBool>,
         tokio::task::JoinHandle<Result<()>>,
     )> {
         let (listener, port) = http_utils::bind_local_listener().await?;
         let active_protocol = Arc::new(AtomicU8::new(self.config.upstream_protocol.to_u8()));
         let request_succeeded = Arc::new(AtomicBool::new(false));
+        let saw_authoritative_response = Arc::new(AtomicBool::new(false));
+        let learned_requires_reasoning = Arc::new(AtomicBool::new(false));
         let state = GeminiRouterState {
             config: Arc::new(self.config.clone()),
             client: Arc::new(http_utils::router_http_client()),
             active_protocol: active_protocol.clone(),
             request_succeeded: request_succeeded.clone(),
+            saw_authoritative_response: saw_authoritative_response.clone(),
+            learned_requires_reasoning: learned_requires_reasoning.clone(),
         };
         let handle = tokio::spawn(async move {
             http_utils::run_text_router(listener, Arc::new(state), handle_router_request).await
         });
-        Ok((port, active_protocol, request_succeeded, handle))
+        Ok((
+            port,
+            active_protocol,
+            request_succeeded,
+            saw_authoritative_response,
+            learned_requires_reasoning,
+            handle,
+        ))
     }
 }
 
@@ -99,6 +122,8 @@ async fn handle_router_request(request: String, state: Arc<GeminiRouterState>) -
         &state.client,
         &state.active_protocol,
         &state.request_succeeded,
+        &state.saw_authoritative_response,
+        &state.learned_requires_reasoning,
     )
     .await
     {
@@ -113,6 +138,8 @@ async fn handle_request(
     client: &Arc<reqwest::Client>,
     active_protocol: &Arc<AtomicU8>,
     request_succeeded: &Arc<AtomicBool>,
+    saw_authoritative_response: &Arc<AtomicBool>,
+    learned_requires_reasoning: &Arc<AtomicBool>,
 ) -> Result<String> {
     let path = http_utils::extract_request_path(request);
 
@@ -129,9 +156,19 @@ async fn handle_request(
             );
             // openai_req already has the model from the Gemini request body — don't pre-select here;
             // select_model_for_protocol is applied per-attempt inside forward_to_provider.
-            match forward_to_provider(openai_req, config, client, active_protocol).await? {
+            match forward_to_provider(
+                openai_req,
+                config,
+                client,
+                active_protocol,
+                saw_authoritative_response,
+                learned_requires_reasoning,
+            )
+            .await?
+            {
                 ForwardResult::Success(openai_response) => {
                     request_succeeded.store(true, Ordering::Relaxed);
+                    saw_authoritative_response.store(true, Ordering::Relaxed);
                     let openai_response = repair_tool_call_args(openai_response, &tool_schemas);
                     if is_streaming {
                         let sse = convert_openai_to_gemini_sse(&openai_response);
@@ -177,13 +214,21 @@ async fn forward_to_provider(
     config: &std::sync::Arc<GeminiRouterConfig>,
     client: &Arc<reqwest::Client>,
     active_protocol: &Arc<AtomicU8>,
+    saw_authoritative_response: &Arc<AtomicBool>,
+    learned_requires_reasoning: &Arc<AtomicBool>,
 ) -> Result<ForwardResult> {
     let candidates = protocol_candidates(active_protocol);
     let mut first_error: Option<(u16, String)> = None;
+    let original_openai_req = openai_req;
+    let mut body_for_attempts = original_openai_req.clone();
+    let mut retried_with_strict = false;
+    let mut idx = 0;
 
-    for (attempt, (protocol, variant)) in candidates.into_iter().enumerate() {
+    while idx < candidates.len() {
+        let (protocol, variant) = candidates[idx];
+        let attempt = idx;
         // Select the right model name for this protocol attempt.
-        let mut req_body = openai_req.clone();
+        let mut req_body = body_for_attempts.clone();
         let selected_model = select_model_for_provider_attempt(
             &config.target_base_url,
             req_body.get("model").and_then(|v| v.as_str()),
@@ -342,12 +387,36 @@ async fn forward_to_provider(
         match classify_attempt(status, body_text, parsed) {
             AttemptOutcome::Success(result) => {
                 commit_protocol_switch(active_protocol, protocol, variant, attempt);
+                saw_authoritative_response.store(true, Ordering::Relaxed);
                 return Ok(ForwardResult::Success(result));
             }
             AttemptOutcome::Mismatch { status, body } => {
-                let is_terminal = is_terminal_upstream_error(status);
-                if is_terminal || first_error.is_none() {
+                // A 4xx whose body is a recognizable LLM-API error envelope is
+                // a semantic rejection — switching protocols cannot fix it.
+                let classification = classify_failed_attempt(status, &body);
+                if classification.is_terminal
+                    || classification.is_semantic_rejection
+                    || first_error.is_none()
+                {
                     first_error = Some((status, body));
+                }
+                if classification.is_semantic_rejection {
+                    saw_authoritative_response.store(true, Ordering::Relaxed);
+                    if classification.quirk_hint == Some("requires_reasoning_content") {
+                        learned_requires_reasoning.store(true, Ordering::Relaxed);
+                        if !retried_with_strict && !config.requires_reasoning_content {
+                            retried_with_strict = true;
+                            body_for_attempts = original_openai_req.clone();
+                            ensure_assistant_reasoning_content_in_chat_request(
+                                &mut body_for_attempts,
+                            );
+                            continue;
+                        }
+                    }
+                    if attempt > 0 {
+                        commit_protocol_switch(active_protocol, protocol, variant, attempt);
+                    }
+                    break;
                 }
                 // Terminal errors (401/403/429/5xx) are usually authoritative,
                 // but attempt 0 is just our best initial guess for this key —
@@ -357,7 +426,7 @@ async fn forward_to_provider(
                 // doesn't recognize Google's `x-goog-api-key`). Probe at least
                 // one fallback before bailing so genuine cross-protocol hosts
                 // can still be discovered.
-                if is_terminal && attempt > 0 {
+                if classification.is_terminal && attempt > 0 {
                     // Pin in-memory: the path answered authoritatively, so
                     // retry storms hit it directly instead of re-probing.
                     commit_protocol_switch(active_protocol, protocol, variant, attempt);
@@ -365,6 +434,7 @@ async fn forward_to_provider(
                 }
             }
         }
+        idx += 1;
     }
 
     let (status, body) = first_error.unwrap_or_default();
@@ -780,7 +850,11 @@ fn convert_parts_to_messages(
         // Plain text message (skip turns with only empty text to avoid sending
         // empty content strings that strict providers / Responses API gateways reject)
         let content = text_parts.join("\n");
-        messages.push(serde_json::json!({"role": openai_role, "content": content}));
+        let mut msg = serde_json::json!({"role": openai_role, "content": content});
+        if openai_role == "assistant" && requires_reasoning_content {
+            msg["reasoning_content"] = Value::String(text_parts.join("\n"));
+        }
+        messages.push(msg);
     }
 }
 
@@ -1416,6 +1490,20 @@ mod tests {
         assert_eq!(messages.len(), 2);
         assert_eq!(messages[0]["content"], "Hello");
         assert_eq!(messages[1]["content"], "Hi there!");
+    }
+
+    #[test]
+    fn test_convert_gemini_to_openai_adds_reasoning_for_plain_model_text_in_strict_mode() {
+        let body = serde_json::json!({
+            "contents": [
+                {"role": "model", "parts": [{"text": "Hi there!"}]},
+            ]
+        });
+        let result = convert_gemini_to_openai(&body, "gpt-4o", true, None);
+        let messages = result["messages"].as_array().unwrap();
+        assert_eq!(messages[0]["role"], "assistant");
+        assert_eq!(messages[0]["content"], "Hi there!");
+        assert_eq!(messages[0]["reasoning_content"], "Hi there!");
     }
 
     #[test]

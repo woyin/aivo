@@ -530,9 +530,14 @@ mod tests {
 
         let starter_url = provider_profile_for_base_url("https://api.getaivo.dev");
         assert_eq!(starter_url.quirks.max_tokens_cap, None);
+        // Static quirks for aivo/starter intentionally leave
+        // `requires_reasoning_content` unset — the actual value is discovered
+        // per-key from the upstream's error body and persisted to ApiKey.
+        assert!(!starter_url.quirks.requires_reasoning_content);
 
         let starter_sentinel = provider_profile_for_base_url("aivo-starter");
         assert_eq!(starter_sentinel.quirks.max_tokens_cap, None);
+        assert!(!starter_sentinel.quirks.requires_reasoning_content);
     }
 
     #[test]

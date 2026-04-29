@@ -79,13 +79,25 @@ pub fn convert_anthropic_to_openai_request(
             let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or("user");
             match msg.get("content") {
                 Some(Value::String(text)) => {
-                    messages.push(json!({"role": role, "content": text}));
+                    let mut out = json!({"role": role, "content": text});
+                    if config.include_reasoning_content
+                        && config.require_non_empty_reasoning_content
+                    {
+                        ensure_assistant_reasoning_content(&mut out);
+                    }
+                    messages.push(out);
                 }
                 Some(Value::Array(blocks)) => {
                     convert_content_blocks(blocks, role, &mut messages, config);
                 }
                 _ => {
-                    messages.push(json!({"role": role, "content": ""}));
+                    let mut out = json!({"role": role, "content": ""});
+                    if config.include_reasoning_content
+                        && config.require_non_empty_reasoning_content
+                    {
+                        ensure_assistant_reasoning_content(&mut out);
+                    }
+                    messages.push(out);
                 }
             }
         }
@@ -164,6 +176,50 @@ pub fn convert_anthropic_to_openai_request(
     }
 
     req
+}
+
+pub(crate) fn ensure_assistant_reasoning_content(message: &mut Value) {
+    if message.get("role").and_then(|r| r.as_str()) != Some("assistant") {
+        return;
+    }
+    if message
+        .get("reasoning_content")
+        .and_then(|v| v.as_str())
+        .is_some_and(|s| !s.is_empty())
+    {
+        return;
+    }
+
+    let fallback = match message.get("content") {
+        Some(Value::String(text)) if !text.is_empty() => text.clone(),
+        Some(Value::Array(parts)) => {
+            let text = parts
+                .iter()
+                .filter_map(|part| {
+                    part.get("text")
+                        .or_else(|| part.get("input_text"))
+                        .and_then(|v| v.as_str())
+                })
+                .filter(|s| !s.is_empty())
+                .collect::<Vec<_>>()
+                .join("\n");
+            if text.is_empty() {
+                " ".to_string()
+            } else {
+                text
+            }
+        }
+        _ => " ".to_string(),
+    };
+    message["reasoning_content"] = Value::String(fallback);
+}
+
+pub(crate) fn ensure_assistant_reasoning_content_in_chat_request(request: &mut Value) {
+    if let Some(messages) = request.get_mut("messages").and_then(|m| m.as_array_mut()) {
+        for message in messages {
+            ensure_assistant_reasoning_content(message);
+        }
+    }
 }
 
 fn convert_content_blocks(
@@ -311,17 +367,10 @@ fn convert_content_blocks(
         let mut msg = json!({"role": role, "content": content, "tool_calls": tool_calls});
         if config.include_reasoning_content {
             if role == "assistant" && config.require_non_empty_reasoning_content {
-                let reasoning_content = if !thinking_parts.is_empty() {
-                    thinking_parts.join("\n")
-                } else {
-                    let text = text_parts.join("\n");
-                    if text.is_empty() {
-                        " ".to_string()
-                    } else {
-                        text
-                    }
-                };
-                msg["reasoning_content"] = Value::String(reasoning_content);
+                if !thinking_parts.is_empty() {
+                    msg["reasoning_content"] = Value::String(thinking_parts.join("\n"));
+                }
+                ensure_assistant_reasoning_content(&mut msg);
             } else if !thinking_parts.is_empty() {
                 msg["reasoning_content"] = Value::String(thinking_parts.join("\n"));
             }
@@ -340,8 +389,15 @@ fn convert_content_blocks(
             Value::String(text_parts.join("\n"))
         };
         let mut msg = json!({"role": role, "content": content});
-        if config.include_reasoning_content && !thinking_parts.is_empty() {
-            msg["reasoning_content"] = Value::String(thinking_parts.join("\n"));
+        if config.include_reasoning_content {
+            if role == "assistant" && config.require_non_empty_reasoning_content {
+                if !thinking_parts.is_empty() {
+                    msg["reasoning_content"] = Value::String(thinking_parts.join("\n"));
+                }
+                ensure_assistant_reasoning_content(&mut msg);
+            } else if !thinking_parts.is_empty() {
+                msg["reasoning_content"] = Value::String(thinking_parts.join("\n"));
+            }
         }
         if role == "assistant" && !anthropic_thinking_blocks.is_empty() {
             msg[ANTHROPIC_THINKING_EXT] = Value::Array(anthropic_thinking_blocks);

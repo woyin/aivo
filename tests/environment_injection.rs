@@ -15,6 +15,7 @@ fn make_key(base_url: &str, key_secret: &str) -> ApiKey {
         pi_mode: None,
         claude_path_variant: None,
         gemini_path_variant: None,
+        requires_reasoning_content: None,
         routing_schema_version: 0,
         key: Zeroizing::new(key_secret.to_string()),
         created_at: "2025-01-01T00:00:00Z".to_string(),
@@ -87,6 +88,34 @@ fn claude_openai_compat_uses_anthropic_to_openai_router() {
         env.get("AIVO_ANTHROPIC_TO_OPENAI_ROUTER_BASE_URL").unwrap(),
         "https://api.deepseek.com/v1"
     );
+}
+
+#[test]
+fn claude_per_key_requires_reasoning_override_injects_strict_flag() {
+    let inj = EnvironmentInjector;
+    // A host that does NOT match the static substring list (no DeepSeek /
+    // Moonshot in the URL) — without the per-key learned override, strict
+    // mode would not be enabled.
+    let mut key = make_key("https://api.example-thinking.dev/v1", "sk-test");
+    key.requires_reasoning_content = Some(true);
+    let env = inj.for_claude(&key, None);
+
+    assert_eq!(
+        env.get("AIVO_ANTHROPIC_TO_OPENAI_ROUTER_REQUIRE_REASONING")
+            .map(String::as_str),
+        Some("1"),
+        "per-key learned quirk must inject strict mode for hosts not in the static list"
+    );
+}
+
+#[test]
+fn claude_without_per_key_override_does_not_force_strict_flag() {
+    let inj = EnvironmentInjector;
+    // No DeepSeek/Moonshot in URL, no per-key override → no strict flag.
+    let key = make_key("https://api.example-thinking.dev/v1", "sk-test");
+    let env = inj.for_claude(&key, None);
+
+    assert!(!env.contains_key("AIVO_ANTHROPIC_TO_OPENAI_ROUTER_REQUIRE_REASONING"));
 }
 
 #[test]

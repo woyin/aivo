@@ -49,8 +49,8 @@ use crate::services::protocol_fallback::{
     AttemptOutcome, classify_attempt, commit_protocol_switch, protocol_candidates,
 };
 use crate::services::provider_protocol::{
-    PathVariant, ProviderProtocol, decode_route, is_endpoint_missing, is_protocol_mismatch,
-    is_terminal_upstream_error,
+    PathVariant, ProviderProtocol, classify_failed_attempt, decode_route, is_endpoint_missing,
+    is_protocol_mismatch, is_terminal_upstream_error,
 };
 use crate::services::serve_upstream::disable_stream_for_inception_with_tools;
 
@@ -97,6 +97,20 @@ struct AnthropicToOpenAIRouterState {
     /// `persist_runtime_discoveries` to gate protocol pinning so a session that
     /// only saw failures (e.g., bad API key) can't poison the persisted route.
     request_succeeded: Arc<AtomicBool>,
+    /// Flipped to `true` when the cascade observes an authoritative response —
+    /// a 2xx success OR a 4xx with a parseable LLM-API error envelope. Both
+    /// prove the active path is real. `persist_runtime_discoveries` reads this
+    /// to persist the learned `claude_path_variant` even when no 2xx was seen,
+    /// so a session that only ever fails semantically still teaches the next
+    /// launch which path variant to start at. Excluded: terminal 401/403/429
+    /// (cross-protocol auth-shape ambiguity) and endpoint-missing 404/405.
+    saw_authoritative_response: Arc<AtomicBool>,
+    /// Flipped to `true` when a cascade attempt sees an upstream error envelope
+    /// matching the `requires_reasoning_content` quirk. `persist_runtime_discoveries`
+    /// reads this and writes `ApiKey::requires_reasoning_content = Some(true)`,
+    /// so subsequent launches enable strict mode for this key without growing
+    /// the hardcoded substring list in `ProviderQuirks::for_base_url`.
+    learned_requires_reasoning: Arc<AtomicBool>,
 }
 
 /// Learned state for the native Anthropic probe, cloned into each request
@@ -231,6 +245,8 @@ impl AnthropicToOpenAIRouter {
         u16,
         Arc<AtomicU8>,
         Arc<AtomicBool>,
+        Arc<AtomicBool>,
+        Arc<AtomicBool>,
         tokio::task::JoinHandle<Result<()>>,
     )> {
         let (listener, port) = http_utils::bind_local_listener().await?;
@@ -242,15 +258,26 @@ impl AnthropicToOpenAIRouter {
         );
         let active_protocol = Arc::new(AtomicU8::new(initial_route));
         let request_succeeded = Arc::new(AtomicBool::new(false));
+        let saw_authoritative_response = Arc::new(AtomicBool::new(false));
+        let learned_requires_reasoning = Arc::new(AtomicBool::new(false));
         let state = AnthropicToOpenAIRouterState {
             config: Arc::new(self.config.clone()),
             client: router_http_client(),
             active_protocol: active_protocol.clone(),
             probe: ProbeState::new(),
             request_succeeded: request_succeeded.clone(),
+            saw_authoritative_response: saw_authoritative_response.clone(),
+            learned_requires_reasoning: learned_requires_reasoning.clone(),
         };
         let handle = tokio::spawn(async move { run_router(listener, state).await });
-        Ok((port, active_protocol, request_succeeded, handle))
+        Ok((
+            port,
+            active_protocol,
+            request_succeeded,
+            saw_authoritative_response,
+            learned_requires_reasoning,
+            handle,
+        ))
     }
 }
 
@@ -265,6 +292,8 @@ async fn run_router(
         let active_protocol = state.active_protocol.clone();
         let probe = state.probe.clone();
         let request_succeeded = state.request_succeeded.clone();
+        let saw_authoritative_response = state.saw_authoritative_response.clone();
+        let learned_requires_reasoning = state.learned_requires_reasoning.clone();
 
         tokio::spawn(async move {
             use tokio::io::AsyncWriteExt;
@@ -293,6 +322,8 @@ async fn run_router(
                 &active_protocol,
                 &probe,
                 &request_succeeded,
+                &saw_authoritative_response,
+                &learned_requires_reasoning,
                 &mut socket,
             )
             .await
@@ -574,6 +605,7 @@ fn should_try_native_anthropic(
 }
 
 /// Convert Anthropic /v1/messages request to OpenAI /v1/chat/completions
+#[allow(clippy::too_many_arguments)]
 async fn handle_anthropic_to_upstream(
     request: &str,
     config: &Arc<AnthropicToOpenAIRouterConfig>,
@@ -581,6 +613,8 @@ async fn handle_anthropic_to_upstream(
     active_protocol: &Arc<AtomicU8>,
     probe: &ProbeState,
     request_succeeded: &Arc<AtomicBool>,
+    saw_authoritative_response: &Arc<AtomicBool>,
+    learned_requires_reasoning: &Arc<AtomicBool>,
     socket: &mut tokio::net::TcpStream,
 ) -> Result<RouterResponse> {
     let mut passthrough_headers = http_utils::extract_passthrough_headers(request)?;
@@ -621,6 +655,7 @@ async fn handle_anthropic_to_upstream(
         match try_native_anthropic(&body, config, client, &passthrough_headers, probe).await? {
             NativeAnthropicResult::Success(response) => {
                 request_succeeded.store(true, Ordering::Relaxed);
+                saw_authoritative_response.store(true, Ordering::Relaxed);
                 return Ok(response);
             }
             NativeAnthropicResult::Terminal(response) => {
@@ -653,28 +688,13 @@ async fn handle_anthropic_to_upstream(
         }
     }
 
-    let mut simplified = anthropic_to_openai(&body, config.requires_reasoning_content)?;
-    // Only inject cache_control for Claude models — other providers don't support it
-    // and strict ones (e.g. Cloudflare Workers AI) reject unknown fields / array content.
-    if model_is_claude && !config.strip_cache_control {
-        inject_chat_completions_cache_control(&mut simplified);
-    }
-    // Bedrock-style shims reject `cache_control` even when it just passes
-    // through from a Claude-shaped client; remove it before forwarding.
-    if config.strip_cache_control {
-        crate::services::anthropic_route_pipeline::strip_cache_control(&mut simplified);
-    }
-    // Map Anthropic thinking config to OpenAI reasoning_effort, preserving
-    // the caller's `budget_tokens` granularity instead of always collapsing
-    // to "high". Boundaries match `effort::CanonicalEffort::from_anthropic_budget_tokens`.
-    if !simplified
-        .as_object()
-        .is_some_and(|m| m.contains_key("reasoning_effort"))
-        && let Some(effort) = crate::services::effort::extract_anthropic_effort(&body)
-    {
-        simplified["reasoning_effort"] = json!(effort.to_openai_effort());
-    }
-    cap_max_tokens_field(&mut simplified, config.max_tokens_cap);
+    let mut simplified = build_simplified_openai_body(
+        &body,
+        config.requires_reasoning_content,
+        model_is_claude,
+        config.strip_cache_control,
+        config.max_tokens_cap,
+    )?;
     let requested_stream = simplified
         .get("stream")
         .and_then(|v| v.as_bool())
@@ -693,8 +713,15 @@ async fn handle_anthropic_to_upstream(
     // The chat-loop's "is_terminal" branch will overwrite this with the more
     // diagnostic chat-shaped response when one is available.
     let mut first_error: Option<RouterResponse> = native_anthropic_terminal;
+    // Set to `true` after we've already rebuilt `simplified` with strict
+    // reasoning mode in response to a `requires_reasoning_content` rejection.
+    // Prevents a retry storm: at most one rebuild per cascade.
+    let mut retried_with_strict = false;
 
-    for (attempt, (protocol, variant)) in candidates.into_iter().enumerate() {
+    let mut idx = 0;
+    while idx < candidates.len() {
+        let (protocol, variant) = candidates[idx];
+        let attempt = idx;
         let mut req_body = simplified.clone();
         let mut attempt_headers = passthrough_headers.clone();
         prepare_gateway_model_metadata(&mut req_body, &mut attempt_headers, config, protocol);
@@ -834,6 +861,7 @@ async fn handle_anthropic_to_upstream(
                         socket.write_all(b"0\r\n\r\n").await?;
                         commit_protocol_switch(active_protocol, protocol, variant, attempt);
                         request_succeeded.store(true, Ordering::Relaxed);
+                        saw_authoritative_response.store(true, Ordering::Relaxed);
                         return Ok(RouterResponse::AlreadyStreamed);
                     }
 
@@ -870,25 +898,69 @@ async fn handle_anthropic_to_upstream(
             AttemptOutcome::Success(r) => {
                 commit_protocol_switch(active_protocol, protocol, variant, attempt);
                 request_succeeded.store(true, Ordering::Relaxed);
+                saw_authoritative_response.store(true, Ordering::Relaxed);
                 return Ok(r);
             }
-            AttemptOutcome::Mismatch { status, body } => {
-                let is_terminal = is_terminal_upstream_error(status);
-                // Terminal errors (5xx, auth, rate-limit) are more diagnostic
-                // than the leading 404 that fallback emits while probing wrong
-                // paths — overwrite so the user sees the real upstream failure.
-                if is_terminal || first_error.is_none() {
+            AttemptOutcome::Mismatch {
+                status,
+                body: response_body,
+            } => {
+                // A 4xx whose body is a recognizable LLM-API error envelope is
+                // a semantic rejection: the upstream parsed our request and
+                // answered in its native shape, which proves the protocol
+                // matches. Switching protocols cannot recover — bail out and
+                // surface the real error instead of paying for 4 more probes.
+                let classification = classify_failed_attempt(status, &response_body);
+                // Terminal errors and semantic rejections are both authoritative
+                // — overwrite earlier non-diagnostic errors (e.g., a leading 404
+                // emitted while probing the wrong path) so the user sees the
+                // real upstream failure.
+                if classification.is_terminal
+                    || classification.is_semantic_rejection
+                    || first_error.is_none()
+                {
                     first_error = Some(RouterResponse::Buffered {
                         status,
                         content_type: CONTENT_TYPE_JSON.to_string(),
-                        body: body.into_bytes(),
+                        body: response_body.into_bytes(),
                     });
+                }
+                if classification.is_semantic_rejection {
+                    saw_authoritative_response.store(true, Ordering::Relaxed);
+                    if classification.quirk_hint == Some("requires_reasoning_content") {
+                        learned_requires_reasoning.store(true, Ordering::Relaxed);
+                        // Same-launch recovery: if the upstream told us it
+                        // needs `reasoning_content` and we sent the request
+                        // without it, rebuild `simplified` with strict mode
+                        // and retry the same (protocol, variant) so the
+                        // *current* request succeeds without a relaunch.
+                        if !retried_with_strict && !config.requires_reasoning_content {
+                            retried_with_strict = true;
+                            if let Ok(strict) = build_simplified_openai_body(
+                                &body,
+                                true,
+                                model_is_claude,
+                                config.strip_cache_control,
+                                config.max_tokens_cap,
+                            ) {
+                                simplified = strict;
+                                continue; // re-do the SAME idx with strict body
+                            }
+                        }
+                    }
+                    // Pin in-memory only after a fallback win: at attempt 0 the
+                    // route is already the configured default and committing
+                    // would be a no-op write.
+                    if attempt > 0 {
+                        commit_protocol_switch(active_protocol, protocol, variant, attempt);
+                    }
+                    break;
                 }
                 // Skip the fast-bail at attempt 0: a 401/403 there often means
                 // "this host rejected the protocol's auth header shape" rather
                 // than "your key is bad" (e.g. cross-protocol gateways). Probe
                 // at least one fallback before believing the upstream.
-                if is_terminal && attempt > 0 {
+                if classification.is_terminal && attempt > 0 {
                     // Pin in-memory so retry storms hit this path directly
                     // instead of re-probing the wrong chat/completions paths.
                     commit_protocol_switch(active_protocol, protocol, variant, attempt);
@@ -896,6 +968,7 @@ async fn handle_anthropic_to_upstream(
                 }
             }
         }
+        idx += 1;
     }
 
     Ok(first_error.unwrap_or(RouterResponse::Buffered {
@@ -903,6 +976,41 @@ async fn handle_anthropic_to_upstream(
         content_type: CONTENT_TYPE_JSON.to_string(),
         body: b"{\"error\":\"No compatible protocol found\"}".to_vec(),
     }))
+}
+
+/// Apply the full Anthropic → OpenAI transform pipeline including the
+/// post-conversion adjustments (cache_control injection / strip,
+/// reasoning_effort mapping, max_tokens cap). Extracted as a function so
+/// the cascade can rebuild the body with `requires_reasoning_content=true`
+/// and re-run the same pipeline when an upstream signals it requires the
+/// quirk — see the in-cascade retry below.
+fn build_simplified_openai_body(
+    anthropic_body: &Value,
+    requires_reasoning_content: bool,
+    model_is_claude: bool,
+    strip_cache_control: bool,
+    max_tokens_cap: Option<u64>,
+) -> Result<Value> {
+    let mut simplified = anthropic_to_openai(anthropic_body, requires_reasoning_content)?;
+    // Only inject cache_control for Claude models — other providers don't support it
+    // and strict ones (e.g. Cloudflare Workers AI) reject unknown fields / array content.
+    if model_is_claude && !strip_cache_control {
+        inject_chat_completions_cache_control(&mut simplified);
+    }
+    // Bedrock-style shims reject `cache_control` even when it just passes
+    // through from a Claude-shaped client; remove it before forwarding.
+    if strip_cache_control {
+        crate::services::anthropic_route_pipeline::strip_cache_control(&mut simplified);
+    }
+    if !simplified
+        .as_object()
+        .is_some_and(|m| m.contains_key("reasoning_effort"))
+        && let Some(effort) = crate::services::effort::extract_anthropic_effort(anthropic_body)
+    {
+        simplified["reasoning_effort"] = json!(effort.to_openai_effort());
+    }
+    cap_max_tokens_field(&mut simplified, max_tokens_cap);
+    Ok(simplified)
 }
 
 fn anthropic_to_openai(body: &Value, requires_reasoning_content: bool) -> Result<Value> {
@@ -1962,6 +2070,103 @@ mod tests {
             messages[0]["tool_calls"][0]["function"]["name"],
             "list_files"
         );
+    }
+
+    #[test]
+    fn test_anthropic_to_openai_sets_reasoning_content_for_plain_assistant_text_without_thinking() {
+        let body = json!({
+            "model": "aivo/starter",
+            "messages": [{
+                "role": "assistant",
+                "content": [
+                    {"type": "text", "text": "OK, continuing."}
+                ]
+            }]
+        });
+
+        let req = anthropic_to_openai(&body, true).unwrap();
+        let messages = req["messages"].as_array().unwrap();
+
+        assert_eq!(messages[0]["role"], "assistant");
+        assert_eq!(messages[0]["content"], "OK, continuing.");
+        assert_eq!(messages[0]["reasoning_content"], "OK, continuing.");
+        assert!(messages[0].get("tool_calls").is_none());
+    }
+
+    #[test]
+    fn test_anthropic_to_openai_sets_placeholder_reasoning_for_empty_assistant_text() {
+        let body = json!({
+            "model": "aivo/starter",
+            "messages": [{
+                "role": "assistant",
+                "content": []
+            }]
+        });
+
+        let req = anthropic_to_openai(&body, true).unwrap();
+        let messages = req["messages"].as_array().unwrap();
+
+        assert_eq!(messages[0]["role"], "assistant");
+        assert_eq!(messages[0]["reasoning_content"], " ");
+    }
+
+    #[test]
+    fn test_anthropic_to_openai_sets_reasoning_content_for_string_content_assistant_in_strict_mode()
+    {
+        // An assistant turn with `content: "..."` (string form, not array
+        // of blocks) bypassed the strict-mode fallback. This is the exact
+        // shape DeepSeek's interleaved-thinking session sends back for brief
+        // acknowledgements — and it triggers the 400 even after learning the
+        // per-key quirk if the bridge doesn't add the field.
+        let body = json!({
+            "model": "deepseek-reasoner",
+            "messages": [{
+                "role": "assistant",
+                "content": "OK, continuing."
+            }]
+        });
+        let req = anthropic_to_openai(&body, true).unwrap();
+        let messages = req["messages"].as_array().unwrap();
+        assert_eq!(messages[0]["role"], "assistant");
+        assert_eq!(messages[0]["content"], "OK, continuing.");
+        assert_eq!(messages[0]["reasoning_content"], "OK, continuing.");
+    }
+
+    #[test]
+    fn test_anthropic_to_openai_does_not_set_reasoning_for_user_string_content_in_strict_mode() {
+        // The strict fallback only applies to assistant turns. User string
+        // content must not get a `reasoning_content` field.
+        let body = json!({
+            "model": "deepseek-reasoner",
+            "messages": [{
+                "role": "user",
+                "content": "hello"
+            }]
+        });
+        let req = anthropic_to_openai(&body, true).unwrap();
+        let messages = req["messages"].as_array().unwrap();
+        assert_eq!(messages[0]["role"], "user");
+        assert!(messages[0].get("reasoning_content").is_none());
+    }
+
+    #[test]
+    fn test_anthropic_to_openai_omits_reasoning_for_plain_assistant_text_when_not_required() {
+        let body = json!({
+            "model": "aivo/starter",
+            "messages": [{
+                "role": "assistant",
+                "content": [
+                    {"type": "text", "text": "OK, continuing."}
+                ]
+            }]
+        });
+
+        let req = anthropic_to_openai(&body, false).unwrap();
+        let messages = req["messages"].as_array().unwrap();
+
+        assert_eq!(messages[0]["role"], "assistant");
+        assert_eq!(messages[0]["content"], "OK, continuing.");
+        assert!(messages[0].get("reasoning_content").is_none());
     }
 
     #[test]

@@ -268,6 +268,17 @@ impl ApiKeyStore {
             .await
     }
 
+    pub(crate) async fn set_key_requires_reasoning_content(
+        &self,
+        id: &str,
+        requires_reasoning_content: Option<bool>,
+    ) -> Result<bool> {
+        self.update_key_field(id, |entry| {
+            entry.requires_reasoning_content = requires_reasoning_content
+        })
+        .await
+    }
+
     pub(crate) async fn set_key_codex_mode(
         &self,
         id: &str,

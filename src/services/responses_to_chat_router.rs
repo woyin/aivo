@@ -15,6 +15,7 @@
  * `responses_chat_conversion.rs` and is re-exported here for backwards compatibility.
  */
 use crate::constants::CONTENT_TYPE_JSON;
+use crate::services::anthropic_chat_request::ensure_assistant_reasoning_content_in_chat_request;
 use crate::services::anthropic_route_pipeline::inject_chat_completions_cache_control;
 use crate::services::copilot_auth::CopilotTokenManager;
 use crate::services::device_fingerprint;
@@ -34,7 +35,7 @@ use crate::services::protocol_fallback::{
     AttemptOutcome, classify_attempt, commit_protocol_switch, protocol_candidates,
 };
 use crate::services::provider_protocol::{
-    PathVariant, ProviderProtocol, decode_route, is_endpoint_missing, is_terminal_upstream_error,
+    PathVariant, ProviderProtocol, classify_failed_attempt, decode_route, is_endpoint_missing,
 };
 use crate::services::responses_chat_conversion;
 use anyhow::Result;
@@ -99,6 +100,16 @@ struct ResponsesToChatRouterState {
     /// Flipped to `true` once any request returns a non-error response. Read
     /// by `persist_runtime_discoveries` to gate protocol pinning.
     request_succeeded: Arc<AtomicBool>,
+    /// Flipped to `true` when the cascade observes an authoritative response
+    /// (2xx success or a 4xx with a parseable LLM-API error envelope). Used
+    /// by `persist_runtime_discoveries` to persist `claude_path_variant`
+    /// even when no 2xx was seen — the path responded, so it's safe to
+    /// remember which variant won.
+    saw_authoritative_response: Arc<AtomicBool>,
+    /// Flipped to `true` when an upstream returns an error envelope matching
+    /// the `requires_reasoning_content` quirk. Persisted to `ApiKey` so future
+    /// launches enable strict mode without hardcoding the host.
+    learned_requires_reasoning: Arc<AtomicBool>,
     /// Consecutive non-2xx responses against the active route. After
     /// `CONSECUTIVE_FAILURES_BEFORE_RESET`, the active route is reset so the
     /// next request re-probes from the configured default — recovers when an
@@ -120,6 +131,8 @@ impl ResponsesToChatRouter {
         Arc<AtomicU8>,
         Arc<AtomicU8>,
         Arc<AtomicBool>,
+        Arc<AtomicBool>,
+        Arc<AtomicBool>,
         tokio::task::JoinHandle<Result<()>>,
     )> {
         let (listener, port) = http_utils::bind_local_listener().await?;
@@ -137,6 +150,8 @@ impl ResponsesToChatRouter {
         };
         let responses_api_supported = Arc::new(AtomicU8::new(initial_responses));
         let request_succeeded = Arc::new(AtomicBool::new(false));
+        let saw_authoritative_response = Arc::new(AtomicBool::new(false));
+        let learned_requires_reasoning = Arc::new(AtomicBool::new(false));
         let consecutive_failures = Arc::new(AtomicU8::new(0));
         let state = ResponsesToChatRouterState {
             config: Arc::new(self.config.clone()),
@@ -144,6 +159,8 @@ impl ResponsesToChatRouter {
             active_protocol: active_protocol.clone(),
             responses_api_supported: responses_api_supported.clone(),
             request_succeeded: request_succeeded.clone(),
+            saw_authoritative_response: saw_authoritative_response.clone(),
+            learned_requires_reasoning: learned_requires_reasoning.clone(),
             consecutive_failures,
         };
         let handle = tokio::spawn(async move {
@@ -159,6 +176,8 @@ impl ResponsesToChatRouter {
             active_protocol,
             responses_api_supported,
             request_succeeded,
+            saw_authoritative_response,
+            learned_requires_reasoning,
             handle,
         ))
     }
@@ -224,6 +243,8 @@ async fn handle_router_request(
             &state.active_protocol,
             &state.responses_api_supported,
             &state.request_succeeded,
+            &state.saw_authoritative_response,
+            &state.learned_requires_reasoning,
             socket,
         )
         .await
@@ -256,6 +277,8 @@ async fn handle_api_request(
     active_protocol: &Arc<AtomicU8>,
     responses_api_supported: &Arc<AtomicU8>,
     request_succeeded: &Arc<AtomicBool>,
+    saw_authoritative_response: &Arc<AtomicBool>,
+    learned_requires_reasoning: &Arc<AtomicBool>,
     socket: &mut tokio::net::TcpStream,
 ) -> Result<Option<String>> {
     let body_str = http_utils::extract_request_body(request)?;
@@ -286,6 +309,8 @@ async fn handle_api_request(
                 client,
                 active_protocol,
                 request_succeeded,
+                saw_authoritative_response,
+                learned_requires_reasoning,
             )
             .await?,
         ))
@@ -316,6 +341,8 @@ async fn handle_api_request(
                 client,
                 active_protocol,
                 request_succeeded,
+                saw_authoritative_response,
+                learned_requires_reasoning,
             )
             .await?,
         ))
@@ -468,6 +495,7 @@ async fn try_responses_api_passthrough(
 /// Handles Responses API requests by converting to Chat Completions format,
 /// forwarding to the provider, and converting the response back to Responses
 /// API SSE format that the Codex CLI expects.
+#[allow(clippy::too_many_arguments)]
 async fn handle_responses_api_via_chat(
     _path: &str,
     body: &Value,
@@ -475,6 +503,8 @@ async fn handle_responses_api_via_chat(
     client: &reqwest::Client,
     active_protocol: &Arc<AtomicU8>,
     request_succeeded: &Arc<AtomicBool>,
+    saw_authoritative_response: &Arc<AtomicBool>,
+    learned_requires_reasoning: &Arc<AtomicBool>,
 ) -> Result<String> {
     // Extract original model before conversion
     let original_model = body
@@ -495,6 +525,8 @@ async fn handle_responses_api_via_chat(
         false,
         active_protocol,
         request_succeeded,
+        saw_authoritative_response,
+        learned_requires_reasoning,
     )
     .await?
     {
@@ -529,6 +561,9 @@ fn prepare_chat_completions_body(
         config.max_tokens_cap,
         &["max_tokens", "max_output_tokens"],
     );
+    if config.requires_reasoning_content {
+        ensure_assistant_reasoning_content_in_chat_request(&mut body);
+    }
     apply_selected_model(&mut body, config, protocol);
     body
 }
@@ -593,6 +628,7 @@ async fn stream_chat_completions(
 // CHAT COMPLETIONS PATH: filter tools and forward (buffered)
 // =============================================================================
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_chat_completions_with_filter(
     _path: &str,
     body: &Value,
@@ -600,6 +636,8 @@ async fn handle_chat_completions_with_filter(
     client: &reqwest::Client,
     active_protocol: &Arc<AtomicU8>,
     request_succeeded: &Arc<AtomicBool>,
+    saw_authoritative_response: &Arc<AtomicBool>,
+    learned_requires_reasoning: &Arc<AtomicBool>,
 ) -> Result<String> {
     let body = prepare_chat_completions_body(
         body,
@@ -618,6 +656,8 @@ async fn handle_chat_completions_with_filter(
         requested_stream,
         active_protocol,
         request_succeeded,
+        saw_authoritative_response,
+        learned_requires_reasoning,
     )
     .await?
     {
@@ -671,6 +711,7 @@ async fn forward_request(
     http_utils::buffered_reqwest_to_http_response(response).await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn forward_openai_chat_request(
     body: &Value,
     config: &Arc<ResponsesToChatRouterConfig>,
@@ -678,6 +719,8 @@ async fn forward_openai_chat_request(
     force_non_streaming: bool,
     active_protocol: &Arc<AtomicU8>,
     request_succeeded: &Arc<AtomicBool>,
+    saw_authoritative_response: &Arc<AtomicBool>,
+    learned_requires_reasoning: &Arc<AtomicBool>,
 ) -> Result<ForwardedChatResponse> {
     // Openai and ResponsesApi both route through `forward_openai_protocol`,
     // so one is a byte-identical duplicate of the other. Drop the non-active.
@@ -693,12 +736,17 @@ async fn forward_openai_chat_request(
         })
         .collect();
     let mut first_error: Option<(u16, String)> = None;
+    let mut body_for_attempts = body.clone();
+    let mut retried_with_strict = false;
+    let mut idx = 0;
 
-    for (attempt, (protocol, variant)) in candidates.into_iter().enumerate() {
+    while idx < candidates.len() {
+        let (protocol, variant) = candidates[idx];
+        let attempt = idx;
         match forward_chat_for_protocol(
             protocol,
             variant,
-            body,
+            &body_for_attempts,
             config.as_ref(),
             client,
             force_non_streaming,
@@ -708,18 +756,46 @@ async fn forward_openai_chat_request(
             AttemptOutcome::Success(value) => {
                 commit_protocol_switch(active_protocol, protocol, variant, attempt);
                 request_succeeded.store(true, Ordering::Relaxed);
+                saw_authoritative_response.store(true, Ordering::Relaxed);
                 return Ok(ForwardedChatResponse::Success(value));
             }
-            AttemptOutcome::Mismatch { status, body } => {
-                let is_terminal = is_terminal_upstream_error(status);
-                if is_terminal || first_error.is_none() {
-                    first_error = Some((status, body));
+            AttemptOutcome::Mismatch {
+                status,
+                body: response_body,
+            } => {
+                // A 4xx whose body is a recognizable LLM-API error envelope is
+                // a semantic rejection — bail out instead of probing other
+                // protocols that will return the same rejection.
+                let classification = classify_failed_attempt(status, &response_body);
+                if classification.is_terminal
+                    || classification.is_semantic_rejection
+                    || first_error.is_none()
+                {
+                    first_error = Some((status, response_body));
+                }
+                if classification.is_semantic_rejection {
+                    saw_authoritative_response.store(true, Ordering::Relaxed);
+                    if classification.quirk_hint == Some("requires_reasoning_content") {
+                        learned_requires_reasoning.store(true, Ordering::Relaxed);
+                        if !retried_with_strict && !config.requires_reasoning_content {
+                            retried_with_strict = true;
+                            body_for_attempts = body.clone();
+                            ensure_assistant_reasoning_content_in_chat_request(
+                                &mut body_for_attempts,
+                            );
+                            continue;
+                        }
+                    }
+                    if attempt > 0 {
+                        commit_protocol_switch(active_protocol, protocol, variant, attempt);
+                    }
+                    break;
                 }
                 // Skip the fast-bail at attempt 0: a 401/403 there often means
                 // "this host rejected the protocol's auth header shape" rather
                 // than "your key is bad" (e.g. cross-protocol gateways). Probe
                 // at least one fallback before believing the upstream.
-                if is_terminal && attempt > 0 {
+                if classification.is_terminal && attempt > 0 {
                     // The path answered (with an error, but it answered) —
                     // pin it in memory so retry storms from codex/claude
                     // don't re-probe the wrong chat/completions paths every
@@ -730,6 +806,7 @@ async fn forward_openai_chat_request(
                 }
             }
         }
+        idx += 1;
     }
 
     let (status, body) = first_error.unwrap_or_default();
@@ -1155,6 +1232,31 @@ mod tests {
     fn strip_anthropic_error_wrap_passes_through_invalid_json() {
         let body = "<html>504 Gateway Timeout</html>";
         assert_eq!(strip_anthropic_error_wrap(body), body);
+    }
+
+    #[test]
+    fn prepare_chat_completions_body_adds_reasoning_for_plain_assistant_in_strict_mode() {
+        let config = ResponsesToChatRouterConfig {
+            target_base_url: "https://api.example.com".to_string(),
+            api_key: "sk-test".to_string(),
+            target_protocol: ProviderProtocol::Openai,
+            target_path_variant: None,
+            copilot_token_manager: None,
+            model_prefix: None,
+            requires_reasoning_content: true,
+            actual_model: None,
+            max_tokens_cap: None,
+            responses_api_supported: None,
+            is_starter: false,
+        };
+        let body = json!({
+            "model": "gpt-4o",
+            "messages": [{"role": "assistant", "content": "OK, continuing."}]
+        });
+
+        let prepared = prepare_chat_completions_body(&body, &config, ProviderProtocol::Openai);
+        let messages = prepared["messages"].as_array().unwrap();
+        assert_eq!(messages[0]["reasoning_content"], "OK, continuing.");
     }
 
     // ── HTTP body extraction ────────────────────────────────────────────────────

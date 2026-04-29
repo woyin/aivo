@@ -315,7 +315,11 @@ impl EnvironmentInjector {
                     format!("{}_UPSTREAM_PROTOCOL", cfg.router_prefix),
                     protocol.as_str().to_string(),
                 );
-                profile.quirks.inject(&mut env, cfg.router_prefix);
+                // Per-key learned override merges into the static profile so
+                // the env-var contract stays single-sourced in `inject`.
+                let mut quirks = profile.quirks;
+                quirks.requires_reasoning_content |= key.requires_reasoning_content == Some(true);
+                quirks.inject(&mut env, cfg.router_prefix);
             }
         }
         if profile.serve_flags.is_starter {

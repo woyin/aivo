@@ -204,6 +204,130 @@ pub fn is_terminal_upstream_error(status: u16) -> bool {
     }
 }
 
+/// True when the response body is a recognizable error envelope from a known
+/// LLM API (OpenAI / Anthropic / Google). Combined with a 4xx status, this
+/// signals a *semantic* rejection: the upstream parsed our request and
+/// answered with its native error shape, which is proof the protocol matches.
+/// Switching protocols cannot fix it; routers should bail out of the fallback
+/// loop immediately rather than spending 4 more requests on candidates that
+/// will return the same rejection in different shapes.
+///
+/// We require object-shaped error fields with at least one structured key
+/// (`type`/`code`/`status`) so generic gateway responses like
+/// `{"error":"Upstream request failed"}` — which usually mean "this path
+/// didn't reach the real upstream" — keep flowing through the cascade.
+pub fn is_request_error_envelope(body: &str) -> bool {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(body) else {
+        return false;
+    };
+    let Some(obj) = value.as_object() else {
+        return false;
+    };
+
+    // Anthropic outer wrapper: { "type": "error", "error": { ... } }
+    if obj.get("type").and_then(|t| t.as_str()) == Some("error")
+        && obj
+            .get("error")
+            .and_then(|e| e.as_object())
+            .is_some_and(|inner| !inner.is_empty())
+    {
+        return true;
+    }
+
+    // OpenAI / Anthropic-inner / Google: { "error": { "type"|"code"|"status": ... } }
+    if let Some(error) = obj.get("error").and_then(|e| e.as_object()) {
+        let has_type = error.get("type").and_then(|v| v.as_str()).is_some();
+        let has_code = error.get("code").is_some();
+        let has_status = error.get("status").and_then(|v| v.as_str()).is_some();
+        if has_type || has_code || has_status {
+            return true;
+        }
+    }
+
+    false
+}
+
+/// If the response body names a known provider quirk, return a short identifier
+/// describing which quirk fired. Used to drive diagnostics and per-key
+/// auto-learning without growing the static substring list in
+/// `provider_profile.rs::ProviderQuirks::for_base_url`.
+///
+/// The matching is intentionally narrow: a body saying "unknown field
+/// reasoning_content" or "reasoning_content is not allowed" must NOT learn
+/// `requires_reasoning_content` — that would teach the wrong thing for
+/// providers that explicitly reject the field. We require both the field
+/// name and a phrase indicating the upstream wants it preserved.
+pub fn quirk_hint_for_error_body(body: &str) -> Option<&'static str> {
+    let lower = body.to_ascii_lowercase();
+
+    // Two layers, scanned independently to keep the rules orthogonal so that
+    // adding a new rejection or demand phrase below cannot silently shadow
+    // another quirk via substring overlap.
+    //
+    // `rejected` — upstream is *rejecting* the named field. `"not support"`
+    // (no 'ed') is a substring of `"not supported"`, so it catches both
+    // forms.
+    let rejected = [
+        "unknown field",
+        "not allowed",
+        "not support",
+        "unrecognized",
+        "invalid field",
+        "unexpected field",
+    ]
+    .iter()
+    .any(|p| lower.contains(p));
+    // `demanded` — upstream wants the named field present.
+    let demanded = [
+        "must be passed",
+        "must be returned",
+        "missing",
+        "required",
+        "must participate",
+    ]
+    .iter()
+    .any(|p| lower.contains(p));
+
+    if lower.contains("reasoning_content") && demanded && !rejected {
+        return Some("requires_reasoning_content");
+    }
+    if lower.contains("cache_control") && rejected {
+        return Some("strips_cache_control");
+    }
+    if lower.contains("tool_choice") && rejected {
+        return Some("tool_choice_not_supported");
+    }
+    if lower.contains("max_tokens") && (lower.contains("exceed") || lower.contains("too large")) {
+        return Some("max_tokens_cap");
+    }
+    None
+}
+
+/// Classification of a failed cascade attempt. Combines the three checks
+/// every router applies on `AttemptOutcome::Mismatch` so the boilerplate
+/// stays in one place — and, when the status is not a 400/422, avoids
+/// parsing the body for the envelope and quirk-hint scans entirely.
+pub struct AttemptClassification {
+    pub is_terminal: bool,
+    pub is_semantic_rejection: bool,
+    pub quirk_hint: Option<&'static str>,
+}
+
+pub fn classify_failed_attempt(status: u16, body: &str) -> AttemptClassification {
+    let is_terminal = is_terminal_upstream_error(status);
+    let is_semantic_rejection = matches!(status, 400 | 422) && is_request_error_envelope(body);
+    let quirk_hint = if is_semantic_rejection {
+        quirk_hint_for_error_body(body)
+    } else {
+        None
+    };
+    AttemptClassification {
+        is_terminal,
+        is_semantic_rejection,
+        quirk_hint,
+    }
+}
+
 /// Returns fallback protocol candidates to try after `current` fails.
 /// Google is always included as the last fallback so generic gateways can still
 /// auto-switch to Google-native routing if they expose it.
@@ -358,6 +482,123 @@ mod tests {
         for status in [200, 301, 400, 404, 405, 415, 422, 501] {
             assert!(!is_terminal_upstream_error(status), "status {status}");
         }
+    }
+
+    #[test]
+    fn is_request_error_envelope_matches_openai_shape() {
+        let body = r#"{"error":{"message":"The reasoning_content in the thinking mode must be passed back to the API.","type":"invalid_request_error","param":null,"code":"invalid_request_error"}}"#;
+        assert!(is_request_error_envelope(body));
+    }
+
+    #[test]
+    fn is_request_error_envelope_matches_anthropic_outer_wrapper() {
+        let body = r#"{"type":"error","error":{"type":"invalid_request_error","message":"bad"}}"#;
+        assert!(is_request_error_envelope(body));
+    }
+
+    #[test]
+    fn is_request_error_envelope_matches_google_shape() {
+        let body =
+            r#"{"error":{"code":400,"message":"Invalid argument","status":"INVALID_ARGUMENT"}}"#;
+        assert!(is_request_error_envelope(body));
+    }
+
+    #[test]
+    fn is_request_error_envelope_rejects_string_error_field() {
+        // Generic gateway "this path didn't reach the real upstream" responses.
+        // Treating these as authoritative would short-circuit the cascade
+        // before we've actually probed the right path.
+        assert!(!is_request_error_envelope(
+            r#"{"error":"Upstream request failed"}"#
+        ));
+        assert!(!is_request_error_envelope(r#"{"error":"Not found"}"#));
+    }
+
+    #[test]
+    fn is_request_error_envelope_rejects_unparseable_or_unrelated_json() {
+        assert!(!is_request_error_envelope(""));
+        assert!(!is_request_error_envelope("<html>500</html>"));
+        assert!(!is_request_error_envelope(
+            r#"{"detail":"validation failed"}"#
+        ));
+        assert!(!is_request_error_envelope(r#"{"error":{}}"#));
+        assert!(!is_request_error_envelope(r#"{"type":"error"}"#));
+    }
+
+    #[test]
+    fn quirk_hint_recognizes_reasoning_content_rejection() {
+        let body = r#"{"error":{"message":"The reasoning_content in the thinking mode must be passed back to the API.","type":"invalid_request_error"}}"#;
+        assert_eq!(
+            quirk_hint_for_error_body(body),
+            Some("requires_reasoning_content")
+        );
+    }
+
+    #[test]
+    fn quirk_hint_does_not_mislearn_when_provider_rejects_reasoning_content() {
+        // Provider says "we don't accept this field" — must NOT learn
+        // `requires_reasoning_content`, that would teach the wrong thing.
+        for body in [
+            r#"{"error":{"message":"Unknown field reasoning_content","type":"invalid_request_error"}}"#,
+            r#"{"error":{"message":"reasoning_content is not allowed","type":"invalid_request_error"}}"#,
+            r#"{"error":{"message":"Unrecognized field reasoning_content","type":"invalid_request_error"}}"#,
+            r#"{"error":{"message":"reasoning_content is not supported by this model","type":"invalid_request_error"}}"#,
+        ] {
+            assert_eq!(
+                quirk_hint_for_error_body(body),
+                None,
+                "body must not be learned as `requires_reasoning_content`: {body}"
+            );
+        }
+    }
+
+    #[test]
+    fn quirk_hint_does_not_match_bare_field_name_without_directional_phrase() {
+        // Just naming the field is not enough — could be a logging diagnostic
+        // or unrelated mention. Require explicit "must be passed" /
+        // "required" wording.
+        let body = r#"{"error":{"message":"reasoning_content","type":"invalid_request_error"}}"#;
+        assert_eq!(quirk_hint_for_error_body(body), None);
+    }
+
+    #[test]
+    fn quirk_hint_recognizes_cache_control_rejection() {
+        let body =
+            r#"{"error":{"message":"Unknown field cache_control","type":"invalid_request_error"}}"#;
+        assert_eq!(
+            quirk_hint_for_error_body(body),
+            Some("strips_cache_control")
+        );
+    }
+
+    #[test]
+    fn quirk_hint_does_not_match_bare_cache_control_name() {
+        let body = r#"{"error":{"message":"cache_control","type":"invalid_request_error"}}"#;
+        assert_eq!(quirk_hint_for_error_body(body), None);
+    }
+
+    #[test]
+    fn quirk_hint_recognizes_tool_choice_rejection() {
+        let body = r#"{"error":{"message":"This model does not support tool_choice"}}"#;
+        assert_eq!(
+            quirk_hint_for_error_body(body),
+            Some("tool_choice_not_supported")
+        );
+    }
+
+    #[test]
+    fn quirk_hint_recognizes_max_tokens_rejection() {
+        let body = r#"{"error":{"message":"max_tokens exceeds limit"}}"#;
+        assert_eq!(quirk_hint_for_error_body(body), Some("max_tokens_cap"));
+    }
+
+    #[test]
+    fn quirk_hint_returns_none_for_unrecognized_body() {
+        assert_eq!(quirk_hint_for_error_body(""), None);
+        assert_eq!(
+            quirk_hint_for_error_body(r#"{"error":{"message":"something else"}}"#),
+            None
+        );
     }
 
     #[test]

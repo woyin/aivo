@@ -391,6 +391,8 @@ impl AILauncher {
             runtime.router_protocol,
             runtime.responses_api_support,
             runtime.request_succeeded,
+            runtime.saw_authoritative_response,
+            runtime.learned_requires_reasoning,
         )
         .await;
 

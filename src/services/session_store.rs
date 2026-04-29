@@ -155,6 +155,18 @@ pub struct ApiKey {
         skip_serializing_if = "Option::is_none"
     )]
     pub gemini_path_variant: Option<String>,
+    /// Learned per-key override for the `requires_reasoning_content` quirk.
+    /// `None` means "fall back to static `ProviderQuirks::for_base_url`".
+    /// `Some(true)` is set when an upstream returns a parseable
+    /// `reasoning_content` semantic rejection, so subsequent launches inject
+    /// the strict-mode flag without needing the host to be in the static
+    /// substring list. Avoids hardcoding new providers as they're added.
+    #[serde(
+        rename = "requiresReasoningContent",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub requires_reasoning_content: Option<bool>,
     /// Schema version for one-shot migrations of routing-related fields. Bumped
     /// when older builds may have written values under buggy logic that should
     /// be cleared on first launch by a newer build. Missing/zero = legacy.
@@ -194,6 +206,7 @@ impl ApiKey {
             pi_mode: None,
             claude_path_variant: None,
             gemini_path_variant: None,
+            requires_reasoning_content: None,
             routing_schema_version: CURRENT_ROUTING_SCHEMA_VERSION,
             key: Zeroizing::new(key),
             created_at: Utc::now().to_rfc3339(),
@@ -1120,6 +1133,16 @@ impl SessionStore {
             .await
     }
 
+    pub async fn set_key_requires_reasoning_content(
+        &self,
+        id: &str,
+        requires_reasoning_content: Option<bool>,
+    ) -> Result<bool> {
+        self.api_keys
+            .set_key_requires_reasoning_content(id, requires_reasoning_content)
+            .await
+    }
+
     pub async fn set_key_codex_mode(
         &self,
         id: &str,
@@ -1484,6 +1507,7 @@ mod tests {
             pi_mode: None,
             claude_path_variant: None,
             gemini_path_variant: None,
+            requires_reasoning_content: None,
             routing_schema_version: 0,
             key: Zeroizing::new("{}".into()),
             created_at: Utc::now().to_rfc3339(),
