@@ -828,6 +828,32 @@ mod tests {
     }
 
     #[test]
+    fn anthropic_to_responses_drops_server_side_tools_but_keeps_function_tools() {
+        let body = json!({
+            "model": "claude-sonnet-4-6",
+            "messages": [{"role": "user", "content": "search then read"}],
+            "tools": [
+                {"type": "web_search_20250305", "name": "web_search"},
+                {
+                    "name": "read_file",
+                    "description": "read a file",
+                    "input_schema": {
+                        "type": "object",
+                        "properties": {"path": {"type": "string"}}
+                    }
+                }
+            ]
+        });
+
+        let req = anthropic_to_responses(&body);
+        let tools = req["tools"].as_array().expect("converted tools");
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0]["type"], "function");
+        assert_eq!(tools[0]["name"], "read_file");
+        assert!(tools.iter().all(|t| t["name"] != "web_search"));
+    }
+
+    #[test]
     fn test_tool_choice_not_present() {
         let body =
             json!({"model": "claude-sonnet-4-6", "messages": [{"role": "user", "content": "hi"}]});

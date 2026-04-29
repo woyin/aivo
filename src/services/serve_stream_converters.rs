@@ -776,6 +776,9 @@ mod tests {
         assert!(output.contains("\"index\":1"));
         assert!(output.contains("\"arguments\":\"{\\\"cmd\\\":\\\"ls\\\"}\""));
         assert!(output.contains("\"finish_reason\":\"tool_calls\""));
+        assert!(output.contains("\"prompt_tokens\":132"));
+        assert!(output.contains("\"completion_tokens\":7"));
+        assert!(output.contains("\"total_tokens\":139"));
         assert!(output.contains("\"cache_read_input_tokens\":90"));
         assert!(output.contains("\"cache_creation_input_tokens\":30"));
         assert!(output.contains("data: [DONE]"));
