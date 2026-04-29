@@ -1373,7 +1373,13 @@ fn finalize_stream_message(
         );
     }
 
+    // OpenAI-shape upstreams only emit `usage` in the final chunk, so
+    // `message_start` was already sent with `input_tokens: 0`. Repeat the
+    // input fields here — the Anthropic SDK merges `message_delta.usage`
+    // into the message's running usage, which is what Claude Code's
+    // status-line percent reads from.
     let mut usage = json!({
+        "input_tokens": input_tokens,
         "output_tokens": output_tokens
     });
     if let Some(value) = cache_read_input_tokens {
@@ -2238,6 +2244,30 @@ data: [DONE]\n";
         assert!(result.contains("\"cache_read_input_tokens\":90"));
         assert!(result.contains("\"cache_creation_input_tokens\":15"));
         assert!(result.contains("event: message_stop"));
+    }
+
+    /// Regression: OpenAI-shape upstreams (DeepSeek, etc.) only emit `usage`
+    /// in the final chunk. Without forwarding `input_tokens` into the
+    /// Anthropic `message_delta`, Claude Code's status-line percent stays
+    /// at 0% because the SDK's running `message.usage.input_tokens` is
+    /// stuck at the placeholder value baked into `message_start`.
+    #[test]
+    fn openai_sse_to_anthropic_propagates_input_tokens_via_message_delta() {
+        let sse = "data: {\"id\":\"chatcmpl_x\",\"model\":\"deepseek-v4\",\"choices\":[{\"delta\":{\"content\":\"hi\"},\"finish_reason\":null}]}\n\
+data: {\"id\":\"chatcmpl_x\",\"model\":\"deepseek-v4\",\"choices\":[{\"delta\":{\"content\":\"!\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":32652,\"completion_tokens\":86}}\n\
+data: [DONE]\n";
+        let result = convert_openai_sse_to_anthropic(sse, 200).unwrap();
+        let delta_section = result
+            .split("event: message_delta\n")
+            .nth(1)
+            .expect("message_delta event present");
+        let data_line = delta_section
+            .lines()
+            .find(|l| l.starts_with("data: "))
+            .expect("data line after message_delta");
+        let payload: Value = serde_json::from_str(data_line.trim_start_matches("data: ")).unwrap();
+        assert_eq!(payload["usage"]["input_tokens"], 32652);
+        assert_eq!(payload["usage"]["output_tokens"], 86);
     }
 
     #[test]
