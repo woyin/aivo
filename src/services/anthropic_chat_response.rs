@@ -3,7 +3,7 @@ use serde_json::{Value, json};
 use crate::services::openai_anthropic_bridge::{
     ANTHROPIC_SERVER_BLOCKS_EXT, ANTHROPIC_THINKING_EXT,
 };
-use crate::services::openai_models::OpenAIChatResponseView;
+use crate::services::openai_models::{OpenAIChatResponseView, resolve_anthropic_input_and_cache};
 
 pub enum UsageValueMode {
     CoerceU64,
@@ -105,10 +105,7 @@ pub fn convert_openai_to_anthropic_message(
         "model": config.model,
         "stop_reason": map_finish_reason(final_finish_reason),
         "stop_sequence": null,
-        "usage": {
-            "input_tokens": usage_value(resp, "prompt_tokens", &config.usage_value_mode),
-            "output_tokens": usage_value(resp, "completion_tokens", &config.usage_value_mode),
-        }
+        "usage": build_anthropic_usage(resp, &config.usage_value_mode),
     });
 
     if config.include_created
@@ -117,10 +114,54 @@ pub fn convert_openai_to_anthropic_message(
         anthropic_resp["created"] = json!(created);
     }
 
-    copy_optional_usage_field(resp, &mut anthropic_resp, "cache_read_input_tokens");
-    copy_optional_usage_field(resp, &mut anthropic_resp, "cache_creation_input_tokens");
-
     Ok(anthropic_resp)
+}
+
+/// Builds an Anthropic-shape `usage` object from an OpenAI-shape response.
+///
+/// Without this normalization, Anthropic clients (Claude Code) record
+/// `cache_read_input_tokens = 0` for cache-aware OpenAI upstreams, which then
+/// undercounts cached tokens in their session logs and downstream stats.
+fn build_anthropic_usage(resp: &Value, mode: &UsageValueMode) -> Value {
+    let raw_prompt = usage_value(resp, "prompt_tokens", mode);
+    let output = usage_value(resp, "completion_tokens", mode);
+    let usage_obj = resp.get("usage");
+    let anthropic_cache_read = usage_obj
+        .and_then(|u| u.get("cache_read_input_tokens"))
+        .and_then(|v| v.as_u64());
+    let openai_cached = usage_obj
+        .and_then(|u| u.get("prompt_tokens_details"))
+        .and_then(|d| d.get("cached_tokens"))
+        .and_then(|v| v.as_u64());
+    let cache_creation = usage_obj
+        .and_then(|u| u.get("cache_creation_input_tokens"))
+        .and_then(|v| v.as_u64());
+
+    // PreserveJson mode (Copilot) keeps prompt_tokens stringly-typed; in that
+    // case there's no cached info to subtract, so pass the raw Value through.
+    let prompt_for_math = raw_prompt.as_u64().unwrap_or(0);
+    let (input_tokens, cache_read) = resolve_anthropic_input_and_cache(
+        prompt_for_math,
+        anthropic_cache_read,
+        openai_cached,
+        cache_creation.unwrap_or(0),
+    );
+
+    let mut usage = json!({
+        "input_tokens": if cache_read.is_some() || cache_creation.is_some() {
+            json!(input_tokens)
+        } else {
+            raw_prompt
+        },
+        "output_tokens": output,
+    });
+    if let Some(value) = cache_read {
+        usage["cache_read_input_tokens"] = json!(value);
+    }
+    if let Some(value) = cache_creation {
+        usage["cache_creation_input_tokens"] = json!(value);
+    }
+    usage
 }
 
 fn map_finish_reason(finish_reason: &str) -> &'static str {
@@ -146,12 +187,6 @@ fn usage_value(resp: &Value, key: &str, mode: &UsageValueMode) -> Value {
             .and_then(|u| u.get(key))
             .cloned()
             .unwrap_or(json!(0)),
-    }
-}
-
-fn copy_optional_usage_field(resp: &Value, anthropic_resp: &mut Value, key: &str) {
-    if let Some(value) = resp.get("usage").and_then(|usage| usage.get(key)).cloned() {
-        anthropic_resp["usage"][key] = value;
     }
 }
 
@@ -367,5 +402,165 @@ mod tests {
             },
         );
         assert!(result.is_err());
+    }
+
+    /// Regression: OpenAI-compatible upstreams (zai, DeepSeek, gemma) report
+    /// cached input tokens at `usage.prompt_tokens_details.cached_tokens` —
+    /// not at the Anthropic-style `cache_read_input_tokens`. Without this
+    /// branch, Anthropic clients log `cache_read_input_tokens: 0` and the
+    /// cached portion silently disappears from `aivo stats`.
+    #[test]
+    fn openai_prompt_tokens_details_cached_tokens_become_cache_read_with_fresh_input() {
+        let resp = json!({
+            "choices": [{
+                "message": {"role": "assistant", "content": "ok"},
+                "finish_reason": "stop"
+            }],
+            "usage": {
+                "prompt_tokens": 1000,
+                "completion_tokens": 50,
+                "prompt_tokens_details": { "cached_tokens": 800 }
+            }
+        });
+
+        let result = convert_openai_to_anthropic_message(
+            &resp,
+            &OpenAIToAnthropicConfig {
+                fallback_id: "msg",
+                model: "aivo/starter",
+                include_created: false,
+                usage_value_mode: UsageValueMode::CoerceU64,
+            },
+        )
+        .unwrap();
+
+        // Anthropic semantics: input_tokens excludes cached input.
+        assert_eq!(result["usage"]["input_tokens"], 200);
+        assert_eq!(result["usage"]["output_tokens"], 50);
+        assert_eq!(result["usage"]["cache_read_input_tokens"], 800);
+        assert!(result["usage"].get("cache_creation_input_tokens").is_none());
+    }
+
+    #[test]
+    fn openai_cache_subtracts_creation_too_when_both_present() {
+        let resp = json!({
+            "choices": [{
+                "message": {"role": "assistant", "content": "ok"},
+                "finish_reason": "stop"
+            }],
+            "usage": {
+                "prompt_tokens": 1500,
+                "completion_tokens": 10,
+                "prompt_tokens_details": { "cached_tokens": 800 },
+                "cache_creation_input_tokens": 500
+            }
+        });
+
+        let result = convert_openai_to_anthropic_message(
+            &resp,
+            &OpenAIToAnthropicConfig {
+                fallback_id: "msg",
+                model: "m",
+                include_created: false,
+                usage_value_mode: UsageValueMode::CoerceU64,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(result["usage"]["input_tokens"], 200); // 1500 − 800 − 500
+        assert_eq!(result["usage"]["cache_read_input_tokens"], 800);
+        assert_eq!(result["usage"]["cache_creation_input_tokens"], 500);
+    }
+
+    /// When an Anthropic-bridge upstream re-emits Anthropic-style cache fields
+    /// in an OpenAI envelope, `prompt_tokens` is already fresh-only — pass it
+    /// through without subtracting.
+    #[test]
+    fn anthropic_shape_cache_read_passes_through_without_subtraction() {
+        let resp = json!({
+            "choices": [{
+                "message": {"role": "assistant", "content": "ok"},
+                "finish_reason": "stop"
+            }],
+            "usage": {
+                "prompt_tokens": 12,
+                "completion_tokens": 7,
+                "cache_read_input_tokens": 90
+            }
+        });
+
+        let result = convert_openai_to_anthropic_message(
+            &resp,
+            &OpenAIToAnthropicConfig {
+                fallback_id: "msg",
+                model: "m",
+                include_created: false,
+                usage_value_mode: UsageValueMode::CoerceU64,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(result["usage"]["input_tokens"], 12);
+        assert_eq!(result["usage"]["cache_read_input_tokens"], 90);
+    }
+
+    /// When both shapes are present, the Anthropic value wins — the upstream
+    /// has already done the math and `prompt_tokens` is fresh-only.
+    #[test]
+    fn anthropic_cache_read_takes_precedence_over_openai_prompt_tokens_details() {
+        let resp = json!({
+            "choices": [{
+                "message": {"role": "assistant", "content": "ok"},
+                "finish_reason": "stop"
+            }],
+            "usage": {
+                "prompt_tokens": 12,
+                "completion_tokens": 7,
+                "cache_read_input_tokens": 90,
+                "prompt_tokens_details": { "cached_tokens": 999 }
+            }
+        });
+
+        let result = convert_openai_to_anthropic_message(
+            &resp,
+            &OpenAIToAnthropicConfig {
+                fallback_id: "msg",
+                model: "m",
+                include_created: false,
+                usage_value_mode: UsageValueMode::CoerceU64,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(result["usage"]["input_tokens"], 12);
+        assert_eq!(result["usage"]["cache_read_input_tokens"], 90);
+    }
+
+    #[test]
+    fn no_cache_info_emits_only_input_and_output() {
+        let resp = json!({
+            "choices": [{
+                "message": {"role": "assistant", "content": "ok"},
+                "finish_reason": "stop"
+            }],
+            "usage": { "prompt_tokens": 100, "completion_tokens": 50 }
+        });
+
+        let result = convert_openai_to_anthropic_message(
+            &resp,
+            &OpenAIToAnthropicConfig {
+                fallback_id: "msg",
+                model: "m",
+                include_created: false,
+                usage_value_mode: UsageValueMode::CoerceU64,
+            },
+        )
+        .unwrap();
+
+        let usage = result["usage"].as_object().unwrap();
+        assert_eq!(usage.get("input_tokens"), Some(&json!(100)));
+        assert_eq!(usage.get("output_tokens"), Some(&json!(50)));
+        assert!(usage.get("cache_read_input_tokens").is_none());
+        assert!(usage.get("cache_creation_input_tokens").is_none());
     }
 }

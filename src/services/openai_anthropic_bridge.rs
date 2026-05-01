@@ -375,6 +375,7 @@ pub fn convert_anthropic_to_openai_chat_response(resp: &Value, fallback_model: &
             total_tokens: prompt_tokens + completion_tokens,
             cache_read_input_tokens,
             cache_creation_input_tokens,
+            prompt_tokens_details: None,
         },
     };
 

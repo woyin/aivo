@@ -1419,6 +1419,14 @@ struct OpenAIStreamConverter {
     tool_blocks: HashMap<usize, StreamToolBlock>,
     message_id: String,
     model: String,
+    /// Latest reported `prompt_tokens` from upstream. Whether it represents
+    /// "total including cached" (OpenAI semantics) or "fresh only" (Anthropic
+    /// semantics) is decided per-update by which cache field accompanies it.
+    raw_prompt_tokens: u64,
+    /// Latest OpenAI-style `prompt_tokens_details.cached_tokens`, kept around
+    /// so a later chunk reporting only `prompt_tokens` still derives correctly.
+    openai_cached_tokens: Option<u64>,
+    /// Anthropic-fresh input count derived from the fields above.
     input_tokens: u64,
     output_tokens: u64,
     cache_read_input_tokens: Option<u64>,
@@ -1438,11 +1446,31 @@ impl OpenAIStreamConverter {
             tool_blocks: HashMap::new(),
             message_id: "msg".to_string(),
             model: "claude".to_string(),
+            raw_prompt_tokens: 0,
+            openai_cached_tokens: None,
             input_tokens: 0,
             output_tokens: 0,
             cache_read_input_tokens: None,
             cache_creation_input_tokens: None,
             saw_tool_use: false,
+        }
+    }
+
+    /// Re-derives `input_tokens` and `cache_read_input_tokens` from the latest
+    /// raw inputs. Called whenever any usage field updates, so chunks that
+    /// report cache info and prompt info separately still produce consistent
+    /// final state.
+    fn recompute_anthropic_input(&mut self) {
+        let creation = self.cache_creation_input_tokens.unwrap_or(0);
+        let (input, cache_read) = crate::services::openai_models::resolve_anthropic_input_and_cache(
+            self.raw_prompt_tokens,
+            self.cache_read_input_tokens,
+            self.openai_cached_tokens,
+            creation,
+        );
+        self.input_tokens = input;
+        if cache_read.is_some() {
+            self.cache_read_input_tokens = cache_read;
         }
     }
 
@@ -1542,7 +1570,7 @@ impl OpenAIStreamConverter {
         }
         if let Some(usage) = chunk.usage {
             if let Some(v) = usage.prompt_tokens {
-                self.input_tokens = v;
+                self.raw_prompt_tokens = v;
             }
             if let Some(v) = usage.completion_tokens {
                 self.output_tokens = v;
@@ -1553,6 +1581,12 @@ impl OpenAIStreamConverter {
             if let Some(v) = usage.cache_creation_input_tokens {
                 self.cache_creation_input_tokens = Some(v);
             }
+            self.openai_cached_tokens = usage
+                .prompt_tokens_details
+                .as_ref()
+                .and_then(|d| d.cached_tokens)
+                .or(self.openai_cached_tokens);
+            self.recompute_anthropic_input();
         }
 
         for choice in chunk.choices {
@@ -2268,6 +2302,54 @@ data: [DONE]\n";
         let payload: Value = serde_json::from_str(data_line.trim_start_matches("data: ")).unwrap();
         assert_eq!(payload["usage"]["input_tokens"], 32652);
         assert_eq!(payload["usage"]["output_tokens"], 86);
+    }
+
+    /// Regression: OpenAI-compatible upstreams (zai, DeepSeek, gemma —
+    /// everything `aivo/starter` routes to) emit cached input tokens at
+    /// `usage.prompt_tokens_details.cached_tokens`, not at
+    /// `cache_read_input_tokens`. Before the fix, aivo's stream converter
+    /// dropped that field, so Claude Code logged `cache_read_input_tokens=0`
+    /// and `aivo stats` undercounted cached usage for `aivo/starter`.
+    #[test]
+    fn openai_sse_to_anthropic_extracts_cached_tokens_from_prompt_tokens_details() {
+        let sse = "data: {\"id\":\"c\",\"model\":\"zai/glm-4.7-flash\",\"choices\":[{\"delta\":{\"content\":\"hi\"},\"finish_reason\":null}]}\n\
+data: {\"id\":\"c\",\"model\":\"zai/glm-4.7-flash\",\"choices\":[{\"delta\":{\"content\":\"!\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":1000,\"completion_tokens\":50,\"prompt_tokens_details\":{\"cached_tokens\":800}}}\n\
+data: [DONE]\n";
+        let result = convert_openai_sse_to_anthropic(sse, 200).unwrap();
+        let delta_section = result
+            .split("event: message_delta\n")
+            .nth(1)
+            .expect("message_delta event present");
+        let data_line = delta_section
+            .lines()
+            .find(|l| l.starts_with("data: "))
+            .expect("data line after message_delta");
+        let payload: Value = serde_json::from_str(data_line.trim_start_matches("data: ")).unwrap();
+        // Anthropic semantics: input_tokens is fresh-only.
+        assert_eq!(payload["usage"]["input_tokens"], 200); // 1000 − 800
+        assert_eq!(payload["usage"]["output_tokens"], 50);
+        assert_eq!(payload["usage"]["cache_read_input_tokens"], 800);
+    }
+
+    /// When upstream emits both shapes, the explicit Anthropic value wins —
+    /// it represents what the bridge already computed and `prompt_tokens` is
+    /// already fresh-only (so we must NOT subtract again).
+    #[test]
+    fn openai_sse_to_anthropic_prefers_explicit_cache_read_over_prompt_tokens_details() {
+        let sse = "data: {\"id\":\"c\",\"model\":\"m\",\"choices\":[{\"delta\":{\"content\":\"hi\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":12,\"completion_tokens\":7,\"cache_read_input_tokens\":90,\"prompt_tokens_details\":{\"cached_tokens\":999}}}\n\
+data: [DONE]\n";
+        let result = convert_openai_sse_to_anthropic(sse, 200).unwrap();
+        let delta_section = result
+            .split("event: message_delta\n")
+            .nth(1)
+            .expect("message_delta event present");
+        let data_line = delta_section
+            .lines()
+            .find(|l| l.starts_with("data: "))
+            .expect("data line after message_delta");
+        let payload: Value = serde_json::from_str(data_line.trim_start_matches("data: ")).unwrap();
+        assert_eq!(payload["usage"]["input_tokens"], 12);
+        assert_eq!(payload["usage"]["cache_read_input_tokens"], 90);
     }
 
     #[test]

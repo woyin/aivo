@@ -363,6 +363,50 @@ pub(crate) struct OpenAIChatChunkUsage {
     pub cache_read_input_tokens: Option<u64>,
     #[serde(default)]
     pub cache_creation_input_tokens: Option<u64>,
+    #[serde(default)]
+    pub prompt_tokens_details: Option<OpenAIPromptTokensDetails>,
+}
+
+/// OpenAI / OpenAI-compatible upstreams (DeepSeek, zai, etc.) report cached
+/// input tokens here under `prompt_tokens_details.cached_tokens`. We capture
+/// the field so the Anthropic converter can surface it as
+/// `cache_read_input_tokens` instead of silently dropping it.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub(crate) struct OpenAIPromptTokensDetails {
+    #[serde(default)]
+    pub cached_tokens: Option<u64>,
+}
+
+/// Resolves Anthropic-shape `(input_tokens, cache_read)` from an upstream's
+/// raw usage numbers, regardless of which convention the upstream uses.
+///
+/// Two conventions:
+///   - **Anthropic-bridge upstreams** report `cache_read_input_tokens` directly
+///     and `prompt_tokens` is already fresh-only. Pass through.
+///   - **OpenAI / DeepSeek / zai / etc.** put cached tokens under
+///     `prompt_tokens_details.cached_tokens`; `prompt_tokens` is the total
+///     including cached + cache-creation. Subtract to get fresh-only input.
+///
+/// When both shapes are present, the explicit Anthropic value wins — the
+/// upstream is a bridge that has already done the math.
+pub(crate) fn resolve_anthropic_input_and_cache(
+    prompt_tokens: u64,
+    anthropic_cache_read: Option<u64>,
+    openai_cached: Option<u64>,
+    cache_creation: u64,
+) -> (u64, Option<u64>) {
+    if let Some(cache_read) = anthropic_cache_read {
+        (prompt_tokens, Some(cache_read))
+    } else if let Some(cached) = openai_cached {
+        (
+            prompt_tokens
+                .saturating_sub(cached)
+                .saturating_sub(cache_creation),
+            Some(cached),
+        )
+    } else {
+        (prompt_tokens, None)
+    }
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
@@ -439,6 +483,8 @@ pub(crate) struct OpenAIChatUsage {
     pub cache_read_input_tokens: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_creation_input_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_tokens_details: Option<OpenAIPromptTokensDetails>,
 }
 
 pub(crate) fn stringify_message_content(request: &mut OpenAIChatRequest) {
@@ -755,6 +801,7 @@ pub(crate) fn convert_responses_to_chat_response(resp: &ResponsesResponse) -> Op
             total_tokens: prompt_tokens + completion_tokens,
             cache_read_input_tokens,
             cache_creation_input_tokens,
+            prompt_tokens_details: None,
         },
     }
 }
