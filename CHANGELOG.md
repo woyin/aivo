@@ -1,5 +1,12 @@
 # Changelog
 
+## v0.19.11
+
+### Fixes
+
+- Launcher: pin the resolved binary path before spawning so npm `.cmd` shims (`claude.cmd`, `codex.cmd`, etc.) launch on Windows — `CreateProcessW` does not honor PATHEXT for non-`.exe` files, so spawning the bare `claude`/`codex` name failed after install
+
+
 ## v0.19.10
 
 ### Fixes
