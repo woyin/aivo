@@ -298,7 +298,13 @@ impl ChatTuiApp {
 
     async fn handle_terminal_event(&mut self, event: Event) -> Result<Option<bool>> {
         match event {
-            Event::Key(key) => Ok(Some(self.handle_key(key).await?)),
+            // On Windows, crossterm emits both Press and Release events for
+            // every keystroke; Unix only emits the press equivalent. Process
+            // Press only so typed characters aren't doubled on Windows.
+            Event::Key(key) if key.kind == KeyEventKind::Press => {
+                Ok(Some(self.handle_key(key).await?))
+            }
+            Event::Key(_) => Ok(None),
             Event::Mouse(mouse) => Ok(Some(self.handle_mouse(mouse).await?)),
             Event::Resize(_, _) => Ok(None),
             Event::Paste(text) => {

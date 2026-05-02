@@ -57,7 +57,7 @@ fn term_read_line(prompt: &str) -> std::io::Result<String> {
 
 // Reads a line from stdin with masked echo (prints '*' per character) for secrets.
 fn term_read_secret(prompt: &str) -> std::io::Result<String> {
-    use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
+    use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
     use crossterm::terminal;
     use std::io::Write;
 
@@ -69,8 +69,13 @@ fn term_read_secret(prompt: &str) -> std::io::Result<String> {
     let mut stdout = std::io::stdout();
     let result = loop {
         match event::read() {
+            // On Windows, crossterm emits Press and Release for every key —
+            // process Press only so secrets aren't doubled.
             Ok(Event::Key(KeyEvent {
-                code, modifiers, ..
+                code,
+                modifiers,
+                kind: KeyEventKind::Press,
+                ..
             })) => match code {
                 KeyCode::Enter => {
                     let _ = write!(stdout, "\r\n");
