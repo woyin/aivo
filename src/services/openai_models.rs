@@ -473,9 +473,9 @@ pub(crate) struct OpenAIChatResponseMessage {
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 pub(crate) struct OpenAIChatUsage {
-    #[serde(default)]
+    #[serde(default, alias = "input_tokens")]
     pub prompt_tokens: u64,
-    #[serde(default)]
+    #[serde(default, alias = "output_tokens")]
     pub completion_tokens: u64,
     #[serde(default)]
     pub total_tokens: u64,
@@ -1383,6 +1383,25 @@ mod tests {
             Some("Visible text")
         );
         assert_eq!(chat.choices[0].finish_reason, "stop");
+    }
+
+    #[test]
+    fn test_openai_chat_usage_accepts_input_output_aliases() {
+        let chat: OpenAIChatResponse = serde_json::from_value(json!({
+            "id": "chatcmpl_xai",
+            "model": "grok-4.3",
+            "choices": [],
+            "usage": {
+                "input_tokens": 15000,
+                "output_tokens": 42,
+                "total_tokens": 15042
+            }
+        }))
+        .unwrap();
+
+        assert_eq!(chat.usage.prompt_tokens, 15000);
+        assert_eq!(chat.usage.completion_tokens, 42);
+        assert_eq!(chat.usage.total_tokens, 15042);
     }
 
     /// Catch schema drift: a representative `OpenAIChatRequest` (text + parts +

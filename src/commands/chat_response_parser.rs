@@ -194,8 +194,14 @@ pub(crate) fn extract_anthropic_usage(body: &serde_json::Value) -> Option<TokenU
 pub(crate) fn extract_openai_usage_update(body: &serde_json::Value) -> Option<TokenUsageUpdate> {
     let usage = body.get("usage")?;
     let update = TokenUsageUpdate {
-        prompt_tokens: usage.get("prompt_tokens").and_then(parse_token_u64),
-        completion_tokens: usage.get("completion_tokens").and_then(parse_token_u64),
+        prompt_tokens: usage
+            .get("prompt_tokens")
+            .or_else(|| usage.get("input_tokens"))
+            .and_then(parse_token_u64),
+        completion_tokens: usage
+            .get("completion_tokens")
+            .or_else(|| usage.get("output_tokens"))
+            .and_then(parse_token_u64),
         cache_read_input_tokens: usage
             .get("cache_read_input_tokens")
             .and_then(parse_token_u64)
@@ -774,6 +780,26 @@ mod tests {
             Some(TokenUsage {
                 prompt_tokens: 24,
                 completion_tokens: 11,
+                cache_read_input_tokens: 0,
+                cache_creation_input_tokens: 0,
+            })
+        );
+    }
+
+    #[test]
+    fn test_extract_openai_usage_accepts_input_output_aliases() {
+        let body = serde_json::json!({
+            "usage": {
+                "input_tokens": 15000,
+                "output_tokens": 42
+            }
+        });
+
+        assert_eq!(
+            extract_openai_usage(&body),
+            Some(TokenUsage {
+                prompt_tokens: 15000,
+                completion_tokens: 42,
                 cache_read_input_tokens: 0,
                 cache_creation_input_tokens: 0,
             })

@@ -440,6 +440,13 @@ pub fn convert_openai_chat_response_to_sse(resp: &Value) -> Result<String, serde
     let id = response.id;
     let model = response.model;
     let created = response.created.unwrap_or_else(current_unix_ts);
+    let usage = response.usage;
+    let has_usage = usage.prompt_tokens != 0
+        || usage.completion_tokens != 0
+        || usage.total_tokens != 0
+        || usage.cache_read_input_tokens.is_some()
+        || usage.cache_creation_input_tokens.is_some()
+        || usage.prompt_tokens_details.is_some();
     let choice = response.choices.into_iter().next();
     let message = choice
         .as_ref()
@@ -558,6 +565,19 @@ pub fn convert_openai_chat_response_to_sse(resp: &Value) -> Result<String, serde
             }]
         })
     ));
+    if has_usage {
+        events.push_str(&format!(
+            "data: {}\n\n",
+            json!({
+                "id": id,
+                "object": "chat.completion.chunk",
+                "created": created,
+                "model": model,
+                "choices": [],
+                "usage": usage
+            })
+        ));
+    }
     events.push_str("data: [DONE]\n\n");
     Ok(events)
 }
@@ -784,6 +804,29 @@ fn is_plain_anthropic_text_block(block: &Value) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_convert_openai_chat_response_to_sse_preserves_usage_aliases() {
+        let body = json!({
+            "id": "chatcmpl_xai",
+            "model": "grok-4.3",
+            "choices": [{
+                "message": {"role": "assistant", "content": "hi"},
+                "finish_reason": "stop"
+            }],
+            "usage": {
+                "input_tokens": 15000,
+                "output_tokens": 42,
+                "total_tokens": 15042
+            }
+        });
+
+        let sse = convert_openai_chat_response_to_sse(&body).unwrap();
+
+        assert!(sse.contains("\"choices\":[]"));
+        assert!(sse.contains("\"prompt_tokens\":15000"));
+        assert!(sse.contains("\"completion_tokens\":42"));
+    }
 
     #[test]
     fn test_convert_openai_chat_to_anthropic_request_with_tool_calls() {

@@ -123,10 +123,18 @@ impl OpenAIToResponsesStreamConverter {
 
         if let Some(usage) = chunk.get("usage") {
             self.saw_usage = true;
-            if let Some(input_tokens) = usage.get("prompt_tokens").and_then(|v| v.as_u64()) {
+            if let Some(input_tokens) = usage
+                .get("prompt_tokens")
+                .or_else(|| usage.get("input_tokens"))
+                .and_then(|v| v.as_u64())
+            {
                 self.input_tokens = input_tokens;
             }
-            if let Some(output_tokens) = usage.get("completion_tokens").and_then(|v| v.as_u64()) {
+            if let Some(output_tokens) = usage
+                .get("completion_tokens")
+                .or_else(|| usage.get("output_tokens"))
+                .and_then(|v| v.as_u64())
+            {
                 self.output_tokens = output_tokens;
             }
             if let Some(cache_read_input_tokens) = usage
@@ -263,12 +271,8 @@ impl OpenAIToResponsesStreamConverter {
             }
         }
 
-        if let Some(finish_reason) = choice.get("finish_reason").and_then(|v| v.as_str())
-            && !finish_reason.is_empty()
-        {
-            self.finalize(output);
-        }
-
+        // OpenAI-compatible providers can send a usage-only chunk after
+        // finish_reason. Finalize on [DONE]/EOF so those tokens are kept.
         Ok(())
     }
 
@@ -586,7 +590,10 @@ fn extract_completed_response_from_sse(sse: &str) -> Option<Value> {
 
 #[cfg(test)]
 mod tests {
-    use super::{convert_chat_response_to_responses_json, convert_chat_sse_to_responses_sse};
+    use super::{
+        convert_chat_response_to_responses_json, convert_chat_sse_to_responses_sse,
+        extract_completed_response_from_sse,
+    };
     use serde_json::json;
 
     #[test]
@@ -659,6 +666,38 @@ mod tests {
         assert!(responses_sse.contains("\"delta\":\"lo\""));
         assert!(responses_sse.contains("\"cache_read_input_tokens\":90"));
         assert!(responses_sse.contains("event: response.completed"));
+    }
+
+    #[test]
+    fn test_convert_chat_sse_to_responses_sse_accepts_input_output_usage_aliases() {
+        let chat_sse = concat!(
+            "data: {\"id\":\"chatcmpl_xai\",\"model\":\"grok-4.3\",\"choices\":[{\"delta\":{\"content\":\"hi\"},\"finish_reason\":\"stop\"}],\"usage\":{\"input_tokens\":15000,\"output_tokens\":42}}\n\n",
+            "data: [DONE]\n\n",
+        );
+
+        let responses_sse = convert_chat_sse_to_responses_sse(chat_sse, "grok-4.3").unwrap();
+        let response = extract_completed_response_from_sse(&responses_sse).unwrap();
+
+        assert_eq!(response["usage"]["input_tokens"], 15000);
+        assert_eq!(response["usage"]["output_tokens"], 42);
+        assert_eq!(response["usage"]["total_tokens"], 15042);
+    }
+
+    #[test]
+    fn test_convert_chat_sse_to_responses_sse_waits_for_trailing_usage_after_finish_reason() {
+        let chat_sse = concat!(
+            "data: {\"id\":\"chatcmpl_xai\",\"model\":\"grok-4.3\",\"choices\":[{\"delta\":{\"content\":\"hi\"},\"finish_reason\":null}]}\n\n",
+            "data: {\"id\":\"chatcmpl_xai\",\"model\":\"grok-4.3\",\"choices\":[{\"delta\":{\"content\":\"!\"},\"finish_reason\":\"stop\"}]}\n\n",
+            "data: {\"id\":\"chatcmpl_xai\",\"model\":\"grok-4.3\",\"choices\":[],\"usage\":{\"input_tokens\":15000,\"output_tokens\":42}}\n\n",
+            "data: [DONE]\n\n",
+        );
+
+        let responses_sse = convert_chat_sse_to_responses_sse(chat_sse, "grok-4.3").unwrap();
+        let response = extract_completed_response_from_sse(&responses_sse).unwrap();
+
+        assert_eq!(response["usage"]["input_tokens"], 15000);
+        assert_eq!(response["usage"]["output_tokens"], 42);
+        assert_eq!(response["output"][0]["content"][0]["text"], "hi!");
     }
 
     #[test]
