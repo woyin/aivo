@@ -218,11 +218,29 @@ async fn spawn_setup_token_with_binary(
 }
 
 /// Test seam: lets tests pass a stub binary path instead of real `claude`.
+///
+/// Retries on `SetupTokenError::Other` to absorb the Linux ETXTBSY race where
+/// fork+execve can fail because another concurrent test thread inherited a
+/// writable fd at fork time (kernel reports os error 26). Production callers
+/// don't hit this — they exec a long-installed `claude` binary, not a stub
+/// we wrote microseconds ago.
 #[cfg(test)]
 pub async fn spawn_setup_token_with_binary_for_test(
     binary: &std::path::Path,
 ) -> Result<ClaudeOAuthCredential, SetupTokenError> {
-    spawn_setup_token_with_binary(binary.to_str().expect("binary path is utf-8")).await
+    let path = binary.to_str().expect("binary path is utf-8");
+    let mut backoff_ms = 25;
+    for _ in 0..5 {
+        match spawn_setup_token_with_binary(path).await {
+            Err(SetupTokenError::Other(_)) => {
+                tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
+                backoff_ms *= 2;
+                continue;
+            }
+            other => return other,
+        }
+    }
+    spawn_setup_token_with_binary(path).await
 }
 
 #[cfg(test)]
