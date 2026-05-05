@@ -435,6 +435,8 @@ impl AudioCommand {
         // Interactive: loop list → action → list. Exits only when the user
         // cancels (Esc/Ctrl-C) from the entry list itself, or when the
         // cache is empty (e.g. after deleting the last entry).
+        let mut selected_hash: Option<String> = None;
+        let mut selected_index = 0usize;
         loop {
             let entries = match audio_cache::list_entries(&cache_dir) {
                 Ok(e) => e,
@@ -452,9 +454,14 @@ impl AudioCommand {
             }
 
             let labels: Vec<String> = entries.iter().map(format_entry_oneliner).collect();
+            let default = selected_hash
+                .as_ref()
+                .and_then(|hash| entries.iter().position(|entry| &entry.hash == hash))
+                .unwrap_or_else(|| selected_index.min(entries.len().saturating_sub(1)));
             let picked = match FuzzySelect::new()
                 .with_prompt("Cached TTS")
                 .items(&labels)
+                .default(default)
                 .interact_opt()
             {
                 Ok(Some(i)) => i,
@@ -464,6 +471,8 @@ impl AudioCommand {
                     return ExitCode::UserError;
                 }
             };
+            selected_hash = Some(entries[picked].hash.clone());
+            selected_index = picked;
             let entry = &entries[picked];
 
             let actions = vec![
@@ -490,8 +499,8 @@ impl AudioCommand {
                 0 => {
                     let _ = self.list_play(entry, &cache_dir);
                 }
-                1 => {
-                    let _ = list_delete(entry, &cache_dir);
+                1 if list_delete(entry, &cache_dir) == ExitCode::Success => {
+                    selected_hash = None;
                 }
                 _ => {} // Cancel: fall through to next iteration
             }

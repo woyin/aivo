@@ -110,17 +110,18 @@ impl FuzzySelect {
         let page_size = 10;
 
         loop {
+            let filter_query = query_for_filter(&query);
             let mut filtered: Vec<(usize, &String)> = self
                 .items
                 .iter()
                 .enumerate()
-                .filter(|(_, item)| matches_fuzzy(&query, item))
+                .filter(|(_, item)| matches_fuzzy(filter_query, item))
                 .collect();
 
-            if !query.is_empty() {
+            if !filter_query.is_empty() {
                 // `sort_by_cached_key` scores each item once and is stable, so
                 // equal-score items keep their original insertion order.
-                filtered.sort_by_cached_key(|(_, item)| score_match(&query, item));
+                filtered.sort_by_cached_key(|(_, item)| score_match(filter_query, item));
             }
 
             let count = filtered.len();
@@ -156,7 +157,7 @@ impl FuzzySelect {
 
             let term_width = term.size().1 as usize;
 
-            let hint = if query.is_empty() && count > page_size {
+            let hint = if filter_query.is_empty() && count > page_size {
                 format!(" {}", crate::style::dim("(type to filter)"))
             } else {
                 String::new()
@@ -251,7 +252,7 @@ impl FuzzySelect {
                         return Ok(FuzzyOutcome::Selected(orig_idx));
                     }
                     term.show_cursor()?;
-                    return Ok(FuzzyOutcome::Query(query));
+                    return Ok(FuzzyOutcome::Query(filter_query.to_string()));
                 }
                 FuzzyInput::Cancel => {
                     term.show_cursor()?;
@@ -400,6 +401,10 @@ fn normalize_pasted_query(text: &str) -> String {
     text.chars().filter(|c| !c.is_control()).collect()
 }
 
+fn query_for_filter(query: &str) -> &str {
+    query.trim()
+}
+
 /// Advances `selection` within `filtered` until it lands on an enabled row,
 /// skipping any disabled rows. The search wraps; if every row in `filtered`
 /// is disabled, `selection` is returned unchanged. `forward` controls whether
@@ -518,7 +523,9 @@ pub(crate) fn matches_fuzzy(query: &str, target: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{next_enabled_filtered, normalize_pasted_query, score_match};
+    use super::{
+        matches_fuzzy, next_enabled_filtered, normalize_pasted_query, query_for_filter, score_match,
+    };
 
     fn filtered_fixture(items: &[&'static str]) -> Vec<(usize, &'static String)> {
         // `next_enabled_filtered` only reads the original index, but the
@@ -643,5 +650,14 @@ mod tests {
             normalize_pasted_query("OpenRouter\nhttps://openrouter.ai\r\n"),
             "OpenRouterhttps://openrouter.ai"
         );
+    }
+
+    #[test]
+    fn filter_query_trims_outer_spaces() {
+        let query = query_for_filter("  openai  ");
+
+        assert_eq!(query, "openai");
+        assert!(matches_fuzzy(query, "openai   https://api.openai.com"));
+        assert_eq!(score_match(query, "openai   https://api.openai.com").0, 0);
     }
 }

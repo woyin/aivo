@@ -22,8 +22,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Result, bail};
+use crossterm::cursor::MoveUp;
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
-use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
+use crossterm::terminal::{Clear, ClearType, disable_raw_mode, enable_raw_mode};
 use rodio::buffer::SamplesBuffer;
 use rodio::{Decoder, OutputStream, Sink, Source};
 
@@ -192,7 +193,7 @@ fn run_interactive_loop(
 
     let last_pos = current_pos(sink, started, start_at);
     sink.stop();
-    clear_status_line();
+    clear_playback_lines(2);
 
     Ok(PlaybackOutcome {
         completed: !user_quit,
@@ -239,9 +240,17 @@ fn render_status(sink: &Sink, total: Option<Duration>) {
     let _ = err.flush();
 }
 
-fn clear_status_line() {
+fn clear_playback_lines(lines: u16) {
+    if lines == 0 {
+        return;
+    }
     let mut err = std::io::stderr().lock();
-    let _ = write!(err, "\r{}\r", " ".repeat(60));
+    let _ = write!(err, "\r");
+    let _ = crossterm::execute!(err, Clear(ClearType::CurrentLine));
+    for _ in 1..lines {
+        let _ = crossterm::execute!(err, MoveUp(1), Clear(ClearType::CurrentLine));
+    }
+    let _ = write!(err, "\r");
     let _ = err.flush();
 }
 
@@ -392,7 +401,7 @@ pub fn run_streaming_playback(
 
     let last_pos = sink.get_pos();
     sink.stop();
-    clear_status_line();
+    clear_playback_lines(2);
 
     Ok(PlaybackOutcome {
         completed: !user_quit,
