@@ -67,6 +67,7 @@ pub mod session_crypto;
 pub mod session_store;
 pub mod since;
 pub mod stdin_io;
+pub mod symlink_util;
 pub mod system_env;
 pub mod usage_stats_store;
 pub mod video_gen;

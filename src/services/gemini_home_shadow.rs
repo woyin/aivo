@@ -1,23 +1,34 @@
 //! Shadow `GEMINI_CLI_HOME` for launching the native `gemini` CLI with
-//! aivo's Google OAuth credentials — without ever touching the user's real
-//! `~/.gemini/`.
+//! aivo's Google OAuth credentials. The shadow owns auth (we manage the
+//! tokens) but transparently exposes the user's real `~/.gemini/` state
+//! — chats, memory, MCP tokens, trust prompts, settings — so a launch
+//! through aivo behaves like a normal launch except for the credential.
 //!
 //! Flow (parallel to `codex_home_shadow.rs`):
 //! 1. Create a temp dir `aivo-gemini-<random>/`.
-//! 2. Create `.gemini/` inside it and write:
-//!    - `oauth_creds.json`  — google-auth-library `Credentials` shape.
+//! 2. Create `.gemini/` inside it and write the auth files we own:
+//!    - `oauth_creds.json` — google-auth-library `Credentials` shape.
 //!    - `google_accounts.json` — `{ active: email, old: [] }`.
-//!    - `settings.json` — `{ security: { auth: { selectedType: "oauth-personal" } } }`.
-//!      Required: the gemini CLI opens its auth picker whenever
-//!      `settings.merged.security.auth.selectedType` is undefined, regardless
-//!      of any env vars (verified in
+//!    - `settings.json` — the user's real `settings.json` deep-merged
+//!      with `security.auth.selectedType = "oauth-personal"`. The
+//!      selected auth type is required: the gemini CLI opens its
+//!      first-run auth picker whenever `settings.merged.security.auth
+//!      .selectedType` is undefined (verified in
 //!      `google-gemini/gemini-cli:packages/cli/src/core/initializer.ts`).
-//! 3. Caller sets `GEMINI_CLI_HOME=<tempdir>` (the *parent* of `.gemini/` —
-//!    the gemini CLI appends `.gemini/` itself in
+//!      Merging (rather than overwriting) preserves theme, telemetry,
+//!      MCP config, and every other pref the user set.
+//! 3. Symlink user-state files/dirs from the real `~/.gemini/` into the
+//!    shadow `.gemini/`: `tmp/`, `history/`, `commands/`, `GEMINI.md`,
+//!    `trustedFolders.json`, `mcp-oauth-tokens-v2.json`, `projects.json`,
+//!    `state.json`, `installation_id`, `user_id`. Reads find prior
+//!    state and writes persist back to the real home.
+//! 4. Caller sets `GEMINI_CLI_HOME=<tempdir>` (the *parent* of `.gemini/`
+//!    — the gemini CLI appends `.gemini/` itself in
 //!    `Storage.getGlobalGeminiDir`) and spawns gemini.
-//! 4. On exit, `read_back` reads the (possibly-rotated) `oauth_creds.json`
+//! 5. On exit, `read_back` reads the (possibly-rotated) `oauth_creds.json`
 //!    so refreshed tokens flow back into aivo's store.
-//! 5. The temp dir is removed on drop.
+//! 6. The temp dir is removed on drop. The symlinked real-home files
+//!    survive untouched.
 //!
 //! We deliberately do *not* set `GEMINI_FORCE_ENCRYPTED_FILE_STORAGE`: its
 //! default-off value is the path that reads/writes `oauth_creds.json`
@@ -30,6 +41,7 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
 use crate::services::gemini_oauth::GeminiOAuthCredential;
+use crate::services::symlink_util::{symlink_dir, symlink_file};
 
 /// On-disk shape the gemini CLI expects at `.gemini/oauth_creds.json`.
 /// Matches google-auth-library's `Credentials` exactly — all fields
@@ -108,6 +120,13 @@ impl GeminiHomeShadow {
     /// Creates the temp dir and writes the three auth files. The returned
     /// `path()` is the *parent* of `.gemini/`; pass it to `GEMINI_CLI_HOME`.
     pub async fn create(creds: &GeminiOAuthCredential) -> Result<Self> {
+        Self::create_with_real_home(creds, real_gemini_home()).await
+    }
+
+    async fn create_with_real_home(
+        creds: &GeminiOAuthCredential,
+        real_home: Option<PathBuf>,
+    ) -> Result<Self> {
         let dir = tempfile::Builder::new()
             .prefix("aivo-gemini-")
             .tempdir()
@@ -125,13 +144,8 @@ impl GeminiHomeShadow {
             old: Vec::new(),
         })
         .context("serialize google_accounts.json")?;
-        // `selectedType: "oauth-personal"` matches `AuthType.LOGIN_WITH_GOOGLE`
-        // in the gemini-cli sources. Without this, the first-run UI opens
-        // the auth picker even though oauth_creds.json is already populated.
-        let settings_body = serde_json::to_vec_pretty(&serde_json::json!({
-            "security": { "auth": { "selectedType": "oauth-personal" } }
-        }))
-        .context("serialize settings.json")?;
+        let settings_body = serde_json::to_vec_pretty(&merged_settings(real_home.as_deref()).await)
+            .context("serialize settings.json")?;
 
         let (creds_r, accounts_r, settings_r) = tokio::join!(
             tokio::fs::write(gemini_subdir.join("oauth_creds.json"), creds_body),
@@ -141,6 +155,10 @@ impl GeminiHomeShadow {
         creds_r.context("write shadow oauth_creds.json")?;
         accounts_r.context("write shadow google_accounts.json")?;
         settings_r.context("write shadow settings.json")?;
+
+        if let Some(real) = real_home {
+            link_user_state(&real, &gemini_subdir).await;
+        }
 
         Ok(Self { dir })
     }
@@ -171,6 +189,91 @@ impl GeminiHomeShadow {
     }
 }
 
+/// Resolve the user's real `.gemini/` directory, matching gemini-cli's
+/// `Storage.getGlobalGeminiDir`: `$GEMINI_CLI_HOME/.gemini/` if set,
+/// else `~/.gemini/`. We read the env eagerly because aivo overwrites
+/// `GEMINI_CLI_HOME` to point at the shadow before spawn.
+fn real_gemini_home() -> Option<PathBuf> {
+    if let Ok(v) = std::env::var("GEMINI_CLI_HOME") {
+        let p = PathBuf::from(v).join(".gemini");
+        if p.is_dir() {
+            return Some(p);
+        }
+    }
+    crate::services::system_env::home_dir().map(|h| h.join(".gemini"))
+}
+
+/// Loads the user's `settings.json` (if present) and deep-merges
+/// `security.auth.selectedType = "oauth-personal"` into it. The selected
+/// auth type is required: gemini-cli opens its first-run auth picker
+/// whenever `settings.merged.security.auth.selectedType` is undefined,
+/// regardless of `oauth_creds.json` being populated. Merging (rather
+/// than overwriting) preserves theme, telemetry, MCP, and every other
+/// pref the user set in their real CLI.
+async fn merged_settings(real_home: Option<&Path>) -> serde_json::Value {
+    let mut base = match real_home {
+        Some(home) => match tokio::fs::read(home.join("settings.json")).await {
+            Ok(bytes) => serde_json::from_slice::<serde_json::Value>(&bytes)
+                .unwrap_or_else(|_| serde_json::json!({})),
+            Err(_) => serde_json::json!({}),
+        },
+        None => serde_json::json!({}),
+    };
+    if !base.is_object() {
+        base = serde_json::json!({});
+    }
+    let security = base
+        .as_object_mut()
+        .unwrap()
+        .entry("security")
+        .or_insert_with(|| serde_json::json!({}));
+    if !security.is_object() {
+        *security = serde_json::json!({});
+    }
+    let auth = security
+        .as_object_mut()
+        .unwrap()
+        .entry("auth")
+        .or_insert_with(|| serde_json::json!({}));
+    if !auth.is_object() {
+        *auth = serde_json::json!({});
+    }
+    auth.as_object_mut()
+        .unwrap()
+        .insert("selectedType".into(), serde_json::json!("oauth-personal"));
+    base
+}
+
+/// Best-effort: link the user-state files of `~/.gemini/` into the
+/// shadow `.gemini/` so chat resume, memory, trust state, MCP tokens,
+/// and project bookkeeping all work as if the user launched gemini
+/// directly — and writes during this session persist back to the real
+/// home. Each link is independent; failures are silent.
+async fn link_user_state(real_home: &Path, shadow_gemini: &Path) {
+    for dir in ["tmp", "history", "commands"] {
+        let real = real_home.join(dir);
+        let _ = tokio::fs::create_dir_all(&real).await;
+        if real.is_dir() {
+            let _ = symlink_dir(&real, &shadow_gemini.join(dir)).await;
+        }
+    }
+
+    for file in [
+        "GEMINI.md",
+        "trustedFolders.json",
+        "mcp-oauth-tokens-v2.json",
+        "projects.json",
+        "state.json",
+        "installation_id",
+        "user_id",
+    ] {
+        let real = real_home.join(file);
+        if real.exists() {
+            let _ = symlink_file(&real, &shadow_gemini.join(file)).await;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -189,10 +292,16 @@ mod tests {
         }
     }
 
+    async fn isolated_shadow(c: &GeminiOAuthCredential) -> GeminiHomeShadow {
+        GeminiHomeShadow::create_with_real_home(c, None)
+            .await
+            .unwrap()
+    }
+
     #[tokio::test]
     async fn creates_dot_gemini_subdir_and_files() {
         let c = sample_cred();
-        let shadow = GeminiHomeShadow::create(&c).await.unwrap();
+        let shadow = isolated_shadow(&c).await;
         let dot = shadow.path().join(".gemini");
         assert!(dot.is_dir());
         assert!(dot.join("oauth_creds.json").is_file());
@@ -205,7 +314,7 @@ mod tests {
         // The gemini CLI opens its auth picker whenever
         // settings.security.auth.selectedType is undefined. Regression guard.
         let c = sample_cred();
-        let shadow = GeminiHomeShadow::create(&c).await.unwrap();
+        let shadow = isolated_shadow(&c).await;
         let body = tokio::fs::read_to_string(shadow.path().join(".gemini/settings.json"))
             .await
             .unwrap();
@@ -219,7 +328,7 @@ mod tests {
     #[tokio::test]
     async fn roundtrip_preserves_tokens() {
         let c = sample_cred();
-        let shadow = GeminiHomeShadow::create(&c).await.unwrap();
+        let shadow = isolated_shadow(&c).await;
         let back = shadow.read_back().await.unwrap().unwrap();
         assert_eq!(back.access_token.as_deref(), Some("at"));
         assert_eq!(back.refresh_token.as_deref(), Some("rt"));
@@ -231,7 +340,7 @@ mod tests {
     #[tokio::test]
     async fn google_accounts_file_has_active_email() {
         let c = sample_cred();
-        let shadow = GeminiHomeShadow::create(&c).await.unwrap();
+        let shadow = isolated_shadow(&c).await;
         let body = tokio::fs::read_to_string(shadow.path().join(".gemini/google_accounts.json"))
             .await
             .unwrap();
@@ -243,7 +352,7 @@ mod tests {
     #[tokio::test]
     async fn read_back_handles_missing_file() {
         let c = sample_cred();
-        let shadow = GeminiHomeShadow::create(&c).await.unwrap();
+        let shadow = isolated_shadow(&c).await;
         tokio::fs::remove_file(shadow.oauth_creds_path())
             .await
             .unwrap();
@@ -253,7 +362,7 @@ mod tests {
     #[tokio::test]
     async fn read_back_handles_malformed_json() {
         let c = sample_cred();
-        let shadow = GeminiHomeShadow::create(&c).await.unwrap();
+        let shadow = isolated_shadow(&c).await;
         tokio::fs::write(shadow.oauth_creds_path(), b"{not json")
             .await
             .unwrap();
@@ -284,9 +393,127 @@ mod tests {
     async fn temp_dir_is_removed_on_drop() {
         let c = sample_cred();
         let path = {
-            let shadow = GeminiHomeShadow::create(&c).await.unwrap();
+            let shadow = isolated_shadow(&c).await;
             shadow.path().to_path_buf()
         };
         assert!(!path.exists());
+    }
+
+    #[tokio::test]
+    async fn settings_merge_preserves_user_prefs() {
+        // Real settings.json has unrelated user prefs and a *different*
+        // selectedType — merged shadow output must keep the prefs and
+        // overwrite only selectedType.
+        let c = sample_cred();
+        let real = tempfile::tempdir().unwrap();
+        let real_gemini = real.path().join(".gemini");
+        tokio::fs::create_dir_all(&real_gemini).await.unwrap();
+        let user_settings = serde_json::json!({
+            "ui": { "theme": "Dracula" },
+            "telemetry": { "enabled": false },
+            "security": { "auth": { "selectedType": "stale" } },
+            "mcpServers": { "foo": { "command": "x" } }
+        });
+        tokio::fs::write(
+            real_gemini.join("settings.json"),
+            serde_json::to_vec(&user_settings).unwrap(),
+        )
+        .await
+        .unwrap();
+
+        let shadow = GeminiHomeShadow::create_with_real_home(&c, Some(real_gemini.clone()))
+            .await
+            .unwrap();
+
+        let body = tokio::fs::read(shadow.path().join(".gemini/settings.json"))
+            .await
+            .unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(parsed["ui"]["theme"].as_str(), Some("Dracula"));
+        assert_eq!(parsed["telemetry"]["enabled"], false);
+        assert_eq!(parsed["mcpServers"]["foo"]["command"].as_str(), Some("x"));
+        assert_eq!(
+            parsed["security"]["auth"]["selectedType"].as_str(),
+            Some("oauth-personal")
+        );
+    }
+
+    #[tokio::test]
+    async fn shadow_exposes_chats_and_memory() {
+        let c = sample_cred();
+        let real = tempfile::tempdir().unwrap();
+        let real_gemini = real.path().join(".gemini");
+        let chats_dir = real_gemini.join("tmp/projhash/chats");
+        tokio::fs::create_dir_all(&chats_dir).await.unwrap();
+        tokio::fs::write(chats_dir.join("session-old.json"), b"{}")
+            .await
+            .unwrap();
+        tokio::fs::write(real_gemini.join("GEMINI.md"), b"my context")
+            .await
+            .unwrap();
+        tokio::fs::write(real_gemini.join("trustedFolders.json"), b"{}")
+            .await
+            .unwrap();
+
+        let shadow = GeminiHomeShadow::create_with_real_home(&c, Some(real_gemini.clone()))
+            .await
+            .unwrap();
+        let dot = shadow.path().join(".gemini");
+
+        let chat = tokio::fs::read(dot.join("tmp/projhash/chats/session-old.json"))
+            .await
+            .unwrap();
+        assert_eq!(chat, b"{}");
+        let mem = tokio::fs::read(dot.join("GEMINI.md")).await.unwrap();
+        assert_eq!(mem, b"my context");
+        assert!(dot.join("trustedFolders.json").exists());
+    }
+
+    #[tokio::test]
+    async fn new_chat_session_persists_back_to_real_home() {
+        let c = sample_cred();
+        let real = tempfile::tempdir().unwrap();
+        let real_gemini = real.path().join(".gemini");
+        tokio::fs::create_dir_all(&real_gemini).await.unwrap();
+
+        let shadow = GeminiHomeShadow::create_with_real_home(&c, Some(real_gemini.clone()))
+            .await
+            .unwrap();
+
+        let new_chat = shadow
+            .path()
+            .join(".gemini/tmp/projhash/chats/session-new.json");
+        tokio::fs::create_dir_all(new_chat.parent().unwrap())
+            .await
+            .unwrap();
+        tokio::fs::write(&new_chat, b"new").await.unwrap();
+
+        let in_real = tokio::fs::read(real_gemini.join("tmp/projhash/chats/session-new.json"))
+            .await
+            .unwrap();
+        assert_eq!(in_real, b"new");
+    }
+
+    #[tokio::test]
+    async fn missing_user_settings_still_emits_oauth_personal() {
+        // Real home exists but has no settings.json → shadow falls back
+        // to a minimal {security:{auth:{selectedType}}} object so the
+        // first-run picker still doesn't trigger.
+        let c = sample_cred();
+        let real = tempfile::tempdir().unwrap();
+        let real_gemini = real.path().join(".gemini");
+        tokio::fs::create_dir_all(&real_gemini).await.unwrap();
+
+        let shadow = GeminiHomeShadow::create_with_real_home(&c, Some(real_gemini))
+            .await
+            .unwrap();
+        let body = tokio::fs::read(shadow.path().join(".gemini/settings.json"))
+            .await
+            .unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            parsed["security"]["auth"]["selectedType"].as_str(),
+            Some("oauth-personal")
+        );
     }
 }
