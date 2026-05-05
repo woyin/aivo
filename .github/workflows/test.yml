@@ -22,7 +22,7 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      - run: cargo test
+      - run: cargo test --features __internal_test_fast_crypto
 
       - run: cargo clippy -- -D warnings
 
@@ -33,7 +33,7 @@ jobs:
       # through CI and only surface when end users hit the binary.
       - name: Test --no-default-features (linux artifact build path)
         if: matrix.runs-on == 'ubuntu-latest'
-        run: cargo test --no-default-features
+        run: cargo test --no-default-features --features __internal_test_fast_crypto
 
       - name: Clippy --no-default-features
         if: matrix.runs-on == 'ubuntu-latest'
