@@ -220,7 +220,7 @@ impl AILauncher {
         let env = self
             .env_injector
             .merge(&resolved.tool_config.env_vars, options.env.as_ref());
-        let mut runtime = prepare_runtime_env(options.tool, env).await?;
+        let mut runtime = prepare_runtime_env(options.tool, env, &self.session_store).await?;
 
         let mut runtime_args = build_runtime_args(
             options.tool,

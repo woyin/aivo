@@ -68,6 +68,7 @@ pub(crate) struct LaunchRuntimeState {
 pub(crate) async fn prepare_runtime_env(
     tool: AIToolType,
     mut env: HashMap<String, String>,
+    session_store: &SessionStore,
 ) -> Result<LaunchRuntimeState> {
     let mut router_protocol = None;
     let mut responses_api_support = None;
@@ -163,14 +164,14 @@ pub(crate) async fn prepare_runtime_env(
 
     let codex_oauth_sync =
         if tool == AIToolType::Codex && env.contains_key("AIVO_CODEX_OAUTH_CREDS") {
-            Some(prepare_codex_oauth_shadow(&mut env).await?)
+            Some(prepare_codex_oauth_shadow(&mut env, session_store).await?)
         } else {
             None
         };
 
     let gemini_oauth_sync =
         if tool == AIToolType::Gemini && env.contains_key("AIVO_GEMINI_OAUTH_CREDS") {
-            Some(prepare_gemini_oauth_shadow(&mut env).await?)
+            Some(prepare_gemini_oauth_shadow(&mut env, session_store).await?)
         } else {
             None
         };
@@ -202,7 +203,10 @@ pub(crate) async fn prepare_runtime_env(
 ///
 /// The placeholder env vars are stripped before codex is spawned; all codex
 /// sees is `CODEX_HOME=<shadow>` and the standard model overrides.
-async fn prepare_codex_oauth_shadow(env: &mut HashMap<String, String>) -> Result<CodexOAuthSync> {
+async fn prepare_codex_oauth_shadow(
+    env: &mut HashMap<String, String>,
+    session_store: &SessionStore,
+) -> Result<CodexOAuthSync> {
     let raw = env
         .remove("AIVO_CODEX_OAUTH_CREDS")
         .ok_or_else(|| anyhow::anyhow!("missing AIVO_CODEX_OAUTH_CREDS"))?;
@@ -211,12 +215,25 @@ async fn prepare_codex_oauth_shadow(env: &mut HashMap<String, String>) -> Result
         .ok_or_else(|| anyhow::anyhow!("missing AIVO_CODEX_KEY_ID"))?;
     let mut creds = CodexOAuthCredential::from_json(&raw)?;
 
-    // Refresh pre-launch so codex starts with a valid access token. If this
-    // succeeds we DON'T persist here — the post-exit sync path will handle
-    // it, picking up any further rotations codex may perform during the
-    // session. If refresh fails the error surfaces to the user who must
-    // re-run `aivo keys add codex`.
-    let _refreshed = ensure_fresh(&mut creds, REFRESH_SKEW_SECS).await?;
+    // Refresh pre-launch so codex starts with a valid access token. If the
+    // refresh token has been invalidated — codex was killed before the
+    // post-exit sync ran, or another process (native codex, a parallel aivo)
+    // rotated it — fall back to an interactive re-login and persist the new
+    // creds immediately so the next launch doesn't repeat the recovery.
+    if let Err(e) = ensure_fresh(&mut creds, REFRESH_SKEW_SECS).await {
+        if !is_oauth_invalid_grant(&e) {
+            return Err(e);
+        }
+        eprintln!(
+            "{} Codex refresh token is no longer valid — re-authenticating.",
+            crate::style::yellow("aivo:")
+        );
+        let stale = creds.clone();
+        creds = crate::services::codex_oauth::interactive_login()
+            .await
+            .map_err(|err| err.context("codex re-login after invalid refresh token"))?;
+        persist_refreshed_if_needed(session_store, &key_id, &stale, &creds).await;
+    }
 
     let shadow = CodexHomeShadow::create(&creds).await?;
     env.insert(
@@ -305,6 +322,20 @@ pub(crate) fn detect_token_rotation(
     tokens_changed(original, disk)
 }
 
+/// Heuristic for "the refresh server told us our refresh token is bad" vs
+/// "transient failure". 4xx from the token endpoint (`invalid_grant`,
+/// `invalid_request_error`) is recoverable via an interactive re-login;
+/// 5xx and network errors are not. Both `codex_oauth::refresh` and
+/// `gemini_oauth::refresh` format their failures as
+/// `"refresh failed (NNN): <body>"`, so a substring match is enough.
+pub(crate) fn is_oauth_invalid_grant(e: &anyhow::Error) -> bool {
+    let s = e.to_string();
+    s.contains("refresh failed (400")
+        || s.contains("refresh failed (401")
+        || s.contains("refresh failed (403")
+        || s.contains("refresh failed (404")
+}
+
 /// Parses `AIVO_GEMINI_OAUTH_CREDS` (set by `environment_injector::for_gemini`
 /// for Google OAuth keys), refreshes the access token if near expiry, and
 /// writes a shadow `GEMINI_CLI_HOME` temp dir containing `.gemini/
@@ -313,7 +344,10 @@ pub(crate) fn detect_token_rotation(
 /// The `AIVO_*` placeholder vars are stripped before gemini is spawned; all
 /// gemini sees is `GEMINI_CLI_HOME=<shadow>`, `GOOGLE_GENAI_USE_GCA=true`,
 /// and `GEMINI_MODEL=<model>`.
-async fn prepare_gemini_oauth_shadow(env: &mut HashMap<String, String>) -> Result<GeminiOAuthSync> {
+async fn prepare_gemini_oauth_shadow(
+    env: &mut HashMap<String, String>,
+    session_store: &SessionStore,
+) -> Result<GeminiOAuthSync> {
     let raw = env
         .remove("AIVO_GEMINI_OAUTH_CREDS")
         .ok_or_else(|| anyhow::anyhow!("missing AIVO_GEMINI_OAUTH_CREDS"))?;
@@ -322,11 +356,24 @@ async fn prepare_gemini_oauth_shadow(env: &mut HashMap<String, String>) -> Resul
         .ok_or_else(|| anyhow::anyhow!("missing AIVO_GEMINI_KEY_ID"))?;
     let mut creds = GeminiOAuthCredential::from_json(&raw)?;
 
-    // Refresh pre-launch so gemini starts with a valid access token. The
-    // post-exit sync path persists both this refresh and any further
-    // rotations gemini performs during the session, so we don't persist
-    // here.
-    let _refreshed = gemini_ensure_fresh(&mut creds, GEMINI_REFRESH_SKEW_SECS).await?;
+    // Refresh pre-launch so gemini starts with a valid access token. As with
+    // codex (see `prepare_codex_oauth_shadow`), an invalid_grant from Google
+    // means the stored refresh token is dead — drop into the OAuth flow
+    // instead of bubbling a confusing 401 to the user.
+    if let Err(e) = gemini_ensure_fresh(&mut creds, GEMINI_REFRESH_SKEW_SECS).await {
+        if !is_oauth_invalid_grant(&e) {
+            return Err(e);
+        }
+        eprintln!(
+            "{} Gemini refresh token is no longer valid — re-authenticating.",
+            crate::style::yellow("aivo:")
+        );
+        let stale = creds.clone();
+        creds = crate::services::gemini_oauth::interactive_login()
+            .await
+            .map_err(|err| err.context("gemini re-login after invalid refresh token"))?;
+        persist_refreshed_gemini_if_needed(session_store, &key_id, &stale, &creds).await;
+    }
 
     let shadow = GeminiHomeShadow::create(&creds).await?;
     env.insert(
@@ -1342,10 +1389,41 @@ async fn start_responses_to_chat_copilot_router(env: &HashMap<String, String>) -
 #[cfg(test)]
 mod tests {
     use super::{
-        clear_node_proxy_env, patch_opencode_config_content,
+        clear_node_proxy_env, is_oauth_invalid_grant, patch_opencode_config_content,
         prepare_gemini_api_key_settings_override,
     };
     use std::collections::HashMap;
+
+    #[test]
+    fn is_oauth_invalid_grant_matches_4xx_refresh_failures() {
+        // Real-world wording from the OpenAI token endpoint. The whole point
+        // of this branch is to trigger interactive re-login, so the bodies
+        // matter less than the status prefix.
+        assert!(is_oauth_invalid_grant(&anyhow::anyhow!(
+            "refresh failed (401): {{\"error\":{{\"message\":\"Your refresh token has already been used\"}}}}"
+        )));
+        assert!(is_oauth_invalid_grant(&anyhow::anyhow!(
+            "refresh failed (400): invalid_grant"
+        )));
+        assert!(is_oauth_invalid_grant(&anyhow::anyhow!(
+            "refresh failed (403): forbidden"
+        )));
+    }
+
+    #[test]
+    fn is_oauth_invalid_grant_skips_transient_failures() {
+        // 5xx, network, and parse errors aren't recoverable via re-login —
+        // we don't want to open a browser for a transient outage.
+        assert!(!is_oauth_invalid_grant(&anyhow::anyhow!(
+            "refresh failed (500): bad gateway"
+        )));
+        assert!(!is_oauth_invalid_grant(&anyhow::anyhow!(
+            "POST /oauth/token (refresh_token)"
+        )));
+        assert!(!is_oauth_invalid_grant(&anyhow::anyhow!(
+            "parse refresh response"
+        )));
+    }
 
     #[test]
     fn patch_opencode_config_content_rewrites_placeholder_url() {
