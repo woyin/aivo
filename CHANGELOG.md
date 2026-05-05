@@ -1,5 +1,17 @@
 # Changelog
 
+## v0.19.18
+
+### Improvements
+
+- `aivo speak` replaces `aivo audio`: cached TTS, file/stdin input, streaming playback, `--list` picker.
+- `aivo run --relogin`: refresh expired Codex/Gemini/Claude OAuth keys in place.
+- Keys: Amazon Bedrock added as a known provider.
+- Codex/Gemini OAuth shadows: expose skills, plugins, rules, and the real home state; auto-relogin when refresh tokens are invalidated.
+- Claude: scoped the non-essential-traffic disable env.
+- TUI: fuzzy picker handles multiline paste and trims outer whitespace from filter queries.
+
+
 ## v0.19.17
 
 ### Fixes
