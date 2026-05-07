@@ -274,7 +274,6 @@ fn should_passthrough_header(name: &str) -> bool {
             | "proxy-authorization"
             | "proxy-connection"
             | "authorization"
-            | "user-agent"
             | "accept-encoding"
             | "api-key"
             | "x-api-key"
