@@ -79,19 +79,14 @@ pub(super) fn save_persisted_draft_history_to_path(
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    std::fs::write(path, encrypted)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
-    }
-    Ok(())
+    crate::services::atomic_write::atomic_write_secure_blocking(path, encrypted.as_bytes())
+        .map_err(io::Error::other)
 }
 
 pub(super) fn draft_history_path() -> PathBuf {
     crate::services::system_env::home_dir()
         .map(|path| path.join(".config").join("aivo").join("chat_history"))
-        .unwrap_or_else(|| PathBuf::from(".config/aivo/chat_history"))
+        .unwrap_or_else(|| std::env::temp_dir().join("aivo").join("chat_history"))
 }
 
 pub(super) fn restore_cancelled_submission(

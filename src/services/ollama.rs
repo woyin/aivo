@@ -84,7 +84,26 @@ fn kill_server_by_pid_file() {
     unsafe {
         libc::kill(pid as libc::pid_t, libc::SIGTERM);
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::Foundation::CloseHandle;
+        use windows_sys::Win32::System::Threading::{
+            OpenProcess, PROCESS_TERMINATE, TerminateProcess,
+        };
+        // SAFETY: OpenProcess/TerminateProcess/CloseHandle take integer or
+        // handle values only; no memory is dereferenced here. Returned handles
+        // are always closed before returning. A failed OpenProcess (process
+        // already exited or insufficient privilege) is silently ignored,
+        // matching the Unix branch's best-effort behaviour.
+        unsafe {
+            let handle = OpenProcess(PROCESS_TERMINATE, 0, pid);
+            if !handle.is_null() {
+                TerminateProcess(handle, 1);
+                CloseHandle(handle);
+            }
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
     let _ = pid;
 }
 

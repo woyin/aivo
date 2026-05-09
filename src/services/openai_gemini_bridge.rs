@@ -103,7 +103,9 @@ fn persist_signature_store(map: &HashMap<String, SignatureEntry>) {
 }
 
 /// Synchronous atomic write: temp file under the same dir + rename + 0o600
-/// on Unix. Mirrors `atomic_write::atomic_write_secure` which is async.
+/// on Unix. Mirrors `atomic_write::atomic_write_secure` which is async, but
+/// uses a per-writer timestamped temp name so concurrent writers don't
+/// truncate each other's in-flight data.
 fn write_string_atomic(path: &PathBuf, contents: &str) {
     use std::io::Write;
     let Some(parent) = path.parent() else {
@@ -113,7 +115,23 @@ fn write_string_atomic(path: &PathBuf, contents: &str) {
         ".gemini_thought_signatures.{}.tmp",
         current_unix_ts()
     ));
-    let Ok(mut file) = std::fs::File::create(&temp_path) else {
+
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        // Restrict reads from the start so there's no world-readable window.
+        opts.mode(0o600);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        // No-share while open; ACL inheritance from the parent dir handles
+        // permissions on Windows.
+        opts.share_mode(0);
+    }
+    let Ok(mut file) = opts.open(&temp_path) else {
         return;
     };
     if file.write_all(contents.as_bytes()).is_err() {
@@ -122,11 +140,6 @@ fn write_string_atomic(path: &PathBuf, contents: &str) {
     }
     let _ = file.sync_all();
     drop(file);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&temp_path, std::fs::Permissions::from_mode(0o600));
-    }
     let _ = std::fs::rename(&temp_path, path);
 }
 

@@ -26,12 +26,6 @@ pub struct ServeCommand {
     log_store: LogStore,
 }
 
-impl Default for ServeCommand {
-    fn default() -> Self {
-        Self::new(LogStore::new(std::path::PathBuf::from(".config/aivo")))
-    }
-}
-
 impl ServeCommand {
     pub fn new(log_store: LogStore) -> Self {
         Self { log_store }
