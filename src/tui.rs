@@ -130,23 +130,10 @@ impl FuzzySelect {
                 selection = count.saturating_sub(1);
             }
 
-            if count > 0 && self.is_disabled(filtered[selection].0) {
-                selection =
-                    next_enabled_filtered(&filtered, selection, true, |i| self.is_disabled(i));
-            }
-
             if selection < page_start {
                 page_start = selection;
             } else if selection >= page_start + page_size {
                 page_start = selection.saturating_sub(page_size).saturating_add(1);
-            }
-
-            // Pin the window to the bottom when selection is near the end so
-            // trailing disabled rows stay visible — navigation skips them, so
-            // `selection` alone can't pull `page_start` far enough to show
-            // them (the user would otherwise see "↓ N more below" forever).
-            if count > page_size && count.saturating_sub(selection) < page_size {
-                page_start = count.saturating_sub(page_size);
             }
 
             if page_start > count.saturating_sub(1) {
@@ -191,9 +178,9 @@ impl FuzzySelect {
                     let styled_item = if disabled {
                         // Strip ANSI baked into `item` by callers (e.g.
                         // `format_key_choice` paints the short-id cyan and the
-                        // base-url dim) so the outer yellow applies
-                        // uniformly instead of getting overridden mid-string.
-                        crate::style::yellow(console::strip_ansi_codes(item))
+                        // base-url dim) so the outer gray applies uniformly
+                        // instead of getting overridden mid-string.
+                        crate::style::gray(console::strip_ansi_codes(item))
                     } else if is_selected {
                         crate::style::cyan(item)
                     } else {
@@ -232,20 +219,22 @@ impl FuzzySelect {
 
             match input {
                 FuzzyInput::Previous if count > 0 => {
-                    selection =
-                        next_enabled_filtered(&filtered, selection, false, |i| self.is_disabled(i));
+                    selection = if selection == 0 {
+                        count - 1
+                    } else {
+                        selection - 1
+                    };
                 }
                 FuzzyInput::Next if count > 0 => {
-                    selection =
-                        next_enabled_filtered(&filtered, selection, true, |i| self.is_disabled(i));
+                    selection = (selection + 1) % count;
                 }
                 FuzzyInput::Enter => {
                     if count > 0 {
                         let orig_idx = filtered[selection].0;
                         if self.is_disabled(orig_idx) {
-                            // Safety net — only reachable if every filtered
-                            // row is disabled, in which case there's nothing
-                            // to select. Ignore the keypress.
+                            // Disabled rows are highlightable but not
+                            // confirmable — let the user keep navigating
+                            // instead of selecting an unusable item.
                             continue;
                         }
                         term.show_cursor()?;
@@ -405,37 +394,6 @@ fn query_for_filter(query: &str) -> &str {
     query.trim()
 }
 
-/// Advances `selection` within `filtered` until it lands on an enabled row,
-/// skipping any disabled rows. The search wraps; if every row in `filtered`
-/// is disabled, `selection` is returned unchanged. `forward` controls whether
-/// the scan moves Down (`true`) or Up (`false`).
-///
-/// `selection` and the return value are both indices into `filtered`;
-/// `is_disabled` receives the original item index (`filtered[i].0`).
-fn next_enabled_filtered(
-    filtered: &[(usize, &String)],
-    selection: usize,
-    forward: bool,
-    is_disabled: impl Fn(usize) -> bool,
-) -> usize {
-    let count = filtered.len();
-    if count == 0 {
-        return 0;
-    }
-    let start = selection.min(count - 1);
-    for step in 1..=count {
-        let idx = if forward {
-            (start + step) % count
-        } else {
-            (start + count - (step % count)) % count
-        };
-        if !is_disabled(filtered[idx].0) {
-            return idx;
-        }
-    }
-    start
-}
-
 /// Truncate a string to fit within terminal width, accounting for ANSI escape codes.
 /// ANSI sequences are not visible characters, so we track visible width separately.
 fn truncate_to_width(s: &str, width: usize) -> String {
@@ -523,69 +481,7 @@ pub(crate) fn matches_fuzzy(query: &str, target: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        matches_fuzzy, next_enabled_filtered, normalize_pasted_query, query_for_filter, score_match,
-    };
-
-    fn filtered_fixture(items: &[&'static str]) -> Vec<(usize, &'static String)> {
-        // `next_enabled_filtered` only reads the original index, but the
-        // signature expects `&String` — leak short static strings to get
-        // stable references for the test harness.
-        items
-            .iter()
-            .enumerate()
-            .map(|(i, s)| {
-                let owned: &'static String = Box::leak(Box::new((*s).to_string()));
-                (i, owned)
-            })
-            .collect()
-    }
-
-    #[test]
-    fn next_enabled_skips_disabled_going_forward() {
-        let filtered = filtered_fixture(&["a", "b", "c", "d"]);
-        // Items 1 and 2 disabled — Down from 0 should land on 3.
-        let disabled = |i: usize| i == 1 || i == 2;
-        assert_eq!(next_enabled_filtered(&filtered, 0, true, disabled), 3);
-    }
-
-    #[test]
-    fn next_enabled_skips_disabled_going_backward() {
-        let filtered = filtered_fixture(&["a", "b", "c", "d"]);
-        // Items 1 and 2 disabled — Up from 3 should land on 0.
-        let disabled = |i: usize| i == 1 || i == 2;
-        assert_eq!(next_enabled_filtered(&filtered, 3, false, disabled), 0);
-    }
-
-    #[test]
-    fn next_enabled_wraps_around() {
-        let filtered = filtered_fixture(&["a", "b", "c"]);
-        // Only item 0 enabled — Down from 0 should wrap back to 0.
-        let only_first_enabled = |i: usize| i != 0;
-        assert_eq!(
-            next_enabled_filtered(&filtered, 0, true, only_first_enabled),
-            0
-        );
-        // Up from 0 should also return 0.
-        assert_eq!(
-            next_enabled_filtered(&filtered, 0, false, only_first_enabled),
-            0
-        );
-    }
-
-    #[test]
-    fn next_enabled_keeps_selection_when_all_disabled() {
-        let filtered = filtered_fixture(&["a", "b", "c"]);
-        let all_disabled = |_: usize| true;
-        assert_eq!(next_enabled_filtered(&filtered, 1, true, all_disabled), 1);
-        assert_eq!(next_enabled_filtered(&filtered, 1, false, all_disabled), 1);
-    }
-
-    #[test]
-    fn next_enabled_handles_empty_slice() {
-        let filtered: Vec<(usize, &String)> = Vec::new();
-        assert_eq!(next_enabled_filtered(&filtered, 0, true, |_| false), 0);
-    }
+    use super::{matches_fuzzy, normalize_pasted_query, query_for_filter, score_match};
 
     #[test]
     fn score_prefers_prefix_over_substring_over_subsequence() {

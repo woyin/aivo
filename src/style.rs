@@ -69,6 +69,13 @@ pub fn dim(text: impl AsRef<str>) -> String {
     style_text(StyleName::Dim, text)
 }
 
+/// Renders text in a true 256-color dark gray. More muted than `dim`, which is
+/// just reduced brightness of the default foreground. Use for disabled or
+/// deeply de-emphasized content.
+pub fn gray(text: impl AsRef<str>) -> String {
+    style(text.as_ref()).color256(240).to_string()
+}
+
 /// Convenience function to style text as bold.
 pub fn bold(text: impl AsRef<str>) -> String {
     style_text(StyleName::Bold, text)

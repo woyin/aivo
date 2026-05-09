@@ -255,25 +255,25 @@ impl ApiKey {
 
     pub fn oauth_tool_hint(&self) -> &'static str {
         if self.is_claude_oauth() {
-            "aivo run claude"
+            "aivo claude"
         } else if self.is_codex_oauth() {
-            "aivo run codex"
+            "aivo codex"
         } else if self.is_gemini_oauth() {
-            "aivo run gemini"
+            "aivo gemini"
         } else {
-            "aivo run <tool>"
+            "aivo <tool>"
         }
     }
 
     /// Short "why you can't use this key here" hint for pickers (e.g. ``needs
-    /// `aivo run claude` ``). Returns `None` for non-OAuth keys.
+    /// `aivo claude` ``). Returns `None` for non-OAuth keys.
     pub fn oauth_run_requirement(&self) -> Option<&'static str> {
         if self.is_claude_oauth() {
-            Some("needs `aivo run claude`")
+            Some("needs `aivo claude`")
         } else if self.is_codex_oauth() {
-            Some("needs `aivo run codex`")
+            Some("needs `aivo codex`")
         } else if self.is_gemini_oauth() {
-            Some("needs `aivo run gemini`")
+            Some("needs `aivo gemini`")
         } else {
             None
         }

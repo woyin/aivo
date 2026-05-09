@@ -136,15 +136,9 @@ mod tests {
         let regular = make_key("openrouter", "https://openrouter.ai/api/v1");
 
         let ctx = KeyCompatContext::Chat;
-        assert_eq!(
-            ctx.incompat_reason(&claude),
-            Some("needs `aivo run claude`")
-        );
-        assert_eq!(ctx.incompat_reason(&codex), Some("needs `aivo run codex`"));
-        assert_eq!(
-            ctx.incompat_reason(&gemini),
-            Some("needs `aivo run gemini`")
-        );
+        assert_eq!(ctx.incompat_reason(&claude), Some("needs `aivo claude`"));
+        assert_eq!(ctx.incompat_reason(&codex), Some("needs `aivo codex`"));
+        assert_eq!(ctx.incompat_reason(&gemini), Some("needs `aivo gemini`"));
         assert!(ctx.incompat_reason(&regular).is_none());
     }
 
