@@ -1,5 +1,17 @@
 # Changelog
 
+## v0.20.1
+
+### Features
+
+- `aivo amp`: `--mode <smart|rush|large|deep>` flag, with the model picker now honoring per-mode model overrides.
+
+### Fixes
+
+- `aivo amp`: per-mode model flags take precedence over `-m`.
+- `aivo amp`: honor per-mode models without invoking the picker.
+
+
 ## v0.20.0
 
 ### Features
