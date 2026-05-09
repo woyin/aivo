@@ -7,6 +7,7 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
+use std::io::Write;
 use std::time::{Duration, Instant};
 
 use crate::commands::normalize_base_url;
@@ -379,9 +380,16 @@ impl ModelsCommand {
             println!("{}", serde_json::to_string_pretty(&payload)?);
         } else {
             let widths = ColumnWidths::from_models(&models);
+            // Stdout's LineWriter flushes on every '\n', so a per-row println!
+            // becomes one syscall per row. Batch into a single write_all.
+            let mut buf = String::with_capacity(models.len() * 80);
             for model in &models {
-                println!("{}", format_model_line(model, &widths));
+                buf.push_str(&format_model_line(model, &widths));
+                buf.push('\n');
             }
+            let stdout = std::io::stdout();
+            let mut handle = stdout.lock();
+            let _ = handle.write_all(buf.as_bytes());
         }
 
         Ok(ExitCode::Success)
