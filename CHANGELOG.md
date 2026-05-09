@@ -1,5 +1,21 @@
 # Changelog
 
+## v0.20.2
+
+### Fixes
+
+- Router: normalize Claude Code 2.x thinking config per model.
+- `aivo models`: respect the model cache instead of refetching on every invocation.
+
+### Performance
+
+- `aivo models`: faster model display, with table output batched into a single stdout write.
+
+### Polish
+
+- TUI: tidy disabled rows in the fuzzy picker.
+
+
 ## v0.20.1
 
 ### Features
