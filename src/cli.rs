@@ -56,7 +56,7 @@ pub enum Commands {
     Alias(AliasArgs),
 
     /// Show system info, keys, tools, and directory state
-    #[command(alias = "ls")]
+    #[command(alias = "ls", hide = true)]
     Info(InfoArgs),
 
     /// Show recent local logs from chat, run, and serve
@@ -66,13 +66,16 @@ pub enum Commands {
     Stats(StatsArgs),
 
     /// Generate images from a text prompt (OpenAI-compatible providers)
+    #[command(hide = true)]
     Image(ImageArgs),
 
     /// Generate videos from a text prompt (OpenAI-compatible providers, async)
+    #[command(hide = true)]
     Video(VideoArgs),
 
     /// Speak a text prompt aloud (TTS). Saves to `~/.config/aivo/audio/`
     /// by default and reuses the cached file on repeat calls.
+    #[command(hide = true)]
     Speak(AudioArgs),
 
     /// Update the CLI tool to the latest version

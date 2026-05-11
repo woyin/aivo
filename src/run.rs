@@ -701,15 +701,11 @@ fn print_help() {
     print_cmd("models", "List available models from the active provider");
     print_cmd("serve", "Start a local OpenAI-compatible API server");
     print_cmd("alias", "Create, list, or remove model aliases");
-    print_cmd("info", "Show system info, keys, tools, and directory state");
     print_cmd(
         "logs",
         "Show recent local logs from chat, run, and serve (show, share, status)",
     );
     print_cmd("stats", "Show usage statistics");
-    print_cmd("image", "Generate images from a text prompt");
-    print_cmd("video", "Generate videos from a text prompt (async)");
-    print_cmd("speak", "Speak a text prompt aloud (TTS)");
     print_cmd("update", "Update to the latest version");
     println!();
     println!("{}", style::bold("Shortcuts:"));

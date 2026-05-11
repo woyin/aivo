@@ -166,16 +166,6 @@ aivo alias rm fast                           # remove (works for both kinds)
 
 Names that collide with built-in subcommands or tool names are rejected.
 
-## info
-
-Show saved keys, installed tools, last selection, and cached model count.
-
-```bash
-aivo info
-aivo info --ping                             # also health-check all keys
-aivo info --json
-```
-
 ## logs
 
 Query the local SQLite log database used by `chat`, `run`, and `serve`. Chat logs include turn content and token usage. `run` and `serve` log metadata only.
