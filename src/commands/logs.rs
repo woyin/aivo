@@ -352,110 +352,191 @@ impl LogsCommand {
         Ok(merge_unified(log_rows, native_rows, amp_rows, args.limit))
     }
 
-    pub fn print_help() {
-        println!("{} aivo logs [COMMAND] [OPTIONS]", style::bold("Usage:"));
-        println!();
-        println!(
-            "{}",
-            style::dim("Unified activity feed: aivo's own events (chat, run, serve), native CLI")
-        );
-        println!(
-            "{}",
-            style::dim("sessions (claude, codex, gemini, pi, opencode), and amp threads.")
-        );
-        println!();
-        let print_opt = |flag: &str, desc: &str| {
-            println!(
-                "  {}{}",
-                style::cyan(format!("{:<26}", flag)),
-                style::dim(desc)
-            );
-        };
-        println!("{}", style::bold("Commands:"));
-        print_opt(
-            "(default)",
-            "List recent rows from all sources (newest first)",
-        );
-        print_opt(
-            "show <id>",
-            "Show one row in detail; accepts logs.db ids, native session ids, or T-…",
-        );
-        print_opt(
-            "share [id]",
-            "Share a session via tunneled viewer URL; omit id to open the picker",
-        );
-        print_opt("status", "Show counts and storage paths across sources");
-        println!();
-        println!("{}", style::bold("Filters:"));
-        print_opt("-n, --limit <N>", "Maximum rows after merge (default: 20)");
-        print_opt(
-            "--json",
-            "Output JSON (tagged union: log_entry|native_session|amp_thread)",
-        );
-        print_opt(
-            "--watch",
-            "Continuously refresh (1s poll across all sources)",
-        );
-        print_opt("--jsonl", "Emit newly seen rows as JSONL while watching");
-        print_opt("-s, --search <query>", "Search title/topic/body text");
-        print_opt(
-            "--by <name>",
-            "chat | run | serve | claude | codex | gemini | pi | opencode | amp | native",
-        );
-        print_opt(
-            "--model <model>",
-            "Filter by model substring (logs.db only)",
-        );
-        print_opt("-k, --key <id|name>", "Filter by saved key (logs.db only)");
-        print_opt(
-            "--cwd <path>",
-            "Filter to a specific cwd (default: current cwd)",
-        );
-        print_opt("-a, --all", "Show rows from every project (no cwd filter)");
-        print_opt("--since <time>", "Only show rows on or after this time");
-        print_opt("--until <time>", "Only show rows on or before this time");
-        print_opt(
-            "--errors",
-            "Only HTTP >= 400 or non-zero exit (logs.db only)",
-        );
-        println!();
-        println!("{}", style::bold("Examples:"));
-        println!(
-            "  {}",
-            style::dim("aivo logs                     # current project, newest first")
-        );
-        println!(
-            "  {}",
-            style::dim("aivo logs --all               # every project")
-        );
-        println!(
-            "  {}",
-            style::dim(
-                "aivo logs --by claude         # claude run-events + claude native sessions"
-            )
-        );
-        println!(
-            "  {}",
-            style::dim("aivo logs --by native         # only native CLI sessions")
-        );
-        println!(
-            "  {}",
-            style::dim("aivo logs --by amp            # only amp threads")
-        );
-        println!(
-            "  {}",
-            style::dim("aivo logs show 1335c631       # any unique id prefix works")
-        );
-        println!(
-            "  {}",
-            style::dim("aivo logs share               # pick a session and share it")
-        );
-        println!(
-            "  {}",
-            style::dim("aivo logs share 1335c631      # share by id prefix")
-        );
-        println!("  {}", style::dim("aivo logs --watch --jsonl"));
+    pub fn print_help(action: Option<&str>) {
+        match action {
+            Some("show") => print_help_show(),
+            Some("share") => print_help_share(),
+            Some("status") => print_help_status(),
+            _ => print_help_overview(),
+        }
     }
+}
+
+fn logs_help_row(flag: &str, desc: &str) {
+    println!(
+        "  {}{}",
+        style::cyan(format!("{:<26}", flag)),
+        style::dim(desc)
+    );
+}
+
+fn print_help_overview() {
+    println!("{} aivo logs [COMMAND] [OPTIONS]", style::bold("Usage:"));
+    println!();
+    println!(
+        "{}",
+        style::dim("Unified activity feed: aivo's own events (chat, run, serve), native CLI")
+    );
+    println!(
+        "{}",
+        style::dim("sessions (claude, codex, gemini, pi, opencode), and amp threads.")
+    );
+    println!();
+    println!("{}", style::bold("Commands:"));
+    logs_help_row(
+        "(default)",
+        "List recent rows from all sources (newest first)",
+    );
+    logs_help_row(
+        "show <id>",
+        "Show one row in detail; accepts logs.db ids, native session ids, or T-…",
+    );
+    logs_help_row(
+        "share [id]",
+        "Share a session via tunneled viewer URL; omit id to open the picker",
+    );
+    logs_help_row("status", "Show counts and storage paths across sources");
+    println!();
+    println!("{}", style::bold("Filters:"));
+    logs_help_row("-n, --limit <N>", "Maximum rows after merge (default: 20)");
+    logs_help_row(
+        "--json",
+        "Output JSON (tagged union: log_entry|native_session|amp_thread)",
+    );
+    logs_help_row(
+        "--watch",
+        "Continuously refresh (1s poll across all sources)",
+    );
+    logs_help_row("--jsonl", "Emit newly seen rows as JSONL while watching");
+    logs_help_row("-s, --search <query>", "Search title/topic/body text");
+    logs_help_row(
+        "--by <name>",
+        "chat | run | serve | claude | codex | gemini | pi | opencode | amp | native",
+    );
+    logs_help_row(
+        "--model <model>",
+        "Filter by model substring (logs.db only)",
+    );
+    logs_help_row("-k, --key <id|name>", "Filter by saved key (logs.db only)");
+    logs_help_row(
+        "--cwd <path>",
+        "Filter to a specific cwd (default: current cwd)",
+    );
+    logs_help_row("-a, --all", "Show rows from every project (no cwd filter)");
+    logs_help_row("--since <time>", "Only show rows on or after this time");
+    logs_help_row("--until <time>", "Only show rows on or before this time");
+    logs_help_row(
+        "--errors",
+        "Only HTTP >= 400 or non-zero exit (logs.db only)",
+    );
+    println!();
+    println!("{}", style::bold("Examples:"));
+    println!(
+        "  {}",
+        style::dim("aivo logs                     # current project, newest first")
+    );
+    println!(
+        "  {}",
+        style::dim("aivo logs --all               # every project")
+    );
+    println!(
+        "  {}",
+        style::dim("aivo logs --by claude         # claude run-events + claude native sessions")
+    );
+    println!(
+        "  {}",
+        style::dim("aivo logs --by native         # only native CLI sessions")
+    );
+    println!(
+        "  {}",
+        style::dim("aivo logs --by amp            # only amp threads")
+    );
+    println!(
+        "  {}",
+        style::dim("aivo logs show 1335c631       # any unique id prefix works")
+    );
+    println!(
+        "  {}",
+        style::dim("aivo logs share               # pick a session and share it")
+    );
+    println!(
+        "  {}",
+        style::dim("aivo logs share 1335c631      # share by id prefix")
+    );
+    println!("  {}", style::dim("aivo logs --watch --jsonl"));
+}
+
+fn print_help_show() {
+    println!("{} aivo logs show <ID>", style::bold("Usage:"));
+    println!();
+    println!(
+        "{}",
+        style::dim(
+            "Show full detail for a single row: logs.db id, native session id, or T-… thread."
+        )
+    );
+    println!(
+        "{}",
+        style::dim("Any unique id prefix works (matches the prefix shown in `aivo logs`).")
+    );
+    println!();
+    println!("{}", style::bold("Examples:"));
+    println!("  {}", style::dim("aivo logs show 1335c631"));
+    println!("  {}", style::dim("aivo logs show T-abc123"));
+}
+
+fn print_help_share() {
+    println!("{} aivo logs share [ID] [OPTIONS]", style::bold("Usage:"));
+    println!();
+    println!(
+        "{}",
+        style::dim("Share a session via a tunneled viewer URL. Default is a one-shot snapshot")
+    );
+    println!(
+        "{}",
+        style::dim("of the session at share time; secrets and $HOME paths are redacted.")
+    );
+    println!(
+        "{}",
+        style::dim("Omit the id to open the picker. `aivo share` is an alias for this command.")
+    );
+    println!();
+    println!("{}", style::bold("Options:"));
+    logs_help_row(
+        "--live",
+        "Follow ongoing changes (default: snapshot at share time)",
+    );
+    logs_help_row(
+        "--no-redact",
+        "Skip redaction (API keys, OAuth tokens, $HOME, secret-shaped env)",
+    );
+    logs_help_row(
+        "--all",
+        "Pick from sessions in every project, not just the current cwd",
+    );
+    logs_help_row(
+        "--open",
+        "Open the share URL in the default browser once ready",
+    );
+    println!();
+    println!("{}", style::bold("Examples:"));
+    println!("  {}", style::dim("aivo logs share"));
+    println!("  {}", style::dim("aivo logs share 1335c631"));
+    println!("  {}", style::dim("aivo logs share --live --open"));
+}
+
+fn print_help_status() {
+    println!("{} aivo logs status", style::bold("Usage:"));
+    println!();
+    println!(
+        "{}",
+        style::dim(
+            "Print row counts and storage paths across logs.db, native sessions, and amp threads."
+        )
+    );
+    println!();
+    println!("{}", style::bold("Examples:"));
+    println!("  {}", style::dim("aivo logs status"));
 }
 
 fn ensure_no_target(args: &LogsArgs, action: &str) -> Result<()> {

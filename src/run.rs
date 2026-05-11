@@ -109,7 +109,7 @@ pub async fn run() -> ! {
     {
         match cmd {
             Commands::Run(run_args) => RunCommand::print_help(run_args.tool.as_deref()),
-            Commands::Keys(_) => KeysCommand::print_help(),
+            Commands::Keys(keys_args) => KeysCommand::print_help(keys_args.action.as_deref()),
             Commands::Chat(_) => ChatCommand::print_help(),
             Commands::Image(_) => {
                 ImageCommand::print_help();
@@ -127,10 +127,12 @@ pub async fn run() -> ! {
             Commands::Serve(_) => ServeCommand::print_help(),
             Commands::Alias(_) => AliasCommand::print_help(),
             Commands::Info(_) => InfoCommand::print_help(),
-            Commands::Logs(_) => LogsCommand::print_help(),
+            Commands::Logs(logs_args) => LogsCommand::print_help(logs_args.action.as_deref()),
             Commands::Stats(_) => StatsCommand::print_help(),
             Commands::Update(_) => UpdateCommand::print_help(),
-            Commands::Amp(_) => crate::commands::AmpCommand::print_help(),
+            Commands::Amp(amp_args) => {
+                crate::commands::AmpCommand::print_help(amp_args.action.as_deref())
+            }
             Commands::Share(_) => ShareCommand::print_help(),
         }
         process::exit(0);
@@ -691,14 +693,23 @@ fn print_help() {
         println!("  {}{}", style::cyan(&padded), style::dim(desc));
     };
     print_cmd("run", "Launch AI tool, or use the saved start flow");
-    print_cmd("keys", "Manage API keys (use, rm, add, cat, edit)");
-    print_cmd("models", "List available models from the active provider");
+    print_cmd(
+        "keys",
+        "Manage API keys (use, add, rm, cat, edit, ping, reset-route)",
+    );
     print_cmd("chat", "Start the interactive chat TUI");
+    print_cmd("models", "List available models from the active provider");
     print_cmd("serve", "Start a local OpenAI-compatible API server");
     print_cmd("alias", "Create, list, or remove model aliases");
     print_cmd("info", "Show system info, keys, tools, and directory state");
-    print_cmd("logs", "Show recent local logs from chat, run, and serve");
+    print_cmd(
+        "logs",
+        "Show recent local logs from chat, run, and serve (show, share, status)",
+    );
     print_cmd("stats", "Show usage statistics");
+    print_cmd("image", "Generate images from a text prompt");
+    print_cmd("video", "Generate videos from a text prompt (async)");
+    print_cmd("speak", "Speak a text prompt aloud (TTS)");
     print_cmd("update", "Update to the latest version");
     println!();
     println!("{}", style::bold("Shortcuts:"));
@@ -708,6 +719,7 @@ fn print_help() {
     };
     print_shortcut("use", "keys use");
     print_shortcut("ping", "keys ping");
+    print_shortcut("share", "logs share");
     print_shortcut("-x", "chat -x (one-shot; reads stdin when no value)");
     print_shortcut("claude/codex/gemini/opencode/pi/amp", " run <tool>");
     println!();

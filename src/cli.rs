@@ -66,16 +66,13 @@ pub enum Commands {
     Stats(StatsArgs),
 
     /// Generate images from a text prompt (OpenAI-compatible providers)
-    #[command(hide = true)]
     Image(ImageArgs),
 
     /// Generate videos from a text prompt (OpenAI-compatible providers, async)
-    #[command(hide = true)]
     Video(VideoArgs),
 
     /// Speak a text prompt aloud (TTS). Saves to `~/.config/aivo/audio/`
     /// by default and reuses the cached file on repeat calls.
-    #[command(hide = true)]
     Speak(AudioArgs),
 
     /// Update the CLI tool to the latest version
@@ -84,9 +81,8 @@ pub enum Commands {
     /// Amp-specific configuration (workspace MCP server trust, etc.)
     Amp(AmpArgs),
 
-    /// Hidden alias for `aivo logs share` (the canonical form). Kept so
-    /// muscle memory from the original top-level command keeps working.
-    #[command(hide = true)]
+    /// Alias for `aivo logs share` — share a session via tunneled viewer URL.
+    /// Both forms accept the same flags.
     Share(ShareArgs),
 }
 

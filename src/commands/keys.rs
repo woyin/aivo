@@ -723,7 +723,7 @@ impl KeysCommand {
             }
             Some(action) => {
                 eprintln!("{} Unknown action '{}'", style::red("Error:"), action);
-                Self::print_help();
+                Self::print_help(None);
                 Ok(ExitCode::UserError)
             }
         }
@@ -2336,53 +2336,186 @@ impl KeysCommand {
     }
 
     // Shows usage information.
-    pub fn print_help() {
-        let print_row = |label: &str, desc: &str| {
-            println!(
-                "  {}{}",
-                style::cyan(format!("{:<18}", label)),
-                style::dim(desc)
-            );
-        };
-
-        println!("{} aivo keys [action]", style::bold("Usage:"));
-        println!();
-        println!(
-            "{}",
-            style::dim("Manage API keys: add, remove, activate, and inspect.")
-        );
-        println!();
-        println!("{}", style::bold("Actions:"));
-        print_row("(no action)", "List all API keys");
-        print_row("use [id|name]", "Activate a specific API key");
-        print_row("cat [id|name]", "Display details for a key");
-        print_row("rm [id|name]", "Remove an API key");
-        print_row("add [name]", "Add an API key");
-        print_row("edit [id|name]", "Edit an API key");
-        print_row("ping [id|name]", "Health-check API keys (or: aivo ping)");
-        println!();
-        println!("{}", style::bold("Add Flags:"));
-        print_row("--name <name>", "Set key name");
-        print_row("--base-url <url>", "Set provider base URL");
-        print_row("--key <api-key>", "Set provider API key");
-        println!();
-        println!("{}", style::bold("List Flags:"));
-        print_row("--ping", "List keys with live ping status");
-        print_row("--json", "Output list as JSON (secret is never included)");
-        println!();
-        println!("{}", style::bold("Examples:"));
-        println!("  {}", style::dim("aivo keys"));
-        println!("  {}", style::dim("aivo keys use openrouter"));
-        println!(
-            "  {}",
-            style::dim("aivo keys add --name abc --base-url https://example.io --key sk-...")
-        );
-        println!("  {}", style::dim("aivo keys --json"));
-        println!(
-            "  {}",
-            style::dim("aivo keys --ping --json | jq '.[] | select(.ping.ok==false)'")
-        );
+    pub fn print_help(action: Option<&str>) {
+        match action {
+            Some("use") => print_help_use(),
+            Some("add") => print_help_add(),
+            Some("rm") => print_help_rm(),
+            Some("cat") => print_help_cat(),
+            Some("edit") => print_help_edit(),
+            Some("ping") => print_help_ping(),
+            Some("reset-route") => print_help_reset_route(),
+            _ => print_help_overview(),
+        }
     }
+}
+
+fn keys_help_row(label: &str, desc: &str) {
+    println!(
+        "  {}{}",
+        style::cyan(format!("{:<23}", label)),
+        style::dim(desc)
+    );
+}
+
+fn print_help_overview() {
+    println!("{} aivo keys [action]", style::bold("Usage:"));
+    println!();
+    println!(
+        "{}",
+        style::dim("Manage API keys: add, remove, activate, and inspect.")
+    );
+    println!();
+    println!("{}", style::bold("Actions:"));
+    keys_help_row("(no action)", "List all API keys");
+    keys_help_row("use [id|name]", "Activate a specific API key");
+    keys_help_row("cat [id|name]", "Display details for a key");
+    keys_help_row("rm [id|name]", "Remove an API key");
+    keys_help_row("add [name]", "Add an API key");
+    keys_help_row("edit [id|name]", "Edit an API key");
+    keys_help_row("ping [id|name]", "Health-check API keys (or: aivo ping)");
+    keys_help_row(
+        "reset-route [id|name]",
+        "Reset cached provider routing for a key",
+    );
+    println!();
+    println!("{}", style::bold("Add Flags:"));
+    keys_help_row("--name <name>", "Set key name");
+    keys_help_row("--base-url <url>", "Set provider base URL");
+    keys_help_row("--key <api-key>", "Set provider API key");
+    println!();
+    println!("{}", style::bold("List Flags:"));
+    keys_help_row("--ping", "List keys with live ping status");
+    keys_help_row("--json", "Output list as JSON (secret is never included)");
+    println!();
+    println!("{}", style::bold("Examples:"));
+    println!("  {}", style::dim("aivo keys"));
+    println!("  {}", style::dim("aivo keys use openrouter"));
+    println!(
+        "  {}",
+        style::dim("aivo keys add --name abc --base-url https://example.io --key sk-...")
+    );
+    println!("  {}", style::dim("aivo keys --json"));
+    println!(
+        "  {}",
+        style::dim("aivo keys --ping --json | jq '.[] | select(.ping.ok==false)'")
+    );
+}
+
+fn print_help_use() {
+    println!("{} aivo keys use [ID|NAME]", style::bold("Usage:"));
+    println!();
+    println!(
+        "{}",
+        style::dim("Activate an API key as the default for run/chat/serve/etc.")
+    );
+    println!(
+        "{}",
+        style::dim("Bare `aivo keys use` opens the interactive picker.")
+    );
+    println!();
+    println!("{}", style::bold("Examples:"));
+    println!("  {}", style::dim("aivo keys use"));
+    println!("  {}", style::dim("aivo keys use openrouter"));
+    println!("  {}", style::dim("aivo use openrouter        # shortcut"));
+}
+
+fn print_help_add() {
+    println!("{} aivo keys add [NAME] [OPTIONS]", style::bold("Usage:"));
+    println!();
+    println!(
+        "{}",
+        style::dim("Add a new API key. With no flags, prompts interactively.")
+    );
+    println!();
+    println!("{}", style::bold("Options:"));
+    keys_help_row("--name <name>", "Display name (skips the name prompt)");
+    keys_help_row(
+        "--base-url <url>",
+        "Provider base URL (e.g. https://openrouter.ai/api/v1)",
+    );
+    keys_help_row("--key <api-key>", "Provider API key value");
+    println!();
+    println!("{}", style::bold("Examples:"));
+    println!("  {}", style::dim("aivo keys add"));
+    println!("  {}", style::dim("aivo keys add openrouter"));
+    println!(
+        "  {}",
+        style::dim("aivo keys add --name abc --base-url https://example.io --key sk-...")
+    );
+}
+
+fn print_help_rm() {
+    println!("{} aivo keys rm [ID|NAME]", style::bold("Usage:"));
+    println!();
+    println!(
+        "{}",
+        style::dim("Remove an API key. Bare `aivo keys rm` opens the picker.")
+    );
+    println!();
+    println!("{}", style::bold("Examples:"));
+    println!("  {}", style::dim("aivo keys rm"));
+    println!("  {}", style::dim("aivo keys rm openrouter"));
+}
+
+fn print_help_cat() {
+    println!("{} aivo keys cat [ID|NAME]", style::bold("Usage:"));
+    println!();
+    println!(
+        "{}",
+        style::dim("Show details for a key (name, base URL, masked secret).")
+    );
+    println!();
+    println!("{}", style::bold("Examples:"));
+    println!("  {}", style::dim("aivo keys cat"));
+    println!("  {}", style::dim("aivo keys cat openrouter"));
+}
+
+fn print_help_edit() {
+    println!("{} aivo keys edit [ID|NAME]", style::bold("Usage:"));
+    println!();
+    println!(
+        "{}",
+        style::dim("Edit an existing key (name, base URL, secret) interactively.")
+    );
+    println!();
+    println!("{}", style::bold("Examples:"));
+    println!("  {}", style::dim("aivo keys edit"));
+    println!("  {}", style::dim("aivo keys edit openrouter"));
+}
+
+fn print_help_ping() {
+    println!(
+        "{} aivo keys ping [ID|NAME] [OPTIONS]",
+        style::bold("Usage:")
+    );
+    println!();
+    println!(
+        "{}",
+        style::dim("Health-check API keys against their providers.")
+    );
+    println!();
+    println!("{}", style::bold("Options:"));
+    keys_help_row("--all", "Ping every saved key");
+    keys_help_row("--json", "Output ping results as JSON");
+    println!();
+    println!("{}", style::bold("Examples:"));
+    println!("  {}", style::dim("aivo keys ping"));
+    println!("  {}", style::dim("aivo keys ping openrouter"));
+    println!("  {}", style::dim("aivo ping --all          # shortcut"));
+}
+
+fn print_help_reset_route() {
+    println!("{} aivo keys reset-route [ID|NAME]", style::bold("Usage:"));
+    println!();
+    println!(
+        "{}",
+        style::dim("Clear the cached provider routing for a key so the next request re-probes.")
+    );
+    println!();
+    println!("{}", style::bold("Examples:"));
+    println!("  {}", style::dim("aivo keys reset-route"));
+    println!("  {}", style::dim("aivo keys reset-route openrouter"));
 }
 
 // Formats an API key as a choice string for interactive selectors.

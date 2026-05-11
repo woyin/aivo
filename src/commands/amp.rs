@@ -41,39 +41,74 @@ impl AmpCommand {
                 ExitCode::UserError
             }
             None => {
-                Self::print_help();
+                Self::print_help(None);
                 ExitCode::Success
             }
         }
     }
 
-    pub fn print_help() {
-        println!("{}", style::bold("aivo amp"));
-        println!("  amp-specific configuration commands.\n");
-        println!("{}", style::bold("Usage:"));
-        println!(
-            "  aivo amp trust                       interactively approve workspace MCP servers"
-        );
-        println!(
-            "  aivo amp trust --all                 approve every pending server in this workspace"
-        );
-        println!(
-            "  aivo amp trust --list                list approved servers (for current workspace)"
-        );
-        println!(
-            "  aivo amp trust --revoke <NAME>       revoke an approved server in this workspace\n"
-        );
-        println!("{}", style::bold("Notes:"));
-        println!("  - 'trust' applies only to MCP servers declared in the workspace's");
-        println!("    `.amp/settings.json` (or `.jsonc`). Servers in your user-level");
-        println!("    `~/.config/amp/settings.json` are not gated.");
-        println!("  - Approvals are scoped per workspace settings file path AND per");
-        println!("    server config hash. A package version bump or command change");
-        println!("    requires re-approval.");
-        println!("  - For amp's own thread management (list/markdown/delete/continue/...),");
-        println!("    just use `aivo amp threads <subcommand>` — those flow through to amp,");
-        println!("    which talks to aivo's bridge for persisted thread state.");
+    pub fn print_help(action: Option<&str>) {
+        match action {
+            Some("trust") => print_help_trust(),
+            _ => print_help_overview(),
+        }
     }
+}
+
+fn print_help_overview() {
+    println!("{}", style::bold("aivo amp"));
+    println!("  amp-specific configuration commands.\n");
+    println!("{}", style::bold("Usage:"));
+    println!("  aivo amp trust                       interactively approve workspace MCP servers");
+    println!(
+        "  aivo amp trust --all                 approve every pending server in this workspace"
+    );
+    println!(
+        "  aivo amp trust --list                list approved servers (for current workspace)"
+    );
+    println!(
+        "  aivo amp trust --revoke <NAME>       revoke an approved server in this workspace\n"
+    );
+    println!("{}", style::bold("Notes:"));
+    println!("  - 'trust' applies only to MCP servers declared in the workspace's");
+    println!("    `.amp/settings.json` (or `.jsonc`). Servers in your user-level");
+    println!("    `~/.config/amp/settings.json` are not gated.");
+    println!("  - Approvals are scoped per workspace settings file path AND per");
+    println!("    server config hash. A package version bump or command change");
+    println!("    requires re-approval.");
+    println!("  - For amp's own thread management (list/markdown/delete/continue/...),");
+    println!("    just use `aivo amp threads <subcommand>` — those flow through to amp,");
+    println!("    which talks to aivo's bridge for persisted thread state.");
+}
+
+fn print_help_trust() {
+    println!("{} aivo amp trust [OPTIONS]", style::bold("Usage:"));
+    println!();
+    println!(
+        "{}",
+        style::dim("Approve workspace MCP servers declared in `.amp/settings.json`.")
+    );
+    println!(
+        "{}",
+        style::dim("With no flags, walks pending servers interactively.")
+    );
+    println!();
+    let row = |flag: &str, desc: &str| {
+        println!(
+            "  {}{}",
+            style::cyan(format!("{:<22}", flag)),
+            style::dim(desc)
+        );
+    };
+    println!("{}", style::bold("Options:"));
+    row("--all", "Approve every pending server without prompting");
+    row("--list", "List approved servers for the current workspace");
+    row("--revoke <NAME>", "Revoke approval for a specific server");
+    println!();
+    println!("{}", style::bold("Examples:"));
+    println!("  {}", style::dim("aivo amp trust"));
+    println!("  {}", style::dim("aivo amp trust --list"));
+    println!("  {}", style::dim("aivo amp trust --revoke playwright"));
 }
 
 fn trust_dispatch(args: &AmpArgs) -> ExitCode {
