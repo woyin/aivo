@@ -110,6 +110,10 @@ pub struct ShareArgs {
     #[arg(long)]
     pub all: bool,
 
+    /// Open the share URL in the default browser once the link is ready.
+    #[arg(long)]
+    pub open: bool,
+
     /// Bind only on 127.0.0.1 — local debugging without the public tunnel.
     #[arg(long, hide = true)]
     pub debug_local_only: bool,

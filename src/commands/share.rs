@@ -89,12 +89,16 @@ impl ShareCommand {
         let local_base = format!("http://127.0.0.1:{port}");
 
         let exit_code = if args.debug_local_only {
-            print_share_started(&format!("{local_base}/state"));
+            let state_url = format!("{local_base}/state");
+            print_share_started(&state_url);
+            if args.open {
+                let _ = crate::services::browser_open::open_url(&state_url);
+            }
             let _ = tokio::signal::ctrl_c().await;
             println!();
             ExitCode::Success
         } else {
-            match share_tunnel::run_tunnel(local_base).await {
+            match share_tunnel::run_tunnel(local_base, args.open).await {
                 Ok(()) => ExitCode::Success,
                 Err(e) => {
                     eprintln!("{} {e}", style::red("Tunnel error:"));
@@ -154,6 +158,10 @@ impl ShareCommand {
         print_opt(
             "--all",
             "Picker shows sessions from every project (default: current cwd)",
+        );
+        print_opt(
+            "--open",
+            "Open the share URL in the default browser once the link is ready",
         );
         println!();
         println!("{}", style::bold("Examples:"));

@@ -32,7 +32,7 @@ const OUTBOUND_BUFFER: usize = 64;
 /// Connect, register, and run the tunnel until either the server drops it
 /// or the user hits Ctrl+C. Returns Ok on clean shutdown; Err on connect /
 /// register failure or on a server-side reject.
-pub async fn run_tunnel(local_base: String) -> Result<()> {
+pub async fn run_tunnel(local_base: String, open_in_browser: bool) -> Result<()> {
     let api_base =
         std::env::var("AIVO_SHARE_BASE_URL").unwrap_or_else(|_| DEFAULT_BASE_URL.to_string());
     let ws_endpoint = format!("{}/_tunnel", http_to_ws_url(&api_base)?);
@@ -112,6 +112,9 @@ pub async fn run_tunnel(local_base: String) -> Result<()> {
     let _ = spinner_handle.await;
     let public_url = first["url"].as_str().unwrap_or(api_base.as_str());
     crate::commands::share::print_share_started(public_url);
+    if open_in_browser {
+        let _ = crate::services::browser_open::open_url(public_url);
+    }
 
     // 3. split the socket; spawn writer task so the read loop and the
     // request-handling tasks can both submit outbound frames concurrently
