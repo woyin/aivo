@@ -596,15 +596,31 @@ async fn resolve_run_event(entry: &LogEntry, ctx: &ResolverContext) -> Result<Sh
         return resolve_amp_run(&ctx.amp_dir, run_ts, &run_cwd).await;
     }
 
-    // Native CLIs: project-scoped ingest, then closest-mtime match within
-    // the matching cli. Lifting `max_age_days` so old runs still resolve.
-    let opts = IngestOptions {
-        max_age_days: None,
-        min_updated_at: None,
-        max_per_source: Some(50),
+    // Native CLIs: project-scoped enumeration, then closest-mtime match within
+    // the matching cli.
+    //
+    // Claude uses a dedicated enumerator (`list_claude_sessions_for_cwd`)
+    // instead of `ingest_project`, because the latter's `extract_claude_thread`
+    // applies a substantive-content filter (drops files whose turns are all
+    // under MIN_TURN_CHARS) that's appropriate for AI-context injection but
+    // wrong here — short sessions like `claude -p 'say hi'` would be silently
+    // un-shareable. Other CLIs still go through `ingest_project` until their
+    // extractors are audited for the same issue.
+    let threads: Vec<Thread> = if tool == "claude" {
+        context_ingest::list_claude_sessions_for_cwd(std::path::Path::new(&run_cwd)).await
+    } else {
+        let opts = IngestOptions {
+            max_age_days: None,
+            min_updated_at: None,
+            max_per_source: Some(50),
+        };
+        context_ingest::ingest_project(std::path::Path::new(&run_cwd), opts)
+            .await?
+            .into_iter()
+            .filter(|t| t.cli == tool)
+            .collect()
     };
-    let threads = context_ingest::ingest_project(std::path::Path::new(&run_cwd), opts).await?;
-    let mut candidates: Vec<&Thread> = threads.iter().filter(|t| t.cli == tool).collect();
+    let mut candidates: Vec<&Thread> = threads.iter().collect();
     if candidates.is_empty() {
         return Err(anyhow!(
             "no native {tool} session found in {run_cwd} — the run may have been deleted, or its session file lives elsewhere"

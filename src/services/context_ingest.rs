@@ -546,6 +546,98 @@ async fn ingest_claude(canonical_root: &Path, cap: Option<usize>) -> Vec<Thread>
     out
 }
 
+/// Enumerate claude session files under the project's encoded cwd dir without
+/// applying the substantive-turn filter that `extract_claude_thread` uses.
+/// Returns one stub per parseable file with `session_id`, `source_path`, and
+/// `updated_at` populated; `topic` / `last_response` stay empty.
+///
+/// Used by the share resolver, which only needs to find which sessions exist
+/// for a cwd — `extract_claude_thread` drops files whose turns are all under
+/// `MIN_TURN_CHARS` (e.g. `claude -p 'say hi'`), so reusing it makes short
+/// sessions un-shareable.
+pub async fn list_claude_sessions_for_cwd(project_root: &Path) -> Vec<Thread> {
+    let home = match system_env::home_dir() {
+        Some(h) => h,
+        None => return Vec::new(),
+    };
+    let canonical_root =
+        std::fs::canonicalize(project_root).unwrap_or_else(|_| project_root.to_path_buf());
+    let session_dir = home
+        .join(".claude")
+        .join("projects")
+        .join(encode_claude_dir(&canonical_root.to_string_lossy()));
+    if !session_dir.exists() {
+        return Vec::new();
+    }
+
+    let files = list_jsonl_newest_first(&session_dir, None).await;
+    let mut out = Vec::new();
+    for path in files {
+        if let Some(stub) = extract_claude_session_stub(&path).await {
+            out.push(stub);
+        }
+    }
+    out
+}
+
+/// Read the headline fields of a claude JSONL: first `sessionId` and latest
+/// `timestamp`. Falls back to file mtime when the file carries no timestamps.
+async fn extract_claude_session_stub(path: &Path) -> Option<Thread> {
+    let file = fs::File::open(path).await.ok()?;
+    let mut lines = BufReader::new(file).lines();
+
+    let mut session_id: Option<String> = None;
+    let mut latest_ts: Option<DateTime<Utc>> = None;
+    let mut event_cwd: Option<String> = None;
+
+    while let Ok(Some(line)) = lines.next_line().await {
+        if line.is_empty() {
+            continue;
+        }
+        let v: Value = match serde_json::from_str(&line) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        if session_id.is_none()
+            && let Some(sid) = v.get("sessionId").and_then(|s| s.as_str())
+        {
+            session_id = Some(sid.to_string());
+        }
+        if event_cwd.is_none()
+            && let Some(c) = v.get("cwd").and_then(|s| s.as_str())
+            && !c.is_empty()
+        {
+            event_cwd = Some(c.to_string());
+        }
+        if let Some(ts) = v.get("timestamp").and_then(|s| s.as_str())
+            && let Ok(parsed) = DateTime::parse_from_rfc3339(ts)
+        {
+            let parsed = parsed.with_timezone(&Utc);
+            latest_ts = Some(latest_ts.map_or(parsed, |cur| cur.max(parsed)));
+        }
+    }
+
+    let session_id = session_id?;
+    let updated_at = match latest_ts {
+        Some(ts) => ts,
+        None => fs::metadata(path)
+            .await
+            .ok()
+            .and_then(|m| m.modified().ok())
+            .map(DateTime::<Utc>::from)
+            .unwrap_or_else(Utc::now),
+    };
+    Some(Thread {
+        cli: "claude".into(),
+        session_id,
+        source_path: path.to_string_lossy().to_string(),
+        topic: String::new(),
+        last_response: String::new(),
+        updated_at,
+        cwd: event_cwd.or_else(|| decode_claude_cwd(path)),
+    })
+}
+
 // ---------------------------------------------------------------------------
 // Codex: ~/.codex/sessions/YYYY/MM/DD/*.jsonl, per-file cwd match
 // ---------------------------------------------------------------------------
@@ -1581,6 +1673,44 @@ mod tests {
         ];
         fs::write(&path, lines.join("\n")).await.unwrap();
         assert!(extract_claude_thread(&path).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn extract_claude_session_stub_works_on_short_turns() {
+        // Short user turn under MIN_TURN_CHARS — extract_claude_thread drops
+        // this file. The stub variant must still find the sessionId so the
+        // share resolver can surface short sessions (e.g. `claude -p 'say hi'`).
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("sess.jsonl");
+        let lines = [
+            r#"{"type":"user","sessionId":"sess1","isSidechain":false,"timestamp":"2026-04-01T10:00:00Z","cwd":"/tmp/p","message":{"content":"say hi"}}"#,
+            r#"{"type":"assistant","sessionId":"sess1","isSidechain":false,"timestamp":"2026-04-01T10:00:05Z","message":{"content":[{"type":"text","text":"Hi!"}]}}"#,
+        ];
+        fs::write(&path, lines.join("\n")).await.unwrap();
+
+        assert!(
+            extract_claude_thread(&path).await.is_none(),
+            "regular extractor still rejects short turns (regression guard)"
+        );
+        let stub = extract_claude_session_stub(&path)
+            .await
+            .expect("stub extractor keeps short sessions");
+        assert_eq!(stub.cli, "claude");
+        assert_eq!(stub.session_id, "sess1");
+        assert_eq!(stub.cwd.as_deref(), Some("/tmp/p"));
+        assert!(stub.topic.is_empty());
+        assert!(stub.last_response.is_empty());
+        assert_eq!(stub.updated_at.to_rfc3339(), "2026-04-01T10:00:05+00:00");
+    }
+
+    #[tokio::test]
+    async fn extract_claude_session_stub_returns_none_without_session_id() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("sess.jsonl");
+        fs::write(&path, r#"{"type":"queue-operation","content":"hi"}"#)
+            .await
+            .unwrap();
+        assert!(extract_claude_session_stub(&path).await.is_none());
     }
 
     #[tokio::test]
