@@ -765,6 +765,42 @@ pub(crate) async fn fetch_all_models_cached(
     Ok(models)
 }
 
+/// Pure decision for `starter_model_still_available`: given a freshly-fetched
+/// catalog, decide whether `model` is still listed. An empty catalog is
+/// treated as a transient hiccup and passes through rather than flagging
+/// every user's model as gone.
+fn model_present_in_catalog(catalog: &[String], model: &str) -> bool {
+    catalog.is_empty() || catalog.iter().any(|m| m == model)
+}
+
+/// Returns whether `model` is still listed for the aivo-starter server.
+/// Returns `true` (skip validation) for non-starter keys, the stable sentinel
+/// `aivo/starter`, `MODEL_DEFAULT_PLACEHOLDER`, and when the catalog can't be
+/// fetched — we never block the user on a network hiccup.
+///
+/// Bypasses the cache: the whole point is to detect server-side removals,
+/// and the cache may hold the pre-removal catalog. The fresh fetch's result
+/// is written back to the cache as a side benefit.
+pub(crate) async fn starter_model_still_available(
+    client: &Client,
+    key: &ApiKey,
+    cache: &ModelsCache,
+    model: &str,
+) -> bool {
+    if !is_aivo_starter_base(&key.base_url) {
+        return true;
+    }
+    if model == crate::constants::AIVO_STARTER_MODEL
+        || model == crate::constants::MODEL_DEFAULT_PLACEHOLDER
+    {
+        return true;
+    }
+    match fetch_all_models_cached(client, key, cache, true).await {
+        Ok(catalog) => model_present_in_catalog(&catalog, model),
+        Err(_) => true,
+    }
+}
+
 /// Fetch models with full metadata from the API where available.
 /// Providers like OpenRouter/Vercel return context window, pricing, and max output.
 /// Google returns inputTokenLimit and outputTokenLimit.
@@ -1307,6 +1343,77 @@ mod tests {
             result.is_err(),
             "Expected network error, not cached stale data"
         );
+    }
+
+    // Tests for `starter_model_still_available`. Short-circuit paths (no
+    // network) are exercised through the full helper; catalog-content
+    // decisions are tested through the pure `model_present_in_catalog` so
+    // they don't depend on HTTP fixtures.
+
+    #[tokio::test]
+    async fn starter_validation_passes_non_starter_keys_without_network() {
+        let dir = TempDir::new().unwrap();
+        let cache = ModelsCache::with_path(dir.path().join("models-cache.json"));
+        let key = make_key("https://api.example.com");
+        let client = reqwest::Client::new();
+        assert!(starter_model_still_available(&client, &key, &cache, "any-model").await);
+    }
+
+    #[tokio::test]
+    async fn starter_validation_passes_sentinel_model_without_network() {
+        let dir = TempDir::new().unwrap();
+        let cache = ModelsCache::with_path(dir.path().join("models-cache.json"));
+        let key = make_key(crate::constants::AIVO_STARTER_SENTINEL);
+        let client = reqwest::Client::new();
+        // `aivo/starter` is the stable sentinel — the helper must short-circuit
+        // before fetching.
+        assert!(
+            starter_model_still_available(
+                &client,
+                &key,
+                &cache,
+                crate::constants::AIVO_STARTER_MODEL,
+            )
+            .await
+        );
+    }
+
+    #[tokio::test]
+    async fn starter_validation_passes_default_placeholder_without_network() {
+        let dir = TempDir::new().unwrap();
+        let cache = ModelsCache::with_path(dir.path().join("models-cache.json"));
+        let key = make_key(crate::constants::AIVO_STARTER_SENTINEL);
+        let client = reqwest::Client::new();
+        assert!(
+            starter_model_still_available(
+                &client,
+                &key,
+                &cache,
+                crate::constants::MODEL_DEFAULT_PLACEHOLDER,
+            )
+            .await
+        );
+    }
+
+    #[test]
+    fn model_present_when_catalog_contains_it() {
+        let catalog = vec!["a".to_string(), "b".to_string()];
+        assert!(model_present_in_catalog(&catalog, "a"));
+        assert!(model_present_in_catalog(&catalog, "b"));
+    }
+
+    #[test]
+    fn model_absent_when_catalog_does_not_contain_it() {
+        let catalog = vec!["a".to_string(), "b".to_string()];
+        assert!(!model_present_in_catalog(&catalog, "removed"));
+    }
+
+    #[test]
+    fn empty_catalog_passes_through() {
+        // A `200 OK` with `data: []` is almost always a transient server bug,
+        // not "every model was removed". Pass through rather than flagging
+        // every user's persisted model as gone.
+        assert!(model_present_in_catalog(&[], "anything"));
     }
 
     #[test]

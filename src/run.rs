@@ -402,7 +402,8 @@ pub async fn run() -> ! {
                     })
                     .await
             } else {
-                let command = RunCommand::new(session_store.clone(), ai_launcher, models_cache);
+                let command =
+                    RunCommand::new(session_store.clone(), ai_launcher, models_cache.clone());
 
                 let key_explicit = key_flag.is_some();
                 let compat = run_args
@@ -481,6 +482,39 @@ pub async fn run() -> ! {
                             }
                         }
                     };
+                // Drop a persisted starter model that's been removed from the
+                // server catalog so the picker reopens with the current list.
+                // Skipped when --model was explicit — we trust what the user
+                // typed and let upstream surface any mismatch.
+                let persisted_model_for_key = if model_flag_explicit {
+                    persisted_model_for_key
+                } else {
+                    match (persisted_model_for_key, key_override.as_ref()) {
+                        (Some(m), Some(k))
+                            if services::provider_profile::is_aivo_starter_base(&k.base_url) =>
+                        {
+                            let client = services::http_utils::router_http_client();
+                            if commands::models::starter_model_still_available(
+                                &client,
+                                k,
+                                &models_cache,
+                                &m,
+                            )
+                            .await
+                            {
+                                Some(m)
+                            } else {
+                                eprintln!(
+                                    "{} Model '{}' is no longer available on aivo-starter. Pick another:",
+                                    style::yellow("Note:"),
+                                    m
+                                );
+                                None
+                            }
+                        }
+                        (other, _) => other,
+                    }
+                };
                 let model = if model.is_some() {
                     model
                 } else if dry_run {

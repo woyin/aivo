@@ -68,6 +68,7 @@ impl StartCommand {
         }
 
         let key_explicit = args.key.is_some();
+        let model_explicit = args.model.is_some();
 
         // Resolve tool first (uses last selection for default)
         let tool = self.resolve_tool(args.tool.as_deref(), last_sel.as_ref())?;
@@ -77,7 +78,7 @@ impl StartCommand {
             .await?;
 
         // Determine model: if -k was explicit, force picker; otherwise use last selection
-        let model_arg = if args.model.is_some() {
+        let model_arg = if model_explicit {
             args.model
         } else if key_explicit {
             // -k used without -m → force model picker
@@ -90,6 +91,11 @@ impl StartCommand {
                 }
                 _ => None, // will trigger picker below
             }
+        };
+        let model_arg = if model_explicit || key_explicit {
+            model_arg
+        } else {
+            self.refresh_starter_model_arg(&key.value, model_arg).await
         };
 
         let model = self
@@ -353,6 +359,31 @@ impl StartCommand {
                 interactive: false,
             }),
         }
+    }
+
+    async fn refresh_starter_model_arg(
+        &self,
+        key: &ApiKey,
+        model_arg: Option<String>,
+    ) -> Option<String> {
+        let model = model_arg?;
+        if model.is_empty() {
+            return Some(model);
+        }
+
+        let client = http_utils::router_http_client();
+        if crate::commands::models::starter_model_still_available(&client, key, &self.cache, &model)
+            .await
+        {
+            return Some(model);
+        }
+
+        eprintln!(
+            "{} Model '{}' is no longer available on aivo-starter. Pick another:",
+            style::yellow("Note:"),
+            model
+        );
+        Some(String::new())
     }
 
     async fn prompt_select_model(

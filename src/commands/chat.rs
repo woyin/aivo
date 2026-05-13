@@ -117,7 +117,8 @@ impl ChatCommand {
     /// --model flag > persisted per-key > last_selection > None (show picker)
     async fn resolve_model(
         &self,
-        key_id: &str,
+        client: &Client,
+        key: &ApiKey,
         flag_model: Option<String>,
     ) -> Result<Option<String>> {
         match flag_model {
@@ -125,28 +126,49 @@ impl ChatCommand {
             Some(ref m) if m.is_empty() => Ok(None),
             // --model <value> → use it and save
             Some(model) => {
-                let current = self.session_store.get_chat_model(key_id).await?;
+                let current = self.session_store.get_chat_model(&key.id).await?;
                 if current.as_deref() != Some(&model) {
-                    self.session_store.set_chat_model(key_id, &model).await?;
+                    self.session_store.set_chat_model(&key.id, &model).await?;
                 }
                 Ok(Some(model))
             }
             None => {
-                // Try per-key chat model first
-                if let Some(m) = self.session_store.get_chat_model(key_id).await? {
-                    return Ok(Some(m));
+                if let Some(m) = self.session_store.get_chat_model(&key.id).await? {
+                    if self.starter_model_valid(client, key, &m).await {
+                        return Ok(Some(m));
+                    }
+                    return Ok(None);
                 }
-                // Fall back to global last selection if key matches
                 if let Ok(Some(sel)) = self.session_store.get_last_selection().await
-                    && sel.key_id == key_id
+                    && sel.key_id == key.id
                     && let Some(ref m) = sel.model
                     && m != crate::constants::MODEL_DEFAULT_PLACEHOLDER
                 {
-                    return Ok(Some(m.clone()));
+                    if self.starter_model_valid(client, key, m).await {
+                        return Ok(Some(m.clone()));
+                    }
+                    return Ok(None);
                 }
                 Ok(None)
             }
         }
+    }
+
+    /// Wraps `starter_model_still_available`, printing a notice when the
+    /// persisted model has been removed from the aivo-starter catalog so the
+    /// caller knows why the picker is about to open.
+    async fn starter_model_valid(&self, client: &Client, key: &ApiKey, model: &str) -> bool {
+        if crate::commands::models::starter_model_still_available(client, key, &self.cache, model)
+            .await
+        {
+            return true;
+        }
+        eprintln!(
+            "{} Model '{}' is no longer available on aivo-starter. Pick another:",
+            style::yellow("Note:"),
+            model
+        );
+        false
     }
 
     /// Transforms model names for OpenRouter compatibility
@@ -220,7 +242,7 @@ impl ChatCommand {
         let cwd =
             crate::services::system_env::current_dir_string().unwrap_or_else(|| ".".to_string());
 
-        let raw_model = match self.resolve_model(&key.id, model_flag).await? {
+        let raw_model = match self.resolve_model(&client, &key, model_flag).await? {
             Some(m) => m,
             None => {
                 ensure_picker_terminal("model", "--model <name>")?;
