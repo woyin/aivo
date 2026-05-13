@@ -1,4 +1,4 @@
-//! `aivo speak` — generate speech (TTS) from a text prompt and play it.
+//! `aivo audio` — generate speech (TTS) from a text prompt and play it.
 //!
 //! Resolves a key, takes the prompt from a positional arg / `--file` /
 //! piped stdin, calls the provider, saves the result, and plays it. Every
@@ -45,11 +45,11 @@ impl AudioCommand {
     }
 
     pub fn print_help() {
-        let name = "aivo speak";
+        let name = "aivo audio";
         println!(
             "{} {}",
             style::cyan(name),
-            style::dim("— speak a prompt aloud (TTS, cached, plays by default)")
+            style::dim("— generate speech from a prompt (TTS, cached, plays by default)")
         );
         println!();
         println!("{} {} [OPTIONS] [<PROMPT>]", style::bold("Usage:"), name);
@@ -112,14 +112,14 @@ impl AudioCommand {
         println!();
         println!("{}", style::bold("Examples:"));
         let ex = |s: &str| println!("  {}", style::dim(s));
-        ex("aivo speak \"hello world\"");
-        ex("aivo speak \"narration line\" -m tts-1-hd --voice nova");
-        ex("aivo speak -f script.txt");
-        ex("aivo speak -f -");
-        ex("echo \"hi from pipe\" | aivo speak");
-        ex("aivo speak \"...\" --no-play -o out.mp3   # save only");
-        ex("aivo speak \"...\" --overwrite           # force regenerate");
-        ex("aivo speak --list                       # browse cached entries");
+        ex("aivo audio \"hello world\"");
+        ex("aivo audio \"narration line\" -m tts-1-hd --voice nova");
+        ex("aivo audio -f script.txt");
+        ex("aivo audio -f -");
+        ex("echo \"hi from pipe\" | aivo audio");
+        ex("aivo audio \"...\" --no-play -o out.mp3   # save only");
+        ex("aivo audio \"...\" --overwrite           # force regenerate");
+        ex("aivo audio --list                       # browse cached entries");
     }
 
     /// Prints the audio-scope active key and model under the help output.
@@ -150,7 +150,7 @@ impl AudioCommand {
             }
         };
 
-        // Streaming path: when the user just runs `aivo speak "..."` with
+        // Streaming path: when the user just runs `aivo audio "..."` with
         // no -o, no --format, and no --no-play, and the provider speaks the
         // OpenAI protocol — request raw PCM, push chunks to rodio as they
         // arrive, and wrap the accumulated PCM into WAV for the cache. The
@@ -408,7 +408,7 @@ impl AudioCommand {
         ExitCode::Success
     }
 
-    /// `aivo speak --list` — fuzzy-pick a cached entry, then play or
+    /// `aivo audio --list` — fuzzy-pick a cached entry, then play or
     /// delete it. Pure local I/O; no key, no provider call.
     pub async fn run_list(self) -> ExitCode {
         let cache_dir = audio_cache::audio_cache_dir(self.session_store.config_dir());
@@ -424,7 +424,7 @@ impl AudioCommand {
             };
             if entries.is_empty() {
                 println!(
-                    "{} no cached entries yet. Run `aivo speak \"…\"` first.",
+                    "{} no cached entries yet. Run `aivo audio \"…\"` first.",
                     style::dim("list:")
                 );
                 return ExitCode::Success;
@@ -450,7 +450,7 @@ impl AudioCommand {
             };
             if entries.is_empty() {
                 println!(
-                    "{} no cached entries yet. Run `aivo speak \"…\"` first.",
+                    "{} no cached entries yet. Run `aivo audio \"…\"` first.",
                     style::dim("list:")
                 );
                 return ExitCode::Success;
@@ -824,7 +824,7 @@ fn default_extension(format: Option<&str>) -> String {
 
 fn start_spinner_if_tty(model: &str) -> Option<(Arc<AtomicBool>, JoinHandle<()>)> {
     if std::io::stderr().is_terminal() {
-        let label = format!(" Speaking with {}…", model);
+        let label = format!(" Generating audio with {}…", model);
         Some(style::start_spinner(Some(&label)))
     } else {
         None

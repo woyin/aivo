@@ -40,12 +40,12 @@ pub(crate) fn trim_to_one_line(text: &str, max_chars: usize) -> String {
     }
 }
 
-/// Decides the final write path for media commands (`image`/`speak`/
+/// Decides the final write path for media commands (`image`/`audio`/
 /// `video`). Reads the `force`/`json`-derived `policy`, prompts on
 /// existing files when interactive, and prints the standard
 /// "exists, pass <flag> to overwrite" error in non-interactive mode.
 /// `force_flag_hint` is the flag the caller advertises for non-interactive
-/// overwrite (e.g. `"-f"` for image/video, `"--overwrite"` for speak).
+/// overwrite (e.g. `"-f"` for image/video, `"--overwrite"` for audio).
 /// Returns `None` when the user (or non-TTY) aborts.
 pub(crate) fn resolve_final_path(
     initial: &Path,

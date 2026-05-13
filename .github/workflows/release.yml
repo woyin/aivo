@@ -60,7 +60,7 @@ jobs:
           # Linux artifacts ship without rodio so the binary doesn't
           # hard-link libasound.so.2 — minimal / headless servers (no ALSA)
           # can run aivo. macOS / Windows keep default features (audio
-          # playback for `aivo speak`).
+          # playback for `aivo audio`).
           CARGO_BUILD_FLAGS: ${{ contains(matrix.target, 'linux') && '--no-default-features' || '' }}
         run: |
           if [[ "${{ matrix.use-cross }}" == "true" ]]; then

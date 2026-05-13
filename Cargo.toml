@@ -64,7 +64,7 @@ windows-sys = { version = "0.59", features = ["Win32_Storage_FileSystem", "Win32
 
 [features]
 default = ["audio_playback"]
-# In-process audio playback for `aivo speak`. Pulls rodio → cpal → alsa-sys,
+# In-process audio playback for `aivo audio`. Pulls rodio → cpal → alsa-sys,
 # which hard-links libasound.so.2 on Linux. Headless / minimal Linux servers
 # without ALSA can't run a binary built with this feature, so the published
 # `aivo-linux-*` artifacts are built with `--no-default-features`. Native

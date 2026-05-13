@@ -286,63 +286,63 @@ fn non_alias_not_rewritten() {
 }
 
 #[test]
-fn speak_with_prompt() {
-    let cli = Cli::try_parse_from(["aivo", "speak", "hello world"]).unwrap();
-    if let Some(Commands::Speak(args)) = cli.command {
+fn audio_with_prompt() {
+    let cli = Cli::try_parse_from(["aivo", "audio", "hello world"]).unwrap();
+    if let Some(Commands::Audio(args)) = cli.command {
         assert_eq!(args.prompt.as_deref(), Some("hello world"));
         assert!(args.file.is_none());
         assert!(!args.overwrite);
         assert!(!args.no_play);
     } else {
-        panic!("Expected Speak command");
+        panic!("Expected Audio command");
     }
 }
 
 #[test]
-fn speak_with_file_short_flag() {
-    let cli = Cli::try_parse_from(["aivo", "speak", "-f", "script.txt"]).unwrap();
-    if let Some(Commands::Speak(args)) = cli.command {
+fn audio_with_file_short_flag() {
+    let cli = Cli::try_parse_from(["aivo", "audio", "-f", "script.txt"]).unwrap();
+    if let Some(Commands::Audio(args)) = cli.command {
         assert_eq!(args.file.as_deref(), Some("script.txt"));
         assert!(args.prompt.is_none());
     } else {
-        panic!("Expected Speak command");
+        panic!("Expected Audio command");
     }
 }
 
 #[test]
-fn speak_with_file_long_flag() {
-    let cli = Cli::try_parse_from(["aivo", "speak", "--file", "lines.md"]).unwrap();
-    if let Some(Commands::Speak(args)) = cli.command {
+fn audio_with_file_long_flag() {
+    let cli = Cli::try_parse_from(["aivo", "audio", "--file", "lines.md"]).unwrap();
+    if let Some(Commands::Audio(args)) = cli.command {
         assert_eq!(args.file.as_deref(), Some("lines.md"));
     } else {
-        panic!("Expected Speak command");
+        panic!("Expected Audio command");
     }
 }
 
 #[test]
-fn speak_with_file_short_flag_without_path_uses_stdin_marker() {
-    let cli = Cli::try_parse_from(["aivo", "speak", "-f"]).unwrap();
-    if let Some(Commands::Speak(args)) = cli.command {
+fn audio_with_file_short_flag_without_path_uses_stdin_marker() {
+    let cli = Cli::try_parse_from(["aivo", "audio", "-f"]).unwrap();
+    if let Some(Commands::Audio(args)) = cli.command {
         assert_eq!(args.file.as_deref(), Some("-"));
         assert!(args.prompt.is_none());
     } else {
-        panic!("Expected Speak command");
+        panic!("Expected Audio command");
     }
 }
 
 #[test]
-fn speak_with_file_long_flag_without_path_uses_stdin_marker() {
-    let cli = Cli::try_parse_from(["aivo", "speak", "--file"]).unwrap();
-    if let Some(Commands::Speak(args)) = cli.command {
+fn audio_with_file_long_flag_without_path_uses_stdin_marker() {
+    let cli = Cli::try_parse_from(["aivo", "audio", "--file"]).unwrap();
+    if let Some(Commands::Audio(args)) = cli.command {
         assert_eq!(args.file.as_deref(), Some("-"));
     } else {
-        panic!("Expected Speak command");
+        panic!("Expected Audio command");
     }
 }
 
 #[test]
-fn speak_prompt_and_file_are_mutually_exclusive() {
-    let err = Cli::try_parse_from(["aivo", "speak", "hello", "-f", "script.txt"]).unwrap_err();
+fn audio_prompt_and_file_are_mutually_exclusive() {
+    let err = Cli::try_parse_from(["aivo", "audio", "hello", "-f", "script.txt"]).unwrap_err();
     let msg = err.to_string();
     assert!(
         msg.contains("cannot be used") || msg.contains("conflict"),
@@ -351,20 +351,20 @@ fn speak_prompt_and_file_are_mutually_exclusive() {
 }
 
 #[test]
-fn speak_with_list_flag() {
-    let cli = Cli::try_parse_from(["aivo", "speak", "--list"]).unwrap();
-    if let Some(Commands::Speak(args)) = cli.command {
+fn audio_with_list_flag() {
+    let cli = Cli::try_parse_from(["aivo", "audio", "--list"]).unwrap();
+    if let Some(Commands::Audio(args)) = cli.command {
         assert!(args.list);
         assert!(args.prompt.is_none());
         assert!(args.file.is_none());
     } else {
-        panic!("Expected Speak command");
+        panic!("Expected Audio command");
     }
 }
 
 #[test]
-fn speak_rejects_removed_history_flag() {
-    let err = Cli::try_parse_from(["aivo", "speak", "--history"]).unwrap_err();
+fn audio_rejects_removed_history_flag() {
+    let err = Cli::try_parse_from(["aivo", "audio", "--history"]).unwrap_err();
     let msg = err.to_string();
     assert!(
         msg.contains("unexpected argument") || msg.contains("unrecognized"),
@@ -373,8 +373,8 @@ fn speak_rejects_removed_history_flag() {
 }
 
 #[test]
-fn speak_rejects_removed_restart_flag() {
-    let err = Cli::try_parse_from(["aivo", "speak", "hello", "--restart"]).unwrap_err();
+fn audio_rejects_removed_restart_flag() {
+    let err = Cli::try_parse_from(["aivo", "audio", "hello", "--restart"]).unwrap_err();
     let msg = err.to_string();
     assert!(
         msg.contains("unexpected argument") || msg.contains("unrecognized"),
@@ -383,10 +383,10 @@ fn speak_rejects_removed_restart_flag() {
 }
 
 #[test]
-fn speak_full_flag_set() {
+fn audio_full_flag_set() {
     let cli = Cli::try_parse_from([
         "aivo",
-        "speak",
+        "audio",
         "narration",
         "-m",
         "tts-1-hd",
@@ -405,7 +405,7 @@ fn speak_full_flag_set() {
         "--json",
     ])
     .unwrap();
-    if let Some(Commands::Speak(args)) = cli.command {
+    if let Some(Commands::Audio(args)) = cli.command {
         assert_eq!(args.prompt.as_deref(), Some("narration"));
         assert_eq!(args.model.as_deref(), Some("tts-1-hd"));
         assert_eq!(args.key.as_deref(), Some("openai"));
@@ -417,18 +417,18 @@ fn speak_full_flag_set() {
         assert!(args.overwrite);
         assert!(args.json);
     } else {
-        panic!("Expected Speak command");
+        panic!("Expected Audio command");
     }
 }
 
 #[test]
-fn audio_command_is_unrecognized() {
-    let err = Cli::try_parse_from(["aivo", "audio", "hello"]).unwrap_err();
+fn track_command_is_unrecognized() {
+    let err = Cli::try_parse_from(["aivo", "track", "hello"]).unwrap_err();
     let msg = err.to_string();
     // clap reports "unrecognized subcommand" or similar — the specific
     // wording depends on the version; just ensure parsing fails.
     assert!(
-        msg.contains("audio") || msg.contains("unrecognized") || msg.contains("subcommand"),
+        msg.contains("track") || msg.contains("unrecognized") || msg.contains("subcommand"),
         "expected unrecognized-subcommand error, got: {msg}"
     );
 }

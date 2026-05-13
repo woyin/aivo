@@ -1,4 +1,4 @@
-//! Cross-platform audio playback for `aivo speak`.
+//! Cross-platform audio playback for `aivo audio`.
 //!
 //! Two paths:
 //!

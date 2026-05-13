@@ -1,4 +1,4 @@
-//! Persistent on-disk cache for `aivo speak` TTS output.
+//! Persistent on-disk cache for `aivo audio` TTS output.
 //!
 //! Cache files live under `<config_dir>/audio/<hash>.<ext>`. The hash is
 //! derived from every input field that materially affects the generated

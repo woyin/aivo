@@ -115,7 +115,7 @@ pub async fn run() -> ! {
                 ImageCommand::print_help();
                 ImageCommand::print_active_selection(&session_store).await;
             }
-            Commands::Speak(_) => {
+            Commands::Audio(_) => {
                 AudioCommand::print_help();
                 AudioCommand::print_active_selection(&session_store).await;
             }
@@ -261,7 +261,7 @@ pub async fn run() -> ! {
             command.execute(image_args, key).await
         }
 
-        Commands::Speak(audio_args) => {
+        Commands::Audio(audio_args) => {
             audio_dispatch(&session_store, &models_cache, audio_args).await
         }
 
@@ -896,7 +896,7 @@ async fn ensure_compatible_key(
     }
 }
 
-/// Dispatch for `Commands::Speak`. Resolves the prompt from positional
+/// Dispatch for `Commands::Audio`. Resolves the prompt from positional
 /// arg / `--file` / piped stdin (in that precedence) before any key or
 /// model work — so a no-prompt invocation in an interactive shell prints
 /// help instead of triggering a picker.
@@ -912,7 +912,7 @@ async fn audio_dispatch(
         return command.run_list().await;
     }
 
-    let prompt = match resolve_speak_prompt(&audio_args) {
+    let prompt = match resolve_audio_prompt(&audio_args) {
         Ok(Some(p)) => p,
         Ok(None) => {
             AudioCommand::print_help();
@@ -959,11 +959,11 @@ async fn audio_dispatch(
     command.execute(audio_args, key, prompt).await
 }
 
-/// Resolves the speak prompt from (positional, `--file`, piped stdin) in
+/// Resolves the audio prompt from (positional, `--file`, piped stdin) in
 /// that precedence. `--file -` or `--file` with no value reads stdin
 /// explicitly. Returns `Ok(None)` to mean "show help" — i.e. the caller
 /// had no positional, no `--file`, and stdin was a TTY or empty.
-fn resolve_speak_prompt(args: &cli::AudioArgs) -> anyhow::Result<Option<String>> {
+fn resolve_audio_prompt(args: &cli::AudioArgs) -> anyhow::Result<Option<String>> {
     if let Some(p) = args
         .prompt
         .as_deref()

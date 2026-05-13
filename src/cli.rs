@@ -73,10 +73,11 @@ pub enum Commands {
     #[command(hide = true)]
     Video(VideoArgs),
 
-    /// Speak a text prompt aloud (TTS). Saves to `~/.config/aivo/audio/`
-    /// by default and reuses the cached file on repeat calls.
+    /// Generate speech (TTS) from a text prompt. Saves to
+    /// `~/.config/aivo/audio/` by default and reuses the cached file on
+    /// repeat calls.
     #[command(hide = true)]
-    Speak(AudioArgs),
+    Audio(AudioArgs),
 
     /// Update the CLI tool to the latest version
     Update(UpdateArgs),
@@ -818,7 +819,7 @@ pub struct AudioArgs {
     #[arg(short = 'r', long)]
     pub refresh: bool,
 
-    /// Suppress playback. Useful for scripting where `speak` should just
+    /// Suppress playback. Useful for scripting where `audio` should just
     /// save a file.
     #[arg(long)]
     pub no_play: bool,
