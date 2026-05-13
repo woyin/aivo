@@ -1870,6 +1870,37 @@ mod tests {
         assert_eq!(input[2]["output"], "Sunny");
     }
 
+    // ── cap_reasoning_effort ──────────────────────────────────────────────────
+
+    #[test]
+    fn cap_reasoning_effort_clamps_xhigh_chat() {
+        let mut body = json!({"reasoning_effort": "xhigh"});
+        cap_reasoning_effort(&mut body);
+        assert_eq!(body["reasoning_effort"], "high");
+    }
+
+    #[test]
+    fn cap_reasoning_effort_clamps_xhigh_responses() {
+        let mut body = json!({"reasoning": {"effort": "xhigh"}});
+        cap_reasoning_effort(&mut body);
+        assert_eq!(body["reasoning"]["effort"], "high");
+    }
+
+    #[test]
+    fn cap_reasoning_effort_passes_through_high() {
+        let mut body = json!({"reasoning_effort": "high"});
+        cap_reasoning_effort(&mut body);
+        assert_eq!(body["reasoning_effort"], "high");
+    }
+
+    #[test]
+    fn cap_reasoning_effort_noop_when_absent() {
+        let mut body = json!({"model": "x"});
+        cap_reasoning_effort(&mut body);
+        assert!(body.get("reasoning_effort").is_none());
+        assert!(body.get("reasoning").is_none());
+    }
+
     #[test]
     fn chat_to_responses_tools_converted() {
         let body = json!({

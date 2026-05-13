@@ -49,6 +49,7 @@ use crate::services::openai_models::{
 use crate::services::protocol_fallback::{
     AttemptOutcome, classify_attempt, commit_protocol_switch, protocol_candidates,
 };
+use crate::services::provider_profile::is_direct_openai_base;
 use crate::services::provider_protocol::{
     PathVariant, ProviderProtocol, classify_failed_attempt, decode_route, is_endpoint_missing,
     is_protocol_mismatch, is_terminal_upstream_error,
@@ -698,19 +699,19 @@ async fn handle_anthropic_to_upstream(
         config.strip_cache_control,
         config.max_tokens_cap,
     )?;
+    // GPT-5.4+ at api.openai.com accepts `reasoning_effort: "xhigh"`, but
+    // generic OpenAI-compat providers (Cloudflare Workers AI, OpenRouter, …)
+    // strictly validate against the spec enum `low|medium|high` and 400 on
+    // anything else. Clamp here so the same Max-tier request reaches both.
+    if !is_direct_openai_base(&config.target_base_url) {
+        crate::services::responses_chat_conversion::cap_reasoning_effort(&mut simplified);
+    }
     let requested_stream = simplified
         .get("stream")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
 
-    // Anthropic candidates would just hit /v1/chat/completions again (the
-    // catch-all `_` arm below), byte-identical to the corresponding Openai
-    // candidate — native Anthropic forwarding lives in `try_native_anthropic`,
-    // not in this loop. Drop them so we don't pay for duplicate requests.
-    let candidates: Vec<(ProviderProtocol, PathVariant)> = protocol_candidates(active_protocol)
-        .into_iter()
-        .filter(|(proto, _)| *proto != ProviderProtocol::Anthropic)
-        .collect();
+    let candidates = router_candidates(active_protocol, &config.target_base_url);
     // Seed first_error with the native-Anthropic Terminal response (if any) so
     // a chat fallback that also exhausts surfaces *some* error to the client.
     // The chat-loop's "is_terminal" branch will overwrite this with the more
@@ -939,13 +940,18 @@ async fn handle_anthropic_to_upstream(
                         // *current* request succeeds without a relaunch.
                         if !retried_with_strict && !effective_requires_reasoning {
                             retried_with_strict = true;
-                            if let Ok(strict) = build_simplified_openai_body(
+                            if let Ok(mut strict) = build_simplified_openai_body(
                                 &body,
                                 true,
                                 model_is_claude,
                                 config.strip_cache_control,
                                 config.max_tokens_cap,
                             ) {
+                                if !is_direct_openai_base(&config.target_base_url) {
+                                    crate::services::responses_chat_conversion::cap_reasoning_effort(
+                                        &mut strict,
+                                    );
+                                }
                                 simplified = strict;
                                 continue; // re-do the SAME idx with strict body
                             }
@@ -1080,6 +1086,29 @@ fn openai_chat_response_to_anthropic_router(
             body: convert_openai_to_anthropic(&openai_response.to_string(), 200)?.into_bytes(),
         })
     }
+}
+
+/// Builds the per-request fallback cascade for this router.
+///
+/// Drops two candidate kinds before the cascade runs:
+/// - `Anthropic`: would just hit /v1/chat/completions again (byte-identical
+///   to the corresponding `Openai` candidate handled by the catch-all arm).
+///   Native Anthropic forwarding lives in `try_native_anthropic`, not here.
+/// - `ResponsesApi` against non-OpenAI hosts: `/responses` is OpenAI-specific.
+///   Other vendors that expose that route (e.g. Cloudflare Workers AI)
+///   implement a different schema, so posting OpenAI-Responses bodies there
+///   just produces a misleading second 400 that masks the real
+///   `/chat/completions` error.
+fn router_candidates(
+    active_protocol: &AtomicU8,
+    target_base_url: &str,
+) -> Vec<(ProviderProtocol, PathVariant)> {
+    let allow_responses_fallback = is_direct_openai_base(target_base_url);
+    protocol_candidates(active_protocol)
+        .into_iter()
+        .filter(|(proto, _)| *proto != ProviderProtocol::Anthropic)
+        .filter(|(proto, _)| allow_responses_fallback || *proto != ProviderProtocol::ResponsesApi)
+        .collect()
 }
 
 /// Convert OpenAI Chat Completions request → Responses API request.
@@ -2581,6 +2610,40 @@ data: [DONE]\n";
     fn build_responses_url_stripped_variant() {
         let url = build_responses_url("https://api.example.com", PathVariant::Stripped);
         assert_eq!(url, "https://api.example.com/responses");
+    }
+
+    #[test]
+    fn router_candidates_drops_anthropic_always() {
+        let active = AtomicU8::new(ProviderProtocol::Openai.to_u8());
+        let cands = router_candidates(&active, "https://api.openai.com/v1");
+        assert!(!cands.iter().any(|(p, _)| *p == ProviderProtocol::Anthropic));
+    }
+
+    #[test]
+    fn router_candidates_keeps_responses_for_openai() {
+        let active = AtomicU8::new(ProviderProtocol::Openai.to_u8());
+        let cands = router_candidates(&active, "https://api.openai.com/v1");
+        assert!(
+            cands
+                .iter()
+                .any(|(p, _)| *p == ProviderProtocol::ResponsesApi)
+        );
+    }
+
+    #[test]
+    fn router_candidates_drops_responses_for_non_openai() {
+        let active = AtomicU8::new(ProviderProtocol::Openai.to_u8());
+        let cands = router_candidates(
+            &active,
+            "https://api.cloudflare.com/client/v4/accounts/abc/ai/v1",
+        );
+        assert!(
+            !cands
+                .iter()
+                .any(|(p, _)| *p == ProviderProtocol::ResponsesApi)
+        );
+        // Other fallbacks (Openai variants, Google) still present.
+        assert!(cands.iter().any(|(p, _)| *p == ProviderProtocol::Google));
     }
 
     #[test]
