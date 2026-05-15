@@ -676,10 +676,11 @@ pub fn sse_data_payload(line: &str) -> Option<&str> {
 
 /// Shared `reqwest::ClientBuilder` for every outbound HTTP client in aivo.
 ///
-/// Applies the v4-bind escape hatch: defaults on under Termux (cellular
-/// DNS64 routinely surfaces only AAAA and v6 connect stalls), overridable
-/// with `AIVO_HTTP_IPV4_ONLY=1` / `=0`. Callers layer their own timeouts,
-/// headers, and proxy settings on top.
+/// Off by default; opt in with `AIVO_HTTP_IPV4_ONLY=1` to bind outbound
+/// sockets to v4. Used as an escape hatch on cellular networks where DNS64
+/// surfaces only AAAA and v6 connect stalls. Was previously on-by-default
+/// under Termux, but that broke v6-preferred networks where v4 is the slow
+/// path. Callers layer their own timeouts, headers, and proxy on top.
 pub fn aivo_http_client_builder() -> reqwest::ClientBuilder {
     let mut builder = reqwest::Client::builder();
     if force_ipv4_enabled() {
@@ -689,18 +690,11 @@ pub fn aivo_http_client_builder() -> reqwest::ClientBuilder {
 }
 
 fn force_ipv4_enabled() -> bool {
-    force_ipv4_with(
-        std::env::var("AIVO_HTTP_IPV4_ONLY").ok().as_deref(),
-        crate::services::termux_exec::is_termux(),
-    )
+    force_ipv4_with(std::env::var("AIVO_HTTP_IPV4_ONLY").ok().as_deref())
 }
 
-fn force_ipv4_with(env: Option<&str>, is_termux: bool) -> bool {
-    match env.map(str::trim) {
-        Some("1" | "true" | "yes" | "on") => true,
-        Some(_) => false,
-        None => is_termux,
-    }
+fn force_ipv4_with(env: Option<&str>) -> bool {
+    matches!(env.map(str::trim), Some("1" | "true" | "yes" | "on"))
 }
 
 /// Creates a `reqwest::Client` with a configurable overall timeout.
@@ -1362,17 +1356,18 @@ mod tests {
     }
 
     #[test]
-    fn force_ipv4_defaults_to_termux_when_env_unset() {
-        assert!(super::force_ipv4_with(None, true));
-        assert!(!super::force_ipv4_with(None, false));
+    fn force_ipv4_defaults_off_when_env_unset() {
+        assert!(!super::force_ipv4_with(None));
     }
 
     #[test]
-    fn force_ipv4_env_overrides_termux_default() {
-        assert!(super::force_ipv4_with(Some("1"), false));
-        assert!(super::force_ipv4_with(Some("true"), false));
-        assert!(!super::force_ipv4_with(Some("0"), true));
-        assert!(!super::force_ipv4_with(Some("no"), true));
-        assert!(!super::force_ipv4_with(Some(""), true));
+    fn force_ipv4_env_opts_in_or_out() {
+        assert!(super::force_ipv4_with(Some("1")));
+        assert!(super::force_ipv4_with(Some("true")));
+        assert!(super::force_ipv4_with(Some("yes")));
+        assert!(super::force_ipv4_with(Some("on")));
+        assert!(!super::force_ipv4_with(Some("0")));
+        assert!(!super::force_ipv4_with(Some("no")));
+        assert!(!super::force_ipv4_with(Some("")));
     }
 }

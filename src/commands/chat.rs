@@ -192,7 +192,7 @@ impl ChatCommand {
         {
             Ok(code) => code,
             Err(e) => {
-                eprintln!("{} {}", style::red("Error:"), e);
+                eprintln!("{} {:#}", style::red("Error:"), e);
                 ExitCode::UserError
             }
         }
