@@ -1,5 +1,24 @@
 # Changelog
 
+## v0.21.3
+
+## Features
+
+- `aivo serve`: resolve model aliases in incoming requests; aliases also listed in `/v1/models`.
+
+## Fixes
+
+- Termux: unbreak `aivo run` / `aivo chat`.
+- HTTP: extend Termux IPv4-bind to all outbound clients.
+- Router: unbreak strict OpenAI-compat providers (e.g. Cloudflare Workers AI).
+
+## Improvements
+
+- `aivo logs` / `aivo share list`: refactor shared listing logic.
+- CLI: rename hidden `speak` (TTS) subcommand to `audio`.
+
+---
+
 ## v0.21.2
 
 ## Features

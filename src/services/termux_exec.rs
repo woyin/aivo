@@ -108,7 +108,7 @@ fn read_shebang(path: &Path) -> Option<(String, Option<String>)> {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use std::fs;
@@ -153,7 +153,7 @@ mod tests {
     }
 
     #[test]
-    fn keeps_env_S_args_as_single_kernel_arg() {
+    fn keeps_env_s_args_as_single_kernel_arg() {
         let tmp = TempDir::new().unwrap();
         let prefix_bin = tmp.path().join("usr/bin");
         mk_fake_bin(&prefix_bin, "env");
