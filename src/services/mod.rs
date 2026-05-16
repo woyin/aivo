@@ -35,6 +35,7 @@ pub mod context_window;
 pub mod copilot_auth;
 pub mod copilot_router;
 pub mod device_fingerprint;
+pub mod dns_resolver;
 pub mod effort;
 pub mod environment_injector;
 pub mod gemini_home_shadow;

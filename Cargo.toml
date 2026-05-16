@@ -1,6 +1,6 @@
 [package]
 name = "aivo"
-version = "0.21.4"
+version = "0.21.5"
 edition = "2024"
 authors = ["yuanchuan"]
 description = "A lightweight CLI for managing API keys and running Claude Code, Codex, and Gemini CLI across providers"
@@ -55,6 +55,7 @@ url = "2"
 # MP3 / FLAC / Vorbis. AAC / Opus / PCM fall through to the system-player
 # path in playback.rs.
 rodio = { version = "0.20", optional = true }
+hickory-resolver = "0.26.1"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

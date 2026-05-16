@@ -682,10 +682,19 @@ pub fn sse_data_payload(line: &str) -> Option<&str> {
 /// under Termux, but that broke v6-preferred networks where v4 is the slow
 /// path. Reqwest's `system-proxy` feature is enabled at the crate level, so
 /// ambient HTTP(S)_PROXY/NO_PROXY settings are honored like curl.
+///
+/// Under Termux, also swaps reqwest's default `getaddrinfo`-backed resolver
+/// for hickory pointed at `$PREFIX/etc/resolv.conf` (or Cloudflare/Google
+/// as fallback). aivo's release binary is static-musl and musl reads
+/// `/etc/resolv.conf` literally — which Termux doesn't populate — so
+/// without this override every lookup returns `EAI_AGAIN`.
 pub fn aivo_http_client_builder() -> reqwest::ClientBuilder {
     let mut builder = reqwest::Client::builder();
     if force_ipv4_enabled() {
         builder = builder.local_address(Some(std::net::Ipv4Addr::UNSPECIFIED.into()));
+    }
+    if crate::services::termux_exec::is_termux() {
+        builder = builder.dns_resolver(crate::services::dns_resolver::termux_dns_resolver());
     }
     builder
 }

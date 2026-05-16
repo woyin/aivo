@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.21.5
+
+## Fixes
+
+- Termux: plug a hickory-backed DNS resolver into all outbound HTTP clients. aivo's release binary is static-musl and reads `/etc/resolv.conf` literally — which Termux doesn't populate — so every lookup was failing with `EAI_AGAIN`. The resolver reads `$PREFIX/etc/resolv.conf` if present and falls back to Cloudflare + Google.
+
+---
+
 ## v0.21.4
 
 ## Features
