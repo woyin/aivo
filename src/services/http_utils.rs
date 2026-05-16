@@ -680,7 +680,8 @@ pub fn sse_data_payload(line: &str) -> Option<&str> {
 /// sockets to v4. Used as an escape hatch on cellular networks where DNS64
 /// surfaces only AAAA and v6 connect stalls. Was previously on-by-default
 /// under Termux, but that broke v6-preferred networks where v4 is the slow
-/// path. Callers layer their own timeouts, headers, and proxy on top.
+/// path. Reqwest's `system-proxy` feature is enabled at the crate level, so
+/// ambient HTTP(S)_PROXY/NO_PROXY settings are honored like curl.
 pub fn aivo_http_client_builder() -> reqwest::ClientBuilder {
     let mut builder = reqwest::Client::builder();
     if force_ipv4_enabled() {
