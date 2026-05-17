@@ -174,6 +174,14 @@ impl AmpModeModels {
     }
 }
 
+/// Internal aivo carrier: comma-separated names of env vars that
+/// `prepare_runtime_env` should `env_remove` from the child instead of
+/// setting. Stripped from the env before spawn. Used so the OAuth path can
+/// actually *unset* an inherited `ANTHROPIC_API_KEY` rather than masking it
+/// with an empty string (which Claude Code's auth resolver still treats as
+/// "set" → API-key mode).
+pub(crate) const AIVO_INTERNAL_ENV_UNSET: &str = "_AIVO_INTERNAL_ENV_UNSET";
+
 /// Slots Claude Code reads to pick the model for each routing class. aivo
 /// fans the user's `--model` value out to all of them so the chosen model
 /// wins everywhere. `ANTHROPIC_SMALL_FAST_MODEL` is intentionally absent —
@@ -441,7 +449,6 @@ impl EnvironmentInjector {
         overrides: &ClaudeModelOverrides,
     ) -> HashMap<String, String> {
         if key.is_claude_oauth() {
-            let _ = model;
             let mut env = HashMap::new();
             match crate::services::claude_oauth::ClaudeOAuthCredential::from_json(key.key.as_str())
             {
@@ -459,9 +466,44 @@ impl EnvironmentInjector {
             // Claude Code's auth resolver prefers ANTHROPIC_API_KEY /
             // ANTHROPIC_AUTH_TOKEN / ANTHROPIC_BASE_URL over the OAuth
             // token, so a shell-exported value would shadow or misroute it.
-            env.insert("ANTHROPIC_API_KEY".to_string(), String::new());
-            env.insert("ANTHROPIC_AUTH_TOKEN".to_string(), String::new());
-            env.insert("ANTHROPIC_BASE_URL".to_string(), String::new());
+            // Setting them to empty string is *not* enough — Claude Code's
+            // source-detection treats a set-but-empty var as "present" and
+            // labels the session as API-key auth. The launcher must actually
+            // unset (env_remove) them so the child inherits no value at all.
+            env.insert(
+                AIVO_INTERNAL_ENV_UNSET.to_string(),
+                "ANTHROPIC_API_KEY,ANTHROPIC_AUTH_TOKEN,ANTHROPIC_BASE_URL".to_string(),
+            );
+
+            // `-m`, `--1m`/`--2m`, and per-slot overrides apply to OAuth the
+            // same as to API keys: Claude Code reads ANTHROPIC_MODEL and the
+            // `[1m]` suffix regardless of auth path. The upstream is Anthropic-
+            // native (subscription backend), so normalize model ids the same
+            // way as Direct mode (`claude-sonnet-4.6` → `claude-sonnet-4-6`).
+            if let Some(model) = model {
+                let normalized = anthropic_native_model_name(model);
+                let anthropic_model = match overrides.max_context.as_deref() {
+                    Some(tag) => format!("{normalized}[{tag}]"),
+                    None => normalized,
+                };
+                for slot in CLAUDE_DEFAULT_MODEL_SLOTS {
+                    env.insert(slot.to_string(), anthropic_model.clone());
+                }
+            }
+            for (env_var, value) in [
+                ("ANTHROPIC_REASONING_MODEL", overrides.reasoning.as_deref()),
+                ("CLAUDE_CODE_SUBAGENT_MODEL", overrides.subagent.as_deref()),
+                ("ANTHROPIC_DEFAULT_HAIKU_MODEL", overrides.haiku.as_deref()),
+                (
+                    "ANTHROPIC_DEFAULT_SONNET_MODEL",
+                    overrides.sonnet.as_deref(),
+                ),
+                ("ANTHROPIC_DEFAULT_OPUS_MODEL", overrides.opus.as_deref()),
+            ] {
+                if let Some(v) = value {
+                    env.insert(env_var.to_string(), anthropic_native_model_name(v));
+                }
+            }
             return env;
         }
 
@@ -1412,7 +1454,7 @@ mod tests {
     }
 
     #[test]
-    fn for_claude_injects_oauth_token_and_clears_api_key_vars() {
+    fn for_claude_injects_oauth_token_and_unsets_api_key_vars() {
         use crate::services::claude_oauth::{CLAUDE_OAUTH_SENTINEL, ClaudeOAuthCredential};
         let creds = ClaudeOAuthCredential {
             token: "sk-ant-oat01-TEST".into(),
@@ -1432,21 +1474,29 @@ mod tests {
             env.get("CLAUDE_CODE_OAUTH_TOKEN"),
             Some(&"sk-ant-oat01-TEST".to_string())
         );
-        // Must not let ANTHROPIC_API_KEY / ANTHROPIC_AUTH_TOKEN shadow the OAuth
-        // token — Claude Code's auth precedence prefers those env vars.
-        assert_eq!(env.get("ANTHROPIC_API_KEY"), Some(&String::new()));
-        assert_eq!(env.get("ANTHROPIC_AUTH_TOKEN"), Some(&String::new()));
+        // Conflicting auth vars must be requested for *removal* (not set to
+        // empty string) so Claude Code's auth-source detector treats them as
+        // truly absent — empty-string is still "set" to that detector, which
+        // would flip the session to API-key mode and disable subscription
+        // features.
+        let unset = env
+            .get(AIVO_INTERNAL_ENV_UNSET)
+            .expect("OAuth path must request env_remove for conflicting auth vars");
+        let names: Vec<&str> = unset.split(',').collect();
+        assert!(names.contains(&"ANTHROPIC_API_KEY"));
+        assert!(names.contains(&"ANTHROPIC_AUTH_TOKEN"));
+        assert!(names.contains(&"ANTHROPIC_BASE_URL"));
+        // And explicitly NOT set to empty string.
+        assert!(!env.contains_key("ANTHROPIC_API_KEY"));
+        assert!(!env.contains_key("ANTHROPIC_AUTH_TOKEN"));
+        assert!(!env.contains_key("ANTHROPIC_BASE_URL"));
         assert!(!env.contains_key("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"));
-        // ANTHROPIC_BASE_URL is cleared so a caller-exported value can't
-        // misroute OAuth traffic (Claude Code falls back to its default
-        // subscription backend when the env var is empty).
-        assert_eq!(env.get("ANTHROPIC_BASE_URL"), Some(&String::new()));
         // No routed-mode indicators.
         assert!(!env.contains_key("AIVO_USE_ANTHROPIC_TO_OPENAI_ROUTER"));
     }
 
     #[test]
-    fn for_claude_oauth_ignores_model_override() {
+    fn for_claude_oauth_fans_model_into_default_slots() {
         use crate::services::claude_oauth::{CLAUDE_OAUTH_SENTINEL, ClaudeOAuthCredential};
         let creds = ClaudeOAuthCredential {
             token: "sk-ant-oat01-TEST".into(),
@@ -1459,18 +1509,96 @@ mod tests {
             None,
             creds.to_json().unwrap(),
         );
-        let env = EnvironmentInjector::new().for_claude(&key, Some("claude-opus-4-7"));
-        assert!(!env.contains_key("ANTHROPIC_MODEL"));
-        assert!(!env.contains_key("ANTHROPIC_SMALL_FAST_MODEL"));
-        assert!(!env.contains_key("ANTHROPIC_DEFAULT_OPUS_MODEL"));
-        assert!(!env.contains_key("ANTHROPIC_DEFAULT_SONNET_MODEL"));
-        assert!(!env.contains_key("ANTHROPIC_DEFAULT_HAIKU_MODEL"));
-        assert!(!env.contains_key("ANTHROPIC_REASONING_MODEL"));
-        assert!(!env.contains_key("CLAUDE_CODE_SUBAGENT_MODEL"));
+        // Dotted form normalizes to the hyphenated native id; same as Direct mode.
+        let env = EnvironmentInjector::new().for_claude(&key, Some("claude-opus-4.7"));
+        for slot in CLAUDE_DEFAULT_MODEL_SLOTS {
+            assert_eq!(
+                env.get(slot),
+                Some(&"claude-opus-4-7".to_string()),
+                "slot {slot} must carry the user's model id for OAuth keys",
+            );
+        }
     }
 
     #[test]
-    fn for_claude_oauth_with_corrupt_json_still_clears_api_key_vars() {
+    fn for_claude_oauth_appends_max_context_suffix() {
+        use crate::services::claude_oauth::{CLAUDE_OAUTH_SENTINEL, ClaudeOAuthCredential};
+        let creds = ClaudeOAuthCredential {
+            token: "sk-ant-oat01-TEST".into(),
+            created_at: chrono::Utc::now(),
+        };
+        let key = ApiKey::new_with_protocol(
+            "id".into(),
+            "work".into(),
+            CLAUDE_OAUTH_SENTINEL.into(),
+            None,
+            creds.to_json().unwrap(),
+        );
+        let overrides = ClaudeModelOverrides {
+            max_context: Some("1m".to_string()),
+            ..Default::default()
+        };
+        let env = EnvironmentInjector::new().for_claude_with_overrides(
+            &key,
+            Some("claude-opus-4-7"),
+            &overrides,
+        );
+        for slot in CLAUDE_DEFAULT_MODEL_SLOTS {
+            assert_eq!(
+                env.get(slot),
+                Some(&"claude-opus-4-7[1m]".to_string()),
+                "slot {slot} must carry the [1m] suffix for OAuth keys",
+            );
+        }
+    }
+
+    #[test]
+    fn for_claude_oauth_honors_per_slot_overrides() {
+        use crate::services::claude_oauth::{CLAUDE_OAUTH_SENTINEL, ClaudeOAuthCredential};
+        let creds = ClaudeOAuthCredential {
+            token: "sk-ant-oat01-TEST".into(),
+            created_at: chrono::Utc::now(),
+        };
+        let key = ApiKey::new_with_protocol(
+            "id".into(),
+            "work".into(),
+            CLAUDE_OAUTH_SENTINEL.into(),
+            None,
+            creds.to_json().unwrap(),
+        );
+        let overrides = ClaudeModelOverrides {
+            opus: Some("claude-opus-4.7".into()),
+            sonnet: Some("claude-sonnet-4.6".into()),
+            haiku: Some("claude-haiku-4-5".into()),
+            reasoning: Some("claude-opus-4.7".into()),
+            subagent: Some("claude-haiku-4-5".into()),
+            ..Default::default()
+        };
+        let env = EnvironmentInjector::new().for_claude_with_overrides(&key, None, &overrides);
+        assert_eq!(
+            env.get("ANTHROPIC_DEFAULT_OPUS_MODEL"),
+            Some(&"claude-opus-4-7".to_string()),
+        );
+        assert_eq!(
+            env.get("ANTHROPIC_DEFAULT_SONNET_MODEL"),
+            Some(&"claude-sonnet-4-6".to_string()),
+        );
+        assert_eq!(
+            env.get("ANTHROPIC_DEFAULT_HAIKU_MODEL"),
+            Some(&"claude-haiku-4-5".to_string()),
+        );
+        assert_eq!(
+            env.get("ANTHROPIC_REASONING_MODEL"),
+            Some(&"claude-opus-4-7".to_string()),
+        );
+        assert_eq!(
+            env.get("CLAUDE_CODE_SUBAGENT_MODEL"),
+            Some(&"claude-haiku-4-5".to_string()),
+        );
+    }
+
+    #[test]
+    fn for_claude_oauth_with_corrupt_json_still_unsets_api_key_vars() {
         use crate::services::claude_oauth::CLAUDE_OAUTH_SENTINEL;
         let key = ApiKey::new_with_protocol(
             "id".into(),
@@ -1482,9 +1610,12 @@ mod tests {
         let env = EnvironmentInjector::new().for_claude(&key, None);
         // Degraded but safe: no OAuth token → Claude Code fails auth at launch
         // loudly, rather than silently falling through to the user's Keychain
-        // account. The cleared API-key vars block that fall-through.
-        assert_eq!(env.get("ANTHROPIC_API_KEY"), Some(&String::new()));
-        assert_eq!(env.get("ANTHROPIC_AUTH_TOKEN"), Some(&String::new()));
+        // account. The unset request blocks that fall-through.
+        let unset = env
+            .get(AIVO_INTERNAL_ENV_UNSET)
+            .expect("OAuth path must request env_remove even on corrupt creds");
+        assert!(unset.contains("ANTHROPIC_API_KEY"));
+        assert!(unset.contains("ANTHROPIC_AUTH_TOKEN"));
         assert!(!env.contains_key("CLAUDE_CODE_OAUTH_TOKEN"));
     }
 

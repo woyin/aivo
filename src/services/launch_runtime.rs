@@ -38,6 +38,11 @@ pub(crate) struct GeminiOAuthSync {
 
 pub(crate) struct LaunchRuntimeState {
     pub(crate) env: HashMap<String, String>,
+    /// Env vars to `env_remove` from the child (vs setting via `env`).
+    /// Populated by `prepare_runtime_env` from the
+    /// `_AIVO_INTERNAL_ENV_UNSET` carrier emitted by the injector for the
+    /// Claude OAuth path — see `environment_injector::AIVO_INTERNAL_ENV_UNSET`.
+    pub(crate) env_unset: Vec<String>,
     pub(crate) router_protocol: Option<Arc<AtomicU8>>,
     pub(crate) responses_api_support: Option<Arc<AtomicU8>>,
     /// Set to `true` by a router after any non-error upstream response. Read
@@ -203,8 +208,20 @@ pub(crate) async fn prepare_runtime_env(
             None
         };
 
+    let env_unset = env
+        .remove(crate::services::environment_injector::AIVO_INTERNAL_ENV_UNSET)
+        .map(|v| {
+            v.split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+
     Ok(LaunchRuntimeState {
         env,
+        env_unset,
         router_protocol,
         responses_api_support,
         request_succeeded,

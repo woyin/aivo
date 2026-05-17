@@ -449,6 +449,7 @@ impl AILauncher {
             &resolved.tool_config.command,
             &runtime_args.args,
             runtime.env,
+            &runtime.env_unset,
         );
         let mut child = match child_result {
             Ok(child) => child,
@@ -819,6 +820,7 @@ impl AILauncher {
         command: &str,
         args: &[String],
         env: HashMap<String, String>,
+        env_unset: &[String],
     ) -> Result<tokio::process::Child> {
         // On Termux, musl-static aivo bypasses the `termux-exec` LD_PRELOAD
         // shebang shim — so npm-installed CLIs (`#!/usr/bin/env node` …)
@@ -836,6 +838,12 @@ impl AILauncher {
             .stdin(Stdio::inherit())
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit());
+        // Drop inherited env vars the injector explicitly marked for removal.
+        // Done after `.envs()` so a name appearing in both wins as removed —
+        // matters when a caller's env carries a placeholder of the same name.
+        for name in env_unset {
+            cmd.env_remove(name);
+        }
         // If a tool was just installed and pulled a new dir into PATH via
         // shell profile, propagate that PATH to the child. Done here rather
         // than via global set_var so we never race with concurrent tasks.
