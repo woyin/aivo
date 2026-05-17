@@ -1,8 +1,9 @@
 /**
  * KeysCommand handler for managing API keys.
  */
-use anyhow::Result;
+use anyhow::{Context, Result};
 use serde_json::{Value, json};
+use zeroize::Zeroizing;
 
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
@@ -116,6 +117,130 @@ fn confirm(prompt: &str) -> std::io::Result<bool> {
     Ok(matches!(input.to_ascii_lowercase().as_str(), "y" | "yes"))
 }
 
+fn read_password_once(from_stdin: bool, label: &str) -> Result<Zeroizing<String>> {
+    if from_stdin {
+        use std::io::BufRead;
+        use zeroize::Zeroize;
+
+        let mut line = String::new();
+        std::io::stdin().lock().read_line(&mut line)?;
+        let trimmed_len = line.trim_end_matches(['\n', '\r']).len();
+        line.truncate(trimmed_len);
+        if line.is_empty() {
+            line.zeroize();
+            return Err(anyhow::anyhow!("Password from stdin was empty"));
+        }
+        Ok(Zeroizing::new(line))
+    } else {
+        let pw = term_read_secret(&format!("{}: ", label))?;
+        if pw.is_empty() {
+            return Err(anyhow::anyhow!("Password must not be empty"));
+        }
+        Ok(Zeroizing::new(pw))
+    }
+}
+
+fn read_password_twice(from_stdin: bool, label: &str) -> Result<Zeroizing<String>> {
+    let pw = read_password_once(from_stdin, label)?;
+    if from_stdin {
+        return Ok(pw);
+    }
+    let confirm = Zeroizing::new(term_read_secret("Confirm password: ")?);
+    if pw.as_str() != confirm.as_str() {
+        return Err(anyhow::anyhow!("Passwords did not match"));
+    }
+    Ok(pw)
+}
+
+fn write_export_file(path: &std::path::Path, data: &[u8], force: bool) -> Result<()> {
+    // `symlink_metadata` doesn't follow symlinks; `exists()` would silently
+    // accept a dangling symlink and write through it.
+    if !force && let Ok(meta) = std::fs::symlink_metadata(path) {
+        if meta.file_type().is_symlink() {
+            return Err(anyhow::anyhow!(
+                "Refusing to write through symlink at {}. Pass --force to override.",
+                path.display()
+            ));
+        }
+        return Err(anyhow::anyhow!(
+            "Refusing to overwrite existing file at {}. Pass --force to override.",
+            path.display()
+        ));
+    }
+
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create directory {:?}", parent))?;
+    }
+
+    crate::services::atomic_write::atomic_write_secure_blocking(path, data)
+}
+
+// Caps a hostile file from OOMing the importer before the password check runs.
+const MAX_EXPORT_FILE_BYTES: u64 = 16 * 1024 * 1024;
+
+fn read_export_file_capped(path: &std::path::Path) -> Result<String> {
+    use std::io::Read;
+    let mut file = std::fs::File::open(path)
+        .with_context(|| format!("failed to read export file: {}", path.display()))?;
+    let mut buf = String::new();
+    file.by_ref()
+        .take(MAX_EXPORT_FILE_BYTES + 1)
+        .read_to_string(&mut buf)?;
+    if buf.len() as u64 > MAX_EXPORT_FILE_BYTES {
+        return Err(anyhow::anyhow!(
+            "Export file is larger than {} MiB; refusing to load.",
+            MAX_EXPORT_FILE_BYTES / (1024 * 1024)
+        ));
+    }
+    Ok(buf)
+}
+
+fn is_http_url(s: &str) -> bool {
+    url::Url::parse(s)
+        .map(|u| matches!(u.scheme(), "http" | "https"))
+        .unwrap_or(false)
+}
+
+// Chunks the response so a lying Content-Length can't bypass the size cap.
+async fn fetch_export_from_url(url: &str) -> Result<String> {
+    let client = crate::services::http_utils::aivo_http_client_builder()
+        .timeout(std::time::Duration::from_secs(60))
+        .build()
+        .context("failed to build HTTP client")?;
+    let mut resp = client
+        .get(url)
+        .send()
+        .await
+        .with_context(|| format!("failed to fetch export from {url}"))?;
+    let status = resp.status();
+    if !status.is_success() {
+        return Err(anyhow::anyhow!("server returned {} for {}", status, url));
+    }
+    if let Some(len) = resp.content_length()
+        && len > MAX_EXPORT_FILE_BYTES
+    {
+        return Err(anyhow::anyhow!(
+            "Remote export advertises {} bytes; exceeds {} MiB cap.",
+            len,
+            MAX_EXPORT_FILE_BYTES / (1024 * 1024)
+        ));
+    }
+    let mut total: Vec<u8> = Vec::new();
+    while let Some(chunk) = resp.chunk().await? {
+        if total.len() as u64 + chunk.len() as u64 > MAX_EXPORT_FILE_BYTES {
+            return Err(anyhow::anyhow!(
+                "Remote export is larger than {} MiB; refusing to load.",
+                MAX_EXPORT_FILE_BYTES / (1024 * 1024)
+            ));
+        }
+        total.extend_from_slice(&chunk);
+    }
+    String::from_utf8(total).context("export file body is not valid UTF-8")
+}
+
 // Creates a safe preview of an API key, handling short keys without panicking.
 fn key_preview(key: &str) -> String {
     let chars: Vec<char> = key.chars().collect();
@@ -144,6 +269,10 @@ struct AddKeyOptions<'a> {
     name: Option<&'a str>,
     base_url: Option<&'a str>,
     key: Option<&'a str>,
+}
+
+fn plural(n: usize) -> &'static str {
+    if n == 1 { "" } else { "s" }
 }
 
 /// Outcome of prompting the user about a conflicting existing key.
@@ -670,21 +799,7 @@ impl KeysCommand {
 
     /// Executes the keys command with the specified action
     pub async fn execute(&self, keys_args: KeysArgs) -> ExitCode {
-        let action = keys_args.action.as_deref();
-        let args: Vec<_> = keys_args.args.iter().map(|s| s.as_str()).collect();
-        let add_options = AddKeyOptions {
-            name: keys_args.name.as_deref(),
-            base_url: keys_args.base_url.as_deref(),
-            key: keys_args.key.as_deref(),
-        };
-        let ping_all = keys_args.all;
-        let list_ping = keys_args.ping;
-        let json = keys_args.json;
-
-        match self
-            .execute_internal(action, Some(&args), add_options, ping_all, list_ping, json)
-            .await
-        {
+        match self.execute_internal(&keys_args).await {
             Ok(code) => code,
             Err(e) => {
                 eprintln!("{} {}", style::red("Error:"), e);
@@ -693,34 +808,28 @@ impl KeysCommand {
         }
     }
 
-    async fn execute_internal(
-        &self,
-        action: Option<&str>,
-        args: Option<&[&str]>,
-        add_options: AddKeyOptions<'_>,
-        ping_all: bool,
-        list_ping: bool,
-        json: bool,
-    ) -> Result<ExitCode> {
+    async fn execute_internal(&self, keys_args: &KeysArgs) -> Result<ExitCode> {
+        let action = keys_args.action.as_deref();
+        let args: Vec<_> = keys_args.args.iter().map(|s| s.as_str()).collect();
+        let first = args.first().copied();
+        let add_options = AddKeyOptions {
+            name: keys_args.name.as_deref(),
+            base_url: keys_args.base_url.as_deref(),
+            key: keys_args.key.as_deref(),
+        };
+
         match action {
-            None if list_ping => self.list_keys_with_ping(json).await,
-            None => self.list_keys(json).await,
-            Some("add") => {
-                self.add_key(args.and_then(|a| a.first().copied()), add_options)
-                    .await
-            }
-            Some("rm") => self.remove_key(args.and_then(|a| a.first().copied())).await,
-            Some("use") => self.use_key(args.and_then(|a| a.first().copied())).await,
-            Some("cat") => self.cat_key(args.and_then(|a| a.first().copied())).await,
-            Some("edit") => self.edit_key(args.and_then(|a| a.first().copied())).await,
-            Some("ping") => {
-                self.ping_keys(args.and_then(|a| a.first().copied()), ping_all)
-                    .await
-            }
-            Some("reset-route") => {
-                self.reset_route(args.and_then(|a| a.first().copied()))
-                    .await
-            }
+            None if keys_args.ping => self.list_keys_with_ping(keys_args.json).await,
+            None => self.list_keys(keys_args.json).await,
+            Some("add") => self.add_key(first, add_options).await,
+            Some("rm") => self.remove_key(first).await,
+            Some("use") => self.use_key(first).await,
+            Some("cat") => self.cat_key(first).await,
+            Some("edit") => self.edit_key(first).await,
+            Some("ping") => self.ping_keys(first, keys_args.all).await,
+            Some("reset-route") => self.reset_route(first).await,
+            Some("export") => self.export_keys_action(first, keys_args).await,
+            Some("import") => self.import_keys_action(first, keys_args).await,
             Some(action) => {
                 eprintln!("{} Unknown action '{}'", style::red("Error:"), action);
                 Self::print_help(None);
@@ -974,6 +1083,163 @@ impl KeysCommand {
             "{}",
             style::dim("The next launch will re-probe protocol/path automatically.")
         );
+        Ok(ExitCode::Success)
+    }
+
+    async fn export_keys_action(
+        &self,
+        file_arg: Option<&str>,
+        keys_args: &KeysArgs,
+    ) -> Result<ExitCode> {
+        let file = match file_arg {
+            Some(p) if !p.is_empty() => crate::services::system_env::expand_tilde(p),
+            _ => {
+                eprintln!(
+                    "{} `aivo keys export` requires a file path.",
+                    style::red("Error:")
+                );
+                Self::print_help(Some("export"));
+                return Ok(ExitCode::UserError);
+            }
+        };
+
+        let id_filter: Option<&[String]> = if keys_args.ids.is_empty() {
+            None
+        } else {
+            Some(&keys_args.ids)
+        };
+
+        let records = self
+            .session_store
+            .export_keys(id_filter, keys_args.include_starter)
+            .await?;
+        if records.is_empty() {
+            eprintln!(
+                "{} No keys to export. {}",
+                style::red("Error:"),
+                style::dim(
+                    "(The aivo-starter key is filtered by default; pass --include-starter to include it.)"
+                )
+            );
+            return Ok(ExitCode::UserError);
+        }
+
+        let n = records.len();
+        println!("{} {} key{}:", style::dim("Exporting"), n, plural(n));
+        for k in &records {
+            println!(
+                "  {} {}",
+                style::cyan(k.short_id()),
+                style::dim(k.display_name())
+            );
+        }
+
+        let password = read_password_twice(keys_args.password_stdin, "Encryption password")?;
+
+        let payload =
+            serde_json::to_vec(&records).context("failed to serialise keys for export")?;
+        let envelope = crate::services::export_crypto::encrypt_export(&payload, &password)?;
+        let json = serde_json::to_string_pretty(&envelope)
+            .context("failed to serialise export envelope")?;
+
+        write_export_file(&file, json.as_bytes(), keys_args.force)?;
+
+        println!(
+            "{} Exported {} key{} to {}",
+            style::success_symbol(),
+            n,
+            plural(n),
+            style::cyan(file.display().to_string())
+        );
+        println!(
+            "{}",
+            style::dim(
+                "Keep this file private — anyone with the file and the password can read every key."
+            )
+        );
+        Ok(ExitCode::Success)
+    }
+
+    async fn import_keys_action(
+        &self,
+        file_arg: Option<&str>,
+        keys_args: &KeysArgs,
+    ) -> Result<ExitCode> {
+        use crate::services::api_key_store::ImportPolicy;
+
+        let arg = match file_arg {
+            Some(p) if !p.is_empty() => p,
+            _ => {
+                eprintln!(
+                    "{} `aivo keys import` requires a file path or URL.",
+                    style::red("Error:")
+                );
+                Self::print_help(Some("import"));
+                return Ok(ExitCode::UserError);
+            }
+        };
+
+        let raw = if is_http_url(arg) {
+            println!("{} {}", style::dim("Fetching"), style::cyan(arg));
+            fetch_export_from_url(arg).await?
+        } else {
+            let path = crate::services::system_env::expand_tilde(arg);
+            read_export_file_capped(&path)?
+        };
+        let envelope: crate::services::export_crypto::ExportEnvelope =
+            serde_json::from_str(&raw)
+                .context("export file is not a valid aivo keys export (failed to parse JSON)")?;
+        envelope.validate_header()?;
+
+        let password = read_password_once(keys_args.password_stdin, "Decryption password")?;
+        let plaintext = Zeroizing::new(crate::services::export_crypto::decrypt_export(
+            &envelope, &password,
+        )?);
+
+        let records: Vec<ApiKey> = serde_json::from_slice(&plaintext)
+            .context("export file decrypted but payload is not a valid key list")?;
+        if records.is_empty() {
+            println!("{}", style::dim("Export contained no keys."));
+            return Ok(ExitCode::Success);
+        }
+
+        let policy = if keys_args.overwrite {
+            ImportPolicy::Overwrite
+        } else if keys_args.rename {
+            ImportPolicy::Rename
+        } else {
+            ImportPolicy::Skip
+        };
+
+        let report = self.session_store.import_keys(records, policy).await?;
+        let check = style::success_symbol();
+        let dot = style::dim("·");
+        let (i, o, r, s) = (
+            report.imported.len(),
+            report.overwritten.len(),
+            report.renamed.len(),
+            report.skipped.len(),
+        );
+        if i > 0 {
+            println!("{check} Imported {i} new key{}.", plural(i));
+        }
+        if o > 0 {
+            println!("{check} Overwrote {o} existing key{}.", plural(o));
+        }
+        if r > 0 {
+            println!(
+                "{check} Renamed {r} conflicting key{} (kept existing).",
+                plural(r)
+            );
+        }
+        if s > 0 {
+            println!(
+                "{dot} Skipped {s} conflicting key{}. Re-run with {} or {} to merge.",
+                plural(s),
+                style::cyan("--overwrite"),
+                style::cyan("--rename")
+            );
+        }
         Ok(ExitCode::Success)
     }
 
@@ -2345,6 +2611,8 @@ impl KeysCommand {
             Some("edit") => print_help_edit(),
             Some("ping") => print_help_ping(),
             Some("reset-route") => print_help_reset_route(),
+            Some("export") => print_help_export(),
+            Some("import") => print_help_import(),
             _ => print_help_overview(),
         }
     }
@@ -2378,6 +2646,8 @@ fn print_help_overview() {
         "reset-route [id|name]",
         "Reset cached provider routing for a key",
     );
+    keys_help_row("export <file>", "Write keys to a password-encrypted file");
+    keys_help_row("import <file>", "Merge keys from a password-encrypted file");
     println!();
     println!("{}", style::bold("Add Flags:"));
     keys_help_row("--name <name>", "Set key name");
@@ -2518,6 +2788,66 @@ fn print_help_reset_route() {
     println!("  {}", style::dim("aivo keys reset-route openrouter"));
 }
 
+fn print_help_export() {
+    println!("{} aivo keys export <FILE>", style::bold("Usage:"));
+    println!();
+    println!(
+        "{}",
+        style::dim(
+            "Write all keys (or `--ids`) to a password-encrypted file portable to other machines."
+        )
+    );
+    println!();
+    println!("{}", style::bold("Flags:"));
+    keys_help_row("--ids <a,b,c>", "Export only the given key ids");
+    keys_help_row("--password-stdin", "Read password from stdin (no prompt)");
+    keys_help_row(
+        "--include-starter",
+        "Include the device-bound aivo-starter key (off by default)",
+    );
+    keys_help_row("--force", "Overwrite an existing file at the target path");
+    println!();
+    println!("{}", style::bold("Examples:"));
+    println!(
+        "  {}",
+        style::dim("aivo keys export ~/aivo-backup.aivo-keys")
+    );
+    println!(
+        "  {}",
+        style::dim("aivo keys export keys.aivo-keys --ids abc,def")
+    );
+}
+
+fn print_help_import() {
+    println!("{} aivo keys import <FILE|URL>", style::bold("Usage:"));
+    println!();
+    println!(
+        "{}",
+        style::dim(
+            "Decrypt a keys export and merge into local config. Accepts a local file path or an http(s) URL. Conflicts skip by default."
+        )
+    );
+    println!();
+    println!("{}", style::bold("Flags:"));
+    keys_help_row("--password-stdin", "Read password from stdin (no prompt)");
+    keys_help_row("--overwrite", "Replace existing keys on conflict");
+    keys_help_row("--rename", "Keep existing; import conflicts under new ids");
+    println!();
+    println!("{}", style::bold("Examples:"));
+    println!(
+        "  {}",
+        style::dim("aivo keys import ~/aivo-backup.aivo-keys")
+    );
+    println!(
+        "  {}",
+        style::dim("aivo keys import https://gist.example.com/raw/abc.aivo-keys")
+    );
+    println!(
+        "  {}",
+        style::dim("aivo keys import keys.aivo-keys --overwrite")
+    );
+}
+
 // Formats an API key as a choice string for interactive selectors.
 pub(crate) fn format_key_choice(key: &ApiKey) -> String {
     format!(
@@ -2642,6 +2972,23 @@ mod tests {
     use super::*;
     use crate::cli::KeysArgs;
 
+    #[test]
+    fn is_http_url_accepts_http_and_https() {
+        assert!(is_http_url("http://example.com/x"));
+        assert!(is_http_url("https://example.com/x"));
+        assert!(is_http_url("HTTPS://example.com/x"));
+    }
+
+    #[test]
+    fn is_http_url_rejects_other_schemes_and_paths() {
+        assert!(!is_http_url("file:///tmp/x"));
+        assert!(!is_http_url("ftp://example.com/x"));
+        assert!(!is_http_url("./relative.aivo-keys"));
+        assert!(!is_http_url("/abs/path"));
+        assert!(!is_http_url("~/path"));
+        assert!(!is_http_url(""));
+    }
+
     fn keys_args(action: Option<&str>, args: &[&str]) -> KeysArgs {
         KeysArgs {
             action: action.map(str::to_string),
@@ -2652,6 +2999,12 @@ mod tests {
             all: false,
             ping: false,
             json: false,
+            ids: Vec::new(),
+            password_stdin: false,
+            overwrite: false,
+            rename: false,
+            include_starter: false,
+            force: false,
         }
     }
 
@@ -2799,6 +3152,12 @@ mod tests {
                 all: false,
                 ping: false,
                 json: false,
+                ids: Vec::new(),
+                password_stdin: false,
+                overwrite: false,
+                rename: false,
+                include_starter: false,
+                force: false,
             })
             .await;
 
@@ -2832,6 +3191,12 @@ mod tests {
                 all: false,
                 ping: false,
                 json: false,
+                ids: Vec::new(),
+                password_stdin: false,
+                overwrite: false,
+                rename: false,
+                include_starter: false,
+                force: false,
             })
             .await;
 
@@ -2855,6 +3220,12 @@ mod tests {
                 all: false,
                 ping: false,
                 json: false,
+                ids: Vec::new(),
+                password_stdin: false,
+                overwrite: false,
+                rename: false,
+                include_starter: false,
+                force: false,
             })
             .await;
 
@@ -2886,6 +3257,12 @@ mod tests {
                 all: false,
                 ping: false,
                 json: false,
+                ids: Vec::new(),
+                password_stdin: false,
+                overwrite: false,
+                rename: false,
+                include_starter: false,
+                force: false,
             })
             .await;
 
@@ -2909,6 +3286,12 @@ mod tests {
                 all: false,
                 ping: false,
                 json: false,
+                ids: Vec::new(),
+                password_stdin: false,
+                overwrite: false,
+                rename: false,
+                include_starter: false,
+                force: false,
             })
             .await;
 

@@ -174,10 +174,10 @@ pub struct AliasArgs {
 /// Arguments for the keys command
 #[derive(Args, Debug, Clone)]
 pub struct KeysArgs {
-    /// The action to perform (use, rm, add, cat, edit)
+    /// The action to perform (use, rm, add, cat, edit, export, import)
     #[arg(
         value_name = "ACTION",
-        help = "Action to perform: use, rm, add, cat, edit"
+        help = "Action to perform: use, rm, add, cat, edit, export, import"
     )]
     pub action: Option<String>,
 
@@ -208,6 +208,31 @@ pub struct KeysArgs {
     /// Output key list as JSON (listing only; secret is never included)
     #[arg(long)]
     pub json: bool,
+
+    /// Comma-separated key ids for `keys export` (default: all keys)
+    #[arg(long, value_name = "IDS", value_delimiter = ',')]
+    pub ids: Vec<String>,
+
+    /// Read the export/import password from stdin instead of prompting
+    #[arg(long = "password-stdin")]
+    pub password_stdin: bool,
+
+    /// On `keys import` conflict, replace the existing key in place
+    #[arg(long, conflicts_with = "rename")]
+    pub overwrite: bool,
+
+    /// On `keys import` conflict, insert the imported key under a fresh id
+    #[arg(long)]
+    pub rename: bool,
+
+    /// On `keys export`, include the device-bound aivo-starter key
+    /// (filtered out by default; not portable between machines)
+    #[arg(long = "include-starter")]
+    pub include_starter: bool,
+
+    /// On `keys export`, overwrite an existing file at the target path
+    #[arg(long)]
+    pub force: bool,
 }
 
 /// Arguments for the run command

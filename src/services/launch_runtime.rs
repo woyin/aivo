@@ -1111,17 +1111,13 @@ fn ensure_loopback_no_proxy(env: &mut HashMap<String, String>) {
     }
 }
 
-/// Same semantics as `ensure_loopback_no_proxy` but operates on the current
-/// process env via `std::env`. Used by `start_amp_bridge`, where the
-/// localhost hop happens inside aivo's own process and reqwest clients
-/// snapshot `HTTP_PROXY`/`NO_PROXY` from the global env at construction time.
+/// Same as `ensure_loopback_no_proxy` but mutates the current process env.
 ///
-/// SAFETY: aivo's tokio runtime is `current_thread` (see `main.rs`), so all
-/// async work shares one OS thread and there are no concurrent env reads.
-/// Callers must not invoke this from inside a `spawn_blocking` closure or
-/// any code that runs after a `spawn_blocking` task has been launched on
-/// the path being modified — that would race with the blocking pool's reads.
-fn ensure_loopback_no_proxy_in_process_env() {
+/// SAFETY: aivo's tokio runtime is `current_thread` (see `main.rs`), so async
+/// work shares one OS thread and concurrent env reads can't race. Must not
+/// run inside or after a `spawn_blocking` on the env vars being modified —
+/// the blocking pool's reads would race the write.
+pub(crate) fn ensure_loopback_no_proxy_in_process_env() {
     // SAFETY: see fn-level comment.
     unsafe {
         for var in NO_PROXY_VAR_NAMES {

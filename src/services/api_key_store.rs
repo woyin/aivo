@@ -10,6 +10,24 @@ use crate::services::session_store::{
     StoredConfig,
 };
 
+/// Policy applied when an imported record conflicts with an existing one.
+/// Conflict = matching `(name, base_url)`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ImportPolicy {
+    Overwrite,
+    /// Insert the conflict under a fresh id and suffix the name with " (imported)".
+    Rename,
+    Skip,
+}
+
+#[derive(Debug, Default)]
+pub struct ImportReport {
+    pub imported: Vec<String>,
+    pub overwritten: Vec<String>,
+    pub renamed: Vec<(String, String)>,
+    pub skipped: Vec<String>,
+}
+
 pub(crate) const KEY_ID_LENGTH: usize = 3;
 pub(crate) const KEY_ID_ALPHABET: &[u8] = b"23456789abcdefghijkmnpqrstuvwxyz";
 
@@ -87,6 +105,106 @@ impl ApiKeyStore {
         // Save directly — existing keys are already encrypted in the raw config
         self.ctx.save_raw(&config).await?;
         Ok(id)
+    }
+
+    /// The aivo-starter sentinel is filtered unless `include_starter` is set
+    /// — it's device-bound and shouldn't travel with backups.
+    pub(crate) async fn export_keys(
+        &self,
+        ids: Option<&[String]>,
+        include_starter: bool,
+    ) -> Result<Vec<ApiKey>> {
+        use crate::services::provider_profile::is_aivo_starter_base;
+
+        let keys = self.get_keys().await?;
+
+        let mut selected: Vec<ApiKey> = if let Some(filter) = ids {
+            let mut missing = Vec::new();
+            let mut found = Vec::new();
+            for needle in filter {
+                match keys
+                    .iter()
+                    .find(|k| &k.id == needle || k.short_id() == needle.as_str())
+                {
+                    Some(k) => found.push(k.clone()),
+                    None => missing.push(needle.clone()),
+                }
+            }
+            if !missing.is_empty() {
+                return Err(anyhow::anyhow!("Unknown key id(s): {}", missing.join(", ")));
+            }
+            found
+        } else {
+            keys
+        };
+
+        if !include_starter {
+            selected.retain(|k| !is_aivo_starter_base(&k.base_url));
+        }
+
+        for key in &mut selected {
+            Self::decrypt_key_secret(key)?;
+        }
+        Ok(selected)
+    }
+
+    /// Records' file IDs are always discarded and replaced with fresh
+    /// local-alphabet IDs. Prevents 3-char id collisions from silently
+    /// overwriting unrelated local keys, and keeps adversarial non-ASCII
+    /// IDs out of storage where `short_id()`'s byte-slice would panic.
+    pub(crate) async fn import_keys(
+        &self,
+        records: Vec<ApiKey>,
+        policy: ImportPolicy,
+    ) -> Result<ImportReport> {
+        let _lock = self.ctx.acquire_config_lock()?;
+        let mut config = self.ctx.load().await?;
+        let mut report = ImportReport::default();
+
+        for mut incoming in records {
+            let source_id = incoming.id.clone();
+            let conflict_idx = config
+                .api_keys
+                .iter()
+                .position(|k| k.name == incoming.name && k.base_url == incoming.base_url);
+
+            incoming.key = Zeroizing::new(encrypt(&incoming.key)?);
+
+            match conflict_idx {
+                None => {
+                    let existing_ids: HashSet<String> =
+                        config.api_keys.iter().map(|k| k.id.clone()).collect();
+                    incoming.id = generate_key_id(&existing_ids)?;
+                    report.imported.push(incoming.id.clone());
+                    config.api_keys.push(incoming);
+                }
+                Some(idx) => match policy {
+                    ImportPolicy::Overwrite => {
+                        let existing_id = config.api_keys[idx].id.clone();
+                        remove_runtime_state_for_key(&mut config, &existing_id);
+                        incoming.id = existing_id.clone();
+                        config.api_keys[idx] = incoming;
+                        report.overwritten.push(existing_id);
+                    }
+                    ImportPolicy::Rename => {
+                        let existing_ids: HashSet<String> =
+                            config.api_keys.iter().map(|k| k.id.clone()).collect();
+                        incoming.id = generate_key_id(&existing_ids)?;
+                        if !incoming.name.is_empty() {
+                            incoming.name = format!("{} (imported)", incoming.name);
+                        }
+                        report.renamed.push((source_id, incoming.id.clone()));
+                        config.api_keys.push(incoming);
+                    }
+                    ImportPolicy::Skip => {
+                        report.skipped.push(source_id);
+                    }
+                },
+            }
+        }
+
+        self.ctx.save_raw(&config).await?;
+        Ok(report)
     }
 
     /// Gets all API keys without decrypting secrets.
@@ -598,5 +716,234 @@ mod tests {
             .unwrap();
         assert!(found);
         assert!(changed);
+    }
+
+    #[tokio::test]
+    async fn export_keys_returns_plaintext_secrets() {
+        let temp_dir = TempDir::new().unwrap();
+        let store = make_store(&temp_dir);
+
+        store
+            .add_key_with_protocol("alpha", "http://a", None, "sk-alpha")
+            .await
+            .unwrap();
+        store
+            .add_key_with_protocol("beta", "http://b", None, "sk-beta")
+            .await
+            .unwrap();
+
+        let exported = store.export_keys(None, true).await.unwrap();
+        assert_eq!(exported.len(), 2);
+        for key in &exported {
+            assert!(!is_encrypted(&key.key), "exported secret must be plaintext");
+        }
+        let secrets: Vec<&str> = exported.iter().map(|k| k.key.as_str()).collect();
+        assert!(secrets.contains(&"sk-alpha"));
+        assert!(secrets.contains(&"sk-beta"));
+    }
+
+    #[tokio::test]
+    async fn export_skips_aivo_starter_by_default() {
+        let temp_dir = TempDir::new().unwrap();
+        let store = make_store(&temp_dir);
+
+        store
+            .add_key_with_protocol("aivo", "aivo-starter", None, "starter-token")
+            .await
+            .unwrap();
+        store
+            .add_key_with_protocol("alpha", "http://a", None, "sk-alpha")
+            .await
+            .unwrap();
+
+        let without = store.export_keys(None, false).await.unwrap();
+        assert_eq!(without.len(), 1);
+        assert_eq!(without[0].name, "alpha");
+
+        let with = store.export_keys(None, true).await.unwrap();
+        assert_eq!(with.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn export_filters_by_id_and_rejects_unknown() {
+        let temp_dir = TempDir::new().unwrap();
+        let store = make_store(&temp_dir);
+
+        let id_a = store
+            .add_key_with_protocol("alpha", "http://a", None, "sk-alpha")
+            .await
+            .unwrap();
+        store
+            .add_key_with_protocol("beta", "http://b", None, "sk-beta")
+            .await
+            .unwrap();
+
+        let only_a = store
+            .export_keys(Some(std::slice::from_ref(&id_a)), true)
+            .await
+            .unwrap();
+        assert_eq!(only_a.len(), 1);
+        assert_eq!(only_a[0].name, "alpha");
+
+        let err = store
+            .export_keys(Some(&["does-not-exist".to_string()]), true)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("Unknown key id"));
+    }
+
+    #[tokio::test]
+    async fn import_into_empty_store_inserts_and_encrypts() {
+        let temp_dir = TempDir::new().unwrap();
+        let src = make_store(&temp_dir);
+        src.add_key_with_protocol("alpha", "http://a", None, "sk-alpha")
+            .await
+            .unwrap();
+        let exported = src.export_keys(None, true).await.unwrap();
+
+        let dst_dir = TempDir::new().unwrap();
+        let dst = make_store(&dst_dir);
+        let report = dst.import_keys(exported, ImportPolicy::Skip).await.unwrap();
+        assert_eq!(report.imported.len(), 1);
+
+        let new_id = &report.imported[0];
+        assert_eq!(new_id.len(), KEY_ID_LENGTH);
+
+        let roundtripped = dst.get_key_by_id(new_id).await.unwrap().unwrap();
+        assert_eq!(roundtripped.key.as_str(), "sk-alpha");
+        assert_eq!(roundtripped.name, "alpha");
+        let info = dst.get_key_by_id_info(new_id).await.unwrap().unwrap();
+        assert!(is_encrypted(&info.key));
+    }
+
+    #[tokio::test]
+    async fn import_id_collision_with_unrelated_key_does_not_overwrite() {
+        let temp_dir = TempDir::new().unwrap();
+        let store = make_store(&temp_dir);
+
+        let local_id = store
+            .add_key_with_protocol("anthropic", "https://api.anthropic.com", None, "sk-local")
+            .await
+            .unwrap();
+
+        let evil = ApiKey::new_with_protocol(
+            local_id.clone(),
+            "openrouter".to_string(),
+            "https://openrouter.ai/api/v1".to_string(),
+            None,
+            "sk-evil-from-other-machine".to_string(),
+        );
+
+        let report = store
+            .import_keys(vec![evil], ImportPolicy::Overwrite)
+            .await
+            .unwrap();
+        assert!(report.overwritten.is_empty(), "must not overwrite by id");
+        assert_eq!(report.imported.len(), 1);
+
+        let local = store.get_key_by_id(&local_id).await.unwrap().unwrap();
+        assert_eq!(local.name, "anthropic");
+        assert_eq!(local.key.as_str(), "sk-local");
+
+        let new_id = &report.imported[0];
+        assert_ne!(new_id, &local_id);
+        let imported = store.get_key_by_id(new_id).await.unwrap().unwrap();
+        assert_eq!(imported.name, "openrouter");
+        assert_eq!(imported.key.as_str(), "sk-evil-from-other-machine");
+    }
+
+    #[tokio::test]
+    async fn import_normalises_non_ascii_id() {
+        let temp_dir = TempDir::new().unwrap();
+        let store = make_store(&temp_dir);
+
+        let evil = ApiKey::new_with_protocol(
+            "🔑🔑".to_string(),
+            "alpha".to_string(),
+            "http://a".to_string(),
+            None,
+            "sk-alpha".to_string(),
+        );
+
+        let report = store
+            .import_keys(vec![evil], ImportPolicy::Skip)
+            .await
+            .unwrap();
+        assert_eq!(report.imported.len(), 1);
+        let new_id = &report.imported[0];
+
+        assert_eq!(new_id.len(), KEY_ID_LENGTH);
+        assert!(new_id.chars().all(|c| KEY_ID_ALPHABET.contains(&(c as u8))));
+
+        let stored = store.get_key_by_id(new_id).await.unwrap().unwrap();
+        assert_eq!(stored.short_id(), new_id.as_str());
+    }
+
+    #[tokio::test]
+    async fn import_same_machine_is_idempotent_on_skip() {
+        let temp_dir = TempDir::new().unwrap();
+        let store = make_store(&temp_dir);
+        let id = store
+            .add_key_with_protocol("alpha", "http://a", None, "sk-alpha")
+            .await
+            .unwrap();
+        let exported = store.export_keys(None, true).await.unwrap();
+
+        let report = store
+            .import_keys(exported, ImportPolicy::Skip)
+            .await
+            .unwrap();
+        assert_eq!(report.skipped, vec![id]);
+        assert!(report.imported.is_empty());
+    }
+
+    #[tokio::test]
+    async fn import_overwrite_replaces_existing_secret() {
+        let temp_dir = TempDir::new().unwrap();
+        let store = make_store(&temp_dir);
+        let id = store
+            .add_key_with_protocol("alpha", "http://a", None, "sk-original")
+            .await
+            .unwrap();
+
+        let mut imported = store.export_keys(None, true).await.unwrap();
+        imported[0].key = Zeroizing::new("sk-rotated".to_string());
+
+        let report = store
+            .import_keys(imported, ImportPolicy::Overwrite)
+            .await
+            .unwrap();
+        assert_eq!(report.overwritten, vec![id.clone()]);
+
+        let after = store.get_key_by_id(&id).await.unwrap().unwrap();
+        assert_eq!(after.key.as_str(), "sk-rotated");
+    }
+
+    #[tokio::test]
+    async fn import_rename_keeps_existing_and_adds_new() {
+        let temp_dir = TempDir::new().unwrap();
+        let store = make_store(&temp_dir);
+        let original_id = store
+            .add_key_with_protocol("alpha", "http://a", None, "sk-original")
+            .await
+            .unwrap();
+
+        let mut imported = store.export_keys(None, true).await.unwrap();
+        imported[0].key = Zeroizing::new("sk-incoming".to_string());
+
+        let report = store
+            .import_keys(imported, ImportPolicy::Rename)
+            .await
+            .unwrap();
+        assert_eq!(report.renamed.len(), 1);
+        let (orig, new_id) = &report.renamed[0];
+        assert_eq!(orig, &original_id);
+        assert_ne!(new_id, &original_id);
+
+        let original = store.get_key_by_id(&original_id).await.unwrap().unwrap();
+        assert_eq!(original.key.as_str(), "sk-original");
+        let imported_back = store.get_key_by_id(new_id).await.unwrap().unwrap();
+        assert_eq!(imported_back.key.as_str(), "sk-incoming");
+        assert!(imported_back.name.ends_with("(imported)"));
     }
 }

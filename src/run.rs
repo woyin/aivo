@@ -82,6 +82,10 @@ async fn maybe_init_http_debug(value: &Option<String>) {
 /// exits the process with the resulting code. Never returns.
 pub async fn run() -> ! {
     fast_crypto_guard();
+    // Must run before any reqwest client is built or `spawn_blocking` is
+    // launched — reqwest snapshots proxy env at construction, and env
+    // mutation is only race-free while the current-thread runtime is idle.
+    services::launch_runtime::ensure_loopback_no_proxy_in_process_env();
     let raw_args: Vec<String> = std::env::args().collect();
 
     // Initialize services. Bundle aliases need to be loaded *before* CLI

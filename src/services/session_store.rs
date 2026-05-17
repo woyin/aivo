@@ -1296,6 +1296,24 @@ impl SessionStore {
         self.api_keys.get_keys().await
     }
 
+    /// See [`ApiKeyStore::export_keys`].
+    pub async fn export_keys(
+        &self,
+        ids: Option<&[String]>,
+        include_starter: bool,
+    ) -> Result<Vec<ApiKey>> {
+        self.api_keys.export_keys(ids, include_starter).await
+    }
+
+    /// See [`ApiKeyStore::import_keys`].
+    pub async fn import_keys(
+        &self,
+        records: Vec<ApiKey>,
+        policy: crate::services::api_key_store::ImportPolicy,
+    ) -> Result<crate::services::api_key_store::ImportReport> {
+        self.api_keys.import_keys(records, policy).await
+    }
+
     /// Decrypts a single key's secret in place. No-op if already decrypted.
     /// Pairs with the `_info` lookup variants for deferred decryption.
     pub fn decrypt_key_secret(key: &mut ApiKey) -> Result<()> {

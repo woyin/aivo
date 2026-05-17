@@ -38,6 +38,7 @@ pub mod device_fingerprint;
 pub mod dns_resolver;
 pub mod effort;
 pub mod environment_injector;
+pub mod export_crypto;
 pub mod gemini_home_shadow;
 pub mod gemini_oauth;
 pub mod gemini_oauth_callback;
