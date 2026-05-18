@@ -1301,8 +1301,14 @@ impl SessionStore {
         &self,
         ids: Option<&[String]>,
         include_starter: bool,
-    ) -> Result<Vec<ApiKey>> {
-        self.api_keys.export_keys(ids, include_starter).await
+        include_oauth: bool,
+    ) -> Result<(
+        Vec<ApiKey>,
+        crate::services::api_key_store::ExportFilterReport,
+    )> {
+        self.api_keys
+            .export_keys(ids, include_starter, include_oauth)
+            .await
     }
 
     /// See [`ApiKeyStore::import_keys`].

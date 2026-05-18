@@ -28,6 +28,12 @@ pub struct ImportReport {
     pub skipped: Vec<String>,
 }
 
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct ExportFilterReport {
+    pub skipped_starter: usize,
+    pub skipped_oauth: usize,
+}
+
 pub(crate) const KEY_ID_LENGTH: usize = 3;
 pub(crate) const KEY_ID_ALPHABET: &[u8] = b"23456789abcdefghijkmnpqrstuvwxyz";
 
@@ -107,14 +113,20 @@ impl ApiKeyStore {
         Ok(id)
     }
 
-    /// The aivo-starter sentinel is filtered unless `include_starter` is set
-    /// — it's device-bound and shouldn't travel with backups.
+    /// Two categories are filtered unless explicitly opted in:
+    /// - `aivo-starter` (device-bound; `include_starter`)
+    /// - OAuth / Copilot login sessions (account-bound subscription
+    ///   credentials — Claude, Codex, Gemini, Copilot; `include_oauth`)
+    ///
+    /// Plain API keys always export. The filter exists so a casual export
+    /// doesn't silently ship subscription access alongside provider keys.
     pub(crate) async fn export_keys(
         &self,
         ids: Option<&[String]>,
         include_starter: bool,
-    ) -> Result<Vec<ApiKey>> {
-        use crate::services::provider_profile::is_aivo_starter_base;
+        include_oauth: bool,
+    ) -> Result<(Vec<ApiKey>, ExportFilterReport)> {
+        use crate::services::provider_profile::{is_aivo_starter_base, is_oauth_or_copilot_base};
 
         let keys = self.get_keys().await?;
 
@@ -138,14 +150,22 @@ impl ApiKeyStore {
             keys
         };
 
+        let mut report = ExportFilterReport::default();
         if !include_starter {
+            let before = selected.len();
             selected.retain(|k| !is_aivo_starter_base(&k.base_url));
+            report.skipped_starter = before - selected.len();
+        }
+        if !include_oauth {
+            let before = selected.len();
+            selected.retain(|k| !is_oauth_or_copilot_base(&k.base_url));
+            report.skipped_oauth = before - selected.len();
         }
 
         for key in &mut selected {
             Self::decrypt_key_secret(key)?;
         }
-        Ok(selected)
+        Ok((selected, report))
     }
 
     /// Records' file IDs are always discarded and replaced with fresh
@@ -732,7 +752,7 @@ mod tests {
             .await
             .unwrap();
 
-        let exported = store.export_keys(None, true).await.unwrap();
+        let (exported, _) = store.export_keys(None, true, true).await.unwrap();
         assert_eq!(exported.len(), 2);
         for key in &exported {
             assert!(!is_encrypted(&key.key), "exported secret must be plaintext");
@@ -756,12 +776,52 @@ mod tests {
             .await
             .unwrap();
 
-        let without = store.export_keys(None, false).await.unwrap();
+        let (without, report) = store.export_keys(None, false, true).await.unwrap();
         assert_eq!(without.len(), 1);
         assert_eq!(without[0].name, "alpha");
+        assert_eq!(report.skipped_starter, 1);
 
-        let with = store.export_keys(None, true).await.unwrap();
+        let (with, _) = store.export_keys(None, true, true).await.unwrap();
         assert_eq!(with.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn export_skips_oauth_and_copilot_by_default() {
+        use crate::services::claude_oauth::CLAUDE_OAUTH_SENTINEL;
+        use crate::services::codex_oauth::CODEX_OAUTH_SENTINEL;
+        use crate::services::gemini_oauth::GEMINI_OAUTH_SENTINEL;
+
+        let temp_dir = TempDir::new().unwrap();
+        let store = make_store(&temp_dir);
+
+        store
+            .add_key_with_protocol("claude", CLAUDE_OAUTH_SENTINEL, None, "{\"token\":\"t\"}")
+            .await
+            .unwrap();
+        store
+            .add_key_with_protocol("codex", CODEX_OAUTH_SENTINEL, None, "{\"token\":\"t\"}")
+            .await
+            .unwrap();
+        store
+            .add_key_with_protocol("gemini", GEMINI_OAUTH_SENTINEL, None, "{\"token\":\"t\"}")
+            .await
+            .unwrap();
+        store
+            .add_key_with_protocol("copilot", "copilot", None, "ghu_test")
+            .await
+            .unwrap();
+        store
+            .add_key_with_protocol("alpha", "http://a", None, "sk-alpha")
+            .await
+            .unwrap();
+
+        let (without, report) = store.export_keys(None, true, false).await.unwrap();
+        assert_eq!(without.len(), 1);
+        assert_eq!(without[0].name, "alpha");
+        assert_eq!(report.skipped_oauth, 4);
+
+        let (with, _) = store.export_keys(None, true, true).await.unwrap();
+        assert_eq!(with.len(), 5);
     }
 
     #[tokio::test]
@@ -778,15 +838,15 @@ mod tests {
             .await
             .unwrap();
 
-        let only_a = store
-            .export_keys(Some(std::slice::from_ref(&id_a)), true)
+        let (only_a, _) = store
+            .export_keys(Some(std::slice::from_ref(&id_a)), true, true)
             .await
             .unwrap();
         assert_eq!(only_a.len(), 1);
         assert_eq!(only_a[0].name, "alpha");
 
         let err = store
-            .export_keys(Some(&["does-not-exist".to_string()]), true)
+            .export_keys(Some(&["does-not-exist".to_string()]), true, true)
             .await
             .unwrap_err();
         assert!(err.to_string().contains("Unknown key id"));
@@ -799,7 +859,7 @@ mod tests {
         src.add_key_with_protocol("alpha", "http://a", None, "sk-alpha")
             .await
             .unwrap();
-        let exported = src.export_keys(None, true).await.unwrap();
+        let (exported, _) = src.export_keys(None, true, true).await.unwrap();
 
         let dst_dir = TempDir::new().unwrap();
         let dst = make_store(&dst_dir);
@@ -887,7 +947,7 @@ mod tests {
             .add_key_with_protocol("alpha", "http://a", None, "sk-alpha")
             .await
             .unwrap();
-        let exported = store.export_keys(None, true).await.unwrap();
+        let (exported, _) = store.export_keys(None, true, true).await.unwrap();
 
         let report = store
             .import_keys(exported, ImportPolicy::Skip)
@@ -906,7 +966,7 @@ mod tests {
             .await
             .unwrap();
 
-        let mut imported = store.export_keys(None, true).await.unwrap();
+        let (mut imported, _) = store.export_keys(None, true, true).await.unwrap();
         imported[0].key = Zeroizing::new("sk-rotated".to_string());
 
         let report = store
@@ -928,7 +988,7 @@ mod tests {
             .await
             .unwrap();
 
-        let mut imported = store.export_keys(None, true).await.unwrap();
+        let (mut imported, _) = store.export_keys(None, true, true).await.unwrap();
         imported[0].key = Zeroizing::new("sk-incoming".to_string());
 
         let report = store

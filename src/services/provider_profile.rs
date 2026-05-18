@@ -136,6 +136,16 @@ pub fn is_aivo_starter_base(base_url: &str) -> bool {
         || base_url == crate::constants::AIVO_STARTER_REAL_URL
 }
 
+/// Account-bound login sessions (browser/device-flow). Filtered from
+/// exports by default — they grant subscription access, not pay-as-you-go
+/// API quota, so they shouldn't travel silently with an API-key backup.
+pub fn is_oauth_or_copilot_base(base_url: &str) -> bool {
+    is_copilot_base(base_url)
+        || base_url == crate::services::claude_oauth::CLAUDE_OAUTH_SENTINEL
+        || base_url == crate::services::codex_oauth::CODEX_OAUTH_SENTINEL
+        || base_url == crate::services::gemini_oauth::GEMINI_OAUTH_SENTINEL
+}
+
 /// Resolves the aivo-starter sentinel to the real API URL.
 /// Returns the base_url unchanged for all other providers.
 pub fn resolve_starter_base_url(base_url: &str) -> String {

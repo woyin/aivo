@@ -1109,17 +1109,31 @@ impl KeysCommand {
             Some(&keys_args.ids)
         };
 
-        let records = self
+        let (records, filter_report) = self
             .session_store
-            .export_keys(id_filter, keys_args.include_starter)
+            .export_keys(
+                id_filter,
+                keys_args.include_starter,
+                keys_args.include_oauth,
+            )
             .await?;
         if records.is_empty() {
+            let mut hints: Vec<String> = Vec::new();
+            if filter_report.skipped_starter > 0 {
+                hints.push("--include-starter".into());
+            }
+            if filter_report.skipped_oauth > 0 {
+                hints.push("--include-oauth".into());
+            }
+            let hint = if hints.is_empty() {
+                String::new()
+            } else {
+                format!(" (pass {} to include filtered keys)", hints.join(" / "))
+            };
             eprintln!(
-                "{} No keys to export. {}",
+                "{} No keys to export.{}",
                 style::red("Error:"),
-                style::dim(
-                    "(The aivo-starter key is filtered by default; pass --include-starter to include it.)"
-                )
+                style::dim(hint)
             );
             return Ok(ExitCode::UserError);
         }
@@ -1131,6 +1145,15 @@ impl KeysCommand {
                 "  {} {}",
                 style::cyan(k.short_id()),
                 style::dim(k.display_name())
+            );
+        }
+        if filter_report.skipped_oauth > 0 {
+            println!(
+                "{} Skipped {} OAuth/Copilot login session{} — pass {} to include.",
+                style::dim("·"),
+                filter_report.skipped_oauth,
+                plural(filter_report.skipped_oauth),
+                style::cyan("--include-oauth")
             );
         }
 
@@ -2805,16 +2828,21 @@ fn print_help_export() {
         "--include-starter",
         "Include the device-bound aivo-starter key (off by default)",
     );
+    keys_help_row(
+        "--include-oauth",
+        "Include OAuth/Copilot login sessions (off by default)",
+    );
     keys_help_row("--force", "Overwrite an existing file at the target path");
     println!();
     println!("{}", style::bold("Examples:"));
+    println!("  {}", style::dim("aivo keys export ~/aivo-backup.aivo"));
     println!(
         "  {}",
-        style::dim("aivo keys export ~/aivo-backup.aivo-keys")
+        style::dim("aivo keys export keys.aivo --ids abc,def")
     );
     println!(
         "  {}",
-        style::dim("aivo keys export keys.aivo-keys --ids abc,def")
+        style::dim("printf '%s' \"$PW\" | aivo keys export keys.aivo --password-stdin --force")
     );
 }
 
@@ -2834,17 +2862,15 @@ fn print_help_import() {
     keys_help_row("--rename", "Keep existing; import conflicts under new ids");
     println!();
     println!("{}", style::bold("Examples:"));
+    println!("  {}", style::dim("aivo keys import ~/aivo-backup.aivo"));
     println!(
         "  {}",
-        style::dim("aivo keys import ~/aivo-backup.aivo-keys")
+        style::dim("aivo keys import https://gist.example.com/raw/abc.aivo")
     );
+    println!("  {}", style::dim("aivo keys import keys.aivo --overwrite"));
     println!(
         "  {}",
-        style::dim("aivo keys import https://gist.example.com/raw/abc.aivo-keys")
-    );
-    println!(
-        "  {}",
-        style::dim("aivo keys import keys.aivo-keys --overwrite")
+        style::dim("printf '%s' \"$PW\" | aivo keys import keys.aivo --password-stdin --overwrite")
     );
 }
 
@@ -3004,6 +3030,7 @@ mod tests {
             overwrite: false,
             rename: false,
             include_starter: false,
+            include_oauth: false,
             force: false,
         }
     }
@@ -3157,6 +3184,7 @@ mod tests {
                 overwrite: false,
                 rename: false,
                 include_starter: false,
+                include_oauth: false,
                 force: false,
             })
             .await;
@@ -3196,6 +3224,7 @@ mod tests {
                 overwrite: false,
                 rename: false,
                 include_starter: false,
+                include_oauth: false,
                 force: false,
             })
             .await;
@@ -3225,6 +3254,7 @@ mod tests {
                 overwrite: false,
                 rename: false,
                 include_starter: false,
+                include_oauth: false,
                 force: false,
             })
             .await;
@@ -3262,6 +3292,7 @@ mod tests {
                 overwrite: false,
                 rename: false,
                 include_starter: false,
+                include_oauth: false,
                 force: false,
             })
             .await;
@@ -3291,6 +3322,7 @@ mod tests {
                 overwrite: false,
                 rename: false,
                 include_starter: false,
+                include_oauth: false,
                 force: false,
             })
             .await;
