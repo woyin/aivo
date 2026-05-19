@@ -1489,14 +1489,14 @@ impl SessionStore {
             return None;
         }
         let is_new_user = config.api_keys.is_empty();
-        // Check if starter key already exists
+        // Common path: starter already exists. Reuse the entry we just
+        // loaded — no second `load()`, no PBKDF2 (callers only read `.id`).
         if let Some(existing) = config
             .api_keys
             .iter()
             .find(|k| k.base_url == AIVO_STARTER_SENTINEL)
         {
-            let key = self.get_key_by_id(&existing.id).await.ok().flatten()?;
-            return Some((key, is_new_user));
+            return Some((existing.clone(), is_new_user));
         }
         let id = self
             .add_key_with_protocol(

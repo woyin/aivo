@@ -927,24 +927,27 @@ fn print_help() {
 }
 
 /// Prints the active selection (key, tool, model) at the bottom of help output.
+///
+/// One config load resolves both the last-selection record and the key's
+/// display name (no PBKDF2). Skips the stale-record self-healing that
+/// `get_last_selection` does — that path will heal on the next command
+/// that actually touches selection state.
 async fn print_active_selection(session_store: &SessionStore) {
-    let sel = match session_store.get_last_selection().await.ok().flatten() {
-        Some(sel) => sel,
-        None => return,
+    let Some(config) = session_store.load().await.ok() else {
+        return;
     };
-
-    // Load config directly to get display name without triggering PBKDF2 decryption.
-    let key_label = session_store
-        .load()
-        .await
-        .ok()
-        .and_then(|c| {
-            c.api_keys
-                .into_iter()
-                .find(|k| k.id == sel.key_id)
-                .map(|k| k.display_name().to_string())
-        })
-        .unwrap_or(sel.key_id.clone());
+    let Some(sel) = config.last_selection.clone() else {
+        return;
+    };
+    let key_entry = config.api_keys.iter().find(|k| k.id == sel.key_id);
+    // Treat a missing or moved key as "no active selection" — mirrors
+    // `get_last_selection`'s stale check without rewriting the config here.
+    if key_entry.is_none_or(|k| k.base_url != sel.base_url) {
+        return;
+    }
+    let key_label = key_entry
+        .map(|k| k.display_name().to_string())
+        .unwrap_or_else(|| sel.key_id.clone());
     let model_display = commands::models::model_display_label(sel.model.as_deref());
 
     println!();
