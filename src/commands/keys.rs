@@ -2657,8 +2657,8 @@ fn print_help_overview() {
         style::dim("Manage API keys: add, remove, activate, and inspect.")
     );
     println!();
-    println!("{}", style::bold("Actions:"));
-    keys_help_row("(no action)", "List all API keys");
+    println!("{}", style::bold("Commands:"));
+    keys_help_row("(no command)", "List all API keys");
     keys_help_row("use [id|name]", "Activate a specific API key");
     keys_help_row("cat [id|name]", "Display details for a key");
     keys_help_row("rm [id|name]", "Remove an API key");

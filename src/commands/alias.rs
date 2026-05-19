@@ -271,7 +271,7 @@ impl AliasCommand {
             style::dim("  launch — short name → preset (tool + flags); run via `aivo run <name>`.")
         );
         println!();
-        println!("{}", style::bold("Actions:"));
+        println!("{}", style::bold("Commands:"));
         let print_row = |label: &str, desc: &str| {
             println!(
                 "  {}{}",

@@ -28,6 +28,12 @@ pub struct Cli {
     #[arg(short, long, global = true, help = "Display help information")]
     pub help: bool,
 
+    /// Dump the full command tree (commands, flags, descriptions) as JSON.
+    /// Intended for AI agents and tooling that needs reliable
+    /// machine-readable command discovery.
+    #[arg(long = "help-json", global = true, help = "Dump command tree as JSON")]
+    pub help_json: bool,
+
     /// Display the current version
     #[arg(short, long, global = true, help = "Display the current version")]
     pub version: bool,

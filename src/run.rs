@@ -5,7 +5,8 @@
 
 use std::process;
 
-use clap::Parser;
+use clap::{Command, CommandFactory, Parser};
+use serde_json::{Map, Value, json};
 
 use crate::cli::{self, Cli, Commands};
 use crate::cli_args::{
@@ -113,6 +114,11 @@ pub async fn run() -> ! {
     // Handle --version and subcommand --help early, before any further service initialization.
     if args.version {
         print_version();
+        process::exit(0);
+    }
+
+    if args.help_json {
+        print_help_json();
         process::exit(0);
     }
 
@@ -877,11 +883,22 @@ fn print_help() {
         let padded = format!("{:<10}", alias);
         println!("  {}{}", style::cyan(&padded), style::dim(expansion));
     };
-    print_shortcut("use", "keys use");
-    print_shortcut("ping", "keys ping");
-    print_shortcut("share", "logs share");
-    print_shortcut("-x", "chat -x (one-shot; reads stdin when no value)");
-    print_shortcut("claude/codex/gemini/opencode/pi/amp", " run <tool>");
+    print_shortcut(
+        "use",
+        "keys use            (run `aivo keys use --help` for flags)",
+    );
+    print_shortcut(
+        "ping",
+        "keys ping           (run `aivo keys ping --help` for flags)",
+    );
+    print_shortcut(
+        "share",
+        "logs share          (run `aivo logs share --help` for flags)",
+    );
+    print_shortcut(
+        "<tool>",
+        "run <tool>          (claude / codex / gemini / opencode / pi / amp)",
+    );
     println!();
     println!("{}", style::bold("Examples:"));
     println!("  {}", style::dim("aivo claude -k aivo"));
@@ -896,11 +913,16 @@ fn print_help() {
     let print_opt = |flag: &str, desc: &str| {
         println!(
             "  {}{}",
-            style::cyan(format!("{:<16}", flag)),
+            style::cyan(format!("{:<22}", flag)),
             style::dim(desc)
         );
     };
+    print_opt(
+        "-x, --execute [msg]",
+        "One-shot chat (shorthand for `chat -x`; reads stdin when no value)",
+    );
     print_opt("-h, --help", "Display help information");
+    print_opt("--help-json", "Dump the full command tree as JSON");
     print_opt("-v, --version", "Display the current version");
 }
 
@@ -933,6 +955,104 @@ async fn print_active_selection(session_store: &SessionStore) {
         key_label,
         style::dim(model_display),
     );
+}
+
+/// Dump the entire CLI command tree (commands, flags, descriptions, env hints)
+/// as JSON on stdout. Intended for AI agents / tooling that needs reliable
+/// machine-readable command discovery — human help text is easy to misparse.
+fn print_help_json() {
+    let cmd = Cli::command();
+    let tree = serialize_command(&cmd);
+    let payload = json!({
+        "name": "aivo",
+        "version": version::VERSION,
+        "shortcuts": [
+            { "alias": "use", "expands_to": ["keys", "use"] },
+            { "alias": "ping", "expands_to": ["keys", "ping"] },
+            { "alias": "share", "expands_to": ["logs", "share"] },
+            { "alias": "-x", "expands_to": ["chat", "-x"] },
+            { "alias": "claude", "expands_to": ["run", "claude"] },
+            { "alias": "codex", "expands_to": ["run", "codex"] },
+            { "alias": "gemini", "expands_to": ["run", "gemini"] },
+            { "alias": "opencode", "expands_to": ["run", "opencode"] },
+            { "alias": "pi", "expands_to": ["run", "pi"] },
+            { "alias": "amp", "expands_to": ["run", "amp"] }
+        ],
+        "environment": [
+            { "name": "AIVO_REDUCE_MOTION", "desc": "Disable chat TUI motion effects (=1)" },
+            { "name": "AIVO_PREVIEW", "desc": "Force-disable (=0) or force-enable (=1) terminal image preview" },
+            { "name": "AIVO_CHAT_DISABLE_MOUSE", "desc": "Disable mouse capture in chat TUI (=1)" },
+            { "name": "AIVO_CHAT_SCROLL_SPEED", "desc": "Lines scrolled per wheel tick in chat TUI (default 3)" },
+            { "name": "AIVO_PATH", "desc": "Override the install path detected by `aivo update`" },
+            { "name": "AIVO_SHARE_BASE_URL", "desc": "Override the public tunnel endpoint used by `aivo logs share`" },
+            { "name": "AIVO_DEBUG", "desc": "Surface upstream HTTP request/response detail in some flows (=1)" }
+        ],
+        "tree": tree,
+    });
+    match serde_json::to_string_pretty(&payload) {
+        Ok(s) => println!("{s}"),
+        Err(e) => eprintln!("failed to serialize help: {e}"),
+    }
+}
+
+/// Recursively serialize a clap `Command` into JSON.
+fn serialize_command(cmd: &Command) -> Value {
+    let mut obj = Map::new();
+    obj.insert("name".into(), json!(cmd.get_name()));
+    if let Some(about) = cmd.get_about() {
+        obj.insert("about".into(), json!(about.to_string()));
+    }
+    if let Some(long) = cmd.get_long_about() {
+        obj.insert("long_about".into(), json!(long.to_string()));
+    }
+    let aliases: Vec<String> = cmd
+        .get_visible_aliases()
+        .map(|s| s.to_string())
+        .chain(cmd.get_all_aliases().map(|s| s.to_string()))
+        .collect();
+    if !aliases.is_empty() {
+        obj.insert("aliases".into(), json!(aliases));
+    }
+    if cmd.is_hide_set() {
+        obj.insert("hidden".into(), json!(true));
+    }
+
+    let mut args = Vec::new();
+    for arg in cmd.get_arguments() {
+        if arg.is_hide_set() {
+            continue;
+        }
+        let mut a = Map::new();
+        a.insert("id".into(), json!(arg.get_id().as_str()));
+        if let Some(s) = arg.get_short() {
+            a.insert("short".into(), json!(format!("-{s}")));
+        }
+        if let Some(l) = arg.get_long() {
+            a.insert("long".into(), json!(format!("--{l}")));
+        }
+        if let Some(h) = arg.get_help().or_else(|| arg.get_long_help()) {
+            a.insert("help".into(), json!(h.to_string()));
+        }
+        let names: Vec<String> = arg
+            .get_value_names()
+            .map(|v| v.iter().map(|s| s.to_string()).collect())
+            .unwrap_or_default();
+        if !names.is_empty() {
+            a.insert("value_names".into(), json!(names));
+        }
+        a.insert("takes_value".into(), json!(arg.get_action().takes_values()));
+        a.insert("positional".into(), json!(arg.is_positional()));
+        args.push(Value::Object(a));
+    }
+    if !args.is_empty() {
+        obj.insert("args".into(), Value::Array(args));
+    }
+
+    let subs: Vec<Value> = cmd.get_subcommands().map(serialize_command).collect();
+    if !subs.is_empty() {
+        obj.insert("subcommands".into(), Value::Array(subs));
+    }
+    Value::Object(obj)
 }
 
 /// Prints version information

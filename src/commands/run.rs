@@ -626,14 +626,16 @@ impl RunCommand {
             "{}",
             style::dim("All arguments are passed through to the underlying tool.")
         );
-        println!();
-        println!("{}", style::bold("Options:"));
         let print_opt = |flag: &str, desc: &str| {
             println!(
                 "  {}{}",
                 style::cyan(format!("{:<26}", flag)),
                 style::dim(desc)
             );
+        };
+        let section = |name: &str| {
+            println!();
+            println!("{}", style::bold(name));
         };
         // Generic help keeps the "Claude only:" / "Amp only:" prefixes so
         // the union view stays unambiguous; per-tool help drops them since
@@ -648,6 +650,8 @@ impl RunCommand {
                     .to_string()
             }
         };
+
+        section("Model:");
         print_opt("-m, --model <model>", "Specify AI model to use");
         if is("claude") {
             print_opt(
@@ -671,7 +675,9 @@ impl RunCommand {
                 &label("Claude only: what `/model opus` resolves to (bare = picker)"),
             );
         }
+
         if is("amp") {
+            section("Amp Modes:");
             print_opt(
                 "--mode <name>",
                 &label(
@@ -699,29 +705,30 @@ impl RunCommand {
                 &label("Amp only: strip a tool by name (repeatable)"),
             );
         }
-        if is("claude") || is("codex") {
-            print_opt(
-                "--max-context <size>",
-                "Opt every model slot into a larger context window (e.g. 1m, 2m)",
-            );
-            print_opt("--1m", "Shorthand for --max-context=1m");
-            print_opt("--2m", "Shorthand for --max-context=2m");
+
+        let context_flags = is("claude") || is("codex") || tool != Some("amp");
+        if context_flags {
+            section("Context:");
+            if is("claude") || is("codex") {
+                print_opt(
+                    "--max-context <size>",
+                    "Opt every model slot into a larger context window (e.g. 1m, 2m)",
+                );
+                print_opt("--1m", "Shorthand for --max-context=1m");
+                print_opt("--2m", "Shorthand for --max-context=2m");
+            }
+            if tool != Some("amp") {
+                print_opt(
+                    "-c, --context[=<id>]",
+                    "Inject one past session (bare = picker; id from `aivo logs --by native`)",
+                );
+            }
         }
+
+        section("Key & Auth:");
         print_opt(
             "-k, --key <id|name>",
             "Select API key by ID or name (-k opens key picker)",
-        );
-        print_opt("-r, --refresh", "Bypass cache and fetch fresh model list");
-        print_opt("--env <k=v>", "Inject environment variable");
-        if tool != Some("amp") {
-            print_opt(
-                "-c, --context[=<id>]",
-                "Inject one past session (bare = picker; id from `aivo logs --by native`)",
-            );
-        }
-        print_opt(
-            "--dry-run",
-            "Print resolved command and environment without launching",
         );
         if is("claude") || is("codex") || is("gemini") {
             let relogin_desc = if generic {
@@ -732,9 +739,17 @@ impl RunCommand {
             print_opt("--relogin", relogin_desc);
         }
 
+        section("Run:");
+        print_opt("-r, --refresh", "Bypass cache and fetch fresh model list");
+        print_opt("--env <k=v>", "Inject environment variable");
+        print_opt(
+            "--dry-run",
+            "Print resolved command and environment without launching",
+        );
+
         if generic {
             println!();
-            println!("{}", style::bold("Tools:"));
+            println!("{}", style::bold("Commands:"));
             let print_tool = |label: &str, desc: &str| {
                 println!(
                     "  {}{}",
