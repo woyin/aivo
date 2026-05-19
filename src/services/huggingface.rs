@@ -910,15 +910,22 @@ async fn stream_to_file(
             .with_context(|| format!("Failed to write {}", tmp.display()))?;
         if last_label.elapsed() >= Duration::from_millis(200) {
             let elapsed = started.elapsed().as_secs_f64().max(0.001);
-            let speed_mb_s = downloaded as f64 / elapsed / (1024.0 * 1024.0);
+            let bytes_per_sec = downloaded as f64 / elapsed;
+            let speed_mb_s = bytes_per_sec / (1024.0 * 1024.0);
             let pct = if file.size_bytes > 0 {
                 (downloaded as f64 / file.size_bytes as f64 * 100.0) as u32
             } else {
                 0
             };
+            let eta = if file.size_bytes > downloaded && bytes_per_sec > 0.0 {
+                let remaining = (file.size_bytes - downloaded) as f64 / bytes_per_sec;
+                format!(", ETA {}", format_eta(remaining as u64))
+            } else {
+                String::new()
+            };
             if let Ok(mut s) = label.lock() {
                 *s = format!(
-                    " Downloading {} — {} / {} ({pct}%, {speed_mb_s:.1} MB/s)",
+                    " Downloading {} — {} / {} ({pct}%, {speed_mb_s:.1} MB/s{eta})",
                     file.filename,
                     human_size(downloaded),
                     human_size(file.size_bytes)
@@ -1233,6 +1240,15 @@ pub fn format_modified_ago(t: Option<std::time::SystemTime>) -> String {
         604_800..=2_592_000 => format!("{}w ago", secs / 604_800),
         2_592_001..=31_535_999 => format!("{}mo ago", secs / 2_592_000),
         _ => format!("{}y ago", secs / 31_536_000),
+    }
+}
+
+fn format_eta(secs: u64) -> String {
+    match secs {
+        0..=59 => format!("{secs}s"),
+        60..=3599 => format!("{}m {}s", secs / 60, secs % 60),
+        3600..=86_399 => format!("{}h {}m", secs / 3600, (secs % 3600) / 60),
+        _ => format!("{}d {}h", secs / 86_400, (secs % 86_400) / 3600),
     }
 }
 
@@ -1567,6 +1583,17 @@ mod tests {
         assert_eq!(human_size(5 * 1024 * 1024), "5.0MB");
         // 1.91 GB — a typical Q4_K_M quant of a 3B model
         assert_eq!(human_size(2_050_000_000), "1.91GB");
+    }
+
+    #[test]
+    fn format_eta_covers_all_buckets() {
+        assert_eq!(format_eta(0), "0s");
+        assert_eq!(format_eta(45), "45s");
+        assert_eq!(format_eta(60), "1m 0s");
+        assert_eq!(format_eta(125), "2m 5s");
+        assert_eq!(format_eta(3600), "1h 0m");
+        assert_eq!(format_eta(3725), "1h 2m");
+        assert_eq!(format_eta(90_061), "1d 1h");
     }
 
     #[test]
