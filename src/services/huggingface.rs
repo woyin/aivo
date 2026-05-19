@@ -1,10 +1,12 @@
 //! HuggingFace direct-run: resolve a model ref, download the GGUF, and
 //! spawn a local `llama-server` for it.
 
+use std::collections::VecDeque;
 use std::io::Write;
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command};
+use std::process::{Child, ChildStderr, Command};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -622,6 +624,44 @@ pub async fn ensure_ready(model: &HfModelRef) -> Result<u16> {
     let cached = ensure_cached(model).await?;
     let cache_path = cached.path;
 
+    let port = match try_spawn_and_warmup(&bin, &cache_path, cache_hit, &[]).await? {
+        WarmupOutcome::Ready(p) => p,
+        WarmupOutcome::JinjaFailed { .. } => {
+            // Some GGUFs ship Jinja chat templates that use filters
+            // (e.g. `tojson`) that llama.cpp's embedded minijinja can't
+            // parse. llama-server's own hint is to retry with --no-jinja.
+            eprintln!(
+                "  {} Model's embedded jinja chat template failed to parse; \
+                 retrying with --no-jinja (tool-call template fidelity may be reduced)",
+                crate::style::yellow("!"),
+            );
+            stop_if_we_started();
+            match try_spawn_and_warmup(&bin, &cache_path, cache_hit, &["--no-jinja"]).await? {
+                WarmupOutcome::Ready(p) => p,
+                WarmupOutcome::JinjaFailed { stderr_tail } => {
+                    stop_if_we_started();
+                    anyhow::bail!(
+                        "llama-server failed even with --no-jinja:\n--- last stderr ---\n{stderr_tail}"
+                    )
+                }
+            }
+        }
+    };
+    let _ = SERVER_PORT.set(port);
+    Ok(port)
+}
+
+enum WarmupOutcome {
+    Ready(u16),
+    JinjaFailed { stderr_tail: String },
+}
+
+async fn try_spawn_and_warmup(
+    bin: &Path,
+    cache_path: &Path,
+    cache_hit: bool,
+    extra_args: &[&str],
+) -> Result<WarmupOutcome> {
     let port = alloc_free_port()?;
     if !cache_hit {
         eprintln!(
@@ -631,18 +671,27 @@ pub async fn ensure_ready(model: &HfModelRef) -> Result<u16> {
         );
     }
 
-    let child = Command::new(&bin)
-        .arg("-m")
-        .arg(&cache_path)
+    let mut cmd = Command::new(bin);
+    cmd.arg("-m")
+        .arg(cache_path)
         .arg("--port")
         .arg(port.to_string())
         .arg("--host")
-        .arg("127.0.0.1")
+        .arg("127.0.0.1");
+    for a in extra_args {
+        cmd.arg(a);
+    }
+    let mut child = cmd
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
         .spawn()
         .with_context(|| format!("Failed to spawn llama-server at {}", bin.display()))?;
+
+    // Drain stderr into a bounded ring so the tail survives until the
+    // warmup loop decides whether to surface it.
+    let stderr = child.stderr.take().expect("stderr was piped");
+    let drain = start_stderr_drain(stderr);
 
     // Per-process ownership: each aivo kills its own child unconditionally
     // on graceful exit. A cross-process refcount would leak servers when
@@ -650,49 +699,129 @@ pub async fn ensure_ready(model: &HfModelRef) -> Result<u16> {
     if let Ok(mut slot) = child_slot().lock() {
         *slot = Some(child);
     }
-    let _ = SERVER_PORT.set(port);
 
-    // Animated spinner with elapsed-time label. llama-server's own stdout/
-    // stderr are nulled, so without this the user sees no signal during a
-    // multi-GB first-run download or the brief warmup after a cache hit.
+    // Animated spinner with elapsed-time label. llama-server's own stdout
+    // is still nulled (verbose progress), but stderr is now mirrored on
+    // failure paths so the user can see real errors instead of timing out.
     let label = Arc::new(Mutex::new(spinner_label(0)));
     let (spinning, handle) = crate::style::start_spinner_with_label(label.clone());
 
     let started = Instant::now();
-    let result = wait_until_healthy(port, label, started).await;
+    let outcome = wait_until_healthy(port, label, started, &drain).await;
 
     crate::style::stop_spinner(&spinning);
     let _ = handle.await;
 
-    // Only announce readiness on slow paths (cache miss, or warmup > 3s).
-    // Cache-hit + fast warmup is the common case; staying quiet keeps
-    // the one-shot stdout output clean.
-    if result.is_ok() && (!cache_hit || started.elapsed().as_secs() >= 3) {
-        eprintln!(
-            "  {} llama-server ready ({}s)",
-            crate::style::success_symbol(),
-            started.elapsed().as_secs()
-        );
+    match outcome {
+        WaitOutcome::Healthy => {
+            if !cache_hit || started.elapsed().as_secs() >= 3 {
+                eprintln!(
+                    "  {} llama-server ready ({}s)",
+                    crate::style::success_symbol(),
+                    started.elapsed().as_secs()
+                );
+            }
+            Ok(WarmupOutcome::Ready(port))
+        }
+        WaitOutcome::ChildExited => {
+            let tail = drain.snapshot();
+            if is_jinja_template_error(&tail) {
+                Ok(WarmupOutcome::JinjaFailed { stderr_tail: tail })
+            } else {
+                stop_if_we_started();
+                anyhow::bail!(
+                    "llama-server exited during warmup on port {port}.\n--- last stderr ---\n{tail}"
+                )
+            }
+        }
+        WaitOutcome::Timeout => {
+            let tail = drain.snapshot();
+            stop_if_we_started();
+            anyhow::bail!(
+                "llama-server did not become ready within 10 minutes on port {port}.\n\
+                 --- last stderr ---\n{tail}"
+            )
+        }
     }
-    result
+}
+
+enum WaitOutcome {
+    Healthy,
+    ChildExited,
+    Timeout,
 }
 
 /// 10-minute health-poll budget accommodates first-run model loads.
-async fn wait_until_healthy(port: u16, label: Arc<Mutex<String>>, started: Instant) -> Result<u16> {
+/// Returns early if the stderr drain reports the child has exited.
+async fn wait_until_healthy(
+    port: u16,
+    label: Arc<Mutex<String>>,
+    started: Instant,
+    drain: &StderrDrain,
+) -> WaitOutcome {
     let client = local_client(Duration::from_secs(2));
     for _ in 0..600 {
         if check_health(&client, port).await {
-            return Ok(port);
+            return WaitOutcome::Healthy;
+        }
+        if drain.exited() {
+            return WaitOutcome::ChildExited;
         }
         if let Ok(mut s) = label.lock() {
             *s = spinner_label(started.elapsed().as_secs());
         }
         tokio::time::sleep(Duration::from_secs(1)).await;
     }
-    anyhow::bail!(
-        "llama-server did not become ready within 10 minutes on port {port}. \
-         Inspect the model size and your network, then try again."
-    )
+    WaitOutcome::Timeout
+}
+
+/// Captures the last `STDERR_TAIL_LINES` lines from llama-server's stderr
+/// and signals when the stream ends (which on llama-server coincides with
+/// process exit).
+struct StderrDrain {
+    tail: Arc<Mutex<VecDeque<String>>>,
+    exited: Arc<AtomicBool>,
+}
+
+const STDERR_TAIL_LINES: usize = 80;
+
+impl StderrDrain {
+    fn exited(&self) -> bool {
+        self.exited.load(Ordering::Relaxed)
+    }
+
+    fn snapshot(&self) -> String {
+        match self.tail.lock() {
+            Ok(t) => t.iter().cloned().collect::<Vec<_>>().join("\n"),
+            Err(_) => String::new(),
+        }
+    }
+}
+
+fn start_stderr_drain(stderr: ChildStderr) -> StderrDrain {
+    let tail = Arc::new(Mutex::new(VecDeque::with_capacity(STDERR_TAIL_LINES)));
+    let exited = Arc::new(AtomicBool::new(false));
+    let tail_writer = tail.clone();
+    let exited_writer = exited.clone();
+    std::thread::spawn(move || {
+        use std::io::{BufRead, BufReader};
+        let reader = BufReader::new(stderr);
+        for line in reader.lines().map_while(Result::ok) {
+            if let Ok(mut t) = tail_writer.lock() {
+                if t.len() == STDERR_TAIL_LINES {
+                    t.pop_front();
+                }
+                t.push_back(line);
+            }
+        }
+        exited_writer.store(true, Ordering::Relaxed);
+    });
+    StderrDrain { tail, exited }
+}
+
+fn is_jinja_template_error(stderr_tail: &str) -> bool {
+    stderr_tail.contains("chat template parsing error")
+        || (stderr_tail.contains("--no-jinja") && stderr_tail.contains("template"))
 }
 
 fn spinner_label(elapsed_secs: u64) -> String {
@@ -1792,6 +1921,24 @@ mod tests {
     #[test]
     fn local_openai_base_url_formats_correctly() {
         assert_eq!(local_openai_base_url(48721), "http://127.0.0.1:48721/v1");
+    }
+
+    #[test]
+    fn jinja_template_error_detected_from_real_llama_server_output() {
+        let tail = "srv          init: init: chat template parsing error: Unable to generate parser for this template. Automatic parser generation failed:\n\
+                    While executing FilterExpression at line 6, column 86 in source:\n\
+                    Error: Unknown (built-in) filter 'tojson' for type Undefined (hint: 'tools')\n\
+                    srv          init: init: please consider disabling jinja via --no-jinja, or use a custom chat template via --chat-template\n\
+                    main: exiting due to model loading error";
+        assert!(is_jinja_template_error(tail));
+    }
+
+    #[test]
+    fn jinja_template_error_not_triggered_by_unrelated_failures() {
+        assert!(!is_jinja_template_error(
+            "llama_model_load: error loading model: failed to mmap"
+        ));
+        assert!(!is_jinja_template_error(""));
     }
 
     #[test]
