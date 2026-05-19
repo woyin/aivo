@@ -1,5 +1,16 @@
 # Changelog
 
+## v0.22.0
+
+## Features
+
+- Run HuggingFace GGUFs locally: `aivo claude|chat|serve hf:owner/repo`, plus `aivo hf <list|pull|rm|clean>` for the cache.
+- Bare prompt shortcut: `aivo "hello"` runs `aivo chat -p "hello"`. One-shot flag renamed to `-p`/`--prompt`.
+- `aivo claude`: routed model now shows up in Claude Code's `/model` picker.
+- `aivo keys export`: filters out OAuth and Copilot entries by default.
+
+---
+
 ## v0.21.6
 
 ## Features

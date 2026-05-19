@@ -875,11 +875,6 @@ fn print_help() {
         ("ping", "keys ping", "aivo keys ping --help"),
         ("share", "logs share", "aivo logs share --help"),
         ("-p", "chat -p", "one-shot; reads stdin when no value"),
-        (
-            "<text>",
-            "chat -p <text>",
-            "any non-subcommand arg → one-shot chat",
-        ),
         ("hf:/url", "chat <ref>", "open chat with a local HF model"),
         (
             "<tool>",
