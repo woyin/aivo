@@ -163,7 +163,7 @@ aivo pi -m hf:Qwen/Qwen2.5-0.5B-Instruct-GGUF                   # any tool that 
 
 The `hf:` form is accepted anywhere a model is — `-m`, chat's positional `REF`, and as a bare top-level arg (which rewrites to `aivo chat hf:...`). Full HuggingFace URLs (`https://huggingface.co/...`) work the same way.
 
-Manage the cached GGUF files (under `~/.aivo/cache/huggingface`):
+Manage the cached GGUF files (under `~/.config/aivo/cache/huggingface`):
 
 ```bash
 aivo hf                                       # list cached repos

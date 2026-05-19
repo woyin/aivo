@@ -45,7 +45,9 @@ impl HfCommand {
         println!();
         println!(
             "{}",
-            style::dim("Manage cached HuggingFace GGUF files under ~/.aivo/cache/huggingface.")
+            style::dim(
+                "Manage cached HuggingFace GGUF files under ~/.config/aivo/cache/huggingface."
+            )
         );
         println!();
         println!("{}", style::bold("Subcommands:"));

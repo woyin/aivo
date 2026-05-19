@@ -945,12 +945,48 @@ async fn stream_to_file(
     Ok(())
 }
 
+const HF_CACHE_REL: &str = ".config/aivo/cache/huggingface";
+const LEGACY_HF_CACHE_REL: &str = ".aivo/cache/huggingface";
+
+/// One-shot migration from the pre-0.23 cache location (`~/.aivo/cache/huggingface`)
+/// to the new one under `~/.config/aivo/`. Skips silently if the new directory
+/// already exists, so a downgrade-then-upgrade won't clobber recent downloads.
+fn migrate_legacy_cache_once() {
+    static DONE: OnceLock<()> = OnceLock::new();
+    DONE.get_or_init(|| {
+        let Some(home) = system_env::home_dir() else {
+            return;
+        };
+        let old = home.join(LEGACY_HF_CACHE_REL);
+        let new = home.join(HF_CACHE_REL);
+        if !old.is_dir() || new.exists() {
+            return;
+        }
+        if let Some(parent) = new.parent()
+            && std::fs::create_dir_all(parent).is_err()
+        {
+            return;
+        }
+        if std::fs::rename(&old, &new).is_ok() {
+            eprintln!(
+                "  {} Moved HuggingFace cache: {} → {}",
+                crate::style::success_symbol(),
+                old.display(),
+                new.display()
+            );
+            let _ = std::fs::remove_dir(home.join(".aivo/cache"));
+            let _ = std::fs::remove_dir(home.join(".aivo"));
+        }
+    });
+}
+
 /// On-disk encoding:
 /// - `<owner>__<repo>/<flat-file>` for main revision
 /// - `<owner>__<repo>/@<rev>__<flat-file>` otherwise
 ///
 /// `<flat-file>` replaces `/` with `__` so the layout stays one level deep.
 fn local_cache_path(repo: &str, revision: &str, filename: &str) -> Result<PathBuf> {
+    migrate_legacy_cache_once();
     let home = system_env::home_dir()
         .ok_or_else(|| anyhow::anyhow!("Cannot determine home directory for model cache"))?;
     let sanitized_repo = repo.replace('/', "__");
@@ -960,14 +996,12 @@ fn local_cache_path(repo: &str, revision: &str, filename: &str) -> Result<PathBu
     } else {
         format!("@{revision}__{flat}")
     };
-    Ok(home
-        .join(".aivo/cache/huggingface")
-        .join(sanitized_repo)
-        .join(on_disk))
+    Ok(home.join(HF_CACHE_REL).join(sanitized_repo).join(on_disk))
 }
 
 pub fn cache_root() -> Option<PathBuf> {
-    system_env::home_dir().map(|h| h.join(".aivo/cache/huggingface"))
+    migrate_legacy_cache_once();
+    system_env::home_dir().map(|h| h.join(HF_CACHE_REL))
 }
 
 #[derive(Debug, Clone)]
@@ -1672,10 +1706,11 @@ mod tests {
     #[test]
     fn local_cache_path_is_under_aivo_cache() {
         let sep = std::path::MAIN_SEPARATOR;
-        let file_segment = format!("bartowski__Llama-3.2-3B-Instruct-GGUF{sep}x.gguf");
+        let dir_segment = format!(
+            ".config{sep}aivo{sep}cache{sep}huggingface{sep}bartowski__Llama-3.2-3B-Instruct-GGUF{sep}x.gguf"
+        );
         let p = local_cache_path("bartowski/Llama-3.2-3B-Instruct-GGUF", "main", "x.gguf").unwrap();
         let s = p.to_string_lossy();
-        assert!(s.contains(".aivo/cache/huggingface"), "got {s}");
-        assert!(s.contains(&file_segment), "got {s}");
+        assert!(s.contains(&dir_segment), "got {s}");
     }
 }
