@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use futures::StreamExt;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use tokio::io::AsyncWriteExt;
 
 use crate::services::http_debug::LoggedSend;
@@ -718,6 +718,15 @@ struct TreeEntry {
 }
 
 async fn resolve_gguf_file(model: &HfModelRef) -> Result<ResolvedGgufFile> {
+    if let Some(cached) = load_cached_metadata(model) {
+        return Ok(cached);
+    }
+    let resolved = resolve_gguf_file_uncached(model).await?;
+    save_cached_metadata(model, &resolved);
+    Ok(resolved)
+}
+
+async fn resolve_gguf_file_uncached(model: &HfModelRef) -> Result<ResolvedGgufFile> {
     let mut current = model.clone();
     loop {
         let revision = current.revision.as_deref().unwrap_or("main");
@@ -983,6 +992,89 @@ fn urlencode(s: &str) -> String {
         }
     }
     out
+}
+
+/// Time-To-Live for cached tree-API/HEAD results. `main` is mutable, so we
+/// don't want infinite reuse; 4h matches the user's tolerance for staleness
+/// (a re-uploaded GGUF would mismatch `size_bytes` at download time and
+/// invalidate naturally via the existing `m.len() == resolved.size_bytes`
+/// check in `ensure_cached`).
+const METADATA_TTL_SECS: u64 = 4 * 60 * 60;
+
+#[derive(Serialize, Deserialize)]
+struct CachedMetadata {
+    cached_at_unix: u64,
+    repo: String,
+    revision: String,
+    filename: String,
+    download_url: String,
+    size_bytes: u64,
+}
+
+fn metadata_cache_path(model: &HfModelRef) -> Option<PathBuf> {
+    let root = cache_root()?;
+    // Key on the *input* ref so a mirror pick made in a prior session is
+    // remembered. `_` stands in for `None` to keep the filename unambiguous.
+    let key = format!(
+        "{}__{}__{}__{}.json",
+        model.repo.replace('/', "__"),
+        model.revision.as_deref().unwrap_or("main"),
+        model
+            .file
+            .as_deref()
+            .map(|f| f.replace('/', "__"))
+            .unwrap_or_else(|| "_".to_string()),
+        model.quant.as_deref().unwrap_or("_"),
+    );
+    Some(root.join("_meta").join(key))
+}
+
+fn load_cached_metadata(model: &HfModelRef) -> Option<ResolvedGgufFile> {
+    if std::env::var("AIVO_HF_NO_META_CACHE").is_ok() {
+        return None;
+    }
+    let path = metadata_cache_path(model)?;
+    let data = std::fs::read_to_string(&path).ok()?;
+    let entry: CachedMetadata = serde_json::from_str(&data).ok()?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_secs();
+    if now.saturating_sub(entry.cached_at_unix) > METADATA_TTL_SECS {
+        return None;
+    }
+    Some(ResolvedGgufFile {
+        repo: entry.repo,
+        revision: entry.revision,
+        filename: entry.filename,
+        download_url: entry.download_url,
+        size_bytes: entry.size_bytes,
+    })
+}
+
+fn save_cached_metadata(model: &HfModelRef, resolved: &ResolvedGgufFile) {
+    let Some(path) = metadata_cache_path(model) else {
+        return;
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let entry = CachedMetadata {
+        cached_at_unix: now,
+        repo: resolved.repo.clone(),
+        revision: resolved.revision.clone(),
+        filename: resolved.filename.clone(),
+        download_url: resolved.download_url.clone(),
+        size_bytes: resolved.size_bytes,
+    };
+    let Ok(json) = serde_json::to_string(&entry) else {
+        return;
+    };
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(&path, json);
 }
 
 async fn head_content_length(url: &str) -> Result<u64> {
