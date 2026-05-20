@@ -1,5 +1,17 @@
 # Changelog
 
+## v0.22.1
+
+## Improvements
+
+- `aivo hf`: accept local `.gguf` paths anywhere an `hf:` ref is accepted.
+- `aivo hf`: resume interrupted GGUF downloads via HTTP Range requests.
+- `aivo update` (npm path): show download progress and the resolved version on Windows.
+- `aivo hf`: surface `llama-server` stderr on launch failure and auto-retry on Jinja chat-template errors.
+- Windows: build all home-relative paths (HF cache, config dirs) with platform separators.
+
+---
+
 ## v0.22.0
 
 ## Features
