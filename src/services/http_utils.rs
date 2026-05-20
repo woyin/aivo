@@ -693,6 +693,7 @@ pub fn aivo_http_client_builder() -> reqwest::ClientBuilder {
     if force_ipv4_enabled() {
         builder = builder.local_address(Some(std::net::Ipv4Addr::UNSPECIFIED.into()));
     }
+    #[cfg(target_env = "musl")]
     if crate::services::termux_exec::is_termux() {
         builder = builder.dns_resolver(crate::services::dns_resolver::termux_dns_resolver());
     }

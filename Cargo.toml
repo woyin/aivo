@@ -56,6 +56,9 @@ url = "2"
 # MP3 / FLAC / Vorbis. AAC / Opus / PCM fall through to the system-player
 # path in playback.rs.
 rodio = { version = "0.20", optional = true }
+
+[target.'cfg(target_env = "musl")'.dependencies]
+# Static-musl needs an explicit DNS resolver; see src/services/dns_resolver.rs.
 hickory-resolver = "0.26.1"
 
 [target.'cfg(unix)'.dependencies]
