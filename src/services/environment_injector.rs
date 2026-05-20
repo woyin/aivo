@@ -1447,6 +1447,7 @@ mod tests {
     #[test]
     fn test_for_claude_anthropic_native_direct() {
         // Official Anthropic endpoints bypass all routers.
+        let _guard = debug_off_guard();
         let injector = EnvironmentInjector::new();
         let mut key = test_key();
         key.base_url = "https://api.anthropic.com/v1".to_string();
