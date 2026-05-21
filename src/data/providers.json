@@ -28,6 +28,7 @@
   {"id":"nvidia","name":"Nvidia","base_url":"https://integrate.api.nvidia.com/v1"},
   {"id":"opencode-zen","name":"OpenCode Zen","base_url":"https://opencode.ai/zen/v1"},
   {"id":"opencode-go","name":"OpenCode Go","base_url":"https://opencode.ai/zen/go/v1"},
+  {"id":"commandcode","name":"Command Code","base_url":"https://api.commandcode.ai/provider/v1"},
   {"id":"kilo","name":"Kilo Gateway","base_url":"https://api.kilo.ai/api/gateway"},
   {"id":"nova","name":"Nova","base_url":"https://api.nova.amazon.com/v1"},
   {"id":"poe","name":"Poe","base_url":"https://api.poe.com/v1"},
