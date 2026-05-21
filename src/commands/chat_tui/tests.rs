@@ -562,6 +562,7 @@ fn make_test_app(
         frame_tick: 0,
         picker_hitbox: None,
         exit_confirm_pending: false,
+        cursor_acp_session: None,
     }
 }
 

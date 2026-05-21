@@ -354,6 +354,10 @@ const GEMINI_OAUTH_INFO: (&str, &str) = (
     "Gemini (Google)",
     "sign in with Google — multiple accounts supported",
 );
+const CURSOR_INFO: (&str, &str) = (
+    "Cursor",
+    "uses cursor-agent login or CURSOR_API_KEY for model discovery",
+);
 const OLLAMA_INFO: (&str, &str) = ("Ollama", "install: ollama.com/download");
 const STARTER_INFO: (&str, &str) = ("aivo starter", "free shared key, no signup needed");
 
@@ -691,6 +695,34 @@ async fn probe_key(key: &ApiKey) -> Result<PingStatus> {
                 Err(_) => Ok(PingStatus::AuthError),
             }
         }
+        ModelListingStrategy::CursorAcp => {
+            if crate::services::cursor_acp::is_legacy_cursor_login_secret(key.key.as_str()) {
+                return Ok(PingStatus::AuthError);
+            }
+            match crate::services::cursor_acp::parse_cursor_shadow_secret(key.key.as_str()) {
+                // OAuth shadow → `cursor-agent status` is authoritative.
+                Some(parsed) if parsed.api_key.is_none() => {
+                    match crate::services::cursor_acp::cursor_status_authenticated_for_key(key)
+                        .await
+                    {
+                        Ok(true) => Ok(PingStatus::Ok),
+                        Ok(false) => Ok(PingStatus::AuthError),
+                        Err(_) => Ok(PingStatus::Unreachable),
+                    }
+                }
+                // API-key shadow → `status` can't validate the key, so
+                // we just confirm cursor-agent is installed. The key is
+                // exercised on the first real request.
+                Some(_) => match crate::services::cursor_acp::ensure_cursor_agent_installed() {
+                    Ok(()) => Ok(PingStatus::Ok),
+                    Err(_) => Ok(PingStatus::Unreachable),
+                },
+                None => match crate::services::cursor_acp::ensure_cursor_agent_installed() {
+                    Ok(()) => Ok(PingStatus::Ok),
+                    Err(_) => Ok(PingStatus::Unreachable),
+                },
+            }
+        }
         ModelListingStrategy::Google => {
             let url = format!(
                 "https://generativelanguage.googleapis.com/v1beta/models?key={}",
@@ -826,6 +858,7 @@ impl KeysCommand {
             Some("use") => self.use_key(first).await,
             Some("cat") => self.cat_key(first).await,
             Some("edit") => self.edit_key(first).await,
+            Some("reauth") => self.reauth_key(first).await,
             Some("ping") => self.ping_keys(first, keys_args.all).await,
             Some("reset-route") => self.reset_route(first).await,
             Some("export") => self.export_keys_action(first, keys_args).await,
@@ -1149,7 +1182,7 @@ impl KeysCommand {
         }
         if filter_report.skipped_oauth > 0 {
             println!(
-                "{} Skipped {} OAuth/Copilot login session{} — pass {} to include.",
+                "{} Skipped {} OAuth/Copilot/Cursor login session{} — pass {} to include.",
                 style::dim("·"),
                 filter_report.skipped_oauth,
                 plural(filter_report.skipped_oauth),
@@ -1433,11 +1466,13 @@ impl KeysCommand {
             return self.edit_bedrock_key(key, &current_region).await;
         }
 
-        // OAuth entries hold a serialized credential bundle in the encrypted
-        // key slot — there is no meaningful base URL or user-editable "API
-        // key" to change. Only the display name is safe to edit; everything
-        // else is preserved verbatim.
-        if key.is_any_oauth() {
+        // OAuth and cursor shadow entries hold credential blobs or
+        // sentinels in their slots — there is no meaningful base URL or
+        // user-editable "API key" to change in place. Only the display
+        // name is safe to edit; everything else is preserved verbatim.
+        // (To swap a cursor key's API key or re-login, `keys rm` then
+        // `keys add cursor`.)
+        if key.is_any_oauth() || key.is_cursor_acp() {
             let current_name = if key.name.is_empty() {
                 format!("unnamed; shown as {}", key.short_id())
             } else {
@@ -1587,6 +1622,133 @@ impl KeysCommand {
     /// form) and substitute the region by hand. Instead we extract the
     /// region from the stored URL, show the same fuzzy picker the add
     /// flow uses (pre-selected on the current region), and substitute
+    /// Re-authenticate a key without removing it.
+    ///
+    /// - OAuth keys (claude / codex / gemini): drive the standard
+    ///   browser-login flow and replace the stored credential blob.
+    /// - Cursor OAuth shadow: re-run `cursor-agent login` against the
+    ///   existing shadow so the same aivo key id keeps working.
+    /// - Cursor API-key shadow: prompt for a fresh key and update the
+    ///   embedded value in place.
+    ///
+    /// Plain REST API keys aren't supported (they're a single value with
+    /// no re-auth concept — use `keys edit` to rotate manually).
+    async fn reauth_key(&self, key_id_or_name: Option<&str>) -> Result<ExitCode> {
+        let key = match self
+            .resolve_key_selection(
+                key_id_or_name,
+                "Select a key to re-authenticate",
+                "No API keys found.",
+            )
+            .await?
+        {
+            KeySelection::Key(mut k) => {
+                SessionStore::decrypt_key_secret(&mut k)?;
+                k
+            }
+            KeySelection::Cancelled => {
+                println!("{}", style::dim("Cancelled."));
+                return Ok(ExitCode::Success);
+            }
+            KeySelection::Empty => return Ok(ExitCode::Success),
+            KeySelection::NotFound => return Ok(ExitCode::UserError),
+        };
+
+        if key.is_any_oauth() {
+            match crate::services::oauth_relogin::relogin_key(&self.session_store, &key).await {
+                Ok(_) => {
+                    println!(
+                        "{} Re-authenticated: {}",
+                        style::success_symbol(),
+                        style::cyan(key.display_name())
+                    );
+                    Ok(ExitCode::Success)
+                }
+                Err(e) => {
+                    eprintln!("{} {e}", style::red("Error:"));
+                    Ok(ExitCode::UserError)
+                }
+            }
+        } else if key.is_cursor_acp() {
+            self.reauth_cursor_key(&key).await
+        } else {
+            eprintln!(
+                "{} `keys reauth` only applies to OAuth or cursor keys. Use `keys edit` to rotate a plain API key.",
+                style::red("Error:")
+            );
+            Ok(ExitCode::UserError)
+        }
+    }
+
+    /// Cursor-specific reauth — preserves the shadow account id, so the
+    /// aivo key id (and every downstream reference) keeps working.
+    async fn reauth_cursor_key(&self, key: &ApiKey) -> Result<ExitCode> {
+        use crate::services::cursor_acp;
+        use crate::services::cursor_home_shadow::CursorShadow;
+
+        let Some(parsed) = cursor_acp::parse_cursor_shadow_secret(key.key.as_str()) else {
+            eprintln!(
+                "{} This cursor key isn't shadow-backed (legacy or raw). Remove it (`aivo keys rm`) and re-add (`aivo keys add cursor`).",
+                style::red("Error:")
+            );
+            return Ok(ExitCode::UserError);
+        };
+
+        let shadow = CursorShadow::for_account_id(parsed.account_id.to_string())?;
+        // ensure() is idempotent — re-creates dirs / keychain if the
+        // shadow got partially deleted while the aivo key survived.
+        shadow.ensure()?;
+
+        let new_secret = if parsed.api_key.is_some() {
+            let entered = term_read_line(&style::dim("New Cursor API key: "))?;
+            let trimmed = entered.trim();
+            if trimmed.is_empty() {
+                println!("{}", style::dim("Cancelled."));
+                return Ok(ExitCode::Success);
+            }
+            if trimmed.contains(':') {
+                eprintln!(
+                    "{} Cursor API keys must not contain ':'. Double-check what you pasted.",
+                    style::red("Error:")
+                );
+                return Ok(ExitCode::UserError);
+            }
+            cursor_acp::build_cursor_apikey_secret(&shadow.account_id, trimmed)
+        } else {
+            if let Err(e) = cursor_acp::run_cursor_login_for_shadow(&shadow).await {
+                eprintln!("{} {e}", style::red("Error:"));
+                return Ok(ExitCode::UserError);
+            }
+            if !cursor_acp::cursor_status_authenticated_for_shadow(&shadow)
+                .await
+                .unwrap_or(false)
+            {
+                eprintln!(
+                    "{} Cursor login was not confirmed by `cursor-agent status`.",
+                    style::red("Error:")
+                );
+                return Ok(ExitCode::UserError);
+            }
+            cursor_acp::build_cursor_oauth_secret(&shadow.account_id)
+        };
+
+        self.session_store
+            .update_key(
+                &key.id,
+                &key.name,
+                &key.base_url,
+                key.claude_protocol,
+                &new_secret,
+            )
+            .await?;
+        println!(
+            "{} Re-authenticated: {}",
+            style::success_symbol(),
+            style::cyan(key.display_name())
+        );
+        Ok(ExitCode::Success)
+    }
+
     /// the new region back into the existing URL — preserving the
     /// runtime-vs-mantle form the user originally chose.
     ///
@@ -1689,6 +1851,7 @@ impl KeysCommand {
             CodexOAuth,
             ClaudeOAuth,
             GeminiOAuth,
+            Cursor,
             Ollama,
             Starter,
             Custom,
@@ -1725,6 +1888,7 @@ impl KeysCommand {
                     "Gemini (Google)",
                     "browser login — multi-account".to_string(),
                 ),
+                ProviderChoice::Cursor => ("Cursor", "cursor-agent login/API key".to_string()),
                 ProviderChoice::Starter => ("aivo starter", "free".to_string()),
                 ProviderChoice::Custom => ("Custom URL", "enter manually".to_string()),
             }
@@ -1760,6 +1924,7 @@ impl KeysCommand {
                     "codex" => Some(ProviderChoice::CodexOAuth),
                     "claude" => Some(ProviderChoice::ClaudeOAuth),
                     "gemini" => Some(ProviderChoice::GeminiOAuth),
+                    "cursor" => Some(ProviderChoice::Cursor),
                     _ => None,
                 }
             } else {
@@ -1792,6 +1957,7 @@ impl KeysCommand {
             ProviderChoice::CodexOAuth,
             ProviderChoice::ClaudeOAuth,
             ProviderChoice::GeminiOAuth,
+            ProviderChoice::Cursor,
         ] {
             if hoisted_special == Some(choice) {
                 continue;
@@ -1842,6 +2008,7 @@ impl KeysCommand {
             ProviderChoice::CodexOAuth => self.add_codex_oauth_interactive(name).await,
             ProviderChoice::ClaudeOAuth => self.add_claude_oauth_interactive(name).await,
             ProviderChoice::GeminiOAuth => self.add_gemini_oauth_interactive(name).await,
+            ProviderChoice::Cursor => self.add_cursor_interactive(name, None).await,
             ProviderChoice::Ollama => self.add_ollama_interactive(name).await,
             ProviderChoice::Starter => self.add_starter_interactive(name).await,
             ProviderChoice::Custom => self.add_custom_interactive(name).await,
@@ -2093,6 +2260,171 @@ impl KeysCommand {
         Ok(ExitCode::Success)
     }
 
+    async fn add_cursor_interactive(
+        &self,
+        name: &str,
+        explicit_key: Option<&str>,
+    ) -> Result<ExitCode> {
+        keys_ui::provider_info(CURSOR_INFO.0, CURSOR_INFO.1);
+
+        // Cursor keys are multi-account — each `aivo keys add cursor`
+        // produces a fresh isolated shadow account. No replace prompt; if
+        // the user wants to swap accounts, they remove + add.
+
+        keys_ui::step_header(3, 3, "Credentials", "checking cursor-agent");
+
+        // Always allocate a shadow first so cursor-agent's per-account
+        // state (auth.json, cli-config.json, projects/, chats/,
+        // acp-sessions/) stays out of the user's real ~/.cursor regardless
+        // of auth mode.
+        let shadow = crate::services::cursor_home_shadow::CursorShadow::create_new()?;
+
+        let secret = match self.resolve_cursor_auth(explicit_key, &shadow).await {
+            Ok(Some(s)) => s,
+            Ok(None) => {
+                let _ = shadow.delete();
+                println!("{}", style::dim("Cancelled."));
+                return Ok(ExitCode::Success);
+            }
+            Err(code) => {
+                let _ = shadow.delete();
+                return Ok(code);
+            }
+        };
+        let shadow_to_cleanup_on_abort = Some(shadow);
+
+        let final_name = if name.is_empty() { "cursor" } else { name };
+        let id = match self
+            .session_store
+            .add_key_with_protocol(final_name, "cursor", None, &secret)
+            .await
+        {
+            Ok(id) => id,
+            Err(e) => {
+                if let Some(shadow) = shadow_to_cleanup_on_abort {
+                    let _ = shadow.delete();
+                }
+                return Err(e);
+            }
+        };
+        self.finalize_add(
+            &id,
+            final_name,
+            "Provider: Cursor",
+            Some(("aivo models", "(list Cursor models)")),
+        )
+        .await?;
+        sync_models_in_background(&id, final_name);
+        Ok(ExitCode::Success)
+    }
+
+    /// Decide how the new cursor key authenticates. Returns:
+    /// - `Ok(Some(secret))` — secret to store in `key.key`.
+    /// - `Ok(None)` — user cancelled; caller cleans up.
+    /// - `Err(code)` — non-recoverable error; caller cleans up and exits
+    ///   with the given code.
+    async fn resolve_cursor_auth(
+        &self,
+        explicit_key: Option<&str>,
+        shadow: &crate::services::cursor_home_shadow::CursorShadow,
+    ) -> std::result::Result<Option<String>, ExitCode> {
+        use crate::services::cursor_acp;
+        use std::io::IsTerminal;
+
+        if let Some(key) = explicit_key {
+            return Ok(Some(cursor_acp::build_cursor_apikey_secret(
+                &shadow.account_id,
+                key,
+            )));
+        }
+        if let Ok(key) = std::env::var("CURSOR_API_KEY")
+            && !key.trim().is_empty()
+        {
+            println!("{}", style::dim("Using CURSOR_API_KEY from environment."));
+            return Ok(Some(cursor_acp::build_cursor_apikey_secret(
+                &shadow.account_id,
+                key.trim(),
+            )));
+        }
+
+        if !std::io::stderr().is_terminal() {
+            eprintln!(
+                "{} Cursor needs an interactive terminal for sign-in. Pass `--key sk-…` or set CURSOR_API_KEY for non-interactive setup.",
+                style::red("Error:")
+            );
+            return Err(ExitCode::UserError);
+        }
+
+        let chose_api_key = match self.prompt_cursor_auth_mode() {
+            Ok(Some(v)) => v,
+            Ok(None) => return Ok(None),
+            Err(_) => return Err(ExitCode::UserError),
+        };
+
+        if chose_api_key {
+            let entered = match term_read_line(&style::dim("Cursor API key: ")) {
+                Ok(s) => s,
+                Err(_) => return Err(ExitCode::UserError),
+            };
+            let trimmed = entered.trim();
+            if trimmed.is_empty() {
+                println!("{}", style::dim("Cancelled."));
+                return Ok(None);
+            }
+            // Reject `:` because the on-disk secret format uses it as a
+            // separator (`cursor-shadow:<id>:api:<key>`). Cursor's keys
+            // don't contain `:`, so this is safe and protective.
+            if trimmed.contains(':') {
+                eprintln!(
+                    "{} Cursor API keys must not contain ':'. Double-check what you pasted.",
+                    style::red("Error:")
+                );
+                return Err(ExitCode::UserError);
+            }
+            return Ok(Some(cursor_acp::build_cursor_apikey_secret(
+                &shadow.account_id,
+                trimmed,
+            )));
+        }
+
+        // OAuth login into the shadow.
+        if let Err(e) = cursor_acp::run_cursor_login_for_shadow(shadow).await {
+            eprintln!("{} {}", style::red("Error:"), e);
+            return Err(ExitCode::UserError);
+        }
+        if !cursor_acp::cursor_status_authenticated_for_shadow(shadow)
+            .await
+            .unwrap_or(false)
+        {
+            eprintln!(
+                "{} Cursor login was not confirmed by `cursor-agent status`.",
+                style::red("Error:")
+            );
+            return Err(ExitCode::UserError);
+        }
+        Ok(Some(cursor_acp::build_cursor_oauth_secret(
+            &shadow.account_id,
+        )))
+    }
+
+    /// Two-branch picker for cursor sign-in. Returns:
+    /// - `Ok(Some(true))` → API key (paste a Cursor API key)
+    /// - `Ok(Some(false))` → OAuth login (sign in via browser)
+    /// - `Ok(None)` → user cancelled (Esc / Ctrl-C)
+    fn prompt_cursor_auth_mode(&self) -> Result<Option<bool>> {
+        let items = vec![
+            "Sign in with browser  —  cursor-agent login (recommended)".to_string(),
+            "Paste a Cursor API key  —  from cursor.com → Settings → API Keys".to_string(),
+        ];
+        let selection = FuzzySelect::new()
+            .with_prompt("Authentication")
+            .items(&items)
+            .default(0)
+            .interact_opt()?;
+        restore_cooked_mode();
+        Ok(selection.map(|idx| idx == 1))
+    }
+
     async fn add_ollama_interactive(&self, name: &str) -> Result<ExitCode> {
         keys_ui::provider_info(OLLAMA_INFO.0, OLLAMA_INFO.1);
 
@@ -2252,6 +2584,13 @@ impl KeysCommand {
             );
             return Ok(ExitCode::UserError);
         }
+        if add_options.base_url == Some(crate::services::cursor_acp::CURSOR_ACP_SENTINEL) {
+            eprintln!(
+                "{} Cursor uses the cursor-agent flow. Use `aivo keys add cursor` instead of `--base-url cursor`.",
+                style::red("Error:")
+            );
+            return Ok(ExitCode::UserError);
+        }
 
         // Defensive: a previously-crashed invocation may have left the terminal
         // in raw mode, which breaks backspace in the first prompt.
@@ -2268,6 +2607,16 @@ impl KeysCommand {
         };
 
         let is_starter_name = name == "aivo-starter" || name == "aivo starter";
+        // `aivo keys add cursor --key sk-…` is the non-interactive shortcut
+        // into the cursor flow. Without `--key`, "cursor" is treated as a
+        // plain key name — users who want OAuth / API-key sub-pickers run
+        // `aivo keys add` (no args) and pick Cursor from the provider list.
+        let is_cursor_shortcut = name.eq_ignore_ascii_case("cursor")
+            && add_options.base_url.is_none()
+            && add_options.key.is_some();
+        if is_cursor_shortcut {
+            return self.add_cursor_interactive(&name, add_options.key).await;
+        }
         let interactive =
             add_options.base_url.is_none() && add_options.key.is_none() && !is_starter_name;
 
@@ -2305,6 +2654,10 @@ impl KeysCommand {
                 let picker_rejections: &[(&str, &str)] = &[
                     ("copilot", "GitHub Copilot login needs the device flow"),
                     ("ollama", "Ollama setup needs a local installation check"),
+                    (
+                        crate::services::cursor_acp::CURSOR_ACP_SENTINEL,
+                        "Cursor setup needs the cursor-agent flow",
+                    ),
                     (
                         crate::services::codex_oauth::CODEX_OAUTH_SENTINEL,
                         "Codex ChatGPT login needs browser auth",
@@ -2544,8 +2897,26 @@ impl KeysCommand {
             return Ok(ExitCode::Success);
         }
 
+        // Resolve any cursor shadow account before the key is gone, so the
+        // shadow dir can be removed once deletion succeeds.
+        let cursor_shadow_to_delete =
+            if crate::services::cursor_acp::is_cursor_acp_base(&key_to_remove.base_url) {
+                self.session_store
+                    .get_key_by_id(&key_to_remove.id)
+                    .await
+                    .ok()
+                    .flatten()
+                    .and_then(|key| crate::services::cursor_acp::cursor_shadow_for_key(&key).ok())
+                    .flatten()
+            } else {
+                None
+            };
+
         if self.session_store.delete_key(&key_to_remove.id).await? {
             let _ = self.session_store.remove_key_stats(&key_to_remove.id).await;
+            if let Some(shadow) = cursor_shadow_to_delete {
+                let _ = shadow.delete();
+            }
             // Remember if the user dismissed the aivo-starter key
             if key_to_remove.base_url == crate::constants::AIVO_STARTER_SENTINEL {
                 let _ = self.session_store.set_starter_key_dismissed(true).await;
@@ -2664,6 +3035,10 @@ fn print_help_overview() {
     keys_help_row("rm [id|name]", "Remove an API key");
     keys_help_row("add [name]", "Add an API key");
     keys_help_row("edit [id|name]", "Edit an API key");
+    keys_help_row(
+        "reauth [id|name]",
+        "Re-authenticate (OAuth re-login or rotate API key)",
+    );
     keys_help_row("ping [id|name]", "Health-check API keys (or: aivo ping)");
     keys_help_row(
         "reset-route [id|name]",
@@ -2731,6 +3106,7 @@ fn print_help_add() {
     println!();
     println!("{}", style::bold("Examples:"));
     println!("  {}", style::dim("aivo keys add"));
+    println!("  {}", style::dim("aivo keys add cursor"));
     println!("  {}", style::dim("aivo keys add openrouter"));
     println!(
         "  {}",
@@ -2830,7 +3206,7 @@ fn print_help_export() {
     );
     keys_help_row(
         "--include-oauth",
-        "Include OAuth/Copilot login sessions (off by default)",
+        "Include OAuth/Copilot/Cursor login sessions (off by default)",
     );
     keys_help_row("--force", "Overwrite an existing file at the target path");
     println!();
@@ -3203,6 +3579,88 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_add_cursor_with_key_stores_shadow_apikey_secret() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let config_path = temp_dir.path().join("config.json");
+        let store = crate::services::session_store::SessionStore::with_path(config_path);
+        let cmd = KeysCommand::new(store.clone());
+
+        let code = cmd
+            .execute(KeysArgs {
+                action: Some("add".to_string()),
+                args: vec!["cursor".to_string()],
+                name: None,
+                base_url: None,
+                key: Some("key_cursor_test".to_string()),
+                all: false,
+                ping: false,
+                json: false,
+                ids: Vec::new(),
+                password_stdin: false,
+                overwrite: false,
+                rename: false,
+                include_starter: false,
+                include_oauth: false,
+                force: false,
+            })
+            .await;
+
+        assert_eq!(code, crate::errors::ExitCode::Success);
+
+        let keys = store.get_keys().await.unwrap();
+        assert_eq!(keys.len(), 1);
+        assert_eq!(keys[0].name, "cursor");
+        assert_eq!(keys[0].base_url, "cursor");
+
+        let active = store.get_active_key().await.unwrap().unwrap();
+        assert_eq!(active.id, keys[0].id);
+
+        // Secret encodes a fresh shadow account + the embedded API key so
+        // launch_runtime can drive cursor-agent without re-prompting.
+        let parsed = crate::services::cursor_acp::parse_cursor_shadow_secret(active.key.as_str())
+            .expect("cursor secret must parse as a shadow secret");
+        assert!(!parsed.account_id.is_empty());
+        assert_eq!(parsed.api_key, Some("key_cursor_test"));
+
+        // Test leaves an empty shadow dir behind under
+        // $HOME/.config/aivo/cursor-accounts/<id>/. Clean it up to avoid
+        // polluting the developer's machine when tests run repeatedly.
+        if let Ok(Some(shadow)) = crate::services::cursor_acp::cursor_shadow_for_key(&active) {
+            let _ = shadow.delete();
+        }
+    }
+
+    #[tokio::test]
+    async fn test_add_key_rejects_manual_cursor_base_url() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let config_path = temp_dir.path().join("config.json");
+        let store = crate::services::session_store::SessionStore::with_path(config_path);
+        let cmd = KeysCommand::new(store);
+
+        let code = cmd
+            .execute(KeysArgs {
+                action: Some("add".to_string()),
+                args: Vec::new(),
+                name: Some("manual-cursor".to_string()),
+                base_url: Some("cursor".to_string()),
+                key: Some("sk-cursor-test".to_string()),
+                all: false,
+                ping: false,
+                json: false,
+                ids: Vec::new(),
+                password_stdin: false,
+                overwrite: false,
+                rename: false,
+                include_starter: false,
+                include_oauth: false,
+                force: false,
+            })
+            .await;
+
+        assert_eq!(code, crate::errors::ExitCode::UserError);
+    }
+
+    #[tokio::test]
     async fn test_add_key_rejects_conflicting_name_sources() {
         let temp_dir = tempfile::TempDir::new().unwrap();
         let config_path = temp_dir.path().join("config.json");
@@ -3510,21 +3968,40 @@ mod tests {
     fn display_secret_labels_oauth_and_copilot() {
         use crate::services::claude_oauth::CLAUDE_OAUTH_SENTINEL;
         use crate::services::codex_oauth::CODEX_OAUTH_SENTINEL;
+        use crate::services::cursor_acp::{CURSOR_ACP_SENTINEL, CURSOR_SHADOW_PREFIX};
         use crate::services::gemini_oauth::GEMINI_OAUTH_SENTINEL;
 
-        let cases = [
-            (CLAUDE_OAUTH_SENTINEL, "<Claude OAuth>"),
-            (CODEX_OAUTH_SENTINEL, "<Codex OAuth>"),
-            (GEMINI_OAUTH_SENTINEL, "<Gemini OAuth>"),
-            ("copilot", "<Copilot>"),
+        let cursor_shadow_secret = format!("{CURSOR_SHADOW_PREFIX}testaccount1");
+        let cases: [(&str, &str, &str); 5] = [
+            (
+                CLAUDE_OAUTH_SENTINEL,
+                "must-not-leak-this-credential-blob",
+                "<Claude OAuth>",
+            ),
+            (
+                CODEX_OAUTH_SENTINEL,
+                "must-not-leak-this-credential-blob",
+                "<Codex OAuth>",
+            ),
+            (
+                GEMINI_OAUTH_SENTINEL,
+                "must-not-leak-this-credential-blob",
+                "<Gemini OAuth>",
+            ),
+            ("copilot", "must-not-leak-this-credential-blob", "<Copilot>"),
+            (
+                CURSOR_ACP_SENTINEL,
+                cursor_shadow_secret.as_str(),
+                "<Cursor login>",
+            ),
         ];
-        for (base_url, expected) in cases {
+        for (base_url, secret, expected) in cases {
             let key = ApiKey::new_with_protocol(
                 "id".to_string(),
                 "name".to_string(),
                 base_url.to_string(),
                 None,
-                "must-not-leak-this-credential-blob".to_string(),
+                secret.to_string(),
             );
             let out = display_secret(&key);
             assert_eq!(out, expected, "base_url: {base_url}");

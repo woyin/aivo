@@ -32,7 +32,7 @@ impl ClaudeOAuthCredential {
 /// the parser strips ANSI and picks the last line matching a token shape
 /// (alphanumeric + `-` / `_`, byte length ≥ 20).
 pub fn extract_token_from_setup_output(stdout: &str) -> Option<String> {
-    let cleaned = strip_ansi(stdout);
+    let cleaned = crate::services::ansi::strip_ansi(stdout);
     cleaned
         .lines()
         .rev()
@@ -46,52 +46,6 @@ fn looks_like_token(s: &str) -> bool {
     s.len() >= 20
         && s.chars()
             .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
-}
-
-/// Strips CSI, OSC, and 2-byte ANSI escapes from terminal output. Good
-/// enough for Node/Ink CLIs; not a general-purpose VT parser.
-fn strip_ansi(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    let mut chars = s.chars().peekable();
-    while let Some(c) = chars.next() {
-        if c == '\x1b' {
-            match chars.peek() {
-                Some('[') => {
-                    // CSI: consume `[` and the rest until a terminator in @-~ range.
-                    chars.next();
-                    for nc in chars.by_ref() {
-                        if ('\x40'..='\x7e').contains(&nc) {
-                            break;
-                        }
-                    }
-                }
-                Some(']') => {
-                    // OSC: consume `]` then read until BEL or ST (`ESC \`).
-                    chars.next();
-                    while let Some(nc) = chars.next() {
-                        if nc == '\x07' {
-                            break;
-                        }
-                        if nc == '\x1b' && matches!(chars.peek(), Some('\\')) {
-                            chars.next();
-                            break;
-                        }
-                    }
-                }
-                Some(_) => {
-                    // Any other two-byte escape (`ESC N`, `ESC O`, `ESC =`,
-                    // `ESC (`, ...): swallow the next byte.
-                    chars.next();
-                }
-                None => {
-                    // Bare trailing ESC at EOF — just drop it.
-                }
-            }
-            continue;
-        }
-        out.push(c);
-    }
-    out
 }
 
 #[derive(Debug)]

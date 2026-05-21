@@ -721,9 +721,10 @@ impl AILauncher {
     ) -> Result<(Option<String>, Vec<String>)> {
         let requested_model = model.map(|m| m.strip_prefix("aivo/").unwrap_or(m).to_string());
         let client = crate::services::http_utils::router_http_client();
+        let cache_key = crate::commands::models::model_cache_key_for_key(key);
 
         // Check cache first — skip the spinner if we get a hit
-        let fetch_result = if let Some(cached) = self.cache.get(&key.base_url).await {
+        let fetch_result = if let Some(cached) = self.cache.get(&cache_key).await {
             Ok(cached)
         } else {
             // Cache miss: show spinner while fetching from network

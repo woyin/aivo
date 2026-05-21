@@ -56,6 +56,18 @@ impl ChatTuiApp {
         self.draft_history_stash = None;
         self.notice = None;
 
+        // If we have a live cursor ACP session, switch its model in place so
+        // the conversation context is preserved. Drop the session on failure
+        // so the next turn opens a fresh one with the new model.
+        let drop_session = if let Some(session) = self.cursor_acp_session.as_mut() {
+            session.set_model(&raw_model).await.is_err()
+        } else {
+            false
+        };
+        if drop_session {
+            self.cursor_acp_session = None;
+        }
+
         if !self.history.is_empty() {
             self.persist_history().await?;
         }
@@ -320,6 +332,9 @@ impl ChatTuiApp {
 
         self.resume_restore_state = Some(ResumeRestoreState::capture(self));
         self.clear_for_resume_loading();
+        // The new session id will come from storage; drop any live cursor ACP
+        // session since cursor doesn't know about the resumed session.
+        self.cursor_acp_session = None;
         self.resume_request_id = self.resume_request_id.wrapping_add(1);
         let request_id = self.resume_request_id;
         self.loading_resume = Some(LoadingResume {
@@ -451,7 +466,8 @@ async fn load_model_choices(
     match crate::commands::models::fetch_models_detailed(client, key).await {
         Ok(infos) => {
             let ids: Vec<String> = infos.iter().map(|m| m.id.clone()).collect();
-            cache.set(&key.base_url, ids).await;
+            let cache_key = crate::commands::models::model_cache_key_for_key(key);
+            cache.set(&cache_key, ids).await;
             infos
                 .into_iter()
                 .map(|m| ModelChoice {

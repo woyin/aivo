@@ -115,8 +115,8 @@ impl ApiKeyStore {
 
     /// Two categories are filtered unless explicitly opted in:
     /// - `aivo-starter` (device-bound; `include_starter`)
-    /// - OAuth / Copilot login sessions (account-bound subscription
-    ///   credentials — Claude, Codex, Gemini, Copilot; `include_oauth`)
+    /// - OAuth / login sessions (account-bound subscription credentials —
+    ///   Claude, Codex, Gemini, Copilot, Cursor login; `include_oauth`)
     ///
     /// Plain API keys always export. The filter exists so a casual export
     /// doesn't silently ship subscription access alongside provider keys.
@@ -158,7 +158,17 @@ impl ApiKeyStore {
         }
         if !include_oauth {
             let before = selected.len();
-            selected.retain(|k| !is_oauth_or_copilot_base(&k.base_url));
+            let mut retained = Vec::with_capacity(selected.len());
+            for mut key in selected {
+                let is_cursor_login =
+                    crate::services::cursor_acp::is_cursor_acp_base(&key.base_url)
+                        && Self::decrypt_key_secret(&mut key).is_ok()
+                        && crate::services::cursor_acp::cursor_account_id(&key).is_some();
+                if !is_oauth_or_copilot_base(&key.base_url) && !is_cursor_login {
+                    retained.push(key);
+                }
+            }
+            selected = retained;
             report.skipped_oauth = before - selected.len();
         }
 
@@ -789,6 +799,7 @@ mod tests {
     async fn export_skips_oauth_and_copilot_by_default() {
         use crate::services::claude_oauth::CLAUDE_OAUTH_SENTINEL;
         use crate::services::codex_oauth::CODEX_OAUTH_SENTINEL;
+        use crate::services::cursor_acp::{CURSOR_ACP_SENTINEL, CURSOR_SHADOW_PREFIX};
         use crate::services::gemini_oauth::GEMINI_OAUTH_SENTINEL;
 
         let temp_dir = TempDir::new().unwrap();
@@ -811,6 +822,15 @@ mod tests {
             .await
             .unwrap();
         store
+            .add_key_with_protocol(
+                "cursor",
+                CURSOR_ACP_SENTINEL,
+                None,
+                &format!("{CURSOR_SHADOW_PREFIX}testaccount1"),
+            )
+            .await
+            .unwrap();
+        store
             .add_key_with_protocol("alpha", "http://a", None, "sk-alpha")
             .await
             .unwrap();
@@ -818,10 +838,29 @@ mod tests {
         let (without, report) = store.export_keys(None, true, false).await.unwrap();
         assert_eq!(without.len(), 1);
         assert_eq!(without[0].name, "alpha");
-        assert_eq!(report.skipped_oauth, 4);
+        assert_eq!(report.skipped_oauth, 5);
 
         let (with, _) = store.export_keys(None, true, true).await.unwrap();
-        assert_eq!(with.len(), 5);
+        assert_eq!(with.len(), 6);
+    }
+
+    #[tokio::test]
+    async fn export_keeps_cursor_api_key_by_default() {
+        use crate::services::cursor_acp::CURSOR_ACP_SENTINEL;
+
+        let temp_dir = TempDir::new().unwrap();
+        let store = make_store(&temp_dir);
+
+        store
+            .add_key_with_protocol("cursor", CURSOR_ACP_SENTINEL, None, "sk-cursor")
+            .await
+            .unwrap();
+
+        let (without, report) = store.export_keys(None, true, false).await.unwrap();
+        assert_eq!(without.len(), 1);
+        assert_eq!(without[0].name, "cursor");
+        assert_eq!(without[0].key.as_str(), "sk-cursor");
+        assert_eq!(report.skipped_oauth, 0);
     }
 
     #[tokio::test]

@@ -8,10 +8,12 @@
 //!   new `base_url.contains(...)` branch.
 //! - Provider glue, optional features (audio/image/video/share), utilities.
 
+pub mod acp_client;
 pub mod ai_launcher;
 pub mod amp_bridge;
 pub mod amp_threads;
 pub mod amp_trust;
+pub mod ansi;
 pub mod anthropic_chat_request;
 pub mod anthropic_chat_response;
 pub mod anthropic_route_pipeline;
@@ -34,6 +36,9 @@ pub mod context_render;
 pub mod context_window;
 pub mod copilot_auth;
 pub mod copilot_router;
+pub mod cursor_acp;
+pub mod cursor_home_shadow;
+pub mod cursor_model_router;
 pub mod device_fingerprint;
 #[cfg(target_env = "musl")]
 pub mod dns_resolver;

@@ -293,8 +293,12 @@ impl ModelsCommand {
             return Ok(ExitCode::UserError);
         }
 
+        if key.is_cursor_acp() {
+            SessionStore::decrypt_key_secret(&mut key)?;
+        }
+
         let is_ollama = crate::services::provider_profile::is_ollama_base(&key.base_url);
-        let all_cache_key = full_catalog_key(&key.base_url);
+        let all_cache_key = full_catalog_cache_key_for_key(&key);
 
         // `aivo models` shows the provider's full catalog, including image,
         // audio, and embedding models. Chat pickers filter/annotate at their
@@ -304,7 +308,10 @@ impl ModelsCommand {
         let cached_entry = if refresh || is_ollama {
             None
         } else {
-            self.cache.get_with_metadata(&all_cache_key).await
+            self.cache
+                .get_with_metadata(&all_cache_key)
+                .await
+                .filter(|(ids, _)| !cursor_cache_looks_corrupt(&key, ids))
         };
 
         let mut models = if let Some((ids, meta)) = cached_entry {
@@ -723,6 +730,26 @@ fn build_metadata_map(models: &[ModelInfo]) -> HashMap<String, ModelMetadata> {
         .collect()
 }
 
+pub(crate) fn model_cache_key_for_key(key: &ApiKey) -> String {
+    if key.is_cursor_acp() {
+        crate::services::cursor_acp::cursor_models_cache_identity(key)
+    } else {
+        key.base_url.clone()
+    }
+}
+
+pub(crate) fn full_catalog_cache_key_for_key(key: &ApiKey) -> String {
+    if key.is_cursor_acp() {
+        // Cursor's `models` listing returns chat-capable ids only — there's no
+        // image/audio/embedding catalog to separate. Collapse the `#all`
+        // namespace into the bare key so `aivo models cursor`, the model
+        // picker, and the in-router cache (see `cursor_model_router::cached_models`)
+        // all hit a single shared entry on disk.
+        return model_cache_key_for_key(key);
+    }
+    full_catalog_key(&model_cache_key_for_key(key))
+}
+
 /// Rebuilds the `aivo models` row list from a cached id list and metadata
 /// map. Models present in `ids` but missing from `metadata` (e.g. Cloudflare
 /// id-only entries) render as plain rows.
@@ -751,10 +778,11 @@ pub(crate) async fn fetch_all_models_cached(
     bypass_cache: bool,
 ) -> Result<Vec<String>> {
     let is_ollama = crate::services::provider_profile::is_ollama_base(&key.base_url);
-    let cache_key = full_catalog_key(&key.base_url);
+    let cache_key = full_catalog_cache_key_for_key(key);
     if !bypass_cache
         && !is_ollama
         && let Some(cached) = cache.get(&cache_key).await
+        && !cursor_cache_looks_corrupt(key, &cached)
     {
         return Ok(cached);
     }
@@ -763,6 +791,19 @@ pub(crate) async fn fetch_all_models_cached(
         cache.set(&cache_key, models.clone()).await;
     }
     Ok(models)
+}
+
+/// Force-refetch when a cursor cache entry was populated by the older
+/// parser bug — historical builds turned cursor-agent's logged-out
+/// "No models available for this account." into the model id `No`, and
+/// shipped that into `~/.config/aivo/models-cache.json`.
+///
+/// The earlier "must contain a digit / hyphen / slash" heuristic was too
+/// broad: cursor's own catalog includes `auto` (no digit, no hyphen, no
+/// slash), so every cache entry was treated as corrupt and refetched on
+/// every call. Match the actual bad string instead.
+fn cursor_cache_looks_corrupt(key: &ApiKey, cached: &[String]) -> bool {
+    key.is_cursor_acp() && cached.iter().any(|id| id.trim() == "No")
 }
 
 /// Pure decision for `starter_model_still_available`: given a freshly-fetched
@@ -881,6 +922,10 @@ async fn fetch_models_detailed_filtered(
                 .filter(|m| is_copilot_chat_model(&m.id))
                 .map(|m| m.into_model_info())
                 .collect())
+        }
+        ModelListingStrategy::CursorAcp => {
+            let ids = crate::services::cursor_acp::list_cursor_models(key).await?;
+            Ok(ids.into_iter().map(ModelInfo::id_only).collect())
         }
         ModelListingStrategy::Google => {
             let url = build_google_models_url(base);
@@ -1080,15 +1125,16 @@ pub(crate) async fn fetch_models_cached(
 ) -> Result<Vec<String>> {
     // Ollama lists local models instantly — skip cache entirely.
     let is_ollama = crate::services::provider_profile::is_ollama_base(&key.base_url);
+    let cache_key = model_cache_key_for_key(key);
     if !bypass_cache
         && !is_ollama
-        && let Some(cached) = cache.get(&key.base_url).await
+        && let Some(cached) = cache.get(&cache_key).await
     {
         return Ok(cached);
     }
     let models = fetch_models(client, key).await?;
     if !is_ollama {
-        cache.set(&key.base_url, models.clone()).await;
+        cache.set(&cache_key, models.clone()).await;
     }
     Ok(models)
 }
@@ -1209,6 +1255,60 @@ mod tests {
             key: Zeroizing::new("sk-test".to_string()),
             created_at: "2026-01-01".to_string(),
         }
+    }
+
+    #[test]
+    fn cursor_cache_corrupt_predicate_rejects_logged_out_marker_only() {
+        // Regression: the previous heuristic ("must contain digit / hyphen /
+        // slash") rejected every cursor cache entry because `auto` is a real
+        // cursor model id with none of those characters. That defeated the
+        // disk cache entirely — every `aivo models` and every cursor router
+        // /v1/models hit refetched from cursor-agent.
+        let mut cursor_key = make_key(crate::services::cursor_acp::CURSOR_ACP_SENTINEL);
+        cursor_key.key = zeroize::Zeroizing::new(format!(
+            "{}testaccount1",
+            crate::services::cursor_acp::CURSOR_SHADOW_PREFIX
+        ));
+        let real_models = vec![
+            "auto".to_string(),
+            "composer-2.5".to_string(),
+            "claude-sonnet-4-6".to_string(),
+        ];
+        assert!(
+            !cursor_cache_looks_corrupt(&cursor_key, &real_models),
+            "`auto` is a real cursor model and must not flag the cache as corrupt"
+        );
+        // The original sentinel that the predicate exists to catch.
+        let bad_models = vec!["No".to_string()];
+        assert!(cursor_cache_looks_corrupt(&cursor_key, &bad_models));
+        // Non-cursor keys are unaffected.
+        let other = make_key("https://api.deepseek.com");
+        assert!(!cursor_cache_looks_corrupt(&other, &bad_models));
+    }
+
+    #[test]
+    fn full_catalog_cache_key_collapses_cursor_into_shared_namespace() {
+        // Cursor listings are chat-only, so `aivo models cursor` and the
+        // picker must hit a single cache entry. Other providers keep the
+        // `#all` namespace to separate the broad catalog from the chat
+        // picker's filtered list.
+        let mut cursor_key = make_key(crate::services::cursor_acp::CURSOR_ACP_SENTINEL);
+        cursor_key.key = zeroize::Zeroizing::new(format!(
+            "{}testaccount1",
+            crate::services::cursor_acp::CURSOR_SHADOW_PREFIX
+        ));
+        assert_eq!(
+            full_catalog_cache_key_for_key(&cursor_key),
+            model_cache_key_for_key(&cursor_key),
+        );
+        // Non-cursor keys retain the `#all` suffix so chat pickers don't
+        // inherit image/audio/embedding entries from the broad fetch.
+        let other = make_key("https://api.deepseek.com");
+        assert_ne!(
+            full_catalog_cache_key_for_key(&other),
+            model_cache_key_for_key(&other),
+        );
+        assert!(full_catalog_cache_key_for_key(&other).ends_with("#all"));
     }
 
     #[test]
@@ -1661,6 +1761,31 @@ mod tests {
         let rich = map.get("rich").unwrap();
         assert_eq!(rich.context_window, Some(128_000));
         assert_eq!(rich.max_output.as_deref(), Some("8K"));
+    }
+
+    #[test]
+    fn cursor_cache_key_separates_shadow_accounts_and_api_keys() {
+        let mut shadow_a = make_key(crate::services::cursor_acp::CURSOR_ACP_SENTINEL);
+        shadow_a.key = zeroize::Zeroizing::new(format!(
+            "{}aaaa1111",
+            crate::services::cursor_acp::CURSOR_SHADOW_PREFIX
+        ));
+        let mut shadow_b = make_key(crate::services::cursor_acp::CURSOR_ACP_SENTINEL);
+        shadow_b.key = zeroize::Zeroizing::new(format!(
+            "{}bbbb2222",
+            crate::services::cursor_acp::CURSOR_SHADOW_PREFIX
+        ));
+        let a = model_cache_key_for_key(&shadow_a);
+        let b = model_cache_key_for_key(&shadow_b);
+        assert!(a.starts_with("cursor#shadow-"));
+        assert_ne!(a, b);
+
+        let mut api = make_key(crate::services::cursor_acp::CURSOR_ACP_SENTINEL);
+        api.key = zeroize::Zeroizing::new("sk-cursor".to_string());
+        let cache_key = model_cache_key_for_key(&api);
+        assert!(cache_key.starts_with("cursor#"));
+        assert!(!cache_key.starts_with("cursor#shadow-"));
+        assert!(!cache_key.contains("sk-cursor"));
     }
 
     #[test]

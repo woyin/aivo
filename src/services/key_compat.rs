@@ -8,6 +8,7 @@
 //! command.
 
 use crate::services::ai_launcher::AIToolType;
+use crate::services::cursor_acp::is_cursor_acp_base;
 use crate::services::provider_profile::{is_copilot_base, is_ollama_base};
 use crate::services::provider_protocol::{ProviderProtocol, detect_provider_protocol};
 use crate::services::session_store::ApiKey;
@@ -65,7 +66,11 @@ impl KeyCompatContext {
 ///   * Anthropic protocol keys — `image_gen::generate` hard-fails (no image API).
 fn image_incompat_reason(key: &ApiKey) -> Option<&'static str> {
     const NO_IMAGE_GEN: &str = "no image generation";
-    if key.is_any_oauth() || is_copilot_base(&key.base_url) || is_ollama_base(&key.base_url) {
+    if key.is_any_oauth()
+        || is_copilot_base(&key.base_url)
+        || is_cursor_acp_base(&key.base_url)
+        || is_ollama_base(&key.base_url)
+    {
         return Some(NO_IMAGE_GEN);
     }
     if key.base_url == crate::constants::AIVO_STARTER_SENTINEL {
@@ -82,7 +87,11 @@ fn image_incompat_reason(key: &ApiKey) -> Option<&'static str> {
 /// the protocol family doesn't expose audio generation at all.
 fn audio_incompat_reason(key: &ApiKey) -> Option<&'static str> {
     const NO_TTS: &str = "no TTS";
-    if key.is_any_oauth() || is_copilot_base(&key.base_url) || is_ollama_base(&key.base_url) {
+    if key.is_any_oauth()
+        || is_copilot_base(&key.base_url)
+        || is_cursor_acp_base(&key.base_url)
+        || is_ollama_base(&key.base_url)
+    {
         return Some(NO_TTS);
     }
     if key.base_url == crate::constants::AIVO_STARTER_SENTINEL {
@@ -99,7 +108,11 @@ fn audio_incompat_reason(key: &ApiKey) -> Option<&'static str> {
 /// a `/v1/videos`-style endpoint.
 fn video_incompat_reason(key: &ApiKey) -> Option<&'static str> {
     const NO_VIDEO: &str = "no video generation";
-    if key.is_any_oauth() || is_copilot_base(&key.base_url) || is_ollama_base(&key.base_url) {
+    if key.is_any_oauth()
+        || is_copilot_base(&key.base_url)
+        || is_cursor_acp_base(&key.base_url)
+        || is_ollama_base(&key.base_url)
+    {
         return Some(NO_VIDEO);
     }
     if key.base_url == crate::constants::AIVO_STARTER_SENTINEL {
@@ -194,11 +207,39 @@ mod tests {
     #[test]
     fn image_rejects_copilot_and_ollama() {
         let copilot = make_key("copilot", "copilot");
+        let cursor = make_key("cursor", "cursor");
         let ollama = make_key("ollama", "ollama");
 
         let ctx = KeyCompatContext::Image;
         assert_eq!(ctx.incompat_reason(&copilot), Some("no image generation"));
+        assert_eq!(ctx.incompat_reason(&cursor), Some("no image generation"));
         assert_eq!(ctx.incompat_reason(&ollama), Some("no image generation"));
+    }
+
+    #[test]
+    fn cursor_is_chat_and_tool_compatible_but_not_media() {
+        let cursor = make_key("cursor", "cursor");
+        assert!(KeyCompatContext::Chat.incompat_reason(&cursor).is_none());
+        for tool in AIToolType::all() {
+            assert!(
+                KeyCompatContext::Tool(*tool)
+                    .incompat_reason(&cursor)
+                    .is_none(),
+                "{tool:?}"
+            );
+        }
+        assert_eq!(
+            KeyCompatContext::Image.incompat_reason(&cursor),
+            Some("no image generation")
+        );
+        assert_eq!(
+            KeyCompatContext::Audio.incompat_reason(&cursor),
+            Some("no TTS")
+        );
+        assert_eq!(
+            KeyCompatContext::Video.incompat_reason(&cursor),
+            Some("no video generation")
+        );
     }
 
     #[test]

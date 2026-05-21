@@ -618,6 +618,10 @@ pub(super) enum RuntimeEvent {
         request_id: u64,
         result: std::result::Result<LoadedSession, String>,
     },
+    /// A cursor-agent ACP session finished opening on a background task. The
+    /// event loop stores it on the app so subsequent turns reuse it without
+    /// paying the Node.js startup cost again.
+    CursorSessionOpened(crate::services::cursor_acp::CursorAcpSession),
 }
 
 pub(super) struct ChatTuiApp {
@@ -672,4 +676,7 @@ pub(super) struct ChatTuiApp {
     pub(super) frame_tick: usize,
     pub(super) picker_hitbox: Option<PickerHitbox>,
     pub(super) exit_confirm_pending: bool,
+    /// Live `cursor-agent acp` connection scoped to the current chat session.
+    /// `None` outside of cursor keys and before the first turn.
+    pub(super) cursor_acp_session: Option<crate::services::cursor_acp::CursorAcpSession>,
 }

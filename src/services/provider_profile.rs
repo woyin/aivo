@@ -6,6 +6,7 @@ use crate::services::session_store::ApiKey;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProviderKind {
     Copilot,
+    CursorAcp,
     Ollama,
     OpenRouter,
     CloudflareAi,
@@ -17,6 +18,7 @@ pub enum ProviderKind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ModelListingStrategy {
     Copilot,
+    CursorAcp,
     Ollama,
     Google,
     Anthropic,
@@ -260,6 +262,20 @@ pub fn provider_profile_for_base_url(base_url: &str) -> ProviderProfile {
         };
     }
 
+    if crate::services::cursor_acp::is_cursor_acp_base(base_url) {
+        return ProviderProfile {
+            kind: ProviderKind::CursorAcp,
+            default_protocol: ProviderProtocol::Openai,
+            quirks,
+            model_listing_strategy: ModelListingStrategy::CursorAcp,
+            serve_flags: ServeFlags {
+                is_copilot: false,
+                is_openrouter: false,
+                is_starter: false,
+            },
+        };
+    }
+
     if is_ollama_base(base_url) {
         return ProviderProfile {
             kind: ProviderKind::Ollama,
@@ -374,6 +390,19 @@ mod tests {
             ModelListingStrategy::Copilot
         );
         assert!(profile.serve_flags.is_copilot);
+        assert!(!profile.serve_flags.is_openrouter);
+    }
+
+    #[test]
+    fn classifies_cursor_acp() {
+        let profile = provider_profile_for_base_url("cursor");
+        assert_eq!(profile.kind, ProviderKind::CursorAcp);
+        assert_eq!(profile.default_protocol, ProviderProtocol::Openai);
+        assert_eq!(
+            profile.model_listing_strategy,
+            ModelListingStrategy::CursorAcp
+        );
+        assert!(!profile.serve_flags.is_copilot);
         assert!(!profile.serve_flags.is_openrouter);
     }
 

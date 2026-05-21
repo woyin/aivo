@@ -317,9 +317,9 @@ pub struct KeysArgs {
     #[arg(long = "include-starter")]
     pub include_starter: bool,
 
-    /// On `keys export`, include OAuth login sessions (Claude, Codex,
-    /// Gemini, Copilot). Off by default — subscription-bound credentials
-    /// shouldn't travel silently with an API-key backup.
+    /// On `keys export`, include OAuth/login sessions (Claude, Codex,
+    /// Gemini, Copilot, Cursor login). Off by default — subscription-bound
+    /// credentials shouldn't travel silently with an API-key backup.
     #[arg(long = "include-oauth")]
     pub include_oauth: bool,
 

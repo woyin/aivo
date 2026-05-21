@@ -490,6 +490,12 @@ where
 
     loop {
         let (mut socket, _) = listener.accept().await?;
+        // Disable Nagle on accepted sockets so streaming SSE chunks (Cursor
+        // ACP deltas, Anthropic content_block_delta frames, etc.) reach the
+        // launched tool in real time instead of being held back by Nagle +
+        // delayed-ACK interactions. Localhost routers have no wire overhead
+        // to worry about, so the only effect is lower latency per chunk.
+        let _ = socket.set_nodelay(true);
         let state = state.clone();
         let handler = handler.clone();
         let permit = match semaphore.clone().acquire_owned().await {

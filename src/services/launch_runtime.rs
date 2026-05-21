@@ -109,6 +109,37 @@ pub(crate) async fn prepare_runtime_env(
         set_local_base_url(&mut env, "ANTHROPIC_BASE_URL", port);
     }
 
+    if env.contains_key("AIVO_USE_CURSOR_ROUTER") {
+        let port = start_cursor_router(&mut env).await?;
+        if tool == AIToolType::Pi && env.contains_key("AIVO_PI_MODELS_JSON") {
+            // Pi reads its upstream URL from a JSON file, not an env var, so
+            // patch the placeholder in AIVO_PI_MODELS_JSON before writing the
+            // temp agent dir.
+            write_pi_agent_dir(&mut env, Some(port)).await?;
+        } else if tool == AIToolType::Opencode && env.contains_key("OPENCODE_CONFIG_CONTENT") {
+            // OpenCode reads its upstream from OPENCODE_CONFIG_CONTENT JSON;
+            // swap the placeholder URL for the bound cursor-router port.
+            patch_opencode_config_content(&mut env, port);
+        } else if tool == AIToolType::Amp && env.contains_key("AIVO_AMP_UPSTREAM_BASE_URL") {
+            // amp goes through the amp_bridge first; the cursor router sits
+            // behind the bridge's translators as the OpenAI-chat upstream.
+            env.insert(
+                "AIVO_AMP_UPSTREAM_BASE_URL".to_string(),
+                format!("http://127.0.0.1:{port}"),
+            );
+        } else {
+            let base_url_env =
+                env.remove("AIVO_CURSOR_BASE_URL_ENV")
+                    .unwrap_or_else(|| match tool {
+                        AIToolType::Codex => "OPENAI_BASE_URL".to_string(),
+                        _ => "ANTHROPIC_BASE_URL".to_string(),
+                    });
+            set_local_base_url(&mut env, &base_url_env, port);
+        }
+        env.remove("AIVO_USE_CURSOR_ROUTER");
+        env.remove("AIVO_CURSOR_KEY_SECRET");
+    }
+
     if tool == AIToolType::Codex && env.contains_key("AIVO_USE_RESPONSES_TO_CHAT_ROUTER") {
         let (port, _active, responses_api, success, authoritative, learned) =
             start_responses_to_chat_router(&env).await?;
@@ -1503,6 +1534,76 @@ async fn start_copilot_router(env: &HashMap<String, String>) -> Result<u16> {
     tokio::spawn(async move {
         if let Ok(Err(e)) = handle.await {
             eprintln!("aivo: copilot router exited unexpectedly: {e}");
+        }
+    });
+    Ok(port)
+}
+
+async fn start_cursor_router(env: &mut HashMap<String, String>) -> Result<u16> {
+    use crate::services::cursor_acp::{self, CURSOR_ACP_SENTINEL};
+    use crate::services::cursor_model_router::{CursorModelRouter, CursorRouterConfig};
+    use crate::services::session_store::ApiKey;
+    use zeroize::Zeroizing;
+
+    let key_secret = env.remove("AIVO_CURSOR_KEY_SECRET").ok_or_else(|| {
+        anyhow::anyhow!(
+            "Missing AIVO_CURSOR_KEY_SECRET; re-run `aivo keys add cursor` to set up an isolated cursor account."
+        )
+    })?;
+
+    if cursor_acp::is_legacy_cursor_login_secret(&key_secret) {
+        anyhow::bail!(
+            "This cursor key predates per-account isolation. Remove it (`aivo keys rm cursor`) and re-add (`aivo keys add cursor`) so cursor-agent runs in its own isolated home."
+        );
+    }
+
+    let key = ApiKey {
+        id: "cursor-router".to_string(),
+        name: "cursor".to_string(),
+        base_url: CURSOR_ACP_SENTINEL.to_string(),
+        claude_protocol: None,
+        gemini_protocol: None,
+        responses_api_supported: None,
+        codex_mode: None,
+        opencode_mode: None,
+        pi_mode: None,
+        claude_path_variant: None,
+        gemini_path_variant: None,
+        requires_reasoning_content: None,
+        routing_schema_version: 0,
+        key: Zeroizing::new(key_secret),
+        created_at: String::new(),
+    };
+
+    // Bail before spawning the router when the saved OAuth shadow has
+    // been signed out. `cursor-agent status` only inspects auth.json, so
+    // API-key shadows always report "unauthenticated" — skip the check
+    // for those and let the first /v1/models request surface a real
+    // upstream error instead.
+    if let Some(parsed) = cursor_acp::parse_cursor_shadow_secret(key.key.as_str())
+        && parsed.api_key.is_none()
+        && !cursor_acp::cursor_status_authenticated_for_key(&key)
+            .await
+            .unwrap_or(false)
+    {
+        anyhow::bail!(
+            "Cursor is not logged in for this key. Run `aivo keys reauth <id>` (or pick `aivo keys reauth` interactively) to sign in again."
+        );
+    }
+    let workspace_cwd = std::env::current_dir()
+        .ok()
+        .and_then(|p| p.to_str().map(String::from))
+        .unwrap_or_else(|| ".".to_string());
+
+    let router = CursorModelRouter::new(CursorRouterConfig {
+        key,
+        workspace_cwd,
+        models_cache: Some(crate::services::models_cache::ModelsCache::new()),
+    });
+    let (port, handle) = router.start_background().await?;
+    tokio::spawn(async move {
+        if let Ok(Err(e)) = handle.await {
+            eprintln!("aivo: cursor router exited unexpectedly: {e}");
         }
     });
     Ok(port)

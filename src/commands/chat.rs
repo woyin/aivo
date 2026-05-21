@@ -23,6 +23,7 @@ use crate::services::copilot_auth::{
     COPILOT_EDITOR_VERSION, COPILOT_INITIATOR_HEADER, COPILOT_INTEGRATION_ID,
     COPILOT_OPENAI_INTENT, CopilotTokenManager,
 };
+use crate::services::cursor_acp::{self, CursorChunk};
 use crate::services::http_debug::LoggedSend;
 use crate::services::http_utils::copilot_initiator_from_openai;
 use crate::services::http_utils::sse_data_payload;
@@ -414,23 +415,59 @@ impl ChatCommand {
             // connection before the process exits. Without this branch the
             // default SIGINT terminates the process abruptly, leaving the
             // server to keep generating.
-            let result = tokio::select! {
-                res = send_message_turn(
-                    &client,
-                    &key,
-                    copilot_tm.as_deref(),
-                    &model,
-                    &history,
-                    &mut format,
-                    &spinning,
-                    json,
-                    &mut on_chunk,
-                ) => res,
-                _ = tokio::signal::ctrl_c() => {
-                    style::stop_spinner(&spinning);
-                    let _ = spinner_handle.await;
-                    eprintln!();
-                    return Ok(ExitCode::ToolExit(130));
+            let result = if key.is_cursor_acp() {
+                let prompt_text = history[0].content.clone();
+                let attachments = history[0].attachments.clone();
+                let spinning_for_cursor = spinning.clone();
+                let mut forward = |chunk: CursorChunk<'_>| -> Result<()> {
+                    style::stop_spinner(&spinning_for_cursor);
+                    let mapped = match chunk {
+                        CursorChunk::Content(t) => ChatResponseChunk::Content(t.to_string()),
+                        CursorChunk::Reasoning(t) => ChatResponseChunk::Reasoning(t.to_string()),
+                    };
+                    on_chunk(mapped)
+                };
+                tokio::select! {
+                    res = cursor_acp::run_cursor_acp_turn(
+                        &key,
+                        Some(&raw_model),
+                        &cwd,
+                        &prompt_text,
+                        &attachments,
+                        &mut forward,
+                    ) => res.map(|cur| ChatTurnResult {
+                        content: cur.content,
+                        reasoning_content: cur.reasoning_content,
+                        usage: None,
+                        model: cur.model,
+                        raw_body: None,
+                    }),
+                    _ = tokio::signal::ctrl_c() => {
+                        style::stop_spinner(&spinning);
+                        let _ = spinner_handle.await;
+                        eprintln!();
+                        return Ok(ExitCode::ToolExit(130));
+                    }
+                }
+            } else {
+                tokio::select! {
+                    res = send_message_turn(
+                        &client,
+                        &key,
+                        copilot_tm.as_deref(),
+                        &model,
+                        &history,
+                        &mut format,
+                        &spinning,
+                        json,
+                        &mut on_chunk,
+                    ) => res,
+                    _ = tokio::signal::ctrl_c() => {
+                        style::stop_spinner(&spinning);
+                        let _ = spinner_handle.await;
+                        eprintln!();
+                        return Ok(ExitCode::ToolExit(130));
+                    }
                 }
             };
             style::stop_spinner(&spinning);

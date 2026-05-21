@@ -434,6 +434,109 @@ impl EnvironmentInjector {
     /// here because integration tests live in a separate crate that sees
     /// only the non-test build of this lib.
     #[allow(dead_code)]
+    /// Builds the env block for a tool whose key is a cursor ACP sentinel.
+    /// Sets a placeholder loopback `base_url_env` plus the `AIVO_USE_CURSOR_ROUTER`
+    /// scaffolding flags that `launch_runtime::start_cursor_router` reads to
+    /// spawn `CursorModelRouter` and rewrite the placeholder with the real port.
+    fn for_cursor_acp_tool(
+        key: &ApiKey,
+        base_url_env: &str,
+        auth_env: Option<&str>,
+    ) -> HashMap<String, String> {
+        let mut env = HashMap::new();
+        env.insert("AIVO_USE_CURSOR_ROUTER".to_string(), "1".to_string());
+        env.insert(
+            "AIVO_CURSOR_BASE_URL_ENV".to_string(),
+            base_url_env.to_string(),
+        );
+        env.insert(
+            "AIVO_CURSOR_KEY_SECRET".to_string(),
+            key.key.as_str().to_string(),
+        );
+        // Placeholder; launch_runtime fills the bound port.
+        env.insert(
+            base_url_env.to_string(),
+            PLACEHOLDER_LOOPBACK_URL.to_string(),
+        );
+        if let Some(auth_env) = auth_env {
+            env.insert(auth_env.to_string(), "aivo-cursor".to_string());
+        }
+        env
+    }
+
+    /// Builds the OpenCode env block for a cursor ACP key. OpenCode reads its
+    /// upstream from `OPENCODE_CONFIG_CONTENT` (JSON), so the placeholder URL
+    /// is embedded there and `launch_runtime::patch_opencode_config_content`
+    /// rewrites it once the cursor router has bound its port.
+    fn for_opencode_cursor(
+        key: &ApiKey,
+        model: Option<&str>,
+        discovered_models: Option<&[String]>,
+    ) -> HashMap<String, String> {
+        let mut env = HashMap::new();
+        env.insert("AIVO_USE_CURSOR_ROUTER".to_string(), "1".to_string());
+        env.insert(
+            "AIVO_CURSOR_KEY_SECRET".to_string(),
+            key.key.as_str().to_string(),
+        );
+
+        let mut provider = Map::new();
+        provider.insert("npm".to_string(), json!("@ai-sdk/openai-compatible"));
+        provider.insert("name".to_string(), json!("aivo"));
+        provider.insert(
+            "options".to_string(),
+            json!({
+                "baseURL": PLACEHOLDER_LOOPBACK_URL,
+                "apiKey": "aivo-cursor",
+            }),
+        );
+
+        let mut model_ids: Vec<String> = discovered_models
+            .map(|models| {
+                models
+                    .iter()
+                    .map(|m| strip_aivo_prefix(m).to_string())
+                    .collect()
+            })
+            .unwrap_or_default();
+        if let Some(model) = model {
+            let model_name = strip_aivo_prefix(model).to_string();
+            if !model_ids.contains(&model_name) {
+                model_ids.push(model_name);
+            }
+        }
+        model_ids.sort();
+        model_ids.dedup();
+        if !model_ids.is_empty() {
+            let mut models = Map::new();
+            for model_id in model_ids {
+                models.insert(model_id.clone(), json!({ "name": model_id }));
+            }
+            provider.insert("models".to_string(), Value::Object(models));
+        }
+
+        let mut providers = Map::new();
+        providers.insert("aivo".to_string(), Value::Object(provider));
+
+        let mut config = Map::new();
+        config.insert(
+            "$schema".to_string(),
+            json!("https://opencode.ai/config.json"),
+        );
+        config.insert("provider".to_string(), Value::Object(providers));
+        if let Some(model) = model {
+            config.insert(
+                "model".to_string(),
+                json!(format!("aivo/{}", strip_aivo_prefix(model))),
+            );
+        }
+        env.insert(
+            "OPENCODE_CONFIG_CONTENT".to_string(),
+            Value::Object(config).to_string(),
+        );
+        env
+    }
+
     pub fn for_claude(&self, key: &ApiKey, model: Option<&str>) -> HashMap<String, String> {
         self.for_claude_with_overrides(key, model, &ClaudeModelOverrides::default())
     }
@@ -448,6 +551,25 @@ impl EnvironmentInjector {
         model: Option<&str>,
         overrides: &ClaudeModelOverrides,
     ) -> HashMap<String, String> {
+        if key.is_cursor_acp() {
+            let mut env =
+                Self::for_cursor_acp_tool(key, "ANTHROPIC_BASE_URL", Some("ANTHROPIC_AUTH_TOKEN"));
+            // Claude Code keys off both ANTHROPIC_AUTH_TOKEN *and* an empty
+            // ANTHROPIC_API_KEY to pick the right auth path; mirror the
+            // existing routed-mode setup.
+            env.insert("ANTHROPIC_API_KEY".to_string(), String::new());
+            if let Some(model) = model {
+                let anthropic_model = match overrides.max_context.as_deref() {
+                    Some(tag) => format!("{model}[{tag}]"),
+                    None => model.to_string(),
+                };
+                for slot in CLAUDE_DEFAULT_MODEL_SLOTS {
+                    env.insert(slot.to_string(), anthropic_model.clone());
+                }
+            }
+            return env;
+        }
+
         if key.is_claude_oauth() {
             let mut env = HashMap::new();
             match crate::services::claude_oauth::ClaudeOAuthCredential::from_json(key.key.as_str())
@@ -644,6 +766,16 @@ impl EnvironmentInjector {
 
     /// Prepares environment variables for Codex CLI
     pub fn for_codex(&self, key: &ApiKey, model: Option<&str>) -> HashMap<String, String> {
+        if key.is_cursor_acp() {
+            let mut env = Self::for_cursor_acp_tool(key, "OPENAI_BASE_URL", Some("OPENAI_API_KEY"));
+            if let Some(model) = model {
+                env.insert("CODEX_MODEL".to_string(), model.to_string());
+                env.insert("OPENAI_DEFAULT_MODEL".to_string(), model.to_string());
+                env.insert("CODEX_MODEL_DEFAULT".to_string(), model.to_string());
+            }
+            return env;
+        }
+
         // ChatGPT OAuth path: the credential lives encrypted in `key.key` as
         // serialized `CodexOAuthCredential` JSON. Pass it through to
         // launch_runtime via a private env var; launch_runtime writes a
@@ -725,6 +857,33 @@ impl EnvironmentInjector {
 
     /// Prepares environment variables for Gemini CLI
     pub fn for_gemini(&self, key: &ApiKey, model: Option<&str>) -> HashMap<String, String> {
+        // Cursor ACP path: route gemini-cli through the local cursor router.
+        // gemini-cli's API-key auth path reads `GOOGLE_GEMINI_BASE_URL` +
+        // `GEMINI_API_KEY` and speaks Gemini's `/v1beta/models/<m>:generateContent`
+        // protocol — the cursor router has a matching handler that translates
+        // those requests into ACP prompts. The settings-override (forced via
+        // AIVO_GEMINI_FORCE_API_KEY_AUTH) pins the CLI to api-key auth so it
+        // never falls back to OAuth.
+        if key.is_cursor_acp() {
+            let mut env =
+                Self::for_cursor_acp_tool(key, "GOOGLE_GEMINI_BASE_URL", Some("GEMINI_API_KEY"));
+            // gemini-cli's OAuth picker would otherwise wait for stdin on
+            // first launch — force api-key path via the system-scope settings
+            // override prepared by `prepare_gemini_api_key_settings_override`.
+            env.insert(
+                "AIVO_GEMINI_FORCE_API_KEY_AUTH".to_string(),
+                "1".to_string(),
+            );
+            if let Some(model) = model {
+                env.insert("GEMINI_MODEL".to_string(), model.to_string());
+                env.insert(
+                    "AIVO_GEMINI_MODEL_CONFIG_MODEL".to_string(),
+                    model.to_string(),
+                );
+            }
+            return env;
+        }
+
         // Google OAuth path: the credential lives encrypted in `key.key` as
         // serialized `GeminiOAuthCredential` JSON. Pass it through to
         // launch_runtime via a private env var; launch_runtime writes a
@@ -842,6 +1001,9 @@ impl EnvironmentInjector {
         model: Option<&str>,
         discovered_models: Option<&[String]>,
     ) -> HashMap<String, String> {
+        if key.is_cursor_acp() {
+            return Self::for_opencode_cursor(key, model, discovered_models);
+        }
         let mut env = HashMap::new();
         let profile = provider_profile_for_key(key);
         let resolved_url = if key.base_url == AIVO_STARTER_SENTINEL {
@@ -993,6 +1155,26 @@ impl EnvironmentInjector {
         let mut env = HashMap::new();
         let profile = provider_profile_for_key(key);
 
+        if key.is_cursor_acp() {
+            // Pi reads its upstream from a JSON config rather than an env var,
+            // so the cursor router is wired in via PLACEHOLDER_LOOPBACK_URL:
+            // launch_runtime starts the router, then patches the placeholder
+            // with the real bound port before writing the temp agent dir.
+            let models_json = build_pi_models_json(
+                PLACEHOLDER_LOOPBACK_URL,
+                "aivo-cursor",
+                "openai-completions",
+                model,
+            );
+            env.insert("AIVO_PI_MODELS_JSON".to_string(), models_json);
+            env.insert("AIVO_USE_CURSOR_ROUTER".to_string(), "1".to_string());
+            env.insert(
+                "AIVO_CURSOR_KEY_SECRET".to_string(),
+                key.key.as_str().to_string(),
+            );
+            return env;
+        }
+
         if profile.kind == ProviderKind::Ollama {
             // Ollama: direct connection via Pi's custom provider
             let models_json = build_pi_models_json(
@@ -1112,6 +1294,73 @@ impl EnvironmentInjector {
         model: Option<&str>,
         amp_modes: &AmpModeModels,
     ) -> HashMap<String, String> {
+        // Cursor ACP path: chain amp → amp_bridge → cursor router. The bridge
+        // still owns amp's management plane (auth/threads/telemetry stubs) and
+        // its in-process Anthropic/Responses translators; the cursor router
+        // sits behind those translators as the OpenAI-chat upstream. The
+        // upstream URL is left as a placeholder and patched by launch_runtime
+        // once the cursor router has bound its port.
+        if key.is_cursor_acp() {
+            let mut env = HashMap::new();
+            env.insert("AIVO_USE_CURSOR_ROUTER".to_string(), "1".to_string());
+            env.insert(
+                "AIVO_CURSOR_KEY_SECRET".to_string(),
+                key.key.as_str().to_string(),
+            );
+            env.insert("AIVO_USE_AMP_BRIDGE".to_string(), "1".to_string());
+            env.insert(
+                "AIVO_AMP_UPSTREAM_BASE_URL".to_string(),
+                PLACEHOLDER_LOOPBACK_URL.to_string(),
+            );
+            env.insert(
+                "AIVO_AMP_UPSTREAM_KEY".to_string(),
+                "aivo-cursor".to_string(),
+            );
+            env.insert("AMP_SKIP_UPDATE_CHECK".to_string(), "1".to_string());
+
+            // Mirror the non-cursor branch's force-model / disable-tools /
+            // initial-mode plumbing. Cursor speaks OpenAI-chat downstream of
+            // amp's translators, so the same forced-model logic applies:
+            // without it, amp's Claude-named modes round-trip into upstream
+            // model names cursor doesn't have.
+            let internal_mode_model = amp_modes.to_internal_model_value();
+            let suppress_user_force = internal_mode_model.is_some();
+            let resolved_force_model = model
+                .filter(|_| !suppress_user_force)
+                .filter(|m| !m.trim().is_empty() && *m != "__default__");
+            if let Some(m) = resolved_force_model {
+                env.insert("AIVO_AMP_FORCE_MODEL".to_string(), m.to_string());
+            }
+
+            const BRIDGE_UNSUPPORTED_TOOLS: &[&str] = &["Task"];
+            let mut disable_tools = amp_modes.disable_tools.clone();
+            for tool in BRIDGE_UNSUPPORTED_TOOLS {
+                if !disable_tools.iter().any(|t| t == tool) {
+                    disable_tools.push((*tool).to_string());
+                }
+            }
+            env.insert(
+                "AIVO_AMP_TOOLS_DISABLE".to_string(),
+                disable_tools.join(","),
+            );
+
+            if let Some(m) = amp_modes
+                .initial_mode
+                .as_deref()
+                .map(str::trim)
+                .filter(|m| !m.is_empty())
+            {
+                env.insert("AIVO_AMP_INITIAL_MODE".to_string(), m.to_string());
+            }
+            if let Some(modes_obj) = internal_mode_model {
+                env.insert(
+                    "AIVO_AMP_INTERNAL_MODEL_JSON".to_string(),
+                    modes_obj.to_string(),
+                );
+            }
+            return env;
+        }
+
         let mut env = HashMap::new();
         if crate::services::amp_bridge::is_amp_native_endpoint(&key.base_url) {
             env.insert("AMP_URL".to_string(), key.base_url.clone());
@@ -1418,6 +1667,237 @@ mod tests {
         let mut key = test_api_key("https://generativelanguage.googleapis.com/v1beta");
         key.gemini_protocol = Some(GeminiProviderProtocol::Openai);
         assert!(!EnvironmentInjector::use_google_native_for_gemini(&key));
+    }
+
+    #[test]
+    fn for_claude_with_cursor_key_routes_through_cursor_router() {
+        let injector = EnvironmentInjector::new();
+        let mut key = test_key();
+        key.base_url = crate::services::cursor_acp::CURSOR_ACP_SENTINEL.to_string();
+        key.key = zeroize::Zeroizing::new(format!(
+            "{}testaccount1",
+            crate::services::cursor_acp::CURSOR_SHADOW_PREFIX
+        ));
+        let env = injector.for_claude(&key, Some("composer-2.5"));
+
+        assert_eq!(env.get("AIVO_USE_CURSOR_ROUTER"), Some(&"1".to_string()));
+        assert_eq!(
+            env.get("AIVO_CURSOR_BASE_URL_ENV"),
+            Some(&"ANTHROPIC_BASE_URL".to_string())
+        );
+        assert_eq!(
+            env.get("AIVO_CURSOR_KEY_SECRET"),
+            Some(&format!(
+                "{}testaccount1",
+                crate::services::cursor_acp::CURSOR_SHADOW_PREFIX
+            ))
+        );
+        assert_eq!(
+            env.get("ANTHROPIC_BASE_URL"),
+            Some(&PLACEHOLDER_LOOPBACK_URL.to_string())
+        );
+        assert_eq!(
+            env.get("ANTHROPIC_AUTH_TOKEN"),
+            Some(&"aivo-cursor".to_string())
+        );
+        assert_eq!(env.get("ANTHROPIC_API_KEY"), Some(&String::new()));
+        // Model fans into the canonical slots so /model picks up cursor's id.
+        for slot in CLAUDE_DEFAULT_MODEL_SLOTS {
+            assert_eq!(env.get(slot), Some(&"composer-2.5".to_string()));
+        }
+        // Cursor routing bypasses the anthropic-to-openai router entirely.
+        assert!(!env.contains_key("AIVO_USE_ANTHROPIC_TO_OPENAI_ROUTER"));
+    }
+
+    #[test]
+    fn for_codex_with_cursor_key_routes_through_cursor_router() {
+        let injector = EnvironmentInjector::new();
+        let mut key = test_key();
+        key.base_url = crate::services::cursor_acp::CURSOR_ACP_SENTINEL.to_string();
+        let env = injector.for_codex(&key, Some("gpt-5"));
+
+        assert_eq!(env.get("AIVO_USE_CURSOR_ROUTER"), Some(&"1".to_string()));
+        assert_eq!(
+            env.get("AIVO_CURSOR_BASE_URL_ENV"),
+            Some(&"OPENAI_BASE_URL".to_string())
+        );
+        assert_eq!(
+            env.get("OPENAI_BASE_URL"),
+            Some(&PLACEHOLDER_LOOPBACK_URL.to_string())
+        );
+        assert_eq!(env.get("OPENAI_API_KEY"), Some(&"aivo-cursor".to_string()));
+        assert_eq!(env.get("CODEX_MODEL"), Some(&"gpt-5".to_string()));
+        assert_eq!(env.get("OPENAI_DEFAULT_MODEL"), Some(&"gpt-5".to_string()));
+        assert!(!env.contains_key("AIVO_USE_RESPONSES_TO_CHAT_ROUTER"));
+    }
+
+    #[test]
+    fn for_opencode_with_cursor_key_routes_through_cursor_router_via_config_json() {
+        let injector = EnvironmentInjector::new();
+        let mut key = test_key();
+        key.base_url = crate::services::cursor_acp::CURSOR_ACP_SENTINEL.to_string();
+        key.key = zeroize::Zeroizing::new(format!(
+            "{}testaccount1",
+            crate::services::cursor_acp::CURSOR_SHADOW_PREFIX
+        ));
+        let env = injector.for_opencode(&key, Some("composer-2.5"), None);
+
+        assert_eq!(env.get("AIVO_USE_CURSOR_ROUTER"), Some(&"1".to_string()));
+        assert_eq!(
+            env.get("AIVO_CURSOR_KEY_SECRET"),
+            Some(&format!(
+                "{}testaccount1",
+                crate::services::cursor_acp::CURSOR_SHADOW_PREFIX
+            ))
+        );
+        let config = env
+            .get("OPENCODE_CONFIG_CONTENT")
+            .expect("OPENCODE_CONFIG_CONTENT must be set for cursor keys");
+        assert!(
+            config.contains(PLACEHOLDER_LOOPBACK_URL),
+            "OpenCode config must carry the loopback placeholder so launch_runtime can patch it: {config}"
+        );
+        assert!(config.contains("composer-2.5"));
+        assert!(config.contains("aivo-cursor"));
+        // Cursor wiring bypasses the generic OpenCode routers.
+        assert!(!env.contains_key("AIVO_USE_OPENCODE_ROUTER"));
+        assert!(!env.contains_key("AIVO_USE_OPENCODE_COPILOT_ROUTER"));
+    }
+
+    #[test]
+    fn for_pi_with_cursor_key_routes_through_cursor_router_via_models_json() {
+        let injector = EnvironmentInjector::new();
+        let mut key = test_key();
+        key.base_url = crate::services::cursor_acp::CURSOR_ACP_SENTINEL.to_string();
+        key.key = zeroize::Zeroizing::new(format!(
+            "{}testaccount1",
+            crate::services::cursor_acp::CURSOR_SHADOW_PREFIX
+        ));
+        let env = injector.for_pi(&key, Some("composer-2.5"));
+
+        assert_eq!(env.get("AIVO_USE_CURSOR_ROUTER"), Some(&"1".to_string()));
+        assert_eq!(
+            env.get("AIVO_CURSOR_KEY_SECRET"),
+            Some(&format!(
+                "{}testaccount1",
+                crate::services::cursor_acp::CURSOR_SHADOW_PREFIX
+            ))
+        );
+        let models_json = env
+            .get("AIVO_PI_MODELS_JSON")
+            .expect("AIVO_PI_MODELS_JSON must be set for cursor keys");
+        assert!(
+            models_json.contains(PLACEHOLDER_LOOPBACK_URL),
+            "Pi config must carry the loopback placeholder so launch_runtime can patch it: {models_json}"
+        );
+        assert!(models_json.contains("openai-completions"));
+        assert!(models_json.contains("composer-2.5"));
+        // Pi reads its upstream from the JSON; don't also force a Pi-specific
+        // router that the launcher would try to start as a second instance.
+        assert!(!env.contains_key("AIVO_USE_PI_ROUTER"));
+        assert!(!env.contains_key("AIVO_USE_PI_COPILOT_ROUTER"));
+        assert!(!env.contains_key("AIVO_USE_PI_STARTER_ROUTER"));
+        // Pi launches with a temp agent dir that's written *after* the router
+        // port is known; the dir-writer is invoked from start_cursor_router's
+        // Pi branch in launch_runtime, not from the AIVO_SETUP_PI_AGENT_DIR
+        // direct path.
+        assert!(!env.contains_key("AIVO_SETUP_PI_AGENT_DIR"));
+    }
+
+    #[test]
+    fn for_gemini_with_cursor_key_routes_through_cursor_router() {
+        let injector = EnvironmentInjector::new();
+        let mut key = test_key();
+        key.base_url = crate::services::cursor_acp::CURSOR_ACP_SENTINEL.to_string();
+        key.key = zeroize::Zeroizing::new(format!(
+            "{}testaccount1",
+            crate::services::cursor_acp::CURSOR_SHADOW_PREFIX
+        ));
+        let env = injector.for_gemini(&key, Some("composer-2.5"));
+
+        assert_eq!(env.get("AIVO_USE_CURSOR_ROUTER"), Some(&"1".to_string()));
+        assert_eq!(
+            env.get("AIVO_CURSOR_BASE_URL_ENV"),
+            Some(&"GOOGLE_GEMINI_BASE_URL".to_string())
+        );
+        assert_eq!(
+            env.get("GOOGLE_GEMINI_BASE_URL"),
+            Some(&PLACEHOLDER_LOOPBACK_URL.to_string())
+        );
+        assert_eq!(env.get("GEMINI_API_KEY"), Some(&"aivo-cursor".to_string()));
+        assert_eq!(env.get("GEMINI_MODEL"), Some(&"composer-2.5".to_string()));
+        assert_eq!(
+            env.get("AIVO_GEMINI_FORCE_API_KEY_AUTH"),
+            Some(&"1".to_string()),
+            "cursor branch must force api-key auth so gemini-cli doesn't fall through to OAuth"
+        );
+        // Cursor routing bypasses the gemini compat router entirely.
+        assert!(!env.contains_key("AIVO_USE_GEMINI_ROUTER"));
+        assert!(!env.contains_key("AIVO_USE_GEMINI_COPILOT_ROUTER"));
+    }
+
+    #[test]
+    fn for_amp_with_cursor_key_chains_through_amp_bridge_to_cursor_router() {
+        let injector = EnvironmentInjector::new();
+        let mut key = test_key();
+        key.base_url = crate::services::cursor_acp::CURSOR_ACP_SENTINEL.to_string();
+        key.key = zeroize::Zeroizing::new(format!(
+            "{}testaccount1",
+            crate::services::cursor_acp::CURSOR_SHADOW_PREFIX
+        ));
+        let modes = AmpModeModels::default();
+        let env = injector.for_amp(&key, Some("composer-2.5"), &modes);
+
+        // Both routers wired so launch_runtime starts the cursor router first
+        // and patches AIVO_AMP_UPSTREAM_BASE_URL before amp_bridge spawns.
+        assert_eq!(env.get("AIVO_USE_CURSOR_ROUTER"), Some(&"1".to_string()));
+        assert_eq!(env.get("AIVO_USE_AMP_BRIDGE"), Some(&"1".to_string()));
+        assert_eq!(
+            env.get("AIVO_AMP_UPSTREAM_BASE_URL"),
+            Some(&PLACEHOLDER_LOOPBACK_URL.to_string()),
+            "upstream URL must be the placeholder so launch_runtime can patch it",
+        );
+        assert_eq!(
+            env.get("AIVO_AMP_UPSTREAM_KEY"),
+            Some(&"aivo-cursor".to_string())
+        );
+        assert_eq!(
+            env.get("AIVO_CURSOR_KEY_SECRET"),
+            Some(&format!(
+                "{}testaccount1",
+                crate::services::cursor_acp::CURSOR_SHADOW_PREFIX
+            ))
+        );
+        // Bridge auto-disables stay in place — Task isn't supported on the
+        // cursor router any more than on a regular upstream.
+        let disable = env
+            .get("AIVO_AMP_TOOLS_DISABLE")
+            .expect("cursor amp path should still emit the auto-disable list");
+        assert!(disable.split(',').any(|t| t == "Task"), "got {disable:?}");
+        // -m without per-mode flags must still force the cursor model on every
+        // amp request body — amp's Claude-named modes won't resolve otherwise.
+        assert_eq!(
+            env.get("AIVO_AMP_FORCE_MODEL"),
+            Some(&"composer-2.5".to_string())
+        );
+        assert_eq!(env.get("AMP_SKIP_UPDATE_CHECK"), Some(&"1".to_string()));
+    }
+
+    #[test]
+    fn for_amp_cursor_branch_suppresses_force_model_when_per_mode_overrides_present() {
+        let injector = EnvironmentInjector::new();
+        let mut key = test_key();
+        key.base_url = crate::services::cursor_acp::CURSOR_ACP_SENTINEL.to_string();
+        let modes = AmpModeModels {
+            smart: Some("composer-2.5".into()),
+            ..Default::default()
+        };
+        let env = injector.for_amp(&key, Some("composer-2.5"), &modes);
+        assert!(
+            !env.contains_key("AIVO_AMP_FORCE_MODEL"),
+            "per-mode overrides must win over -m on the cursor branch too: {env:?}"
+        );
+        assert!(env.contains_key("AIVO_AMP_INTERNAL_MODEL_JSON"));
     }
 
     #[test]

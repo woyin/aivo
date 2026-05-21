@@ -20,6 +20,15 @@ impl ChatTuiApp {
             RuntimeEvent::ResumeLoaded { request_id, result } => {
                 self.apply_resume_load_result(request_id, result).await?;
             }
+            RuntimeEvent::CursorSessionOpened(session) => {
+                // Defensive: a /new or /key switch could land between the task
+                // starting `open()` and this event arriving. Only adopt the
+                // session if we still need one for the current cursor key.
+                if self.key.is_cursor_acp() && self.cursor_acp_session.is_none() {
+                    self.cursor_acp_session = Some(session);
+                }
+                // Otherwise the session drops here, killing its child cleanly.
+            }
         }
         Ok(())
     }

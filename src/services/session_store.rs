@@ -299,6 +299,12 @@ impl ApiKey {
         crate::services::provider_profile::is_copilot_base(&self.base_url)
     }
 
+    /// True when this entry selects Cursor through the `cursor-agent` ACP
+    /// provider sentinel.
+    pub fn is_cursor_acp(&self) -> bool {
+        crate::services::cursor_acp::is_cursor_acp_base(&self.base_url)
+    }
+
     /// Returns a display label for credentials the user cannot retype (OAuth
     /// bundles, Copilot device tokens). Used by inspection UIs to avoid
     /// echoing live access/refresh tokens that have no copy-paste use.
@@ -311,6 +317,12 @@ impl ApiKey {
             Some("<Gemini OAuth>")
         } else if self.is_copilot() {
             Some("<Copilot>")
+        } else if self.is_cursor_acp() {
+            match crate::services::cursor_acp::parse_cursor_shadow_secret(self.key.as_str()) {
+                Some(s) if s.api_key.is_some() => Some("<Cursor API key>"),
+                Some(_) => Some("<Cursor login>"),
+                None => None,
+            }
         } else {
             None
         }
@@ -1945,6 +1957,30 @@ mod tests {
         };
         assert!(k.is_claude_oauth());
         assert!(!k.is_codex_oauth());
+    }
+
+    #[test]
+    fn cursor_credential_labels_distinguish_login_and_apikey() {
+        let mut k = ApiKey::new_with_protocol(
+            "x".into(),
+            "cursor".into(),
+            crate::services::cursor_acp::CURSOR_ACP_SENTINEL.into(),
+            None,
+            crate::services::cursor_acp::build_cursor_oauth_secret("testaccount1"),
+        );
+        assert!(k.is_cursor_acp());
+        assert_eq!(k.credential_label(), Some("<Cursor login>"));
+
+        k.key = Zeroizing::new(crate::services::cursor_acp::build_cursor_apikey_secret(
+            "testaccount1",
+            "key_xyz",
+        ));
+        assert_eq!(k.credential_label(), Some("<Cursor API key>"));
+
+        // Non-shadow values (legacy raw API key) get no label, so the
+        // suffix preview falls through and the key tail prints.
+        k.key = Zeroizing::new("sk-cursor".to_string());
+        assert_eq!(k.credential_label(), None);
     }
 
     #[tokio::test]
