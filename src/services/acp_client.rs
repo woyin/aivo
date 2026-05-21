@@ -8,6 +8,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::process::Stdio;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Instant;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, Command};
 use tokio::sync::{Mutex, mpsc, oneshot};
@@ -33,6 +34,12 @@ impl std::error::Error for JsonRpcError {}
 type PendingMap = Arc<Mutex<HashMap<u64, oneshot::Sender<Result<Value, JsonRpcError>>>>>;
 type SessionMap = Arc<Mutex<HashMap<String, mpsc::UnboundedSender<PromptEvent>>>>;
 type Writer = Arc<Mutex<ChildStdin>>;
+/// Per-client map from outbound-request id → send instant. Read by the reader
+/// task when an inbound response arrives to compute the round-trip
+/// `duration_ms` for the debug log. Scoped per `AcpClient` because each child
+/// has its own `next_id` counter starting at 1, so a global map would collide
+/// across prewarmed sessions.
+type RequestTimings = Arc<std::sync::Mutex<HashMap<u64, Instant>>>;
 
 /// Caller-supplied policy for server-initiated `session/request_permission`
 /// requests. The closure is invoked from the reader task, so it must be
@@ -72,6 +79,7 @@ pub struct AcpClient {
     next_id: AtomicU64,
     pending: PendingMap,
     session_handlers: SessionMap,
+    request_timings: RequestTimings,
     child: Mutex<Option<Child>>,
     _reader: JoinHandle<()>,
 }
@@ -105,12 +113,14 @@ impl AcpClient {
         let pending: PendingMap = Arc::new(Mutex::new(HashMap::new()));
         let sessions: SessionMap = Arc::new(Mutex::new(HashMap::new()));
         let writer: Writer = Arc::new(Mutex::new(stdin));
+        let request_timings: RequestTimings = Arc::new(std::sync::Mutex::new(HashMap::new()));
 
         let reader = spawn_reader(
             BufReader::new(stdout),
             pending.clone(),
             sessions.clone(),
             writer.clone(),
+            request_timings.clone(),
             permission_fn,
         );
 
@@ -119,6 +129,7 @@ impl AcpClient {
             next_id: AtomicU64::new(1),
             pending,
             session_handlers: sessions,
+            request_timings,
             child: Mutex::new(Some(child)),
             _reader: reader,
         })
@@ -130,13 +141,15 @@ impl AcpClient {
         self.pending.lock().await.insert(id, tx);
 
         let frame = json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params});
-        write_frame(&self.writer, &frame).await.inspect_err(|_| {
-            // Reclaim the pending slot so it doesn't leak.
-            let pending = self.pending.clone();
-            tokio::spawn(async move {
-                pending.lock().await.remove(&id);
-            });
-        })?;
+        write_frame(&self.writer, &frame, Some(&self.request_timings))
+            .await
+            .inspect_err(|_| {
+                // Reclaim the pending slot so it doesn't leak.
+                let pending = self.pending.clone();
+                tokio::spawn(async move {
+                    pending.lock().await.remove(&id);
+                });
+            })?;
 
         match rx.await {
             Ok(Ok(v)) => Ok(v),
@@ -151,7 +164,7 @@ impl AcpClient {
 
     pub async fn notify(&self, method: &str, params: Value) -> Result<()> {
         let frame = json!({"jsonrpc": "2.0", "method": method, "params": params});
-        write_frame(&self.writer, &frame).await
+        write_frame(&self.writer, &frame, None).await
     }
 
     /// Subscribe to `session/update` notifications for `session_id` and send a
@@ -174,7 +187,7 @@ impl AcpClient {
             "method": "session/prompt",
             "params": {"sessionId": session_id, "prompt": prompt},
         });
-        if let Err(e) = write_frame(&self.writer, &frame).await {
+        if let Err(e) = write_frame(&self.writer, &frame, Some(&self.request_timings)).await {
             self.pending.lock().await.remove(&id);
             self.session_handlers.lock().await.remove(session_id);
             return Err(e);
@@ -213,6 +226,7 @@ fn spawn_reader(
     pending: PendingMap,
     sessions: SessionMap,
     writer: Writer,
+    request_timings: RequestTimings,
     permission_fn: PermissionFn,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
@@ -231,11 +245,18 @@ fn spawn_reader(
             let Ok(value) = serde_json::from_str::<Value>(trimmed) else {
                 continue;
             };
-            log_acp_frame(Direction::Inbound, &value).await;
+            // Pair inbound responses with the outbound `Instant` recorded
+            // when the request was sent so the log entry carries an accurate
+            // round-trip `duration_ms`. Notifications and server-initiated
+            // requests have no paired start, so duration stays `None`.
+            let duration_ms = inbound_duration_ms(&value, &request_timings);
+            log_acp_frame(Direction::Inbound, &value, duration_ms).await;
             dispatch_inbound(value, &pending, &sessions, &writer, &permission_fn).await;
         }
 
-        // EOF: surface a clear error to anyone still waiting.
+        // EOF: surface a clear error to anyone still waiting, and drop any
+        // unmatched timing entries so the child's untracked requests don't
+        // accumulate in memory until the process exits.
         let mut pending_guard = pending.lock().await;
         for (_, tx) in pending_guard.drain() {
             let _ = tx.send(Err(JsonRpcError {
@@ -244,7 +265,24 @@ fn spawn_reader(
                 data: None,
             }));
         }
+        if let Ok(mut timings) = request_timings.lock() {
+            timings.clear();
+        }
     })
+}
+
+/// Look up the recorded send-time for the inbound frame's JSON-RPC id and
+/// compute the elapsed milliseconds. Returns `None` for frames that aren't
+/// responses to one of our outbound requests (notifications, server-initiated
+/// requests, unknown ids).
+fn inbound_duration_ms(value: &Value, request_timings: &RequestTimings) -> Option<u64> {
+    let id = value.get("id").and_then(value_to_u64)?;
+    if value.get("method").is_some() {
+        // Has both id and method ⇒ server-initiated request, not a response.
+        return None;
+    }
+    let started = request_timings.lock().ok()?.remove(&id)?;
+    Some(started.elapsed().as_millis() as u64)
 }
 
 async fn dispatch_inbound(
@@ -272,7 +310,7 @@ async fn dispatch_inbound(
             let params = value.get("params").unwrap_or(&Value::Null);
             let decision = permission_fn(params);
             let resp = build_permission_response(id, params, decision);
-            let _ = write_frame(writer, &resp).await;
+            let _ = write_frame(writer, &resp, None).await;
         }
         (Some(id), Some(method)) => {
             // Other server-initiated requests (fs/*, terminal/*) aren't
@@ -286,7 +324,7 @@ async fn dispatch_inbound(
                     "message": format!("aivo ACP client does not implement `{method}`"),
                 },
             });
-            let _ = write_frame(writer, &resp).await;
+            let _ = write_frame(writer, &resp, None).await;
         }
         (None, None) => {}
     }
@@ -364,16 +402,72 @@ fn value_to_u64(v: &Value) -> Option<u64> {
     v.as_u64().or_else(|| v.as_i64().map(|n| n as u64))
 }
 
-async fn write_frame(writer: &Writer, value: &Value) -> Result<()> {
+async fn write_frame<W>(
+    writer: &Arc<Mutex<W>>,
+    value: &Value,
+    request_timings: Option<&RequestTimings>,
+) -> Result<()>
+where
+    W: tokio::io::AsyncWrite + Unpin + Send,
+{
     let mut buf = serde_json::to_vec(value).context("encode JSON-RPC frame")?;
     buf.push(b'\n');
-    {
+
+    // Record the send instant *before* the bytes hit the pipe so a fast
+    // response from the child can be paired with the timing entry. Inserting
+    // after flush races the reader: the child can read+respond between
+    // flush and insert, leaving the response with `duration_ms: None` and
+    // orphaning the entry forever. Rollback on write failure keeps the map
+    // clean.
+    let timing_key = request_tracking_key(value, request_timings);
+    with_timings(timing_key, |map, id| {
+        map.insert(id, Instant::now());
+    });
+
+    let write_result: Result<()> = async {
         let mut w = writer.lock().await;
         w.write_all(&buf).await.context("write ACP frame")?;
         w.flush().await.context("flush ACP frame")?;
+        Ok(())
     }
-    log_acp_frame(Direction::Outbound, value).await;
+    .await;
+
+    if let Err(e) = write_result {
+        with_timings(timing_key, |map, id| {
+            map.remove(&id);
+        });
+        return Err(e);
+    }
+
+    log_acp_frame(Direction::Outbound, value, None).await;
     Ok(())
+}
+
+/// Runs `f` against the timings map for `key`'s id, swallowing the lock-poison
+/// case. No-op when `key` is `None` (untracked frame) or the mutex is poisoned.
+fn with_timings<F>(key: Option<(&RequestTimings, u64)>, f: F)
+where
+    F: FnOnce(&mut HashMap<u64, Instant>, u64),
+{
+    if let Some((timings, id)) = key
+        && let Ok(mut map) = timings.lock()
+    {
+        f(&mut map, id);
+    }
+}
+
+/// Returns `Some((timings, id))` when this frame is an outbound JSON-RPC
+/// request whose round-trip latency we should record. Notifications (no
+/// `id`) and responses to server-initiated requests (no `method`) are
+/// untracked and yield `None`.
+fn request_tracking_key<'a>(
+    value: &Value,
+    request_timings: Option<&'a RequestTimings>,
+) -> Option<(&'a RequestTimings, u64)> {
+    let timings = request_timings?;
+    let id = value.get("id").and_then(value_to_u64)?;
+    value.get("method").and_then(Value::as_str)?;
+    Some((timings, id))
 }
 
 /// Direction tag for a logged ACP frame.
@@ -385,10 +479,17 @@ enum Direction {
 
 const ACP_LOG_BODY_LIMIT: usize = 64 * 1024;
 
-/// Emit one paired Phase::Request / Phase::Response entry per ACP frame so the
-/// `aivo logs` JSONL stays consistent with the HTTP routers. No-op when
-/// `--debug` is not in effect.
-async fn log_acp_frame(direction: Direction, value: &Value) {
+/// ACP `session/update` kinds whose body is dropped under `AIVO_DEBUG_QUIET`.
+/// These two account for the bulk of bytes during a streaming turn while
+/// carrying no actionable signal post-hoc (the agent's prose, not its tool
+/// activity).
+const QUIET_REDACTED_UPDATES: &[&str] = &["agent_message_chunk", "agent_thought_chunk"];
+
+/// Emit one log entry per ACP frame, labeled by JSON-RPC frame shape
+/// (request/response/notification) rather than transport direction so
+/// `aivo logs` filters match how a reader thinks about the protocol.
+/// No-op when `--debug` is not in effect.
+async fn log_acp_frame(direction: Direction, value: &Value, duration_ms: Option<u64>) {
     let Some(logger) = http_debug::global() else {
         return;
     };
@@ -396,23 +497,81 @@ async fn log_acp_frame(direction: Direction, value: &Value) {
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
     let id = format!("acp-{n:x}");
     logger
-        .log(build_acp_debug_entry(id, direction, value))
+        .log(build_acp_debug_entry(id, direction, value, duration_ms))
         .await;
+}
+
+/// JSON-RPC frame kind, derived from the presence/absence of `id` and `method`.
+/// Maps onto `Phase` in the debug log: requests/notifications keep their
+/// JSON-RPC method name as the entry's `method` field; responses use the
+/// `result` / `error` label so the log reader can grep on it directly.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum FrameKind {
+    Request,
+    Response,
+    Notification,
+}
+
+fn classify_frame(value: &Value) -> FrameKind {
+    let has_id = value.get("id").is_some();
+    let has_method = value.get("method").is_some();
+    match (has_id, has_method) {
+        (true, true) => FrameKind::Request,
+        (true, false) => FrameKind::Response,
+        (false, _) => FrameKind::Notification,
+    }
+}
+
+/// Extracts the `sessionUpdate` kind from an ACP `session/update` notification
+/// envelope. Returns `None` for non-update frames.
+fn session_update_kind(value: &Value) -> Option<&str> {
+    value
+        .get("params")
+        .and_then(|p| p.get("update"))
+        .and_then(|u| u.get("sessionUpdate"))
+        .and_then(Value::as_str)
+}
+
+fn debug_quiet_enabled() -> bool {
+    use std::sync::OnceLock;
+    static FLAG: OnceLock<bool> = OnceLock::new();
+    *FLAG.get_or_init(|| {
+        std::env::var("AIVO_DEBUG_QUIET")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
+    })
 }
 
 /// Pure builder for the JSONL schema; keeps `log_acp_frame` testable without a
 /// real logger. `id` is injected by the caller so tests can pin it.
-fn build_acp_debug_entry(id: String, direction: Direction, value: &Value) -> DebugEntry {
+fn build_acp_debug_entry(
+    id: String,
+    direction: Direction,
+    value: &Value,
+    duration_ms: Option<u64>,
+) -> DebugEntry {
+    let kind = classify_frame(value);
     let method = value
         .get("method")
         .and_then(Value::as_str)
-        .unwrap_or_else(|| match value.get("error") {
-            Some(_) => "error",
-            None if value.get("result").is_some() => "result",
-            _ => "frame",
-        })
-        .to_string();
-    let body_str = value.to_string();
+        .map(str::to_string)
+        .unwrap_or_else(|| {
+            match value.get("error") {
+                Some(_) => "error",
+                None if value.get("result").is_some() => "result",
+                _ => "frame",
+            }
+            .to_string()
+        });
+    let session_update = session_update_kind(value);
+    let body_str = match session_update {
+        // Preserve the envelope + sessionUpdate label so the entry stays
+        // greppable; drop only the verbose text payload.
+        Some(kind) if debug_quiet_enabled() && QUIET_REDACTED_UPDATES.contains(&kind) => {
+            format!("[quiet: {kind}]")
+        }
+        _ => value.to_string(),
+    };
     let body = if body_str.len() > ACP_LOG_BODY_LIMIT {
         let mut truncated = body_str[..ACP_LOG_BODY_LIMIT].to_string();
         truncated.push_str("…[truncated]");
@@ -420,10 +579,36 @@ fn build_acp_debug_entry(id: String, direction: Direction, value: &Value) -> Deb
     } else {
         body_str
     };
-    let (phase, url) = match direction {
-        Direction::Outbound => (Phase::Request, "acp://outbound"),
-        Direction::Inbound => (Phase::Response, "acp://inbound"),
+    let phase = match kind {
+        FrameKind::Request => Phase::Request,
+        FrameKind::Response => Phase::Response,
+        FrameKind::Notification => Phase::Notification,
     };
+    let url = match direction {
+        Direction::Outbound => "acp://outbound",
+        Direction::Inbound => "acp://inbound",
+    };
+    // Body lives in `request_body` for anything we sent and `response_body`
+    // for anything we received. The slot tracks transport direction; the
+    // phase label tracks JSON-RPC frame kind.
+    let (request_body, response_body) = match direction {
+        Direction::Outbound => (Some(body), None),
+        Direction::Inbound => (None, Some(body)),
+    };
+    // Surface JSON-RPC errors via the dedicated `error` field so post-hoc
+    // log queries can `select * where error is not null` without parsing
+    // the body envelope.
+    let error = value
+        .get("error")
+        .and_then(|err| err.get("message").and_then(Value::as_str))
+        .map(|msg| {
+            let code = value
+                .get("error")
+                .and_then(|e| e.get("code"))
+                .and_then(Value::as_i64)
+                .unwrap_or(0);
+            format!("JSON-RPC {code}: {msg}")
+        });
     DebugEntry {
         ts: chrono::Utc::now().to_rfc3339(),
         id,
@@ -431,18 +616,12 @@ fn build_acp_debug_entry(id: String, direction: Direction, value: &Value) -> Deb
         method,
         url: url.to_string(),
         status: None,
-        duration_ms: None,
+        duration_ms,
         request_headers: BTreeMap::new(),
-        request_body: match direction {
-            Direction::Outbound => Some(body.clone()),
-            Direction::Inbound => None,
-        },
+        request_body,
         response_headers: BTreeMap::new(),
-        response_body: match direction {
-            Direction::Inbound => Some(body),
-            Direction::Outbound => None,
-        },
-        error: None,
+        response_body,
+        error,
     }
 }
 
@@ -552,7 +731,7 @@ read line; printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"ok":true}}'"#,
             "method": "session/prompt",
             "params": {"sessionId": "s", "prompt": [{"type":"text","text":"hi"}]},
         });
-        let entry = build_acp_debug_entry("acp-7".into(), Direction::Outbound, &frame);
+        let entry = build_acp_debug_entry("acp-7".into(), Direction::Outbound, &frame, None);
         assert_eq!(entry.id, "acp-7");
         assert!(matches!(entry.phase, Phase::Request));
         assert_eq!(entry.url, "acp://outbound");
@@ -564,10 +743,11 @@ read line; printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"ok":true}}'"#,
     #[test]
     fn inbound_debug_entry_uses_result_method_label_when_no_method_present() {
         let frame = json!({"jsonrpc":"2.0","id":1,"result":{"ok":true}});
-        let entry = build_acp_debug_entry("acp-1".into(), Direction::Inbound, &frame);
+        let entry = build_acp_debug_entry("acp-1".into(), Direction::Inbound, &frame, Some(42));
         assert!(matches!(entry.phase, Phase::Response));
         assert_eq!(entry.url, "acp://inbound");
         assert_eq!(entry.method, "result");
+        assert_eq!(entry.duration_ms, Some(42));
         assert!(
             entry
                 .response_body
@@ -576,13 +756,67 @@ read line; printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"ok":true}}'"#,
                 .contains("\"ok\":true")
         );
         assert!(entry.request_body.is_none());
+        assert!(entry.error.is_none());
     }
 
     #[test]
     fn inbound_debug_entry_marks_error_frames() {
         let frame = json!({"jsonrpc":"2.0","id":1,"error":{"code":-32601,"message":"nope"}});
-        let entry = build_acp_debug_entry("acp-1".into(), Direction::Inbound, &frame);
+        let entry = build_acp_debug_entry("acp-1".into(), Direction::Inbound, &frame, None);
         assert_eq!(entry.method, "error");
+        // JSON-RPC errors get surfaced in the dedicated `error` field so the
+        // log reader doesn't have to parse the body envelope to spot failures.
+        assert_eq!(
+            entry.error.as_deref(),
+            Some("JSON-RPC -32601: nope"),
+            "error message should encode code + message"
+        );
+    }
+
+    #[test]
+    fn inbound_notification_is_labeled_notification_not_response() {
+        // Regression: pre-fix, session/update notifications were labeled
+        // Phase::Response, conflating them with replies to our requests.
+        let frame = json!({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {"sessionId": "s1", "update": {"sessionUpdate": "tool_call"}},
+        });
+        let entry = build_acp_debug_entry("acp-n".into(), Direction::Inbound, &frame, None);
+        assert!(matches!(entry.phase, Phase::Notification));
+        assert_eq!(entry.method, "session/update");
+        assert!(entry.duration_ms.is_none());
+    }
+
+    #[test]
+    fn outbound_response_to_server_request_is_labeled_response() {
+        // We reply to server-initiated requests (e.g. session/request_permission)
+        // by writing a frame with id+result. The phase should reflect that
+        // it's a response, even though we're the one writing it.
+        let frame = json!({"jsonrpc":"2.0","id":42,"result":{"outcome":{"outcome":"cancelled"}}});
+        let entry = build_acp_debug_entry("acp-r".into(), Direction::Outbound, &frame, None);
+        assert!(matches!(entry.phase, Phase::Response));
+        assert_eq!(entry.url, "acp://outbound");
+        assert_eq!(entry.method, "result");
+        // Outbound frames put the body in `request_body` regardless of phase.
+        assert!(entry.request_body.is_some());
+        assert!(entry.response_body.is_none());
+    }
+
+    #[test]
+    fn classify_frame_distinguishes_all_three_kinds() {
+        assert_eq!(
+            classify_frame(&json!({"id":1,"method":"x"})),
+            FrameKind::Request
+        );
+        assert_eq!(
+            classify_frame(&json!({"id":1,"result":{}})),
+            FrameKind::Response
+        );
+        assert_eq!(
+            classify_frame(&json!({"method":"session/update"})),
+            FrameKind::Notification
+        );
     }
 
     #[test]
@@ -630,10 +864,119 @@ read line; printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"ok":true}}'"#,
     fn huge_acp_frame_bodies_are_truncated_with_marker() {
         let huge: String = "x".repeat(ACP_LOG_BODY_LIMIT + 5_000);
         let frame = json!({"method": "noisy", "data": huge});
-        let entry = build_acp_debug_entry("acp-x".into(), Direction::Outbound, &frame);
+        let entry = build_acp_debug_entry("acp-x".into(), Direction::Outbound, &frame, None);
         let body = entry.request_body.unwrap();
         assert!(body.ends_with("…[truncated]"));
         assert!(body.len() < frame.to_string().len());
+    }
+
+    #[test]
+    fn quiet_mode_redaction_covers_only_chunk_sessionupdate_kinds() {
+        // The QUIET_REDACTED_UPDATES list is what `build_acp_debug_entry`
+        // checks against; tool_call updates carry signal worth keeping
+        // verbatim and must NOT be in the list.
+        let chunk = json!({
+            "method": "session/update",
+            "params": {"update": {"sessionUpdate": "agent_message_chunk", "content": {"text": "x"}}},
+        });
+        let thought = json!({
+            "method": "session/update",
+            "params": {"update": {"sessionUpdate": "agent_thought_chunk", "content": {"text": "x"}}},
+        });
+        let tool = json!({
+            "method": "session/update",
+            "params": {"update": {"sessionUpdate": "tool_call_update", "status": "in_progress"}},
+        });
+        assert!(QUIET_REDACTED_UPDATES.contains(&session_update_kind(&chunk).unwrap()));
+        assert!(QUIET_REDACTED_UPDATES.contains(&session_update_kind(&thought).unwrap()));
+        assert!(!QUIET_REDACTED_UPDATES.contains(&session_update_kind(&tool).unwrap()));
+    }
+
+    #[test]
+    fn request_tracking_key_skips_notifications_and_responses() {
+        let timings: RequestTimings = Arc::new(std::sync::Mutex::new(HashMap::new()));
+        // Outbound request (id + method): tracked.
+        let req = json!({"jsonrpc":"2.0","id":7,"method":"ping"});
+        assert!(request_tracking_key(&req, Some(&timings)).is_some());
+        // Outbound notification (method only): not tracked.
+        let notif = json!({"jsonrpc":"2.0","method":"session/update","params":{}});
+        assert!(request_tracking_key(&notif, Some(&timings)).is_none());
+        // Outbound response to server-initiated request (id only): not tracked.
+        let resp = json!({"jsonrpc":"2.0","id":42,"result":{}});
+        assert!(request_tracking_key(&resp, Some(&timings)).is_none());
+        // No timings map at all: not tracked.
+        assert!(request_tracking_key(&req, None).is_none());
+    }
+
+    #[tokio::test]
+    async fn write_frame_inserts_timing_before_bytes_hit_pipe() {
+        // Regression: inserting AFTER write+flush raced the reader task —
+        // a fast child could respond before the insert landed, and the
+        // matching inbound entry was logged with `duration_ms: None`. The
+        // insert must happen before the bytes are flushed.
+        use tokio::io::AsyncReadExt;
+
+        let (mut reader_side, writer_side) = tokio::io::duplex(1024);
+        let writer = Arc::new(Mutex::new(writer_side));
+        let timings: RequestTimings = Arc::new(std::sync::Mutex::new(HashMap::new()));
+
+        let frame = json!({
+            "jsonrpc": "2.0",
+            "id": 42,
+            "method": "ping",
+            "params": {},
+        });
+
+        let writer_clone = writer.clone();
+        let timings_clone = timings.clone();
+        let frame_clone = frame.clone();
+        let write_handle = tokio::spawn(async move {
+            write_frame(&writer_clone, &frame_clone, Some(&timings_clone))
+                .await
+                .unwrap();
+        });
+
+        // Pull bytes off the pipe. The moment we observe ANY byte, the
+        // entry MUST already be in the map — otherwise the reader-side
+        // race window we're guarding against is still open.
+        let mut buf = vec![0u8; 1024];
+        let n = reader_side.read(&mut buf).await.expect("pipe read");
+        assert!(n > 0, "expected bytes on the pipe");
+        assert!(
+            timings.lock().unwrap().contains_key(&42),
+            "timing entry must be present BEFORE the writer's flush is observable to the reader"
+        );
+
+        write_handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn write_frame_rolls_back_timing_on_write_error() {
+        // Drop the reader side of the duplex so the writer's flush fails;
+        // the insert must be removed so the map doesn't leak entries that
+        // outlive the request.
+        let (reader_side, writer_side) = tokio::io::duplex(1);
+        drop(reader_side);
+        let writer = Arc::new(Mutex::new(writer_side));
+        let timings: RequestTimings = Arc::new(std::sync::Mutex::new(HashMap::new()));
+
+        // Pad the frame so the single-byte buffer can't absorb it before
+        // hitting the closed reader side.
+        let frame = json!({
+            "jsonrpc": "2.0",
+            "id": 99,
+            "method": "ping",
+            "params": {"pad": "x".repeat(4096)},
+        });
+        let result = write_frame(&writer, &frame, Some(&timings)).await;
+        assert!(
+            result.is_err(),
+            "expected the write to fail once the reader half is closed"
+        );
+        assert!(
+            !timings.lock().unwrap().contains_key(&99),
+            "timing entry must be removed when the write fails so the map stays clean"
+        );
     }
 
     #[tokio::test]

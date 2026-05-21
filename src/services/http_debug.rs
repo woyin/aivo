@@ -100,6 +100,11 @@ pub(crate) enum Phase {
     /// in addition to the per-headers `Response` entry, sharing its `id`.
     ResponseBody,
     Error,
+    /// JSON-RPC notification: a frame with `method` but no `id`, used by ACP's
+    /// `session/update` push stream. Distinct from `Request` / `Response`
+    /// because notifications have no reply and shouldn't be paired up by id
+    /// when post-processing the log.
+    Notification,
 }
 
 #[derive(Debug, Serialize)]

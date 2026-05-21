@@ -11,7 +11,7 @@ use anyhow::{Context, Result, anyhow};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Instant;
 use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener, TcpStream};
@@ -38,6 +38,11 @@ pub struct CursorRouterConfig {
     /// `cursor-agent models` — saving ~1-3 s on every launch where a fresh
     /// entry exists from a prior `aivo models cursor` or picker invocation.
     pub models_cache: Option<ModelsCache>,
+    /// Number of ACP sessions to pre-open at router startup. Capped at
+    /// [`MAX_POOL_SESSIONS`]. Pick `2` for tools that fan out paired requests
+    /// (e.g. Claude Code's main + subagent burst), `1` for sequential tools
+    /// (pi, codex), `0` in tests that don't want to spawn `cursor-agent`.
+    pub prewarm_count: usize,
 }
 
 pub struct CursorModelRouter {
@@ -48,9 +53,11 @@ pub struct CursorModelRouter {
 /// per session, so paired turns (main + subagent) need separate slots.
 const MAX_POOL_SESSIONS: usize = 3;
 
-/// Prewarm count at router startup — covers Claude Code's paired
-/// main+subagent burst without paying cold `session/new` on either.
-const INITIAL_POOL_PREWARM: usize = 2;
+/// Default prewarm when the caller doesn't override. Two sessions covers
+/// Claude Code's paired main+subagent burst; tools without that pattern
+/// override this via `CursorRouterConfig::prewarm_count` to avoid spawning
+/// a second cursor-agent that the tool would never use.
+pub const DEFAULT_POOL_PREWARM: usize = 2;
 
 /// One lazily-opened ACP session. Held inside `Arc<Mutex<...>>` so HTTP
 /// handlers can take an owned lock for the full turn duration; the outer pool
@@ -64,6 +71,14 @@ struct RouterState {
     /// Each slot holds at most one session; concurrent requests fan out into
     /// idle slots and only block when every slot is busy.
     pool: Mutex<Vec<SessionSlot>>,
+    /// Count of prewarm tasks still opening sessions. `acquire_session_slot`
+    /// consults this to wait on an in-flight prewarmed slot rather than
+    /// expanding the pool past `prewarm_count` and orphaning a process. The
+    /// counter is incremented synchronously in `spawn_prewarm` (before any
+    /// task is spawned) so an early request arriving between
+    /// `start_background` returning and the prewarm task starting still
+    /// sees `prewarming > 0`.
+    prewarming: AtomicUsize,
 }
 
 impl CursorModelRouter {
@@ -78,22 +93,25 @@ impl CursorModelRouter {
     /// can stream.
     pub async fn start_background(&self) -> Result<(u16, JoinHandle<Result<()>>)> {
         let (listener, port) = bind_local_listener().await?;
+        let prewarm = self.config.prewarm_count;
         let state = Arc::new(RouterState {
             config: self.config.clone(),
             cached_models: Mutex::new(None),
             pool: Mutex::new(Vec::new()),
+            prewarming: AtomicUsize::new(0),
         });
-        spawn_prewarm(state.clone(), INITIAL_POOL_PREWARM);
+        spawn_prewarm(state.clone(), prewarm);
         let handle = tokio::spawn(run_router(listener, state));
         Ok((port, handle))
     }
 }
 
 /// Reserve a session slot for the current HTTP turn. Prefers an idle slot;
-/// expands the pool up to [`MAX_POOL_SESSIONS`] when every existing slot is
-/// busy; finally falls back to waiting on the first slot when the cap is hit.
-/// The returned guard pins the slot for the caller's exclusive use until
-/// dropped.
+/// when prewarm is still in flight, blocks on one of the existing slots so we
+/// don't expand past `prewarm_count` and orphan a cursor-agent process;
+/// otherwise expands the pool up to [`MAX_POOL_SESSIONS`]; finally falls
+/// back to waiting on the first slot when the cap is hit. The returned guard
+/// pins the slot for the caller's exclusive use until dropped.
 async fn acquire_session_slot(
     state: &RouterState,
 ) -> tokio::sync::OwnedMutexGuard<Option<CursorAcpSession>> {
@@ -103,9 +121,28 @@ async fn acquire_session_slot(
             return guard;
         }
     }
-    // Every existing slot is busy. Append a new one if there's headroom.
+    // Every existing slot is busy. If a prewarm task is still opening one of
+    // them, wait for it to finish instead of expanding the pool — otherwise
+    // we'd spawn a second cursor-agent that the prewarmed one would
+    // duplicate. Race the lock_owned() futures across all existing slots so
+    // whichever frees first (prewarm completion OR request return) wins;
+    // pinning to slot 0 would deadlock a second concurrent acquirer when
+    // slot 1 finishes first.
+    if state.prewarming.load(Ordering::SeqCst) > 0 && !existing.is_empty() {
+        return wait_for_any_slot(existing).await;
+    }
     {
         let mut pool = state.pool.lock().await;
+        // Re-sweep under the pool mutex before expanding: a prewarm or
+        // another acquirer may have released between the initial try_lock
+        // pass above and now. Without this, prewarming dropping to 0
+        // milliseconds before we read it would still let us expand past a
+        // freshly-freed slot and orphan a cursor-agent.
+        for slot in pool.iter() {
+            if let Ok(guard) = slot.clone().try_lock_owned() {
+                return guard;
+            }
+        }
         if pool.len() < MAX_POOL_SESSIONS {
             let slot: SessionSlot = Arc::new(Mutex::new(None));
             pool.push(slot.clone());
@@ -117,6 +154,19 @@ async fn acquire_session_slot(
     // be marginally fairer but the launched tool rarely keeps all three
     // pegged, so a deterministic pick keeps the code simple.
     existing[0].clone().lock_owned().await
+}
+
+/// Race `lock_owned()` across every slot, returning whichever lock resolves
+/// first. Pending futures are dropped (and their internal waiters cancelled)
+/// when the winner returns, so the loser slots remain available for the next
+/// acquirer.
+async fn wait_for_any_slot(
+    slots: Vec<SessionSlot>,
+) -> tokio::sync::OwnedMutexGuard<Option<CursorAcpSession>> {
+    use futures::future::FutureExt;
+    let mut futures: Vec<_> = slots.into_iter().map(|s| s.lock_owned().boxed()).collect();
+    let (guard, _, _rest) = futures::future::select_all(futures.drain(..)).await;
+    guard
 }
 
 /// Ensure the slot holds an open session, opening one on demand. Equivalent
@@ -145,16 +195,28 @@ async fn ensure_session_open(
 /// from the launched tool find ready ACP sessions instead of paying Node.js
 /// startup + initialize + authenticate + session/new serially. Slots beyond
 /// `count` are still opened on demand the first time a request lands on
-/// them. `count` is capped at `MAX_POOL_SESSIONS`.
+/// them. `count` is capped at [`MAX_POOL_SESSIONS`].
+///
+/// The `prewarming` counter is bumped synchronously *before* each task is
+/// spawned, so an HTTP request that lands during the small window between
+/// `start_background` returning and the task actually starting will still
+/// see `prewarming > 0` and choose to wait on the prewarmed slot instead of
+/// expanding the pool.
 fn spawn_prewarm(state: Arc<RouterState>, count: usize) {
     let target = count.min(MAX_POOL_SESSIONS);
     for slot_idx in 0..target {
+        state.prewarming.fetch_add(1, Ordering::SeqCst);
         spawn_single_prewarm(state.clone(), slot_idx);
     }
 }
 
 fn spawn_single_prewarm(state: Arc<RouterState>, slot_idx: usize) {
     tokio::spawn(async move {
+        // Drop guard so the counter decrements on any exit path, including
+        // panics inside CursorAcpSession::open.
+        let _decrement = PrewarmCounterGuard {
+            state: state.clone(),
+        };
         // Reserve the slot at the requested index, growing the pool to fit
         // if necessary. Concurrent requests that arrive before the prewarm
         // finishes find the slot already in the pool and wait on its lock.
@@ -180,6 +242,19 @@ fn spawn_single_prewarm(state: Arc<RouterState>, slot_idx: usize) {
             }
         }
     });
+}
+
+/// Decrements `RouterState::prewarming` on drop. Used by `spawn_single_prewarm`
+/// so the counter is bookkept correctly across both Ok and Err exit paths,
+/// and even if `CursorAcpSession::open` panics.
+struct PrewarmCounterGuard {
+    state: Arc<RouterState>,
+}
+
+impl Drop for PrewarmCounterGuard {
+    fn drop(&mut self) {
+        self.state.prewarming.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 async fn run_router(listener: TcpListener, state: Arc<RouterState>) -> Result<()> {
@@ -2754,9 +2829,11 @@ mod tests {
                 // Tests pin the in-memory cache directly via `cached_models`;
                 // skip disk plumbing so they don't touch `~/.config/aivo/`.
                 models_cache: None,
+                prewarm_count: 0,
             },
             cached_models: Mutex::new(Some(models.into_iter().map(String::from).collect())),
             pool: Mutex::new(Vec::new()),
+            prewarming: AtomicUsize::new(0),
         })
     }
 
@@ -2880,11 +2957,13 @@ mod tests {
                 key,
                 workspace_cwd: "/tmp".to_string(),
                 models_cache: Some(cache),
+                prewarm_count: 0,
             },
             // In-memory cache deliberately empty so the lookup falls through
             // to the disk-backed branch.
             cached_models: Mutex::new(None),
             pool: Mutex::new(Vec::new()),
+            prewarming: AtomicUsize::new(0),
         });
 
         let response = tokio::time::timeout(
@@ -3076,6 +3155,107 @@ mod tests {
             "update": {"sessionUpdate": "session_info_update"},
         });
         assert!(extract_tool_call_marker(&irrelevant).is_none());
+    }
+
+    #[tokio::test]
+    async fn acquire_session_slot_waits_for_prewarm_instead_of_expanding() {
+        // Regression: when a prewarm task is mid-`CursorAcpSession::open` it
+        // holds the slot's lock. The previous `try_lock_owned` path
+        // immediately gave up and expanded the pool, spawning a second
+        // cursor-agent that the prewarmed one would duplicate. With the fix,
+        // an arriving request must wait on the prewarmed slot when
+        // `prewarming > 0`, not append a new slot.
+        let state = state_with_models(vec![]);
+        let slot: SessionSlot = Arc::new(Mutex::new(None));
+        state.pool.lock().await.push(slot.clone());
+        // Simulate the prewarm task holding the slot's lock and the
+        // prewarming counter being non-zero.
+        let held = slot.clone().lock_owned().await;
+        state.prewarming.fetch_add(1, Ordering::SeqCst);
+
+        let acquire_state = state.clone();
+        let mut acquire = Box::pin(async move { acquire_session_slot(&acquire_state).await });
+
+        // While the prewarm slot is held, acquire must NOT complete (it
+        // should be parked on the slot's lock) AND must NOT expand the
+        // pool.
+        let parked = tokio::time::timeout(std::time::Duration::from_millis(50), &mut acquire)
+            .await
+            .is_err();
+        assert!(
+            parked,
+            "acquire should block, not expand, while prewarm holds the slot"
+        );
+        assert_eq!(
+            state.pool.lock().await.len(),
+            1,
+            "pool must stay at 1 slot — expanding would orphan a cursor-agent"
+        );
+
+        // Release the prewarm's hold; acquire should now resolve with the
+        // existing slot.
+        state.prewarming.fetch_sub(1, Ordering::SeqCst);
+        drop(held);
+        let guard = tokio::time::timeout(std::time::Duration::from_secs(1), acquire)
+            .await
+            .expect("acquire should resolve once prewarm releases");
+        assert!(guard.is_none(), "slot's inner session is still empty");
+        assert_eq!(state.pool.lock().await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn acquire_session_slot_picks_whichever_prewarm_slot_frees_first() {
+        // With two prewarmed slots both locked, two concurrent acquirers
+        // must each land on a separate slot. Pinning to existing[0] would
+        // deadlock the second acquirer if slot[1] freed first.
+        let state = state_with_models(vec![]);
+        let slot_a: SessionSlot = Arc::new(Mutex::new(None));
+        let slot_b: SessionSlot = Arc::new(Mutex::new(None));
+        {
+            let mut pool = state.pool.lock().await;
+            pool.push(slot_a.clone());
+            pool.push(slot_b.clone());
+        }
+        let held_a = slot_a.clone().lock_owned().await;
+        let held_b = slot_b.clone().lock_owned().await;
+        state.prewarming.fetch_add(2, Ordering::SeqCst);
+
+        let s1 = state.clone();
+        let s2 = state.clone();
+        let acquire_1 = tokio::spawn(async move { acquire_session_slot(&s1).await });
+        let acquire_2 = tokio::spawn(async move { acquire_session_slot(&s2).await });
+
+        // Free slot B first: one acquirer wakes.
+        drop(held_b);
+        // Then slot A: the other acquirer wakes.
+        drop(held_a);
+        state.prewarming.store(0, Ordering::SeqCst);
+
+        let r1 = tokio::time::timeout(std::time::Duration::from_secs(1), acquire_1).await;
+        let r2 = tokio::time::timeout(std::time::Duration::from_secs(1), acquire_2).await;
+        assert!(r1.is_ok() && r2.is_ok(), "both acquirers must resolve");
+        assert_eq!(
+            state.pool.lock().await.len(),
+            2,
+            "pool size unchanged — no expansion happened"
+        );
+    }
+
+    #[tokio::test]
+    async fn spawn_prewarm_increments_counter_synchronously() {
+        // The counter must reflect pending prewarms BEFORE the spawned
+        // tasks run, so an early request that arrives in the gap between
+        // `start_background` returning and the prewarm task starting
+        // observes `prewarming > 0` and picks the wait-on-slot branch.
+        let state = state_with_models(vec![]);
+        spawn_prewarm(state.clone(), 2);
+        // No `.await` since the increment is synchronous.
+        assert_eq!(state.prewarming.load(Ordering::SeqCst), 2);
+        // Drain any background work and let the PrewarmCounterGuard drop
+        // so we don't leave state behind for sibling tests.
+        for _ in 0..32 {
+            tokio::task::yield_now().await;
+        }
     }
 
     #[tokio::test]

@@ -110,7 +110,7 @@ pub(crate) async fn prepare_runtime_env(
     }
 
     if env.contains_key("AIVO_USE_CURSOR_ROUTER") {
-        let port = start_cursor_router(&mut env).await?;
+        let port = start_cursor_router(&mut env, tool).await?;
         if tool == AIToolType::Pi && env.contains_key("AIVO_PI_MODELS_JSON") {
             // Pi reads its upstream URL from a JSON file, not an env var, so
             // patch the placeholder in AIVO_PI_MODELS_JSON before writing the
@@ -1539,7 +1539,7 @@ async fn start_copilot_router(env: &HashMap<String, String>) -> Result<u16> {
     Ok(port)
 }
 
-async fn start_cursor_router(env: &mut HashMap<String, String>) -> Result<u16> {
+async fn start_cursor_router(env: &mut HashMap<String, String>, tool: AIToolType) -> Result<u16> {
     use crate::services::cursor_acp::{self, CURSOR_ACP_SENTINEL};
     use crate::services::cursor_model_router::{CursorModelRouter, CursorRouterConfig};
     use crate::services::session_store::ApiKey;
@@ -1595,10 +1595,19 @@ async fn start_cursor_router(env: &mut HashMap<String, String>) -> Result<u16> {
         .and_then(|p| p.to_str().map(String::from))
         .unwrap_or_else(|| ".".to_string());
 
+    // Claude Code fires paired main+subagent prompts concurrently — both
+    // slots prewarmed avoid a cold `session/new` on the subagent. Other
+    // tools (pi, codex, opencode, amp, gemini) send turns sequentially and
+    // would just orphan the second cursor-agent process, so they prewarm 1.
+    let prewarm_count = match tool {
+        AIToolType::Claude => 2,
+        _ => 1,
+    };
     let router = CursorModelRouter::new(CursorRouterConfig {
         key,
         workspace_cwd,
         models_cache: Some(crate::services::models_cache::ModelsCache::new()),
+        prewarm_count,
     });
     let (port, handle) = router.start_background().await?;
     tokio::spawn(async move {
