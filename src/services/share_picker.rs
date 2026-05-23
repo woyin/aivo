@@ -14,7 +14,8 @@ use anyhow::{Context, Result};
 
 use crate::cli::LogsArgs;
 use crate::commands::logs::{
-    UnifiedRow, compute_orphan_chat_ids, fetch_unified_rows, picker_detail_width,
+    UnifiedRow, compute_orphan_chat_ids, fetch_unified_rows, min_unique_id_width,
+    picker_detail_width,
 };
 use crate::services::session_store::SessionStore;
 use crate::style;
@@ -71,11 +72,12 @@ pub async fn pick_session_id(
         prompt.to_string()
     };
 
-    let detail_width = picker_detail_width(console::Term::stdout().size().1 as usize);
+    let id_width = min_unique_id_width(&rows);
+    let detail_width = picker_detail_width(console::Term::stdout().size().1 as usize, id_width);
     let orphan_chat_ids = compute_orphan_chat_ids(session_store).await;
     let labels: Vec<String> = rows
         .iter()
-        .map(|r| r.picker_label(detail_width, &orphan_chat_ids, &run_meta))
+        .map(|r| r.picker_label(id_width, detail_width, &orphan_chat_ids, &run_meta))
         .collect();
     let ids: Vec<String> = rows.iter().map(UnifiedRow::id).collect();
 

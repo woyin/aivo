@@ -190,12 +190,11 @@ impl LogStore {
         .context("Failed to join log get task")?
     }
 
-    /// Like `get_by_reference` but prefix-matches the id, event_group_id,
-    /// and session_id columns. Used by the share resolver and `aivo logs
-    /// show` because the listing displays the most useful id per source:
-    /// row id for run/serve, event_group_id for collapsed run pairs,
-    /// session_id for chat rows. Returns at most `limit` matches;
-    /// collisions are surfaced to the caller for disambiguation.
+    /// Prefix-matches up to `limit` rows. Matches `id` / `event_group_id`
+    /// first (what `aivo logs` displays) and only falls back to
+    /// `session_id` when that pass is empty — UUIDv7 session ids share
+    /// 10+ leading hex chars for same-minute creates, which used to
+    /// create false ambiguity for users copy-pasting a displayed id.
     pub async fn find_by_id_prefix(&self, prefix: &str, limit: usize) -> Result<Vec<LogEntry>> {
         let path = self.path.clone();
         let prefix = prefix.trim().to_string();
@@ -205,24 +204,36 @@ impl LogStore {
                 return Ok(Vec::new());
             }
             let conn = open_read_connection(&path)?;
-            let sql = format!(
+            let primary_sql = format!(
                 "select {} from events
                   where id like ?1 || '%'
                      or event_group_id like ?1 || '%'
-                     or session_id like ?1 || '%'
                   order by ts_utc desc
                   limit ?2",
                 event_select_columns(true)
             );
-            let mut stmt = conn.prepare(&sql)?;
+            let mut stmt = conn.prepare(&primary_sql)?;
             let rows = stmt.query_map(rusqlite::params![prefix, limit as i64], map_log_row)?;
             let mut out = Vec::new();
             for row in rows {
                 out.push(row?);
             }
-            // Collapse duplicates: a run start+finish pair shares
-            // `event_group_id`; multiple chat events share `session_id`. Keep
-            // the most recent row in each group (rows arrive ts_utc desc).
+            if out.is_empty() {
+                let fallback_sql = format!(
+                    "select {} from events
+                      where session_id like ?1 || '%'
+                      order by ts_utc desc
+                      limit ?2",
+                    event_select_columns(true)
+                );
+                let mut stmt = conn.prepare(&fallback_sql)?;
+                let rows = stmt.query_map(rusqlite::params![prefix, limit as i64], map_log_row)?;
+                for row in rows {
+                    out.push(row?);
+                }
+            }
+            // Collapse start+finish pairs and per-chat events; rows are
+            // ts_utc-desc so the most recent in each group wins.
             let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
             out.retain(|e| {
                 let key = e
@@ -1019,6 +1030,64 @@ mod tests {
             .unwrap();
         assert_eq!(entry.id, finished_id);
         assert_eq!(entry.phase.as_deref(), Some("finished"));
+    }
+
+    #[tokio::test]
+    async fn find_by_id_prefix_prefers_event_group_over_session_id() {
+        let dir = TempDir::new().unwrap();
+        let store = store(&dir);
+        store
+            .append(LogEvent {
+                source: "run".to_string(),
+                kind: "tool_launch".to_string(),
+                event_group_id: Some("abcd1234zzzz".to_string()),
+                phase: Some("finished".to_string()),
+                tool: Some("claude".to_string()),
+                session_id: Some("ffff-no-collide".to_string()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        // Different event_group_id, but session_id shares the prefix —
+        // must not pollute the result.
+        store
+            .append(LogEvent {
+                source: "run".to_string(),
+                kind: "tool_launch".to_string(),
+                event_group_id: Some("eeee5555yyyy".to_string()),
+                phase: Some("finished".to_string()),
+                tool: Some("claude".to_string()),
+                session_id: Some("abcd1234-uuid-suffix".to_string()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        let hits = store.find_by_id_prefix("abcd1234", 5).await.unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].event_group_id.as_deref(), Some("abcd1234zzzz"));
+    }
+
+    #[tokio::test]
+    async fn find_by_id_prefix_falls_back_to_session_id_when_no_aivo_match() {
+        let dir = TempDir::new().unwrap();
+        let store = store(&dir);
+        store
+            .append(LogEvent {
+                source: "run".to_string(),
+                kind: "tool_launch".to_string(),
+                event_group_id: Some("eeee5555yyyy".to_string()),
+                phase: Some("finished".to_string()),
+                tool: Some("claude".to_string()),
+                session_id: Some("019e47b1-uuid-suffix".to_string()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        let hits = store.find_by_id_prefix("019e47b1", 5).await.unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].session_id.as_deref(), Some("019e47b1-uuid-suffix"));
     }
 
     #[tokio::test]

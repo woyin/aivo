@@ -97,12 +97,14 @@ impl UnifiedRow {
     }
 
     /// Plain-text formatted row matching `aivo logs`'s column shape
-    /// (`<age:5> <id:8> <bracket:10> <detail>`). No ANSI escapes — callers
-    /// (e.g. `FuzzySelect`) apply their own highlighting. Orphan chat rows
-    /// (session file deleted) get a `(file deleted)` suffix; native rows
-    /// with `[run]` metadata pick up a ` · <key> · exit <N>` suffix.
+    /// (`<age:5> <id:id_width> <bracket:10> <detail>`). No ANSI escapes —
+    /// callers (e.g. `FuzzySelect`) apply their own highlighting. Orphan
+    /// chat rows (session file deleted) get a `(file deleted)` suffix;
+    /// native rows with `[run]` metadata pick up a ` · <key> · exit <N>`
+    /// suffix.
     pub(crate) fn picker_label(
         &self,
+        id_width: usize,
         detail_width: usize,
         orphan_chat_ids: &HashSet<String>,
         run_meta: &RunMetaIndex,
@@ -115,12 +117,12 @@ impl UnifiedRow {
             ),
             UnifiedRow::Native(t) => (
                 format_time_ago_short_dt(t.updated_at),
-                compact_id(&t.session_id, ID_COL_WIDTH),
+                compact_id(&t.session_id, id_width),
                 t.topic.clone(),
             ),
             UnifiedRow::Amp(a) => (
                 format_time_ago_short_dt(a.updated_at),
-                compact_id(&a.id, ID_COL_WIDTH),
+                compact_id(&a.id, id_width),
                 a.title
                     .clone()
                     .unwrap_or_else(|| format!("(amp thread, {} messages)", a.message_count)),
@@ -151,10 +153,43 @@ impl UnifiedRow {
             detail,
             run_suffix_plain,
             orphan_suffix,
-            id_w = ID_COL_WIDTH,
+            id_w = id_width,
             br_w = BRACKET_COL_WIDTH,
         )
     }
+}
+
+/// Smallest prefix length in `ID_COL_WIDTH..=ID_COL_WIDTH_MAX` that keeps
+/// every row's displayed id unique. UUIDv7 session ids share 10+ leading
+/// hex chars for same-minute creates, so the 8-char floor isn't always
+/// enough; residual collisions past the cap fall through to the picker.
+pub(crate) fn min_unique_id_width(rows: &[UnifiedRow]) -> usize {
+    if rows.len() < 2 {
+        return ID_COL_WIDTH;
+    }
+    let ids: Vec<String> = rows
+        .iter()
+        .map(|r| compact_id(&r.id(), ID_COL_WIDTH_MAX))
+        .collect();
+    for width in ID_COL_WIDTH..=ID_COL_WIDTH_MAX {
+        let mut seen: HashSet<&str> = HashSet::new();
+        let mut unique = true;
+        for id in &ids {
+            let take = id
+                .char_indices()
+                .nth(width)
+                .map(|(i, _)| i)
+                .unwrap_or(id.len());
+            if !seen.insert(&id[..take]) {
+                unique = false;
+                break;
+            }
+        }
+        if unique {
+            return width;
+        }
+    }
+    ID_COL_WIDTH_MAX
 }
 
 /// Plain-text detail string for a logs.db row — mirrors the `text` half of
@@ -208,9 +243,9 @@ fn log_row_detail(entry: &LogEntry) -> String {
 
 /// Picker-facing column-width helper. Same math as
 /// `available_detail_width` so picker labels and `aivo logs` rows line up.
-pub(crate) fn picker_detail_width(term_cols: usize) -> usize {
-    const PREFIX: usize = 5 + 1 + ID_COL_WIDTH + 1 + BRACKET_COL_WIDTH + 1;
-    term_cols.saturating_sub(PREFIX + 4).clamp(20, 80)
+pub(crate) fn picker_detail_width(term_cols: usize, id_width: usize) -> usize {
+    let prefix = 5 + 1 + id_width + 1 + BRACKET_COL_WIDTH + 1;
+    term_cols.saturating_sub(prefix + 4).clamp(20, 80)
 }
 
 pub struct LogsCommand {
@@ -329,17 +364,9 @@ impl LogsCommand {
             }
         };
 
-        // 1. Try logs.db first with prefix matching — `aivo logs` displays
-        //    8-char ids and copy-pasting one needs to find the full row.
-        //    For chat/run/serve, the metadata view here is the right output
-        //    (don't auto-drill into chat sessions; that's `aivo logs share`'s
-        //    job — `show` is the row-level inspector).
+        // logs.db first — don't auto-drill into chat sessions, that's
+        // `aivo logs share`'s job; `show` is the row-level inspector.
         let logs_hits = self.session_store.logs().find_by_id_prefix(id, 5).await?;
-        // Multiple hits is most often a `session_id` UUID-prefix collision
-        // (e.g. the same native session re-launched produces distinct
-        // event_group_ids that share its session_id). Disambiguate via a
-        // picker in interactive mode; JSON / non-TTY callers still get the
-        // listing so they can re-run with a longer prefix.
         if logs_hits.len() > 1 {
             if let Some(entry) = pick_ambiguous_log_hit(id, &logs_hits, args.json).await? {
                 if args.json {
@@ -716,50 +743,58 @@ fn render_unified_rows(
         println!("{}", style::dim("No entries found."));
         return;
     }
-    let detail_width = available_detail_width();
+    let id_width = min_unique_id_width(rows);
+    let detail_width = available_detail_width(id_width);
     for row in rows {
         let orphan = row.is_orphan_chat(orphan_chat_ids);
         match row {
-            UnifiedRow::Log(e) => print_summary(e, detail_width, orphan),
+            UnifiedRow::Log(e) => print_summary(e, id_width, detail_width, orphan),
             UnifiedRow::Native(t) => {
-                print_native_summary(t, detail_width, run_meta.get(&t.session_id))
+                print_native_summary(t, id_width, detail_width, run_meta.get(&t.session_id))
             }
-            UnifiedRow::Amp(a) => print_amp_summary(a, detail_width),
+            UnifiedRow::Amp(a) => print_amp_summary(a, id_width, detail_width),
         }
     }
 }
 
 /// Detail-column width that keeps each row on a single terminal line.
-/// `prefix` covers age (5) + id (8) + bracket (10) + 3 separator spaces = 26;
-/// the trailing `+1` leaves headroom for the cursor so terminals that
-/// auto-wrap on the *last* column don't push every row to two lines.
+/// `prefix` covers age (5) + id (`id_width`) + bracket (10) + 3 separator
+/// spaces; the trailing `+1` leaves headroom for the cursor so terminals
+/// that auto-wrap on the *last* column don't push every row to two lines.
 /// Clamped to a comfortable reading band so very wide terminals don't
 /// produce unscannable 200-char rows.
-fn available_detail_width() -> usize {
-    const PREFIX: usize = 5 + 1 + ID_COL_WIDTH + 1 + BRACKET_COL_WIDTH + 1;
+fn available_detail_width(id_width: usize) -> usize {
+    let prefix = 5 + 1 + id_width + 1 + BRACKET_COL_WIDTH + 1;
     let cols = console::Term::stdout().size().1 as usize;
-    cols.saturating_sub(PREFIX + 1).clamp(30, 80)
+    cols.saturating_sub(prefix + 1).clamp(30, 80)
 }
 
-/// Width of the id column. 8 chars matches git-style short SHA — enough
-/// entropy to avoid collisions across a user's history while keeping the
-/// table compact. The resolver matches any unique prefix, so longer ids
-/// still work when pasted from other tools.
+/// Floor width for the id column — git-style short SHA.
+/// `min_unique_id_width` widens this up to `ID_COL_WIDTH_MAX` when the
+/// rows being rendered collide at 8.
 const ID_COL_WIDTH: usize = 8;
+/// Hard cap on the dynamic id column so the detail field stays readable;
+/// residual collisions past this fall through to the picker.
+const ID_COL_WIDTH_MAX: usize = 14;
 /// Width of the source bracket column, padded for `[opencode]` (10 chars).
 /// Keeps detail-column alignment consistent across all sources.
 const BRACKET_COL_WIDTH: usize = 10;
 
-fn print_native_summary(t: &Thread, detail_width: usize, run_meta: Option<&RunMeta>) {
+fn print_native_summary(
+    t: &Thread,
+    id_width: usize,
+    detail_width: usize,
+    run_meta: Option<&RunMeta>,
+) {
     let time_ago = format_time_ago_short_dt(t.updated_at);
-    let id = compact_id(&t.session_id, ID_COL_WIDTH);
+    let id = compact_id(&t.session_id, id_width);
     let suffix = run_meta.map(format_run_meta_suffix).unwrap_or_default();
     let topic_budget = detail_width.saturating_sub(visible_width(&suffix));
     let topic = trim_to_one_line(&t.topic, topic_budget);
     println!(
         "{} {} {} {}{}",
         style::dim(format!("{:>5}", time_ago)),
-        style::cyan(format!("{:<width$}", id, width = ID_COL_WIDTH)),
+        style::cyan(format!("{:<width$}", id, width = id_width)),
         style::magenta(format!(
             "{:<width$}",
             format!("[{}]", t.cli),
@@ -820,9 +855,9 @@ fn visible_width(s: &str) -> usize {
     out
 }
 
-fn print_amp_summary(a: &AmpRow, detail_width: usize) {
+fn print_amp_summary(a: &AmpRow, id_width: usize, detail_width: usize) {
     let time_ago = format_time_ago_short_dt(a.updated_at);
-    let id = compact_id(&a.id, ID_COL_WIDTH);
+    let id = compact_id(&a.id, id_width);
     let title = a
         .title
         .clone()
@@ -831,7 +866,7 @@ fn print_amp_summary(a: &AmpRow, detail_width: usize) {
     println!(
         "{} {} {} {}",
         style::dim(format!("{:>5}", time_ago)),
-        style::cyan(format!("{:<width$}", id, width = ID_COL_WIDTH)),
+        style::cyan(format!("{:<width$}", id, width = id_width)),
         style::magenta(format!("{:<width$}", "[amp]", width = BRACKET_COL_WIDTH)),
         title
     );
@@ -889,7 +924,7 @@ pub(crate) fn trim_to_one_line(text: &str, max_cols: usize) -> String {
     truncated
 }
 
-fn print_summary(entry: &LogEntry, detail_width: usize, is_orphan: bool) {
+fn print_summary(entry: &LogEntry, id_width: usize, detail_width: usize, is_orphan: bool) {
     let display_id = display_id(entry);
     let time_ago = format_time_ago_short(&entry.ts_utc);
     // (text, dim_suffix). Trimming runs on the plain text *before* styling
@@ -958,17 +993,13 @@ fn print_summary(entry: &LogEntry, detail_width: usize, is_orphan: bool) {
     } else {
         detail
     };
-    // Same column shape as native/amp rows: age (5) · id (8) · bracket (10) · detail.
+    // Same column shape as native/amp rows: age (5) · id (`id_width`) · bracket (10) · detail.
     // `{:<W.W}` truncates a too-long id to W chars then pads it to W — gives
     // a clean column even when logs.db's full 12-char id is longer than W.
     println!(
         "{} {} {} {}",
         style::dim(format!("{:>5}", time_ago)),
-        style::cyan(format!(
-            "{:<width$.width$}",
-            display_id,
-            width = ID_COL_WIDTH
-        )),
+        style::cyan(format!("{:<width$.width$}", display_id, width = id_width)),
         style::yellow(format!(
             "{:<width$}",
             format!("[{}]", entry.source),
@@ -1015,10 +1046,8 @@ fn format_duration_ms(ms: i64) -> String {
     }
 }
 
-/// Interactive disambiguation for `aivo logs show <prefix>` when more than
-/// one logs.db row matches. Returns `Ok(Some(entry))` on selection, `Ok(None)`
-/// on user cancel, and bails (with the same listing the legacy error showed)
-/// when the picker isn't usable — JSON mode or a non-TTY.
+/// Picker over multiple `find_by_id_prefix` hits. Bails with the legacy
+/// listing when JSON mode or non-TTY makes the picker unusable.
 async fn pick_ambiguous_log_hit(
     prefix: &str,
     hits: &[LogEntry],
@@ -1039,18 +1068,17 @@ async fn pick_ambiguous_log_hit(
         );
     }
 
-    let detail_width = picker_detail_width(console::Term::stdout().size().1 as usize);
+    let rows: Vec<UnifiedRow> = hits
+        .iter()
+        .map(|e| UnifiedRow::Log(Box::new(e.clone())))
+        .collect();
+    let id_width = min_unique_id_width(&rows);
+    let detail_width = picker_detail_width(console::Term::stdout().size().1 as usize, id_width);
     let orphan_chat_ids: HashSet<String> = HashSet::new();
     let run_meta: RunMetaIndex = RunMetaIndex::new();
-    let labels: Vec<String> = hits
+    let labels: Vec<String> = rows
         .iter()
-        .map(|e| {
-            UnifiedRow::Log(Box::new(e.clone())).picker_label(
-                detail_width,
-                &orphan_chat_ids,
-                &run_meta,
-            )
-        })
+        .map(|r| r.picker_label(id_width, detail_width, &orphan_chat_ids, &run_meta))
         .collect();
     let owned: Vec<LogEntry> = hits.to_vec();
     let prompt = format!("Multiple matches for '{prefix}' — pick one");
@@ -2179,11 +2207,42 @@ mod tests {
                 exit_code: Some(0),
             },
         );
-        let label = row.picker_label(60, &HashSet::new(), &meta);
+        let label = row.picker_label(ID_COL_WIDTH, 60, &HashSet::new(), &meta);
         assert!(
             label.contains("· copilot-1 · exit 0"),
             "label missing run-meta suffix: {label}"
         );
+    }
+
+    #[test]
+    fn min_unique_id_width_widens_for_uuidv7_prefix_collision() {
+        // Dash-stripped, both start with `019e47b1` and diverge at index 8.
+        let ts: DateTime<Utc> = "2026-05-01T10:00:00Z".parse().unwrap();
+        let rows = vec![
+            UnifiedRow::Native(test_thread("019e47b1-1a3b-711f-a383-2f1d2cf040e5", ts)),
+            UnifiedRow::Native(test_thread("019e47b1-4e7c-767c-894c-3ffde3f26302", ts)),
+        ];
+        assert_eq!(min_unique_id_width(&rows), 9);
+    }
+
+    #[test]
+    fn min_unique_id_width_returns_floor_for_distinct_ids() {
+        let ts: DateTime<Utc> = "2026-05-01T10:00:00Z".parse().unwrap();
+        let rows = vec![
+            UnifiedRow::Native(test_thread("aaaaaaaa-1111-2222-3333-444444444444", ts)),
+            UnifiedRow::Native(test_thread("bbbbbbbb-1111-2222-3333-444444444444", ts)),
+        ];
+        assert_eq!(min_unique_id_width(&rows), ID_COL_WIDTH);
+    }
+
+    #[test]
+    fn min_unique_id_width_caps_when_collision_persists() {
+        let ts: DateTime<Utc> = "2026-05-01T10:00:00Z".parse().unwrap();
+        let rows = vec![
+            UnifiedRow::Native(test_thread(&"a".repeat(40), ts)),
+            UnifiedRow::Native(test_thread(&"a".repeat(40), ts)),
+        ];
+        assert_eq!(min_unique_id_width(&rows), ID_COL_WIDTH_MAX);
     }
 
     #[test]
