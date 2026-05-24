@@ -154,6 +154,30 @@ impl SharePayload {
     }
 }
 
+/// Fold messages whose content is *only* tool_result blocks into the
+/// previous message. Anthropic-style wires (amp, claude) emit each tool
+/// result as a fresh `role: "user"` message; codex emits a separate
+/// `role: "tool"` message. The share viewer always renders those results
+/// inline with the preceding tool_use, so a standalone count of
+/// `messages.len()` overcounts vs. what the viewer (and `aivo logs show`)
+/// actually displays. Collapsing here keeps those counts in sync.
+fn merge_tool_result_turns(messages: Vec<ShareMessage>) -> Vec<ShareMessage> {
+    let mut out: Vec<ShareMessage> = Vec::with_capacity(messages.len());
+    for msg in messages {
+        let only_tool_results = !msg.content.is_empty()
+            && msg
+                .content
+                .iter()
+                .all(|b| matches!(b, ContentBlock::ToolResult { .. }));
+        if only_tool_results && let Some(prev) = out.last_mut() {
+            prev.content.extend(msg.content);
+            continue;
+        }
+        out.push(msg);
+    }
+    out
+}
+
 // ---------------------------------------------------------------------------
 // Amp extractor
 // ---------------------------------------------------------------------------
@@ -255,6 +279,8 @@ pub fn extract_amp_value(raw: &Value, project_root: Option<&str>) -> Result<Shar
             content,
         });
     }
+
+    let messages = merge_tool_result_turns(messages);
 
     let meta = SharePayload::new_meta(false);
 
@@ -698,7 +724,7 @@ pub async fn extract_claude_full(
         model,
         created_at: None,
         updated_at: latest_ts,
-        messages,
+        messages: merge_tool_result_turns(messages),
         meta: SharePayload::new_meta(false),
     })
 }
@@ -950,7 +976,7 @@ pub async fn extract_codex_full(
         model,
         created_at: None,
         updated_at: latest_ts,
-        messages,
+        messages: merge_tool_result_turns(messages),
         meta: SharePayload::new_meta(false),
     })
 }
@@ -1326,6 +1352,102 @@ mod tests {
     use serde_json::json;
     use tempfile::TempDir;
 
+    fn text(t: &str) -> ContentBlock {
+        ContentBlock::Text { text: t.into() }
+    }
+    fn tool_call(id: &str) -> ContentBlock {
+        ContentBlock::ToolCall {
+            id: Some(id.into()),
+            name: "Bash".into(),
+            arguments: serde_json::Value::Null,
+        }
+    }
+    fn tool_result(id: &str, output: &str) -> ContentBlock {
+        ContentBlock::ToolResult {
+            id: Some(id.into()),
+            ok: true,
+            output: output.into(),
+            error: None,
+        }
+    }
+    fn msg(role: &str, content: Vec<ContentBlock>) -> ShareMessage {
+        ShareMessage {
+            role: role.into(),
+            timestamp: None,
+            model: None,
+            reasoning: None,
+            content,
+        }
+    }
+
+    #[test]
+    fn merge_tool_result_turns_folds_amp_alternation() {
+        // user / asst(tool_use) / user(tool_result) / asst(tool_use) / user(tool_result)
+        // collapses to user / asst(tool_use + tool_result) / asst(tool_use + tool_result)
+        let input = vec![
+            msg("user", vec![text("hi")]),
+            msg("assistant", vec![tool_call("a")]),
+            msg("user", vec![tool_result("a", "ok-a")]),
+            msg("assistant", vec![tool_call("b")]),
+            msg("user", vec![tool_result("b", "ok-b")]),
+        ];
+        let out = merge_tool_result_turns(input);
+        assert_eq!(out.len(), 3);
+        assert_eq!(out[0].role, "user");
+        assert_eq!(out[1].role, "assistant");
+        assert_eq!(out[1].content.len(), 2);
+        assert!(matches!(out[1].content[0], ContentBlock::ToolCall { .. }));
+        assert!(matches!(out[1].content[1], ContentBlock::ToolResult { .. }));
+        assert_eq!(out[2].content.len(), 2);
+    }
+
+    #[test]
+    fn merge_tool_result_turns_keeps_mixed_user_turn() {
+        // A user message that carries text alongside a tool_result is a real
+        // user turn — leave it alone.
+        let input = vec![
+            msg("assistant", vec![tool_call("a")]),
+            msg("user", vec![text("followup"), tool_result("a", "ok")]),
+        ];
+        let out = merge_tool_result_turns(input);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[1].role, "user");
+        assert_eq!(out[1].content.len(), 2);
+    }
+
+    #[test]
+    fn merge_tool_result_turns_preserves_orphan_first_message() {
+        // A tool_result with no preceding message survives as-is (rare, but
+        // a few amp threads start with one and existing tests rely on it).
+        let input = vec![msg("user", vec![tool_result("a", "ok")])];
+        let out = merge_tool_result_turns(input);
+        assert_eq!(out.len(), 1);
+        assert!(matches!(out[0].content[0], ContentBlock::ToolResult { .. }));
+    }
+
+    #[test]
+    fn merge_tool_result_turns_preserves_error_payload() {
+        let err_block = ContentBlock::ToolResult {
+            id: Some("a".into()),
+            ok: false,
+            output: String::new(),
+            error: Some("boom".into()),
+        };
+        let input = vec![
+            msg("assistant", vec![tool_call("a")]),
+            msg("user", vec![err_block]),
+        ];
+        let out = merge_tool_result_turns(input);
+        assert_eq!(out.len(), 1);
+        match &out[0].content[1] {
+            ContentBlock::ToolResult { ok, error, .. } => {
+                assert!(!*ok);
+                assert_eq!(error.as_deref(), Some("boom"));
+            }
+            other => panic!("expected tool_result, got {other:?}"),
+        }
+    }
+
     #[test]
     fn extract_amp_value_preserves_messages_and_models() {
         let raw = json!({
@@ -1364,7 +1486,9 @@ mod tests {
         assert_eq!(payload.source_cli, "amp");
         assert_eq!(payload.session_id, "T-019e05ae-80a5-7718-80ee-ec89cb6fc1c0");
         assert_eq!(payload.project.name.as_deref(), Some("aivo"));
-        assert_eq!(payload.messages.len(), 3);
+        // Tool-result-only third message folds into the assistant turn so
+        // the count matches what the viewer renders.
+        assert_eq!(payload.messages.len(), 2);
 
         // First user turn — plain string content.
         let user = &payload.messages[0];
@@ -1375,11 +1499,11 @@ mod tests {
             other => panic!("expected text block, got {other:?}"),
         }
 
-        // Assistant turn has both text and a tool_use.
+        // Assistant turn carries text + tool_use + the merged tool_result.
         let asst = &payload.messages[1];
         assert_eq!(asst.role, "assistant");
         assert_eq!(asst.model.as_deref(), Some("claude-sonnet-4-5"));
-        assert_eq!(asst.content.len(), 2);
+        assert_eq!(asst.content.len(), 3);
         assert!(matches!(asst.content[0], ContentBlock::Text { .. }));
         match &asst.content[1] {
             ContentBlock::ToolCall { id, name, .. } => {
@@ -1388,12 +1512,7 @@ mod tests {
             }
             other => panic!("expected tool_call, got {other:?}"),
         }
-
-        // Tool result message.
-        let tool = &payload.messages[2];
-        assert_eq!(tool.role, "tool");
-        assert_eq!(tool.content.len(), 1);
-        match &tool.content[0] {
+        match &asst.content[2] {
             ContentBlock::ToolResult {
                 id,
                 ok,
@@ -1464,8 +1583,10 @@ mod tests {
             ]
         });
         let payload = extract_amp_value(&raw, None).unwrap();
-        let tool_msg = &payload.messages[2];
-        match &tool_msg.content[0] {
+        // tool_result merges into the preceding assistant turn — it lives
+        // alongside the tool_use at index 1.
+        let asst = &payload.messages[1];
+        match &asst.content[1] {
             ContentBlock::ToolResult {
                 id,
                 ok,
@@ -1813,8 +1934,10 @@ mod tests {
         assert_eq!(payload.source_cli, "claude");
         assert_eq!(payload.session_id, "sess-A");
         assert_eq!(payload.model.as_deref(), Some("claude-sonnet-4-5"));
-        assert_eq!(payload.messages.len(), 3); // user, assistant (sidechain skipped), tool_result-bearing user
-        // Sidechain content didn't sneak in.
+        // user + assistant(text + tool_call + folded tool_result). Sidechain
+        // is skipped; the tool_result-only user message folds into the prior
+        // assistant turn to match the viewer's rendered count.
+        assert_eq!(payload.messages.len(), 2);
         for m in &payload.messages {
             for b in &m.content {
                 if let ContentBlock::Text { text } = b {
@@ -1822,20 +1945,16 @@ mod tests {
                 }
             }
         }
-        // Assistant turn has text + tool_call.
-        assert!(matches!(
-            payload.messages[1].content[0],
-            ContentBlock::Text { .. }
-        ));
-        match &payload.messages[1].content[1] {
+        let asst = &payload.messages[1];
+        assert!(matches!(asst.content[0], ContentBlock::Text { .. }));
+        match &asst.content[1] {
             ContentBlock::ToolCall { name, id, .. } => {
                 assert_eq!(name, "Read");
                 assert_eq!(id.as_deref(), Some("call_1"));
             }
             other => panic!("expected tool_call, got {other:?}"),
         }
-        // Tool result preserved.
-        match &payload.messages[2].content[0] {
+        match &asst.content[2] {
             ContentBlock::ToolResult { id, ok, output, .. } => {
                 assert_eq!(id.as_deref(), Some("call_1"));
                 assert!(*ok);
@@ -1870,8 +1989,12 @@ mod tests {
         assert_eq!(payload.source_cli, "codex");
         assert_eq!(payload.session_id, "codex-X");
         assert_eq!(payload.model.as_deref(), Some("gpt-5"));
-        assert_eq!(payload.messages.len(), 4);
-        match &payload.messages[1].content[0] {
+        // user + assistant(function_call + folded function_call_output) +
+        // final assistant message. The tool-output turn folds into the
+        // tool-call turn so the count matches the viewer.
+        assert_eq!(payload.messages.len(), 3);
+        let tool_turn = &payload.messages[1];
+        match &tool_turn.content[0] {
             ContentBlock::ToolCall {
                 name,
                 id,
@@ -1883,12 +2006,16 @@ mod tests {
             }
             other => panic!("expected tool_call, got {other:?}"),
         }
-        match &payload.messages[2].content[0] {
+        match &tool_turn.content[1] {
             ContentBlock::ToolResult { id, output, .. } => {
                 assert_eq!(id.as_deref(), Some("fc1"));
                 assert!(output.contains("main.rs"));
             }
             other => panic!("expected tool_result, got {other:?}"),
+        }
+        match &payload.messages[2].content[0] {
+            ContentBlock::Text { text } => assert_eq!(text, "Two files."),
+            other => panic!("expected text, got {other:?}"),
         }
     }
 
