@@ -151,7 +151,13 @@ pub async fn resolve_session(session_id: &str, ctx: &ResolverContext) -> Result<
                 // launched: same tool, same cwd, mtime closest to ts_utc.
                 // Heuristic but reliable in practice — `aivo run X` produces
                 // exactly one native session, and we already know which X.
-                let payload = resolve_run_event(&entry, ctx).await?;
+                let mut payload = resolve_run_event(&entry, ctx).await?;
+                // Prefer logs.db's model so `share` matches `logs show
+                // --json` (and surfaces e.g. `composer-2.5` for amp routed
+                // through cursor, where the thread file only knows agentMode).
+                if let Some(m) = entry.model.as_deref().filter(|s| !s.is_empty()) {
+                    payload.model = Some(m.to_string());
+                }
                 return Ok(ResolvedSession { payload });
             }
             "serve" => {
@@ -946,6 +952,83 @@ mod tests {
             resolved.payload.session_id,
             "T-019e05ae-80a5-7718-80ee-ec89cb6fc1c0"
         );
+    }
+
+    #[tokio::test]
+    async fn run_event_overrides_amp_agent_mode_with_logs_db_model() {
+        // The bug: `aivo logs show --json` shows the cursor-routed model
+        // (e.g. `composer-2.5`) but `aivo logs share` shows amp's agentMode
+        // (e.g. `rush`) because the amp thread file carries no per-message
+        // model. The run-event branch should override with logs.db's model.
+        let temp = TempDir::new().unwrap();
+        let project_root = temp.path().to_path_buf();
+        let ctx = ctx_with_tempdirs(&temp, project_root.clone());
+        fs::create_dir_all(&ctx.amp_dir).await.unwrap();
+        let thread_id = "T-019e593a-b41f-700b-a3db-ebb54822cb7a";
+        let thread = json!({
+            "id": thread_id,
+            "agentMode": "rush",
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        amp_threads::save_thread(&ctx.amp_dir, &thread)
+            .await
+            .unwrap();
+
+        ctx.session_store
+            .logs()
+            .append(crate::services::log_store::LogEvent {
+                source: "run".into(),
+                kind: "tool_launch".into(),
+                phase: Some("finished".into()),
+                tool: Some("amp".into()),
+                model: Some("composer-2.5".into()),
+                cwd: Some(project_root.to_string_lossy().to_string()),
+                session_id: Some(thread_id.into()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        let resolved = resolve_session(thread_id, &ctx).await.unwrap();
+        assert_eq!(resolved.payload.source_cli, "amp");
+        assert_eq!(resolved.payload.model.as_deref(), Some("composer-2.5"));
+    }
+
+    #[tokio::test]
+    async fn run_event_keeps_amp_agent_mode_when_logs_db_model_absent() {
+        // Older run rows have no model column. The agentMode fallback in
+        // extract_amp_value must still survive.
+        let temp = TempDir::new().unwrap();
+        let project_root = temp.path().to_path_buf();
+        let ctx = ctx_with_tempdirs(&temp, project_root.clone());
+        fs::create_dir_all(&ctx.amp_dir).await.unwrap();
+        let thread_id = "T-019e593b-0000-7000-8000-000000000000";
+        let thread = json!({
+            "id": thread_id,
+            "agentMode": "rush",
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        amp_threads::save_thread(&ctx.amp_dir, &thread)
+            .await
+            .unwrap();
+
+        ctx.session_store
+            .logs()
+            .append(crate::services::log_store::LogEvent {
+                source: "run".into(),
+                kind: "tool_launch".into(),
+                phase: Some("finished".into()),
+                tool: Some("amp".into()),
+                model: None,
+                cwd: Some(project_root.to_string_lossy().to_string()),
+                session_id: Some(thread_id.into()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        let resolved = resolve_session(thread_id, &ctx).await.unwrap();
+        assert_eq!(resolved.payload.model.as_deref(), Some("rush"));
     }
 
     #[tokio::test]
