@@ -936,6 +936,28 @@ enum WarmupOutcome {
     JinjaFailed { stderr_tail: String },
 }
 
+fn ngl_for_spawn() -> Option<u32> {
+    resolved_ngl(
+        std::env::var("AIVO_GPU").ok().as_deref(),
+        std::env::var("AIVO_LLAMA_NGL").ok().as_deref(),
+        cfg!(target_os = "macos"),
+    )
+}
+
+/// `-ngl 99` means "offload as many layers as fit"; llama.cpp clamps.
+/// Harmless on CPU-only builds (prints one warning, then proceeds).
+fn resolved_ngl(gpu_env: Option<&str>, ngl_env: Option<&str>, default_on: bool) -> Option<u32> {
+    if let Some(v) = ngl_env
+        && let Ok(n) = v.trim().parse::<u32>()
+    {
+        return Some(n);
+    }
+    if matches!(gpu_env, Some(v) if v.trim().eq_ignore_ascii_case("cpu")) {
+        return None;
+    }
+    default_on.then_some(99)
+}
+
 async fn try_spawn_and_warmup(
     bin: &Path,
     cache_path: &Path,
@@ -943,11 +965,17 @@ async fn try_spawn_and_warmup(
     extra_args: &[&str],
 ) -> Result<WarmupOutcome> {
     let port = alloc_free_port()?;
+    let ngl = ngl_for_spawn();
     if !cache_hit {
+        let gpu_suffix = match ngl {
+            Some(n) => format!(" (GPU offload: {n} layers)"),
+            None => String::new(),
+        };
         eprintln!(
-            "  {} Starting llama-server on port {}",
+            "  {} Starting llama-server on port {}{}",
             crate::style::dim("⟳"),
-            port
+            port,
+            gpu_suffix,
         );
     }
 
@@ -958,6 +986,9 @@ async fn try_spawn_and_warmup(
         .arg(port.to_string())
         .arg("--host")
         .arg("127.0.0.1");
+    if let Some(n) = ngl {
+        cmd.arg("--n-gpu-layers").arg(n.to_string());
+    }
     for a in extra_args {
         cmd.arg(a);
     }
@@ -2201,6 +2232,37 @@ mod tests {
     #[test]
     fn local_openai_base_url_formats_correctly() {
         assert_eq!(local_openai_base_url(48721), "http://127.0.0.1:48721/v1");
+    }
+
+    #[test]
+    fn resolved_ngl_defaults_to_99_on_mac() {
+        assert_eq!(resolved_ngl(None, None, true), Some(99));
+    }
+
+    #[test]
+    fn resolved_ngl_defaults_off_elsewhere() {
+        assert_eq!(resolved_ngl(None, None, false), None);
+    }
+
+    #[test]
+    fn resolved_ngl_gpu_cpu_disables_default() {
+        assert_eq!(resolved_ngl(Some("cpu"), None, true), None);
+        assert_eq!(resolved_ngl(Some("CPU"), None, true), None);
+    }
+
+    #[test]
+    fn resolved_ngl_explicit_override_wins_on_any_platform() {
+        assert_eq!(resolved_ngl(None, Some("32"), false), Some(32));
+        assert_eq!(resolved_ngl(Some("cpu"), Some("32"), true), Some(32));
+        assert_eq!(resolved_ngl(None, Some("0"), true), Some(0));
+        assert_eq!(resolved_ngl(None, Some("  16 "), false), Some(16));
+    }
+
+    #[test]
+    fn resolved_ngl_malformed_override_falls_back_to_default() {
+        assert_eq!(resolved_ngl(None, Some("nope"), true), Some(99));
+        assert_eq!(resolved_ngl(None, Some(""), true), Some(99));
+        assert_eq!(resolved_ngl(Some("cpu"), Some("nope"), true), None);
     }
 
     #[test]
