@@ -1,5 +1,11 @@
 # Changelog
 
+## v0.23.2
+
+- CLI: reject short opaque tokens instead of treating them as prompts.
+- `aivo starter`: sign requests with a per-device HMAC.
+- Termux: fix device ID detection.
+
 ## v0.23.1
 
 - Fix logs and imporove cursor support.
