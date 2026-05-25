@@ -1,5 +1,11 @@
 # Changelog
 
+## v0.23.3
+
+- `aivo hf`: default to Metal GPU offload on macOS; keep tool routing alive when the jinja template fails.
+- `aivo cursor`: surface in-flight status in the codex/claude TUIs via the cursor bridge.
+- `aivo logs share`: match codex sessions by dashes-stripped UUID prefix.
+
 ## v0.23.2
 
 - CLI: reject short opaque tokens instead of treating them as prompts.
