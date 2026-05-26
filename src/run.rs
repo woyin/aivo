@@ -1183,6 +1183,29 @@ async fn audio_dispatch(
         }
     };
 
+    // Local TTS via `hf:` refs isn't wired up. Reject these up front
+    // with a clear message — otherwise the request flows to the active
+    // key's `/v1/audio/speech` and fails confusingly (with a 404 from
+    // OpenAI, or with `This endpoint only accepts the path
+    // /chat/completions` from a stale llama-server base_url).
+    if let Some(m) = audio_args.model.as_deref()
+        && services::huggingface::is_hf_or_local_gguf(m)
+    {
+        eprintln!(
+            "{} aivo audio doesn't support local HuggingFace TTS models.",
+            style::red("Error:")
+        );
+        eprintln!(
+            "  {} use a provider TTS model instead:",
+            style::dim("hint:")
+        );
+        let ex = |s: &str| eprintln!("    {}", style::dim(s));
+        ex("aivo audio \"…\" -m tts-1            # OpenAI");
+        ex("aivo audio \"…\" -m gpt-4o-mini-tts  # OpenAI (newer)");
+        ex("aivo audio \"…\" -m gemini-tts       # Google");
+        process::exit(ExitCode::UserError.code());
+    }
+
     let key_override = key_or_exit(
         resolve_audio_key_override(
             session_store,
