@@ -90,6 +90,9 @@ impl StatsCommand {
         let mut tool_tokens: HashMap<String, ToolTokenSummary> = HashMap::new();
         let aivo_tool_counts = aggregate_tool_counts(&stats, &key_ids);
         for (tool, gs) in &global {
+            if !is_valid_tool(tool) {
+                continue;
+            }
             tool_tokens.insert(
                 tool.clone(),
                 ToolTokenSummary {
@@ -1173,12 +1176,20 @@ fn aggregate_tool_counts(
                 all_have_per_key = false;
             }
             for (tool, count) in &entry.per_tool {
+                if !is_valid_tool(tool) {
+                    continue;
+                }
                 *result.entry(tool.clone()).or_default() += count;
             }
         }
     }
     if !all_have_per_key {
-        return stats.tool_counts.clone();
+        return stats
+            .tool_counts
+            .iter()
+            .filter(|(tool, _)| is_valid_tool(tool))
+            .map(|(tool, count)| (tool.clone(), *count))
+            .collect();
     }
     result
 }
@@ -1423,6 +1434,37 @@ mod tests {
         let result = aggregate_tool_counts(&stats, &keys);
         assert_eq!(result.get("claude"), Some(&5));
         assert_eq!(result.get("codex"), Some(&3));
+    }
+
+    #[test]
+    fn aggregate_tool_counts_skips_unsupported_tools() {
+        let mut stats = UsageStats::default();
+        let mut counter = UsageCounter::default();
+        counter.per_tool.insert("claude".to_string(), 5);
+        counter.per_tool.insert("omp".to_string(), 3);
+        counter.per_tool.insert("cursor".to_string(), 1);
+        stats.key_usage.insert("key1".to_string(), counter);
+
+        let keys: HashSet<&str> = ["key1"].into_iter().collect();
+        let result = aggregate_tool_counts(&stats, &keys);
+        assert_eq!(result.get("claude"), Some(&5));
+        assert!(!result.contains_key("omp"));
+        assert!(!result.contains_key("cursor"));
+    }
+
+    #[test]
+    fn aggregate_tool_counts_global_fallback_also_filters() {
+        let mut stats = UsageStats::default();
+        stats.tool_counts.insert("claude".to_string(), 10);
+        stats.tool_counts.insert("omp".to_string(), 5);
+        stats
+            .key_usage
+            .insert("key1".to_string(), UsageCounter::default());
+
+        let keys: HashSet<&str> = ["key1"].into_iter().collect();
+        let result = aggregate_tool_counts(&stats, &keys);
+        assert_eq!(result.get("claude"), Some(&10));
+        assert!(!result.contains_key("omp"));
     }
 
     #[test]
