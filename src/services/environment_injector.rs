@@ -1562,7 +1562,7 @@ pub(crate) fn redact_env_value(key: &str, value: &str) -> String {
         return "<redacted>".to_string();
     }
 
-    if key.contains("TOKEN") || key.contains("KEY") {
+    if key.contains("TOKEN") || key.contains("KEY") || key.contains("CREDS") {
         let char_count = value.chars().count();
         if char_count > 12 {
             // Safely slice at character boundaries

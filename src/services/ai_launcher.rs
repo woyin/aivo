@@ -16,8 +16,8 @@ use crate::services::environment_injector::{
 };
 use crate::services::launch_args::{
     build_preview_notes, build_runtime_args, inject_codex_max_context,
-    inject_codex_provider_config, merge_preview_env, preview_args, rewrite_amp_preview_env,
-    rewrite_codex_preview_env,
+    inject_codex_max_context_before_args, inject_codex_provider_config, inject_codex_root_model,
+    merge_preview_env, preview_args, rewrite_amp_preview_env, rewrite_codex_preview_env,
 };
 use crate::services::launch_runtime::{
     cleanup_runtime_artifacts, finalize_codex_oauth, finalize_gemini_oauth,
@@ -42,6 +42,7 @@ use crate::services::session_store::{
 pub enum AIToolType {
     Claude,
     Codex,
+    CodexApp,
     Gemini,
     Opencode,
     Pi,
@@ -54,6 +55,7 @@ impl AIToolType {
         match s.to_lowercase().as_str() {
             "claude" => Some(Self::Claude),
             "codex" => Some(Self::Codex),
+            "codex-app" => Some(Self::CodexApp),
             "gemini" => Some(Self::Gemini),
             "opencode" => Some(Self::Opencode),
             "pi" => Some(Self::Pi),
@@ -66,6 +68,7 @@ impl AIToolType {
         match self {
             Self::Claude => "claude",
             Self::Codex => "codex",
+            Self::CodexApp => "codex-app",
             Self::Gemini => "gemini",
             Self::Opencode => "opencode",
             Self::Pi => "pi",
@@ -73,10 +76,22 @@ impl AIToolType {
         }
     }
 
+    pub fn command_name(&self) -> &'static str {
+        match self {
+            Self::CodexApp => "codex",
+            _ => self.as_str(),
+        }
+    }
+
+    pub fn is_codex_family(&self) -> bool {
+        matches!(self, Self::Codex | Self::CodexApp)
+    }
+
     pub fn all() -> &'static [Self] {
         &[
             Self::Claude,
             Self::Codex,
+            Self::CodexApp,
             Self::Gemini,
             Self::Opencode,
             Self::Pi,
@@ -89,7 +104,7 @@ impl AIToolType {
     /// or `None` when the key is compatible.
     pub fn oauth_incompat_reason(&self, key: &ApiKey) -> Option<&'static str> {
         let matches_tool = (*self == AIToolType::Claude && key.is_claude_oauth())
-            || (*self == AIToolType::Codex && key.is_codex_oauth())
+            || (self.is_codex_family() && key.is_codex_oauth())
             || (*self == AIToolType::Gemini && key.is_gemini_oauth());
         if matches_tool {
             None
@@ -103,7 +118,7 @@ impl AIToolType {
         #[cfg(unix)]
         match self {
             Self::Claude => "curl -fsSL https://claude.ai/install.sh | bash",
-            Self::Codex => "npm install -g @openai/codex",
+            Self::Codex | Self::CodexApp => "npm install -g @openai/codex",
             Self::Gemini => "npm install -g @google/gemini-cli",
             Self::Opencode => "curl -fsSL https://opencode.ai/install | bash",
             Self::Pi => "npm install -g @mariozechner/pi-coding-agent",
@@ -112,7 +127,7 @@ impl AIToolType {
         #[cfg(not(unix))]
         match self {
             Self::Claude => "npm install -g @anthropic-ai/claude-code",
-            Self::Codex => "npm install -g @openai/codex",
+            Self::Codex | Self::CodexApp => "npm install -g @openai/codex",
             Self::Gemini => "npm install -g @google/gemini-cli",
             Self::Opencode => "npm install -g opencode-ai",
             Self::Pi => "npm install -g @mariozechner/pi-coding-agent",
@@ -235,25 +250,90 @@ impl AILauncher {
 
         self.output_key_info(&resolved.key);
 
+        // Preflight: codex-app needs Codex.app on disk to actually route. Bail
+        // BEFORE injecting the `app` subcommand into argv so the user gets a
+        // clear error instead of a downstream "unknown subcommand 'app'" from
+        // a stripped-down npm-installed codex binary.
+        if options.tool == AIToolType::CodexApp {
+            #[cfg(not(target_os = "macos"))]
+            {
+                return Err(CLIError::new(
+                    "`aivo codex-app` is macOS-only \u{2014} the desktop Codex.app ships only for macOS.",
+                    ErrorCategory::User,
+                    None::<String>,
+                    Some("Use `aivo codex` (CLI) instead on Linux/Windows."),
+                )
+                .into());
+            }
+            #[cfg(target_os = "macos")]
+            if crate::services::codex_app_wrapper::locate_codex_app().is_none() {
+                return Err(CLIError::new(
+                    "Codex.app not found. `aivo codex-app` requires the Codex desktop app.",
+                    ErrorCategory::User,
+                    None::<String>,
+                    Some("Install Codex.app from https://chatgpt.com/codex (or set AIVO_CODEX_APP_PATH to its bundle path)"),
+                )
+                .into());
+            }
+        }
+
+        // Preflight: Codex.app is a singleton on macOS, and `CODEX_CLI_PATH`
+        // is captured at GUI launch — `aivo codex-app` against an already-
+        // running instance silently fails to route. Prompt the user to
+        // restart so the new wrapper/key takes effect.
+        if options.tool == AIToolType::CodexApp {
+            preflight_codex_app_running().await?;
+        }
+
         let env = self
             .env_injector
             .merge(&resolved.tool_config.env_vars, options.env.as_ref());
+        let mut env = env;
+        if options.tool == AIToolType::CodexApp {
+            env.insert(
+                "AIVO_CODEX_APP_HOME_KEY".to_string(),
+                resolved.key.id.clone(),
+            );
+        }
         let mut runtime = prepare_runtime_env(options.tool, env, &self.session_store).await?;
 
         let mut runtime_args = build_runtime_args(
             options.tool,
             &options.args,
             resolved.model.as_deref(),
+            resolved.codex_app_models.as_deref(),
             &runtime.env,
         )
         .await?;
 
-        if options.tool == AIToolType::Codex {
+        let mut codex_app_wrapper_path: Option<std::path::PathBuf> = None;
+        if options.tool.is_codex_family() {
             inject_codex_provider_config(&mut runtime.env, &mut runtime_args.args);
-            inject_codex_max_context(
-                &mut runtime_args.args,
-                options.claude_overrides.max_context.as_deref(),
-            );
+            if options.tool == AIToolType::CodexApp {
+                inject_codex_max_context_before_args(
+                    &mut runtime_args.args,
+                    options.claude_overrides.max_context.as_deref(),
+                );
+                inject_codex_root_model(&mut runtime_args.args, resolved.model.as_deref());
+                crate::services::launch_args::inject_codex_app_subcommand(&mut runtime_args.args);
+                codex_app_wrapper_path = install_codex_app_wrapper(
+                    &mut runtime.env,
+                    &mut runtime_args.args,
+                    self.session_store.config_dir(),
+                    &resolved.key.id,
+                )
+                .await;
+                install_codex_app_models_cache(
+                    &runtime.env,
+                    runtime_args.codex_model_catalog_path.as_deref(),
+                )
+                .await;
+            } else {
+                inject_codex_max_context(
+                    &mut runtime_args.args,
+                    options.claude_overrides.max_context.as_deref(),
+                );
+            }
         }
 
         if options.tool == AIToolType::Amp {
@@ -489,6 +569,16 @@ impl AILauncher {
         let started_at = Instant::now();
         let result = self.wait_for_process(&mut child).await;
 
+        // `codex app /path` returns once the GUI is open; aivo's local router
+        // would otherwise be torn down while Codex.app is still using it.
+        // Block on the GUI's lifetime so the router survives the session.
+        if options.tool == AIToolType::CodexApp {
+            wait_for_codex_app_gui_exit().await;
+            if let Some(path) = codex_app_wrapper_path.as_deref() {
+                let _ = tokio::fs::remove_file(path).await;
+            }
+        }
+
         if options.tool == AIToolType::Pi {
             process_pi_sessions(runtime.pi_agent_dir.as_deref()).await;
         }
@@ -508,8 +598,20 @@ impl AILauncher {
         finalize_codex_oauth(&self.session_store, runtime.codex_oauth_sync).await;
         finalize_gemini_oauth(&self.session_store, runtime.gemini_oauth_sync).await;
 
+        // The codex model catalog tempfile is referenced by the GUI's wrapper
+        // for the duration of the Codex.app session. If we cleaned it up here
+        // after a SIGINT-early-return from wait_for_codex_app_gui_exit, the
+        // still-running GUI would lose its catalog on the next app-server
+        // re-spawn (settings change, crash recovery). Leave it for codex-app
+        // launches — `cleanup_stale_codex_catalogs` reaps it on subsequent
+        // aivo runs.
+        let catalog_to_clean = if options.tool == AIToolType::CodexApp {
+            None
+        } else {
+            runtime_args.codex_model_catalog_path.as_deref()
+        };
         cleanup_runtime_artifacts(
-            runtime_args.codex_model_catalog_path.as_deref(),
+            catalog_to_clean,
             runtime.pi_agent_dir.as_deref(),
             runtime.amp_settings_path.as_deref(),
         )
@@ -545,16 +647,54 @@ impl AILauncher {
             resolved.model.as_deref(),
             &resolved.tool_config.env_vars,
         );
-        let notes = build_preview_notes(
+        let mut notes = build_preview_notes(
             options.tool,
             &options.args,
             resolved.model.as_deref(),
             &resolved.tool_config.env_vars,
         );
 
-        if options.tool == AIToolType::Codex {
+        if options.tool.is_codex_family() {
             rewrite_codex_preview_env(&mut env_vars);
-            inject_codex_max_context(&mut args, options.claude_overrides.max_context.as_deref());
+            if options.tool == AIToolType::CodexApp {
+                inject_codex_max_context_before_args(
+                    &mut args,
+                    options.claude_overrides.max_context.as_deref(),
+                );
+                // Match the real launch ordering exactly so --dry-run isn't
+                // misleading: root model first, then the `app` subcommand
+                // insert. The actual launch then drains the global prefix
+                // into a wrapper at CODEX_CLI_PATH (we document that via a
+                // note rather than simulating the file write here).
+                inject_codex_root_model(&mut args, resolved.model.as_deref());
+                env_vars.insert(
+                    "CODEX_HOME".to_string(),
+                    crate::services::codex_home_shadow::CodexHomeShadow::persistent_path(
+                        self.session_store.config_dir(),
+                        &resolved.key.id,
+                    )
+                    .to_string_lossy()
+                    .to_string(),
+                );
+                env_vars.insert(
+                    "CODEX_CLI_PATH".to_string(),
+                    "<temp:aivo-codex-wrapper>".to_string(),
+                );
+                crate::services::launch_args::inject_codex_app_subcommand(&mut args);
+                notes.push(
+                    "installs a per-launch wrapper at $AIVO_CONFIG/codex-app-wrappers/<key>-<pid>-<nanos>.sh, points CODEX_CLI_PATH at it, and moves the global --config prefix into the wrapper so Codex.app's app-server subprocess inherits the overrides"
+                        .to_string(),
+                );
+                notes.push(
+                    "writes a per-key models_cache.json into the shadow CODEX_HOME so the GUI's model picker reflects aivo's discovered models"
+                        .to_string(),
+                );
+            } else {
+                inject_codex_max_context(
+                    &mut args,
+                    options.claude_overrides.max_context.as_deref(),
+                );
+            }
         }
         if options.tool == AIToolType::Amp {
             rewrite_amp_preview_env(&mut env_vars);
@@ -606,7 +746,7 @@ impl AILauncher {
             key = self
                 .resolve_claude_protocol(key, options.model.as_deref())
                 .await?;
-        } else if options.tool == AIToolType::Codex {
+        } else if options.tool.is_codex_family() {
             key = self
                 .resolve_codex_mode(key, persist && options.key_override.is_none())
                 .await?;
@@ -626,6 +766,21 @@ impl AILauncher {
         } else {
             (options.model.clone(), None)
         };
+        let codex_app_models = if options.tool == AIToolType::CodexApp && options.model.is_none() {
+            self.discover_codex_app_models(&key).await
+        } else {
+            None
+        };
+        // For CodexApp without -m, pick a sensible default so codex doesn't
+        // ship requests with an empty model name. The dropdown will still
+        // list all discovered entries from the catalog.
+        let model = if model.is_none() {
+            codex_app_models
+                .as_ref()
+                .and_then(|m| pick_default_codex_app_model(m))
+        } else {
+            model
+        };
         let tool_config = self.get_tool_config(
             options.tool,
             &key,
@@ -637,8 +792,34 @@ impl AILauncher {
         Ok(ResolvedLaunchContext {
             key,
             model,
+            codex_app_models,
             tool_config,
         })
+    }
+
+    /// Fetches the key's available models for CodexApp's GUI dropdown. Soft
+    /// failure: returns `None` so the launch still works against codex's
+    /// built-in catalog (the user can pass `-m` explicitly).
+    ///
+    /// Skipped for keys whose `/v1/models` endpoint isn't meaningful here:
+    /// Codex OAuth (uses ChatGPT's hardcoded list, not /v1/models), Ollama
+    /// and Copilot sentinels (custom URL schemes handled by their own
+    /// runners). Avoids a pointless spinner + guaranteed failure on those.
+    async fn discover_codex_app_models(&self, key: &ApiKey) -> Option<Vec<String>> {
+        if key.is_codex_oauth() || is_ollama_base(&key.base_url) || is_copilot_base(&key.base_url) {
+            return None;
+        }
+        let cache_key = crate::commands::models::model_cache_key_for_key(key);
+        if let Some(models) = self.cache.get(&cache_key).await {
+            return Some(sanitize_discovered_slugs(models));
+        }
+        let client = crate::services::http_utils::router_http_client();
+        let (spinning, spinner_handle) = crate::style::start_spinner(Some(" Fetching models..."));
+        let result =
+            crate::commands::models::fetch_models_cached(&client, key, &self.cache, false).await;
+        crate::style::stop_spinner(&spinning);
+        let _ = spinner_handle.await;
+        result.ok().map(sanitize_discovered_slugs)
     }
 
     /// Outputs information about which key is being used
@@ -808,7 +989,7 @@ impl AILauncher {
                 self.env_injector
                     .for_claude_with_overrides(key, model, claude_overrides)
             }
-            AIToolType::Codex => self.env_injector.for_codex(key, model),
+            AIToolType::Codex | AIToolType::CodexApp => self.env_injector.for_codex(key, model),
             AIToolType::Gemini => self.env_injector.for_gemini(key, model),
             AIToolType::Opencode => self.env_injector.for_opencode(key, model, opencode_models),
             AIToolType::Pi => self.env_injector.for_pi(key, model),
@@ -816,7 +997,7 @@ impl AILauncher {
         };
 
         ToolConfig {
-            command: tool.as_str().to_string(),
+            command: tool.command_name().to_string(),
             env_vars,
         }
     }
@@ -913,7 +1094,560 @@ impl AILauncher {
 struct ResolvedLaunchContext {
     key: ApiKey,
     model: Option<String>,
+    /// All models discovered for the key when launching CodexApp without an
+    /// explicit `-m`. Plumbed into `build_runtime_args` so the codex model
+    /// catalog file lists every entry — the GUI's model picker reads from it.
+    codex_app_models: Option<Vec<String>>,
     tool_config: ToolConfig,
+}
+
+/// Drops slugs containing control bytes (NUL, newline, CR, tab) that a buggy
+/// or hostile `/v1/models` endpoint might return. Those would break out of the
+/// TOML basic-strings we emit via `-c model="..."` and the catalog JSON.
+fn sanitize_discovered_slugs(models: Vec<String>) -> Vec<String> {
+    models
+        .into_iter()
+        .filter(|m| !m.is_empty() && !m.chars().any(|c| c.is_control()))
+        .collect()
+}
+
+/// Picks a sensible default model from the provider's `/v1/models` listing for
+/// codex-app's GUI when the user didn't pass `-m`. Mirrors the OpenCode logic:
+/// newest GPT-style chat model wins; then any OpenAI-shaped name; else the
+/// first alphabetical. Returns `None` only for an empty list.
+fn pick_default_codex_app_model(models: &[String]) -> Option<String> {
+    let mut sorted = models.to_vec();
+    sorted.sort();
+    sorted.dedup();
+    sorted
+        .iter()
+        .rev()
+        .find(|m| is_gpt_chat_model_name(m))
+        .or_else(|| sorted.iter().rev().find(|m| is_openai_style_model_name(m)))
+        .or_else(|| sorted.first())
+        .cloned()
+}
+
+/// Replaces the shadow `CODEX_HOME`'s `models_cache.json` with one listing
+/// aivo's discovered models. The GUI's model picker reads from this file (not
+/// `model_catalog_json`), so without this step the picker keeps showing the
+/// user's previously-seen OpenAI slugs. The real `~/.codex/models_cache.json`
+/// is never touched — we explicitly unlink the symlink before writing so the
+/// write can't follow back to the user's home dir.
+async fn install_codex_app_models_cache(env: &HashMap<String, String>, catalog_path: Option<&str>) {
+    let Some(codex_home) = env.get("CODEX_HOME") else {
+        return;
+    };
+    let Some(catalog) = catalog_path else {
+        return;
+    };
+    let catalog_text = match tokio::fs::read_to_string(catalog).await {
+        Ok(t) => t,
+        Err(e) => {
+            warn_codex_app_cache(format!("read catalog {catalog}: {e}"));
+            return;
+        }
+    };
+    let parsed: serde_json::Value = match serde_json::from_str(&catalog_text) {
+        Ok(v) => v,
+        Err(e) => {
+            warn_codex_app_cache(format!("parse catalog JSON: {e}"));
+            return;
+        }
+    };
+    let models = match parsed.get("models").and_then(|m| m.as_array()) {
+        Some(m) if !m.is_empty() => m.clone(),
+        _ => {
+            warn_codex_app_cache("catalog has no `models`; picker will fall back");
+            return;
+        }
+    };
+    // The bundled codex tags its cache with its own version. A mismatch makes
+    // codex treat the file as stale and refetch from chatgpt.com — which fails
+    // for non-ChatGPT keys, leaving the picker empty. If we can't detect the
+    // version (probe timed out, bundle broken), skip the cache write entirely:
+    // `model_catalog_json` still serves the slugs via codex's CLI plumbing,
+    // and we avoid stamping the cache with a wrong literal that codex would
+    // reject anyway.
+    let Some(client_version) = detect_bundled_codex_version().await else {
+        warn_codex_app_cache(
+            "could not detect bundled codex version; leaving shadow models_cache.json alone",
+        );
+        return;
+    };
+    let cache = serde_json::json!({
+        "fetched_at": chrono::Utc::now().to_rfc3339(),
+        "client_version": client_version,
+        "etag": "aivo-injected",
+        "models": models,
+    });
+    let body = match serde_json::to_vec(&cache) {
+        Ok(b) => b,
+        Err(e) => {
+            warn_codex_app_cache(format!("serialize models cache: {e}"));
+            return;
+        }
+    };
+    let cache_path = std::path::PathBuf::from(codex_home).join("models_cache.json");
+    // `link_session_state` may have symlinked this path to ~/.codex/models_cache.json.
+    // Unlink before write so the upcoming write can't follow the symlink into
+    // the user's real home dir. Tolerate NotFound (no prior file). Any other
+    // error must abort: writing through a surviving symlink would corrupt the
+    // user's real codex cache — exactly what this whole helper exists to avoid.
+    match tokio::fs::remove_file(&cache_path).await {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            warn_codex_app_cache(format!(
+                "could not unlink shadow {} before write: {} \u{2014} skipping to avoid writing through to ~/.codex/",
+                cache_path.display(),
+                e
+            ));
+            return;
+        }
+    }
+    if let Err(e) = tokio::fs::write(&cache_path, body).await {
+        warn_codex_app_cache(format!("write {}: {}", cache_path.display(), e));
+    }
+}
+
+fn warn_codex_app_cache(msg: impl AsRef<str>) {
+    eprintln!(
+        "  {} codex-app picker: {}",
+        crate::style::yellow("aivo:"),
+        msg.as_ref()
+    );
+}
+
+/// Probes `<Codex.app>/Contents/Resources/codex --version` and returns the
+/// trimmed version string (e.g. `"0.133.0"`). Bounded by a hard timeout so a
+/// stuck binary (Gatekeeper translocation, hung sig verification, damaged
+/// bundle) can't wedge the whole `aivo codex-app` launch. On failure we return
+/// `None` and the caller skips the cache install instead of stamping a stale
+/// literal.
+async fn detect_bundled_codex_version() -> Option<String> {
+    let bin = crate::services::codex_app_wrapper::locate_bundled_codex()?;
+    let mut cmd = Command::new(&bin);
+    cmd.arg("--version")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .kill_on_drop(true);
+    let probe = cmd.output();
+    let out = tokio::time::timeout(std::time::Duration::from_secs(3), probe)
+        .await
+        .ok()?
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    // Some CLIs (npm update-notifier, banners) print extra lines on
+    // `--version`. Look specifically for "codex-cli X.Y.Z" — the exact format
+    // the bundled codex emits — and fall back to any version-shaped token only
+    // if that anchor is missing.
+    if let Some(version) = text.lines().find_map(parse_codex_version_line) {
+        return Some(version);
+    }
+    text.split_whitespace()
+        .find(|t| version_token(t))
+        .map(|s| s.to_string())
+}
+
+fn parse_codex_version_line(line: &str) -> Option<String> {
+    let mut tokens = line.split_whitespace();
+    let head = tokens.next()?;
+    if !head.eq_ignore_ascii_case("codex-cli") && !head.eq_ignore_ascii_case("codex") {
+        return None;
+    }
+    let v = tokens.next()?;
+    if version_token(v) {
+        Some(v.to_string())
+    } else {
+        None
+    }
+}
+
+fn version_token(t: &str) -> bool {
+    let mut chars = t.chars();
+    chars.next().is_some_and(|c| c.is_ascii_digit()) && t.contains('.')
+}
+
+/// Polls until the Codex.app GUI process has exited. Snapshots the pid(s) of
+/// the GUI's Mach-O main on first sighting (so an unrelated process whose
+/// argv mentions `Codex.app/Contents/MacOS/Codex` — debugger, editor opening
+/// the path, log tail — can't keep us pinned), then watches only those pids.
+///
+/// Ctrl-C / SIGTERM offers two-tap confirmation: the first signal prints a
+/// hint, the second within 5s sends a graceful `osascript quit` (or SIGTERM
+/// fallback) and waits for the GUI to exit. A single accidental Ctrl-C
+/// reverts to silent waiting after the prompt timeout.
+#[cfg(unix)]
+async fn wait_for_codex_app_gui_exit() {
+    use std::time::{Duration, Instant};
+    use tokio::time::sleep;
+    let mut sigint = match signal::unix::signal(signal::unix::SignalKind::interrupt()) {
+        Ok(s) => s,
+        Err(_) => return,
+    };
+    let mut sigterm = match signal::unix::signal(signal::unix::SignalKind::terminate()) {
+        Ok(s) => s,
+        Err(_) => return,
+    };
+    let gui_appear_deadline = Instant::now() + Duration::from_secs(30);
+    let mut tracked: Vec<i32> = Vec::new();
+    loop {
+        tokio::select! {
+            _ = sigint.recv() => {
+                if handle_signal_quit_prompt(&mut sigint, &mut sigterm, &mut tracked).await {
+                    return;
+                }
+            }
+            _ = sigterm.recv() => {
+                if handle_signal_quit_prompt(&mut sigint, &mut sigterm, &mut tracked).await {
+                    return;
+                }
+            }
+            _ = sleep(Duration::from_millis(1500)) => {
+                let pids = codex_app_gui_pids().await;
+                if tracked.is_empty() {
+                    if !pids.is_empty() {
+                        tracked = pids;
+                    } else if Instant::now() >= gui_appear_deadline {
+                        // No GUI sighting within the appearance window — treat
+                        // as never-launched and bail rather than blocking
+                        // forever.
+                        return;
+                    }
+                    continue;
+                }
+                // Keep only the pids we first saw that are still alive.
+                tracked.retain(|pid| pid_alive(*pid));
+                if tracked.is_empty() {
+                    return;
+                }
+            }
+        }
+    }
+}
+
+/// First signal: print the two-tap hint. Second signal within 5s: send a
+/// graceful quit to Codex.app and poll the tracked pids until they exit (or
+/// up to 8s — Cocoa's "are you sure?" dialog can take a beat).
+///
+/// Returns `true` when the caller should exit the wait loop (signal-driven
+/// quit completed, or user chose to abandon and the GUI is dying), `false` to
+/// resume the normal poll loop (single accidental signal, no follow-up).
+#[cfg(unix)]
+async fn handle_signal_quit_prompt(
+    sigint: &mut signal::unix::Signal,
+    sigterm: &mut signal::unix::Signal,
+    tracked: &mut Vec<i32>,
+) -> bool {
+    use std::time::Duration;
+    use tokio::time::sleep;
+    eprintln!(
+        "  {} press Ctrl-C again within 5s to quit Codex.app (and aivo). Wait to keep both running.",
+        crate::style::yellow("aivo:")
+    );
+    tokio::select! {
+        _ = sigint.recv() => {}
+        _ = sigterm.recv() => {}
+        _ = sleep(Duration::from_secs(5)) => {
+            eprintln!(
+                "  {} keeping Codex.app open; resuming normal wait.",
+                crate::style::dim("aivo:")
+            );
+            return false;
+        }
+    }
+    // Confirmed quit. Best-effort graceful shutdown of any tracked pids we
+    // know about, plus a generic AppleScript quit that hits whichever Codex
+    // instance LaunchServices currently knows about (some launches we tracked
+    // a single MacOS/Codex pid, others use the lib's NSWorkspace bundle id).
+    eprintln!(
+        "  {} quitting Codex.app gracefully...",
+        crate::style::yellow("aivo:")
+    );
+    quit_codex_app(tracked).await;
+    // Then poll briefly until the pids drop, so the local router survives
+    // until Cocoa actually finishes its quit handlers.
+    let quit_deadline = std::time::Instant::now() + Duration::from_secs(8);
+    while std::time::Instant::now() < quit_deadline {
+        tracked.retain(|pid| pid_alive(*pid));
+        if tracked.is_empty() {
+            break;
+        }
+        sleep(Duration::from_millis(400)).await;
+    }
+    true
+}
+
+/// Detects an existing Codex.app instance and asks the user to restart it.
+/// Bails (or auto-aborts on a non-interactive stdin) if the user declines —
+/// continuing would silently leave the running GUI on its old wrapper / key.
+async fn preflight_codex_app_running() -> Result<()> {
+    let pids = codex_app_gui_pids().await;
+    if pids.is_empty() {
+        return Ok(());
+    }
+
+    eprintln!(
+        "  {} Codex.app is already running (pid{} {}). aivo can't route a new key into an existing instance \u{2014} `CODEX_CLI_PATH` is captured at launch.",
+        crate::style::yellow("aivo:"),
+        if pids.len() == 1 { "" } else { "s" },
+        pids.iter()
+            .map(|p| p.to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+
+    if !std::io::stdin().is_terminal() {
+        return Err(CLIError::new(
+            "Codex.app is already running and stdin is not a TTY \u{2014} cannot prompt to restart.",
+            ErrorCategory::User,
+            None::<String>,
+            Some("Quit Codex.app manually (Cmd-Q) and re-run `aivo codex-app`."),
+        )
+        .into());
+    }
+
+    eprint!(
+        "  {} Quit Codex.app and relaunch via aivo? [Y/n] ",
+        crate::style::yellow("?")
+    );
+    let _ = std::io::stderr().flush();
+
+    let mut input = String::new();
+    std::io::stdin().read_line(&mut input)?;
+    let trimmed = input.trim();
+    let consent = trimmed.is_empty()
+        || trimmed.eq_ignore_ascii_case("y")
+        || trimmed.eq_ignore_ascii_case("yes");
+    if !consent {
+        return Err(CLIError::new(
+            "Aborted by user; Codex.app left running with its existing routing.",
+            ErrorCategory::User,
+            None::<String>,
+            None::<String>,
+        )
+        .into());
+    }
+
+    eprintln!(
+        "  {} quitting Codex.app gracefully so the new key takes effect...",
+        crate::style::yellow("aivo:")
+    );
+    #[cfg(unix)]
+    {
+        quit_codex_app(&pids).await;
+    }
+    // Poll until the tracked pids are gone, with a hard cap so a hung GUI
+    // doesn't trap the launch indefinitely.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while std::time::Instant::now() < deadline {
+        let still_running = codex_app_gui_pids()
+            .await
+            .into_iter()
+            .any(|p| pids.contains(&p));
+        if !still_running {
+            return Ok(());
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    }
+    Err(CLIError::new(
+        "Codex.app did not exit within 10s after the quit request.",
+        ErrorCategory::User,
+        None::<String>,
+        Some("Quit Codex.app manually (Cmd-Q) and re-run `aivo codex-app`."),
+    )
+    .into())
+}
+
+#[cfg(unix)]
+async fn quit_codex_app(tracked: &[i32]) {
+    // Prefer the AppleScript quit — it lets Cocoa run normal shutdown handlers
+    // (including any "are you sure?" dialogs the app's UI might show).
+    #[cfg(target_os = "macos")]
+    {
+        let _ = Command::new("osascript")
+            .args(["-e", "tell application \"Codex\" to quit"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .await;
+    }
+    // Then signal-fallback to the tracked pids in case osascript didn't find
+    // the app (or we're on a Unix that isn't macOS). SIGTERM lets the process
+    // run its own shutdown handlers, unlike SIGKILL.
+    for pid in tracked {
+        // SAFETY: `kill` takes plain integers; nothing is dereferenced.
+        unsafe { libc::kill(*pid, libc::SIGTERM) };
+    }
+}
+
+#[cfg(not(unix))]
+async fn wait_for_codex_app_gui_exit() {
+    use std::time::{Duration, Instant};
+    use tokio::time::sleep;
+    let gui_appear_deadline = Instant::now() + Duration::from_secs(30);
+    let mut tracked: Vec<i32> = Vec::new();
+    loop {
+        sleep(Duration::from_millis(1500)).await;
+        let pids = codex_app_gui_pids().await;
+        if tracked.is_empty() {
+            if !pids.is_empty() {
+                tracked = pids;
+            } else if Instant::now() >= gui_appear_deadline {
+                return;
+            }
+            continue;
+        }
+        tracked.retain(|pid| pid_alive(*pid));
+        if tracked.is_empty() {
+            return;
+        }
+    }
+}
+
+/// Returns the pids of running Codex.app GUI processes (Mach-O main on macOS,
+/// `Codex.exe` on Windows). Matches only the literal executable path, never
+/// argv: a `tail -f /Applications/Codex.app/Contents/MacOS/Codex.log` or
+/// `lldb /Applications/Codex.app/Contents/MacOS/Codex` would otherwise pin us.
+async fn codex_app_gui_pids() -> Vec<i32> {
+    #[cfg(unix)]
+    {
+        // `ps -axo pid,comm` prints `<pid> <executable path>`. `comm` on macOS
+        // shows the actual executable backing the process, not argv[0], so we
+        // can match Codex.app's Mach-O without false positives.
+        let output = Command::new("ps")
+            .args(["-axo", "pid=,comm="])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .output()
+            .await;
+        let Ok(out) = output else {
+            return Vec::new();
+        };
+        let text = String::from_utf8_lossy(&out.stdout);
+        let mut pids = Vec::new();
+        for line in text.lines() {
+            let trimmed = line.trim_start();
+            let (pid_str, rest) = match trimmed.split_once(char::is_whitespace) {
+                Some(parts) => parts,
+                None => continue,
+            };
+            let exe = rest.trim();
+            // The Mach-O main lives at `/Applications/Codex.app/Contents/MacOS/Codex`
+            // (or `~/Applications/Codex.app/...`). Helper / framework /
+            // renderer processes have different `comm` values and stay out.
+            if exe.ends_with("/Codex.app/Contents/MacOS/Codex")
+                && let Ok(pid) = pid_str.parse::<i32>()
+            {
+                pids.push(pid);
+            }
+        }
+        pids
+    }
+    #[cfg(not(unix))]
+    {
+        let output = Command::new("tasklist")
+            .args(["/FI", "IMAGENAME eq Codex.exe", "/FO", "CSV", "/NH"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .output()
+            .await;
+        let Ok(out) = output else {
+            return Vec::new();
+        };
+        let text = String::from_utf8_lossy(&out.stdout);
+        let mut pids = Vec::new();
+        for line in text.lines() {
+            // tasklist CSV: `"Codex.exe","<pid>","Console",...`
+            let parts: Vec<&str> = line.split(',').collect();
+            if parts.len() >= 2
+                && let Ok(pid) = parts[1].trim_matches('"').parse::<i32>()
+            {
+                pids.push(pid);
+            }
+        }
+        pids
+    }
+}
+
+fn pid_alive(pid: i32) -> bool {
+    #[cfg(unix)]
+    {
+        // SAFETY: kill(pid, 0) doesn't deliver a signal — it only probes that
+        // the pid exists and we have permission to signal it. No memory is
+        // dereferenced.
+        let rc = unsafe { libc::kill(pid, 0) };
+        if rc == 0 {
+            return true;
+        }
+        // ESRCH means the pid is gone. EPERM means it exists but we can't
+        // signal it — still counts as alive for our "is the GUI running"
+        // purposes.
+        std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+    }
+    #[cfg(not(unix))]
+    {
+        // No cheap equivalent of kill(0) on Windows that's available without
+        // pulling in `windows-sys`; re-poll via tasklist on the next tick.
+        let _ = pid;
+        true
+    }
+}
+
+/// Moves codex's global `-c/--config/--enable/--disable` prefix into a wrapper
+/// shell script and points `CODEX_CLI_PATH` at it. Codex.app spawns its codex
+/// app-server subprocess via that env var (see `codex_app_wrapper` module
+/// docs); the parent `codex app` call's own `--config` flags are NOT
+/// inherited by that subprocess, so we move them where they'll actually be
+/// read.
+///
+/// Best-effort: if Codex.app isn't installed, leaves args alone so the
+/// existing `codex` CLI receives the flags (and Codex.app's installer prompt
+/// will steer the user from there).
+/// Installs the per-launch wrapper script and returns its path so the caller
+/// can clean it up after the GUI exits. The path is also stored in
+/// `CODEX_CLI_PATH` for the child env.
+async fn install_codex_app_wrapper(
+    env: &mut HashMap<String, String>,
+    args: &mut Vec<String>,
+    config_dir: &std::path::Path,
+    key_id: &str,
+) -> Option<std::path::PathBuf> {
+    use crate::services::codex_app_wrapper;
+    let codex_bin = codex_app_wrapper::locate_bundled_codex()?;
+    let prefix = crate::services::launch_args::drain_codex_global_prefix(args);
+    if prefix.is_empty() {
+        return None;
+    }
+    let dir = codex_app_wrapper::wrapper_dir(config_dir);
+    codex_app_wrapper::cleanup_stale_wrappers(&dir).await;
+    match codex_app_wrapper::write_wrapper(&dir, key_id, &codex_bin, &prefix).await {
+        Ok(path) => {
+            env.insert(
+                "CODEX_CLI_PATH".to_string(),
+                path.to_string_lossy().into_owned(),
+            );
+            Some(path)
+        }
+        Err(e) => {
+            eprintln!(
+                "  {} could not install codex-app wrapper: {} \u{2014} falling back to parent --config flags",
+                crate::style::yellow("aivo:"),
+                e
+            );
+            // Restore args so the parent codex CLI sees the flags. The flags
+            // won't reach the GUI child, but the user gets a working CLI
+            // launch rather than a silent misconfiguration.
+            let mut restored = prefix;
+            restored.append(args);
+            *args = restored;
+            None
+        }
+    }
 }
 
 /// Cached fresh PATH read from a login shell after a tool install. Set once
@@ -1020,6 +1754,7 @@ mod tests {
         assert_eq!(AIToolType::parse("Claude"), Some(AIToolType::Claude));
         assert_eq!(AIToolType::parse("CLAUDE"), Some(AIToolType::Claude));
         assert_eq!(AIToolType::parse("codex"), Some(AIToolType::Codex));
+        assert_eq!(AIToolType::parse("codex-app"), Some(AIToolType::CodexApp));
         assert_eq!(AIToolType::parse("gemini"), Some(AIToolType::Gemini));
         assert_eq!(AIToolType::parse("opencode"), Some(AIToolType::Opencode));
         assert_eq!(AIToolType::parse("pi"), Some(AIToolType::Pi));
@@ -1051,7 +1786,12 @@ mod tests {
         // npm prefix to `~/.npm-global` (a common rootless pattern) need that
         // dir as a fallback when the installer ran but PATH wasn't refreshed.
         let home = crate::services::system_env::home_dir().expect("HOME set in test env");
-        for tool in [AIToolType::Codex, AIToolType::Gemini, AIToolType::Pi] {
+        for tool in [
+            AIToolType::Codex,
+            AIToolType::CodexApp,
+            AIToolType::Gemini,
+            AIToolType::Pi,
+        ] {
             let dirs = tool.well_known_install_dirs();
             assert!(
                 dirs.contains(&home.join(".npm-global").join("bin")),

@@ -395,7 +395,7 @@ pub async fn run() -> ! {
                 };
                 let parsed_tool = run_args.tool.as_deref().and_then(AIToolType::parse);
                 let supported = parsed_tool
-                    .is_some_and(|t| matches!(t, AIToolType::Claude | AIToolType::Codex));
+                    .is_some_and(|t| matches!(t, AIToolType::Claude) || t.is_codex_family());
                 if !supported {
                     let tool_name = run_args.tool.as_deref().unwrap_or("(none)");
                     if parsed_tool == Some(AIToolType::Amp) {
@@ -405,7 +405,7 @@ pub async fn run() -> ! {
                         );
                     } else {
                         eprintln!(
-                            "{} --max-context only applies to `aivo run claude` and `aivo run codex` (got {}).",
+                            "{} --max-context only applies to `aivo run claude`, `aivo run codex`, and `aivo run codex-app` (got {}).",
                             style::red("Error:"),
                             tool_name
                         );
@@ -879,7 +879,7 @@ fn print_help() {
         (
             "<tool>",
             "run <tool>",
-            "claude / codex / gemini / opencode / pi / amp",
+            "claude / codex / codex-app / gemini / opencode / pi / amp",
         ),
     ];
     let expansion_width = shortcuts.iter().map(|(_, e, _)| e.len()).max().unwrap_or(0);
@@ -981,6 +981,7 @@ fn print_help_json() {
             { "alias": "hf:<ref> | http(s)://<url>", "expands_to": ["chat", "<ref>"], "note": "Top-level HF/URL arg → chat with that model" },
             { "alias": "claude", "expands_to": ["run", "claude"] },
             { "alias": "codex", "expands_to": ["run", "codex"] },
+            { "alias": "codex-app", "expands_to": ["run", "codex-app"] },
             { "alias": "gemini", "expands_to": ["run", "gemini"] },
             { "alias": "opencode", "expands_to": ["run", "opencode"] },
             { "alias": "pi", "expands_to": ["run", "pi"] },

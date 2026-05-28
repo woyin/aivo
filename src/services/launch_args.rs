@@ -41,7 +41,7 @@ pub(crate) fn preview_args(
         let args = inject_amp_initial_mode(&args, env);
         return inject_amp_settings_file(&args, env);
     }
-    if tool != AIToolType::Codex {
+    if !tool.is_codex_family() {
         return args;
     }
 
@@ -144,7 +144,7 @@ pub(crate) fn build_preview_notes(
     );
 
     let use_responses_router = uses_responses_to_chat_router(env);
-    if tool == AIToolType::Codex
+    if tool.is_codex_family()
         && model.is_some()
         && !raw_args.iter().any(|arg| {
             arg == "--model" || arg == "-m" || arg.starts_with("--model=") || arg.starts_with("-m=")
@@ -152,11 +152,10 @@ pub(crate) fn build_preview_notes(
     {
         notes.push("injects `-m <model>` for Codex".to_string());
     }
-    if tool == AIToolType::Codex && should_preview_codex_model_catalog(model, use_responses_router)
-    {
+    if tool.is_codex_family() && should_preview_codex_model_catalog(model, use_responses_router) {
         notes.push("writes a temporary Codex model catalog file at launch time".to_string());
     }
-    if tool == AIToolType::Codex && env.contains_key("OPENAI_BASE_URL") {
+    if tool.is_codex_family() && env.contains_key("OPENAI_BASE_URL") {
         notes.push("injects `--config model_provider=aivo` to bypass codex auth.json".to_string());
     }
 
@@ -211,6 +210,7 @@ pub(crate) async fn build_runtime_args(
     tool: AIToolType,
     raw_args: &[String],
     model: Option<&str>,
+    codex_app_models: Option<&[String]>,
     env: &HashMap<String, String>,
 ) -> Result<RuntimeArgs> {
     let args = inject_claude_teammate_mode(tool, raw_args);
@@ -229,7 +229,7 @@ pub(crate) async fn build_runtime_args(
             codex_model_catalog_path: None,
         });
     }
-    if tool != AIToolType::Codex {
+    if !tool.is_codex_family() {
         return Ok(RuntimeArgs {
             args,
             codex_model_catalog_path: None,
@@ -238,7 +238,7 @@ pub(crate) async fn build_runtime_args(
 
     let use_responses_router = uses_responses_to_chat_router(env);
     let codex_model_catalog_path =
-        maybe_write_codex_model_catalog(model, use_responses_router).await?;
+        maybe_write_codex_model_catalog(model, codex_app_models, use_responses_router).await?;
     let args = inject_codex_model(model, &args, use_responses_router);
     let args = inject_codex_model_catalog(codex_model_catalog_path.as_deref(), &args);
     let args = inject_codex_cursor_tui_reasoning(use_responses_router, &args);
@@ -369,12 +369,128 @@ pub(crate) fn inject_codex_max_context(args: &mut Vec<String>, max_context: Opti
     args.push(format!("model_context_window={tokens}"));
 }
 
+pub(crate) fn inject_codex_max_context_before_args(
+    args: &mut Vec<String>,
+    max_context: Option<&str>,
+) {
+    let Some(tag) = max_context else {
+        return;
+    };
+    let Some(tokens) = context_tag_to_tokens(tag) else {
+        return;
+    };
+    let insert_at = codex_global_prefix_len(args);
+    args.splice(
+        insert_at..insert_at,
+        [
+            "--config".to_string(),
+            format!("model_context_window={tokens}"),
+        ],
+    );
+}
+
+/// Converts Codex CLI args into Codex Desktop App args by inserting the
+/// `app` subcommand after leading global options. aivo injects Codex config
+/// as top-level flags so the desktop app server receives provider/model
+/// overrides without writing them into the user's real `~/.codex/config.toml`.
+pub(crate) fn inject_codex_app_subcommand(args: &mut Vec<String>) {
+    let insert_at = codex_global_prefix_len(args);
+    if args.get(insert_at).is_some_and(|arg| arg == "app") {
+        return;
+    }
+    args.insert(insert_at, "app".to_string());
+}
+
+/// Drains the global flag prefix from `args`. Used for codex-app launches:
+/// the parent `codex app` invocation's `-c` overrides are NOT propagated to
+/// the GUI's spawned app-server child, so we move them into the
+/// `CODEX_CLI_PATH` wrapper instead — see `codex_app_wrapper`.
+pub(crate) fn drain_codex_global_prefix(args: &mut Vec<String>) -> Vec<String> {
+    let end = codex_global_prefix_len(args);
+    args.drain(0..end).collect()
+}
+
+fn codex_global_prefix_len(args: &[String]) -> usize {
+    let mut index = 0;
+    while index < args.len() {
+        let arg = args[index].as_str();
+        if arg == "--" {
+            break;
+        }
+        if codex_global_flag_takes_value(arg) {
+            index += if arg.contains('=') { 1 } else { 2 };
+            continue;
+        }
+        if codex_global_flag_no_value(arg) {
+            index += 1;
+            continue;
+        }
+        break;
+    }
+    index.min(args.len())
+}
+
+fn codex_global_flag_takes_value(arg: &str) -> bool {
+    matches!(
+        arg,
+        "-c" | "--config"
+            | "-m"
+            | "--model"
+            | "--model-provider"
+            | "--profile"
+            | "-s"
+            | "--sandbox"
+            | "-a"
+            | "--ask-for-approval"
+            | "-C"
+            | "--cd"
+            | "--search"
+            | "--image"
+            | "--enable"
+            | "--disable"
+    ) || arg.starts_with("--config=")
+        || arg.starts_with("-c=")
+        || arg.starts_with("--model=")
+        || arg.starts_with("-m=")
+        || arg.starts_with("--model-provider=")
+        || arg.starts_with("--profile=")
+        || arg.starts_with("--sandbox=")
+        || arg.starts_with("-s=")
+        || arg.starts_with("--ask-for-approval=")
+        || arg.starts_with("-a=")
+        || arg.starts_with("--cd=")
+        || arg.starts_with("-C=")
+        || arg.starts_with("--search=")
+        || arg.starts_with("--image=")
+        || arg.starts_with("--enable=")
+        || arg.starts_with("--disable=")
+}
+
+fn codex_global_flag_no_value(arg: &str) -> bool {
+    matches!(
+        arg,
+        "--oss"
+            | "--dangerously-bypass-approvals-and-sandbox"
+            | "--skip-git-repo-check"
+            | "--full-auto"
+            | "--json"
+    )
+}
+
 /// Rewrites env vars for the dry-run preview so it reflects what codex
 /// will actually receive at runtime.
 pub(crate) fn rewrite_codex_preview_env(env: &mut HashMap<String, String>) {
     if let Some(api_key) = env.remove("OPENAI_API_KEY") {
         env.insert("AIVO_CODEX_API_KEY".to_string(), api_key);
     }
+    if env.remove("AIVO_CODEX_OAUTH_CREDS").is_some() {
+        env.insert(
+            "CODEX_HOME".to_string(),
+            "<temp:aivo-codex-home>".to_string(),
+        );
+    }
+    env.remove("AIVO_CODEX_KEY_ID");
+    env.remove("AIVO_CODEX_APP_HOME_KEY");
     env.remove("OPENAI_BASE_URL");
 }
 
@@ -639,6 +755,60 @@ fn inject_codex_model(model: Option<&str>, args: &[String], use_router: bool) ->
     new_args
 }
 
+/// Sets root `model = "<X>"` in the codex config via `-c`. The codex CLI's
+/// `-m` flag only seeds the current launch's model; codex-app's GUI picks its
+/// per-thread default from the resolved config's `model` field. Without this,
+/// the GUI falls back to the bundled default (`gpt-5.5`) and the upstream
+/// rejects the request.
+pub(crate) fn inject_codex_root_model(args: &mut Vec<String>, model: Option<&str>) {
+    let model = match model {
+        Some(m) if !m.is_empty() => m,
+        _ => return,
+    };
+    if args.iter().any(|a| a == "model" || a.starts_with("model=")) {
+        return;
+    }
+    let escaped = model.replace('\\', "\\\\").replace('"', "\\\"");
+    let insert_at = codex_global_prefix_len(args);
+    args.splice(
+        insert_at..insert_at,
+        ["--config".to_string(), format!("model=\"{}\"", escaped)],
+    );
+}
+
+/// Best-effort reaper for older `aivo-codex-model-catalog-*.json` tempfiles
+/// the codex-app launch path intentionally leaves behind (the GUI references
+/// them for the duration of its session, so we can't unlink during cleanup
+/// without risking a Ctrl-C'd aivo yanking the file out from under a still-
+/// running Codex.app). Deletes files older than 24h that match our prefix.
+async fn cleanup_stale_codex_model_catalogs() {
+    use std::time::{Duration, SystemTime};
+    const MAX_AGE: Duration = Duration::from_secs(24 * 60 * 60);
+    let dir = std::env::temp_dir();
+    let Ok(mut entries) = tokio::fs::read_dir(&dir).await else {
+        return;
+    };
+    let now = SystemTime::now();
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        if !name.starts_with("aivo-codex-model-catalog-") || !name.ends_with(".json") {
+            continue;
+        }
+        let Ok(meta) = entry.metadata().await else {
+            continue;
+        };
+        let Ok(modified) = meta.modified() else {
+            continue;
+        };
+        if now.duration_since(modified).is_ok_and(|age| age > MAX_AGE) {
+            let _ = tokio::fs::remove_file(&path).await;
+        }
+    }
+}
+
 fn inject_codex_model_catalog(path: Option<&str>, args: &[String]) -> Vec<String> {
     let path = match path {
         Some(p) if !p.is_empty() => p,
@@ -660,28 +830,16 @@ fn inject_codex_model_catalog(path: Option<&str>, args: &[String]) -> Vec<String
 
 async fn maybe_write_codex_model_catalog(
     model: Option<&str>,
+    codex_app_models: Option<&[String]>,
     uses_non_openai_router: bool,
 ) -> Result<Option<String>> {
-    let model = match model {
-        Some(m) if !m.is_empty() => m,
-        _ => return Ok(None),
-    };
-
-    if !uses_non_openai_router {
+    let slugs = catalog_slugs(model, codex_app_models, uses_non_openai_router);
+    if slugs.is_empty() {
         return Ok(None);
     }
+    cleanup_stale_codex_model_catalogs().await;
 
-    let model_lower = model.to_lowercase();
-    let name_only = model_lower.split('/').next_back().unwrap_or(&model_lower);
-    if name_only.starts_with("gpt-")
-        || name_only.starts_with("o1")
-        || name_only.starts_with("o3")
-        || name_only.starts_with("o4")
-    {
-        return Ok(None);
-    }
-
-    let catalog_json = build_codex_model_catalog_json(model)?;
+    let catalog_json = build_codex_model_catalog_json(&slugs)?;
     let nonce = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
@@ -705,55 +863,132 @@ async fn maybe_write_codex_model_catalog(
     Ok(Some(path.to_string_lossy().to_string()))
 }
 
-fn build_codex_model_catalog_json(model: &str) -> Result<String> {
-    let catalog = json!({
-        "models": [{
-            "slug": model,
-            "display_name": model,
-            "description": format!("Custom model metadata for {}", model),
-            "default_reasoning_level": "medium",
-            "supported_reasoning_levels": [
-                {"effort": "low", "description": "low"},
-                {"effort": "medium", "description": "medium"}
-            ],
-            "shell_type": "default",
-            "visibility": "list",
-            "minimal_client_version": [0, 1, 0],
-            "supported_in_api": true,
-            "priority": 0,
-            "upgrade": serde_json::Value::Null,
-            "base_instructions": "base instructions",
-            // Tell codex this model exposes reasoning summaries so it (a)
-            // sends `reasoning: {summary: "auto"}` in the Responses request
-            // and (b) routes incoming `response.reasoning_summary_text.delta`
-            // events into a visible panel instead of dropping them. Cursor's
-            // composer-* models do actually emit thoughts (cursor's ACP
-            // `agent_thought_chunk` events), and aivo's bridge already
-            // forwards those as reasoning summaries — without this flag the
-            // bridge was emitting reasoning events into a UI codex had
-            // already gated off, making cursor's mid-turn silences look like
-            // a finished response. See debug-20260525-151512 trace.
-            "supports_reasoning_summaries": true,
-            "default_reasoning_summary": "auto",
-            // Codex's built-in catalog entries set this to "experimental" on
-            // every reasoning-capable model (verified by `strings` dump of
-            // codex 0.132's catalog blob — gpt-5-codex, gpt-5*, etc.). With
-            // `supports_reasoning_summaries: true` but `format` absent or
-            // "none", codex still requests `reasoning: {summary: "auto"}` but
-            // its TUI's reasoning-panel rendering path is gated off, so the
-            // events go in and nothing visible comes out.
-            "reasoning_summary_format": "experimental",
-            "support_verbosity": false,
-            "default_verbosity": serde_json::Value::Null,
-            "apply_patch_tool_type": serde_json::Value::Null,
-            "truncation_policy": {"mode": "bytes", "limit": 10000},
-            "supports_parallel_tool_calls": false,
-            "supports_image_detail_original": false,
-            "context_window": 272000,
-            "experimental_supported_tools": []
-        }]
-    });
+/// Determines which model slugs the codex catalog file should contain.
+/// Returns empty when no catalog is needed (regular OpenAI-style models hitting
+/// codex's built-in catalog).
+fn catalog_slugs(
+    model: Option<&str>,
+    codex_app_models: Option<&[String]>,
+    uses_non_openai_router: bool,
+) -> Vec<String> {
+    // CodexApp without `-m`: list every discovered provider model so the GUI
+    // dropdown lets the user pick. Reject slugs with control bytes (newline,
+    // CR, NUL, tab) — they'd break out of the TOML basic-string in
+    // `inject_codex_root_model` / catalog JSON.
+    if let Some(list) = codex_app_models {
+        let mut slugs: Vec<String> = list
+            .iter()
+            .filter(|m| is_safe_codex_slug(m))
+            .cloned()
+            .collect();
+        if !slugs.is_empty() {
+            slugs.sort();
+            slugs.dedup();
+            // If EVERY discovered slug is OpenAI-shaped, codex's built-in
+            // catalog already serves them with correct metadata (272k context,
+            // proper reasoning fields, etc.) — overwriting with our slim
+            // 128k/freeform entries silently degrades capability. Defer to the
+            // bundled catalog in that case; aivo's wrapper still routes
+            // requests through our local provider so the user's key is used.
+            if slugs.iter().all(|m| is_openai_shaped_slug(m)) {
+                return Vec::new();
+            }
+            return slugs;
+        }
+    }
+
+    // CLI single-model path: only write when the model is non-OpenAI-shaped
+    // and we're behind a non-OpenAI router (else codex's built-in catalog
+    // serves the user without aivo interference).
+    let model = match model {
+        Some(m) if !m.is_empty() && is_safe_codex_slug(m) => m,
+        _ => return Vec::new(),
+    };
+    if !uses_non_openai_router {
+        return Vec::new();
+    }
+    if is_openai_shaped_slug(model) {
+        return Vec::new();
+    }
+    vec![model.to_string()]
+}
+
+/// True when the slug's local name (after any `provider/` prefix) starts with
+/// an OpenAI family prefix codex's bundled catalog already covers.
+fn is_openai_shaped_slug(model: &str) -> bool {
+    let lower = model.to_lowercase();
+    let name_only = lower.split('/').next_back().unwrap_or(&lower);
+    name_only.starts_with("gpt-")
+        || name_only.starts_with("o1")
+        || name_only.starts_with("o3")
+        || name_only.starts_with("o4")
+}
+
+/// Rejects model slugs that contain control bytes (NUL, newline, CR, tab).
+/// These would otherwise be embedded into TOML basic-strings via
+/// `inject_codex_root_model` / `inject_codex_provider_config`, where they
+/// terminate the string and let the rest re-target unrelated config keys.
+fn is_safe_codex_slug(s: &str) -> bool {
+    !s.is_empty() && !s.chars().any(|c| c.is_control())
+}
+
+fn build_codex_model_catalog_json(slugs: &[String]) -> Result<String> {
+    let models: Vec<_> = slugs
+        .iter()
+        .enumerate()
+        .map(|(i, m)| model_entry(m, i))
+        .collect();
+    let catalog = json!({ "models": models });
     Ok(serde_json::to_string(&catalog)?)
+}
+
+fn model_entry(model: &str, index: usize) -> serde_json::Value {
+    // Field set tracks codex 0.133+ `ModelInfo` (protocol/src/openai_models.rs).
+    // Missing required fields make codex silently reject the catalog file —
+    // codex then falls back to its built-in `models_cache.json` (full of stock
+    // OpenAI slugs), so the GUI's model picker ignores aivo's provider entirely.
+    //
+    // Priority starts at 10 (matches codex's stock catalog band — gpt-5.5 is 9,
+    // gpt-5.4 is 16, gpt-5.4-mini is 23) and increases by 10 per entry. Lower
+    // values render earlier / more prominently in the picker; the GUI hides
+    // entries with priority 0 ("internal") so a non-zero value is required.
+    let priority = 10 + (index as i64) * 10;
+    json!({
+        "slug": model,
+        "display_name": model,
+        "description": format!("aivo-routed model {}", model),
+        "default_reasoning_level": "medium",
+        "supported_reasoning_levels": [
+            {"effort": "low", "description": "Lighter reasoning"},
+            {"effort": "medium", "description": "Balanced"},
+            {"effort": "high", "description": "Deeper reasoning"}
+        ],
+        "shell_type": "default",
+        "visibility": "list",
+        "supported_in_api": true,
+        "priority": priority,
+        "additional_speed_tiers": [],
+        "service_tiers": [],
+        "availability_nux": serde_json::Value::Null,
+        "upgrade": serde_json::Value::Null,
+        "base_instructions": "You are a coding agent.",
+        "model_messages": serde_json::Value::Null,
+        "supports_reasoning_summaries": false,
+        "default_reasoning_summary": "none",
+        "support_verbosity": false,
+        "default_verbosity": serde_json::Value::Null,
+        "apply_patch_tool_type": "freeform",
+        "web_search_tool_type": "text",
+        "truncation_policy": {"mode": "tokens", "limit": 100000},
+        "supports_parallel_tool_calls": false,
+        "supports_image_detail_original": false,
+        "context_window": 128000,
+        "max_context_window": 128000,
+        "effective_context_window_percent": 95,
+        "experimental_supported_tools": [],
+        "input_modalities": ["text"],
+        "supports_search_tool": false
+    })
 }
 
 #[cfg(test)]
@@ -778,6 +1013,7 @@ mod tests {
             AIToolType::Codex,
             &["prompt".to_string()],
             Some("composer-2.5"),
+            None,
             &env,
         )
         .await
@@ -803,6 +1039,62 @@ mod tests {
         if let Some(path) = runtime.codex_model_catalog_path {
             let _ = tokio::fs::remove_file(path).await;
         }
+    }
+
+    #[tokio::test]
+    async fn codex_app_wraps_global_options_before_app_subcommand() {
+        let env = HashMap::from([
+            (
+                "OPENAI_BASE_URL".to_string(),
+                "https://api.openai.com/v1".to_string(),
+            ),
+            ("OPENAI_API_KEY".to_string(), "sk-test".to_string()),
+        ]);
+        let mut runtime = build_runtime_args(
+            AIToolType::CodexApp,
+            &[".".to_string()],
+            Some("gpt-5"),
+            None,
+            &env,
+        )
+        .await
+        .unwrap();
+
+        let mut env_for_provider = env.clone();
+        inject_codex_provider_config(&mut env_for_provider, &mut runtime.args);
+        inject_codex_max_context_before_args(&mut runtime.args, Some("1m"));
+        inject_codex_app_subcommand(&mut runtime.args);
+
+        let app_idx = runtime
+            .args
+            .iter()
+            .position(|arg| arg == "app")
+            .expect("app subcommand present");
+        let path_idx = runtime.args.iter().position(|arg| arg == ".").unwrap();
+        assert!(app_idx < path_idx, "app must come before PATH");
+        assert!(
+            runtime.args[..app_idx]
+                .windows(2)
+                .any(|w| w[0] == "--config" && w[1] == "model_context_window=1000000"),
+            "max-context config must remain a top-level codex option"
+        );
+        assert!(
+            runtime.args[..app_idx]
+                .windows(2)
+                .any(|w| w[0] == "--disable" && w[1] == "apps"),
+            "provider config should remain before app"
+        );
+    }
+
+    #[test]
+    fn codex_app_subcommand_respects_user_global_flags() {
+        let mut args = vec![
+            "--profile".to_string(),
+            "work".to_string(),
+            "--help".to_string(),
+        ];
+        inject_codex_app_subcommand(&mut args);
+        assert_eq!(args, vec!["--profile", "work", "app", "--help"]);
     }
 
     #[test]
@@ -949,8 +1241,8 @@ mod tests {
 
     #[test]
     fn test_build_codex_model_catalog_json_includes_model_slug() {
-        let model = "minimax/minimax-m2.5";
-        let json = build_codex_model_catalog_json(model).unwrap();
+        let model = "minimax/minimax-m2.5".to_string();
+        let json = build_codex_model_catalog_json(&[model.clone()]).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed["models"][0]["slug"], model);
         assert_eq!(parsed["models"][0]["display_name"], model);
@@ -965,9 +1257,85 @@ mod tests {
         // codex silently swallows the failure and falls back to its built-in
         // default model — so the user's `-m <picked>` is ignored and the
         // banner shows `gpt-4o` instead of the chosen cursor/openrouter slug.
-        let json = build_codex_model_catalog_json("composer-2.5").unwrap();
+        let json = build_codex_model_catalog_json(&["composer-2.5".to_string()]).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed["models"][0]["shell_type"], "default");
+    }
+
+    #[test]
+    fn build_codex_model_catalog_json_emits_multiple_entries() {
+        // CodexApp without -m: catalog should list every discovered model so
+        // the GUI dropdown can show them.
+        let json = build_codex_model_catalog_json(&[
+            "deepseek-chat".to_string(),
+            "deepseek-reasoner".to_string(),
+        ])
+        .unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["models"][0]["slug"], "deepseek-chat");
+        assert_eq!(parsed["models"][1]["slug"], "deepseek-reasoner");
+    }
+
+    #[test]
+    fn catalog_slugs_falls_back_to_single_model_when_no_app_list() {
+        let slugs = catalog_slugs(Some("composer-2.5"), None, true);
+        assert_eq!(slugs, vec!["composer-2.5"]);
+    }
+
+    #[test]
+    fn catalog_slugs_uses_app_list_when_present_regardless_of_router() {
+        // CodexApp path: catalog gets written even on the OpenAI router so
+        // the GUI dropdown is populated with provider's models.
+        let app_models = vec!["deepseek-chat".to_string(), "deepseek-reasoner".to_string()];
+        let slugs = catalog_slugs(None, Some(&app_models), false);
+        assert_eq!(slugs, vec!["deepseek-chat", "deepseek-reasoner"]);
+    }
+
+    #[test]
+    fn catalog_slugs_skips_all_openai_shaped_app_list() {
+        // When every discovered slug is OpenAI-shaped, codex's bundled catalog
+        // already serves them with correct metadata (272k context window,
+        // proper reasoning fields, etc.). Overwriting with our slim entries
+        // would silently degrade the GUI. catalog_slugs should defer.
+        let app_models = vec![
+            "gpt-5".to_string(),
+            "gpt-5-codex".to_string(),
+            "o3-mini".to_string(),
+        ];
+        let slugs = catalog_slugs(None, Some(&app_models), true);
+        assert!(
+            slugs.is_empty(),
+            "all-OpenAI list should defer to codex's bundled catalog"
+        );
+    }
+
+    #[test]
+    fn catalog_slugs_writes_when_mixed_with_non_openai() {
+        let app_models = vec!["gpt-5".to_string(), "deepseek-chat".to_string()];
+        let slugs = catalog_slugs(None, Some(&app_models), false);
+        assert_eq!(slugs, vec!["deepseek-chat", "gpt-5"]);
+    }
+
+    #[test]
+    fn catalog_slugs_filters_control_byte_slugs() {
+        // A buggy /v1/models endpoint returning a slug with a newline must
+        // not flow through to TOML formatting.
+        let app_models = vec![
+            "good-model".to_string(),
+            "evil\n[features]\nfoo=true".to_string(),
+        ];
+        let slugs = catalog_slugs(None, Some(&app_models), false);
+        assert_eq!(slugs, vec!["good-model"]);
+    }
+
+    #[test]
+    fn is_safe_codex_slug_rejects_control_chars() {
+        assert!(is_safe_codex_slug("deepseek-v4-flash"));
+        assert!(is_safe_codex_slug("provider/model-name"));
+        assert!(!is_safe_codex_slug(""));
+        assert!(!is_safe_codex_slug("with\nnewline"));
+        assert!(!is_safe_codex_slug("with\ttab"));
+        assert!(!is_safe_codex_slug("with\0nul"));
     }
 
     #[test]
@@ -1005,7 +1373,7 @@ mod tests {
     async fn opencode_prompt_passes_through_build_runtime_args() {
         let args = vec!["explain this code".to_string()];
         let env = HashMap::new();
-        let result = build_runtime_args(AIToolType::Opencode, &args, None, &env)
+        let result = build_runtime_args(AIToolType::Opencode, &args, None, None, &env)
             .await
             .unwrap();
         assert_eq!(result.args, vec!["explain this code"]);

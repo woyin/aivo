@@ -60,6 +60,7 @@ Supported tools:
 
 - `claude` [Claude Code](https://github.com/anthropics/claude-code)
 - `codex` [Codex](https://github.com/openai/codex)
+- `codex-app` [Codex.app](https://github.com/openai/codex) desktop (macOS only)
 - `gemini` [Gemini CLI](https://github.com/google-gemini/gemini-cli)
 - `opencode` [OpenCode](https://github.com/anomalyco/opencode)
 - `pi` [Pi Coding Agent](https://github.com/badlogic/pi-mono/tree/main/packages/coding-agent)

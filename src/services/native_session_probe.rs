@@ -126,7 +126,7 @@ async fn recent_session_entries(
     };
     match tool {
         AIToolType::Claude => claude_entries(&home, cwd, cutoff).await,
-        AIToolType::Codex => codex_entries(&home, cutoff).await,
+        AIToolType::Codex | AIToolType::CodexApp => codex_entries(&home, cutoff).await,
         AIToolType::Gemini => gemini_entries(&home, cwd, cutoff).await,
         AIToolType::Pi => pi_entries(&home, cwd, cutoff).await,
         AIToolType::Opencode => {

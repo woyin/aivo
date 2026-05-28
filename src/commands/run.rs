@@ -308,7 +308,7 @@ impl RunCommand {
             Some(t) => t,
             None => {
                 eprintln!(
-                    "{} Unknown tool '{}'. Valid tools: claude, codex, gemini, opencode, pi, amp.",
+                    "{} Unknown tool '{}'. Valid tools: claude, codex, codex-app, gemini, opencode, pi, amp.",
                     style::red("Error:"),
                     tool
                 );
@@ -533,7 +533,15 @@ impl RunCommand {
 
         // Optional context injection: inject exactly one past session.
         let args = if let Some(selector) = context_selector {
-            maybe_inject_context(ai_tool, args, &selector).await
+            if ai_tool == AIToolType::CodexApp {
+                eprintln!(
+                    "  {} --context is ignored for codex-app",
+                    style::yellow("!")
+                );
+                args
+            } else {
+                maybe_inject_context(ai_tool, args, &selector).await
+            }
         } else {
             args
         };
@@ -581,8 +589,8 @@ impl RunCommand {
     ///   - Claude slot flags (`--reasoning-model`, `--{haiku,sonnet,opus}-model`,
     ///     `--subagent-model`) → claude
     ///   - Amp mode-model flags (`--{rush,smart,deep,large}-model`) → amp
-    ///   - `--max-context`/`--1m`/`--2m` → claude, codex
-    ///   - `--relogin` → claude, codex, gemini (the OAuth-backed keys)
+    ///   - `--max-context`/`--1m`/`--2m` → claude, codex, codex-app
+    ///   - `--relogin` → claude, codex/codex-app, gemini (the OAuth-backed keys)
     ///   - `-c, --context` → every tool except amp (no flat prompt-flag path)
     pub fn print_help(tool: Option<&str>) {
         let generic = tool.is_none();
@@ -599,6 +607,10 @@ impl RunCommand {
                 println!("{}", style::dim("Launch Claude Code with a local API key."))
             }
             Some("codex") => println!("{}", style::dim("Launch Codex with a local API key.")),
+            Some("codex-app") => println!(
+                "{}",
+                style::dim("Launch Codex Desktop App with a local API key.")
+            ),
             Some("gemini") => println!("{}", style::dim("Launch Gemini with a local API key.")),
             Some("opencode") => println!("{}", style::dim("Launch OpenCode with a local API key.")),
             Some("pi") => println!("{}", style::dim("Launch Pi with a local API key.")),
@@ -700,10 +712,10 @@ impl RunCommand {
             );
         }
 
-        let context_flags = is("claude") || is("codex") || tool != Some("amp");
+        let context_flags = is("claude") || is("codex") || is("codex-app") || tool != Some("amp");
         if context_flags {
             section("Context:");
-            if is("claude") || is("codex") {
+            if is("claude") || is("codex") || is("codex-app") {
                 print_opt(
                     "--max-context <size>",
                     "Opt every model slot into a larger context window (e.g. 1m, 2m)",
@@ -711,7 +723,7 @@ impl RunCommand {
                 print_opt("--1m", "Shorthand for --max-context=1m");
                 print_opt("--2m", "Shorthand for --max-context=2m");
             }
-            if tool != Some("amp") {
+            if tool != Some("amp") && tool != Some("codex-app") {
                 print_opt(
                     "-c, --context[=<id>]",
                     "Inject one past session (bare = picker; id from `aivo logs --by native`)",
@@ -724,9 +736,9 @@ impl RunCommand {
             "-k, --key <id|name>",
             "Select API key by ID or name (-k opens key picker)",
         );
-        if is("claude") || is("codex") || is("gemini") {
+        if is("claude") || is("codex") || is("codex-app") || is("gemini") {
             let relogin_desc = if generic {
-                "Force OAuth re-login for the selected key (codex / gemini / claude)"
+                "Force OAuth re-login for the selected key (codex / codex-app / gemini / claude)"
             } else {
                 "Force OAuth re-login for the selected key"
             };
@@ -759,6 +771,7 @@ impl RunCommand {
             };
             print_tool("claude", "Claude Code");
             print_tool("codex", "Codex");
+            print_tool("codex-app", "Codex Desktop App");
             print_tool("gemini", "Gemini");
             print_tool("opencode", "OpenCode");
             print_tool("pi", "Pi");
@@ -789,6 +802,10 @@ impl RunCommand {
                 println!("  {}", style::dim("aivo codex -k mykey -m gpt-5"));
                 println!("  {}", style::dim("aivo codex \"refactor this function\""));
             }
+            Some("codex-app") => {
+                println!("  {}", style::dim("aivo codex-app"));
+                println!("  {}", style::dim("aivo codex-app -k mykey -m gpt-5 ."));
+            }
             Some("gemini") => {
                 println!("  {}", style::dim("aivo gemini"));
                 println!("  {}", style::dim("aivo gemini -k mykey"));
@@ -817,6 +834,7 @@ impl RunCommand {
                 );
                 println!("  {}", style::dim("aivo claude \"fix the login bug\""));
                 println!("  {}", style::dim("aivo codex \"refactor this function\""));
+                println!("  {}", style::dim("aivo codex-app ."));
                 println!("  {}", style::dim("aivo gemini \"explain this code\""));
             }
         }
@@ -1005,7 +1023,7 @@ async fn maybe_inject_context(tool: AIToolType, args: Vec<String>, selector: &st
     match tool {
         // Both claude and pi accept the same `--append-system-prompt <text>` flag.
         AIToolType::Claude | AIToolType::Pi => inject_append_system_prompt(&rendered, args),
-        AIToolType::Codex => inject_codex(&rendered, args),
+        AIToolType::Codex | AIToolType::CodexApp => inject_codex(&rendered, args),
         AIToolType::Gemini => inject_via_flag(&rendered, args, "-i"),
         AIToolType::Opencode => inject_via_flag(&rendered, args, "--prompt"),
         // Amp has no flat prompt flag (uses `amp threads continue <id>` semantics);
@@ -1265,7 +1283,15 @@ mod tests {
     #[test]
     fn test_ai_tool_type_display_names() {
         // Ensure all tools have valid string representations
-        let tools = ["claude", "codex", "gemini", "opencode", "pi", "amp"];
+        let tools = [
+            "claude",
+            "codex",
+            "codex-app",
+            "gemini",
+            "opencode",
+            "pi",
+            "amp",
+        ];
         for tool in &tools {
             let parsed = AIToolType::parse(tool).unwrap();
             // Roundtrip: parsing should give a valid tool type
@@ -1274,6 +1300,7 @@ mod tests {
                     parsed,
                     AIToolType::Claude
                         | AIToolType::Codex
+                        | AIToolType::CodexApp
                         | AIToolType::Gemini
                         | AIToolType::Opencode
                         | AIToolType::Pi

@@ -26,6 +26,7 @@ pub fn render_single_session(tool: AIToolType, thread: &Thread) -> RenderedConte
     let text = match tool {
         AIToolType::Claude => format_claude_single(thread),
         AIToolType::Codex
+        | AIToolType::CodexApp
         | AIToolType::Gemini
         | AIToolType::Opencode
         | AIToolType::Pi

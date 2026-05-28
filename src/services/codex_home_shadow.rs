@@ -1,15 +1,17 @@
-//! Shadow `CODEX_HOME` for launching the native `codex` CLI with aivo's
-//! ChatGPT OAuth credentials. The shadow owns auth (we manage the
-//! tokens) but transparently exposes the user's real `~/.codex/` state
-//! — sessions, history, AGENTS.md, memories — so a launch through aivo
-//! behaves like a normal launch except for the credential.
+//! Shadow `CODEX_HOME` for launching native Codex surfaces with aivo-managed
+//! credentials. The shadow owns auth/config overlays (we manage the tokens and
+//! provider flags) but transparently exposes the user's real `~/.codex/` state
+//! — sessions, history, AGENTS.md, memories — so a launch through aivo behaves
+//! like a normal launch except for credential/config isolation.
 //!
 //! Flow (mirrors the Pi `PI_CODING_AGENT_DIR` pattern in
 //! `launch_runtime.rs::write_pi_agent_dir`):
-//! 1. Create a temp dir `aivo-codex-<random>/`.
-//! 2. Write `auth.json` in the native codex `AuthDotJson` schema
+//! 1. Create a temp dir `aivo-codex-<random>/` for CLI or a persistent
+//!    aivo-owned dir for Codex Desktop App.
+//! 2. If using Codex OAuth, write `auth.json` in the native codex `AuthDotJson` schema
 //!    (see `openai/codex: codex-rs/login/src/token_data.rs`).
-//! 3. Copy the user's `config.toml` into the shadow.
+//! 3. Copy the user's `config.toml` into the shadow. Persistent app homes are
+//!    seeded only once so app-side settings stay in the aivo-owned copy.
 //! 4. Symlink user-state files/dirs from the real `~/.codex/`:
 //!    `sessions/`, `memories/`, `skills/`, `plugins/`, `rules/`,
 //!    `prompts/`, `history.jsonl`, `AGENTS.md`, `installation_id`,
@@ -18,8 +20,8 @@
 //! 5. Caller sets `CODEX_HOME=<dir>` on the child env and spawns codex.
 //! 6. On exit, `read_back` reads the (possibly-rotated) auth.json so the
 //!    refreshed tokens can be persisted back into aivo's store.
-//! 7. The temp dir is removed. The symlinked real-home files survive
-//!    untouched.
+//! 7. The temp dir is removed for CLI launches. Persistent app homes remain so
+//!    a detached GUI can keep using the same isolated CODEX_HOME.
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
@@ -88,11 +90,22 @@ impl AuthDotJson {
     }
 }
 
-/// Owns a temp dir containing a single `auth.json`. Dropping removes the
-/// directory; callers who want to sync refreshed tokens back must call
-/// `read_back` before the value is dropped.
+/// Owns a shadow CODEX_HOME. CLI launches use a temp dir that is removed on
+/// drop; desktop-app launches use a persistent aivo-owned dir because the GUI
+/// can outlive the `codex app` launcher process.
 pub struct CodexHomeShadow {
-    dir: tempfile::TempDir,
+    dir: ShadowDir,
+}
+
+enum ShadowDir {
+    Temp(tempfile::TempDir),
+    Persistent(PathBuf),
+}
+
+#[derive(Clone, Copy)]
+enum ConfigSeedMode {
+    Always,
+    IfMissing,
 }
 
 impl CodexHomeShadow {
@@ -114,29 +127,64 @@ impl CodexHomeShadow {
             .tempdir()
             .context("create CODEX_HOME shadow temp dir")?;
 
-        let auth = AuthDotJson::from_credential(creds);
-        let body = serde_json::to_vec_pretty(&auth).context("serialize auth.json")?;
-        tokio::fs::write(dir.path().join("auth.json"), body)
+        initialize_shadow_home(
+            dir.path(),
+            Some(creds),
+            real_home.as_deref(),
+            ConfigSeedMode::Always,
+        )
+        .await?;
+
+        Ok(Self {
+            dir: ShadowDir::Temp(dir),
+        })
+    }
+
+    pub async fn create_persistent(
+        creds: &CodexOAuthCredential,
+        config_dir: &Path,
+        key_id: &str,
+    ) -> Result<Self> {
+        Self::create_persistent_with_real_home(Some(creds), config_dir, key_id, real_codex_home())
             .await
-            .context("write shadow auth.json")?;
+    }
 
-        if let Some(real_home) = real_home {
-            let src = real_home.join("config.toml");
-            if src.exists() {
-                let _ = tokio::fs::copy(&src, dir.path().join("config.toml")).await;
-            }
-            link_session_state(&real_home, dir.path()).await;
-        }
+    pub async fn create_persistent_without_auth(config_dir: &Path, key_id: &str) -> Result<Self> {
+        Self::create_persistent_with_real_home(None, config_dir, key_id, real_codex_home()).await
+    }
 
-        Ok(Self { dir })
+    async fn create_persistent_with_real_home(
+        creds: Option<&CodexOAuthCredential>,
+        config_dir: &Path,
+        key_id: &str,
+        real_home: Option<PathBuf>,
+    ) -> Result<Self> {
+        let dir = Self::persistent_path(config_dir, key_id);
+        tokio::fs::create_dir_all(&dir)
+            .await
+            .with_context(|| format!("create persistent CODEX_HOME shadow {}", dir.display()))?;
+        initialize_shadow_home(&dir, creds, real_home.as_deref(), ConfigSeedMode::IfMissing)
+            .await?;
+        Ok(Self {
+            dir: ShadowDir::Persistent(dir),
+        })
+    }
+
+    pub fn persistent_path(config_dir: &Path, key_id: &str) -> PathBuf {
+        config_dir
+            .join("codex-app-home")
+            .join(safe_codex_app_home_key(key_id))
     }
 
     pub fn path(&self) -> &Path {
-        self.dir.path()
+        match &self.dir {
+            ShadowDir::Temp(dir) => dir.path(),
+            ShadowDir::Persistent(path) => path.as_path(),
+        }
     }
 
     pub fn auth_path(&self) -> PathBuf {
-        self.dir.path().join("auth.json")
+        self.path().join("auth.json")
     }
 
     /// Reads the on-disk auth.json back (after codex exits). If the file is
@@ -144,8 +192,12 @@ impl CodexHomeShadow {
     /// returns `Ok(None)` so the caller can keep the pre-launch credential
     /// intact.
     pub async fn read_back(&self) -> Result<Option<AuthDotJson>> {
-        let path = self.auth_path();
-        let bytes = match tokio::fs::read(&path).await {
+        Self::read_auth_path(self.auth_path()).await
+    }
+
+    pub async fn read_auth_path(path: impl AsRef<Path>) -> Result<Option<AuthDotJson>> {
+        let path = path.as_ref();
+        let bytes = match tokio::fs::read(path).await {
             Ok(b) => b,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(e) => return Err(anyhow::Error::new(e).context("read shadow auth.json")),
@@ -154,6 +206,62 @@ impl CodexHomeShadow {
             Ok(v) => Ok(Some(v)),
             Err(_) => Ok(None),
         }
+    }
+}
+
+async fn initialize_shadow_home(
+    shadow: &Path,
+    creds: Option<&CodexOAuthCredential>,
+    real_home: Option<&Path>,
+    config_seed_mode: ConfigSeedMode,
+) -> Result<()> {
+    if let Some(creds) = creds {
+        let auth = AuthDotJson::from_credential(creds);
+        let body = serde_json::to_vec_pretty(&auth).context("serialize auth.json")?;
+        tokio::fs::write(shadow.join("auth.json"), body)
+            .await
+            .context("write shadow auth.json")?;
+    } else {
+        match tokio::fs::remove_file(shadow.join("auth.json")).await {
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => {}
+        }
+    }
+
+    if let Some(real_home) = real_home {
+        seed_config_toml(real_home, shadow, config_seed_mode).await;
+        link_session_state(real_home, shadow).await;
+    }
+
+    Ok(())
+}
+
+async fn seed_config_toml(real_home: &Path, shadow: &Path, mode: ConfigSeedMode) {
+    let src = real_home.join("config.toml");
+    if !src.exists() {
+        return;
+    }
+    let dest = shadow.join("config.toml");
+    if matches!(mode, ConfigSeedMode::IfMissing) && dest.exists() {
+        return;
+    }
+    let _ = tokio::fs::copy(&src, dest).await;
+}
+
+fn safe_codex_app_home_key(key_id: &str) -> String {
+    let mut out = String::with_capacity(key_id.len());
+    for ch in key_id.chars() {
+        if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_') {
+            out.push(ch);
+        } else {
+            out.push('_');
+        }
+    }
+    if out.is_empty() {
+        "default".to_string()
+    } else {
+        out
     }
 }
 
@@ -186,7 +294,8 @@ async fn link_session_state(real_home: &Path, shadow: &Path) {
         let real = real_home.join(dir);
         let _ = tokio::fs::create_dir_all(&real).await;
         if real.is_dir() {
-            let _ = symlink_dir(&real, &shadow.join(dir)).await;
+            let dest = shadow.join(dir);
+            replace_with_symlink_dir(&real, &dest).await;
         }
     }
 
@@ -199,9 +308,39 @@ async fn link_session_state(real_home: &Path, shadow: &Path) {
     ] {
         let real = real_home.join(file);
         if real.exists() {
-            let _ = symlink_file(&real, &shadow.join(file)).await;
+            let dest = shadow.join(file);
+            replace_with_symlink_file(&real, &dest).await;
         }
     }
+}
+
+/// Re-establishes a `dest -> real` file symlink, clearing any stale regular
+/// file left behind by a prior CodexApp launch (e.g. `models_cache.json` after
+/// `install_codex_app_models_cache` overwrote the symlink with a per-key
+/// cache). Without this step, the persistent shadow keeps the stale file on
+/// the next launch even if discovery fails to write a fresh one.
+async fn replace_with_symlink_file(real: &Path, dest: &Path) {
+    if let Ok(meta) = tokio::fs::symlink_metadata(dest).await {
+        if meta.file_type().is_symlink() {
+            // Already a symlink — leave it; the OS will resolve it to `real`.
+            return;
+        }
+        // Regular file (or dir) sitting at the target path. Unlink so the
+        // symlink_file call below has a clean slot. Failure is fine — likely
+        // a permission/race we can't usefully recover from.
+        let _ = tokio::fs::remove_file(dest).await;
+    }
+    let _ = symlink_file(real, dest).await;
+}
+
+async fn replace_with_symlink_dir(real: &Path, dest: &Path) {
+    if let Ok(meta) = tokio::fs::symlink_metadata(dest).await {
+        if meta.file_type().is_symlink() {
+            return;
+        }
+        let _ = tokio::fs::remove_dir_all(dest).await;
+    }
+    let _ = symlink_dir(real, dest).await;
 }
 
 /// Returns true if the on-disk tokens differ from `original` in any field
@@ -489,5 +628,76 @@ mod tests {
             .unwrap();
         assert!(shadow.auth_path().exists());
         assert!(!shadow.path().join("history.jsonl").exists());
+    }
+
+    #[tokio::test]
+    async fn persistent_shadow_seeds_config_once_and_survives_drop() {
+        let c = sample_cred();
+        let real = tempfile::tempdir().unwrap();
+        let config = tempfile::tempdir().unwrap();
+        tokio::fs::write(real.path().join("config.toml"), b"model = \"real\"\n")
+            .await
+            .unwrap();
+
+        let shadow = CodexHomeShadow::create_persistent_with_real_home(
+            Some(&c),
+            config.path(),
+            "key/one",
+            Some(real.path().to_path_buf()),
+        )
+        .await
+        .unwrap();
+        let path = shadow.path().to_path_buf();
+        assert!(path.join("auth.json").exists());
+        assert_eq!(
+            tokio::fs::read_to_string(path.join("config.toml"))
+                .await
+                .unwrap(),
+            "model = \"real\"\n"
+        );
+
+        tokio::fs::write(path.join("config.toml"), b"model = \"app-copy\"\n")
+            .await
+            .unwrap();
+        drop(shadow);
+        assert!(path.exists(), "persistent codex-app home must outlive drop");
+
+        let shadow2 = CodexHomeShadow::create_persistent_with_real_home(
+            Some(&c),
+            config.path(),
+            "key/one",
+            Some(real.path().to_path_buf()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            tokio::fs::read_to_string(shadow2.path().join("config.toml"))
+                .await
+                .unwrap(),
+            "model = \"app-copy\"\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn persistent_shadow_without_auth_removes_stale_auth() {
+        let c = sample_cred();
+        let config = tempfile::tempdir().unwrap();
+        let shadow = CodexHomeShadow::create_persistent_with_real_home(
+            Some(&c),
+            config.path(),
+            "key-one",
+            None,
+        )
+        .await
+        .unwrap();
+        let path = shadow.path().to_path_buf();
+        assert!(path.join("auth.json").exists());
+        drop(shadow);
+
+        let shadow =
+            CodexHomeShadow::create_persistent_with_real_home(None, config.path(), "key-one", None)
+                .await
+                .unwrap();
+        assert!(!shadow.path().join("auth.json").exists());
     }
 }

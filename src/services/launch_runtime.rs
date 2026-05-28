@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use crate::constants::PLACEHOLDER_LOOPBACK_URL;
 use crate::services::ai_launcher::AIToolType;
 use crate::services::amp_trust::{find_workspace_amp_settings, read_amp_settings_file};
-use crate::services::codex_home_shadow::{CodexHomeShadow, tokens_changed};
+use crate::services::codex_home_shadow::{AuthDotJson, CodexHomeShadow, tokens_changed};
 use crate::services::codex_oauth::{CodexOAuthCredential, REFRESH_SKEW_SECS, ensure_fresh};
 use crate::services::gemini_home_shadow::GeminiHomeShadow;
 use crate::services::gemini_oauth::{
@@ -131,7 +131,7 @@ pub(crate) async fn prepare_runtime_env(
             let base_url_env =
                 env.remove("AIVO_CURSOR_BASE_URL_ENV")
                     .unwrap_or_else(|| match tool {
-                        AIToolType::Codex => "OPENAI_BASE_URL".to_string(),
+                        tool if tool.is_codex_family() => "OPENAI_BASE_URL".to_string(),
                         _ => "ANTHROPIC_BASE_URL".to_string(),
                     });
             set_local_base_url(&mut env, &base_url_env, port);
@@ -144,7 +144,7 @@ pub(crate) async fn prepare_runtime_env(
         // is already consumed by `start_cursor_router` itself.
     }
 
-    if tool == AIToolType::Codex && env.contains_key("AIVO_USE_RESPONSES_TO_CHAT_ROUTER") {
+    if tool.is_codex_family() && env.contains_key("AIVO_USE_RESPONSES_TO_CHAT_ROUTER") {
         let (port, _active, responses_api, success, authoritative, learned) =
             start_responses_to_chat_router(&env).await?;
         responses_api_support = Some(responses_api);
@@ -154,7 +154,7 @@ pub(crate) async fn prepare_runtime_env(
         set_local_base_url(&mut env, "OPENAI_BASE_URL", port);
     }
 
-    if tool == AIToolType::Codex && env.contains_key("AIVO_USE_RESPONSES_TO_CHAT_COPILOT_ROUTER") {
+    if tool.is_codex_family() && env.contains_key("AIVO_USE_RESPONSES_TO_CHAT_COPILOT_ROUTER") {
         let port = start_responses_to_chat_copilot_router(&env).await?;
         set_local_base_url(&mut env, "OPENAI_BASE_URL", port);
     }
@@ -222,12 +222,15 @@ pub(crate) async fn prepare_runtime_env(
     let pi_agent_dir = env.get("PI_CODING_AGENT_DIR").cloned();
     let amp_settings_path = env.get("AIVO_AMP_SETTINGS_FILE").cloned();
 
-    let codex_oauth_sync =
-        if tool == AIToolType::Codex && env.contains_key("AIVO_CODEX_OAUTH_CREDS") {
-            Some(prepare_codex_oauth_shadow(&mut env, session_store).await?)
-        } else {
-            None
-        };
+    let codex_oauth_sync = if tool.is_codex_family() && env.contains_key("AIVO_CODEX_OAUTH_CREDS") {
+        Some(prepare_codex_oauth_shadow(tool, &mut env, session_store).await?)
+    } else {
+        None
+    };
+
+    if tool == AIToolType::CodexApp && codex_oauth_sync.is_none() {
+        prepare_codex_app_home_without_auth(&mut env, session_store).await?;
+    }
 
     let gemini_oauth_sync =
         if tool == AIToolType::Gemini && env.contains_key("AIVO_GEMINI_OAUTH_CREDS") {
@@ -277,6 +280,7 @@ pub(crate) async fn prepare_runtime_env(
 /// The placeholder env vars are stripped before codex is spawned; all codex
 /// sees is `CODEX_HOME=<shadow>` and the standard model overrides.
 async fn prepare_codex_oauth_shadow(
+    tool: AIToolType,
     env: &mut HashMap<String, String>,
     session_store: &SessionStore,
 ) -> Result<CodexOAuthSync> {
@@ -285,8 +289,14 @@ async fn prepare_codex_oauth_shadow(
         .ok_or_else(|| anyhow::anyhow!("missing AIVO_CODEX_OAUTH_CREDS"))?;
     let key_id = env
         .remove("AIVO_CODEX_KEY_ID")
+        .or_else(|| env.remove("AIVO_CODEX_APP_HOME_KEY"))
         .ok_or_else(|| anyhow::anyhow!("missing AIVO_CODEX_KEY_ID"))?;
+    env.remove("AIVO_CODEX_APP_HOME_KEY");
     let mut creds = CodexOAuthCredential::from_json(&raw)?;
+
+    if tool == AIToolType::CodexApp {
+        adopt_persistent_codex_app_tokens(session_store, &key_id, &mut creds).await;
+    }
 
     // Refresh pre-launch so codex starts with a valid access token. If the
     // refresh token has been invalidated — codex was killed before the
@@ -308,7 +318,11 @@ async fn prepare_codex_oauth_shadow(
         persist_refreshed_if_needed(session_store, &key_id, &stale, &creds).await;
     }
 
-    let shadow = CodexHomeShadow::create(&creds).await?;
+    let shadow = if tool == AIToolType::CodexApp {
+        CodexHomeShadow::create_persistent(&creds, session_store.config_dir(), &key_id).await?
+    } else {
+        CodexHomeShadow::create(&creds).await?
+    };
     env.insert(
         "CODEX_HOME".to_string(),
         shadow.path().to_string_lossy().to_string(),
@@ -319,6 +333,43 @@ async fn prepare_codex_oauth_shadow(
         shadow,
         original: creds,
     })
+}
+
+async fn prepare_codex_app_home_without_auth(
+    env: &mut HashMap<String, String>,
+    session_store: &SessionStore,
+) -> Result<()> {
+    let key_id = env
+        .remove("AIVO_CODEX_APP_HOME_KEY")
+        .unwrap_or_else(|| "default".to_string());
+    let shadow =
+        CodexHomeShadow::create_persistent_without_auth(session_store.config_dir(), &key_id)
+            .await?;
+    env.insert(
+        "CODEX_HOME".to_string(),
+        shadow.path().to_string_lossy().to_string(),
+    );
+    Ok(())
+}
+
+async fn adopt_persistent_codex_app_tokens(
+    session_store: &SessionStore,
+    key_id: &str,
+    creds: &mut CodexOAuthCredential,
+) {
+    let auth_path =
+        CodexHomeShadow::persistent_path(session_store.config_dir(), key_id).join("auth.json");
+    let disk = match CodexHomeShadow::read_auth_path(auth_path).await {
+        Ok(Some(disk)) => disk,
+        _ => return,
+    };
+    if !tokens_changed(creds, &disk) {
+        return;
+    }
+    let updated = auth_dot_json_into_credential(disk, creds);
+    let original = creds.clone();
+    persist_refreshed_if_needed(session_store, key_id, &original, &updated).await;
+    *creds = updated;
 }
 
 /// Reads the shadow `auth.json` back after codex exits and, if any token
@@ -352,8 +403,15 @@ pub(crate) async fn finalize_codex_oauth(
         Err(_) => return,
     };
 
-    let updated = disk.into_credential(sync.original.email.clone(), sync.original.expires_at);
+    let updated = auth_dot_json_into_credential(disk, &sync.original);
     persist_refreshed_if_needed(session_store, &sync.key_id, &sync.original, &updated).await;
+}
+
+fn auth_dot_json_into_credential(
+    disk: AuthDotJson,
+    original: &CodexOAuthCredential,
+) -> CodexOAuthCredential {
+    disk.into_credential(original.email.clone(), original.expires_at)
 }
 
 async fn persist_refreshed_if_needed(
@@ -1616,9 +1674,11 @@ async fn start_cursor_router(env: &mut HashMap<String, String>, tool: AIToolType
     let mcp_prewarm_id_style = Some(match tool {
         AIToolType::Claude => ToolUseIdStyle::Anthropic,
         AIToolType::Gemini => ToolUseIdStyle::Gemini,
-        AIToolType::Codex | AIToolType::Opencode | AIToolType::Pi | AIToolType::Amp => {
-            ToolUseIdStyle::OpenAi
-        }
+        AIToolType::Codex
+        | AIToolType::CodexApp
+        | AIToolType::Opencode
+        | AIToolType::Pi
+        | AIToolType::Amp => ToolUseIdStyle::OpenAi,
     });
     let router = CursorModelRouter::new(CursorRouterConfig {
         key,

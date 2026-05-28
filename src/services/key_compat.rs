@@ -170,6 +170,11 @@ mod tests {
         assert!(codex_ctx.incompat_reason(&claude).is_some());
         assert!(codex_ctx.incompat_reason(&codex).is_none());
         assert!(codex_ctx.incompat_reason(&regular).is_none());
+
+        let codex_app_ctx = KeyCompatContext::Tool(AIToolType::CodexApp);
+        assert!(codex_app_ctx.incompat_reason(&claude).is_some());
+        assert!(codex_app_ctx.incompat_reason(&codex).is_none());
+        assert!(codex_app_ctx.incompat_reason(&regular).is_none());
     }
 
     #[test]

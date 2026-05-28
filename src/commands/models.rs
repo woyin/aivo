@@ -1151,7 +1151,7 @@ pub(crate) fn tool_supports_default_model(tool: AIToolType, models: &[String]) -
         AIToolType::Claude => models
             .iter()
             .any(|m| m.to_ascii_lowercase().contains("claude")),
-        AIToolType::Codex => models
+        AIToolType::Codex | AIToolType::CodexApp => models
             .iter()
             .any(|m| m.to_ascii_lowercase().starts_with("gpt-")),
         AIToolType::Gemini => models

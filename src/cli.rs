@@ -41,7 +41,7 @@ pub struct Cli {
 #[derive(Subcommand, Debug, Clone)]
 #[allow(clippy::large_enum_variant)]
 pub enum Commands {
-    /// Run AI tools (claude, codex, gemini, opencode, pi, amp) - all args passed through
+    /// Run AI tools (claude, codex, codex-app, gemini, opencode, pi, amp) - all args passed through
     Run(RunArgs),
 
     /// Manage API keys (use <id|name>, rm <id|name>, add, cat, edit)
@@ -329,10 +329,10 @@ pub struct KeysArgs {
 /// Arguments for the run command
 #[derive(Args, Debug, Clone)]
 pub struct RunArgs {
-    /// The AI tool to run (claude, codex, gemini, opencode, pi, amp)
+    /// The AI tool to run (claude, codex, codex-app, gemini, opencode, pi, amp)
     #[arg(
         value_name = "TOOL",
-        help = "AI tool to run: claude, codex, gemini, opencode, pi, or amp"
+        help = "AI tool to run: claude, codex, codex-app, gemini, opencode, pi, or amp"
     )]
     pub tool: Option<String>,
 
@@ -453,7 +453,7 @@ pub struct RunArgs {
     ///   etc.) so Claude Code opts into the matching beta context tier. Per-slot
     ///   overrides (`--haiku-model`, `--sonnet-model`, …) are left verbatim.
     /// - For `codex`: passes `--config model_context_window=<N×1_000_000>` to
-    ///   codex, which clamps the value against the model's advertised ceiling.
+    ///   codex/codex-app, which clamps the value against the model's advertised ceiling.
     #[arg(long = "max-context", value_name = "SIZE")]
     pub max_context: Option<String>,
 
@@ -1192,7 +1192,15 @@ mod tests {
 
     /// Helper to simulate the alias rewriting done in main.rs
     fn rewrite_alias(args: &[&str]) -> Vec<String> {
-        let aliases = ["claude", "codex", "gemini", "opencode", "pi", "amp"];
+        let aliases = [
+            "claude",
+            "codex",
+            "codex-app",
+            "gemini",
+            "opencode",
+            "pi",
+            "amp",
+        ];
         let raw: Vec<String> = args.iter().map(|s| s.to_string()).collect();
         if raw.len() > 1 && aliases.contains(&raw[1].as_str()) {
             let mut rewritten = vec![raw[0].clone(), "run".to_string()];
@@ -1222,6 +1230,19 @@ mod tests {
             assert_eq!(run_args.tool, Some("codex".to_string()));
             assert_eq!(run_args.model, Some("o4-mini".to_string()));
             assert!(run_args.args.contains(&"file.ts".to_string()));
+        } else {
+            panic!("Expected Run command");
+        }
+    }
+
+    #[test]
+    fn test_tool_alias_codex_app_with_path() {
+        let args = rewrite_alias(&["aivo", "codex-app", "--model", "gpt-5", "."]);
+        let cli = Cli::try_parse_from(&args).unwrap();
+        if let Some(Commands::Run(run_args)) = cli.command {
+            assert_eq!(run_args.tool, Some("codex-app".to_string()));
+            assert_eq!(run_args.model, Some("gpt-5".to_string()));
+            assert!(run_args.args.contains(&".".to_string()));
         } else {
             panic!("Expected Run command");
         }

@@ -3,7 +3,7 @@ use clap::Parser;
 
 /// Simulates the alias rewriting done in main.rs
 fn rewrite_alias(args: &[&str]) -> Vec<String> {
-    let aliases = ["claude", "codex", "gemini", "opencode", "pi"];
+    let aliases = ["claude", "codex", "codex-app", "gemini", "opencode", "pi"];
     let raw: Vec<String> = args.iter().map(|s| s.to_string()).collect();
     if raw.len() > 1 && aliases.contains(&raw[1].as_str()) {
         let mut rewritten = vec![raw[0].clone(), "run".to_string()];
@@ -74,6 +74,19 @@ fn tool_alias_codex_with_model() {
     if let Some(Commands::Run(run_args)) = cli.command {
         assert_eq!(run_args.tool, Some("codex".to_string()));
         assert_eq!(run_args.model, Some("o4-mini".to_string()));
+    } else {
+        panic!("Expected Run command");
+    }
+}
+
+#[test]
+fn tool_alias_codex_app_with_path() {
+    let args = rewrite_alias(&["aivo", "codex-app", "-m", "gpt-5", "."]);
+    let cli = Cli::try_parse_from(&args).unwrap();
+    if let Some(Commands::Run(run_args)) = cli.command {
+        assert_eq!(run_args.tool, Some("codex-app".to_string()));
+        assert_eq!(run_args.model, Some("gpt-5".to_string()));
+        assert_eq!(run_args.args, vec!["."]);
     } else {
         panic!("Expected Run command");
     }
