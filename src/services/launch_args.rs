@@ -871,15 +871,16 @@ fn catalog_slugs(
     codex_app_models: Option<&[String]>,
     uses_non_openai_router: bool,
 ) -> Vec<String> {
-    // CodexApp without `-m`: list every discovered provider model so the GUI
-    // dropdown lets the user pick. Reject slugs with control bytes (newline,
-    // CR, NUL, tab) — they'd break out of the TOML basic-string in
-    // `inject_codex_root_model` / catalog JSON.
+    // CodexApp: discovered provider models plus the explicit `-m`, for the GUI
+    // dropdown. Reject control-byte slugs — they'd break out of the TOML
+    // basic-string in `inject_codex_root_model` / catalog JSON.
     if let Some(list) = codex_app_models {
         let mut slugs: Vec<String> = list
             .iter()
-            .filter(|m| is_safe_codex_slug(m))
-            .cloned()
+            .map(String::as_str)
+            .chain(model)
+            .filter(|&m| is_safe_codex_slug(m))
+            .map(str::to_string)
             .collect();
         if !slugs.is_empty() {
             slugs.sort();
@@ -1314,6 +1315,37 @@ mod tests {
         let app_models = vec!["gpt-5".to_string(), "deepseek-chat".to_string()];
         let slugs = catalog_slugs(None, Some(&app_models), false);
         assert_eq!(slugs, vec!["deepseek-chat", "gpt-5"]);
+    }
+
+    #[test]
+    fn catalog_slugs_merges_explicit_model_into_app_list() {
+        let app_models = vec!["deepseek-chat".to_string()];
+        let slugs = catalog_slugs(Some("my-custom-model"), Some(&app_models), false);
+        assert_eq!(slugs, vec!["deepseek-chat", "my-custom-model"]);
+    }
+
+    #[test]
+    fn catalog_slugs_explicit_model_breaks_all_openai_defer() {
+        // Non-OpenAI `-m` forces a catalog even when all discovered slugs are
+        // OpenAI-shaped — else the custom model stays invisible.
+        let app_models = vec!["gpt-5".to_string(), "o3-mini".to_string()];
+        let slugs = catalog_slugs(Some("deepseek-chat"), Some(&app_models), true);
+        assert_eq!(slugs, vec!["deepseek-chat", "gpt-5", "o3-mini"]);
+    }
+
+    #[test]
+    fn catalog_slugs_dedups_explicit_model_already_in_app_list() {
+        let app_models = vec!["deepseek-chat".to_string(), "deepseek-reasoner".to_string()];
+        let slugs = catalog_slugs(Some("deepseek-chat"), Some(&app_models), false);
+        assert_eq!(slugs, vec!["deepseek-chat", "deepseek-reasoner"]);
+    }
+
+    #[test]
+    fn catalog_slugs_rejects_control_bytes_in_explicit_model() {
+        // The chained `-m` is filtered too, not just the discovered list.
+        let app_models = vec!["deepseek-chat".to_string()];
+        let slugs = catalog_slugs(Some("evil\n[features]\nfoo=true"), Some(&app_models), false);
+        assert_eq!(slugs, vec!["deepseek-chat"]);
     }
 
     #[test]

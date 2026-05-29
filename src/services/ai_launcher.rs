@@ -766,14 +766,15 @@ impl AILauncher {
         } else {
             (options.model.clone(), None)
         };
-        let codex_app_models = if options.tool == AIToolType::CodexApp && options.model.is_none() {
+        // Discover with `-m` too: the picker lists the whole catalog, not just
+        // the pinned model. Gated on `persist` so dry-run skips the live fetch.
+        let codex_app_models = if options.tool == AIToolType::CodexApp && persist {
             self.discover_codex_app_models(&key).await
         } else {
             None
         };
-        // For CodexApp without -m, pick a sensible default so codex doesn't
-        // ship requests with an empty model name. The dropdown will still
-        // list all discovered entries from the catalog.
+        // For CodexApp without -m, pick a default so codex doesn't ship an
+        // empty model name.
         let model = if model.is_none() {
             codex_app_models
                 .as_ref()
@@ -1094,9 +1095,9 @@ impl AILauncher {
 struct ResolvedLaunchContext {
     key: ApiKey,
     model: Option<String>,
-    /// All models discovered for the key when launching CodexApp without an
-    /// explicit `-m`. Plumbed into `build_runtime_args` so the codex model
-    /// catalog file lists every entry — the GUI's model picker reads from it.
+    /// Models discovered for the key on a CodexApp launch (an explicit `-m` is
+    /// merged in by `catalog_slugs`). Feeds the codex model catalog file via
+    /// `build_runtime_args`. `None` on preview and for OAuth/ollama/copilot keys.
     codex_app_models: Option<Vec<String>>,
     tool_config: ToolConfig,
 }
@@ -1128,12 +1129,12 @@ fn pick_default_codex_app_model(models: &[String]) -> Option<String> {
         .cloned()
 }
 
-/// Replaces the shadow `CODEX_HOME`'s `models_cache.json` with one listing
-/// aivo's discovered models. The GUI's model picker reads from this file (not
-/// `model_catalog_json`), so without this step the picker keeps showing the
-/// user's previously-seen OpenAI slugs. The real `~/.codex/models_cache.json`
-/// is never touched — we explicitly unlink the symlink before writing so the
-/// write can't follow back to the user's home dir.
+/// Replaces the shadow `CODEX_HOME`'s `models_cache.json` with aivo's models.
+/// NOT the picker source — that's the `-c model_catalog_json` override
+/// (`inject_codex_model_catalog`); this cache is TTL-gated (~300s) and ignored
+/// when the catalog is present. Kept only so the shadow cache doesn't symlink
+/// back to the user's stock `~/.codex/models_cache.json`, which we unlink
+/// before writing so the write can't follow into the real home dir.
 async fn install_codex_app_models_cache(env: &HashMap<String, String>, catalog_path: Option<&str>) {
     let Some(codex_home) = env.get("CODEX_HOME") else {
         return;
