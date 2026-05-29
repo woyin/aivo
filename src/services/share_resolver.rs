@@ -626,7 +626,10 @@ async fn resolve_run_event(entry: &LogEntry, ctx: &ResolverContext) -> Result<Sh
     let run_path = std::path::Path::new(&run_cwd);
     let threads: Vec<Thread> = match tool {
         "claude" => context_ingest::list_claude_sessions_for_cwd(run_path).await,
-        "codex" => {
+        // codex-app launches the `codex` binary, so its rollouts land in the
+        // same ~/.codex/sessions tree (via the shadow CODEX_HOME symlink) and
+        // are indistinguishable from plain codex sessions.
+        "codex" | "codex-app" => {
             context_ingest::list_codex_sessions_for_cwd(&ctx.codex_sessions_root, run_path).await
         }
         "pi" => context_ingest::list_pi_sessions_for_cwd(&ctx.pi_sessions_root, run_path).await,
@@ -1075,6 +1078,50 @@ mod tests {
         fs::write(&path, lines.join("\n")).await.unwrap();
 
         let resolved = resolve_session("019e5d69fe", &ctx).await.unwrap();
+        assert_eq!(resolved.payload.source_cli, "codex");
+        assert_eq!(resolved.payload.session_id, full_id);
+    }
+
+    #[tokio::test]
+    async fn resolve_codex_app_run_event_finds_codex_rollout() {
+        // Regression: `aivo run codex-app` logs the run event with tool
+        // "codex-app", but it launches the `codex` binary, so its rollout
+        // lands in ~/.codex/sessions like any codex session. The run-event
+        // resolver must route "codex-app" to the codex enumerator instead of
+        // erroring with "no native codex-app session found".
+        let temp = TempDir::new().unwrap();
+        let project_root = temp.path().to_path_buf();
+        let ctx = ctx_with_tempdirs(&temp, project_root.clone());
+        let day_dir = ctx.codex_sessions_root.join("2026").join("05").join("28");
+        fs::create_dir_all(&day_dir).await.unwrap();
+
+        let full_id = "019e71a0-1111-72b2-a794-7da3a44485a6";
+        let path =
+            day_dir.join("rollout-2026-05-28T10-00-00-019e71a0-1111-72b2-a794-7da3a44485a6.jsonl");
+        let proj_json = project_root.to_string_lossy().replace('\\', "\\\\");
+        let lines = [
+            format!(
+                r#"{{"type":"session_meta","timestamp":"2026-05-28T10:00:00Z","payload":{{"id":"{}","cwd":"{}","timestamp":"2026-05-28T10:00:00Z"}}}}"#,
+                full_id, proj_json
+            ),
+            r#"{"type":"response_item","timestamp":"2026-05-28T10:00:05Z","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]}}"#.to_string(),
+        ];
+        fs::write(&path, lines.join("\n")).await.unwrap();
+
+        let event_id = ctx
+            .session_store
+            .logs()
+            .append(crate::services::log_store::LogEvent {
+                source: "run".into(),
+                kind: "tool_launch".into(),
+                tool: Some("codex-app".into()),
+                cwd: Some(project_root.to_string_lossy().to_string()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        let resolved = resolve_session(&event_id, &ctx).await.unwrap();
         assert_eq!(resolved.payload.source_cli, "codex");
         assert_eq!(resolved.payload.session_id, full_id);
     }
