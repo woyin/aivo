@@ -10,8 +10,8 @@ use std::sync::Arc;
 
 use crate::constants::CONTENT_TYPE_JSON;
 use crate::services::anthropic_chat_request::{
-    AnthropicToOpenAIConfig, convert_anthropic_to_openai_request, is_anthropic_server_tool,
-    tool_parameters_from_input_schema,
+    AnthropicToOpenAIConfig, convert_anthropic_to_openai_request, hoist_anthropic_system_messages,
+    is_anthropic_server_tool, tool_parameters_from_input_schema,
 };
 use crate::services::anthropic_chat_response::{
     OpenAIToAnthropicConfig, UsageValueMode, convert_openai_to_anthropic_message,
@@ -68,7 +68,11 @@ async fn handle_copilot_request(request: String, state: Arc<CopilotRouterState>)
 
 async fn handle_messages(request: &str, state: &CopilotRouterState) -> Result<String> {
     let body_str = http_utils::extract_request_body(request)?;
-    let body: Value = serde_json::from_str(body_str)?;
+    let mut body: Value = serde_json::from_str(body_str)?;
+    // Both Copilot sub-paths below (Responses API and Chat Completions) read
+    // top-level `system`; hoist any stray `role:"system"` message into it so
+    // the catalog lands as system context, not a mid-conversation turn.
+    hoist_anthropic_system_messages(&mut body);
 
     let is_streaming = body
         .get("stream")

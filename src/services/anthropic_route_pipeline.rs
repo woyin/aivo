@@ -9,6 +9,8 @@ use serde_json::{Value, json};
 
 use crate::services::model_names::transform_model_for_provider;
 
+const ANTHROPIC_CACHE_CONTROL_BREAKPOINT_LIMIT: usize = 4;
+
 pub struct RequestContext<'a> {
     pub upstream_base_url: &'a str,
 }
@@ -95,7 +97,9 @@ impl RequestPatch for CacheControlPatch {
     fn patch_json(&self, route: &str, body: &mut Value, _ctx: &RequestContext<'_>) -> Result<()> {
         match route {
             "messages" => {
-                if let Some(system) = body.get_mut("system") {
+                if cache_control_breakpoint_count(body) < ANTHROPIC_CACHE_CONTROL_BREAKPOINT_LIMIT
+                    && let Some(system) = body.get_mut("system")
+                {
                     inject_cache_control_on_last_block(system);
                 }
             }
@@ -106,7 +110,9 @@ impl RequestPatch for CacheControlPatch {
             _ => return Ok(()),
         }
 
-        if let Some(messages) = body.get_mut("messages").and_then(|m| m.as_array_mut()) {
+        if cache_control_breakpoint_count(body) < ANTHROPIC_CACHE_CONTROL_BREAKPOINT_LIMIT
+            && let Some(messages) = body.get_mut("messages").and_then(|m| m.as_array_mut())
+        {
             for msg in messages.iter_mut().rev() {
                 if msg.get("role").and_then(|r| r.as_str()) != Some("user") {
                     continue;
@@ -124,7 +130,9 @@ impl RequestPatch for CacheControlPatch {
 /// Inject `cache_control` markers on an OpenAI Chat Completions request body.
 /// Adds markers to the system message and last user message.
 pub(crate) fn inject_chat_completions_cache_control(body: &mut Value) {
-    if let Some(messages) = body.get_mut("messages").and_then(|m| m.as_array_mut()) {
+    if cache_control_breakpoint_count(body) < ANTHROPIC_CACHE_CONTROL_BREAKPOINT_LIMIT
+        && let Some(messages) = body.get_mut("messages").and_then(|m| m.as_array_mut())
+    {
         for msg in messages.iter_mut().rev() {
             if msg.get("role").and_then(|r| r.as_str()) == Some("system") {
                 if let Some(content) = msg.get_mut("content") {
@@ -133,6 +141,10 @@ pub(crate) fn inject_chat_completions_cache_control(body: &mut Value) {
                 break;
             }
         }
+    }
+    if cache_control_breakpoint_count(body) < ANTHROPIC_CACHE_CONTROL_BREAKPOINT_LIMIT
+        && let Some(messages) = body.get_mut("messages").and_then(|m| m.as_array_mut())
+    {
         for msg in messages.iter_mut().rev() {
             if msg.get("role").and_then(|r| r.as_str()) != Some("user") {
                 continue;
@@ -142,6 +154,25 @@ pub(crate) fn inject_chat_completions_cache_control(body: &mut Value) {
             }
             break;
         }
+    }
+}
+
+fn cache_control_breakpoint_count(value: &Value) -> usize {
+    match value {
+        Value::Object(obj) => {
+            let here = obj
+                .get("cache_control")
+                .and_then(Value::as_object)
+                .and_then(|cc| cc.get("type"))
+                .and_then(Value::as_str)
+                .is_some_and(|kind| kind == "ephemeral") as usize;
+            here + obj
+                .values()
+                .map(cache_control_breakpoint_count)
+                .sum::<usize>()
+        }
+        Value::Array(arr) => arr.iter().map(cache_control_breakpoint_count).sum(),
+        _ => 0,
     }
 }
 
@@ -447,6 +478,48 @@ mod tests {
     }
 
     #[test]
+    fn cache_control_patch_does_not_add_fifth_breakpoint_to_hoisted_system() {
+        let patch = CacheControlPatch;
+        let mut body = serde_json::json!({
+            "system": [
+                {"type": "text", "text": "Base A", "cache_control": {"type": "ephemeral"}},
+                {"type": "text", "text": "Base B", "cache_control": {"type": "ephemeral"}},
+                {"type": "text", "text": "Base C", "cache_control": {"type": "ephemeral"}}
+            ],
+            "messages": [
+                {"role": "user", "content": [
+                    {"type": "text", "text": "Hi", "cache_control": {"type": "ephemeral"}}
+                ]},
+                {"role": "system", "content": [
+                    {"type": "text", "text": "Hoisted catalog", "cache_control": {"type": "ephemeral"}}
+                ]}
+            ]
+        });
+        let ctx = RequestContext {
+            upstream_base_url: "https://api.anthropic.com/v1",
+        };
+
+        let report =
+            crate::services::anthropic_chat_request::hoist_anthropic_system_messages(&mut body)
+                .expect("system message hoisted");
+        assert_eq!(report.hoisted_blocks, 1);
+        assert_eq!(cache_control_breakpoint_count(&body), 4);
+
+        patch.patch_json("messages", &mut body, &ctx).unwrap();
+
+        let system = body["system"].as_array().unwrap();
+        assert_eq!(cache_control_breakpoint_count(&body), 4);
+        assert!(
+            system
+                .last()
+                .expect("hoisted block appended")
+                .get("cache_control")
+                .is_none(),
+            "hoisted block must not receive a fifth cache_control marker"
+        );
+    }
+
+    #[test]
     fn test_cache_control_patch_chat_completions_system_message() {
         let patch = CacheControlPatch;
         let mut body = serde_json::json!({
@@ -469,6 +542,29 @@ mod tests {
         // Last user message also gets cache_control
         let user_content = body["messages"][1]["content"].as_array().unwrap();
         assert_eq!(user_content[0]["cache_control"]["type"], "ephemeral");
+    }
+
+    #[test]
+    fn chat_completions_cache_control_respects_breakpoint_limit() {
+        let mut body = serde_json::json!({
+            "messages": [
+                {"role": "system", "content": [
+                    {"type": "text", "text": "A", "cache_control": {"type": "ephemeral"}},
+                    {"type": "text", "text": "B", "cache_control": {"type": "ephemeral"}},
+                    {"type": "text", "text": "C", "cache_control": {"type": "ephemeral"}},
+                    {"type": "text", "text": "D", "cache_control": {"type": "ephemeral"}}
+                ]},
+                {"role": "user", "content": "Hi"}
+            ]
+        });
+
+        inject_chat_completions_cache_control(&mut body);
+
+        assert_eq!(cache_control_breakpoint_count(&body), 4);
+        assert!(
+            body["messages"][1]["content"].is_string(),
+            "user message should stay unmodified once the request is at the limit"
+        );
     }
 
     #[test]

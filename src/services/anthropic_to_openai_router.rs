@@ -17,7 +17,7 @@ use crate::constants::CONTENT_TYPE_JSON;
 use crate::services::device_fingerprint;
 
 use crate::services::anthropic_chat_request::{
-    AnthropicToOpenAIConfig, convert_anthropic_to_openai_request,
+    AnthropicToOpenAIConfig, convert_anthropic_to_openai_request, hoist_anthropic_system_messages,
 };
 use crate::services::anthropic_chat_response::{
     OpenAIToAnthropicConfig, UsageValueMode, convert_openai_to_anthropic_message,
@@ -620,6 +620,12 @@ async fn handle_anthropic_to_upstream(
     let body_str = http_utils::extract_request_body(request)?;
 
     let mut body: Value = serde_json::from_str(body_str)?;
+    // Hoist any stray `role:"system"` message into the top-level `system`
+    // field before conversion/forwarding. Covers both sub-paths from here: the
+    // Anthropic→OpenAI bridge (which would otherwise emit a second,
+    // mid-conversation system message) and the native-Anthropic forward (which
+    // a strict upstream would 400). See hoist_anthropic_system_messages.
+    hoist_anthropic_system_messages(&mut body);
     // Drop the `[1m]`/`[2m]` UI-hint suffix Claude Code carries through from
     // its env vars. The upstream (real Anthropic, OpenAI Chat, Gemini) doesn't
     // know about it; native Anthropic is in Direct mode where the bridge

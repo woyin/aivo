@@ -7,6 +7,121 @@ use crate::services::openai_anthropic_bridge::{
     ANTHROPIC_SERVER_BLOCKS_EXT, ANTHROPIC_THINKING_EXT,
 };
 
+/// Report describing what [`hoist_anthropic_system_messages`] changed.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SystemHoistReport {
+    /// `role:"system"` entries removed from `messages`.
+    pub hoisted_messages: usize,
+    /// Text blocks appended to the top-level `system` field as a result.
+    pub hoisted_blocks: usize,
+}
+
+/// Normalize an Anthropic request body in place by hoisting stray
+/// `role:"system"` messages into the top-level `system` field.
+///
+/// Anthropic's Messages API only permits `user`/`assistant` roles inside
+/// `messages`; the system prompt is a top-level `system` field (string or an
+/// array of content blocks). Some clients — Claude Code among them — emit a
+/// `role:"system"` entry *inside* `messages`, often alongside a correct
+/// top-level `system` field. Strict upstreams (real Anthropic, DeepSeek's
+/// `/anthropic` endpoint) 400 with
+/// "messages[N].role: unknown variant `system`, expected `user` or `assistant`",
+/// and the Anthropic→OpenAI bridge would otherwise forward it as a second,
+/// mid-conversation system message.
+///
+/// Hoisted content is appended *after* the existing system (document order —
+/// Claude Code emits the skills/commands catalog as a trailing system block) as
+/// plain `{type:"text"}` blocks: `cache_control` and other extras are stripped
+/// so the repair can't push a request past Anthropic's 4-breakpoint
+/// cache_control limit. Returns `None` when nothing was hoisted, leaving a
+/// clean request's `system` field untouched.
+pub fn hoist_anthropic_system_messages(body: &mut Value) -> Option<SystemHoistReport> {
+    let mut hoisted_text: Vec<String> = Vec::new();
+    let mut hoisted_messages = 0usize;
+
+    {
+        let messages = body.get_mut("messages").and_then(|m| m.as_array_mut())?;
+        messages.retain(|msg| {
+            if msg.get("role").and_then(|r| r.as_str()) != Some("system") {
+                return true;
+            }
+            hoisted_messages += 1;
+            hoisted_text.extend(extract_system_text(msg.get("content")));
+            false
+        });
+    }
+
+    if hoisted_messages == 0 {
+        return None;
+    }
+
+    let hoisted_blocks = hoisted_text.len();
+
+    // Existing system blocks first (verbatim, preserving cache_control), then
+    // the hoisted text appended as plain blocks.
+    let mut combined: Vec<Value> = match body.get("system") {
+        Some(Value::String(s)) if !s.is_empty() => vec![json!({"type": "text", "text": s})],
+        Some(Value::Array(arr)) => arr.clone(),
+        _ => Vec::new(),
+    };
+    combined.extend(
+        hoisted_text
+            .into_iter()
+            .map(|t| json!({"type": "text", "text": t})),
+    );
+
+    // Nothing usable (e.g. an empty system message hoisted onto no existing
+    // system): drop the now-removed messages but leave `system` as-is.
+    if combined.is_empty() {
+        return Some(SystemHoistReport {
+            hoisted_messages,
+            hoisted_blocks: 0,
+        });
+    }
+
+    let has_extra_fields = combined.iter().any(|b| {
+        b.as_object()
+            .is_some_and(|o| o.keys().any(|k| k != "type" && k != "text"))
+    });
+    if has_extra_fields {
+        body["system"] = Value::Array(combined);
+    } else {
+        let text = combined
+            .iter()
+            .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
+            .filter(|t| !t.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n");
+        if !text.is_empty() {
+            body["system"] = Value::String(text);
+        }
+    }
+
+    Some(SystemHoistReport {
+        hoisted_messages,
+        hoisted_blocks,
+    })
+}
+
+fn extract_system_text(content: Option<&Value>) -> Vec<String> {
+    match content {
+        Some(Value::String(s)) if !s.is_empty() => vec![s.clone()],
+        Some(Value::Array(parts)) => parts
+            .iter()
+            .filter_map(|p| match p {
+                Value::String(s) if !s.is_empty() => Some(s.clone()),
+                Value::Object(_) => p
+                    .get("text")
+                    .and_then(|t| t.as_str())
+                    .filter(|t| !t.is_empty())
+                    .map(|t| t.to_string()),
+                _ => None,
+            })
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
 pub type ModelTransform = fn(&str) -> String;
 
 #[derive(Clone, Copy, Debug)]
@@ -974,5 +1089,165 @@ mod tests {
         let tools = req["tools"].as_array().expect("tools array");
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0]["function"]["name"], "ls");
+    }
+}
+
+#[cfg(test)]
+mod system_hoist_tests {
+    use super::*;
+
+    #[test]
+    fn clean_request_returns_none_and_leaves_body_untouched() {
+        let mut body = json!({
+            "system": "You are helpful.",
+            "messages": [
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "content": "hello"}
+            ]
+        });
+        let before = body.clone();
+        assert_eq!(hoist_anthropic_system_messages(&mut body), None);
+        assert_eq!(body, before);
+    }
+
+    #[test]
+    fn returns_none_when_no_messages_array() {
+        let mut with_system = json!({"system": "x"});
+        assert_eq!(hoist_anthropic_system_messages(&mut with_system), None);
+        let mut empty = json!({});
+        assert_eq!(hoist_anthropic_system_messages(&mut empty), None);
+    }
+
+    #[test]
+    fn hoists_into_string_system_in_append_order() {
+        let mut body = json!({
+            "system": "You are Claude.",
+            "messages": [
+                {"role": "user", "content": "do a thing"},
+                {"role": "system", "content": "Available skills: review, security-review."}
+            ]
+        });
+        let report = hoist_anthropic_system_messages(&mut body).expect("hoisted");
+        assert_eq!(
+            report,
+            SystemHoistReport {
+                hoisted_messages: 1,
+                hoisted_blocks: 1
+            }
+        );
+        assert_eq!(
+            body["system"],
+            json!("You are Claude.\nAvailable skills: review, security-review.")
+        );
+        assert_eq!(
+            body["messages"],
+            json!([{"role": "user", "content": "do a thing"}])
+        );
+    }
+
+    #[test]
+    fn sets_system_when_absent() {
+        let mut body = json!({
+            "messages": [
+                {"role": "system", "content": "You are helpful."},
+                {"role": "user", "content": "hi"}
+            ]
+        });
+        let report = hoist_anthropic_system_messages(&mut body).expect("hoisted");
+        assert_eq!(
+            report,
+            SystemHoistReport {
+                hoisted_messages: 1,
+                hoisted_blocks: 1
+            }
+        );
+        assert_eq!(body["system"], json!("You are helpful."));
+        assert_eq!(body["messages"], json!([{"role": "user", "content": "hi"}]));
+    }
+
+    // The exact shape captured from the gateway: a role:system message with
+    // array content (cache_control) alongside an array-form top-level system.
+    #[test]
+    fn observed_payload_preserves_array_system_and_strips_hoisted_cache_control() {
+        let mut body = json!({
+            "max_tokens": 32000,
+            "messages": [
+                {"role": "user", "content": [{"text": "<system-reminder>..."}]},
+                {"role": "system", "content": [
+                    {"cache_control": {"type": "ephemeral"}, "text": "- review: view a pull request", "type": "text"}
+                ]}
+            ],
+            "system": [
+                {"cache_control": {"type": "ephemeral"}, "text": "You are Claude Code, Anthropic's official CLI.", "type": "text"}
+            ]
+        });
+        let report = hoist_anthropic_system_messages(&mut body).expect("hoisted");
+        assert_eq!(
+            report,
+            SystemHoistReport {
+                hoisted_messages: 1,
+                hoisted_blocks: 1
+            }
+        );
+
+        let msgs = body["messages"].as_array().expect("messages array");
+        assert_eq!(msgs.len(), 1);
+        assert!(!msgs.iter().any(|m| m["role"] == "system"));
+
+        assert_eq!(
+            body["system"],
+            json!([
+                {"cache_control": {"type": "ephemeral"}, "text": "You are Claude Code, Anthropic's official CLI.", "type": "text"},
+                {"type": "text", "text": "- review: view a pull request"}
+            ])
+        );
+        let breakpoints = body["system"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|b| b.get("cache_control").is_some())
+            .count();
+        assert_eq!(breakpoints, 1);
+    }
+
+    #[test]
+    fn merges_multiple_system_messages_in_order() {
+        let mut body = json!({
+            "messages": [
+                {"role": "system", "content": "A"},
+                {"role": "user", "content": "q"},
+                {"role": "system", "content": [{"type": "text", "text": "B"}, {"type": "text", "text": "C"}]}
+            ]
+        });
+        let report = hoist_anthropic_system_messages(&mut body).expect("hoisted");
+        assert_eq!(
+            report,
+            SystemHoistReport {
+                hoisted_messages: 2,
+                hoisted_blocks: 3
+            }
+        );
+        assert_eq!(body["system"], json!("A\nB\nC"));
+        assert_eq!(body["messages"], json!([{"role": "user", "content": "q"}]));
+    }
+
+    #[test]
+    fn empty_system_message_dropped_without_inventing_system() {
+        let mut body = json!({
+            "messages": [
+                {"role": "system", "content": ""},
+                {"role": "user", "content": "hi"}
+            ]
+        });
+        let report = hoist_anthropic_system_messages(&mut body).expect("hoisted");
+        assert_eq!(
+            report,
+            SystemHoistReport {
+                hoisted_messages: 1,
+                hoisted_blocks: 0
+            }
+        );
+        assert_eq!(body["messages"], json!([{"role": "user", "content": "hi"}]));
+        assert!(body.get("system").is_none());
     }
 }

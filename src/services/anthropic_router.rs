@@ -9,6 +9,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::constants::CONTENT_TYPE_JSON;
+use crate::services::anthropic_chat_request::hoist_anthropic_system_messages;
 use crate::services::anthropic_route_pipeline::{RequestContext, RouterPipeline};
 use crate::services::device_fingerprint;
 use crate::services::http_debug::LoggedSend;
@@ -224,6 +225,11 @@ async fn forward_request(
     let body_str = http_utils::extract_request_body(request)?;
 
     let mut body: Value = serde_json::from_str(body_str)?;
+    // Strict Anthropic upstreams 400 on a `role:"system"` entry inside
+    // `messages` (only user/assistant are valid there). Hoist any such message
+    // into the top-level `system` field before patching/forwarding so the
+    // request validates regardless of which client produced it.
+    hoist_anthropic_system_messages(&mut body);
     let ctx = RequestContext {
         upstream_base_url: &config.upstream_base_url,
     };
