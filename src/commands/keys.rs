@@ -136,6 +136,19 @@ fn term_edit_line(prompt: &str, initial: &str) -> std::io::Result<String> {
                             "interrupted",
                         ));
                     }
+                    // Ctrl-D = readline delete-char: drop the char at the cursor;
+                    // on an empty line it's EOF, submitting so the caller keeps
+                    // its default.
+                    KeyCode::Char('d') if ctrl => {
+                        if buf.is_empty() {
+                            let _ = write!(stdout, "\r\n");
+                            let _ = stdout.flush();
+                            break Ok(String::new());
+                        }
+                        if cursor < buf.len() {
+                            buf.remove(cursor);
+                        }
+                    }
                     KeyCode::Left => cursor = cursor.saturating_sub(1),
                     KeyCode::Char('b') if ctrl => cursor = cursor.saturating_sub(1),
                     KeyCode::Right if cursor < buf.len() => cursor += 1,
@@ -197,9 +210,12 @@ fn term_edit_line(prompt: &str, initial: &str) -> std::io::Result<String> {
 // keeps the current value.
 fn edit_name(key: &ApiKey) -> std::io::Result<String> {
     let input = if key.name.is_empty() {
-        term_read_line(&format!("Name [unnamed; shown as {}]: ", key.short_id()))?
+        term_read_line(&style::dim(format!(
+            "Name [unnamed; shown as {}]: ",
+            key.short_id()
+        )))?
     } else {
-        term_edit_line("Name: ", &key.name)?
+        term_edit_line(&style::dim("Name: "), &key.name)?
     };
     Ok(if input.is_empty() {
         key.name.clone()
@@ -255,7 +271,17 @@ fn term_read_secret(prompt: &str) -> std::io::Result<String> {
                         "interrupted",
                     ));
                 }
-                KeyCode::Char(c) => {
+                // Ctrl-D = readline delete-char. A masked secret keeps the cursor
+                // at the end, so there's nothing ahead to delete; it only acts as
+                // EOF on an empty line (caller keeps its default).
+                KeyCode::Char('d')
+                    if modifiers.contains(KeyModifiers::CONTROL) && input.is_empty() =>
+                {
+                    let _ = write!(stdout, "\r\n");
+                    let _ = stdout.flush();
+                    break Ok(input);
+                }
+                KeyCode::Char(c) if !modifiers.contains(KeyModifiers::CONTROL) => {
                     input.push(c);
                     let _ = write!(stdout, "*");
                     let _ = stdout.flush();
@@ -1617,7 +1643,6 @@ impl KeysCommand {
         println!("{}", style::bold("Edit API Key"));
         println!();
         println!("Press Enter to keep the current value.");
-        println!();
 
         // Bedrock keys: dedicated edit flow that mirrors the add flow's
         // region picker instead of forcing the user to hand-edit the
@@ -1636,6 +1661,7 @@ impl KeysCommand {
         // (To swap a cursor key's API key or re-login, `keys rm` then
         // `keys add cursor`.)
         if key.is_any_oauth() || key.is_cursor_acp() {
+            keys_ui::step_header(1, 1, "Name", "a short label for this key");
             let name = edit_name(&key)?;
 
             if name == key.name {
@@ -1664,11 +1690,13 @@ impl KeysCommand {
         }
 
         // Name — pre-filled with the current value for in-place editing.
+        keys_ui::step_header(1, 3, "Name", "a short label for this key");
         let name = edit_name(&key)?;
 
         // Base URL — pre-filled so the user can tweak a long URL in place.
+        keys_ui::step_header(2, 3, "Base URL", "where requests are sent");
         let base_url = loop {
-            let input = term_edit_line("Base URL: ", &key.base_url)?;
+            let input = term_edit_line(&style::dim("Base URL: "), &key.base_url)?;
             let value = if input.is_empty() {
                 key.base_url.clone()
             } else {
@@ -1690,9 +1718,10 @@ impl KeysCommand {
         };
 
         // API Key
+        keys_ui::step_header(3, 3, "API Key", "input is hidden");
         let api_key = loop {
             let preview = display_secret(&key);
-            let input = term_read_secret(&format!("API Key [{}]: ", preview))?;
+            let input = term_read_secret(&style::dim(format!("API Key [{}]: ", preview)))?;
             let value = if input.is_empty() {
                 key.key.as_str().to_string()
             } else {
@@ -1897,9 +1926,11 @@ impl KeysCommand {
     /// the edit with Ctrl-C.
     async fn edit_bedrock_key(&self, key: ApiKey, current_region: &str) -> Result<ExitCode> {
         // Name (same shape as the generic edit flow).
+        keys_ui::step_header(1, 3, "Name", "a short label for this key");
         let name = edit_name(&key)?;
 
         // Region picker, defaulted to current.
+        keys_ui::step_header(2, 3, "Region", "Bedrock AWS region");
         let region = match pick_bedrock_region(Some(current_region))? {
             Some(r) => r,
             None => {
@@ -1919,9 +1950,10 @@ impl KeysCommand {
         };
 
         // API key with masked preview (same shape as generic edit flow).
+        keys_ui::step_header(3, 3, "API Key", "input is hidden");
         let api_key = loop {
             let preview = display_secret(&key);
-            let input = term_read_secret(&format!("API Key [{}]: ", preview))?;
+            let input = term_read_secret(&style::dim(format!("API Key [{}]: ", preview)))?;
             let value = if input.is_empty() {
                 key.key.as_str().to_string()
             } else {
