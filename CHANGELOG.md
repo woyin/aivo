@@ -1,5 +1,25 @@
 # Changelog
 
+## v0.24.0
+
+### Features
+
+- `aivo amp`: full neo-compatible bridge.
+- `aivo keys`: in-place line editing and paste-safe input for the add/edit flows.
+- `aivo pi`: list the full provider catalog in pi's `/model` picker.
+
+### Fixes
+
+- `aivo keys`: show the active key in the bare `aivo` footer when `last_selection` is empty.
+- Harden token-usage math and id slicing against malformed input.
+
+### Changes
+
+- Redraw the chat TUI only on state change.
+- Match the keys edit flow to add's stepped layout.
+- Remove the image/audio/video media commands (archived on the `media` branch).
+
+
 ## v0.23.6
 
 - fix(codex-app): stream the responses path to Codex instead of buffering
