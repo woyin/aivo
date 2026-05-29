@@ -559,7 +559,7 @@ fn responses_usage_json(
     let mut usage = json!({
         "input_tokens": input_tokens,
         "output_tokens": output_tokens,
-        "total_tokens": input_tokens + output_tokens
+        "total_tokens": input_tokens.saturating_add(output_tokens)
     });
     if let Some(value) = cache_read_input_tokens {
         usage["cache_read_input_tokens"] = json!(value);

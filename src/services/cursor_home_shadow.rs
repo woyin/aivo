@@ -1,7 +1,7 @@
 //! Per-aivo-key isolated home dir for cursor-agent, so multiple logins
-//! coexist without touching `~/.cursor`. See `ARCHITECTURE.md` for the
-//! platform env-var matrix and the `CURSOR_CONFIG_DIR`/`CURSOR_DATA_DIR`
-//! pinning rationale.
+//! coexist without touching `~/.cursor`. See the "cursor-agent env-var matrix"
+//! section in `ARCHITECTURE.md` for the platform env-var matrix and the
+//! `CURSOR_CONFIG_DIR`/`CURSOR_DATA_DIR` pinning rationale.
 
 use anyhow::{Context, Result};
 use rand::RngCore;

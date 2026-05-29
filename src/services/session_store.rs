@@ -214,7 +214,11 @@ impl ApiKey {
     }
 
     pub fn short_id(&self) -> &str {
-        &self.id[..self.id.len().min(3)]
+        // Slice on a char boundary: a hand-edited config can carry a multi-byte id.
+        match self.id.char_indices().nth(3) {
+            Some((end, _)) => &self.id[..end],
+            None => &self.id,
+        }
     }
 
     pub fn display_name(&self) -> &str {
@@ -1837,6 +1841,22 @@ mod tests {
         };
         assert!(k.is_claude_oauth());
         assert!(!k.is_codex_oauth());
+    }
+
+    #[test]
+    fn short_id_is_char_boundary_safe() {
+        // A multi-byte id (e.g. hand-edited config) must not panic on a byte slice.
+        let k =
+            ApiKey::new_with_protocol("日本語id".into(), "".into(), "x".into(), None, "k".into());
+        assert_eq!(k.short_id(), "日本語");
+        assert_eq!(k.display_name(), "日本語");
+
+        let short = ApiKey::new_with_protocol("ab".into(), "".into(), "x".into(), None, "k".into());
+        assert_eq!(short.short_id(), "ab");
+
+        let ascii =
+            ApiKey::new_with_protocol("abcdef".into(), "".into(), "x".into(), None, "k".into());
+        assert_eq!(ascii.short_id(), "abc");
     }
 
     #[test]

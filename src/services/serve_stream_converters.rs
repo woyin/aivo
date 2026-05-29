@@ -713,7 +713,7 @@ fn openai_usage_json(
     let mut usage = json!({
         "prompt_tokens": prompt_tokens,
         "completion_tokens": completion_tokens,
-        "total_tokens": prompt_tokens + completion_tokens
+        "total_tokens": prompt_tokens.saturating_add(completion_tokens)
     });
     if let Some(value) = cache_read_input_tokens {
         usage["cache_read_input_tokens"] = json!(value);

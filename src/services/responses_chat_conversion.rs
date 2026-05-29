@@ -1356,7 +1356,7 @@ fn chat_usage_to_responses_usage(chat: &Value) -> Option<Value> {
     let total_tokens = usage.get("total_tokens").cloned().unwrap_or_else(|| {
         let input = input_tokens.as_u64().unwrap_or(0);
         let output = output_tokens.as_u64().unwrap_or(0);
-        json!(input + output)
+        json!(input.saturating_add(output))
     });
 
     // Map OpenAI chat-completion's `prompt_tokens_details.cached_tokens` (and

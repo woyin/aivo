@@ -632,12 +632,12 @@ pub fn convert_gemini_to_openai_chat_response(resp: &Value, fallback_model: &str
     // already includes reasoning. Gemini reports candidates + thoughts
     // separately, so fold them here — otherwise total_tokens
     // undercounts by the thinking budget.
-    let completion_tokens = candidates_tokens + thoughts_tokens.unwrap_or(0);
+    let completion_tokens = candidates_tokens.saturating_add(thoughts_tokens.unwrap_or(0));
 
     let mut usage = json!({
         "prompt_tokens": prompt_tokens,
         "completion_tokens": completion_tokens,
-        "total_tokens": prompt_tokens + completion_tokens
+        "total_tokens": prompt_tokens.saturating_add(completion_tokens)
     });
     if let Some(value) = cache_read_input_tokens {
         usage["cache_read_input_tokens"] = json!(value);
