@@ -46,26 +46,187 @@ fn restore_cooked_mode() {
 
 // Reads a line from stdin, flushing the prompt first so it appears before blocking.
 fn term_read_line(prompt: &str) -> std::io::Result<String> {
-    use std::io::{BufRead, Write};
+    term_edit_line(prompt, "")
+}
+
+// Single-line editor with cursor movement: ←/→ Home/End (and Ctrl-A/E/B/F) move,
+// Backspace/Delete edit at the cursor, Ctrl-U/K/W kill, and bracketed paste inserts
+// (control chars stripped). `initial` pre-fills the buffer so edit prompts can offer
+// the current value for in-place editing. Falls back to a plain cooked read when
+// stdin isn't a TTY (piped input, CI) — there `initial` is ignored and empty input
+// lets the caller keep its default.
+fn term_edit_line(prompt: &str, initial: &str) -> std::io::Result<String> {
+    use std::io::{IsTerminal, Write};
+
+    if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
+        use std::io::BufRead;
+        print!("{}", prompt);
+        std::io::stdout().flush()?;
+        let mut input = String::new();
+        std::io::stdin().lock().read_line(&mut input)?;
+        return Ok(input.trim().to_string());
+    }
+
+    use crossterm::cursor::MoveToColumn;
+    use crossterm::event::{
+        self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyEventKind,
+        KeyModifiers,
+    };
+    use crossterm::terminal::{self, Clear, ClearType};
+    use crossterm::{execute, queue};
+    use unicode_width::UnicodeWidthChar;
+
+    // Repaint the input region in place: jump to the input's start column, clear to
+    // the line end, write the buffer, then park the cursor at its logical position.
+    fn render(
+        stdout: &mut std::io::Stdout,
+        start_col: u16,
+        buf: &[char],
+        cursor: usize,
+    ) -> std::io::Result<()> {
+        let cursor_w: u16 = buf[..cursor]
+            .iter()
+            .map(|c| UnicodeWidthChar::width(*c).unwrap_or(0) as u16)
+            .sum();
+        queue!(
+            stdout,
+            MoveToColumn(start_col),
+            Clear(ClearType::UntilNewLine)
+        )?;
+        write!(stdout, "{}", buf.iter().collect::<String>())?;
+        queue!(stdout, MoveToColumn(start_col.saturating_add(cursor_w)))?;
+        stdout.flush()
+    }
+
     print!("{}", prompt);
     std::io::stdout().flush()?;
-    let mut input = String::new();
-    std::io::stdin().lock().read_line(&mut input)?;
-    Ok(input.trim().to_string())
+
+    terminal::enable_raw_mode()?;
+    let mut stdout = std::io::stdout();
+    let _ = execute!(stdout, EnableBracketedPaste);
+    // Anchor for redraws: the column just past the prompt where input begins.
+    let start_col = crossterm::cursor::position().map(|(c, _)| c).unwrap_or(0);
+
+    let mut buf: Vec<char> = initial.chars().collect();
+    let mut cursor = buf.len();
+    let _ = render(&mut stdout, start_col, &buf, cursor);
+
+    let result = loop {
+        match event::read() {
+            // On Windows, crossterm emits Press and Release for every key —
+            // process Press only.
+            Ok(Event::Key(KeyEvent {
+                code,
+                modifiers,
+                kind: KeyEventKind::Press,
+                ..
+            })) => {
+                let ctrl = modifiers.contains(KeyModifiers::CONTROL);
+                match code {
+                    KeyCode::Enter => {
+                        let _ = write!(stdout, "\r\n");
+                        let _ = stdout.flush();
+                        break Ok(buf.iter().collect::<String>().trim().to_string());
+                    }
+                    KeyCode::Char('c') if ctrl => {
+                        let _ = write!(stdout, "\r\n");
+                        let _ = stdout.flush();
+                        break Err(std::io::Error::new(
+                            std::io::ErrorKind::Interrupted,
+                            "interrupted",
+                        ));
+                    }
+                    KeyCode::Left => cursor = cursor.saturating_sub(1),
+                    KeyCode::Char('b') if ctrl => cursor = cursor.saturating_sub(1),
+                    KeyCode::Right if cursor < buf.len() => cursor += 1,
+                    KeyCode::Char('f') if ctrl && cursor < buf.len() => cursor += 1,
+                    KeyCode::Home => cursor = 0,
+                    KeyCode::End => cursor = buf.len(),
+                    KeyCode::Char('a') if ctrl => cursor = 0,
+                    KeyCode::Char('e') if ctrl => cursor = buf.len(),
+                    KeyCode::Char('u') if ctrl => {
+                        buf.drain(0..cursor);
+                        cursor = 0;
+                    }
+                    KeyCode::Char('k') if ctrl => buf.truncate(cursor),
+                    KeyCode::Char('w') if ctrl => {
+                        let end = cursor;
+                        while cursor > 0 && buf[cursor - 1].is_whitespace() {
+                            cursor -= 1;
+                        }
+                        while cursor > 0 && !buf[cursor - 1].is_whitespace() {
+                            cursor -= 1;
+                        }
+                        buf.drain(cursor..end);
+                    }
+                    KeyCode::Backspace if cursor > 0 => {
+                        cursor -= 1;
+                        buf.remove(cursor);
+                    }
+                    KeyCode::Delete if cursor < buf.len() => {
+                        buf.remove(cursor);
+                    }
+                    KeyCode::Char(c) if !ctrl && !modifiers.contains(KeyModifiers::ALT) => {
+                        buf.insert(cursor, c);
+                        cursor += 1;
+                    }
+                    _ => continue,
+                }
+                let _ = render(&mut stdout, start_col, &buf, cursor);
+            }
+            // Insert pasted text at the cursor, stripping control chars (newlines,
+            // tabs) so a multi-line paste doesn't submit early or smuggle bytes in.
+            Ok(Event::Paste(data)) => {
+                for c in data.chars().filter(|c| !c.is_control()) {
+                    buf.insert(cursor, c);
+                    cursor += 1;
+                }
+                let _ = render(&mut stdout, start_col, &buf, cursor);
+            }
+            Ok(_) => {}
+            Err(e) => break Err(e),
+        }
+    };
+    let _ = execute!(stdout, DisableBracketedPaste);
+    let _ = terminal::disable_raw_mode();
+    result
+}
+
+// Edit prompt for a key's display name: pre-fills the current name for in-place
+// editing when set, or shows a descriptive placeholder when unnamed. Empty input
+// keeps the current value.
+fn edit_name(key: &ApiKey) -> std::io::Result<String> {
+    let input = if key.name.is_empty() {
+        term_read_line(&format!("Name [unnamed; shown as {}]: ", key.short_id()))?
+    } else {
+        term_edit_line("Name: ", &key.name)?
+    };
+    Ok(if input.is_empty() {
+        key.name.clone()
+    } else {
+        input
+    })
 }
 
 // Reads a line from stdin with masked echo (prints '*' per character) for secrets.
 fn term_read_secret(prompt: &str) -> std::io::Result<String> {
-    use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
-    use crossterm::terminal;
+    use crossterm::event::{
+        self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyEventKind,
+        KeyModifiers,
+    };
+    use crossterm::{execute, terminal};
     use std::io::Write;
 
     print!("{}", prompt);
     std::io::stdout().flush()?;
 
     terminal::enable_raw_mode()?;
-    let mut input = String::new();
     let mut stdout = std::io::stdout();
+    // Bracketed paste delivers a multi-line paste as one Event::Paste instead of
+    // per-char key events; without it an embedded '\n' reads as Enter and submits
+    // the secret early, dumping the rest of the paste onto the next prompt.
+    let _ = execute!(stdout, EnableBracketedPaste);
+    let mut input = String::new();
     let result = loop {
         match event::read() {
             // On Windows, crossterm emits Press and Release for every key —
@@ -101,10 +262,20 @@ fn term_read_secret(prompt: &str) -> std::io::Result<String> {
                 }
                 _ => {}
             },
+            // Strip control chars (newlines, tabs) so a pasted secret with line
+            // breaks doesn't submit early or smuggle control bytes into the key.
+            Ok(Event::Paste(data)) => {
+                for c in data.chars().filter(|c| !c.is_control()) {
+                    input.push(c);
+                    let _ = write!(stdout, "*");
+                }
+                let _ = stdout.flush();
+            }
             Ok(_) => {}
             Err(e) => break Err(e),
         }
     };
+    let _ = execute!(stdout, DisableBracketedPaste);
     let _ = terminal::disable_raw_mode();
     result
 }
@@ -1427,8 +1598,6 @@ impl KeysCommand {
 
     /// Interactively edits an API key
     async fn edit_key(&self, key_id_or_name: Option<&str>) -> Result<ExitCode> {
-        use std::io;
-
         let key = match self
             .resolve_key_selection(key_id_or_name, "Select a key to edit", "No API keys found.")
             .await?
@@ -1450,10 +1619,6 @@ impl KeysCommand {
         println!("Press Enter to keep the current value.");
         println!();
 
-        fn read_line_with_default(prompt: &str) -> io::Result<String> {
-            term_read_line(prompt)
-        }
-
         // Bedrock keys: dedicated edit flow that mirrors the add flow's
         // region picker instead of forcing the user to hand-edit the
         // `bedrock-runtime.<region>.amazonaws.com` URL string. Detected
@@ -1471,19 +1636,7 @@ impl KeysCommand {
         // (To swap a cursor key's API key or re-login, `keys rm` then
         // `keys add cursor`.)
         if key.is_any_oauth() || key.is_cursor_acp() {
-            let current_name = if key.name.is_empty() {
-                format!("unnamed; shown as {}", key.short_id())
-            } else {
-                key.name.clone()
-            };
-            let name = {
-                let input = read_line_with_default(&format!("Name [{}]: ", current_name))?;
-                if input.is_empty() {
-                    key.name.clone()
-                } else {
-                    input
-                }
-            };
+            let name = edit_name(&key)?;
 
             if name == key.name {
                 println!("{}", style::dim("No changes."));
@@ -1510,24 +1663,12 @@ impl KeysCommand {
             return Ok(ExitCode::Success);
         }
 
-        // Name
-        let current_name = if key.name.is_empty() {
-            format!("unnamed; shown as {}", key.short_id())
-        } else {
-            key.name.clone()
-        };
-        let name = {
-            let input = read_line_with_default(&format!("Name [{}]: ", current_name))?;
-            if input.is_empty() {
-                key.name.clone()
-            } else {
-                input
-            }
-        };
+        // Name — pre-filled with the current value for in-place editing.
+        let name = edit_name(&key)?;
 
-        // Base URL
+        // Base URL — pre-filled so the user can tweak a long URL in place.
         let base_url = loop {
-            let input = read_line_with_default(&format!("Base URL [{}]: ", key.base_url))?;
+            let input = term_edit_line("Base URL: ", &key.base_url)?;
             let value = if input.is_empty() {
                 key.base_url.clone()
             } else {
@@ -1756,19 +1897,7 @@ impl KeysCommand {
     /// the edit with Ctrl-C.
     async fn edit_bedrock_key(&self, key: ApiKey, current_region: &str) -> Result<ExitCode> {
         // Name (same shape as the generic edit flow).
-        let current_name = if key.name.is_empty() {
-            format!("unnamed; shown as {}", key.short_id())
-        } else {
-            key.name.clone()
-        };
-        let name = {
-            let input = term_read_line(&format!("Name [{}]: ", current_name))?;
-            if input.is_empty() {
-                key.name.clone()
-            } else {
-                input
-            }
-        };
+        let name = edit_name(&key)?;
 
         // Region picker, defaulted to current.
         let region = match pick_bedrock_region(Some(current_region))? {
