@@ -269,7 +269,12 @@ pub async fn run() -> ! {
                     .or_else(|| run_args.two_m.then(|| "2m".to_string())),
                 &run_args.args,
             );
-            services::transform_mode::set_active(run_args.transform || extracted.transform);
+            // Pi defaults to the router; `--transparent` opts back into native.
+            let is_pi =
+                run_args.tool.as_deref().and_then(AIToolType::parse) == Some(AIToolType::Pi);
+            let transparent = run_args.transparent || extracted.transparent;
+            let transform_on = run_args.transform || extracted.transform || is_pi;
+            services::transform_mode::set_active(transform_on && !transparent);
             // After extract_aivo_flags so `--debug` after the tool name
             // (recovered from passthrough) activates the logger too.
             maybe_init_http_debug(&extracted.debug).await;

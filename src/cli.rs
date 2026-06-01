@@ -386,12 +386,18 @@ pub struct RunArgs {
     #[arg(long = "2m")]
     pub two_m: bool,
 
-    /// Pi only: route through aivo's responses-to-chat router. Applies
+    /// Pi only: route through aivo's responses-to-chat router. This is the
+    /// default for `pi` (pass `--transparent` to opt out). Applies
     /// model-name + protocol transforms and normalizes the SSE stream, so
     /// upstreams that emit malformed chunks (e.g. newapi omitting
     /// `finish_reason`) still parse. Same path as `--debug`, no JSONL log.
     #[arg(long)]
     pub transform: bool,
+
+    /// Pi only: opt out of the default transform router and talk to the
+    /// upstream natively (transparent passthrough).
+    #[arg(long)]
+    pub transparent: bool,
 
     /// Additional arguments to pass through to the AI tool
     #[arg(

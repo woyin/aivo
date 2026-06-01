@@ -5,6 +5,9 @@
 //! default). `--debug` does so implicitly because its JSONL logger needs
 //! the router to capture pi's traffic; `--transform` does so explicitly
 //! to normalize SSE for upstreams that omit `finish_reason`.
+//!
+//! Pi defaults to on (`--transparent` opts out); the default is set at the
+//! run dispatch (src/run.rs), so the `aivo start` picker stays direct.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 

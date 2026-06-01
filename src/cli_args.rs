@@ -343,6 +343,8 @@ pub(crate) struct ExtractedFlags {
     /// `None` = flag absent. `Some("1m")` = activate the 1M-context spoof.
     pub(crate) max_context: Option<String>,
     pub(crate) transform: bool,
+    /// Pi only: `--transparent` opts out of the default transform router.
+    pub(crate) transparent: bool,
 }
 
 /// Strip a trailing `[<digits>m]` from the model name and lift it into
@@ -416,6 +418,7 @@ pub(crate) fn extract_aivo_flags(
     let mut context: Option<String> = None;
     let mut max_context: Option<String> = initial_max_context;
     let mut transform = false;
+    let mut transparent = false;
     let mut env_strings = initial_envs;
     let ClaudeSlotFlags {
         reasoning: mut reasoning_model,
@@ -609,6 +612,8 @@ pub(crate) fn extract_aivo_flags(
             }
         } else if arg == "--transform" {
             transform = true;
+        } else if arg == "--transparent" {
+            transparent = true;
         } else if model.is_none() && is_hf_or_local_gguf(arg) {
             // Lift positional `hf:`/URL/local-path into `-m`. Explicit `-m` wins.
             model = Some(arg.clone());
@@ -637,6 +642,7 @@ pub(crate) fn extract_aivo_flags(
         context,
         max_context,
         transform,
+        transparent,
     }
 }
 
@@ -664,6 +670,25 @@ mod tests {
         );
         assert_eq!(r.model, Some("gpt-4o".to_string()));
         assert_eq!(r.remaining_args, args(&["file.ts"]));
+    }
+
+    #[test]
+    fn transform_flags_parsed_not_passed_through() {
+        let r = extract_aivo_flags(
+            None,
+            ClaudeSlotFlags::default(),
+            None,
+            None,
+            false,
+            false,
+            false,
+            vec![],
+            None,
+            &args(&["--transform", "--transparent"]),
+        );
+        assert!(r.transform);
+        assert!(r.transparent);
+        assert!(r.remaining_args.is_empty());
     }
 
     #[test]

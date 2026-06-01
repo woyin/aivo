@@ -637,8 +637,8 @@ impl RunCommand {
         );
         if is("pi") {
             print_opt(
-                "--transform",
-                &label("Pi only: route via aivo (normalizes SSE)"),
+                "--transparent",
+                &label("Pi only: talk to upstream natively (router is the default)"),
             );
         }
 
@@ -690,7 +690,7 @@ impl RunCommand {
             Some("pi") => {
                 println!("  {}", style::dim("aivo pi"));
                 println!("  {}", style::dim("aivo pi -k mykey"));
-                println!("  {}", style::dim("aivo pi --transform -k openrouter"));
+                println!("  {}", style::dim("aivo pi --transparent -k openrouter"));
             }
             _ => {
                 println!("  {}", style::dim("aivo run claude"));
