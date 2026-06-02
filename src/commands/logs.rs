@@ -7,6 +7,7 @@ use std::time::Duration;
 
 use crate::cli::LogsArgs;
 use crate::commands::chat::format_time_ago_short;
+use crate::constants::KNOWN_TOOLS;
 use crate::errors::ExitCode;
 use crate::services::SessionStore;
 use crate::services::context_ingest::{self, IngestOptions};
@@ -1221,7 +1222,7 @@ async fn fetch_logs_rows(
     } else {
         args.limit.saturating_mul(3)
     };
-    let entries = store
+    let mut entries = store
         .logs()
         .list(LogQuery {
             limit: query_limit,
@@ -1229,12 +1230,39 @@ async fn fetch_logs_rows(
             by: plan.logs_by(),
             model: args.model.clone(),
             key_query: args.key.clone(),
-            cwd: cwd_filter,
+            cwd: cwd_filter.clone(),
             since: normalize_time_filter(args.since.as_deref()),
             until: normalize_time_filter(args.until.as_deref()),
             errors_only: args.errors,
         })
         .await?;
+    // Plugin tools (e.g. amp) aren't a native AIToolType and have no native
+    // session source, so the unified view never sees them. Pull their `[run]`
+    // rows in — non-native tools only, so native tools aren't duplicated — and
+    // re-sort newest-first so the downstream collapse/merge invariants hold.
+    if plan.plugin_runs {
+        let runs = store
+            .logs()
+            .list(LogQuery {
+                limit: query_limit,
+                search: args.search.clone(),
+                by: Some("run".to_string()),
+                model: args.model.clone(),
+                key_query: args.key.clone(),
+                cwd: cwd_filter,
+                since: normalize_time_filter(args.since.as_deref()),
+                until: normalize_time_filter(args.until.as_deref()),
+                errors_only: args.errors,
+            })
+            .await?;
+        entries.extend(
+            runs.into_iter()
+                .filter(|e| e.tool.as_deref().is_some_and(|t| !KNOWN_TOOLS.contains(&t))),
+        );
+        // ts_utc is always a UTC rfc3339 stamp written by aivo, so lexical
+        // descending order is chronological newest-first.
+        entries.sort_by(|a, b| b.ts_utc.cmp(&a.ts_utc));
+    }
     // Run events are emitted as start+finish pairs sharing an event_group_id;
     // collapse here too so the unified listing doesn't show both halves.
     // Then collapse chat events by session_id so the session list shows one
@@ -1435,6 +1463,11 @@ struct SourcePlan {
     /// `--by run` / `--by serve`).
     logs_by: Option<String>,
     native: bool,
+    /// Include `[run]` rows for plugin (non-native) tools in the unified view.
+    /// Native tools surface as native session rows, so their run events stay
+    /// excluded; a plugin tool (e.g. amp) has no native source, so its run
+    /// events are its representation in `aivo logs`.
+    plugin_runs: bool,
 }
 
 impl SourcePlan {
@@ -1450,17 +1483,20 @@ impl SourcePlan {
         let logs;
         let logs_by;
         let native;
+        let plugin_runs;
         match by {
             // Explicit logs.db source.
             Some(name @ ("chat" | "run" | "serve")) => {
                 logs = true;
                 logs_by = Some(name.to_string());
                 native = false;
+                plugin_runs = false;
             }
             Some("native") => {
                 logs = false;
                 logs_by = None;
                 native = true;
+                plugin_runs = false;
             }
             // CLI names: native sessions of that cli only. `[run]` rows are
             // aivo's launch record for the same session — including them
@@ -1472,11 +1508,14 @@ impl SourcePlan {
                 logs = strict_logs;
                 logs_by = if strict_logs { args.by.clone() } else { None };
                 native = !strict_logs;
+                plugin_runs = false;
             }
             // No --by: the unified session list. logs.db restricted to chat
             // (collapsed by session_id downstream), native joins in,
             // run/serve stay out of the default view. Strict-logs reopens
-            // logs.db to every source for auditing.
+            // logs.db to every source for auditing. Plugin tools have no
+            // native source, so their `[run]` rows are pulled in (see
+            // `plugin_runs`) — this also covers `--by <plugin>` (unknown name).
             None | Some(_) => {
                 logs = true;
                 logs_by = if strict_logs {
@@ -1485,6 +1524,7 @@ impl SourcePlan {
                     Some("chat".to_string())
                 };
                 native = !strict_logs;
+                plugin_runs = !strict_logs;
             }
         }
 
@@ -1492,6 +1532,7 @@ impl SourcePlan {
             logs,
             logs_by,
             native,
+            plugin_runs,
         }
     }
 

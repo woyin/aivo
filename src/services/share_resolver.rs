@@ -21,6 +21,7 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 
 use chrono::{DateTime, Utc};
 
+use crate::constants::KNOWN_TOOLS;
 use crate::services::context_ingest::{
     self, IngestOptions, encode_claude_dir, gemini_matching_session_files, pi_session_dir,
 };
@@ -571,6 +572,15 @@ async fn resolve_run_event(entry: &LogEntry, ctx: &ResolverContext) -> Result<Sh
         .tool
         .as_deref()
         .ok_or_else(|| anyhow!("run event has no tool field"))?;
+    // Plugin tools (not a native AIToolType) run out-of-process via their own
+    // binary; aivo records the launch in `aivo logs` but never sees the
+    // transcript, so there's nothing to share. Fail with a clear reason rather
+    // than the misleading "session deleted / lives elsewhere" native message.
+    if !KNOWN_TOOLS.contains(&tool) {
+        return Err(anyhow!(
+            "'{tool}' is a plugin tool — aivo logs its launches but doesn't store a transcript, so this run can't be shared"
+        ));
+    }
     let run_cwd: String = entry
         .cwd
         .clone()
