@@ -889,14 +889,17 @@ async fn link_pi_agent_state(real_agent: &Path, dest: &Path) {
     }
 }
 
-/// Populate `dest_bin` with pi's managed binaries from `real_bin`. Best
-/// effort: any single failure is silently skipped so pi falls back to
-/// re-downloading just that binary.
+/// Ensure `dest_bin` is a writable dir for pi's managed binaries, linking the
+/// existing ones from `real_bin` when present. Best effort: failures are
+/// silently skipped so pi just re-downloads what's missing.
 #[cfg(unix)]
 async fn populate_pi_bin_dir(real_bin: &std::path::Path, dest_bin: &std::path::Path) {
-    // A single symlink covers the whole directory — cheap and keeps pi's
-    // post-launch writes (if any) pointing at the managed copy.
-    let _ = tokio::fs::symlink(real_bin, dest_bin).await;
+    // On first run real_bin doesn't exist yet; a dangling symlink would make
+    // pi's own `mkdir <temp>/bin` fail (ENOENT), so fall back to a writable dir.
+    if real_bin.is_dir() && symlink_dir(real_bin, dest_bin).await.is_ok() {
+        return;
+    }
+    let _ = tokio::fs::create_dir_all(dest_bin).await;
 }
 
 #[cfg(windows)]
@@ -932,7 +935,9 @@ async fn populate_pi_bin_dir(real_bin: &std::path::Path, dest_bin: &std::path::P
 }
 
 #[cfg(not(any(unix, windows)))]
-async fn populate_pi_bin_dir(_real_bin: &std::path::Path, _dest_bin: &std::path::Path) {}
+async fn populate_pi_bin_dir(_real_bin: &std::path::Path, dest_bin: &std::path::Path) {
+    let _ = tokio::fs::create_dir_all(dest_bin).await;
+}
 
 async fn seed_pi_sessions(
     real_sessions: Option<std::path::PathBuf>,
@@ -1970,6 +1975,20 @@ mod tests {
                 .unwrap(),
             installed
         );
+    }
+
+    #[tokio::test]
+    async fn write_pi_agent_dir_creates_writable_bin_on_first_time_use() {
+        // First-time use: real agent dir exists but has no bin/ yet.
+        let real = tempfile::tempdir().unwrap();
+        let (_env, agent) = launch_pi_agent(Some(real.path())).await;
+
+        let bin = agent.join("bin");
+        assert!(bin.is_dir(), "temp agent bin/ should exist");
+        tokio::fs::write(bin.join("fd"), b"#!/bin/sh\n")
+            .await
+            .unwrap();
+        assert!(bin.join("fd").is_file());
     }
 
     #[tokio::test]
