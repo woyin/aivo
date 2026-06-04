@@ -1340,15 +1340,24 @@ async fn resolve_gguf_file_uncached(model: &HfModelRef) -> Result<ResolvedGgufFi
             current.repo, revision
         );
         let client = http_utils::router_http_client();
-        let resp = client
-            .get(&tree_url)
+        let resp = with_hf_auth(client.get(&tree_url))
             .send_logged()
             .await
             .with_context(|| format!("Failed to query HuggingFace tree API at {tree_url}"))?;
         if !resp.status().is_success() {
+            let status = resp.status();
+            if matches!(
+                status,
+                reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN
+            ) {
+                anyhow::bail!(
+                    "HuggingFace tree API returned HTTP {status} for {} — gated or private repo.\n  · {}",
+                    current.repo,
+                    gated_repo_hint(),
+                );
+            }
             anyhow::bail!(
-                "HuggingFace tree API returned HTTP {} for {}",
-                resp.status(),
+                "HuggingFace tree API returned HTTP {status} for {}",
                 current.repo
             );
         }
@@ -1545,7 +1554,7 @@ async fn search_gguf_mirrors(basename: &str) -> Vec<String> {
         urlencode(&format!("{basename} GGUF"))
     );
     let client = http_utils::router_http_client();
-    let Ok(resp) = client.get(&url).send_logged().await else {
+    let Ok(resp) = with_hf_auth(client.get(&url)).send_logged().await else {
         return Vec::new();
     };
     if !resp.status().is_success() {
@@ -1665,10 +1674,82 @@ fn save_cached_metadata(model: &HfModelRef, resolved: &ResolvedGgufFile) {
     let _ = std::fs::write(&path, json);
 }
 
+/// HuggingFace env vars holding a bearer token, in precedence order.
+const HF_TOKEN_ENV_VARS: &[&str] = &["HF_TOKEN", "HUGGING_FACE_HUB_TOKEN", "HUGGINGFACE_TOKEN"];
+
+/// Token for gated/private repos. Env vars win; otherwise the CLI token file
+/// (`huggingface-cli login` writes `$HF_HOME/token`). `None` when unset.
+fn hf_token() -> Option<String> {
+    hf_token_from_env(|k| std::env::var(k).ok())
+        .or_else(|| read_hf_token_file(hf_token_file_path()))
+}
+
+fn hf_token_from_env(lookup: impl Fn(&str) -> Option<String>) -> Option<String> {
+    HF_TOKEN_ENV_VARS.iter().find_map(|&var| {
+        lookup(var)
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+    })
+}
+
+fn hf_token_file_path() -> Option<PathBuf> {
+    hf_token_file_path_from(
+        std::env::var("HF_TOKEN_PATH").ok(),
+        std::env::var("HF_HOME").ok(),
+        system_env::home_dir(),
+    )
+}
+
+/// `$HF_TOKEN_PATH` → `$HF_HOME/token` → `~/.cache/huggingface/token`.
+fn hf_token_file_path_from(
+    token_path: Option<String>,
+    hf_home: Option<String>,
+    home: Option<PathBuf>,
+) -> Option<PathBuf> {
+    if let Some(p) = token_path
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        return Some(PathBuf::from(p));
+    }
+    if let Some(h) = hf_home.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        return Some(Path::new(h).join("token"));
+    }
+    home.map(|h| h.join(".cache").join("huggingface").join("token"))
+}
+
+fn read_hf_token_file(path: Option<PathBuf>) -> Option<String> {
+    let raw = std::fs::read_to_string(path?).ok()?;
+    let token = raw.trim();
+    (!token.is_empty()).then(|| token.to_string())
+}
+
+/// Attaches `Authorization: Bearer <token>` when a token is configured.
+/// reqwest strips this header on the cross-host redirect to HF's CDN, so the
+/// signed download URL never receives a redundant bearer.
+fn with_hf_auth(req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+    match hf_token() {
+        Some(token) => req.bearer_auth(token),
+        None => req,
+    }
+}
+
+/// Trailing hint for gated/private 401/403s, tailored to whether a token
+/// was already sent.
+fn gated_repo_hint() -> &'static str {
+    if hf_token().is_some() {
+        "An HF token was sent but access was denied — accept the model's license on its \
+         HuggingFace page (gated repos need a one-time click), or the token lacks access."
+    } else {
+        "Set a token for gated/private repos — `export HF_TOKEN=hf_…` or `huggingface-cli \
+         login` — then accept the model's license on its page."
+    }
+}
+
 async fn head_content_length(url: &str) -> Result<u64> {
     let client = http_utils::router_http_client();
-    let resp = client
-        .head(url)
+    let resp = with_hf_auth(client.head(url))
         .send_logged()
         .await
         .with_context(|| format!("HEAD {url} failed"))?;
@@ -1723,7 +1804,7 @@ async fn stream_to_file(
     };
 
     let client = http_utils::router_http_streaming_client(60);
-    let mut req = client.get(&file.download_url);
+    let mut req = with_hf_auth(client.get(&file.download_url));
     if resume_offset > 0 {
         req = req.header(reqwest::header::RANGE, format!("bytes={resume_offset}-"));
     }
@@ -1738,12 +1819,13 @@ async fn stream_to_file(
             reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN
         ) {
             anyhow::bail!(
-                "Download of {} returned HTTP {status} — this looks like a gated or private \
-                 repo (e.g. `google/gemma-*`). aivo can't authenticate to HuggingFace yet.\n  \
-                 · Pull an ungated community GGUF mirror instead — a `bartowski/…-GGUF`, \
+                "Download of {} returned HTTP {status} — gated or private repo \
+                 (e.g. `google/gemma-*`).\n  · {}\n  \
+                 · Or pull an ungated community GGUF mirror — a `bartowski/…-GGUF`, \
                  `unsloth/…-GGUF`, or `lmstudio-community/…-GGUF` repo.\n  \
                  · Re-run with `--refresh` to drop the cached pick and re-resolve.",
                 file.filename,
+                gated_repo_hint(),
             );
         }
         anyhow::bail!("Download of {} returned HTTP {status}", file.filename);
@@ -2854,5 +2936,62 @@ mod tests {
         let tmp = tempfile::NamedTempFile::new().unwrap();
         std::fs::write(tmp.path(), &bytes).unwrap();
         ensure_arch_is_chat_capable(tmp.path()).unwrap();
+    }
+
+    #[test]
+    fn hf_token_from_env_precedence_and_trim() {
+        let lookup = |k: &str| match k {
+            "HF_TOKEN" => Some("  hf_primary  ".to_string()),
+            "HUGGING_FACE_HUB_TOKEN" => Some("hf_secondary".to_string()),
+            _ => None,
+        };
+        assert_eq!(hf_token_from_env(lookup), Some("hf_primary".to_string()));
+    }
+
+    #[test]
+    fn hf_token_from_env_skips_blank_to_next_var() {
+        let lookup = |k: &str| match k {
+            "HF_TOKEN" => Some("   ".to_string()),
+            "HUGGING_FACE_HUB_TOKEN" => Some("hf_secondary".to_string()),
+            _ => None,
+        };
+        assert_eq!(hf_token_from_env(lookup), Some("hf_secondary".to_string()));
+    }
+
+    #[test]
+    fn hf_token_from_env_none_when_all_unset() {
+        assert_eq!(hf_token_from_env(|_| None), None);
+    }
+
+    #[test]
+    fn hf_token_file_path_prefers_token_path_then_home() {
+        let home = Some(PathBuf::from("/home/u"));
+        assert_eq!(
+            hf_token_file_path_from(Some("/x/tok".into()), Some("/y".into()), home.clone()),
+            Some(PathBuf::from("/x/tok"))
+        );
+        assert_eq!(
+            hf_token_file_path_from(Some("  ".into()), Some("/y".into()), home.clone()),
+            Some(PathBuf::from("/y/token"))
+        );
+        assert_eq!(
+            hf_token_file_path_from(None, None, home),
+            Some(PathBuf::from("/home/u/.cache/huggingface/token"))
+        );
+        assert_eq!(hf_token_file_path_from(None, None, None), None);
+    }
+
+    #[test]
+    fn read_hf_token_file_trims_and_rejects_empty() {
+        assert_eq!(read_hf_token_file(None), None);
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(tmp.path(), "  hf_fromfile\n").unwrap();
+        assert_eq!(
+            read_hf_token_file(Some(tmp.path().to_path_buf())),
+            Some("hf_fromfile".to_string())
+        );
+        let blank = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(blank.path(), "\n  \n").unwrap();
+        assert_eq!(read_hf_token_file(Some(blank.path().to_path_buf())), None);
     }
 }

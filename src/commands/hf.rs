@@ -83,6 +83,13 @@ impl HfCommand {
         ] {
             println!("  {}", style::dim(ex));
         }
+        println!();
+        println!(
+            "{}",
+            style::dim(
+                "Gated/private repos (e.g. google/gemma-*) need an HF token: set HF_TOKEN or run `huggingface-cli login`."
+            )
+        );
     }
 }
 
