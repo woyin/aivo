@@ -54,6 +54,7 @@ pub use responses_chat_conversion::{
 };
 
 // Internal re-exports used within this router
+use crate::services::serve_router::{StreamUsageSniffer, TokenUsage, parse_token_usage};
 use responses_chat_conversion::{
     ResponsesStreamConverter, ResponsesToChatStreamConverter, apply_max_tokens_cap_to_fields,
     cap_reasoning_effort, convert_chat_to_responses_request, convert_responses_json_to_chat,
@@ -117,6 +118,8 @@ pub struct ResponsesToChatRouter {
 pub struct UsageAccounting {
     pub store: crate::services::session_store::SessionStore,
     pub key_id: String,
+    /// Launching plugin name, for per-(tool, model) stats attribution.
+    pub tool: String,
 }
 
 enum ForwardedChatResponse {
@@ -158,13 +161,19 @@ impl ResponsesToChatRouter {
         self
     }
 
-    /// Record buffered 2xx token usage against `key_id` in stats (plugin endpoint).
+    /// Record buffered 2xx token usage against `key_id` in stats (plugin endpoint),
+    /// attributed to `tool` (the launching plugin name) for per-tool stats.
     pub fn with_usage_accounting(
         mut self,
         store: crate::services::session_store::SessionStore,
         key_id: String,
+        tool: String,
     ) -> Self {
-        self.usage = Some(UsageAccounting { store, key_id });
+        self.usage = Some(UsageAccounting {
+            store,
+            key_id,
+            tool,
+        });
         self
     }
 
@@ -300,6 +309,23 @@ async fn handle_router_request_streaming(
     }
 }
 
+/// Record one usage report against the plugin-endpoint key, tagged with the
+/// launching tool. Shared by the buffered and streamed accounting paths.
+async fn record_endpoint_usage(acct: &UsageAccounting, model: Option<&str>, u: &TokenUsage) {
+    let _ = acct
+        .store
+        .record_tokens(
+            &acct.key_id,
+            Some(acct.tool.as_str()),
+            model,
+            u.prompt,
+            u.completion,
+            u.cache_read,
+            u.cache_creation,
+        )
+        .await;
+}
+
 /// Quick check on a buffered HTTP/1.1 response string: status starts at byte
 /// offset 9 (after "HTTP/1.1 "). 2xx → success.
 fn response_is_2xx(http_response: &str) -> bool {
@@ -362,6 +388,7 @@ async fn handle_router_request(
             .and_then(|v| v.get("model").and_then(|m| m.as_str()).map(str::to_string))
             .unwrap_or_default();
         let slot = state.route_cache.resolve(&model);
+        let mut sniffer = StreamUsageSniffer::new(state.usage.is_some());
         let response = match handle_api_request(
             path_no_query,
             &request,
@@ -370,6 +397,7 @@ async fn handle_router_request(
             &slot,
             &state.learned_requires_reasoning,
             socket,
+            &mut sniffer,
         )
         .await
         {
@@ -379,10 +407,9 @@ async fn handle_router_request(
                 &format!("Internal Server Error: {e:#}"),
             )),
         };
-        // Failure-streak demotion for buffered responses; streamed responses
-        // (None) already recorded success via `slot.confirm()` inside the
-        // streamer.
+        let model_label = (!model.is_empty()).then_some(model.as_str());
         if let Some(resp) = &response {
+            // Buffered path: demote on failure, account a buffered 2xx body.
             let (seed_proto, seed_variant) = slot.seed_route();
             record_request_outcome(
                 slot.route_atom(),
@@ -391,26 +418,17 @@ async fn handle_router_request(
                 seed_variant,
                 response_is_2xx(resp),
             );
-            // Buffered 2xx token accounting for the plugin endpoint (streamed
-            // responses return `None` and are uncounted, like `ServeRouter`).
             if let Some(acct) = &state.usage
                 && response_is_2xx(resp)
                 && let Some(body) = resp.split_once("\r\n\r\n").map(|(_, b)| b)
-                && let Some(u) = crate::services::serve_router::parse_token_usage(body.as_bytes())
+                && let Some(u) = parse_token_usage(body.as_bytes())
             {
-                let model = (!model.is_empty()).then_some(model.as_str());
-                let _ = acct
-                    .store
-                    .record_tokens(
-                        &acct.key_id,
-                        model,
-                        u.prompt,
-                        u.completion,
-                        u.cache_read,
-                        u.cache_creation,
-                    )
-                    .await;
+                record_endpoint_usage(acct, model_label, &u).await;
             }
+        } else if let (Some(acct), Some(u)) = (&state.usage, sniffer.finish()) {
+            // Streamed path (None): account usage sniffed off the SSE stream.
+            // Success was already recorded via `slot.confirm()` in the streamer.
+            record_endpoint_usage(acct, model_label, &u).await;
         }
         response
     } else {
@@ -512,6 +530,7 @@ async fn note_streaming_failure(
 /// - Chat Completions format: filter non-function tools and forward
 ///
 /// Returns `None` if the response was streamed directly to the socket.
+#[allow(clippy::too_many_arguments)]
 async fn handle_api_request(
     path: &str,
     request: &str,
@@ -520,6 +539,7 @@ async fn handle_api_request(
     slot: &RouteSlot,
     learned_requires_reasoning: &Arc<AtomicBool>,
     socket: &mut tokio::net::TcpStream,
+    sniffer: &mut StreamUsageSniffer,
 ) -> Result<Option<String>> {
     let body_str = http_utils::extract_request_body(request)?;
     let body: Value = serde_json::from_str(body_str)?;
@@ -535,7 +555,7 @@ async fn handle_api_request(
             || (config.responses_api_supported != Some(false) && !slot.is_confirmed());
         if should_probe_responses {
             if let Some(result) =
-                try_responses_api_passthrough(&body, config, client, slot, socket).await
+                try_responses_api_passthrough(&body, config, client, slot, socket, sniffer).await
             {
                 return result;
             }
@@ -553,6 +573,7 @@ async fn handle_api_request(
             slot,
             learned_requires_reasoning,
             socket,
+            sniffer,
         )
         .await
         .is_ok()
@@ -586,6 +607,7 @@ async fn handle_api_request(
                 slot,
                 client_wants_stream,
                 socket,
+                sniffer,
             )
             .await;
         }
@@ -602,12 +624,16 @@ async fn handle_api_request(
                 slot,
                 learned_requires_reasoning,
                 socket,
+                sniffer,
             )
             .await
             {
                 Ok(ChatStreamOutcome::Streamed) => return Ok(None),
                 Ok(ChatStreamOutcome::NeedsResponses) => {
-                    return run_chat_via_responses(&body, config, client, slot, true, socket).await;
+                    return run_chat_via_responses(
+                        &body, config, client, slot, true, socket, sniffer,
+                    )
+                    .await;
                 }
                 Ok(ChatStreamOutcome::Failed) | Err(_) => {}
             }
@@ -659,6 +685,7 @@ async fn run_chat_via_responses(
     slot: &RouteSlot,
     client_wants_stream: bool,
     socket: &mut tokio::net::TcpStream,
+    sniffer: &mut StreamUsageSniffer,
 ) -> Result<Option<String>> {
     use tokio::io::AsyncWriteExt;
 
@@ -739,6 +766,7 @@ async fn run_chat_via_responses(
             .await?;
         let mut conv = ResponsesToChatStreamConverter::new(&original_model, include_usage);
         while let Some(chunk) = response.chunk().await? {
+            sniffer.observe(&chunk);
             let out = conv.push_bytes(&chunk);
             if !out.is_empty() {
                 socket
@@ -783,6 +811,7 @@ async fn try_responses_api_passthrough(
     client: &reqwest::Client,
     slot: &RouteSlot,
     socket: &mut tokio::net::TcpStream,
+    sniffer: &mut StreamUsageSniffer,
 ) -> Option<Result<Option<String>>> {
     let variant = slot.current().1;
     // Confirmed-responses routes surface their errors; an unprobed (prior-only)
@@ -899,6 +928,7 @@ async fn try_responses_api_passthrough(
             &content_type,
             &prefix,
             response,
+            |c| sniffer.observe(c),
         )
         .await
         {
@@ -1000,6 +1030,7 @@ async fn stream_responses_via_chat(
     slot: &RouteSlot,
     learned_requires_reasoning: &Arc<AtomicBool>,
     socket: &mut tokio::net::TcpStream,
+    sniffer: &mut StreamUsageSniffer,
 ) -> Result<()> {
     let (protocol, variant) = slot.current();
     // Openai and ResponsesApi both hit /v1/chat/completions; codex pins
@@ -1076,6 +1107,7 @@ async fn stream_responses_via_chat(
     let mut converter =
         ResponsesStreamConverter::new(&original_model, effective_requires_reasoning);
     while let Some(chunk) = response.chunk().await? {
+        sniffer.observe(&chunk);
         let converted = converter.push_bytes(&chunk);
         if !converted.is_empty() {
             socket
@@ -1130,6 +1162,7 @@ async fn stream_chat_completions(
     slot: &RouteSlot,
     learned_requires_reasoning: &Arc<AtomicBool>,
     socket: &mut tokio::net::TcpStream,
+    sniffer: &mut StreamUsageSniffer,
 ) -> Result<ChatStreamOutcome> {
     // Only stream for OpenAI protocol (the common case for DeepSeek, etc.)
     let (protocol, variant) = slot.current();
@@ -1139,7 +1172,20 @@ async fn stream_chat_completions(
 
     let effective_requires_reasoning =
         config.requires_reasoning_content || learned_requires_reasoning.load(Ordering::Relaxed);
-    let body = prepare_chat_completions_body(body, config, protocol, effective_requires_reasoning);
+    let mut body =
+        prepare_chat_completions_body(body, config, protocol, effective_requires_reasoning);
+
+    // Ask the upstream to emit a final usage chunk so the forwarded stream can be
+    // accounted. Only when accounting is on — native launches leave it untouched.
+    if sniffer.is_enabled()
+        && let Some(obj) = body.as_object_mut()
+        && let Some(so) = obj
+            .entry("stream_options")
+            .or_insert_with(|| json!({}))
+            .as_object_mut()
+    {
+        so.insert("include_usage".to_string(), json!(true));
+    }
 
     let target_url = build_target_url(
         &config.target_base_url,
@@ -1185,7 +1231,15 @@ async fn stream_chat_completions(
         .to_string();
 
     slot.confirm();
-    http_utils::write_streaming_response(socket, 200, &content_type, response).await?;
+    http_utils::write_streaming_response_with_prefix(
+        socket,
+        200,
+        &content_type,
+        &[],
+        response,
+        |c| sniffer.observe(c),
+    )
+    .await?;
     Ok(ChatStreamOutcome::Streamed)
 }
 

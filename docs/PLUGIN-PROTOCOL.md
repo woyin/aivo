@@ -101,6 +101,48 @@ echo "hello: $*"
 Other types are recorded and shown but otherwise inert. (Token accounting at the endpoint is
 independent of `type` — see [Endpoint handoff](#endpoint-handoff).)
 
+## Stats
+
+A plugin that declares the **`stats`** capability implements a second probe:
+
+```
+aivo-<name> --aivo-stats --json
+```
+
+It reads its **own** session/usage data — every agent stores tokens differently, in a different
+folder — and prints **one** `aivo.stats/v1` JSON object: a **timestamped, per-session** list of
+per-model token usage. **The plugin only provides data; aivo owns all filtering.** aivo applies
+`--since` windowing, model-name normalization, and aggregation host-side — consistently with native
+tools — so the plugin never reimplements them. aivo pulls this on demand for `aivo stats --by <name>`
+and the `By tool` overview, **preferring it over aivo's own endpoint accounting** (the plugin's data
+is the complete, authoritative view of that agent). Best-effort and capability-gated: a missing flag,
+timeout (5s), non-zero exit, or wrong schema → aivo falls back to its endpoint token accounting, then
+to launch counts. `stats` is **disclosure-only** (the plugin only reads its own data) — no consent
+grant, like `--aivo-manifest`.
+
+```jsonc
+{
+  "schema":   "aivo.stats/v1",
+  "tool":     "amp",
+  "source":   "aivo-routed amp threads (~/.config/aivo/amp-threads)",  // shown as provenance
+  "sessions": [
+    {
+      "ts":     "2026-06-08T01:23:45Z",   // RFC3339; omit if you can't place the session in time
+      "models": [
+        { "name": "deepseek-v4-flash", "input_tokens": 9, "output_tokens": 410,
+          "cache_read_tokens": 0, "cache_write_tokens": 0 }
+      ]
+    }
+  ]
+}
+```
+
+Emit **one entry per session** with its `ts` so aivo can window it (`--since`); a session with no
+`ts` is counted in lifetime views but dropped under `--since`. All token fields default to `0` — omit
+dimensions you don't track; sum a session's turns into its per-model entries. The `source` string is
+shown to the user, so make it descriptive — and scope the data to **aivo-routed** runs where you can,
+since these totals sit under aivo's own usage stats.
+
 ## Help
 
 `aivo <name> --help` / `-h` is a **pure passthrough**: aivo never resolves a key, opens a picker,
@@ -121,9 +163,10 @@ off and lets aivo's banner stand in.
 
 ## Capabilities & consent
 
-Capability vocabulary: `endpoint`, `config-read`, `config-write`, `spawn`, `hook:<event>`.
+Capability vocabulary: `endpoint`, `config-read`, `config-write`, `spawn`, `stats`, `hook:<event>`.
 **`endpoint` is the only grantable capability in v1**; the rest are disclosure/reserved — parsed and
-stored verbatim, never granted or injected.
+stored verbatim, never granted or injected. `stats` opts the plugin into the
+[`--aivo-stats`](#stats) usage probe (read-only, no grant).
 
 `endpoint` hands the plugin real power, so it is consent-gated:
 

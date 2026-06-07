@@ -235,7 +235,8 @@ Aggregates token counts from aivo chat, Claude Code, Codex, Gemini, OpenCode, an
 
 ```bash
 aivo stats
-aivo stats claude --since 7d                 # one tool, recent window
+aivo stats --by claude --since 7d            # one tool, recent window
+aivo stats --by omp                          # a coding-agent plugin
 aivo stats -s openrouter -n                  # filter, exact numbers
 aivo stats --json | jq '.totals.tokens'
 ```

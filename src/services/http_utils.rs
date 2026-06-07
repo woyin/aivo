@@ -553,18 +553,21 @@ pub async fn write_streaming_response<W>(
 where
     W: tokio::io::AsyncWrite + Unpin,
 {
-    write_streaming_response_with_prefix(socket, status, content_type, &[], upstream).await
+    write_streaming_response_with_prefix(socket, status, content_type, &[], upstream, |_| {}).await
 }
 
 /// Like `write_streaming_response`, but flushes `prefix` as the first chunk
 /// before draining `upstream`. Used when bytes were already read off the
 /// upstream (e.g. sniffing the SSE shape) and must be replayed to the client.
+/// `on_chunk` observes each raw upstream chunk (prefix + body) — callers use it
+/// to sniff token usage off the forwarded stream without buffering it.
 pub async fn write_streaming_response_with_prefix<W>(
     socket: &mut W,
     status: u16,
     content_type: &str,
     prefix: &[u8],
     mut upstream: reqwest::Response,
+    mut on_chunk: impl FnMut(&[u8]),
 ) -> Result<()>
 where
     W: tokio::io::AsyncWrite + Unpin,
@@ -573,9 +576,11 @@ where
     let headers = http_chunked_response_head(status, content_type);
     socket.write_all(headers.as_bytes()).await?;
     if !prefix.is_empty() {
+        on_chunk(prefix);
         socket.write_all(&format_http_chunk(prefix)).await?;
     }
     while let Some(chunk) = upstream.chunk().await? {
+        on_chunk(&chunk);
         let formatted = format_http_chunk(&chunk);
         if !formatted.is_empty() {
             socket.write_all(&formatted).await?;
@@ -1067,6 +1072,7 @@ mod tests {
                 "text/event-stream",
                 prefix,
                 upstream,
+                |_| {},
             )
             .await
             .unwrap();

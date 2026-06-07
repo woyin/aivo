@@ -7,6 +7,7 @@ mod endpoint;
 pub(crate) mod manifest;
 pub(crate) mod registry;
 pub(crate) mod source;
+pub(crate) mod stats;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};

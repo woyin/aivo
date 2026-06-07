@@ -115,6 +115,7 @@ impl ChatTuiApp {
         self.session_store
             .record_tokens(
                 &self.key.id,
+                Some("chat"),
                 Some(stats_model),
                 usage.prompt_tokens,
                 usage.completion_tokens,

@@ -172,7 +172,7 @@ pub(crate) async fn dispatch(name: &str, bin: &Path, args: &[String], store: &Se
                 }
                 let started = if use_responses_router(key) {
                     maybe_init_http_debug(debug_log.as_deref()).await;
-                    start_responses_endpoint(key, store).await
+                    start_responses_endpoint(key, store, name).await
                 } else {
                     let started = start_loopback_endpoint(
                         key,
@@ -694,6 +694,7 @@ fn use_responses_router(key: &ApiKey) -> bool {
 async fn start_responses_endpoint(
     key: &ApiKey,
     store: &SessionStore,
+    tool: &str,
 ) -> anyhow::Result<EndpointHandle> {
     use crate::services::copilot_auth::CopilotTokenManager;
     use crate::services::provider_profile::{provider_profile_for_key, resolve_starter_base_url};
@@ -744,7 +745,7 @@ async fn start_responses_endpoint(
     })
     .with_tool(PLUGIN_ROUTE_TOOL)
     .with_seed_routes(key.routes_for_tool(PLUGIN_ROUTE_TOOL))
-    .with_usage_accounting(store.clone(), key.id.clone())
+    .with_usage_accounting(store.clone(), key.id.clone(), tool.to_string())
     .with_auth_token(token.clone());
     let (port, route_cache, learned, handle) = router.start_background().await?;
     Ok(

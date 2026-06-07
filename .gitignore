@@ -28,3 +28,5 @@ Thumbs.db
 # npm package
 npm/native/
 npm/*.tgz
+
+memory/

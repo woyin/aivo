@@ -565,9 +565,10 @@ pub struct ServeArgs {
 /// Arguments for the stats command
 #[derive(Args, Debug, Clone)]
 pub struct StatsArgs {
-    /// Show stats for a specific tool (claude, codex, gemini, opencode, pi, chat)
-    #[arg(value_name = "TOOL")]
-    pub tool: Option<String>,
+    /// Filter to one tool: claude, codex, gemini, opencode, pi, chat, or an
+    /// installed coding-agent plugin (e.g. omp). Mirrors `aivo logs --by`.
+    #[arg(long, value_name = "NAME", value_parser = non_empty())]
+    pub by: Option<String>,
 
     /// Exact numbers instead of human-readable
     #[arg(short = 'n', long)]

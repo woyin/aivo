@@ -573,6 +573,7 @@ impl ChatCommand {
                     self.session_store
                         .record_tokens(
                             &key.id,
+                            Some("chat"),
                             Some(stats_model),
                             usage.prompt_tokens,
                             usage.completion_tokens,

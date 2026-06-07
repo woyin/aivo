@@ -397,6 +397,16 @@ impl ModelCounter {
     pub fn total_tokens(&self) -> u64 {
         self.prompt_tokens.saturating_add(self.completion_tokens)
     }
+
+    /// Accumulate one usage report's four token dimensions (saturating).
+    fn add(&mut self, prompt: u64, completion: u64, cache_read: u64, cache_creation: u64) {
+        self.prompt_tokens = self.prompt_tokens.saturating_add(prompt);
+        self.completion_tokens = self.completion_tokens.saturating_add(completion);
+        self.cache_read_input_tokens = self.cache_read_input_tokens.saturating_add(cache_read);
+        self.cache_creation_input_tokens = self
+            .cache_creation_input_tokens
+            .saturating_add(cache_creation);
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -429,6 +439,15 @@ pub struct UsageCounter {
         skip_serializing_if = "HashMap::is_empty"
     )]
     pub per_model_usage: HashMap<String, ModelCounter>,
+    /// Per-(tool, model) token usage. Only aivo-proxied launches that know the
+    /// launching tool (plugins, chat) populate this; native CLIs read their own
+    /// usage files, so they never appear here. Forward-only — old data is empty.
+    #[serde(
+        rename = "perToolModelUsage",
+        default,
+        skip_serializing_if = "HashMap::is_empty"
+    )]
+    pub per_tool_model_usage: HashMap<String, HashMap<String, ModelCounter>>,
     /// Legacy per-model total tokens. Read by the migration helper, never written
     /// after this version. Kept on the type for forward/backward compatibility
     /// with on-disk data recorded before the schema collapse.
@@ -637,9 +656,11 @@ impl UsageStats {
         // to avoid counting invalid/alias model names.
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn record_tokens(
         &mut self,
         key_id: &str,
+        tool: Option<&str>,
         model: Option<&str>,
         prompt_tokens: u64,
         completion_tokens: u64,
@@ -659,18 +680,32 @@ impl UsageStats {
         if let Some(model) =
             model.filter(|value| !value.trim().is_empty() && (total > 0 || cache_total > 0))
         {
-            let entry = key_stats
+            key_stats
                 .per_model_usage
                 .entry(model.to_string())
-                .or_default();
-            entry.prompt_tokens = entry.prompt_tokens.saturating_add(prompt_tokens);
-            entry.completion_tokens = entry.completion_tokens.saturating_add(completion_tokens);
-            entry.cache_read_input_tokens = entry
-                .cache_read_input_tokens
-                .saturating_add(cache_read_input_tokens);
-            entry.cache_creation_input_tokens = entry
-                .cache_creation_input_tokens
-                .saturating_add(cache_creation_input_tokens);
+                .or_default()
+                .add(
+                    prompt_tokens,
+                    completion_tokens,
+                    cache_read_input_tokens,
+                    cache_creation_input_tokens,
+                );
+            // Per-tool attribution: only aivo-proxied launches that know the
+            // tool (plugins, chat) supply one, so stats can attribute tokens.
+            if let Some(tool) = tool.filter(|t| !t.trim().is_empty()) {
+                key_stats
+                    .per_tool_model_usage
+                    .entry(tool.to_string())
+                    .or_default()
+                    .entry(model.to_string())
+                    .or_default()
+                    .add(
+                        prompt_tokens,
+                        completion_tokens,
+                        cache_read_input_tokens,
+                        cache_creation_input_tokens,
+                    );
+            }
             if total > 0 {
                 let model_stats = self.model_usage.entry(model.to_string()).or_default();
                 model_stats.total_tokens = model_stats.total_tokens.saturating_add(total);
@@ -1618,9 +1653,11 @@ impl SessionStore {
         self.stats.record_selection(key_id, tool, model).await
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn record_tokens(
         &self,
         key_id: &str,
+        tool: Option<&str>,
         model: Option<&str>,
         prompt_tokens: u64,
         completion_tokens: u64,
@@ -1630,6 +1667,7 @@ impl SessionStore {
         self.stats
             .record_tokens(
                 key_id,
+                tool,
                 model,
                 prompt_tokens,
                 completion_tokens,
@@ -2249,7 +2287,7 @@ mod tests {
             .await
             .unwrap();
         store
-            .record_tokens(&id, Some("gpt-4o"), 10, 5, 90, 15)
+            .record_tokens(&id, Some("chat"), Some("gpt-4o"), 10, 5, 90, 15)
             .await
             .unwrap();
         store

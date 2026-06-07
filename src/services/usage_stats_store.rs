@@ -115,9 +115,11 @@ impl UsageStatsStore {
         self.stats_ctx.save(&stats).await
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn record_tokens(
         &self,
         key_id: &str,
+        tool: Option<&str>,
         model: Option<&str>,
         prompt_tokens: u64,
         completion_tokens: u64,
@@ -128,6 +130,7 @@ impl UsageStatsStore {
         let mut stats = self.load_with_migration().await?;
         stats.record_tokens(
             key_id,
+            tool,
             model,
             prompt_tokens,
             completion_tokens,
@@ -192,11 +195,11 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let store = test_store(&dir);
         store
-            .record_tokens("key1", Some("gpt-4o"), 100, 50, 80, 10)
+            .record_tokens("key1", Some("amp"), Some("gpt-4o"), 100, 50, 80, 10)
             .await
             .unwrap();
         store
-            .record_tokens("key1", Some("gpt-4o"), 200, 100, 0, 0)
+            .record_tokens("key1", Some("amp"), Some("gpt-4o"), 200, 100, 0, 0)
             .await
             .unwrap();
         let stats = store.load().await.unwrap();
@@ -205,6 +208,12 @@ mod tests {
         assert_eq!(key_stats.completion_tokens, 150);
         assert_eq!(key_stats.total_tokens, 450);
         assert_eq!(key_stats.cache_read_input_tokens, 80);
+        // Per-tool attribution accumulates per (tool, model).
+        let amp = key_stats.per_tool_model_usage.get("amp").unwrap();
+        let model = amp.get("gpt-4o").unwrap();
+        assert_eq!(model.prompt_tokens, 300);
+        assert_eq!(model.completion_tokens, 150);
+        assert_eq!(model.cache_read_input_tokens, 80);
     }
 
     #[tokio::test]
