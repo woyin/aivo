@@ -349,19 +349,27 @@ struct Body {
     content_type: Option<String>,
 }
 
-pub(crate) async fn materialize(source: &str, name: &str, dir: &Path) -> Result<Materialized> {
+/// `quiet` mutes the resolve/asset/download progress lines (used by `update`,
+/// which re-fetches known plugins and reports its own per-plugin result);
+/// warnings and errors are always shown.
+pub(crate) async fn materialize(
+    source: &str,
+    name: &str,
+    dir: &Path,
+    quiet: bool,
+) -> Result<Materialized> {
     std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
     match classify(source)? {
         SourceKind::LocalPath => materialize_local(source, name, dir),
-        SourceKind::DirectUrl => materialize_url(source, name, dir).await,
+        SourceKind::DirectUrl => materialize_url(source, name, dir, quiet).await,
         SourceKind::GitHub { owner, repo, tag } => {
-            materialize_github(&owner, &repo, tag.as_deref(), name, dir).await
+            materialize_github(&owner, &repo, tag.as_deref(), name, dir, quiet).await
         }
         SourceKind::Npm { pkg, version } => {
-            materialize_npm(&pkg, version.as_deref(), name, dir).await
+            materialize_npm(&pkg, version.as_deref(), name, dir, quiet).await
         }
         SourceKind::Cargo { krate, version } => {
-            materialize_cargo(&krate, version.as_deref(), name, dir).await
+            materialize_cargo(&krate, version.as_deref(), name, dir, quiet).await
         }
     }
 }
@@ -383,8 +391,8 @@ fn materialize_local(source: &str, name: &str, dir: &Path) -> Result<Materialize
     })
 }
 
-async fn materialize_url(url: &str, name: &str, dir: &Path) -> Result<Materialized> {
-    let body = download(url).await?;
+async fn materialize_url(url: &str, name: &str, dir: &Path, quiet: bool) -> Result<Materialized> {
+    let body = download(url, quiet).await?;
     let html_ct = body
         .content_type
         .as_deref()
@@ -434,17 +442,20 @@ async fn materialize_github(
     tag: Option<&str>,
     name: &str,
     dir: &Path,
+    quiet: bool,
 ) -> Result<Materialized> {
     let base = env_base("AIVO_GITHUB_API", "https://api.github.com");
     let url = match tag {
         Some(t) => format!("{base}/repos/{owner}/{repo}/releases/tags/{t}"),
         None => format!("{base}/repos/{owner}/{repo}/releases/latest"),
     };
-    eprintln!(
-        "  {} Resolving {} release…",
-        style::dim("·"),
-        style::cyan(format!("{owner}/{repo}"))
-    );
+    if !quiet {
+        eprintln!(
+            "  {} Resolving {} release…",
+            style::dim("·"),
+            style::cyan(format!("{owner}/{repo}"))
+        );
+    }
     let client = http_client(30)?;
     let resp = client
         .get(&url)
@@ -490,8 +501,10 @@ async fn materialize_github(
         .and_then(|a| a.get("browser_download_url"))
         .and_then(|v| v.as_str())
         .context("chosen asset has no download URL")?;
-    eprintln!("  {} {picked}", style::dim("·"));
-    let body = download(asset_url).await?;
+    if !quiet {
+        eprintln!("  {} {picked}", style::dim("·"));
+    }
+    let body = download(asset_url, quiet).await?;
     let checksum = sha(&body.bytes);
     let primary = install_payload(&body.bytes, Some(picked), name, dir)?;
     Ok(Materialized {
@@ -506,6 +519,7 @@ async fn materialize_npm(
     version: Option<&str>,
     name: &str,
     dir: &Path,
+    quiet: bool,
 ) -> Result<Materialized> {
     let base = env_base("AIVO_NPM_REGISTRY", "https://registry.npmjs.org");
     let meta_url = npm_metadata_url(&base, pkg);
@@ -539,8 +553,10 @@ async fn materialize_npm(
         .and_then(|d| d.get("tarball"))
         .and_then(|v| v.as_str())
         .context("npm version missing dist.tarball")?;
-    eprintln!("  {} {pkg}@{ver}", style::dim("·"));
-    let body = download(tarball).await?;
+    if !quiet {
+        eprintln!("  {} {pkg}@{ver}", style::dim("·"));
+    }
+    let body = download(tarball, quiet).await?;
     let checksum = sha(&body.bytes);
 
     let bundle = dir.join(format!("aivo-{name}.d"));
@@ -597,6 +613,7 @@ async fn materialize_cargo(
     version: Option<&str>,
     name: &str,
     dir: &Path,
+    quiet: bool,
 ) -> Result<Materialized> {
     if find_in_dirs("cargo", &collect_path_dirs()).is_none() {
         anyhow::bail!(
@@ -607,11 +624,13 @@ async fn materialize_cargo(
     let _ = std::fs::remove_dir_all(&tmp);
     std::fs::create_dir_all(&tmp).with_context(|| format!("creating {}", tmp.display()))?;
     let _cleanup = CleanupDir(tmp.clone());
-    eprintln!(
-        "  {} cargo install {krate}{}…",
-        style::dim("·"),
-        version.map(|v| format!("@{v}")).unwrap_or_default()
-    );
+    if !quiet {
+        eprintln!(
+            "  {} cargo install {krate}{}…",
+            style::dim("·"),
+            version.map(|v| format!("@{v}")).unwrap_or_default()
+        );
+    }
     let mut cmd = tokio::process::Command::new("cargo");
     cmd.arg("install").arg(krate);
     if let Some(v) = version {
@@ -692,8 +711,10 @@ impl Drop for CleanupDir {
     }
 }
 
-async fn download(url: &str) -> Result<Body> {
-    eprintln!("  {} Downloading {url}", style::dim("·"));
+async fn download(url: &str, quiet: bool) -> Result<Body> {
+    if !quiet {
+        eprintln!("  {} Downloading {url}", style::dim("·"));
+    }
     let client = http_client(180)?;
     let resp = client
         .get(url)

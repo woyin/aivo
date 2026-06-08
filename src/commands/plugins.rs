@@ -268,8 +268,8 @@ async fn install_action(args: PluginInstallArgs) -> Result<ExitCode> {
     let target = dir.join(source::plugin_filename(&name));
     if target.exists() && !args.force {
         anyhow::bail!(
-            "plugin `{name}` is already installed at {}. Pass --force to overwrite.",
-            target.display()
+            "plugin `{name}` is already installed.\n  \
+             Re-fetch it in place with `aivo plugins update {name}`, or pass --force to reinstall (e.g. from a different source)."
         );
     }
 
@@ -281,12 +281,17 @@ async fn install_action(args: PluginInstallArgs) -> Result<ExitCode> {
         .get(&name)
         .map(|r| r.granted_caps.clone())
         .unwrap_or_default();
-    let outcome = reinstall(&name, &source, &dir).await?;
+    let outcome = reinstall_animated(&name, &source, &dir, false, "Installing", false).await?;
 
+    let version = outcome
+        .manifest
+        .as_ref()
+        .map(|m| format!(" v{}", m.version));
     eprintln!(
-        "  {} Installed plugin `{}` — run it with {}",
+        "  {} Installed plugin `{}`{} — run it with {}",
         style::success_symbol(),
         name,
+        version.unwrap_or_default(),
         style::cyan(format!("aivo {name}")),
     );
     eprintln!(
@@ -297,7 +302,13 @@ async fn install_action(args: PluginInstallArgs) -> Result<ExitCode> {
     // Seek consent for any grantable caps the manifest requests, then
     // persist the grant alongside the record.
     let granted = resolve_grants(&name, outcome.manifest.as_ref(), &prior, args.trust);
-    record_install(&name, &source, &outcome, granted.clone());
+    record_install(
+        &name,
+        &source,
+        outcome.checksum.clone(),
+        outcome.manifest.clone(),
+        granted.clone(),
+    );
     print_disclosure(&outcome, &granted);
     ensure_requirements(outcome.manifest.as_ref()).await;
     Ok(ExitCode::Success)
@@ -307,6 +318,7 @@ async fn update_action(args: PluginUpdateArgs) -> Result<ExitCode> {
     let dir = plugins_dir().context("could not resolve ~/.config/aivo/plugins")?;
     let records = registry::load().plugins;
 
+    let update_all = args.name.is_none();
     let targets: Vec<String> = match args.name {
         Some(n) => vec![n.strip_prefix(PLUGIN_PREFIX).unwrap_or(&n).to_string()],
         None => records.keys().cloned().collect(),
@@ -320,46 +332,130 @@ async fn update_action(args: PluginUpdateArgs) -> Result<ExitCode> {
         return Ok(ExitCode::Success);
     }
 
-    let mut any_failed = false;
+    // Announce the scope of a bulk run so interleaved fetch lines have context.
+    if update_all && targets.len() > 1 {
+        eprintln!(
+            "{}",
+            style::dim(format!("Updating {} plugins…", targets.len()))
+        );
+    }
+    // Align names into a column, matching `list`'s layout.
+    let width = targets.iter().map(|n| n.len()).max().unwrap_or(0).min(24);
+
+    let (mut updated, mut unchanged, mut failed) = (0usize, 0usize, 0usize);
     for name in &targets {
-        let Some(source) = records.get(name).map(|r| r.source.clone()) else {
-            any_failed = true;
+        let col = style::cyan(format!("{name:<width$}"));
+        let Some(rec) = records.get(name) else {
+            failed += 1;
             if discover(name).is_some() {
                 eprintln!(
-                    "  {} `{name}`: no recorded source (installed manually or externally) — reinstall with `aivo plugins install <source>`.",
-                    style::yellow("!")
+                    "  {} {col}  {}",
+                    style::red("✗"),
+                    style::dim(
+                        "no recorded source (installed manually) — reinstall with `aivo plugins install <source>`"
+                    )
                 );
             } else {
-                eprintln!("  {} `{name}` is not installed.", style::yellow("!"));
+                eprintln!(
+                    "  {} {col}  {}",
+                    style::red("✗"),
+                    style::dim("not installed")
+                );
             }
             continue;
         };
-        match reinstall(name, &source, &dir).await {
+
+        let source = rec.source.clone();
+        let prior_checksum = rec.checksum.clone();
+        let prior_version = rec.manifest.as_ref().map(|m| m.version.clone());
+        let prior_granted = rec.granted_caps.clone();
+        // Re-probe only a plugin aivo has already run (manifest cached), so the
+        // displayed version/caps refresh in place without executing a never-run
+        // remote binary at update time.
+        let reprobe = rec.manifest.is_some();
+
+        // A spinner animates the fetch (TTY); the per-plugin result line below is
+        // the lasting signal, so the resolve/download chatter stays muted.
+        match reinstall_animated(name, &source, &dir, reprobe, "Updating", true).await {
             Ok(outcome) => {
-                let prior = records
-                    .get(name)
-                    .map(|r| r.granted_caps.clone())
-                    .unwrap_or_default();
-                // Update preserves prior grants; it never auto-escalates.
-                let granted = resolve_grants(name, outcome.manifest.as_ref(), &prior, false);
-                record_install(name, &source, &outcome, granted);
-                eprintln!(
-                    "  {} Updated `{name}` from {}",
-                    style::success_symbol(),
-                    style::dim(&source)
-                );
+                // Carry the cached manifest forward when a re-probe yields nothing
+                // (best-effort probe failed), so update never wipes it.
+                let manifest = outcome.manifest.clone().or_else(|| rec.manifest.clone());
+                // Preserve prior grants; only a newly-requested cap prompts (TTY).
+                let granted = resolve_grants(name, manifest.as_ref(), &prior_granted, false);
+                let new_version = manifest.as_ref().map(|m| m.version.clone());
+                // Same bytes as before → nothing actually changed. A missing pin
+                // (legacy record) is treated as changed, since we can't prove otherwise.
+                let changed = match (&prior_checksum, &outcome.checksum) {
+                    (Some(a), Some(b)) => a != b,
+                    _ => true,
+                };
+                record_install(name, &source, outcome.checksum.clone(), manifest, granted);
+
+                if changed {
+                    updated += 1;
+                    eprintln!(
+                        "  {} {col}  {}  {}",
+                        style::success_symbol(),
+                        version_transition(prior_version.as_deref(), new_version.as_deref()),
+                        style::dim(collapse_tilde(&source)),
+                    );
+                } else {
+                    unchanged += 1;
+                    let v = new_version.map(|v| format!(" · v{v}")).unwrap_or_default();
+                    eprintln!(
+                        "  {} {col}  {}{}",
+                        style::dim("·"),
+                        style::dim("up to date"),
+                        style::dim(v),
+                    );
+                }
             }
             Err(e) => {
-                any_failed = true;
-                eprintln!("  {} `{name}`: {e:#}", style::red("✗"));
+                failed += 1;
+                eprintln!(
+                    "  {} {col}  {}",
+                    style::red("✗"),
+                    style::dim(format!("{e:#}"))
+                );
             }
         }
     }
 
-    if any_failed {
+    if targets.len() > 1 {
+        let parts: Vec<String> = [
+            (updated, "updated"),
+            (unchanged, "unchanged"),
+            (failed, "failed"),
+        ]
+        .into_iter()
+        .filter(|(n, _)| *n > 0)
+        .map(|(n, label)| format!("{n} {label}"))
+        .collect();
+        if !parts.is_empty() {
+            eprintln!();
+            eprintln!("  {}", style::dim(parts.join(" · ")));
+        }
+    }
+
+    if failed > 0 {
         Ok(ExitCode::UserError)
     } else {
         Ok(ExitCode::Success)
+    }
+}
+
+/// Render a plugin's version change for an `update` result line: `vA → vB` when
+/// both are known and differ, the new (or only-known) version otherwise, and a
+/// plain `updated` when no manifest version is available either side.
+fn version_transition(old: Option<&str>, new: Option<&str>) -> String {
+    match (old, new) {
+        (Some(o), Some(n)) if o != n => {
+            format!("v{o} {} {}", style::dim("→"), style::cyan(format!("v{n}")))
+        }
+        (_, Some(n)) => style::cyan(format!("v{n}")),
+        (Some(o), None) => format!("v{o}"),
+        (None, None) => style::dim("updated").to_string(),
     }
 }
 
@@ -439,13 +535,58 @@ struct InstallOutcome {
 }
 
 /// Resolve the source (local path / URL / `github:` / `npm:` / `cargo:`), install
-/// `aivo-<name>` into `dir`, and probe for a manifest. The probe runs for
-/// **local-path installs only** — aivo doesn't execute a freshly-fetched remote
-/// binary at install time just to read its manifest; such plugins are recorded
+/// `aivo-<name>` into `dir`, and probe for a manifest. At install the probe runs
+/// for **local-path installs only** — aivo doesn't execute a freshly-fetched
+/// remote binary just to read its manifest; such plugins are recorded
 /// manifest-less and probed lazily on first dispatch (see `crate::plugin::endpoint`).
-async fn reinstall(name: &str, source: &str, dir: &Path) -> Result<InstallOutcome> {
-    let materialized = source::materialize(source, name, dir).await?;
-    let manifest = if materialized.trusted_local {
+/// `reprobe` lifts that on `update` for a plugin aivo has already run (its
+/// manifest is cached), so the refreshed version/caps are picked up in place —
+/// the trust surface is the same as the next dispatch would be.
+/// `reinstall` with terminal-appropriate progress feedback: an animated spinner
+/// on a TTY — erased when done, leaving only the result line the caller prints —
+/// and discrete `·` lines otherwise. The spinner is skipped for instant local
+/// copies and for `cargo:` builds (cargo prints its own output, which a spinner
+/// would fight). Off-TTY `install` keeps its lines (useful in CI logs); off-TTY
+/// `update` stays silent (it reports its own per-plugin result).
+async fn reinstall_animated(
+    name: &str,
+    source: &str,
+    dir: &Path,
+    reprobe: bool,
+    verb: &str,
+    is_update: bool,
+) -> Result<InstallOutcome> {
+    let tty = std::io::stderr().is_terminal();
+    let kind = source::classify(source).ok();
+    let instant_or_noisy = matches!(
+        kind,
+        Some(SourceKind::LocalPath) | Some(SourceKind::Cargo { .. })
+    );
+    let spin = tty && !instant_or_noisy;
+    // Mute materialize's own lines while a spinner animates, and off-TTY for
+    // `update` (keeping piped output clean); `install` keeps them off-TTY.
+    let quiet = spin || (is_update && !tty && !instant_or_noisy);
+
+    if !spin {
+        return reinstall(name, source, dir, reprobe, quiet).await;
+    }
+    let label = format!(" {verb} {name}…");
+    let (spinning, handle) = style::start_spinner(Some(label.as_str()));
+    let result = reinstall(name, source, dir, reprobe, quiet).await;
+    style::stop_spinner(&spinning);
+    let _ = handle.await;
+    result
+}
+
+async fn reinstall(
+    name: &str,
+    source: &str,
+    dir: &Path,
+    reprobe: bool,
+    quiet: bool,
+) -> Result<InstallOutcome> {
+    let materialized = source::materialize(source, name, dir, quiet).await?;
+    let manifest = if materialized.trusted_local || reprobe {
         probe_manifest(&materialized.primary, name).await
     } else {
         None
@@ -474,13 +615,19 @@ fn canonical_source(source: &str) -> String {
 /// Persist provenance (source + checksum + manifest + timestamp + granted caps)
 /// so `update` can re-fetch and dispatch knows what to hand over. See
 /// `crate::plugin::registry`.
-fn record_install(name: &str, source: &str, outcome: &InstallOutcome, granted_caps: Vec<String>) {
+fn record_install(
+    name: &str,
+    source: &str,
+    checksum: Option<String>,
+    manifest: Option<PluginManifest>,
+    granted_caps: Vec<String>,
+) {
     registry::record(
         name,
         PluginRecord {
             source: source.to_string(),
-            checksum: outcome.checksum.clone(),
-            manifest: outcome.manifest.clone(),
+            checksum,
+            manifest,
             installed_at: Some(Utc::now().to_rfc3339()),
             granted_caps,
         },
@@ -640,6 +787,23 @@ mod tests {
             transcripts: None,
             requires: Vec::new(),
         }
+    }
+
+    #[test]
+    fn version_transition_renders_each_case() {
+        // Both known and differ → an arrowed transition carrying both versions.
+        let t = version_transition(Some("1.0.0"), Some("1.1.0"));
+        assert!(
+            t.contains("1.0.0") && t.contains("1.1.0") && t.contains('→'),
+            "{t}"
+        );
+        // Only the new version known → just the new version.
+        assert!(version_transition(None, Some("2.0.0")).contains("2.0.0"));
+        // Bytes changed but the version string is identical → show it once, no arrow.
+        let same = version_transition(Some("1.0.0"), Some("1.0.0"));
+        assert!(same.contains("1.0.0") && !same.contains('→'), "{same}");
+        // No version either side → a plain "updated".
+        assert!(version_transition(None, None).contains("updated"));
     }
 
     #[test]
