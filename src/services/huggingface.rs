@@ -27,6 +27,11 @@ const DEFAULT_QUANT: &str = "Q4_K_M";
 const HF_URL_PREFIX: &str = "https://huggingface.co/";
 const HF_SHORT_PREFIX: &str = "hf:";
 
+/// Synthetic key id for the local llama-server takeover, shared by `aivo run`,
+/// `aivo serve`, and plugin dispatch so all three build — and recognize — the
+/// same loopback key.
+pub const HF_LOCAL_KEY_ID: &str = "aivo-hf-local";
+
 fn child_slot() -> &'static Mutex<Option<Child>> {
     SERVER_CHILD.get_or_init(|| Mutex::new(None))
 }
@@ -623,6 +628,41 @@ async fn check_health(client: &reqwest::Client, port: u16) -> bool {
 
 pub fn local_openai_base_url(port: u16) -> String {
     format!("http://127.0.0.1:{port}/v1")
+}
+
+/// Build the synthetic loopback `ApiKey` for an already-spawned llama-server on
+/// `port` serving `hf_ref`. The local server is OpenAI Chat Completions-only for
+/// every consumer, so claude/gemini are pinned off their native protocols (codex
+/// is already OpenAI-native) to skip the wasted first-attempt probe, and the
+/// codex/opencode routers are forced into OpenAI mode. Shared by `aivo run` and
+/// plugin dispatch so both reach the local server identically.
+pub fn local_takeover_key(
+    hf_ref: &HfModelRef,
+    port: u16,
+) -> crate::services::session_store::ApiKey {
+    use crate::services::session_store::{ApiKey, OpenAICompatibilityMode};
+    let mut k = ApiKey::new_with_protocol(
+        HF_LOCAL_KEY_ID.to_string(),
+        format!("hf:{}", hf_ref.repo),
+        local_openai_base_url(port),
+        None,
+        "huggingface".to_string(),
+    );
+    for tool in ["claude", "gemini"] {
+        k.protocol_routes
+            .entry(tool.to_string())
+            .or_default()
+            .insert(
+                String::new(),
+                crate::services::route_cache::PersistedRoute {
+                    protocol: "openai".to_string(),
+                    path_variant: String::new(),
+                },
+            );
+    }
+    k.codex_mode = Some(OpenAICompatibilityMode::Router);
+    k.opencode_mode = Some(OpenAICompatibilityMode::Router);
+    k
 }
 
 /// Cache-first: skips the HF tree API call when the file is already on

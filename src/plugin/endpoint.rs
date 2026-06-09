@@ -67,15 +67,36 @@ pub(crate) async fn dispatch(name: &str, bin: &Path, args: &[String], store: &Se
     } else {
         super::debug_log_path(args)
     };
-    let (key_flag, model_flag, plugin_args): (Option<String>, Option<String>, Vec<String>) =
+    let (key_flag, model_flag, mut plugin_args): (Option<String>, Option<String>, Vec<String>) =
         if plan.is_coding_agent {
             (flags.key, flags.model, flags.rest)
         } else {
             (flags.key.filter(|s| !s.is_empty()), None, args.to_vec())
         };
 
-    let key_was_explicit = key_flag.is_some();
-    let key = resolve_plugin_key(store, key_flag.as_deref(), plan.is_coding_agent).await;
+    // HF/local-gguf takeover (coding-agent only): an `hf:`/gguf model — passed via
+    // `-m hf:…` or positionally as `aivo <plugin> hf:…` — is served by a local
+    // llama-server, not the active key. Spawn it, synthesize the loopback key, and
+    // strip a positional ref from the wrapped tool's argv (it can't read `hf:`; the
+    // model reaches it through the endpoint). Mirrors `aivo run`'s takeover.
+    let hf = if plan.is_coding_agent {
+        match take_hf_takeover(model_flag.as_deref(), &mut plugin_args).await {
+            Ok(h) => h,
+            Err(e) => {
+                eprintln!("  {} {e:#}", style::red("Error:"));
+                return 1;
+            }
+        }
+    } else {
+        None
+    };
+
+    // The takeover owns the key + model when active; otherwise resolve as usual.
+    let key_was_explicit = hf.is_none() && key_flag.is_some();
+    let key = match &hf {
+        Some(h) => Some(h.key.clone()),
+        None => resolve_plugin_key(store, key_flag.as_deref(), plan.is_coding_agent).await,
+    };
     let serve = key.as_ref().map(plugin_serve);
     let servable = serve.is_some_and(PluginServe::is_servable);
 
@@ -88,11 +109,15 @@ pub(crate) async fn dispatch(name: &str, bin: &Path, args: &[String], store: &Se
     // forces the model picker after key selection, otherwise the picker opens
     // once and the choice is remembered. OAuth is Blocked; Cursor is servable
     // only through the coding-agent Cursor router.
-    let model = match key.as_ref() {
-        Some(k) if plan.is_coding_agent && servable => {
-            resolve_plugin_model(store, k, model_request, model_flag_was_explicit).await
-        }
-        _ => model_request,
+    let model = match &hf {
+        // The takeover already resolved the served model.
+        Some(h) => Some(h.model.clone()),
+        None => match key.as_ref() {
+            Some(k) if plan.is_coding_agent && servable => {
+                resolve_plugin_model(store, k, model_request, model_flag_was_explicit).await
+            }
+            _ => model_request,
+        },
     };
 
     // A coding-agent plugin launched with an explicit `-k` records that key as
@@ -213,6 +238,11 @@ pub(crate) async fn dispatch(name: &str, bin: &Path, args: &[String], store: &Se
     }
     if let Some(ep) = endpoint {
         ep.shutdown().await;
+    }
+    // Stop the llama-server an hf takeover auto-started: the plugin path exits via
+    // `process::exit` and never reaches run.rs's global `stop_if_we_started`.
+    if hf.is_some() {
+        crate::services::huggingface::stop_if_we_started();
     }
     code
 }
@@ -385,6 +415,62 @@ fn plugin_model_request(model_flag: Option<String>, key_was_explicit: bool) -> O
     match (model_flag, key_was_explicit) {
         (None, true) => Some(String::new()),
         (other, _) => other,
+    }
+}
+
+/// A stood-up hf/local-gguf takeover: the synthetic loopback key bound to the
+/// local llama-server, plus the served model's display name.
+struct HfTakeover {
+    key: ApiKey,
+    model: String,
+}
+
+/// Detect and stand up an `hf:`/local-gguf takeover for a coding-agent plugin.
+/// The ref is an explicit `-m hf:…`, else the first positional `hf:`/gguf arg —
+/// lifted out of `plugin_args` since the wrapped tool can't interpret it. Spawns
+/// the local llama-server and returns the synthetic loopback key + served model.
+/// `Ok(None)` when the invocation carries no hf ref.
+async fn take_hf_takeover(
+    model_flag: Option<&str>,
+    plugin_args: &mut Vec<String>,
+) -> anyhow::Result<Option<HfTakeover>> {
+    use crate::services::huggingface as hf;
+
+    let Some(raw) = take_hf_ref(model_flag, plugin_args) else {
+        return Ok(None);
+    };
+
+    // Bare `hf:` opens the cached-model picker; resolve it to a concrete ref.
+    let raw = if hf::is_bare_hf_picker_trigger(&raw) {
+        match hf::pick_cached_short_ref() {
+            Some(short) => short,
+            None => std::process::exit(0),
+        }
+    } else {
+        raw
+    };
+
+    let hf_ref = hf::parse_hf_ref(&raw)?;
+    let port = hf::ensure_ready(&hf_ref).await?;
+    Ok(Some(HfTakeover {
+        key: hf::local_takeover_key(&hf_ref, port),
+        model: hf_ref.display_model_name(),
+    }))
+}
+
+/// The hf/gguf ref for a coding-agent invocation, or `None`. An explicit `-m`
+/// wins entirely (an `hf:` value takes over; a normal model suppresses any
+/// positional lift); otherwise the first positional `hf:`/gguf arg is lifted out
+/// of `plugin_args` (parity with `aivo run`'s positional-hf lifting in `cli_args`).
+fn take_hf_ref(model_flag: Option<&str>, plugin_args: &mut Vec<String>) -> Option<String> {
+    use crate::services::huggingface::is_hf_or_local_gguf;
+    match model_flag {
+        Some(m) if is_hf_or_local_gguf(m) => Some(m.to_string()),
+        Some(_) => None,
+        None => {
+            let idx = plugin_args.iter().position(|a| is_hf_or_local_gguf(a))?;
+            Some(plugin_args.remove(idx))
+        }
     }
 }
 
@@ -676,6 +762,11 @@ const PLUGIN_ROUTE_TOOL: &str = "plugin";
 fn use_responses_router(key: &ApiKey) -> bool {
     use crate::services::provider_profile::{is_ollama_base, provider_profile_for_key};
     use crate::services::provider_protocol::ProviderProtocol;
+    // The hf-local llama-server speaks only OpenAI Chat Completions (like Ollama),
+    // so keep it on ServeRouter — never probe `/v1/responses` against it.
+    if key.id == crate::services::huggingface::HF_LOCAL_KEY_ID {
+        return false;
+    }
     if key.is_copilot() {
         return true;
     }
@@ -828,13 +919,14 @@ async fn finish_accounting(store: &SessionStore, acct: Accounting, code: i32) {
 mod tests {
     use super::{
         HelpKind, PluginServe, help_kind, missing_grants, plugin_model_request, plugin_serve,
-        retained_grants, use_responses_router,
+        retained_grants, take_hf_ref, use_responses_router,
     };
     use crate::plugin::manifest::grantable_capabilities;
     use crate::services::claude_oauth::CLAUDE_OAUTH_SENTINEL;
     use crate::services::codex_oauth::CODEX_OAUTH_SENTINEL;
     use crate::services::cursor_acp::CURSOR_ACP_SENTINEL;
     use crate::services::gemini_oauth::GEMINI_OAUTH_SENTINEL;
+    use crate::services::huggingface::{HF_LOCAL_KEY_ID, HfModelRef, local_takeover_key};
     use crate::services::session_store::ApiKey;
 
     fn key(base: &str) -> ApiKey {
@@ -933,5 +1025,64 @@ mod tests {
             "an explicit -m value still wins"
         );
         assert!(plugin_model_request(None, false).is_none());
+    }
+
+    fn args(items: &[&str]) -> Vec<String> {
+        items.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn take_hf_ref_prefers_explicit_model_flag() {
+        // `-m hf:…` is the ref; positional args are left untouched.
+        let mut rest = args(&["-p", "hi"]);
+        assert_eq!(
+            take_hf_ref(Some("hf:owner/repo"), &mut rest).as_deref(),
+            Some("hf:owner/repo")
+        );
+        assert_eq!(rest, args(&["-p", "hi"]));
+        // A normal `-m` suppresses any positional lift entirely.
+        let mut rest = args(&["hf:owner/repo"]);
+        assert!(take_hf_ref(Some("gpt-4o"), &mut rest).is_none());
+        assert_eq!(rest, args(&["hf:owner/repo"]));
+    }
+
+    #[test]
+    fn take_hf_ref_lifts_positional_out_of_argv() {
+        // `aivo <plugin> hf:…` with no `-m`: the ref is lifted out of the argv so
+        // the wrapped tool never sees the (uninterpretable) `hf:` token.
+        let mut rest = args(&["hf:owner/repo", "explain this"]);
+        assert_eq!(
+            take_hf_ref(None, &mut rest).as_deref(),
+            Some("hf:owner/repo")
+        );
+        assert_eq!(rest, args(&["explain this"]));
+        // A `.gguf` path is lifted the same way.
+        let mut rest = args(&["./model.gguf"]);
+        assert_eq!(
+            take_hf_ref(None, &mut rest).as_deref(),
+            Some("./model.gguf")
+        );
+        assert!(rest.is_empty());
+        // No hf ref anywhere → no takeover, argv unchanged.
+        let mut rest = args(&["just", "a", "prompt"]);
+        assert!(take_hf_ref(None, &mut rest).is_none());
+        assert_eq!(rest, args(&["just", "a", "prompt"]));
+    }
+
+    #[test]
+    fn hf_local_key_stays_on_serve_router() {
+        // The synthetic llama-server key speaks only OpenAI Chat Completions, so it
+        // must use ServeRouter (not the responses router that probes /v1/responses).
+        let hf_ref = HfModelRef {
+            repo: "DevQuasar/google.gemma-4-E2B".to_string(),
+            quant: None,
+            file: None,
+            revision: None,
+            local_source: None,
+        };
+        let hf_key = local_takeover_key(&hf_ref, 12345);
+        assert_eq!(hf_key.id, HF_LOCAL_KEY_ID);
+        assert_eq!(plugin_serve(&hf_key), PluginServe::Serve);
+        assert!(!use_responses_router(&hf_key));
     }
 }
