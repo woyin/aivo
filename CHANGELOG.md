@@ -1,5 +1,15 @@
 # Changelog
 
+## v0.27.1
+
+- feat(plugins): native transcript export for `aivo share` (a46a772)
+- feat(plugins): `--dry-run` preview + unified model memory for coding-agent plugins (4effa54)
+- feat(plugins): serve `hf:`/local-gguf models to coding-agent plugins (f029895)
+- feat(plugins): guide users to install the amp plugin instead of erroring (623cac8)
+- feat(plugins): report real update outcomes with a fetch spinner (31b988a)
+- docs(plugins): reconcile the protocol doc with shipped endpoint behavior (5ca103c)
+
+
 ## v0.27.0
 
 - feat(plugins): typed plugins + capability-gated key/endpoint handoff (33734f6)
