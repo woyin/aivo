@@ -251,7 +251,7 @@ impl ModelsCommand {
             Ok(code) => code,
             Err(e) => {
                 eprintln!("{}", style::yellow(e.to_string()));
-                ExitCode::UserError
+                crate::errors::exit_code_for_error(&e)
             }
         }
     }

@@ -45,7 +45,7 @@ impl PluginsCommand {
             Ok(code) => code,
             Err(e) => {
                 eprintln!("{} {:#}", style::red("Error:"), e);
-                ExitCode::UserError
+                crate::errors::exit_code_for_error(&e)
             }
         }
     }

@@ -70,7 +70,7 @@ impl StatsCommand {
             Ok(s) => s,
             Err(e) => {
                 eprintln!("{} {}", style::red("Error:"), e);
-                return ExitCode::UserError;
+                return crate::errors::exit_code_for_error(&e);
             }
         };
 

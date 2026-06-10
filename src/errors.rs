@@ -38,16 +38,24 @@ impl fmt::Display for ExitCode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ErrorCategory {
     User,
-    #[allow(dead_code)]
     Network,
     Auth,
+}
+
+impl ErrorCategory {
+    pub fn exit_code(self) -> ExitCode {
+        match self {
+            ErrorCategory::User => ExitCode::UserError,
+            ErrorCategory::Network => ExitCode::NetworkError,
+            ErrorCategory::Auth => ExitCode::AuthError,
+        }
+    }
 }
 
 /// CLI error with category for exit code mapping.
 #[derive(Debug)]
 pub struct CLIError {
     message: String,
-    #[allow(dead_code)] // used in binary crate's error handling
     category: ErrorCategory,
     details: Option<String>,
     suggestion: Option<String>,
@@ -67,6 +75,30 @@ impl CLIError {
             suggestion: suggestion.map(|s| s.into()),
         }
     }
+
+    pub fn exit_code(&self) -> ExitCode {
+        self.category.exit_code()
+    }
+}
+
+/// Exit code for an error chain at a command boundary: a wrapped [`CLIError`]
+/// supplies its category (network → 2, auth → 3); a transport-level reqwest
+/// failure (connect/timeout) anywhere in the chain maps to network; anything
+/// else is a user error (1). Keeps the documented exit-code contract honest
+/// without every call site re-classifying.
+pub fn exit_code_for_error(err: &anyhow::Error) -> ExitCode {
+    if let Some(cli) = err.chain().find_map(|c| c.downcast_ref::<CLIError>()) {
+        return cli.exit_code();
+    }
+    let is_transport = err.chain().any(|cause| {
+        cause
+            .downcast_ref::<reqwest::Error>()
+            .is_some_and(|e| e.is_connect() || e.is_timeout())
+    });
+    if is_transport {
+        return ExitCode::NetworkError;
+    }
+    ExitCode::UserError
 }
 
 impl fmt::Display for CLIError {
@@ -153,6 +185,39 @@ mod tests {
         );
         let display = err.to_string();
         assert_eq!(display, "Simple error");
+    }
+
+    #[test]
+    fn exit_code_for_error_maps_cli_error_categories() {
+        for (category, expected) in [
+            (ErrorCategory::User, ExitCode::UserError),
+            (ErrorCategory::Network, ExitCode::NetworkError),
+            (ErrorCategory::Auth, ExitCode::AuthError),
+        ] {
+            let err: anyhow::Error =
+                CLIError::new("boom", category, None::<String>, None::<String>).into();
+            assert_eq!(exit_code_for_error(&err), expected, "{category:?}");
+        }
+    }
+
+    #[test]
+    fn exit_code_for_error_survives_anyhow_context() {
+        use anyhow::Context;
+        let err: anyhow::Error = CLIError::new(
+            "no key",
+            ErrorCategory::Auth,
+            None::<String>,
+            None::<String>,
+        )
+        .into();
+        let wrapped = Err::<(), _>(err).context("while launching").unwrap_err();
+        assert_eq!(exit_code_for_error(&wrapped), ExitCode::AuthError);
+    }
+
+    #[test]
+    fn exit_code_for_error_defaults_to_user_error() {
+        let err = anyhow::anyhow!("something else");
+        assert_eq!(exit_code_for_error(&err), ExitCode::UserError);
     }
 
     #[test]

@@ -411,7 +411,7 @@ pub async fn run() -> ! {
                         Ok(updated) => Some(updated),
                         Err(e) => {
                             eprintln!("{} {e}", style::red("Error:"));
-                            process::exit(ExitCode::UserError.code());
+                            process::exit(crate::errors::exit_code_for_error(&e).code());
                         }
                     }
                 } else {
@@ -599,7 +599,7 @@ pub async fn run() -> ! {
                     Ok(r) => r,
                     Err(e) => {
                         eprintln!("{} {}", style::red("Error:"), e);
-                        process::exit(ExitCode::UserError.code());
+                        process::exit(crate::errors::exit_code_for_error(&e).code());
                     }
                 };
                 match services::huggingface::ensure_ready(&hf_ref).await {
@@ -643,7 +643,7 @@ pub async fn run() -> ! {
                     Ok(KeyResolution::MissingAuth) => None,
                     Err(e) => {
                         eprintln!("{} {}", style::red("Error:"), e);
-                        process::exit(ExitCode::UserError.code());
+                        process::exit(crate::errors::exit_code_for_error(&e).code());
                     }
                 }
             };
