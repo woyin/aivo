@@ -511,6 +511,18 @@ fn convert_content_blocks(
                 "content": content,
             }));
         }
+        // Text sharing the message (interrupt notes, system reminders) must
+        // follow the tool messages — a user message between an assistant
+        // tool_calls turn and its results breaks pairing on strict upstreams
+        // (DeepSeek).
+        if !text_parts.is_empty() {
+            let content = if any_text_has_cache_control {
+                Value::Array(text_parts_with_cache)
+            } else {
+                Value::String(text_parts.join("\n"))
+            };
+            messages.push(json!({"role": role, "content": content}));
+        }
     } else if !tool_calls.is_empty() {
         // Per OpenAI spec, content must be null (not "") when tool_calls is
         // present without text. Strict OpenAI-compatible providers reject the
@@ -794,6 +806,29 @@ mod tests {
                 "image_url": {"url": "data:image/png;base64,abc"},
             })
         );
+    }
+
+    #[test]
+    fn tool_result_sibling_text_survives_and_follows_tool_messages() {
+        let body = json!({
+            "model": "claude-sonnet-4-5",
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "[Request interrupted by user]"},
+                    {"type": "tool_result", "tool_use_id": "toolu_1", "content": "ok"}
+                ]
+            }]
+        });
+        let req = convert_anthropic_to_openai_request(&body, &test_config());
+        let msgs = req["messages"].as_array().unwrap();
+        assert_eq!(msgs.len(), 2);
+        // Tool message first regardless of block order — a user message
+        // before it would detach the result from its tool_calls turn.
+        assert_eq!(msgs[0]["role"], "tool");
+        assert_eq!(msgs[0]["tool_call_id"], "toolu_1");
+        assert_eq!(msgs[1]["role"], "user");
+        assert_eq!(msgs[1]["content"], "[Request interrupted by user]");
     }
 
     #[test]

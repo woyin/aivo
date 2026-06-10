@@ -97,6 +97,9 @@ pub fn convert_openai_chat_to_anthropic_request(
     let mut messages: Vec<Value> = Vec::new();
 
     if let Some(msgs) = body.get("messages").and_then(|m| m.as_array()) {
+        // Whether the last entry pushed to `messages` is the user message
+        // accumulating tool_results for the current run of tool messages.
+        let mut prev_was_tool = false;
         for msg in msgs {
             let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or("user");
             match role {
@@ -104,9 +107,27 @@ pub fn convert_openai_chat_to_anthropic_request(
                     system_blocks.extend(extract_openai_anthropic_text_blocks(msg.get("content")));
                 }
                 "assistant" => messages.push(openai_assistant_to_anthropic(msg)),
-                "tool" => messages.push(openai_tool_to_anthropic(msg)),
+                "tool" => {
+                    // A parallel-tool turn arrives as consecutive tool
+                    // messages; Anthropic wants all their tool_results in the
+                    // single user message after the assistant turn, and strict
+                    // Anthropic-compat upstreams (DeepSeek /anthropic) 400 on
+                    // the split one-result-per-message form.
+                    let block = openai_tool_result_block(msg);
+                    match messages.last_mut() {
+                        Some(prev) if prev_was_tool => {
+                            if let Some(content) =
+                                prev.get_mut("content").and_then(|c| c.as_array_mut())
+                            {
+                                content.push(block);
+                            }
+                        }
+                        _ => messages.push(json!({"role": "user", "content": [block]})),
+                    }
+                }
                 _ => messages.push(openai_user_to_anthropic(msg, role)),
             }
+            prev_was_tool = role == "tool";
         }
     }
 
@@ -662,15 +683,11 @@ fn openai_assistant_to_anthropic(msg: &Value) -> Value {
     })
 }
 
-fn openai_tool_to_anthropic(msg: &Value) -> Value {
-    let content = extract_openai_text(msg.get("content"));
+fn openai_tool_result_block(msg: &Value) -> Value {
     json!({
-        "role": "user",
-        "content": [{
-            "type": "tool_result",
-            "tool_use_id": msg.get("tool_call_id").cloned().unwrap_or(json!("")),
-            "content": content
-        }]
+        "type": "tool_result",
+        "tool_use_id": msg.get("tool_call_id").cloned().unwrap_or(json!("")),
+        "content": extract_openai_text(msg.get("content"))
     })
 }
 
@@ -861,6 +878,69 @@ mod tests {
             "tool_result"
         );
         assert_eq!(converted["tools"][0]["name"], "ls");
+    }
+
+    #[test]
+    fn test_convert_openai_chat_to_anthropic_request_coalesces_parallel_tool_results() {
+        let body = json!({
+            "model": "gpt-4o",
+            "messages": [
+                {"role": "assistant", "content": null, "tool_calls": [
+                    {"id": "call_a", "type": "function", "function": {"name": "fa", "arguments": "{}"}},
+                    {"id": "call_b", "type": "function", "function": {"name": "fb", "arguments": "{}"}}
+                ]},
+                {"role": "tool", "tool_call_id": "call_a", "content": "A done"},
+                {"role": "tool", "tool_call_id": "call_b", "content": "B done"},
+                {"role": "user", "content": "next"}
+            ]
+        });
+
+        let converted = convert_openai_chat_to_anthropic_request(
+            &body,
+            &OpenAIToAnthropicChatConfig {
+                default_model: "gpt-4o",
+            },
+        );
+        let msgs = converted["messages"].as_array().unwrap();
+        assert_eq!(msgs.len(), 3);
+        assert_eq!(msgs[1]["role"], "user");
+        let results = msgs[1]["content"].as_array().unwrap();
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0]["tool_use_id"], "call_a");
+        assert_eq!(results[0]["content"], "A done");
+        assert_eq!(results[1]["tool_use_id"], "call_b");
+        assert_eq!(results[1]["content"], "B done");
+        assert_eq!(msgs[2]["role"], "user");
+    }
+
+    #[test]
+    fn test_convert_openai_chat_to_anthropic_request_keeps_sequential_tool_turns_separate() {
+        let body = json!({
+            "model": "gpt-4o",
+            "messages": [
+                {"role": "assistant", "content": null, "tool_calls": [
+                    {"id": "call_a", "type": "function", "function": {"name": "fa", "arguments": "{}"}}
+                ]},
+                {"role": "tool", "tool_call_id": "call_a", "content": "A done"},
+                {"role": "assistant", "content": null, "tool_calls": [
+                    {"id": "call_b", "type": "function", "function": {"name": "fb", "arguments": "{}"}}
+                ]},
+                {"role": "tool", "tool_call_id": "call_b", "content": "B done"}
+            ]
+        });
+
+        let converted = convert_openai_chat_to_anthropic_request(
+            &body,
+            &OpenAIToAnthropicChatConfig {
+                default_model: "gpt-4o",
+            },
+        );
+        let msgs = converted["messages"].as_array().unwrap();
+        assert_eq!(msgs.len(), 4);
+        assert_eq!(msgs[1]["content"].as_array().unwrap().len(), 1);
+        assert_eq!(msgs[1]["content"][0]["tool_use_id"], "call_a");
+        assert_eq!(msgs[3]["content"].as_array().unwrap().len(), 1);
+        assert_eq!(msgs[3]["content"][0]["tool_use_id"], "call_b");
     }
 
     #[test]
