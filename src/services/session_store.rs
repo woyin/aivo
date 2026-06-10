@@ -1207,9 +1207,7 @@ pub(crate) struct ConfigContext {
 impl ConfigContext {
     pub(crate) fn acquire_config_lock(&self) -> Result<ConfigLockGuard> {
         if !self.config_dir.as_os_str().is_empty() {
-            std::fs::create_dir_all(&self.config_dir).with_context(|| {
-                format!("Failed to create config directory: {:?}", self.config_dir)
-            })?;
+            crate::services::atomic_write::ensure_private_dir_blocking(&self.config_dir)?;
         }
         ConfigLockGuard::acquire(&self.config_dir.join("config.lock"))
     }
@@ -1218,9 +1216,7 @@ impl ConfigContext {
     /// Keys must already be encrypted before calling this.
     /// Uses atomic write (write to temp file then rename) to prevent corruption.
     pub(crate) async fn save_raw(&self, config: &StoredConfig) -> Result<()> {
-        tokio::fs::create_dir_all(&self.config_dir)
-            .await
-            .with_context(|| format!("Failed to create config directory: {:?}", self.config_dir))?;
+        crate::services::atomic_write::ensure_private_dir(&self.config_dir).await?;
 
         let data = serde_json::to_string_pretty(config).context("Failed to serialize config")?;
         atomic_write_secure(&self.config_path, data.into_bytes()).await

@@ -358,8 +358,9 @@ async fn write_cache(path: &Path, cache: &StatsCache) -> Result<()> {
         fs::create_dir_all(parent).await?;
     }
     let data = serde_json::to_string(cache)?;
-    fs::write(path, data).await?;
-    Ok(())
+    // Atomic rename: concurrent aivo processes refresh this cache; a plain
+    // write could interleave and leave torn JSON.
+    crate::services::atomic_write::atomic_write_secure(path, data.into_bytes()).await
 }
 
 // ---------------------------------------------------------------------------

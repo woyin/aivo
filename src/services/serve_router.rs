@@ -734,6 +734,12 @@ impl StreamUsageSniffer {
                 self.seen = true;
             }
         }
+        // Sniffing is best-effort: a pathological newline-less stream must not
+        // grow this buffer without bound, so give up rather than hold it.
+        if self.pending.len() > http_utils::MAX_SSE_PENDING_BYTES {
+            self.pending = String::new();
+            self.enabled = false;
+        }
     }
 
     pub(crate) fn finish(self) -> Option<TokenUsage> {
@@ -1341,6 +1347,18 @@ mod tests {
     use crate::services::session_store::ApiKey;
     use http::Response as HttpResponse;
     use serde_json::json;
+
+    #[test]
+    fn usage_sniffer_disables_on_oversized_partial_line() {
+        let mut sniffer = StreamUsageSniffer::new(true);
+        // A newline-less stream larger than the cap must disable sniffing
+        // instead of buffering forever.
+        let big = vec![b'x'; http_utils::MAX_SSE_PENDING_BYTES + 1];
+        sniffer.observe(&big);
+        assert!(!sniffer.is_enabled());
+        sniffer.observe(b"data: {\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1}}\n");
+        assert!(sniffer.finish().is_none());
+    }
 
     fn test_key() -> ApiKey {
         ApiKey::new_with_protocol(

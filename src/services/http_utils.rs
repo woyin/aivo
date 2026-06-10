@@ -437,6 +437,14 @@ pub fn http_chunked_response_head_with_extra(
     )
 }
 
+/// OOM backstop for SSE partial-line buffers: complete lines drain as they
+/// arrive, so the buffer only ever holds one trailing partial line, and no
+/// legitimate single SSE line (even a `response.completed` carrying a full
+/// response object) approaches this. An upstream streaming endless bytes
+/// without a newline would otherwise grow the buffer without bound —
+/// converters abort the stream, observers stop observing.
+pub(crate) const MAX_SSE_PENDING_BYTES: usize = 16 * 1024 * 1024;
+
 /// Formats a single chunk for HTTP chunked transfer encoding.
 /// Returns empty vec for empty input.
 pub fn format_http_chunk(chunk: &[u8]) -> Vec<u8> {

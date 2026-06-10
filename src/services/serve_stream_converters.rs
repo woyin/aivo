@@ -120,6 +120,11 @@ impl AnthropicToOpenAIStreamConverter {
         while let Some(line) = drain_sse_line(&mut self.pending) {
             self.process_line(&line, &mut output)?;
         }
+        anyhow::ensure!(
+            self.pending.len() <= crate::services::http_utils::MAX_SSE_PENDING_BYTES,
+            "upstream SSE line exceeded {} bytes without a newline",
+            crate::services::http_utils::MAX_SSE_PENDING_BYTES
+        );
 
         Ok(output)
     }
@@ -504,6 +509,11 @@ impl GeminiToOpenAIStreamConverter {
         while let Some(line) = drain_sse_line(&mut self.pending) {
             self.process_line(&line, &mut output)?;
         }
+        anyhow::ensure!(
+            self.pending.len() <= crate::services::http_utils::MAX_SSE_PENDING_BYTES,
+            "upstream SSE line exceeded {} bytes without a newline",
+            crate::services::http_utils::MAX_SSE_PENDING_BYTES
+        );
 
         Ok(output)
     }

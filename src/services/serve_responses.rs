@@ -84,6 +84,11 @@ impl OpenAIToResponsesStreamConverter {
             self.pending = self.pending[pos + 1..].to_string();
             self.process_line(&line, &mut output)?;
         }
+        anyhow::ensure!(
+            self.pending.len() <= crate::services::http_utils::MAX_SSE_PENDING_BYTES,
+            "upstream SSE line exceeded {} bytes without a newline",
+            crate::services::http_utils::MAX_SSE_PENDING_BYTES
+        );
 
         Ok(output)
     }

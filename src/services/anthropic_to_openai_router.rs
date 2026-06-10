@@ -1460,6 +1460,12 @@ impl OpenAIStreamConverter {
             self.pending.drain(..=pos);
             self.process_line(line.trim_end_matches('\r'), &mut output)?;
         }
+        anyhow::ensure!(
+            self.pending.len() <= http_utils::MAX_SSE_PENDING_BYTES,
+            "upstream SSE line exceeded {} bytes without a newline",
+            http_utils::MAX_SSE_PENDING_BYTES
+        );
+
         Ok(output)
     }
 

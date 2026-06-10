@@ -979,6 +979,11 @@ impl ResponsesStreamConverter {
             self.pending.drain(..=pos);
             self.process_line(line.trim_end_matches('\r'), &mut out);
         }
+        // OOM backstop: a newline-less upstream can't be converted anyway;
+        // drop the oversized partial line instead of buffering it forever.
+        if self.pending.len() > crate::services::http_utils::MAX_SSE_PENDING_BYTES {
+            self.pending = Vec::new();
+        }
         out
     }
 
@@ -1607,6 +1612,11 @@ impl ResponsesToChatStreamConverter {
             let line = String::from_utf8_lossy(&self.pending[..pos]).into_owned();
             self.pending.drain(..=pos);
             self.process_line(line.trim_end_matches('\r'), &mut out);
+        }
+        // OOM backstop: a newline-less upstream can't be converted anyway;
+        // drop the oversized partial line instead of buffering it forever.
+        if self.pending.len() > crate::services::http_utils::MAX_SSE_PENDING_BYTES {
+            self.pending = Vec::new();
         }
         out
     }
