@@ -917,7 +917,7 @@ fn print_help_json() {
             { "alias": "share", "expands_to": ["logs", "share"] },
             { "alias": "-p", "expands_to": ["chat", "-p"] },
             { "alias": "-x", "expands_to": ["chat", "-x"], "deprecated": true, "replaced_by": "-p" },
-            { "alias": "<text>", "expands_to": ["chat", "-p", "<text>"], "note": "Any non-subcommand, non-flag top-level arg → one-shot chat prompt" },
+            { "alias": "<text>", "expands_to": ["chat", "-p", "<text>"], "note": "Top-level arg that can't be a command name (whitespace, uppercase, punctuation, non-ASCII) → one-shot chat prompt; bare [a-z0-9-] words fall through as subcommands" },
             { "alias": "hf:<ref> | http(s)://<url>", "expands_to": ["chat", "<ref>"], "note": "Top-level HF/URL arg → chat with that model" },
             { "alias": "claude", "expands_to": ["run", "claude"] },
             { "alias": "codex", "expands_to": ["run", "codex"] },

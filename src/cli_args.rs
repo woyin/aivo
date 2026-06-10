@@ -71,119 +71,40 @@ pub(crate) fn rewrite_cli_args(
         return expand_bundle(&raw_args[0], bundle, &raw_args[2..]);
     }
 
-    // Bare-prompt shortcut. After tool/subcommand/bundle matches have failed,
-    // a top-level non-flag arg is interpreted as input to `chat`:
-    //   `aivo hf:Qwen/...` / `aivo https://...` → `aivo chat <ref>`
+    // Bare-prompt shortcut. After tool/subcommand/bundle/plugin matches have
+    // failed, a top-level non-flag arg is interpreted as input to `chat`:
+    //   `aivo hf:Qwen/...` / `aivo https://...`      → `aivo chat <ref>`
     //     (chat's positional REF; opens TUI with that model)
-    //   `aivo "hello world"` / `aivo hello`     → `aivo chat -p <text>`
+    //   `aivo "tell me a story"` / `aivo 你好` / `aivo hi?` → `aivo chat -p <text>`
     //     (one-shot prompt; trailing args pass through to chat)
-    // Reserved subcommand names (chat, keys, models, ...) and clap's built-in
-    // `help` fall through so real subcommands stay reachable. A typo gate
-    // (`looks_like_subcommand_typo`) also falls through inputs that are one
-    // edit away from a known subcommand so clap can surface "did you mean
-    // 'chat'?" instead of silently sending the typo to the AI.
+    // A bare `[a-z0-9-]` word is never a prompt: it falls through to clap's
+    // "unrecognized subcommand" with did-you-mean (this also keeps reserved
+    // names and clap's built-in `help` reachable — all are shaped). The shell
+    // strips quotes, so `aivo "hello"` is indistinguishable from `aivo hello`
+    // and gets the same treatment; use `-p` to force a one-word prompt.
+    // Embedded whitespace (only producible via quoting), uppercase,
+    // punctuation, or non-ASCII marks a prompt.
     let first = raw_args[1].as_str();
-    if !first.starts_with('-') && !RESERVED_ALIAS_NAMES.contains(&first) && first != "help" {
-        if first.starts_with("hf:") || first.starts_with("http://") || first.starts_with("https://")
-        {
-            let mut rewritten = vec![raw_args[0].clone(), "chat".to_string()];
-            rewritten.extend_from_slice(&raw_args[1..]);
-            return rewritten;
-        }
-        // Short subcommand-shaped tokens (`aivo a`, `aivo hi`, `aivo abc`) are
-        // almost always typos or unknown commands, not real prompts. Fall
-        // through to clap so the user sees "unrecognized subcommand" with
-        // did-you-mean suggestions. Use explicit `-p` to force a short
-        // prompt: `aivo -p hi`. Punctuated / capitalized inputs (`hi?`,
-        // `Hi`) and any non-ASCII input (`aivo 你`, `aivo 你好`) bypass this
-        // gate via `is_subcommand_shaped` — they're clearly prompt-shaped
-        // regardless of length, since aivo's own command names are all
-        // ASCII lowercase.
-        if first.chars().count() < 4 && is_subcommand_shaped(first) {
-            return raw_args;
-        }
-        if looks_like_subcommand_typo(first) {
-            return raw_args;
-        }
-        let mut rewritten = vec![raw_args[0].clone(), "chat".to_string(), "-p".to_string()];
+    if first.starts_with('-') || is_subcommand_shaped(first) {
+        return raw_args;
+    }
+    if first.starts_with("hf:") || first.starts_with("http://") || first.starts_with("https://") {
+        let mut rewritten = vec![raw_args[0].clone(), "chat".to_string()];
         rewritten.extend_from_slice(&raw_args[1..]);
         return rewritten;
     }
-
-    raw_args
-}
-
-/// Returns true when `s` is plausibly a typo for a known top-level subcommand
-/// or tool name — Damerau-Levenshtein distance ≤ 1 (one edit OR one adjacent
-/// transposition) against the union of `RESERVED_ALIAS_NAMES`, `KNOWN_TOOLS`,
-/// and clap's built-in `help`. Used to gate the bare-prompt rewrite so
-/// `aivo chta` / `aivo kyes` reach clap's "did you mean" suggestion instead
-/// of silently becoming chat prompts.
-///
-/// Inputs that don't look subcommand-shaped — anything shorter than 3 chars,
-/// or containing characters other than `[a-z0-9-]` — bypass the gate entirely.
-/// That keeps short prompts (`hi`, `yo`) and punctuated prompts (`hi?`, `1+1`)
-/// out of the false-positive zone, where most typo candidates live.
-///
-/// Known false positives at distance ≤ 1: prompts like `what` (1 from `chat`)
-/// and `runs` (1 from `run`) fall through to clap. Users who hit this can
-/// type `aivo -p what` or quote a multi-word prompt to bypass.
-fn looks_like_subcommand_typo(s: &str) -> bool {
-    if s.chars().count() < 3 {
-        return false;
-    }
-    if !is_subcommand_shaped(s) {
-        return false;
-    }
-    RESERVED_ALIAS_NAMES
-        .iter()
-        .copied()
-        .chain(KNOWN_TOOLS.iter().copied())
-        .chain(std::iter::once("help"))
-        .any(|name| damerau_levenshtein_at_most_one(s, name))
+    let mut rewritten = vec![raw_args[0].clone(), "chat".to_string(), "-p".to_string()];
+    rewritten.extend_from_slice(&raw_args[1..]);
+    rewritten
 }
 
 /// True when `s` looks like a subcommand name — only `[a-z0-9-]` chars.
-/// Used to scope the short-token rejection and the typo gate to inputs
-/// that *could* plausibly be a misspelled command; anything with
-/// uppercase or punctuation is treated as prompt-shaped.
+/// Gates the bare-prompt rewrite: anything with whitespace, uppercase,
+/// punctuation, or non-ASCII can't be a command name and is prompt-shaped.
 fn is_subcommand_shaped(s: &str) -> bool {
     !s.is_empty()
         && s.chars()
             .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
-}
-
-/// Damerau-Levenshtein distance check bounded at 1. Returns true iff `a` and
-/// `b` are equal, differ by one insert/delete/substitute, or differ by one
-/// adjacent transposition. Linear in `max(len(a), len(b))` — we only need to
-/// know "≤ 1", not the exact distance, so we avoid the full DP table.
-fn damerau_levenshtein_at_most_one(a: &str, b: &str) -> bool {
-    let a: Vec<char> = a.chars().collect();
-    let b: Vec<char> = b.chars().collect();
-    let (la, lb) = (a.len(), b.len());
-    if la.abs_diff(lb) > 1 {
-        return false;
-    }
-    // Walk in parallel to the first mismatch; classify the single allowed edit
-    // by length parity, then verify the suffixes match.
-    let mut i = 0;
-    while i < la && i < lb && a[i] == b[i] {
-        i += 1;
-    }
-    if i == la && i == lb {
-        return true; // exact match
-    }
-    match la.cmp(&lb) {
-        std::cmp::Ordering::Equal => {
-            // Substitution at i, or transposition of a[i]/a[i+1].
-            if i + 1 < la && a[i] == b[i + 1] && a[i + 1] == b[i] {
-                return a[i + 2..] == b[i + 2..];
-            }
-            a[i + 1..] == b[i + 1..]
-        }
-        std::cmp::Ordering::Less => a[i..] == b[i + 1..], // insertion in b
-        std::cmp::Ordering::Greater => a[i + 1..] == b[i..], // deletion in b
-    }
 }
 
 /// Builds the final argv for a Bundle launch:
@@ -1498,20 +1419,29 @@ mod tests {
     }
 
     #[test]
-    fn rewrite_treats_single_word_unknown_as_prompt() {
-        // `aivo hello` (no quotes/spaces) also becomes a one-shot prompt —
-        // the shell collapses `aivo "hello"` to the same argv, so the bare
-        // and quoted forms must behave identically.
-        assert_eq!(
-            rewrite_cli_args(args(&["aivo", "hello"]), &no_bundles()),
-            args(&["aivo", "chat", "-p", "hello"])
-        );
+    fn rewrite_bare_word_falls_through_to_clap() {
+        // A bare `[a-z0-9-]` word is never a prompt — short tokens, typos
+        // (`chta`), and real words (`hello`, `what`) all reach clap's
+        // "unrecognized subcommand" with did-you-mean. The shell collapses
+        // `aivo "hello"` to the same argv, so the quoted form necessarily
+        // behaves identically; `-p` forces a one-word prompt.
+        for s in [
+            "a", "ab", "hi", "yo", "hello", "what", "runs", "chta", "kyes", "claud", "logz",
+            "modls", "gpt-4o",
+        ] {
+            assert_eq!(
+                rewrite_cli_args(args(&["aivo", s]), &no_bundles()),
+                args(&["aivo", s]),
+                "expected `aivo {s}` to fall through to clap",
+            );
+        }
     }
 
     #[test]
     fn rewrite_leaves_reserved_subcommand_unchanged() {
         // `aivo chat`, `aivo keys`, etc. must reach clap as real subcommands,
-        // not get rewritten to `chat -p chat`. RESERVED_ALIAS_NAMES guards this.
+        // not get rewritten to `chat -p chat`. All reserved names are
+        // `[a-z0-9-]`, so the bare-word gate covers them.
         assert_eq!(
             rewrite_cli_args(args(&["aivo", "chat"]), &no_bundles()),
             args(&["aivo", "chat"])
@@ -1524,8 +1454,8 @@ mod tests {
 
     #[test]
     fn rewrite_leaves_help_subcommand_unchanged() {
-        // `help` is clap-generated and not in RESERVED_ALIAS_NAMES, so it
-        // needs an explicit pass-through to remain reachable.
+        // `help` is clap-generated and not in RESERVED_ALIAS_NAMES; the
+        // bare-word gate keeps it reachable.
         assert_eq!(
             rewrite_cli_args(args(&["aivo", "help"]), &no_bundles()),
             args(&["aivo", "help"])
@@ -1533,46 +1463,22 @@ mod tests {
     }
 
     #[test]
-    fn rewrite_typo_gate_passes_through_close_typos() {
-        // One-edit / one-transposition away from a real subcommand → fall
-        // through so clap can suggest "did you mean 'chat'?".
-        for typo in ["chta", "kyes", "claud", "logz", "modls"] {
-            assert_eq!(
-                rewrite_cli_args(args(&["aivo", typo]), &no_bundles()),
-                args(&["aivo", typo]),
-                "expected `aivo {typo}` to fall through to clap",
-            );
-        }
-    }
-
-    #[test]
-    fn rewrite_short_subcommand_shaped_falls_through_to_clap() {
-        // Short lowercase tokens (< 4 chars) are almost always typos or
-        // unknown commands. Fall through so clap can suggest a real one
-        // instead of silently sending the typo to the model. Use `-p` to
-        // force a short prompt.
-        for s in ["a", "ab", "abc", "hi", "yo"] {
-            assert_eq!(
-                rewrite_cli_args(args(&["aivo", s]), &no_bundles()),
-                args(&["aivo", s]),
-                "expected `aivo {s}` to fall through to clap",
-            );
-        }
-    }
-
-    #[test]
-    fn rewrite_short_input_with_trailing_args_still_falls_through() {
-        // First-token check: even with more args, a short opaque first
-        // token gets rejected. Matches the typo gate's first-arg-only rule.
+    fn rewrite_bare_word_with_trailing_args_still_falls_through() {
+        // First-token check: even with more args, a bare first word gets
+        // rejected — unquoted multi-word prompts must be quoted or use `-p`.
         assert_eq!(
             rewrite_cli_args(args(&["aivo", "a", "b", "c"]), &no_bundles()),
             args(&["aivo", "a", "b", "c"]),
         );
+        assert_eq!(
+            rewrite_cli_args(args(&["aivo", "tell", "me", "a", "story"]), &no_bundles()),
+            args(&["aivo", "tell", "me", "a", "story"]),
+        );
     }
 
     #[test]
-    fn rewrite_short_input_with_explicit_p_still_works() {
-        // `-p` is parsed before the bare-prompt branch — the length gate
+    fn rewrite_bare_word_with_explicit_p_still_works() {
+        // `-p` is parsed before the bare-prompt branch — the bare-word gate
         // never fires when the user is explicit about intent.
         assert_eq!(
             rewrite_cli_args(args(&["aivo", "-p", "a"]), &no_bundles()),
@@ -1581,11 +1487,10 @@ mod tests {
     }
 
     #[test]
-    fn rewrite_short_non_ascii_input_is_still_a_prompt() {
-        // Single Chinese/Japanese/Korean/emoji/Cyrillic characters can be
-        // complete meaningful prompts. They bypass the length gate via
-        // `is_subcommand_shaped` (which requires `[a-z0-9-]`-only), so
-        // `chars().count()` being 1 doesn't matter.
+    fn rewrite_non_ascii_input_is_a_prompt() {
+        // Chinese/Japanese/Korean/emoji/Cyrillic prompts contain no spaces
+        // even as full sentences. They bypass the bare-word gate via
+        // `is_subcommand_shaped` (which requires `[a-z0-9-]`-only).
         for s in ["你", "你好", "こんにちは", "안녕", "привет", "🎉", "1你"] {
             assert_eq!(
                 rewrite_cli_args(args(&["aivo", s]), &no_bundles()),
@@ -1598,8 +1503,8 @@ mod tests {
     #[test]
     fn rewrite_short_bundle_alias_still_expands() {
         // `aivo a` where `a` is a registered Bundle alias must still
-        // expand — the bundle lookup at line 77 runs before the length
-        // gate, so registered aliases win.
+        // expand — the bundle lookup runs before the bare-word gate, so
+        // registered aliases win.
         let bundles = one_bundle("a", "claude", &["--key", "work"]);
         assert_eq!(
             rewrite_cli_args(args(&["aivo", "a"]), &bundles),
@@ -1608,11 +1513,9 @@ mod tests {
     }
 
     #[test]
-    fn rewrite_typo_gate_skips_punctuated_inputs() {
-        // Anything that isn't `[a-z0-9-]` skips both the typo gate and the
-        // short-token gate — punctuation/uppercase is a strong signal that
-        // this is a prompt, not a typo'd subcommand. Even short inputs
-        // (`hi?`, `Hi`) pass through to chat.
+    fn rewrite_punctuated_or_uppercase_input_is_a_prompt() {
+        // Anything that isn't `[a-z0-9-]` can't be a command name —
+        // punctuation/uppercase marks a prompt, even one word.
         for s in ["hi?", "Hello", "Hi", "1+1"] {
             assert_eq!(
                 rewrite_cli_args(args(&["aivo", s]), &no_bundles()),
@@ -1620,15 +1523,6 @@ mod tests {
                 "expected `aivo {s}` to be treated as a prompt",
             );
         }
-    }
-
-    #[test]
-    fn rewrite_typo_gate_does_not_catch_distant_words() {
-        // `hello` is 2+ edits from any subcommand → still rewritten as prompt.
-        assert_eq!(
-            rewrite_cli_args(args(&["aivo", "hello"]), &no_bundles()),
-            args(&["aivo", "chat", "-p", "hello"])
-        );
     }
 
     #[test]
