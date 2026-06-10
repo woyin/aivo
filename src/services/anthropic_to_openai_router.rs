@@ -1987,6 +1987,22 @@ mod tests {
     }
 
     #[test]
+    fn test_anthropic_to_openai_strips_sampling_for_rejecting_models() {
+        // o3 rejects temperature/top_p — forwarding them 400s upstream.
+        let body = json!({
+            "model": "o3",
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 128,
+            "temperature": 0.2,
+            "top_p": 0.9
+        });
+        let req = anthropic_to_openai(&body, false).unwrap();
+        assert!(req.get("temperature").is_none());
+        assert!(req.get("top_p").is_none());
+        assert_eq!(req["max_tokens"], 128);
+    }
+
+    #[test]
     fn test_cap_max_tokens_field_caps_numeric_value() {
         let mut req = json!({"model": "gpt-4o", "max_tokens": 12000});
         cap_max_tokens_field(&mut req, Some(8192));

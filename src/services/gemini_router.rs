@@ -553,7 +553,11 @@ pub fn convert_gemini_to_openai(
 
     // generationConfig → OpenAI fields
     if let Some(gc) = body.get("generationConfig") {
-        if let Some(t) = gc.get("temperature") {
+        // Sampling params dropped for models that reject them (o-series etc.).
+        let rejects_sampling = crate::services::model_metadata::rejects_temperature(model);
+        if let Some(t) = gc.get("temperature")
+            && !rejects_sampling
+        {
             req["temperature"] = t.clone();
         }
         if let Some(mt) = gc.get("maxOutputTokens") {
@@ -566,7 +570,9 @@ pub fn convert_gemini_to_openai(
             };
             req["max_tokens"] = val;
         }
-        if let Some(tp) = gc.get("topP") {
+        if let Some(tp) = gc.get("topP")
+            && !rejects_sampling
+        {
             req["top_p"] = tp.clone();
         }
     }

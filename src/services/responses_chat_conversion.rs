@@ -269,9 +269,16 @@ pub fn convert_responses_to_chat_request(
     {
         chat["max_tokens"] = cap_token_value(v, config.max_tokens_cap);
     }
-    for field in ["temperature", "top_p"] {
-        if let Some(v) = body.get(field) {
-            chat[field] = v.clone();
+    // Dropped for models that reject sampling params (o-series etc.) —
+    // forwarding them turns into upstream 400s.
+    let rejects_sampling = chat["model"]
+        .as_str()
+        .is_some_and(crate::services::model_metadata::rejects_temperature);
+    if !rejects_sampling {
+        for field in ["temperature", "top_p"] {
+            if let Some(v) = body.get(field) {
+                chat[field] = v.clone();
+            }
         }
     }
 
@@ -2075,6 +2082,29 @@ mod tests {
         assert_eq!(msgs[0]["role"], "assistant");
         assert_eq!(msgs[0]["tool_calls"][0]["id"], "call_x");
         assert_eq!(msgs[0]["reasoning_content"], "step by step plan");
+    }
+
+    #[test]
+    fn test_convert_request_strips_sampling_for_rejecting_models() {
+        // o3 rejects temperature/top_p — forwarding them 400s upstream.
+        let body = json!({
+            "model": "o3",
+            "input": [{"role": "user", "content": "hi"}],
+            "temperature": 0.2,
+            "top_p": 0.9
+        });
+        let chat = convert_responses_to_chat_request(&body, &default_test_config());
+        assert!(chat.get("temperature").is_none());
+        assert!(chat.get("top_p").is_none());
+
+        // Normal models keep them.
+        let body = json!({
+            "model": "deepseek-chat",
+            "input": [{"role": "user", "content": "hi"}],
+            "temperature": 0.2
+        });
+        let chat = convert_responses_to_chat_request(&body, &default_test_config());
+        assert_eq!(chat["temperature"], 0.2);
     }
 
     #[test]

@@ -284,11 +284,15 @@ pub fn convert_anthropic_to_openai_request(
     if let Some(mt) = body.get("max_tokens") {
         req["max_tokens"] = mt.clone();
     }
-    if let Some(t) = body.get("temperature") {
-        req["temperature"] = t.clone();
-    }
-    if let Some(tp) = body.get("top_p") {
-        req["top_p"] = tp.clone();
+    // o-series / forced-reasoning models reject sampling params outright —
+    // forwarding them turns into upstream 400s.
+    if !crate::services::model_metadata::rejects_temperature(&model) {
+        if let Some(t) = body.get("temperature") {
+            req["temperature"] = t.clone();
+        }
+        if let Some(tp) = body.get("top_p") {
+            req["top_p"] = tp.clone();
+        }
     }
     if let Some(ss) = body.get("stop_sequences") {
         req["stop"] = ss.clone();

@@ -379,11 +379,14 @@ fn anthropic_to_responses(body: &Value) -> Value {
     if let Some(v) = body.get("max_tokens") {
         req["max_output_tokens"] = v.clone();
     }
-    if let Some(v) = body.get("temperature") {
-        req["temperature"] = v.clone();
-    }
-    if let Some(v) = body.get("top_p") {
-        req["top_p"] = v.clone();
+    // Dropped for models that reject sampling params (o-series etc.).
+    if !crate::services::model_metadata::rejects_temperature(model) {
+        if let Some(v) = body.get("temperature") {
+            req["temperature"] = v.clone();
+        }
+        if let Some(v) = body.get("top_p") {
+            req["top_p"] = v.clone();
+        }
     }
 
     // Tools: input_schema → parameters. Drop Anthropic server-side tools

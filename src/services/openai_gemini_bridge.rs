@@ -481,14 +481,17 @@ pub fn convert_openai_chat_to_gemini_request(body: &Value, config: &OpenAIToGemi
     if let Some(v) = body.get("max_tokens") {
         generation.insert("maxOutputTokens".to_string(), v.clone());
     }
-    if let Some(v) = body.get("temperature") {
-        generation.insert("temperature".to_string(), v.clone());
-    }
-    if let Some(v) = body.get("top_p") {
-        generation.insert("topP".to_string(), v.clone());
-    }
-    if let Some(v) = body.get("top_k") {
-        generation.insert("topK".to_string(), v.clone());
+    // Dropped for models that reject sampling params (o-series etc.).
+    if !crate::services::model_metadata::rejects_temperature(&request_model) {
+        if let Some(v) = body.get("temperature") {
+            generation.insert("temperature".to_string(), v.clone());
+        }
+        if let Some(v) = body.get("top_p") {
+            generation.insert("topP".to_string(), v.clone());
+        }
+        if let Some(v) = body.get("top_k") {
+            generation.insert("topK".to_string(), v.clone());
+        }
     }
     if let Some(v) = body.get("seed") {
         generation.insert("seed".to_string(), v.clone());
