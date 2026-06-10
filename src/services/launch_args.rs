@@ -1406,7 +1406,8 @@ mod tests {
         let (_dir, cache) = empty_cache();
         let slugs = vec![
             "gemini-3-flash-preview".to_string(),
-            "deepseek-v4-flash".to_string(),
+            "kimi-k2.6".to_string(),
+            "step-3.5-flash-2603".to_string(),
             "glm-4.7".to_string(),
         ];
         let mut limits = HashMap::new();
@@ -1429,12 +1430,16 @@ mod tests {
         // Publishes minimal,low,medium,high.
         assert_eq!(levels(0), ["minimal", "low", "medium", "high"]);
         assert_eq!(parsed["models"][0]["default_reasoning_level"], "medium");
-        // Publishes high,max — `max` filtered to codex-safe values.
-        assert_eq!(levels(1), ["high"]);
-        assert_eq!(parsed["models"][1]["default_reasoning_level"], "high");
+        // Publishes none,minimal,low,medium,high,xhigh,max — filtered to
+        // codex-safe values.
+        assert_eq!(levels(1), ["minimal", "low", "medium", "high"]);
+        assert_eq!(parsed["models"][1]["default_reasoning_level"], "medium");
+        // Publishes low,high — no medium, so the default falls to the last.
+        assert_eq!(levels(2), ["low", "high"]);
+        assert_eq!(parsed["models"][2]["default_reasoning_level"], "high");
         // Publishes nothing → unchanged hardcoded fallback.
-        assert_eq!(levels(2), ["low", "medium", "high"]);
-        assert_eq!(parsed["models"][2]["default_reasoning_level"], "medium");
+        assert_eq!(levels(3), ["low", "medium", "high"]);
+        assert_eq!(parsed["models"][3]["default_reasoning_level"], "medium");
     }
 
     #[test]
