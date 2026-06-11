@@ -24,10 +24,15 @@ pub struct AnthropicRouterConfig {
 
 pub struct AnthropicRouter {
     config: AnthropicRouterConfig,
+    /// Per-launch loopback token; `Some` rejects requests without it so other
+    /// local processes can't spend the key through this router. On the router
+    /// (not config) so existing config literals stay untouched.
+    expected_token: Option<String>,
 }
 
 struct AnthropicRouterState {
     config: Arc<AnthropicRouterConfig>,
+    expected_token: Option<String>,
     client: reqwest::Client,
     /// Set to true when the provider rejects `anthropic-beta` headers.
     /// Once learned, the header is stripped from all future requests.
@@ -56,7 +61,16 @@ enum AnthropicRoute {
 
 impl AnthropicRouter {
     pub fn new(config: AnthropicRouterConfig) -> Self {
-        Self { config }
+        Self {
+            config,
+            expected_token: None,
+        }
+    }
+
+    /// Requires loopback clients to present this token (Bearer/x-api-key).
+    pub fn with_auth_token(mut self, token: String) -> Self {
+        self.expected_token = Some(token);
+        self
     }
 
     /// Binds to a random available port and starts the router in the background.
@@ -65,6 +79,7 @@ impl AnthropicRouter {
         let (listener, port) = http_utils::bind_local_listener().await?;
         let state = AnthropicRouterState {
             config: Arc::new(self.config.clone()),
+            expected_token: self.expected_token.clone(),
             client: router_http_client(),
             beta_header_rejected: Arc::new(AtomicBool::new(false)),
         };
@@ -77,6 +92,7 @@ async fn run_router(listener: tokio::net::TcpListener, state: AnthropicRouterSta
     loop {
         let (mut socket, _) = listener.accept().await?;
         let config = state.config.clone();
+        let expected_token = state.expected_token.clone();
         let client = state.client.clone();
         let beta_header_rejected = state.beta_header_rejected.clone();
 
@@ -93,6 +109,18 @@ async fn run_router(listener: tokio::net::TcpListener, state: AnthropicRouterSta
             };
 
             let request = String::from_utf8_lossy(&request_bytes);
+
+            if let Some(expected) = expected_token.as_deref()
+                && !http_utils::request_loopback_authorized(&request, expected)
+            {
+                let response = http_utils::http_error_response(
+                    401,
+                    "Invalid or missing auth token (expected Authorization: Bearer or x-api-key)",
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+                return;
+            }
+
             let path = http_utils::extract_request_path(&request);
             let path = path.split('?').next().unwrap_or("");
             let method_is_post = request.starts_with("POST ");

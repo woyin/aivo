@@ -51,6 +51,9 @@ pub struct GeminiRouter {
     /// Per-model routes learned for `gemini` (`""` = default), seeding the
     /// `RouteCache`. On the router (not config) so test literals stay untouched.
     seed_routes: BTreeMap<String, PersistedRoute>,
+    /// Per-launch loopback token; `Some` rejects requests without it so other
+    /// local processes can't spend the key through this router.
+    expected_token: Option<String>,
 }
 
 enum ForwardResult {
@@ -64,6 +67,7 @@ enum ForwardResult {
 
 struct GeminiRouterState {
     config: Arc<GeminiRouterConfig>,
+    expected_token: Option<String>,
     client: Arc<reqwest::Client>,
     /// Per-(model) learned routes; the cascade reads/writes the resolved slot's
     /// atom and `slot.confirm()` marks authoritative outcomes for write-behind.
@@ -79,11 +83,19 @@ impl GeminiRouter {
         Self {
             config,
             seed_routes: BTreeMap::new(),
+            expected_token: None,
         }
     }
 
     pub fn with_seed_routes(mut self, seed_routes: BTreeMap<String, PersistedRoute>) -> Self {
         self.seed_routes = seed_routes;
+        self
+    }
+
+    /// Requires loopback clients to present this token
+    /// (Bearer/x-api-key/x-goog-api-key/?key=).
+    pub fn with_auth_token(mut self, token: String) -> Self {
+        self.expected_token = Some(token);
         self
     }
 
@@ -113,6 +125,7 @@ impl GeminiRouter {
         let learned_requires_reasoning = Arc::new(AtomicBool::new(false));
         let state = GeminiRouterState {
             config: Arc::new(self.config.clone()),
+            expected_token: self.expected_token.clone(),
             client: Arc::new(http_utils::router_http_client()),
             route_cache: route_cache.clone(),
             learned_requires_reasoning: learned_requires_reasoning.clone(),
@@ -125,6 +138,14 @@ impl GeminiRouter {
 }
 
 async fn handle_router_request(request: String, state: Arc<GeminiRouterState>) -> String {
+    if let Some(expected) = state.expected_token.as_deref()
+        && !http_utils::request_loopback_authorized(&request, expected)
+    {
+        return http_utils::http_error_response(
+            401,
+            "Invalid or missing auth token (expected Authorization: Bearer or x-api-key)",
+        );
+    }
     match handle_request(
         &request,
         &state.config,

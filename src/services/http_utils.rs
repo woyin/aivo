@@ -180,6 +180,33 @@ pub fn request_bearer_authorized(request: &str, expected: &str) -> bool {
         || header_value(head, "x-api-key") == Some(expected)
 }
 
+/// Launch-router auth gate: like [`request_bearer_authorized`] but also
+/// accepts `x-goog-api-key: <expected>` and a `?key=<expected>` query
+/// parameter — the forms Google SDKs (Gemini CLI) send their key in.
+pub fn request_loopback_authorized(request: &str, expected: &str) -> bool {
+    if request_bearer_authorized(request, expected) {
+        return true;
+    }
+    let headers_end = request.find("\r\n\r\n").unwrap_or(request.len());
+    let head = &request[..headers_end];
+    if header_value(head, "x-goog-api-key") == Some(expected) {
+        return true;
+    }
+    request_line_query_param(request, "key") == Some(expected)
+}
+
+/// Value of `name` in the request-line query string, if present.
+fn request_line_query_param<'a>(request: &'a str, name: &str) -> Option<&'a str> {
+    let line_end = request.find("\r\n").unwrap_or(request.len());
+    let target = request[..line_end].split_whitespace().nth(1)?;
+    let query = target.split_once('?')?.1;
+    query.split('&').find_map(|pair| {
+        pair.split_once('=')
+            .filter(|(k, _)| *k == name)
+            .map(|(_, v)| v)
+    })
+}
+
 /// Parses Content-Length from HTTP headers (case-insensitive).
 pub fn parse_content_length(headers: &str) -> Option<usize> {
     header_value(headers, "content-length").and_then(|v| v.parse().ok())
@@ -855,6 +882,42 @@ pub fn copilot_initiator_from_openai(body: &Value) -> &'static str {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn test_request_loopback_authorized_forms() {
+        let req = |extra: &str, path: &str| {
+            format!("POST {path} HTTP/1.1\r\nHost: x\r\n{extra}Content-Length: 2\r\n\r\n{{}}")
+        };
+        let tok = "tok123";
+        assert!(request_loopback_authorized(
+            &req("Authorization: Bearer tok123\r\n", "/v1/messages"),
+            tok
+        ));
+        assert!(request_loopback_authorized(
+            &req("x-api-key: tok123\r\n", "/v1/messages"),
+            tok
+        ));
+        assert!(request_loopback_authorized(
+            &req(
+                "x-goog-api-key: tok123\r\n",
+                "/v1beta/models/m:generateContent"
+            ),
+            tok
+        ));
+        assert!(request_loopback_authorized(
+            &req("", "/v1beta/models/m:generateContent?alt=sse&key=tok123"),
+            tok
+        ));
+        assert!(!request_loopback_authorized(&req("", "/v1/messages"), tok));
+        assert!(!request_loopback_authorized(
+            &req("Authorization: Bearer wrong\r\n", "/v1/messages"),
+            tok
+        ));
+        // A `key=` in the body must not satisfy the gate.
+        let body_smuggle =
+            "POST /v1/messages HTTP/1.1\r\nHost: x\r\nContent-Length: 10\r\n\r\nkey=tok123";
+        assert!(!request_loopback_authorized(body_smuggle, tok));
+    }
 
     #[test]
     fn test_find_header_end() {

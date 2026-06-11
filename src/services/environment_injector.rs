@@ -93,6 +93,12 @@ pub struct ClaudeModelOverrides {
 /// "set" → API-key mode).
 pub(crate) const AIVO_INTERNAL_ENV_UNSET: &str = "_AIVO_INTERNAL_ENV_UNSET";
 
+/// Per-launch loopback auth token carrier. The same value is injected as the
+/// child's API key, read by `launch_runtime` into each router's
+/// `expected_token`, then stripped before spawn — so the child holds only the
+/// token and the real upstream key stays router-side.
+pub(crate) const AIVO_ROUTER_AUTH_TOKEN: &str = "AIVO_ROUTER_AUTH_TOKEN";
+
 /// Slots Claude Code reads to pick the model for each routing class. aivo
 /// fans the user's `--model` value out to all of them so the chosen model
 /// wins everywhere. `ANTHROPIC_SMALL_FAST_MODEL` is intentionally absent —
@@ -172,6 +178,10 @@ impl EnvironmentInjector {
             key.key.to_string()
         };
 
+        // The child authenticates to aivo's loopback router with a per-launch
+        // token; the real key never enters the child env (Direct mode aside).
+        let loopback_token = crate::services::serve_router::random_auth_token();
+
         let mut env = HashMap::new();
         match mode {
             ConnectionMode::Ollama => {
@@ -179,7 +189,8 @@ impl EnvironmentInjector {
                     cfg.base_url_env.to_string(),
                     PLACEHOLDER_LOOPBACK_URL.to_string(),
                 );
-                env.insert(cfg.auth_env.to_string(), "ollama".to_string());
+                env.insert(cfg.auth_env.to_string(), loopback_token.clone());
+                env.insert(AIVO_ROUTER_AUTH_TOKEN.to_string(), loopback_token);
                 env.insert(cfg.router_flag.to_string(), "1".to_string());
                 env.insert(
                     format!("{}_API_KEY", cfg.router_prefix),
@@ -199,7 +210,8 @@ impl EnvironmentInjector {
                     cfg.base_url_env.to_string(),
                     PLACEHOLDER_LOOPBACK_URL.to_string(),
                 );
-                env.insert(cfg.auth_env.to_string(), "copilot".to_string());
+                env.insert(cfg.auth_env.to_string(), loopback_token.clone());
+                env.insert(AIVO_ROUTER_AUTH_TOKEN.to_string(), loopback_token);
                 env.insert(cfg.copilot_flag.to_string(), "1".to_string());
                 env.insert("AIVO_COPILOT_GITHUB_TOKEN".to_string(), key.key.to_string());
             }
@@ -208,7 +220,8 @@ impl EnvironmentInjector {
                     cfg.base_url_env.to_string(),
                     PLACEHOLDER_LOOPBACK_URL.to_string(),
                 );
-                env.insert(cfg.auth_env.to_string(), auth_value.clone());
+                env.insert(cfg.auth_env.to_string(), loopback_token.clone());
+                env.insert(AIVO_ROUTER_AUTH_TOKEN.to_string(), loopback_token);
                 env.insert("AIVO_USE_ROUTER".to_string(), "1".to_string());
                 env.insert("AIVO_ROUTER_API_KEY".to_string(), auth_value);
                 env.insert("AIVO_ROUTER_BASE_URL".to_string(), resolved_base_url);
@@ -227,7 +240,8 @@ impl EnvironmentInjector {
                     cfg.base_url_env.to_string(),
                     PLACEHOLDER_LOOPBACK_URL.to_string(),
                 );
-                env.insert(cfg.auth_env.to_string(), auth_value.clone());
+                env.insert(cfg.auth_env.to_string(), loopback_token.clone());
+                env.insert(AIVO_ROUTER_AUTH_TOKEN.to_string(), loopback_token);
                 env.insert(cfg.router_flag.to_string(), "1".to_string());
                 env.insert(format!("{}_API_KEY", cfg.router_prefix), auth_value);
                 env.insert(format!("{}_BASE_URL", cfg.router_prefix), resolved_base_url);
@@ -289,7 +303,9 @@ impl EnvironmentInjector {
             PLACEHOLDER_LOOPBACK_URL.to_string(),
         );
         if let Some(auth_env) = auth_env {
-            env.insert(auth_env.to_string(), "aivo-cursor".to_string());
+            let loopback_token = crate::services::serve_router::random_auth_token();
+            env.insert(auth_env.to_string(), loopback_token.clone());
+            env.insert(AIVO_ROUTER_AUTH_TOKEN.to_string(), loopback_token);
         }
         env
     }
@@ -309,6 +325,8 @@ impl EnvironmentInjector {
             "AIVO_CURSOR_KEY_SECRET".to_string(),
             key.key.as_str().to_string(),
         );
+        let loopback_token = crate::services::serve_router::random_auth_token();
+        env.insert(AIVO_ROUTER_AUTH_TOKEN.to_string(), loopback_token.clone());
 
         let mut provider = Map::new();
         provider.insert("npm".to_string(), json!("@ai-sdk/openai-compatible"));
@@ -317,7 +335,7 @@ impl EnvironmentInjector {
             "options".to_string(),
             json!({
                 "baseURL": PLACEHOLDER_LOOPBACK_URL,
-                "apiKey": "aivo-cursor",
+                "apiKey": loopback_token,
             }),
         );
 
@@ -808,6 +826,7 @@ impl EnvironmentInjector {
         // For Ollama, connect directly — OpenCode speaks OpenAI-compatible natively.
         // For GitHub Copilot, the base_url is the magic string "copilot" — not a real URL.
         // Use a placeholder that ai_launcher will overwrite with the actual CopilotRouter port.
+        let loopback_token = crate::services::serve_router::random_auth_token();
         let (base_url, api_key) = if profile.kind == ProviderKind::Ollama {
             (ollama_openai_base_url(), "ollama".to_string())
         } else if profile.serve_flags.is_copilot {
@@ -816,8 +835,10 @@ impl EnvironmentInjector {
                 "1".to_string(),
             );
             env.insert("AIVO_COPILOT_GITHUB_TOKEN".to_string(), key.key.to_string());
-            (PLACEHOLDER_LOOPBACK_URL.to_string(), "copilot".to_string())
+            env.insert(AIVO_ROUTER_AUTH_TOKEN.to_string(), loopback_token.clone());
+            (PLACEHOLDER_LOOPBACK_URL.to_string(), loopback_token)
         } else if use_router_for_opencode(key) || profile.serve_flags.is_starter {
+            env.insert(AIVO_ROUTER_AUTH_TOKEN.to_string(), loopback_token.clone());
             env.insert("AIVO_USE_OPENCODE_ROUTER".to_string(), "1".to_string());
             env.insert(
                 "AIVO_RESPONSES_TO_CHAT_ROUTER_API_KEY".to_string(),
@@ -875,7 +896,7 @@ impl EnvironmentInjector {
                     );
                 }
             }
-            (PLACEHOLDER_LOOPBACK_URL.to_string(), auth)
+            (PLACEHOLDER_LOOPBACK_URL.to_string(), loopback_token)
         } else {
             (resolved_url, auth)
         };
@@ -976,14 +997,16 @@ impl EnvironmentInjector {
             // so the cursor router is wired in via PLACEHOLDER_LOOPBACK_URL:
             // launch_runtime starts the router, then patches the placeholder
             // with the real bound port before writing the temp agent dir.
+            let loopback_token = crate::services::serve_router::random_auth_token();
             let models_json = build_pi_models_json(
                 PLACEHOLDER_LOOPBACK_URL,
-                "aivo-cursor",
+                &loopback_token,
                 "openai-completions",
                 model,
                 catalog,
                 limits,
             );
+            env.insert(AIVO_ROUTER_AUTH_TOKEN.to_string(), loopback_token);
             env.insert("AIVO_PI_MODELS_JSON".to_string(), models_json);
             env.insert("AIVO_USE_CURSOR_ROUTER".to_string(), "1".to_string());
             env.insert(
@@ -1007,28 +1030,32 @@ impl EnvironmentInjector {
             env.insert("AIVO_SETUP_PI_AGENT_DIR".to_string(), "1".to_string());
         } else if profile.serve_flags.is_copilot {
             // Copilot needs CopilotTokenManager — route through ResponsesToChatRouter
+            let loopback_token = crate::services::serve_router::random_auth_token();
             let models_json = build_pi_models_json(
                 PLACEHOLDER_LOOPBACK_URL,
-                "copilot",
+                &loopback_token,
                 "openai-completions",
                 model,
                 catalog,
                 limits,
             );
+            env.insert(AIVO_ROUTER_AUTH_TOKEN.to_string(), loopback_token);
             env.insert("AIVO_PI_MODELS_JSON".to_string(), models_json);
             env.insert("AIVO_USE_PI_COPILOT_ROUTER".to_string(), "1".to_string());
             env.insert("AIVO_COPILOT_GITHUB_TOKEN".to_string(), key.key.to_string());
         } else if profile.serve_flags.is_starter {
             // Starter provider: route through a local router so device fingerprint
             // headers are attached (Pi's native HTTP client can't add them).
+            let loopback_token = crate::services::serve_router::random_auth_token();
             let models_json = build_pi_models_json(
                 PLACEHOLDER_LOOPBACK_URL,
-                AIVO_STARTER_SENTINEL,
+                &loopback_token,
                 "openai-completions",
                 model,
                 catalog,
                 limits,
             );
+            env.insert(AIVO_ROUTER_AUTH_TOKEN.to_string(), loopback_token);
             env.insert("AIVO_PI_MODELS_JSON".to_string(), models_json);
             env.insert("AIVO_USE_PI_STARTER_ROUTER".to_string(), "1".to_string());
             env.insert("AIVO_IS_STARTER".to_string(), "1".to_string());
@@ -1046,14 +1073,16 @@ impl EnvironmentInjector {
             // Force the local router. `--transform` does this explicitly to
             // normalize buggy SSE; `--debug` does it so the JSONL logger sees
             // traffic that pi's native HTTP client would otherwise skip.
+            let loopback_token = crate::services::serve_router::random_auth_token();
             let models_json = build_pi_models_json(
                 PLACEHOLDER_LOOPBACK_URL,
-                AIVO_STARTER_SENTINEL,
+                &loopback_token,
                 "openai-completions",
                 model,
                 catalog,
                 limits,
             );
+            env.insert(AIVO_ROUTER_AUTH_TOKEN.to_string(), loopback_token);
             env.insert("AIVO_PI_MODELS_JSON".to_string(), models_json);
             env.insert("AIVO_USE_PI_ROUTER".to_string(), "1".to_string());
             env.insert(
@@ -1258,6 +1287,19 @@ mod tests {
         k
     }
 
+    /// The per-launch loopback token every router-backed launch must carry.
+    fn loopback_token(env: &HashMap<String, String>) -> String {
+        env.get("AIVO_ROUTER_AUTH_TOKEN")
+            .expect("router launches must carry AIVO_ROUTER_AUTH_TOKEN")
+            .clone()
+    }
+
+    /// Asserts the child's auth env var holds the loopback token, never the
+    /// real key.
+    fn assert_auth_is_loopback_token(env: &HashMap<String, String>, auth_env: &str) {
+        assert_eq!(env.get(auth_env), Some(&loopback_token(env)));
+    }
+
     /// All `use_direct_*` predicates consult `is_debug_active()`. The
     /// debug-toggling tests serialize via `DEBUG_TEST_MUTEX`; tests that
     /// assume the debug flag is off must take the same mutex (and explicitly
@@ -1297,10 +1339,7 @@ mod tests {
             env.get("ANTHROPIC_BASE_URL"),
             Some(&PLACEHOLDER_LOOPBACK_URL.to_string())
         );
-        assert_eq!(
-            env.get("ANTHROPIC_AUTH_TOKEN"),
-            Some(&"aivo-cursor".to_string())
-        );
+        assert_auth_is_loopback_token(&env, "ANTHROPIC_AUTH_TOKEN");
         assert_eq!(env.get("ANTHROPIC_API_KEY"), Some(&String::new()));
         // Model fans into the canonical slots so /model picks up cursor's id.
         for slot in CLAUDE_DEFAULT_MODEL_SLOTS {
@@ -1326,7 +1365,7 @@ mod tests {
             env.get("OPENAI_BASE_URL"),
             Some(&PLACEHOLDER_LOOPBACK_URL.to_string())
         );
-        assert_eq!(env.get("OPENAI_API_KEY"), Some(&"aivo-cursor".to_string()));
+        assert_auth_is_loopback_token(&env, "OPENAI_API_KEY");
         assert_eq!(env.get("CODEX_MODEL"), Some(&"gpt-5".to_string()));
         assert_eq!(env.get("OPENAI_DEFAULT_MODEL"), Some(&"gpt-5".to_string()));
         assert!(!env.contains_key("AIVO_USE_RESPONSES_TO_CHAT_ROUTER"));
@@ -1359,7 +1398,7 @@ mod tests {
             "OpenCode config must carry the loopback placeholder so launch_runtime can patch it: {config}"
         );
         assert!(config.contains("composer-2.5"));
-        assert!(config.contains("aivo-cursor"));
+        assert!(config.contains(&loopback_token(&env)));
         // Cursor wiring bypasses the generic OpenCode routers.
         assert!(!env.contains_key("AIVO_USE_OPENCODE_ROUTER"));
         assert!(!env.contains_key("AIVO_USE_OPENCODE_COPILOT_ROUTER"));
@@ -1425,7 +1464,7 @@ mod tests {
             env.get("GOOGLE_GEMINI_BASE_URL"),
             Some(&PLACEHOLDER_LOOPBACK_URL.to_string())
         );
-        assert_eq!(env.get("GEMINI_API_KEY"), Some(&"aivo-cursor".to_string()));
+        assert_auth_is_loopback_token(&env, "GEMINI_API_KEY");
         assert_eq!(env.get("GEMINI_MODEL"), Some(&"composer-2.5".to_string()));
         assert_eq!(
             env.get("AIVO_GEMINI_FORCE_API_KEY_AUTH"),
@@ -2438,10 +2477,7 @@ mod tests {
             env.get("OPENAI_BASE_URL"),
             Some(&PLACEHOLDER_LOOPBACK_URL.to_string())
         );
-        assert_eq!(
-            env.get("OPENAI_API_KEY"),
-            Some(&"sk-test-key-12345".to_string())
-        );
+        assert_auth_is_loopback_token(&env, "OPENAI_API_KEY");
         assert_eq!(
             env.get("AIVO_USE_RESPONSES_TO_CHAT_ROUTER"),
             Some(&"1".to_string())
@@ -2615,10 +2651,7 @@ mod tests {
             env.get("GOOGLE_GEMINI_BASE_URL"),
             Some(&PLACEHOLDER_LOOPBACK_URL.to_string())
         );
-        assert_eq!(
-            env.get("GEMINI_API_KEY"),
-            Some(&"sk-test-key-12345".to_string())
-        );
+        assert_auth_is_loopback_token(&env, "GEMINI_API_KEY");
         assert!(!env.contains_key("GEMINI_MODEL"));
     }
 
@@ -2815,7 +2848,7 @@ mod tests {
             env.get("GOOGLE_GEMINI_BASE_URL"),
             Some(&PLACEHOLDER_LOOPBACK_URL.to_string())
         );
-        assert_eq!(env.get("GEMINI_API_KEY"), Some(&"copilot".to_string()));
+        assert_auth_is_loopback_token(&env, "GEMINI_API_KEY");
         assert!(!env.contains_key("AIVO_USE_GEMINI_ROUTER"));
         assert!(!env.contains_key("AIVO_GEMINI_COPILOT_FORCED_MODEL"));
     }
@@ -3067,7 +3100,10 @@ mod tests {
             config["provider"]["aivo"]["options"]["baseURL"],
             PLACEHOLDER_LOOPBACK_URL
         );
-        assert_eq!(config["provider"]["aivo"]["options"]["apiKey"], "copilot");
+        assert_eq!(
+            config["provider"]["aivo"]["options"]["apiKey"].as_str(),
+            Some(loopback_token(&env).as_str())
+        );
     }
 
     #[test]
@@ -3090,8 +3126,8 @@ mod tests {
             PLACEHOLDER_LOOPBACK_URL
         );
         assert_eq!(
-            config["provider"]["aivo"]["options"]["apiKey"],
-            "sk-test-key-12345"
+            config["provider"]["aivo"]["options"]["apiKey"].as_str(),
+            Some(loopback_token(&env).as_str())
         );
     }
 
@@ -3123,10 +3159,7 @@ mod tests {
             env.get("ANTHROPIC_BASE_URL"),
             Some(&PLACEHOLDER_LOOPBACK_URL.to_string())
         );
-        assert_eq!(
-            env.get("ANTHROPIC_AUTH_TOKEN"),
-            Some(&"copilot".to_string())
-        );
+        assert_auth_is_loopback_token(&env, "ANTHROPIC_AUTH_TOKEN");
         // Should NOT set OpenRouter router
         assert!(!env.contains_key("AIVO_USE_ROUTER"));
         // Model should still be set
@@ -3150,7 +3183,7 @@ mod tests {
             env.get("OPENAI_BASE_URL"),
             Some(&PLACEHOLDER_LOOPBACK_URL.to_string())
         );
-        assert_eq!(env.get("OPENAI_API_KEY"), Some(&"copilot".to_string()));
+        assert_auth_is_loopback_token(&env, "OPENAI_API_KEY");
         assert_eq!(
             env.get("AIVO_COPILOT_GITHUB_TOKEN"),
             Some(&"sk-test-key-12345".to_string())
@@ -3201,7 +3234,7 @@ mod tests {
             env.get("ANTHROPIC_BASE_URL"),
             Some(&PLACEHOLDER_LOOPBACK_URL.to_string())
         );
-        assert_eq!(env.get("ANTHROPIC_AUTH_TOKEN"), Some(&"ollama".to_string()));
+        assert_auth_is_loopback_token(&env, "ANTHROPIC_AUTH_TOKEN");
         assert_eq!(
             env.get("AIVO_ANTHROPIC_TO_OPENAI_ROUTER_API_KEY"),
             Some(&"ollama".to_string())
@@ -3231,7 +3264,7 @@ mod tests {
             env.get("OPENAI_BASE_URL"),
             Some(&PLACEHOLDER_LOOPBACK_URL.to_string())
         );
-        assert_eq!(env.get("OPENAI_API_KEY"), Some(&"ollama".to_string()));
+        assert_auth_is_loopback_token(&env, "OPENAI_API_KEY");
         assert!(
             env.get("AIVO_RESPONSES_TO_CHAT_ROUTER_BASE_URL")
                 .unwrap()
@@ -3252,7 +3285,7 @@ mod tests {
             env.get("GOOGLE_GEMINI_BASE_URL"),
             Some(&PLACEHOLDER_LOOPBACK_URL.to_string())
         );
-        assert_eq!(env.get("GEMINI_API_KEY"), Some(&"ollama".to_string()));
+        assert_auth_is_loopback_token(&env, "GEMINI_API_KEY");
         assert!(
             env.get("AIVO_GEMINI_ROUTER_BASE_URL")
                 .unwrap()

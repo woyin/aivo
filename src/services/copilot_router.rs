@@ -30,22 +30,36 @@ pub struct CopilotRouterConfig {
 
 pub struct CopilotRouter {
     config: CopilotRouterConfig,
+    /// Per-launch loopback token; `Some` rejects requests without it so other
+    /// local processes can't spend the Copilot quota through this router.
+    expected_token: Option<String>,
 }
 
 struct CopilotRouterState {
     token_manager: Arc<CopilotTokenManager>,
+    expected_token: Option<String>,
     client: reqwest::Client,
 }
 
 impl CopilotRouter {
     pub fn new(config: CopilotRouterConfig) -> Self {
-        Self { config }
+        Self {
+            config,
+            expected_token: None,
+        }
+    }
+
+    /// Requires loopback clients to present this token (Bearer/x-api-key).
+    pub fn with_auth_token(mut self, token: String) -> Self {
+        self.expected_token = Some(token);
+        self
     }
 
     pub async fn start_background(&self) -> Result<(u16, tokio::task::JoinHandle<Result<()>>)> {
         let (listener, port) = http_utils::bind_local_listener().await?;
         let state = CopilotRouterState {
             token_manager: Arc::new(CopilotTokenManager::new(self.config.github_token.clone())),
+            expected_token: self.expected_token.clone(),
             client: http_utils::router_http_client(),
         };
         let handle = tokio::spawn(async move {
@@ -56,6 +70,14 @@ impl CopilotRouter {
 }
 
 async fn handle_copilot_request(request: String, state: Arc<CopilotRouterState>) -> String {
+    if let Some(expected) = state.expected_token.as_deref()
+        && !http_utils::request_loopback_authorized(&request, expected)
+    {
+        return http_utils::http_error_response(
+            401,
+            "Invalid or missing auth token (expected Authorization: Bearer or x-api-key)",
+        );
+    }
     if http_utils::is_post_path(&request, &["/v1/messages", "/messages"]) {
         match handle_messages(&request, &state).await {
             Ok(r) => r,

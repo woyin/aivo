@@ -507,3 +507,174 @@ async fn serve_router_learns_routes_per_model() {
         fake.hits()
     );
 }
+
+// ── Loopback token enforcement ───────────────────────────────────────────
+
+/// Like `raw_post` but with a caller-controlled auth header line
+/// (`None` = no auth header at all).
+async fn raw_post_with_auth(port: u16, path: &str, body: &str, auth_line: Option<&str>) -> String {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", port))
+        .await
+        .unwrap();
+    let auth = auth_line.map(|l| format!("{l}\r\n")).unwrap_or_default();
+    let req = format!(
+        "POST {path} HTTP/1.1\r\nHost: 127.0.0.1\r\n{auth}Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    stream.write_all(req.as_bytes()).await.unwrap();
+    let _ = stream.shutdown().await;
+    let mut buf = Vec::new();
+    let _ = stream.read_to_end(&mut buf).await;
+    String::from_utf8_lossy(&buf).into_owned()
+}
+
+#[tokio::test]
+async fn claude_router_enforces_loopback_token() {
+    no_proxy();
+    let fake = spawn_fake(&[(Endpoint::Chat, Mode::Ok)]);
+    let router = AnthropicToOpenAIRouter::new(AnthropicToOpenAIRouterConfig {
+        target_base_url: fake.base_url(),
+        target_api_key: "sk-test".to_string(),
+        seed_routes: BTreeMap::new(),
+        strip_cache_control: false,
+        model_prefix: None,
+        requires_reasoning_content: false,
+        max_tokens_cap: None,
+        is_starter: false,
+    })
+    .with_auth_token("tok".to_string());
+    let (port, _routes, _learned, handle) = router.start_background().await.unwrap();
+
+    let resp = raw_post_with_auth(port, "/v1/messages", ANTHROPIC_REQ, None).await;
+    assert_eq!(response_status(&resp), 401, "{resp}");
+    let resp = raw_post_with_auth(
+        port,
+        "/v1/messages",
+        ANTHROPIC_REQ,
+        Some("Authorization: Bearer wrong"),
+    )
+    .await;
+    assert_eq!(response_status(&resp), 401, "{resp}");
+    assert!(
+        fake.hits().is_empty(),
+        "unauthorized requests must never reach upstream: {:?}",
+        fake.hits()
+    );
+
+    // `raw_post` sends `Authorization: Bearer tok` — the launch token.
+    let resp = raw_post(port, "/v1/messages", ANTHROPIC_REQ).await;
+    assert_eq!(response_status(&resp), 200, "{resp}");
+    handle.abort();
+}
+
+#[tokio::test]
+async fn codex_router_enforces_loopback_token() {
+    no_proxy();
+    let fake = spawn_fake(&[(Endpoint::Chat, Mode::Ok)]);
+    let router = ResponsesToChatRouter::new(responses_router_config(fake.base_url()))
+        .with_auth_token("tok".to_string());
+    let (port, _routes, _learned, handle) = router.start_background().await.unwrap();
+
+    let resp = raw_post_with_auth(port, "/v1/responses", RESPONSES_REQ, None).await;
+    assert_eq!(response_status(&resp), 401, "{resp}");
+    assert!(
+        fake.hits().is_empty(),
+        "unauthorized requests must never reach upstream: {:?}",
+        fake.hits()
+    );
+
+    let resp = raw_post(port, "/v1/responses", RESPONSES_REQ).await;
+    assert_eq!(response_status(&resp), 200, "{resp}");
+    handle.abort();
+}
+
+#[tokio::test]
+async fn gemini_router_enforces_loopback_token_in_google_auth_forms() {
+    no_proxy();
+    let fake = spawn_fake(&[(Endpoint::Chat, Mode::Ok)]);
+    let router = GeminiRouter::new(GeminiRouterConfig {
+        target_base_url: fake.base_url(),
+        api_key: "sk-test".to_string(),
+        upstream_protocol: ProviderProtocol::Google,
+        forced_model: None,
+        copilot_token_manager: None,
+        requires_reasoning_content: false,
+        max_tokens_cap: None,
+        is_starter: false,
+    })
+    .with_auth_token("tok".to_string());
+    let (port, _routes, _learned, handle) = router.start_background().await.unwrap();
+
+    let path = "/v1beta/models/test-model:generateContent";
+    let resp = raw_post_with_auth(port, path, GEMINI_REQ, None).await;
+    assert_eq!(response_status(&resp), 401, "{resp}");
+    assert!(
+        fake.hits().is_empty(),
+        "unauthorized requests must never reach upstream: {:?}",
+        fake.hits()
+    );
+
+    // Gemini CLI sends its key as `x-goog-api-key`.
+    let resp = raw_post_with_auth(port, path, GEMINI_REQ, Some("x-goog-api-key: tok")).await;
+    assert_eq!(response_status(&resp), 200, "{resp}");
+
+    // Legacy Google clients send `?key=` instead of any header.
+    let with_query = format!("{path}?key=tok");
+    let resp = raw_post_with_auth(port, &with_query, GEMINI_REQ, None).await;
+    assert_eq!(response_status(&resp), 200, "{resp}");
+    handle.abort();
+}
+
+#[tokio::test]
+async fn openrouter_anthropic_router_enforces_loopback_token() {
+    use aivo::services::anthropic_router::{AnthropicRouter, AnthropicRouterConfig};
+
+    no_proxy();
+    let fake = spawn_fake(&[(Endpoint::Messages, Mode::Ok)]);
+    let router = AnthropicRouter::new(AnthropicRouterConfig {
+        upstream_base_url: fake.base_url(),
+        upstream_api_key: "sk-test".to_string(),
+        is_starter: false,
+    })
+    .with_auth_token("tok".to_string());
+    let (port, handle) = router.start_background().await.unwrap();
+
+    let resp = raw_post_with_auth(port, "/v1/messages", ANTHROPIC_REQ, None).await;
+    assert_eq!(response_status(&resp), 401, "{resp}");
+    assert!(
+        fake.hits().is_empty(),
+        "unauthorized requests must never reach upstream: {:?}",
+        fake.hits()
+    );
+
+    let resp = raw_post(port, "/v1/messages", ANTHROPIC_REQ).await;
+    assert_eq!(response_status(&resp), 200, "{resp}");
+    handle.abort();
+}
+
+#[tokio::test]
+async fn copilot_router_enforces_loopback_token() {
+    use aivo::services::copilot_router::{CopilotRouter, CopilotRouterConfig};
+
+    no_proxy();
+    // No 200-path here: a valid request would call the real Copilot API.
+    let router = CopilotRouter::new(CopilotRouterConfig {
+        github_token: "gho_test".to_string(),
+    })
+    .with_auth_token("tok".to_string());
+    let (port, handle) = router.start_background().await.unwrap();
+
+    let resp = raw_post_with_auth(port, "/v1/messages", ANTHROPIC_REQ, None).await;
+    assert_eq!(response_status(&resp), 401, "{resp}");
+    let resp = raw_post_with_auth(
+        port,
+        "/v1/messages",
+        ANTHROPIC_REQ,
+        Some("x-api-key: wrong"),
+    )
+    .await;
+    assert_eq!(response_status(&resp), 401, "{resp}");
+    handle.abort();
+}

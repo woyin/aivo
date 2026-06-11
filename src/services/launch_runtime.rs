@@ -212,6 +212,20 @@ pub(crate) async fn prepare_runtime_env(
         })
         .unwrap_or_default();
 
+    // The routers above consumed their upstream credentials; strip them (and
+    // the token carrier) so the child env never holds a real key — the child
+    // authenticates to the loopback router with its injected per-launch token.
+    for var in [
+        "AIVO_ROUTER_API_KEY",
+        "AIVO_ANTHROPIC_TO_OPENAI_ROUTER_API_KEY",
+        "AIVO_RESPONSES_TO_CHAT_ROUTER_API_KEY",
+        "AIVO_GEMINI_ROUTER_API_KEY",
+        "AIVO_COPILOT_GITHUB_TOKEN",
+        crate::services::environment_injector::AIVO_ROUTER_AUTH_TOKEN,
+    ] {
+        env.remove(var);
+    }
+
     Ok(LaunchRuntimeState {
         env,
         env_unset,
@@ -1109,6 +1123,13 @@ fn merge_loopback_entries(existing: &str) -> String {
 }
 
 /// Starts the built-in AnthropicRouter and returns the port it bound to
+/// Per-launch loopback token injected by the environment injector; routers
+/// require it from clients so other local processes can't spend the key.
+fn loopback_auth_token(env: &HashMap<String, String>) -> Option<String> {
+    env.get(crate::services::environment_injector::AIVO_ROUTER_AUTH_TOKEN)
+        .cloned()
+}
+
 async fn start_anthropic_router(env: &HashMap<String, String>) -> Result<u16> {
     use crate::services::{AnthropicRouter, AnthropicRouterConfig};
 
@@ -1131,7 +1152,10 @@ async fn start_anthropic_router(env: &HashMap<String, String>) -> Result<u16> {
             .unwrap_or(false),
     };
 
-    let router = AnthropicRouter::new(config);
+    let mut router = AnthropicRouter::new(config);
+    if let Some(token) = loopback_auth_token(env) {
+        router = router.with_auth_token(token);
+    }
     let (port, handle) = router.start_background().await?;
     tokio::spawn(async move {
         if let Ok(Err(e)) = handle.await {
@@ -1192,7 +1216,10 @@ async fn start_anthropic_to_openai_router(
             .unwrap_or(false),
     };
 
-    let router = AnthropicToOpenAIRouter::new(config);
+    let mut router = AnthropicToOpenAIRouter::new(config);
+    if let Some(token) = loopback_auth_token(env) {
+        router = router.with_auth_token(token);
+    }
     let (port, route_cache, learned_requires_reasoning, handle) = router.start_background().await?;
     tokio::spawn(async move {
         if let Ok(Err(e)) = handle.await {
@@ -1276,6 +1303,10 @@ async fn start_responses_to_chat_router(
         env,
         "AIVO_RESPONSES_TO_CHAT_ROUTER_ROUTES_JSON",
     ));
+    let router = match loopback_auth_token(env) {
+        Some(token) => router.with_auth_token(token),
+        None => router,
+    };
     let (port, route_cache, learned_requires_reasoning, handle) = router.start_background().await?;
     tokio::spawn(async move {
         if let Ok(Err(e)) = handle.await {
@@ -1326,6 +1357,10 @@ async fn start_gemini_router(
             .unwrap_or(false),
     })
     .with_seed_routes(parse_seed_routes(env, "AIVO_GEMINI_ROUTER_ROUTES_JSON"));
+    let router = match loopback_auth_token(env) {
+        Some(token) => router.with_auth_token(token),
+        None => router,
+    };
     let (port, route_cache, learned_requires_reasoning, handle) = router.start_background().await?;
     tokio::spawn(async move {
         if let Ok(Err(e)) = handle.await {
@@ -1364,6 +1399,10 @@ async fn start_gemini_copilot_router(env: &HashMap<String, String>) -> Result<u1
         max_tokens_cap: None,
         is_starter: false,
     });
+    let router = match loopback_auth_token(env) {
+        Some(token) => router.with_auth_token(token),
+        None => router,
+    };
     let (port, _route_cache, _learned, handle) = router.start_background().await?;
     tokio::spawn(async move {
         if let Ok(Err(e)) = handle.await {
@@ -1381,7 +1420,10 @@ async fn start_copilot_router(env: &HashMap<String, String>) -> Result<u16> {
         .ok_or_else(|| anyhow::anyhow!("Missing AIVO_COPILOT_GITHUB_TOKEN"))?
         .clone();
 
-    let router = CopilotRouter::new(CopilotRouterConfig { github_token });
+    let mut router = CopilotRouter::new(CopilotRouterConfig { github_token });
+    if let Some(token) = loopback_auth_token(env) {
+        router = router.with_auth_token(token);
+    }
     let (port, handle) = router.start_background().await?;
     tokio::spawn(async move {
         if let Ok(Err(e)) = handle.await {
@@ -1467,9 +1509,9 @@ async fn start_cursor_router(env: &mut HashMap<String, String>, tool: AIToolType
         models_cache: Some(crate::services::models_cache::ModelsCache::new()),
         prewarm_count,
         mcp_prewarm_id_style,
-        // Native-tool launches reach the router over trusted local env (the
-        // `aivo-cursor` placeholder); only the plugin endpoint gates the bearer.
-        expected_token: None,
+        // Native-tool launches now inject a per-launch token too, so the
+        // bearer gate applies the same as for the plugin endpoint.
+        expected_token: loopback_auth_token(env),
     });
     let (port, handle) = router.start_background().await?;
     tokio::spawn(async move {
@@ -1503,6 +1545,10 @@ async fn start_responses_to_chat_copilot_router(env: &HashMap<String, String>) -
         is_starter: false,
         aivo_prefix_models: Vec::new(),
     });
+    let router = match loopback_auth_token(env) {
+        Some(token) => router.with_auth_token(token),
+        None => router,
+    };
     let (port, _route_cache, _learned, handle) = router.start_background().await?;
     tokio::spawn(async move {
         if let Ok(Err(e)) = handle.await {

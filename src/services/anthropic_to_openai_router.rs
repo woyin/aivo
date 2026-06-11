@@ -82,10 +82,15 @@ pub struct AnthropicToOpenAIRouterConfig {
 
 pub struct AnthropicToOpenAIRouter {
     config: AnthropicToOpenAIRouterConfig,
+    /// Per-launch loopback token; `Some` rejects requests without it so other
+    /// local processes can't spend the key through this router. On the router
+    /// (not config) so existing config literals stay untouched.
+    expected_token: Option<String>,
 }
 
 struct AnthropicToOpenAIRouterState {
     config: Arc<AnthropicToOpenAIRouterConfig>,
+    expected_token: Option<String>,
     client: reqwest::Client,
     /// Per-model learned routes; each request resolves its slot and runs the
     /// cascade against it. A confirmed slot persists on exit via `dirty_routes`.
@@ -220,7 +225,16 @@ enum NativeAnthropicResult {
 
 impl AnthropicToOpenAIRouter {
     pub fn new(config: AnthropicToOpenAIRouterConfig) -> Self {
-        Self { config }
+        Self {
+            config,
+            expected_token: None,
+        }
+    }
+
+    /// Requires loopback clients to present this token (Bearer/x-api-key).
+    pub fn with_auth_token(mut self, token: String) -> Self {
+        self.expected_token = Some(token);
+        self
     }
 
     /// Binds to a random available port and starts the router in the background.
@@ -244,6 +258,7 @@ impl AnthropicToOpenAIRouter {
         let learned_requires_reasoning = Arc::new(AtomicBool::new(false));
         let state = AnthropicToOpenAIRouterState {
             config: Arc::new(self.config.clone()),
+            expected_token: self.expected_token.clone(),
             client: router_http_client(),
             route_cache: route_cache.clone(),
             probe: ProbeState::new(),
@@ -261,6 +276,7 @@ async fn run_router(
     loop {
         let (mut socket, _) = listener.accept().await?;
         let config = state.config.clone();
+        let expected_token = state.expected_token.clone();
         let client = state.client.clone();
         let route_cache = state.route_cache.clone();
         let probe = state.probe.clone();
@@ -278,6 +294,17 @@ async fn run_router(
                 }
             };
             let request = String::from_utf8_lossy(&request_bytes).into_owned();
+
+            if let Some(expected) = expected_token.as_deref()
+                && !http_utils::request_loopback_authorized(&request, expected)
+            {
+                let response = http_utils::http_error_response(
+                    401,
+                    "Invalid or missing auth token (expected Authorization: Bearer or x-api-key)",
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+                return;
+            }
 
             if !http_utils::is_post_path(&request, &["/v1/messages", "/messages"]) {
                 let not_found =

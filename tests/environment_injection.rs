@@ -88,7 +88,13 @@ fn claude_copilot_uses_copilot_router() {
         env.get("AIVO_COPILOT_GITHUB_TOKEN").unwrap(),
         "gho_test_token"
     );
-    assert_eq!(env.get("ANTHROPIC_AUTH_TOKEN").unwrap(), "copilot");
+    // The child authenticates with the per-launch loopback token, never the
+    // real credential or a guessable placeholder.
+    assert_eq!(
+        env.get("ANTHROPIC_AUTH_TOKEN"),
+        env.get("AIVO_ROUTER_AUTH_TOKEN")
+    );
+    assert!(env.get("AIVO_ROUTER_AUTH_TOKEN").is_some());
 }
 
 #[test]

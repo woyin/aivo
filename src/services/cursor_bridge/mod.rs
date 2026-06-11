@@ -497,15 +497,15 @@ pub(crate) async fn handle_request(
     let log_id = log_inbound(&method, &path, &request).await;
     let started = Instant::now();
 
-    // Bearer gate for the plugin endpoint (native-tool launches set no token
-    // and skip this). The CORS preflight and the root probe stay open — clients
-    // send them before any auth and Claude Code treats a non-200 root as a
-    // config error.
+    // Token gate, shared by the plugin endpoint and native-tool launches
+    // (both inject a per-launch token). The CORS preflight and the root probe
+    // stay open — clients send them before any auth and Claude Code treats a
+    // non-200 root as a config error.
     if let Some(expected) = state.config.expected_token.as_deref() {
         let is_open = method == "OPTIONS"
             || ((method == "HEAD" || method == "GET")
                 && matches!(strip_v1_prefix(&path), "/" | ""));
-        if !is_open && !http_utils::request_bearer_authorized(&request, expected) {
+        if !is_open && !http_utils::request_loopback_authorized(&request, expected) {
             let msg = "Invalid or missing auth token (expected Authorization: Bearer or x-api-key)";
             let _ = write_json_error(&mut socket, 401, msg).await;
             log_outbound(
