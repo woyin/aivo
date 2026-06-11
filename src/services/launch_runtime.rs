@@ -764,9 +764,13 @@ pub(crate) async fn process_pi_sessions(pi_agent_dir: Option<&str>) {
 
 pub(crate) async fn cleanup_runtime_artifacts(
     codex_model_catalog_path: Option<&str>,
+    claude_settings_pin_path: Option<&str>,
     pi_agent_dir: Option<&str>,
 ) {
     if let Some(path) = codex_model_catalog_path {
+        let _ = tokio::fs::remove_file(path).await;
+    }
+    if let Some(path) = claude_settings_pin_path {
         let _ = tokio::fs::remove_file(path).await;
     }
     if let Some(dir) = pi_agent_dir {

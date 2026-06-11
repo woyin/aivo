@@ -591,7 +591,12 @@ impl AILauncher {
         } else {
             runtime_args.codex_model_catalog_path.as_deref()
         };
-        cleanup_runtime_artifacts(catalog_to_clean, runtime.pi_agent_dir.as_deref()).await;
+        cleanup_runtime_artifacts(
+            catalog_to_clean,
+            runtime_args.claude_settings_pin_path.as_deref(),
+            runtime.pi_agent_dir.as_deref(),
+        )
+        .await;
 
         let exit_code = result.as_ref().ok().copied();
         let detected_session_id = probe.detect_new().await;

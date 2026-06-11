@@ -11,6 +11,7 @@ use crate::services::models_cache::ModelsCache;
 pub(crate) struct RuntimeArgs {
     pub(crate) args: Vec<String>,
     pub(crate) codex_model_catalog_path: Option<String>,
+    pub(crate) claude_settings_pin_path: Option<String>,
 }
 
 pub(crate) fn merge_preview_env(
@@ -39,7 +40,7 @@ pub(crate) fn preview_args(
     if !tool.is_codex_family() {
         if tool == AIToolType::Claude {
             // Preview has no runtime env; the pre-merge tool env is both key and value source.
-            return inject_claude_env_pin(env, env, args);
+            return inject_claude_env_pin_preview(env, env, args);
         }
         return args;
     }
@@ -186,17 +187,19 @@ pub(crate) async fn build_runtime_args(
         return Ok(RuntimeArgs {
             args: inject_pi_model(model, &args),
             codex_model_catalog_path: None,
+            claude_settings_pin_path: None,
         });
     }
     if !tool.is_codex_family() {
-        let args = if tool == AIToolType::Claude {
-            inject_claude_env_pin(aivo_env, env, args)
+        let (args, claude_settings_pin_path) = if tool == AIToolType::Claude {
+            inject_claude_env_pin_file(aivo_env, env, args).await?
         } else {
-            args
+            (args, None)
         };
         return Ok(RuntimeArgs {
             args,
             codex_model_catalog_path: None,
+            claude_settings_pin_path,
         });
     }
 
@@ -216,6 +219,7 @@ pub(crate) async fn build_runtime_args(
     Ok(RuntimeArgs {
         args,
         codex_model_catalog_path,
+        claude_settings_pin_path: None,
     })
 }
 
@@ -497,50 +501,93 @@ fn should_preview_codex_model_catalog(model: Option<&str>, uses_non_openai_route
         || name_only.starts_with("o4"))
 }
 
-/// Bearer-token vars never pinned via `--settings`: the payload lands in argv
-/// (world-readable via `ps`), so secrets stay in the owner-only child env.
-const CLAUDE_PIN_SECRET_DENYLIST: &[&str] = &["ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN"];
+/// Path shown by `--dry-run` in place of the real pin file: previews must
+/// stay side-effect free (same convention as the codex catalog placeholder).
+const CLAUDE_PIN_PREVIEW_PATH: &str = "<temp:aivo-claude-settings-pin.json>";
 
-/// Re-assert the env aivo overwrote via `--settings` (CLI-args precedence), since
-/// `~/.claude/settings.json`'s `env` block otherwise shadows every var aivo injects.
-/// Keys come from `aivo_env`, so the user's inherited shell vars are never pinned;
-/// values come from `final_env`. Skips `AIVO_*` internals, the secret denylist, and any
-/// non-empty `ANTHROPIC_API_KEY`.
-/// Prepended (Claude honors only the first `--settings`); skipped if the user passes one.
-fn inject_claude_env_pin(
+/// Builds the `--settings` pin payload: every Claude-facing var aivo set,
+/// re-asserted at CLI-args precedence. Keys come from `aivo_env`, so the
+/// user's inherited shell vars are never pinned; values come from `final_env`.
+/// Skips `AIVO_*` internals (Claude never reads them). Bearer tokens ARE
+/// included — the gated loopback routers reject the launch otherwise when
+/// `~/.claude/settings.json` shadows `ANTHROPIC_AUTH_TOKEN`; the payload is
+/// safe to carry them because it ships in an owner-only file, never argv.
+fn claude_pin_payload(
     aivo_env: &HashMap<String, String>,
     final_env: &HashMap<String, String>,
-    args: Vec<String>,
-) -> Vec<String> {
-    if args
-        .iter()
-        .any(|a| a == "--settings" || a.starts_with("--settings="))
-    {
-        return args;
-    }
+) -> Option<String> {
     let mut pinned_env = serde_json::Map::new();
     for k in aivo_env.keys() {
         if k.starts_with("AIVO_") || k.starts_with("_AIVO_") {
             continue;
         }
-        if CLAUDE_PIN_SECRET_DENYLIST.contains(&k.as_str()) {
-            continue;
-        }
         if let Some(v) = final_env.get(k) {
-            // `--env` can fill the empty ANTHROPIC_API_KEY suppressor with a real key; never put a secret in argv/logs.
-            if k == "ANTHROPIC_API_KEY" && !v.is_empty() {
-                continue;
-            }
             pinned_env.insert(k.clone(), json!(v));
         }
     }
     if pinned_env.is_empty() {
+        return None;
+    }
+    Some(json!({ "env": pinned_env }).to_string())
+}
+
+fn user_passed_settings(args: &[String]) -> bool {
+    args.iter()
+        .any(|a| a == "--settings" || a.starts_with("--settings="))
+}
+
+/// Preview twin of `inject_claude_env_pin_file`: same decision logic, no file.
+fn inject_claude_env_pin_preview(
+    aivo_env: &HashMap<String, String>,
+    final_env: &HashMap<String, String>,
+    args: Vec<String>,
+) -> Vec<String> {
+    if user_passed_settings(&args) || claude_pin_payload(aivo_env, final_env).is_none() {
         return args;
     }
-    let settings = json!({ "env": pinned_env }).to_string();
-    let mut pinned = vec!["--settings".to_string(), settings];
+    let mut pinned = vec![
+        "--settings".to_string(),
+        CLAUDE_PIN_PREVIEW_PATH.to_string(),
+    ];
     pinned.extend(args);
     pinned
+}
+
+/// Re-assert the env aivo overwrote via `--settings` (CLI-args precedence), since
+/// `~/.claude/settings.json`'s `env` block otherwise shadows every var aivo injects.
+/// The payload is written to an owner-only (0600) temp file and passed by path so
+/// bearer tokens can be pinned without a `ps` argv leak; the file is removed by
+/// `cleanup_runtime_artifacts` after the child exits.
+/// Prepended (Claude honors only the first `--settings`); skipped if the user passes one.
+async fn inject_claude_env_pin_file(
+    aivo_env: &HashMap<String, String>,
+    final_env: &HashMap<String, String>,
+    args: Vec<String>,
+) -> Result<(Vec<String>, Option<String>)> {
+    if user_passed_settings(&args) {
+        return Ok((args, None));
+    }
+    let Some(payload) = claude_pin_payload(aivo_env, final_env) else {
+        return Ok((args, None));
+    };
+    cleanup_stale_temp_files("aivo-claude-settings-pin-").await;
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let file_name = format!(
+        "aivo-claude-settings-pin-{}-{}.json",
+        std::process::id(),
+        nonce
+    );
+    let path = std::env::temp_dir().join(file_name);
+    crate::services::atomic_write::atomic_write_secure(&path, payload.into_bytes())
+        .await
+        .with_context(|| format!("Failed to write Claude settings pin at {}", path.display()))?;
+    let path_str = path.to_string_lossy().to_string();
+    let mut pinned = vec!["--settings".to_string(), path_str.clone()];
+    pinned.extend(args);
+    Ok((pinned, Some(path_str)))
 }
 
 fn inject_claude_teammate_mode(tool: AIToolType, args: &[String]) -> Vec<String> {
@@ -631,7 +678,9 @@ pub(crate) fn inject_codex_root_model(args: &mut Vec<String>, model: Option<&str
 /// them for the duration of its session, so we can't unlink during cleanup
 /// without risking a Ctrl-C'd aivo yanking the file out from under a still-
 /// running Codex.app). Deletes files older than 24h that match our prefix.
-async fn cleanup_stale_codex_model_catalogs() {
+/// Reaps day-old `<prefix>*.json` leftovers in the temp dir (crashed launches
+/// never reach `cleanup_runtime_artifacts`).
+async fn cleanup_stale_temp_files(prefix: &str) {
     use std::time::{Duration, SystemTime};
     const MAX_AGE: Duration = Duration::from_secs(24 * 60 * 60);
     let dir = std::env::temp_dir();
@@ -644,7 +693,7 @@ async fn cleanup_stale_codex_model_catalogs() {
         let Some(name) = path.file_name().and_then(|s| s.to_str()) else {
             continue;
         };
-        if !name.starts_with("aivo-codex-model-catalog-") || !name.ends_with(".json") {
+        if !name.starts_with(prefix) || !name.ends_with(".json") {
             continue;
         }
         let Ok(meta) = entry.metadata().await else {
@@ -689,7 +738,7 @@ async fn maybe_write_codex_model_catalog(
     if slugs.is_empty() {
         return Ok(None);
     }
-    cleanup_stale_codex_model_catalogs().await;
+    cleanup_stale_temp_files("aivo-codex-model-catalog-").await;
 
     let mut limits = HashMap::new();
     for slug in &slugs {
@@ -1053,37 +1102,34 @@ mod tests {
         assert_eq!(result, vec!["--teammate-mode", "in-process"]);
     }
 
-    // Parse the `--settings` JSON payload's `env` object out of an arg vec.
-    fn pinned_env(args: &[String]) -> serde_json::Value {
-        let idx = args
-            .iter()
-            .position(|a| a == "--settings")
-            .expect("--settings injected");
-        let payload: serde_json::Value = serde_json::from_str(&args[idx + 1]).unwrap();
-        payload["env"].clone()
+    // Parse the pin payload's `env` object for the given env maps.
+    fn payload_env(
+        aivo_env: &HashMap<String, String>,
+        final_env: &HashMap<String, String>,
+    ) -> serde_json::Value {
+        let payload = claude_pin_payload(aivo_env, final_env).expect("payload built");
+        let parsed: serde_json::Value = serde_json::from_str(&payload).unwrap();
+        parsed["env"].clone()
     }
 
     #[test]
-    fn test_inject_claude_env_pin_prepends_settings() {
+    fn test_claude_env_pin_preview_prepends_settings_placeholder() {
         let env = HashMap::from([(
             "ANTHROPIC_BASE_URL".to_string(),
             "http://127.0.0.1:4123".to_string(),
         )]);
         let args = vec!["--teammate-mode".to_string(), "in-process".to_string()];
-        let result = inject_claude_env_pin(&env, &env, args);
+        let result = inject_claude_env_pin_preview(&env, &env, args);
         assert_eq!(result[0], "--settings");
+        assert_eq!(result[1], CLAUDE_PIN_PREVIEW_PATH);
         assert_eq!(
             result[2..],
             ["--teammate-mode".to_string(), "in-process".to_string()]
         );
-        assert_eq!(
-            pinned_env(&result)["ANTHROPIC_BASE_URL"],
-            "http://127.0.0.1:4123"
-        );
     }
 
     #[test]
-    fn test_inject_claude_env_pin_keys_from_aivo_values_from_final() {
+    fn test_claude_pin_payload_keys_from_aivo_values_from_final() {
         // aivo overwrote BASE_URL + MODEL; ANTHROPIC_SMALL_FAST_MODEL is a shell var aivo never touched.
         let aivo_env = HashMap::from([
             (
@@ -1103,7 +1149,7 @@ mod tests {
                 "haiku".to_string(),
             ),
         ]);
-        let pinned = pinned_env(&inject_claude_env_pin(&aivo_env, &final_env, vec![]));
+        let pinned = payload_env(&aivo_env, &final_env);
         // value comes from the port-patched final env, not the placeholder
         assert_eq!(pinned["ANTHROPIC_BASE_URL"], "http://127.0.0.1:4123");
         assert_eq!(pinned["ANTHROPIC_MODEL"], "glm-4.6");
@@ -1112,7 +1158,7 @@ mod tests {
     }
 
     #[test]
-    fn test_inject_claude_env_pin_excludes_secrets_and_internals() {
+    fn test_claude_pin_payload_includes_bearer_tokens_excludes_internals() {
         let env = HashMap::from([
             (
                 "ANTHROPIC_BASE_URL".to_string(),
@@ -1127,21 +1173,23 @@ mod tests {
                 "1".to_string(),
             ),
         ]);
-        let pinned = pinned_env(&inject_claude_env_pin(&env, &env, vec![]));
+        let pinned = payload_env(&env, &env);
         // empty API key is pinned — suppresses a user's stray key, exposes no secret
         assert_eq!(pinned["ANTHROPIC_API_KEY"], "");
         // every aivo-overwritten var aivo set gets pinned, including preference vars
         assert_eq!(pinned["BASH_DEFAULT_TIMEOUT_MS"], "2400000");
-        // bearer tokens stay in the owner-only env, never argv (ps leak)
-        assert!(pinned.get("ANTHROPIC_AUTH_TOKEN").is_none());
-        assert!(pinned.get("CLAUDE_CODE_OAUTH_TOKEN").is_none());
+        // bearer tokens ride the owner-only pin file: a settings.json shadow
+        // would otherwise feed the gated loopback routers the wrong token
+        assert_eq!(pinned["ANTHROPIC_AUTH_TOKEN"], "tok");
+        assert_eq!(pinned["CLAUDE_CODE_OAUTH_TOKEN"], "oauth");
         // AIVO_* internals aren't read by Claude (and some carry secrets)
         assert!(pinned.get("AIVO_USE_ANTHROPIC_TO_OPENAI_ROUTER").is_none());
     }
 
     #[test]
-    fn test_inject_claude_env_pin_drops_user_overridden_api_key() {
-        // a user `--env` override turns the empty suppressor into a real key — keep it out of the argv payload.
+    fn test_claude_pin_payload_pins_user_overridden_api_key() {
+        // a user `--env` override turns the empty suppressor into a real key;
+        // the pin file is owner-only, so the override is pinned like any other var.
         let aivo_env = HashMap::from([
             (
                 "ANTHROPIC_BASE_URL".to_string(),
@@ -1156,32 +1204,33 @@ mod tests {
             ),
             ("ANTHROPIC_API_KEY".to_string(), "sk-secret".to_string()),
         ]);
-        let pinned = pinned_env(&inject_claude_env_pin(&aivo_env, &final_env, vec![]));
+        let pinned = payload_env(&aivo_env, &final_env);
         assert_eq!(pinned["ANTHROPIC_BASE_URL"], "http://127.0.0.1:4123");
-        assert!(pinned.get("ANTHROPIC_API_KEY").is_none());
+        assert_eq!(pinned["ANTHROPIC_API_KEY"], "sk-secret");
     }
 
     #[test]
-    fn test_inject_claude_env_pin_noop_without_pinned_vars() {
+    fn test_claude_pin_payload_noop_without_pinned_vars() {
         // only an AIVO_* internal — nothing Claude-facing to pin
         let env = HashMap::from([("AIVO_USE_ROUTER".to_string(), "1".to_string())]);
+        assert!(claude_pin_payload(&env, &env).is_none());
         let args = vec!["-p".to_string(), "hi".to_string()];
-        let result = inject_claude_env_pin(&env, &env, args.clone());
+        let result = inject_claude_env_pin_preview(&env, &env, args.clone());
         assert_eq!(result, args);
     }
 
     #[test]
-    fn test_inject_claude_env_pin_respects_user_settings() {
+    fn test_claude_env_pin_respects_user_settings() {
         let env = HashMap::from([(
             "ANTHROPIC_BASE_URL".to_string(),
             "http://127.0.0.1:4123".to_string(),
         )]);
         let args = vec!["--settings".to_string(), "/my/settings.json".to_string()];
-        let result = inject_claude_env_pin(&env, &env, args.clone());
+        let result = inject_claude_env_pin_preview(&env, &env, args.clone());
         assert_eq!(result, args);
 
         let args = vec!["--settings=/my/settings.json".to_string()];
-        let result = inject_claude_env_pin(&env, &env, args.clone());
+        let result = inject_claude_env_pin_preview(&env, &env, args.clone());
         assert_eq!(result, args);
     }
 
@@ -1204,12 +1253,31 @@ mod tests {
         )
         .await
         .unwrap();
+        let idx = runtime
+            .args
+            .iter()
+            .position(|a| a == "--settings")
+            .expect("--settings injected");
+        let pin_path = runtime.args[idx + 1].clone();
         assert_eq!(
-            pinned_env(&runtime.args)["ANTHROPIC_BASE_URL"],
+            runtime.claude_settings_pin_path.as_deref(),
+            Some(pin_path.as_str())
+        );
+        let payload: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&pin_path).unwrap()).unwrap();
+        assert_eq!(
+            payload["env"]["ANTHROPIC_BASE_URL"],
             "http://127.0.0.1:4123"
         );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&pin_path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "pin file carries bearer tokens");
+        }
         // pin and teammate-mode injection coexist
         assert!(runtime.args.iter().any(|a| a == "--teammate-mode"));
+        let _ = std::fs::remove_file(&pin_path);
     }
 
     #[test]
