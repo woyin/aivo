@@ -241,19 +241,24 @@ fn parse_hf_url(url: &str) -> Result<HfModelRef> {
     })
 }
 
-/// Allocation-free `.gguf`/`.GGUF` suffix check.
+/// Allocation-free `.gguf`/`.GGUF` suffix check; byte-wise so a non-ASCII
+/// tail can't split a char boundary and panic.
 fn is_gguf_name(s: &str) -> bool {
-    s.len() >= 5 && s[s.len() - 5..].eq_ignore_ascii_case(".gguf")
+    let b = s.as_bytes();
+    b.len() >= 5 && b[b.len() - 5..].eq_ignore_ascii_case(b".gguf")
 }
 
 /// Splits `Model-Q5_K_M.gguf` → (`Model`, Some(`Q5_K_M`)). Handles both
 /// `-` and `.` separators. Returns `(stem, None)` when no quant tag is
 /// recognized.
 fn split_repo_and_quant(filename: &str) -> (&str, Option<String>) {
-    let stem = filename
-        .strip_suffix(".gguf")
-        .or_else(|| filename.strip_suffix(".GGUF"))
-        .unwrap_or(filename);
+    // Strip via `is_gguf_name` so any case mix (`.Gguf`) that passes the gguf
+    // gates is also stripped here; the suffix is ASCII, so len-5 is a boundary.
+    let stem = if is_gguf_name(filename) {
+        &filename[..filename.len() - 5]
+    } else {
+        filename
+    };
     let Some(idx) = stem.rfind(['-', '.']) else {
         return (stem, None);
     };
@@ -2818,6 +2823,30 @@ mod tests {
         assert!(!looks_like_local_gguf_path("https://huggingface.co/x/y"));
         assert!(!looks_like_local_gguf_path("gpt-4o"));
         assert!(!looks_like_local_gguf_path(""));
+    }
+
+    #[test]
+    fn is_gguf_name_is_total_over_non_ascii() {
+        // len-5 lands mid-char here; a str-slice implementation panics.
+        assert!(!is_gguf_name("总结一下这个项目"));
+        assert!(!is_gguf_name("你好吗"));
+        assert!(is_gguf_name("模型.gguf"));
+    }
+
+    #[test]
+    fn split_repo_and_quant_strips_any_suffix_case() {
+        assert_eq!(
+            split_repo_and_quant("Model-Q5_K_M.Gguf"),
+            ("Model", Some("Q5_K_M".to_string()))
+        );
+        assert_eq!(
+            split_repo_and_quant("Model-Q5_K_M.GGUF"),
+            ("Model", Some("Q5_K_M".to_string()))
+        );
+        assert_eq!(
+            split_repo_and_quant("no-quant-here"),
+            ("no-quant-here", None)
+        );
     }
 
     #[test]

@@ -61,7 +61,8 @@ pub(crate) async fn dispatch(name: &str, bin: &Path, args: &[String], store: &Se
     // tool), opens the picker on a bare `-k`, and resolves the model. Other
     // granted plugins keep verbatim argv — `-k <id>` still selects a key, but
     // nothing is stripped and a bare `-k` uses the active key (no surprise picker
-    // before launch).
+    // before launch); the key's remembered model still travels as `AIVO_KEY_MODEL`
+    // (a read-only hint — see the model match below).
     let flags = super::extract_aivo_flags(args);
     // `--dry-run` previews the resolved plan instead of launching — coding-agent
     // only (it mirrors native `aivo run --dry-run`; other plugins keep verbatim
@@ -128,6 +129,11 @@ pub(crate) async fn dispatch(name: &str, bin: &Path, args: &[String], store: &Se
                 resolve_plugin_model(store, k, model_request, model_flag_was_explicit, dry_run)
                     .await
             }
+            // Endpoint-granted non-coding-agent plugin: hand over the key's
+            // remembered model as a read-only hint (it self-resolves and ranks
+            // `AIVO_KEY_MODEL` below its own flags/env) — no picker, no
+            // flag-stripping, nothing persisted.
+            Some(k) if servable && plan.has("endpoint") => remembered_plugin_model(store, k).await,
             _ => model_request,
         },
     };
@@ -156,8 +162,11 @@ pub(crate) async fn dispatch(name: &str, bin: &Path, args: &[String], store: &Se
     // back via `remembered_plugin_model`). Fires on every launch, not just an
     // explicit `-k`: a *fat* plugin (amp) re-resolves the key from the store, and
     // a bare launch — whose key/model were themselves resolved from this record —
-    // writes back idempotently.
+    // writes back idempotently. Skipped on an hf takeover (mirrors run.rs): the
+    // synthetic loopback key isn't in the store, so persisting it would poison
+    // the record and the next read would prune it.
     if plan.is_coding_agent
+        && hf.is_none()
         && let Some(k) = key.as_ref()
     {
         let _ = store.set_last_selection(k, name, model.as_deref()).await;

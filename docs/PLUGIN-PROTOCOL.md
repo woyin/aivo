@@ -208,7 +208,7 @@ active key (or one named by `-k`/`--key <id>` in the plugin's argv) and injects:
 |---|---|
 | `AIVO_ENDPOINT_URL` | `http://127.0.0.1:<port>/v1` (OS-assigned loopback port) |
 | `AIVO_ENDPOINT_TOKEN` | a random per-launch bearer token |
-| `AIVO_KEY_MODEL` | the resolved model, for `coding-agent` plugins |
+| `AIVO_KEY_MODEL` | the resolved model for `coding-agent` plugins; for other endpoint-granted plugins, the key's remembered model when one exists — an **advisory hint**, rank it below your own flags/env |
 | `AIVO_MODEL_CONTEXT_WINDOW` | the resolved model's context window in tokens — **advisory, only when known** |
 | `AIVO_MODEL_MAX_OUTPUT_TOKENS` | the resolved model's max output tokens — **advisory, only when known** |
 
