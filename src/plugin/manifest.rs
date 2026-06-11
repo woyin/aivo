@@ -28,12 +28,11 @@ pub(crate) struct PluginManifest {
     pub protocol: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
-    /// What the plugin *is* — open vocabulary (`coding-agent`, `media`, …).
-    /// Orthogonal to `roles` (how aivo runs it) and `capabilities` (what it's
-    /// granted). `coding-agent` is the only type with host behavior today
-    /// (stats/logs wrapping). Absent for plugins that don't self-classify.
+    /// What the plugin *is* — see [`PluginKind`]. Orthogonal to `roles` (how
+    /// aivo runs it) and `capabilities` (what it's granted). Absent for
+    /// plugins that don't self-classify.
     #[serde(default, rename = "type", skip_serializing_if = "Option::is_none")]
-    pub kind: Option<String>,
+    pub kind: Option<PluginKind>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub roles: Vec<String>,
     /// True when the plugin's own `--help` already documents aivo's injected
@@ -64,13 +63,40 @@ pub(crate) struct PluginManifest {
     pub requires: Vec<Requirement>,
 }
 
-/// The only plugin `type` with host behavior today: stats/logs wrapping and
-/// automatic `--aivo-stats` probing.
-const CODING_AGENT_TYPE: &str = "coding-agent";
+/// Plugin `type` vocabulary, closed in protocol v1. Only `CodingAgent` has
+/// host behavior (argv ownership, run accounting, stats probe); `Media` is
+/// reserved. Unrecognized values land in `Other` — kept verbatim so a future
+/// additive type never invalidates a manifest — and warn at probe time.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum PluginKind {
+    CodingAgent,
+    Tool,
+    Media,
+    #[serde(untagged)]
+    Other(String),
+}
+
+impl PluginKind {
+    pub(crate) fn as_str(&self) -> &str {
+        match self {
+            PluginKind::CodingAgent => "coding-agent",
+            PluginKind::Tool => "tool",
+            PluginKind::Media => "media",
+            PluginKind::Other(t) => t,
+        }
+    }
+}
+
+impl std::fmt::Display for PluginKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
 
 impl PluginManifest {
     pub(crate) fn is_coding_agent(&self) -> bool {
-        self.kind.as_deref() == Some(CODING_AGENT_TYPE)
+        matches!(self.kind, Some(PluginKind::CodingAgent))
     }
 }
 
@@ -140,6 +166,13 @@ pub(crate) fn parse_manifest(stdout: &str, expected_name: &str) -> Option<Plugin
             PROTOCOL_VERSION,
         );
         return None;
+    }
+    if let Some(PluginKind::Other(t)) = &manifest.kind {
+        eprintln!(
+            "  {} plugin type `{}` is not recognized (coding-agent, tool, media) — recorded but inert",
+            style::yellow("!"),
+            t,
+        );
     }
     if manifest.name != expected_name {
         eprintln!(
@@ -227,21 +260,40 @@ mod tests {
     #[test]
     fn type_field_parses_and_defaults_to_none() {
         let typed = r#"{"name":"omp","version":"1","protocol":"1","type":"coding-agent"}"#;
-        assert_eq!(
-            parse_manifest(typed, "omp").unwrap().kind.as_deref(),
-            Some("coding-agent")
-        );
+        let m = parse_manifest(typed, "omp").unwrap();
+        assert_eq!(m.kind, Some(PluginKind::CodingAgent));
+        assert!(m.is_coding_agent());
         // A manifest without `type` round-trips to None, not an error.
         assert!(parse_manifest(VALID, "amp").unwrap().kind.is_none());
     }
 
     #[test]
-    fn type_round_trips_and_is_omitted_when_absent() {
+    fn known_types_round_trip_kebab_case() {
+        for (raw, kind) in [
+            ("coding-agent", PluginKind::CodingAgent),
+            ("tool", PluginKind::Tool),
+            ("media", PluginKind::Media),
+        ] {
+            let json = format!(r#"{{"name":"x","version":"1","protocol":"1","type":"{raw}"}}"#);
+            let m = parse_manifest(&json, "x").unwrap();
+            assert_eq!(m.kind, Some(kind));
+            assert!(
+                serde_json::to_string(&m)
+                    .unwrap()
+                    .contains(&format!("\"type\":\"{raw}\""))
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_type_round_trips_verbatim_and_is_omitted_when_absent() {
         let m = parse_manifest(
             r#"{"name":"x","version":"1","protocol":"1","type":"tts"}"#,
             "x",
         )
         .unwrap();
+        assert_eq!(m.kind, Some(PluginKind::Other("tts".to_string())));
+        assert!(!m.is_coding_agent());
         let json = serde_json::to_string(&m).unwrap();
         assert!(json.contains("\"type\":\"tts\""));
         // Absent type serializes away entirely (skip_serializing_if).

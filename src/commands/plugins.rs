@@ -164,7 +164,7 @@ fn list_action() -> Result<ExitCode> {
         let mut ident: Vec<String> = Vec::new();
         if let Some(m) = manifest {
             if let Some(kind) = &m.kind {
-                ident.push(kind.clone());
+                ident.push(kind.to_string());
             }
             ident.push(format!("v{}", m.version));
         }

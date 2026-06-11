@@ -89,8 +89,17 @@ echo "hello: $*"
 
 ### Type
 
-`type` is an **open vocabulary** for what the plugin *is* (`coding-agent`, `media`,
-`code-review`, …); aivo validates nothing. Today only **`coding-agent`** carries host behavior:
+`type` declares what the plugin *is*. Protocol v1 recognizes a **closed vocabulary**:
+
+| type | meaning | host behavior |
+|---|---|---|
+| `coding-agent` | wraps an interactive AI coding CLI | see below |
+| `tool` | any other key/endpoint consumer | none — opts into stats via the [`stats`](#stats) capability |
+| `media` | image / audio / video generation | reserved — none today |
+
+An unrecognized value warns at install, is recorded and shown verbatim, and carries no behavior
+(same as `tool`). New types are added to this table additively — no protocol bump. Today only
+**`coding-agent`** carries host behavior:
 
 - aivo owns `-k`/`--key`, `-m`/`--model`, `--debug`, and `--dry-run` in the plugin's argv, strips
   them before launch (so they don't reach the wrapped tool), opens the key/model picker on a bare
@@ -103,8 +112,8 @@ echo "hello: $*"
 - it's probed for [`--aivo-stats`](#stats) automatically (no `stats` cap needed) — reporting its own
   usage is part of being a coding agent.
 
-Other types are recorded and shown but otherwise inert. (Token accounting at the endpoint is
-independent of `type` — see [Endpoint handoff](#endpoint-handoff).)
+Other types are inert. (Token accounting at the endpoint is independent of `type` — see
+[Endpoint handoff](#endpoint-handoff).)
 
 ## Stats
 
