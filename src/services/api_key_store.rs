@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::Result;
 use rand::Rng;
 use std::collections::{BTreeMap, HashSet};
 use zeroize::Zeroizing;
@@ -245,7 +245,8 @@ impl ApiKeyStore {
         Ok(config.api_keys)
     }
 
-    /// Re-encrypts any keys still using older encryption versions (v2/v3) to v4.
+    /// Re-encrypts any keys still using an older encryption version to the
+    /// current one (v5 when the OS keyring is active, otherwise v4).
     async fn maybe_migrate_encryption(&self, keys: &[ApiKey]) {
         let needs_migration = keys
             .iter()
@@ -281,8 +282,15 @@ impl ApiKeyStore {
     /// Decrypts a single key's secret in place.
     pub(crate) fn decrypt_key_secret(key: &mut ApiKey) -> Result<()> {
         if is_encrypted(&key.key) {
-            let plaintext = decrypt(&key.key)
-                .with_context(|| format!("failed to decrypt key '{}'", key.display_name()))?;
+            let plaintext = decrypt(&key.key).map_err(|e| {
+                // A CLIError carries its own actionable message + suggestion;
+                // wrapping would hide it (top-level display is outermost only).
+                if e.downcast_ref::<crate::errors::CLIError>().is_some() {
+                    e
+                } else {
+                    e.context(format!("failed to decrypt key '{}'", key.display_name()))
+                }
+            })?;
             key.key = Zeroizing::new(plaintext);
         }
         Ok(())
