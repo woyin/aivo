@@ -1,0 +1,103 @@
+name: Canary
+
+# Nightly upstream-drift detector: build aivo from main, then drive each real
+# coding-agent CLI (latest from npm) through aivo's loopback router against the
+# free `aivo/starter` provider — no API key/secret needed. Catches the case
+# where an upstream CLI release silently breaks aivo's integration (settings
+# precedence, model-catalog shape, auth wiring) before users report it.
+#
+# Each tool is its own matrix leg (fail-fast: false) so one tool's breakage is
+# reported without masking the others. Adding a tool is one matrix entry.
+
+on:
+  schedule:
+    - cron: '23 6 * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: canary
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@1.95.0
+      - uses: Swatinem/rust-cache@v2
+      - name: Build aivo
+        run: cargo build --release
+      - uses: actions/upload-artifact@v5
+        with:
+          name: aivo-bin
+          path: target/release/aivo
+
+  smoke:
+    needs: build
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - tool: claude
+            package: '@anthropic-ai/claude-code'
+            run: '-p'
+          - tool: codex
+            package: '@openai/codex'
+            run: 'exec'
+          - tool: gemini
+            package: '@google/gemini-cli'
+            run: '-p'
+            # Gemini CLI refuses headless runs in an untrusted dir without this.
+            extra_env: 'GEMINI_CLI_TRUST_WORKSPACE=true'
+          - tool: opencode
+            package: 'opencode-ai'
+            run: 'run'
+          # TODO: pi (@earendil-works/pi-coding-agent) once its headless
+          # invocation is pinned; needs Node >= 22.19.
+    steps:
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+
+      - uses: actions/download-artifact@v5
+        with:
+          name: aivo-bin
+
+      - name: Install tool (latest)
+        env:
+          PACKAGE: ${{ matrix.package }}
+        run: npm install -g "$PACKAGE"
+
+      - name: Smoke through aivo against starter
+        env:
+          TOOL: ${{ matrix.tool }}
+          RUN_ARGS: ${{ matrix.run }}
+          EXTRA_ENV: ${{ matrix.extra_env }}
+        run: |
+          chmod +x aivo
+          AIVO="$PWD/aivo"
+
+          # Capture the CLI version for the report (best effort).
+          CLI_VER=$("$TOOL" --version 2>/dev/null | head -1 || echo "?")
+
+          # Fresh HOME → aivo's `aivo/starter` provider activates on first run,
+          # so the canary needs no API key or repo secret.
+          export HOME
+          HOME=$(mktemp -d)
+          WORK=$(mktemp -d)
+          PROMPT='Reply with exactly this token and nothing else: CANARY_OK'
+
+          set +e
+          OUT=$(cd "$WORK" && timeout 180 env $EXTRA_ENV "$AIVO" "$TOOL" $RUN_ARGS "$PROMPT" 2>&1)
+          rc=$?
+          set -e
+          echo "$OUT"
+
+          if echo "$OUT" | grep -q CANARY_OK; then
+            echo "✅ \`$TOOL\` (CLI $CLI_VER) — round-trip OK" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "❌ \`$TOOL\` (CLI $CLI_VER) — exit $rc, no CANARY_OK in output" >> "$GITHUB_STEP_SUMMARY"
+            echo "::error title=canary failure::round-trip failed (CLI $CLI_VER, exit $rc)"
+            exit 1
+          fi
