@@ -651,11 +651,16 @@ fn cap_tail(s: String) -> String {
 fn read_file(args: &Value, cwd: &Path) -> Result<String, String> {
     let path = arg_str(args, "path")?;
     let full = resolve(cwd, path);
-    let file = std::fs::File::open(&full).map_err(|e| format!("read {path}: {e}"))?;
-    let meta = file.metadata().map_err(|e| format!("read {path}: {e}"))?;
-    if meta.is_dir() {
+    // Reject a directory up front. On Windows `File::open` on a directory fails
+    // outright (a dir can't be opened as a file), so a post-open `is_dir` check
+    // would never run and the model would get a raw OS error instead of the
+    // "use list_dir" hint. On Unix opening a dir succeeds, so this single check
+    // covers both platforms.
+    if full.is_dir() {
         return Err(format!("read {path}: is a directory (use list_dir)"));
     }
+    let file = std::fs::File::open(&full).map_err(|e| format!("read {path}: {e}"))?;
+    let meta = file.metadata().map_err(|e| format!("read {path}: {e}"))?;
     // Slurp at most MAX_READ_BYTES so a multi-GB file can't OOM the process;
     // the model can page further with offset/limit or fall back to run_bash.
     let oversize = meta.len() > MAX_READ_BYTES;

@@ -2594,6 +2594,11 @@ mod tests {
     /// "Always allow" remembers the exact command, not the whole tool: approving
     /// one destructive `rm` doesn't silently auto-run a *different* destructive
     /// command — that one prompts again.
+    ///
+    /// Unix-only: the test executes `rm -rf … && touch …`, which PowerShell 5.1
+    /// (the Windows shell) can't run (no `touch`, no `&&`). The permission-scoping
+    /// logic under test is platform-agnostic.
+    #[cfg(unix)]
     #[tokio::test]
     async fn always_allow_is_scoped_to_the_exact_command() {
         let dir = tmp();
@@ -3193,6 +3198,11 @@ mod tests {
         assert!(!is_retryable_error("bad request: malformed timeout field"));
     }
 
+    // Unix-only: the mock is a hand-rolled raw `TcpListener` serving sequential
+    // blocking `accept()`s (503 then 200), whose connection sequencing is fragile
+    // on Windows. The retry-past-503 logic it exercises is platform-agnostic and
+    // stays covered on Linux/macOS.
+    #[cfg(unix)]
     #[tokio::test]
     async fn engine_retries_then_succeeds() {
         // First connection returns 503 (retryable, before any stream); the retry
