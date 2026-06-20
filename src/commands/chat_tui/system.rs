@@ -103,7 +103,7 @@ if let data = pasteboard.data(forType: .png) {
 /// so a big-but-finite command like `find .` is captured whole and scrollable.
 /// Only output past this ceiling is dropped — the child is killed and the run
 /// marked `truncated`. Generous enough that ordinary floody commands complete;
-/// the 120s watchdog bounds the time dimension.
+/// the 120s timeout bounds the time dimension.
 const MAX_CAPTURED_LINES: usize = 50_000;
 const MAX_CAPTURED_BYTES: usize = 8 * 1024 * 1024;
 /// A single output line longer than this is truncated for storage/display, so one
@@ -111,6 +111,12 @@ const MAX_CAPTURED_BYTES: usize = 8 * 1024 * 1024;
 const MAX_LINE_CHARS: usize = 2000;
 /// Wall-clock ceiling on a `!cmd` run; on hit the child is killed.
 const SHELL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+/// Windows-only grace after the child exits, letting the reader drain trailing
+/// ConPTY output before we close the pseudoconsole (`ClosePseudoConsole` can drop
+/// not-yet-read bytes). Best-effort: output mostly streams live as it's produced,
+/// so this only covers the final buffered chunk.
+#[cfg(windows)]
+const PTY_DRAIN_GRACE: std::time::Duration = std::time::Duration::from_millis(150);
 
 /// A spawned `!cmd`: the open PTY, a line reader over its (merged stdout+stderr)
 /// output, and the child handle (for `wait`/exit status). The command runs under a
@@ -174,84 +180,145 @@ pub(super) fn spawn_pty_shell(command: &str, cwd: &std::path::Path) -> std::io::
     })
 }
 
-/// Drive a [`PtyShell`] to completion on a blocking thread: emit one
-/// [`RuntimeEvent::LocalCommandLine`] per output line as it arrives (so output
-/// streams live) and a terminal [`RuntimeEvent::LocalCommandDone`]. Reading stops
-/// — and the child is killed — once output crosses
-/// [`MAX_CAPTURED_LINES`]/[`MAX_CAPTURED_BYTES`] (`truncated`) or [`SHELL_TIMEOUT`]
-/// elapses, so a huge or runaway command returns the first screenful fast instead
-/// of blocking on the full dump. Runs under `spawn_blocking` (PTY I/O is sync).
+/// Drive a [`PtyShell`] to completion: a reader thread streams output live (one
+/// [`RuntimeEvent::LocalCommandLine`] per line) while this thread waits for the
+/// child and enforces the wall-clock ceiling, then closes the PTY and emits a
+/// terminal [`RuntimeEvent::LocalCommandDone`]. Reading stops — and the child is
+/// killed — once output crosses [`MAX_CAPTURED_LINES`]/[`MAX_CAPTURED_BYTES`]
+/// (`truncated`) or [`SHELL_TIMEOUT`] elapses. Runs under `spawn_blocking`.
+///
+/// The reader lives on its own thread because closing the PTY is what unblocks a
+/// blocked read on Windows: `portable-pty`'s ConPTY output pipe never returns EOF
+/// when the child exits — only `ClosePseudoConsole` (dropping `master`) does — so a
+/// single-threaded read-then-close would hang forever. Waiting on the child here
+/// lets us drop `master` the moment it exits, unblocking the reader on every
+/// platform (broken pipe on Windows; on Unix the read already EOF'd).
 pub(super) fn run_pty_to_completion(shell: PtyShell, tx: UnboundedSender<RuntimeEvent>) {
     let PtyShell {
         master,
-        mut reader,
+        reader,
         mut child,
     } = shell;
 
-    // Wall-clock watchdog: a command can hang producing nothing, and a blocking
-    // read can't be cancelled, so a side thread kills the child on timeout — that
-    // closes the PTY and unblocks the read with EOF.
-    let timed_out = Arc::new(AtomicBool::new(false));
-    let finished = Arc::new(AtomicBool::new(false));
-    let mut watchdog_killer = child.clone_killer();
-    let watchdog = {
-        let timed_out = timed_out.clone();
-        let finished = finished.clone();
-        std::thread::spawn(move || {
-            let start = std::time::Instant::now();
-            while start.elapsed() < SHELL_TIMEOUT {
-                if finished.load(Ordering::Acquire) {
-                    return;
-                }
-                std::thread::sleep(std::time::Duration::from_millis(100));
-            }
-            if !finished.load(Ordering::Acquire) {
-                timed_out.store(true, Ordering::Release);
-                let _ = watchdog_killer.kill();
-            }
-        })
-    };
+    let truncated = Arc::new(AtomicBool::new(false));
 
-    let mut cap_killer = child.clone_killer();
-    let mut lines = 0usize;
-    let mut bytes = 0usize;
-    let mut truncated = false;
-    let mut acc: Vec<u8> = Vec::new();
-    let mut buf = [0u8; 8192];
-    'read: loop {
-        match reader.read(&mut buf) {
-            Ok(0) | Err(_) => break, // EOF (child exited / PTY closed) or read error
-            Ok(n) => {
-                for &byte in &buf[..n] {
-                    // The PTY translates `\n` → `\r\n`; the `\r` is dropped as a
-                    // control char when the line is cleaned below. Flush a line on
-                    // newline, or when a newline-less run gets over-long (e.g. `cat`
-                    // of a binary) so `acc` can't grow without bound.
-                    let flush = byte == b'\n' || acc.len() >= MAX_LINE_CHARS * 4;
-                    if byte != b'\n' {
-                        acc.push(byte);
-                    }
-                    if flush {
-                        let capped = emit_pty_line(&tx, &acc, &mut lines, &mut bytes);
-                        acc.clear();
-                        if capped {
-                            truncated = true;
-                            let _ = cap_killer.kill();
-                            break 'read;
+    // Reader thread: blocking PTY reads, one emitted line per newline. It owns the
+    // reader and its own killer so it can stop the child the instant output crosses
+    // the capture cap, without waiting for the controller below to notice.
+    let reader_thread = {
+        let tx = tx.clone();
+        let truncated = truncated.clone();
+        let mut cap_killer = child.clone_killer();
+        let mut reader = reader;
+        std::thread::spawn(move || {
+            let mut lines = 0usize;
+            let mut bytes = 0usize;
+            let mut acc: Vec<u8> = Vec::new();
+            let mut buf = [0u8; 8192];
+            'read: loop {
+                match reader.read(&mut buf) {
+                    Ok(0) | Err(_) => break, // EOF (child exited / PTY closed) or read error
+                    Ok(n) => {
+                        for &byte in &buf[..n] {
+                            // The PTY translates `\n` → `\r\n`; the `\r` is dropped as a
+                            // control char when the line is cleaned below. Flush a line on
+                            // newline, or when a newline-less run gets over-long (e.g. `cat`
+                            // of a binary) so `acc` can't grow without bound.
+                            let flush = byte == b'\n' || acc.len() >= MAX_LINE_CHARS * 4;
+                            if byte != b'\n' {
+                                acc.push(byte);
+                            }
+                            if flush {
+                                let capped = emit_pty_line(&tx, &acc, &mut lines, &mut bytes);
+                                acc.clear();
+                                if capped {
+                                    truncated.store(true, Ordering::Release);
+                                    let _ = cap_killer.kill();
+                                    break 'read;
+                                }
+                            }
                         }
                     }
                 }
             }
+            // Flush a trailing partial line (output without a final newline).
+            if !acc.is_empty() {
+                let _ = emit_pty_line(&tx, &acc, &mut lines, &mut bytes);
+            }
+        })
+    };
+
+    // Controller: wait for the child, enforcing the wall-clock ceiling. A blocking
+    // `wait()` was observed to hang on a macOS PTY after a kill, so poll `try_wait`,
+    // ramping the interval so a quick command returns fast without busy-waiting a
+    // slow one. On timeout, signal via a cloned killer (one SIGHUP / TerminateProcess);
+    // the owned `child.kill()` would block while it escalates to SIGKILL.
+    let mut timeout_killer = child.clone_killer();
+    let start = std::time::Instant::now();
+    let mut timed_out = false;
+    let mut exit_status = None;
+    let mut poll = std::time::Duration::from_millis(10);
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                exit_status = Some(status);
+                break;
+            }
+            Ok(None) => {}
+            Err(_) => break,
         }
-    }
-    // Flush a trailing partial line (output without a final newline).
-    if !acc.is_empty() {
-        let _ = emit_pty_line(&tx, &acc, &mut lines, &mut bytes);
+        if truncated.load(Ordering::Acquire) {
+            // The reader hit the capture cap and stopped draining the PTY. Stop
+            // waiting and close it (drop(master) below): a child still flooding a
+            // now-undrained PTY gets EIO and dies, where the cap's kill signal alone
+            // may not stop it (e.g. `yes` blocked writing). Without this we'd block
+            // here for the full timeout waiting on a child that can't make progress.
+            break;
+        }
+        if start.elapsed() >= SHELL_TIMEOUT {
+            timed_out = true;
+            let _ = timeout_killer.kill();
+            break;
+        }
+        std::thread::sleep(poll);
+        poll = (poll * 2).min(std::time::Duration::from_millis(50));
     }
 
-    finished.store(true, Ordering::Release);
-    let _ = watchdog.join();
-    let timed_out = timed_out.load(Ordering::Acquire);
+    // Windows: the reader is still blocked (ConPTY won't EOF on child exit), and
+    // `ClosePseudoConsole` can discard output it hasn't read yet — a short grace lets
+    // it drain first. Skipped on Unix (the read already EOF'd when the slave closed)
+    // and on timeout (we're tearing down regardless).
+    #[cfg(windows)]
+    if !timed_out {
+        std::thread::sleep(PTY_DRAIN_GRACE);
+    }
+
+    // Close the PTY. Dropping our last `master` handle calls `ClosePseudoConsole` on
+    // Windows — which unblocks the reader's blocked `read()` (broken pipe) — and on
+    // Unix gives EIO to any still-writing grandchild (e.g. `yes &`) so it dies instead
+    // of holding the pty open. LOAD-BEARING: `master` must be the last live PTY handle
+    // (the slave is dropped in `spawn_pty_shell` and `master` is never cloned) or the
+    // reader never unblocks and the `join` below hangs.
+    drop(master);
+
+    // Reap a child we stopped (cap/timeout) so it doesn't linger as a zombie; its exit
+    // code is unused on that path. A natural exit already recorded `exit_status`.
+    if exit_status.is_none() {
+        for _ in 0..40 {
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    exit_status = Some(status);
+                    break;
+                }
+                Ok(None) => std::thread::sleep(std::time::Duration::from_millis(50)),
+                Err(_) => break,
+            }
+        }
+    }
+
+    let _ = reader_thread.join();
+
+    let truncated = truncated.load(Ordering::Acquire);
     if timed_out {
         let _ = tx.send(RuntimeEvent::LocalCommandLine {
             is_err: true,
@@ -259,30 +326,14 @@ pub(super) fn run_pty_to_completion(shell: PtyShell, tx: UnboundedSender<Runtime
         });
     }
 
-    // Close the PTY before reaping: it drops our last master handle so a command
-    // whose shell forked a still-writing grandchild (e.g. `yes`) gets EIO and dies,
-    // and it avoids a `wait()` that can block forever on an open macOS PTY.
-    drop(reader);
-    drop(master);
-
-    // Reap the child non-blockingly (a blocking `wait()` was observed to hang on a
-    // macOS PTY after a kill). A natural finish reports the command's real exit
-    // code; a run WE stopped (cap/timeout) reports -1, and folds timeout into
-    // `truncated` so the render shows the "truncated" note, not a bogus `[exited -1]`.
+    // A natural finish reports the command's real exit code; a run WE stopped
+    // (cap/timeout) reports -1, and folds timeout into `truncated` so the render shows
+    // the "truncated" note, not a bogus `[exited -1]`.
     let stopped_early = truncated || timed_out;
-    let mut exit_code = -1;
-    for _ in 0..40 {
-        match child.try_wait() {
-            Ok(Some(status)) => {
-                if !stopped_early {
-                    exit_code = i64::from(status.exit_code());
-                }
-                break;
-            }
-            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(50)),
-            Err(_) => break,
-        }
-    }
+    let exit_code = match exit_status {
+        Some(status) if !stopped_early => i64::from(status.exit_code()),
+        _ => -1,
+    };
     let _ = tx.send(RuntimeEvent::LocalCommandDone {
         exit_code,
         truncated: stopped_early,
