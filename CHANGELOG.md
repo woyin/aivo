@@ -1,5 +1,16 @@
 # Changelog
 
+## v0.31.0
+
+`aivo chat` is now a native, in-process coding agent. It reads and edits
+files, runs commands behind permission prompts, and drives a full chat TUI
+directly inside aivo — sharing the same engine, tools, and protocol as the
+rest of the CLI instead of shelling out to an external agent.
+
+- feat(chat): native in-process coding agent (74c1b27)
+- fix(chat): cross-platform shell + clipboard for the chat agent (718812f)
+- fix(pi): symlink `~/.pi/agent/npm` into the temp `PI_CODING_AGENT_DIR` (30e6600)
+
 ## v0.30.1
 
 Local llama-server runs (`hf:` refs and local `.gguf` files) now configure
