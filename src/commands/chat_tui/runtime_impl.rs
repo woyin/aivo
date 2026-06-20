@@ -120,20 +120,35 @@ impl ChatTuiApp {
                 }
                 Ok(false)
             }
-            SubmitAction::Command(command) => match self.execute_slash_command(command).await {
-                Ok(should_exit) => {
-                    self.draft.clear();
-                    self.cursor = 0;
-                    self.command_menu.reset();
-                    self.draft_history_index = None;
-                    self.draft_history_stash = None;
-                    Ok(should_exit)
+            SubmitAction::Command(command) => {
+                // Record the typed `/command` so up-arrow recalls it, the same as
+                // a normal message or `!cmd`. Skills and `/create-skill` record
+                // their own normalized `/name args` form inside their handlers
+                // (see `run_skill_command`), so skip them here to avoid a
+                // duplicate entry. Capture the draft before it's cleared below.
+                let recordable = !matches!(
+                    command,
+                    SlashCommand::Skill { .. } | SlashCommand::CreateSkill(_)
+                );
+                let typed = self.draft.trim().to_string();
+                match self.execute_slash_command(command).await {
+                    Ok(should_exit) => {
+                        if recordable {
+                            self.record_draft_history(&typed);
+                        }
+                        self.draft.clear();
+                        self.cursor = 0;
+                        self.command_menu.reset();
+                        self.draft_history_index = None;
+                        self.draft_history_stash = None;
+                        Ok(should_exit)
+                    }
+                    Err(err) => {
+                        self.notice = Some((ERROR, err.to_string()));
+                        Ok(false)
+                    }
                 }
-                Err(err) => {
-                    self.notice = Some((ERROR, err.to_string()));
-                    Ok(false)
-                }
-            },
+            }
             SubmitAction::Shell(command) => {
                 // Don't run a local command on top of a model turn; interrupt it
                 // (esc) first. Keeps the draft so the command can be retried.
@@ -1554,7 +1569,12 @@ impl ChatTuiApp {
         if input.is_empty() {
             return;
         }
-        self.draft_history.push(input.to_string());
+        // Drop consecutive duplicates (shell `ignoredups` behavior): re-running
+        // the same command or recalling an entry with up-arrow and resending it
+        // shouldn't stack identical rows. Non-adjacent repeats are kept.
+        if self.draft_history.last().map(String::as_str) != Some(input) {
+            self.draft_history.push(input.to_string());
+        }
         self.draft_history_index = None;
         self.draft_history_stash = None;
     }

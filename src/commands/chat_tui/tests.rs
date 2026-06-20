@@ -842,6 +842,46 @@ async fn test_ctrl_l_clears_history_navigation_state() {
 }
 
 #[tokio::test]
+async fn test_submit_slash_command_records_draft_history() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.draft = "/help".to_string();
+    app.cursor = app.draft.len();
+
+    let should_exit = app.submit_draft().await.unwrap();
+
+    // The command ran (help overlay opened) and the draft cleared...
+    assert!(!should_exit);
+    assert!(app.draft.is_empty());
+    assert!(matches!(app.overlay, Overlay::Help { .. }));
+    // ...but the typed `/help` is now recallable from input history, just like
+    // a normal message or `!cmd`.
+    assert_eq!(app.draft_history, vec!["/help".to_string()]);
+    app.history_prev();
+    assert_eq!(app.draft, "/help");
+}
+
+#[tokio::test]
+async fn test_record_draft_history_dedupes_consecutive() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+
+    app.record_draft_history("/help");
+    app.record_draft_history("/help"); // consecutive dup → ignored
+    app.record_draft_history("/model");
+    app.record_draft_history("/help"); // non-adjacent repeat → kept
+
+    assert_eq!(
+        app.draft_history,
+        vec![
+            "/help".to_string(),
+            "/model".to_string(),
+            "/help".to_string()
+        ]
+    );
+}
+
+#[tokio::test]
 async fn test_ctrl_c_requires_confirmation_to_exit() {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let mut app = make_test_app(tx, rx);
