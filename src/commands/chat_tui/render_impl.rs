@@ -9,6 +9,15 @@ fn table_layout_width(area_width: u16) -> u16 {
     area_width.saturating_sub(ACCENT_GUTTER_WIDTH + 1)
 }
 
+/// The inner content rect of a centered overlay — mirrors the `Margin` every
+/// overlay insets its body by, so the screen selection can be confined to it.
+fn overlay_content_rect(area: Rect) -> Rect {
+    area.inner(ratatui::layout::Margin {
+        vertical: 1,
+        horizontal: 2,
+    })
+}
+
 impl ChatTuiApp {
     pub(super) fn is_transcript_empty(&self) -> bool {
         self.history.is_empty()
@@ -531,6 +540,7 @@ impl ChatTuiApp {
         let outer = frame.area();
         self.picker_hitbox = None;
         self.transcript_hitbox = None;
+        self.screen_region = None;
         let composer_area = self.render_main(frame, outer);
         if let Some(menu) = self.visible_command_menu() {
             let (area, placement) = command_menu_area(
@@ -549,27 +559,33 @@ impl ChatTuiApp {
                 self.render_picker(frame, centered_rect(68, 72, body), &picker);
             }
             Overlay::Help { scroll } => {
-                let clamped = self.render_help_overlay(frame, centered_rect(72, 88, body), scroll);
+                let area = centered_rect(72, 88, body);
+                self.screen_region = Some(overlay_content_rect(area));
+                let clamped = self.render_help_overlay(frame, area, scroll);
                 if let Overlay::Help { scroll } = &mut self.overlay {
                     *scroll = clamped;
                 }
             }
             Overlay::Output { scroll } => {
-                let clamped =
-                    self.render_output_overlay(frame, centered_rect(84, 88, body), scroll);
+                let area = centered_rect(84, 88, body);
+                self.screen_region = Some(overlay_content_rect(area));
+                let clamped = self.render_output_overlay(frame, area, scroll);
                 if let Overlay::Output { scroll } = &mut self.overlay {
                     *scroll = clamped;
                 }
             }
             Overlay::Skills(skills) => {
-                let clamped =
-                    self.render_skills_overlay(frame, centered_rect(64, 80, body), &skills);
+                let area = centered_rect(64, 80, body);
+                self.screen_region = Some(overlay_content_rect(area));
+                let clamped = self.render_skills_overlay(frame, area, &skills);
                 if let (Some(c), Overlay::Skills(s)) = (clamped, &mut self.overlay) {
                     s.detail_scroll = c;
                 }
             }
             Overlay::Mcp(mcp) => {
-                let clamped = self.render_mcp_overlay(frame, centered_rect(64, 80, body), &mcp);
+                let area = centered_rect(64, 80, body);
+                self.screen_region = Some(overlay_content_rect(area));
+                let clamped = self.render_mcp_overlay(frame, area, &mcp);
                 if let (Some(c), Overlay::Mcp(s)) = (clamped, &mut self.overlay) {
                     s.detail_scroll = c;
                 }
@@ -583,7 +599,88 @@ impl ChatTuiApp {
             self.render_permission_card(frame, composer_area, outer);
         }
 
+        // Snapshot the finished screen so a drag can copy from anywhere on it,
+        // then wash the full-screen selection over whatever now sits there.
+        self.capture_screen_surface(frame);
+        self.render_screen_selection_highlight(frame);
+
         self.render_toast(frame, outer);
+    }
+
+    /// Captures the rendered screen into `screen_surface` for full-screen drag-copy.
+    /// Confined to `screen_region` (a modal's content rect) when one is open.
+    fn capture_screen_surface(&mut self, frame: &mut Frame<'_>) {
+        let full = frame.area();
+        let area = self
+            .screen_region
+            .map(|region| region.intersection(full))
+            .unwrap_or(full);
+        let buffer = frame.buffer_mut();
+        let mut rows = Vec::with_capacity(usize::from(area.height));
+        for y in area.y..area.y.saturating_add(area.height) {
+            let mut row = String::with_capacity(usize::from(area.width));
+            for x in area.x..area.x.saturating_add(area.width) {
+                if let Some(cell) = buffer.cell((x, y)) {
+                    // Wide-char spacers carry an empty symbol, so the row's display
+                    // width stays equal to its column count.
+                    row.push_str(cell.symbol());
+                }
+            }
+            rows.push(row);
+        }
+        self.screen_surface = Some(ScreenSurface { area, rows });
+    }
+
+    /// Screen-coordinate twin of `render_transcript_selection_highlight`.
+    fn render_screen_selection_highlight(&self, frame: &mut Frame<'_>) {
+        let Some(selection) = self
+            .screen_selection
+            .filter(|selection| !selection.is_empty())
+        else {
+            return;
+        };
+        let Some(surface) = &self.screen_surface else {
+            return;
+        };
+
+        let wash = if self.selection_flash_until.is_some() {
+            SELECT_FLASH
+        } else {
+            SELECT_WARM
+        };
+        let (start, end) = normalized_selection(selection);
+        let area = surface.area;
+        let row_end = end.row.min(surface.rows.len().saturating_sub(1));
+        if start.row > row_end {
+            return;
+        }
+
+        let buffer = frame.buffer_mut();
+        for row in start.row..=row_end {
+            // Clamp to the row's real text (trailing blanks excluded), matching copy.
+            let text_width = surface
+                .rows
+                .get(row)
+                .map(|line| row_display_width(line.trim_end()))
+                .unwrap_or(0);
+            let start_col = if row == start.row { start.column } else { 0 };
+            let end_col = if row == end.row {
+                end.column
+            } else {
+                text_width
+            };
+            let start_col = start_col.min(text_width);
+            let end_col = end_col.min(text_width);
+            if start_col >= end_col {
+                continue;
+            }
+            let y = area.y.saturating_add(row as u16);
+            for column in start_col..end_col {
+                if let Some(cell) = buffer.cell_mut((area.x + column, y)) {
+                    cell.set_bg(wash);
+                }
+            }
+        }
     }
 
     /// Card asking whether to spawn a repo's project `.mcp.json` stdio servers
@@ -1255,6 +1352,7 @@ impl ChatTuiApp {
         {
             self.selection_flash_until = None;
             self.transcript_selection = None;
+            self.screen_selection = None;
         }
     }
 

@@ -1033,6 +1033,10 @@ fn make_test_app(
         volatile_tail_cache: None,
         transcript_selection: None,
         transcript_drag_active: false,
+        screen_selection: None,
+        screen_drag_active: false,
+        screen_surface: None,
+        screen_region: None,
         drag_autoscroll: None,
         last_autoscroll: None,
         last_click: None,
@@ -3936,6 +3940,140 @@ async fn test_mouse_drag_coordinates_map_to_transcript_rows() {
     );
 }
 
+#[tokio::test]
+async fn test_screen_drag_selects_off_transcript_from_screen_capture() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    // A press below the transcript (composer/footer band) selects the screen capture.
+    app.transcript_hitbox = Some(TranscriptHitbox {
+        area: Rect::new(0, 0, 20, 1),
+        first_row: 0,
+        rows: vec!["transcript".to_string()],
+    });
+    app.screen_surface = Some(ScreenSurface {
+        area: Rect::new(0, 0, 20, 4),
+        rows: vec![
+            "transcript".to_string(),
+            "alpha beta gamma".to_string(),
+            "second line here".to_string(),
+            String::new(),
+        ],
+    });
+
+    app.handle_mouse(MouseEvent {
+        kind: MouseEventKind::Down(MouseButton::Left),
+        column: 6,
+        row: 1,
+        modifiers: KeyModifiers::NONE,
+    })
+    .await
+    .unwrap();
+    app.handle_mouse(MouseEvent {
+        kind: MouseEventKind::Drag(MouseButton::Left),
+        column: 6,
+        row: 2,
+        modifiers: KeyModifiers::NONE,
+    })
+    .await
+    .unwrap();
+
+    assert!(app.transcript_selection.is_none());
+    assert_eq!(
+        app.screen_selection,
+        Some(TranscriptSelection {
+            anchor: TranscriptPoint { row: 1, column: 6 },
+            focus: TranscriptPoint { row: 2, column: 6 },
+        })
+    );
+    assert_eq!(
+        app.selected_screen_text().as_deref(),
+        Some("beta gamma\nsecond")
+    );
+}
+
+#[tokio::test]
+async fn test_open_overlay_left_drag_selects_overlay_text() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    // An open overlay covers the transcript: a left drag selects the overlay text.
+    app.overlay = Overlay::Output { scroll: 0 };
+    app.transcript_hitbox = Some(TranscriptHitbox {
+        area: Rect::new(0, 0, 40, 10),
+        first_row: 0,
+        rows: vec!["hidden transcript".to_string(); 10],
+    });
+    app.screen_surface = Some(ScreenSurface {
+        area: Rect::new(0, 0, 40, 4),
+        rows: vec![
+            "  command output line one".to_string(),
+            "  command output line two".to_string(),
+            String::new(),
+            String::new(),
+        ],
+    });
+
+    app.handle_mouse(MouseEvent {
+        kind: MouseEventKind::Down(MouseButton::Left),
+        column: 2,
+        row: 0,
+        modifiers: KeyModifiers::NONE,
+    })
+    .await
+    .unwrap();
+    app.handle_mouse(MouseEvent {
+        kind: MouseEventKind::Drag(MouseButton::Left),
+        column: 25,
+        row: 0,
+        modifiers: KeyModifiers::NONE,
+    })
+    .await
+    .unwrap();
+
+    assert!(app.transcript_selection.is_none());
+    assert_eq!(
+        app.selected_screen_text().as_deref(),
+        Some("command output line one")
+    );
+}
+
+#[test]
+fn test_open_modal_confines_screen_selection_to_its_content() {
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.overlay = Overlay::Help { scroll: 0 };
+
+    let mut terminal = Terminal::new(TestBackend::new(100, 40)).unwrap();
+    terminal.draw(|frame| app.render(frame)).unwrap();
+
+    // A modal is open → the selection surface is its inner content rect, not the
+    // whole screen, so a drag/line-select can't grab the full terminal line.
+    let region = app
+        .screen_region
+        .expect("an open modal sets a selection region");
+    assert!(
+        region.width < 100,
+        "region must be narrower than the screen"
+    );
+    assert!(region.x > 0, "region starts inside the modal border");
+    let surface = app.screen_surface.as_ref().unwrap();
+    assert_eq!(surface.area, region);
+    assert!(
+        surface
+            .rows
+            .iter()
+            .all(|r| row_display_width(r) <= region.width),
+        "captured rows must not exceed the modal width"
+    );
+    assert!(
+        surface.rows.iter().any(|r| r.contains("Slash commands")),
+        "modal content should be captured: {:?}",
+        surface.rows
+    );
+}
+
 #[test]
 fn test_word_bounds_at_grabs_contiguous_word() {
     // "alpha beta gamma" → clicking inside "beta" (cols 6..10) selects 6..10.
@@ -4021,7 +4159,10 @@ fn test_select_word_and_line_set_expected_bounds() {
         rows: vec!["alpha beta".to_string(), "x".to_string()],
     });
 
-    assert!(app.select_word_at(TranscriptPoint { row: 0, column: 7 }));
+    assert!(app.select_word_on(
+        SelectionSurface::Transcript,
+        TranscriptPoint { row: 0, column: 7 }
+    ));
     assert_eq!(
         app.transcript_selection,
         Some(TranscriptSelection {
@@ -4030,7 +4171,10 @@ fn test_select_word_and_line_set_expected_bounds() {
         })
     );
 
-    assert!(app.select_line_at(TranscriptPoint { row: 0, column: 2 }));
+    assert!(app.select_line_on(
+        SelectionSurface::Transcript,
+        TranscriptPoint { row: 0, column: 2 }
+    ));
     assert_eq!(
         app.transcript_selection,
         Some(TranscriptSelection {
@@ -4041,7 +4185,10 @@ fn test_select_word_and_line_set_expected_bounds() {
 
     // A click on whitespace produces no word selection.
     app.transcript_selection = None;
-    assert!(!app.select_word_at(TranscriptPoint { row: 0, column: 5 }));
+    assert!(!app.select_word_on(
+        SelectionSurface::Transcript,
+        TranscriptPoint { row: 0, column: 5 }
+    ));
     assert!(app.transcript_selection.is_none());
 }
 

@@ -1210,17 +1210,15 @@ impl ChatTuiApp {
             MouseEventKind::ScrollDown if self.mouse_over_transcript(mouse) => {
                 self.scroll_down_lines(self.scroll_speed)
             }
-            MouseEventKind::Down(MouseButton::Left)
+            MouseEventKind::Down(MouseButton::Left) => {
+                // A press in the composer also drops the caret there; a drag still selects.
                 if self.should_show_input_cursor()
-                    && self.composer_offset_for_mouse(mouse).is_some() =>
-            {
-                if let Some(offset) = self.composer_offset_for_mouse(mouse) {
-                    self.clear_transcript_selection();
+                    && !self.overlay.blocks_input()
+                    && let Some(offset) = self.composer_offset_for_mouse(mouse)
+                {
                     self.cursor = offset;
                 }
-            }
-            MouseEventKind::Down(MouseButton::Left) => {
-                let Some(point) = self.transcript_point_for_mouse(mouse, false) else {
+                let Some((surface, point)) = self.selection_target(mouse, false) else {
                     return Ok(false);
                 };
                 let clicks = self.register_click(point);
@@ -1230,31 +1228,33 @@ impl ChatTuiApp {
                     // selects the whole visual row. Both copy + flash, matching the
                     // drag-to-copy model. They fall through to a caret drag when the
                     // click lands on blank space (no word/row to grab).
-                    2 if self.select_word_at(point) => {
-                        self.transcript_drag_active = false;
+                    2 if self.select_word_on(surface, point) => {
+                        self.end_drag();
                         self.copy_selection_to_clipboard();
                     }
-                    3 if self.select_line_at(point) => {
-                        self.transcript_drag_active = false;
+                    3 if self.select_line_on(surface, point) => {
+                        self.end_drag();
                         self.copy_selection_to_clipboard();
                     }
-                    _ => {
-                        self.transcript_selection = Some(TranscriptSelection {
-                            anchor: point,
-                            focus: point,
-                        });
-                        self.transcript_drag_active = true;
-                    }
+                    _ => self.begin_drag(surface, point),
                 }
             }
             MouseEventKind::Drag(MouseButton::Left) if self.transcript_drag_active => {
                 self.set_drag_focus(mouse);
                 self.update_drag_autoscroll(mouse);
             }
+            MouseEventKind::Drag(MouseButton::Left) if self.screen_drag_active => {
+                self.set_screen_drag_focus(mouse);
+            }
             MouseEventKind::Up(MouseButton::Left) if self.transcript_drag_active => {
                 self.transcript_drag_active = false;
                 self.drag_autoscroll = None;
                 self.set_drag_focus(mouse);
+                self.copy_selection_to_clipboard();
+            }
+            MouseEventKind::Up(MouseButton::Left) if self.screen_drag_active => {
+                self.screen_drag_active = false;
+                self.set_screen_drag_focus(mouse);
                 self.copy_selection_to_clipboard();
             }
             _ => {}
@@ -1285,58 +1285,149 @@ impl ChatTuiApp {
         count
     }
 
-    /// Selects the word at `point`. Returns false (leaving selection untouched)
-    /// when the click lands on whitespace or past the row's text.
-    pub(super) fn select_word_at(&mut self, point: TranscriptPoint) -> bool {
+    /// The selectable rows backing `surface`.
+    fn surface_rows(&self, surface: SelectionSurface) -> Option<&[String]> {
+        match surface {
+            SelectionSurface::Transcript => {
+                self.transcript_hitbox.as_ref().map(|h| h.rows.as_slice())
+            }
+            SelectionSurface::Screen => self.screen_surface.as_ref().map(|s| s.rows.as_slice()),
+        }
+    }
+
+    /// Writes `selection` to `surface`, clearing the other so only one is live.
+    fn set_selection(&mut self, surface: SelectionSurface, selection: TranscriptSelection) {
+        match surface {
+            SelectionSurface::Transcript => {
+                self.screen_selection = None;
+                self.transcript_selection = Some(selection);
+            }
+            SelectionSurface::Screen => {
+                self.transcript_selection = None;
+                self.screen_selection = Some(selection);
+            }
+        }
+    }
+
+    /// Selects the word at `point` on `surface`; false on whitespace/past the row.
+    pub(super) fn select_word_on(
+        &mut self,
+        surface: SelectionSurface,
+        point: TranscriptPoint,
+    ) -> bool {
         let Some((start, end)) = self
-            .transcript_hitbox
-            .as_ref()
-            .and_then(|hitbox| hitbox.rows.get(point.row))
+            .surface_rows(surface)
+            .and_then(|rows| rows.get(point.row))
             .and_then(|row| word_bounds_at(row, point.column))
         else {
             return false;
         };
-        self.transcript_selection = Some(TranscriptSelection {
-            anchor: TranscriptPoint {
-                row: point.row,
-                column: start,
+        self.set_selection(
+            surface,
+            TranscriptSelection {
+                anchor: TranscriptPoint {
+                    row: point.row,
+                    column: start,
+                },
+                focus: TranscriptPoint {
+                    row: point.row,
+                    column: end,
+                },
             },
-            focus: TranscriptPoint {
-                row: point.row,
-                column: end,
-            },
-        });
+        );
         true
     }
 
-    /// Selects the entire visual row at `point`. Returns false for empty rows.
-    pub(super) fn select_line_at(&mut self, point: TranscriptPoint) -> bool {
+    /// Selects the visual row at `point` on `surface` (trailing blanks excluded);
+    /// false for empty rows.
+    pub(super) fn select_line_on(
+        &mut self,
+        surface: SelectionSurface,
+        point: TranscriptPoint,
+    ) -> bool {
         let width = self
-            .transcript_hitbox
-            .as_ref()
-            .and_then(|hitbox| hitbox.rows.get(point.row))
-            .map(|row| row_display_width(row))
+            .surface_rows(surface)
+            .and_then(|rows| rows.get(point.row))
+            .map(|row| row_display_width(row.trim_end()))
             .unwrap_or(0);
         if width == 0 {
             return false;
         }
-        self.transcript_selection = Some(TranscriptSelection {
-            anchor: TranscriptPoint {
-                row: point.row,
-                column: 0,
+        self.set_selection(
+            surface,
+            TranscriptSelection {
+                anchor: TranscriptPoint {
+                    row: point.row,
+                    column: 0,
+                },
+                focus: TranscriptPoint {
+                    row: point.row,
+                    column: width,
+                },
             },
-            focus: TranscriptPoint {
-                row: point.row,
-                column: width,
-            },
-        });
+        );
         true
     }
 
-    /// Extends the live selection to follow the dragged mouse position.
+    /// Picks the surface + mapped point for a press/drag: the transcript when the
+    /// pointer is over it with no overlay, else the flat screen. `clamp` pins an
+    /// off-surface drag to the edge instead of returning `None`.
+    fn selection_target(
+        &self,
+        mouse: MouseEvent,
+        clamp: bool,
+    ) -> Option<(SelectionSurface, TranscriptPoint)> {
+        if !self.overlay.blocks_input() && self.mouse_over_transcript(mouse) {
+            return self
+                .transcript_point_for_mouse(mouse, clamp)
+                .map(|point| (SelectionSurface::Transcript, point));
+        }
+        self.screen_point_for_mouse(mouse, clamp)
+            .map(|point| (SelectionSurface::Screen, point))
+    }
+
+    /// Anchors a fresh drag-selection at `point` on `surface`.
+    fn begin_drag(&mut self, surface: SelectionSurface, point: TranscriptPoint) {
+        self.set_selection(
+            surface,
+            TranscriptSelection {
+                anchor: point,
+                focus: point,
+            },
+        );
+        match surface {
+            SelectionSurface::Transcript => {
+                self.screen_drag_active = false;
+                self.transcript_drag_active = true;
+            }
+            SelectionSurface::Screen => {
+                self.transcript_drag_active = false;
+                self.drag_autoscroll = None;
+                self.screen_drag_active = true;
+            }
+        }
+    }
+
+    /// Ends any in-progress drag (after a word/line click finalizes).
+    fn end_drag(&mut self) {
+        self.transcript_drag_active = false;
+        self.screen_drag_active = false;
+        self.drag_autoscroll = None;
+    }
+
+    /// Extends the live transcript selection to the dragged position.
     fn set_drag_focus(&mut self, mouse: MouseEvent) {
         if let Some(point) = self.transcript_point_for_mouse(mouse, true)
             && let Some(selection) = &mut self.transcript_selection
+        {
+            selection.focus = point;
+        }
+    }
+
+    /// Extends the live screen selection to the dragged position.
+    fn set_screen_drag_focus(&mut self, mouse: MouseEvent) {
+        if let Some(point) = self.screen_point_for_mouse(mouse, true)
+            && let Some(selection) = &mut self.screen_selection
         {
             selection.focus = point;
         }
@@ -1421,10 +1512,7 @@ impl ChatTuiApp {
     /// Copies the current selection to the clipboard, toasts, and lights the
     /// brief flash. An empty selection is cleared instead.
     fn copy_selection_to_clipboard(&mut self) {
-        match self
-            .selected_transcript_text()
-            .filter(|text| !text.is_empty())
-        {
+        match self.selected_any_text().filter(|text| !text.is_empty()) {
             Some(selected) => match write_system_clipboard(&selected) {
                 Ok(()) => {
                     let chars = selected.chars().count();
@@ -1443,6 +1531,7 @@ impl ChatTuiApp {
             },
             None => {
                 self.transcript_selection = None;
+                self.screen_selection = None;
             }
         }
     }
@@ -1522,7 +1611,37 @@ impl ChatTuiApp {
         })
     }
 
+    /// Maps a mouse position to a `screen_surface` point (absolute coordinates).
+    /// `clamp` pins an off-screen drag to the edge instead of returning `None`.
+    fn screen_point_for_mouse(&self, mouse: MouseEvent, clamp: bool) -> Option<TranscriptPoint> {
+        let surface = self.screen_surface.as_ref()?;
+        let area = surface.area;
+        if !clamp && !rect_contains(area, (mouse.column, mouse.row)) {
+            return None;
+        }
+        let max_x = area.x.saturating_add(area.width.saturating_sub(1));
+        let max_y = area.y.saturating_add(area.height.saturating_sub(1));
+        let column = mouse.column.clamp(area.x, max_x).saturating_sub(area.x);
+        let row = mouse.row.clamp(area.y, max_y).saturating_sub(area.y);
+        Some(TranscriptPoint {
+            row: usize::from(row),
+            column,
+        })
+    }
+
     async fn handle_overlay_mouse(&mut self, mouse: MouseEvent) -> Result<Option<bool>> {
+        // A left press/drag/release over a non-picker overlay falls through to the
+        // screen selection, so the Ctrl+O pager / help / skills / mcp bodies are
+        // selectable; wheel + picker clicks stay handled below.
+        if matches!(
+            mouse.kind,
+            MouseEventKind::Down(MouseButton::Left)
+                | MouseEventKind::Drag(MouseButton::Left)
+                | MouseEventKind::Up(MouseButton::Left)
+        ) && !matches!(self.overlay, Overlay::Picker(_) | Overlay::None)
+        {
+            return Ok(None);
+        }
         match (&self.overlay, mouse.kind) {
             (Overlay::Help { .. }, MouseEventKind::ScrollUp | MouseEventKind::ScrollDown) => {
                 let up = matches!(mouse.kind, MouseEventKind::ScrollUp);

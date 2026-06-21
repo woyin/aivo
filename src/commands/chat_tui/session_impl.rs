@@ -1483,6 +1483,19 @@ impl ChatTuiApp {
         let rows = &self.transcript_hitbox.as_ref()?.rows;
         selected_text_from_rows(rows, selection)
     }
+
+    /// Text under the full-screen selection, from the captured [`ScreenSurface`].
+    pub(super) fn selected_screen_text(&self) -> Option<String> {
+        let selection = self.screen_selection?;
+        let rows = &self.screen_surface.as_ref()?.rows;
+        selected_text_from_rows(rows, selection)
+    }
+
+    /// Text under whichever selection is live — transcript or screen.
+    pub(super) fn selected_any_text(&self) -> Option<String> {
+        self.selected_transcript_text()
+            .or_else(|| self.selected_screen_text())
+    }
 }
 
 /// Parse a `/mcp` add line into `(command, args)`, shell-splitting so quoted

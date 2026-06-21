@@ -1043,6 +1043,23 @@ pub(super) struct TranscriptHitbox {
     pub(super) rows: Vec<String>,
 }
 
+/// Snapshot of the rendered screen so a drag can copy from anywhere on it, not
+/// just the transcript. `rows[i]` is screen row `area.y + i`, one symbol per
+/// display column (CJK wide cells included).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct ScreenSurface {
+    pub(super) area: Rect,
+    pub(super) rows: Vec<String>,
+}
+
+/// Which surface a drag-selection reads from: the scroll-aware transcript, or the
+/// flat [`ScreenSurface`] (overlays, composer, footer).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum SelectionSurface {
+    Transcript,
+    Screen,
+}
+
 /// Memoizes the heavy transcript build + word-wrap across frames. The transcript
 /// body (intro + history + the streamed reply + notice) is re-rendered and
 /// re-wrapped only when its content or the render width actually changes — not on
@@ -1421,6 +1438,15 @@ pub(super) struct ChatTuiApp {
     pub(super) volatile_tail_cache: Option<VolatileTailCache>,
     pub(super) transcript_selection: Option<TranscriptSelection>,
     pub(super) transcript_drag_active: bool,
+    /// Full-screen drag selection (overlays, composer, footer), mutually exclusive
+    /// with `transcript_selection` — starting either drag clears the other.
+    pub(super) screen_selection: Option<TranscriptSelection>,
+    pub(super) screen_drag_active: bool,
+    pub(super) screen_surface: Option<ScreenSurface>,
+    /// Region the screen selection is confined to — a modal's inner content rect
+    /// while one is open, so a drag selects inside the modal, not the whole line.
+    /// `None` = the full screen.
+    pub(super) screen_region: Option<Rect>,
     /// Live edge auto-scroll state while dragging a selection.
     pub(super) drag_autoscroll: Option<DragAutoscroll>,
     /// When the last auto-scroll step fired, to throttle the scroll rate.

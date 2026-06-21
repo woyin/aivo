@@ -50,7 +50,9 @@ impl ChatTuiApp {
     /// resume) so a stale, content-detached highlight can't linger.
     pub(super) fn clear_transcript_selection(&mut self) {
         self.transcript_selection = None;
+        self.screen_selection = None;
         self.transcript_drag_active = false;
+        self.screen_drag_active = false;
         self.drag_autoscroll = None;
         self.selection_flash_until = None;
         self.last_click = None;
