@@ -471,7 +471,7 @@ impl RunCommand {
                 println!(
                     "{}",
                     style::dim(
-                        "When no tool is provided, `aivo run` falls back to the saved `start` flow."
+                        "When no tool is provided, `aivo run` opens an interactive picker of agents and plugins."
                     )
                 );
             }

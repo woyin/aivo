@@ -388,7 +388,7 @@ pub async fn run() -> ! {
             let env_strings = extracted.env_strings;
             let remaining_args = extracted.remaining_args;
 
-            // Bare `aivo run` opens the saved `start` picker; `aivo run chat`
+            // Bare `aivo run` opens the `start` tool picker; `aivo run chat`
             // names aivo's own in-process agent. Both route through the start
             // flow — `chat` isn't an external `AIToolType`, so it can't take the
             // launcher pipeline below; the picker dispatches it to `aivo chat`.
@@ -834,7 +834,7 @@ fn print_help() {
     let print_cmd = |name: &str, desc: &str| {
         println!("  {}  {}", style::cyan(format!("{:<8}", name)), desc);
     };
-    print_cmd("run", "Launch an AI tool, or the saved start flow");
+    print_cmd("run", "Launch an AI tool, or open the tool picker");
     print_cmd("keys", "Manage API keys");
     print_cmd("chat", "Start the interactive chat TUI");
     print_cmd("models", "List available models from the active provider");
