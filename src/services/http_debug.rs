@@ -249,6 +249,10 @@ pub(crate) enum Phase {
     /// in addition to the per-headers `Response` entry, sharing its `id`.
     ResponseBody,
     Error,
+    /// The request future was dropped before `send()` resolved (interrupt /
+    /// process exit while an upstream stalls). Closes the pair so a cancelled
+    /// request isn't a dangling `phase=request` that looks like a truncated log.
+    Cancelled,
     /// JSON-RPC notification: a frame with `method` but no `id`, used by ACP's
     /// `session/update` push stream. Distinct from `Request` / `Response`
     /// because notifications have no reply and shouldn't be paired up by id
@@ -314,6 +318,26 @@ impl HttpDebugLogger {
 
     pub(crate) fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// Synchronous append of one entry, for `Drop` on a cancellation path where
+    /// the process is often about to exit and a spawned async write would never
+    /// be polled. O_APPEND keeps the single-line write atomic against the async
+    /// writer. Bypasses `log`'s redaction, so the entry must carry no body.
+    pub(crate) fn log_blocking(&self, entry: &DebugEntry) {
+        use std::io::Write;
+        let Ok(mut line) = serde_json::to_string(entry) else {
+            return;
+        };
+        line.push('\n');
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.path)
+        {
+            let _ = f.write_all(line.as_bytes());
+            let _ = f.flush();
+        }
     }
 
     pub(crate) async fn log(&self, mut entry: DebugEntry) {
@@ -595,6 +619,54 @@ impl<S> Drop for StreamFinalizer<S> {
     }
 }
 
+struct CancelData {
+    id: String,
+    method: String,
+    url: String,
+    started: std::time::Instant,
+    logger: &'static HttpDebugLogger,
+}
+
+/// Guards the `send()` await: if the future is dropped before `send()` resolves
+/// (interrupt / process exit while an upstream stalls), `Drop` logs a
+/// `phase=cancelled` entry. Disarmed the instant `send()` returns, so the normal
+/// path never emits one.
+struct CancelGuard {
+    data: Option<CancelData>,
+}
+
+impl CancelGuard {
+    fn disarm(&mut self) {
+        self.data.take();
+    }
+}
+
+impl Drop for CancelGuard {
+    fn drop(&mut self) {
+        let Some(data) = self.data.take() else {
+            return;
+        };
+        let duration_ms = data.started.elapsed().as_millis() as u64;
+        let entry = DebugEntry {
+            ts: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+            id: data.id,
+            phase: Phase::Cancelled,
+            method: data.method,
+            url: data.url,
+            status: None,
+            duration_ms: Some(duration_ms),
+            request_headers: BTreeMap::new(),
+            request_body: None,
+            response_headers: BTreeMap::new(),
+            response_body: None,
+            error: Some("request cancelled before response (future dropped in-flight)".to_string()),
+        };
+        // Synchronous, not spawned: cancellation usually precedes process exit,
+        // so a spawned write would never be polled in time.
+        data.logger.log_blocking(&entry);
+    }
+}
+
 /// Core logging logic for `send_logged`, parameterized on a logger reference so
 /// tests can inject a per-test `HttpDebugLogger` without contending for the
 /// process-global `OnceLock`. The trait impl below just resolves `global()` and
@@ -652,7 +724,19 @@ async fn send_logged_with(
         })
         .await;
 
+    // Logs `phase=cancelled` if this future is dropped before `send()` resolves;
+    // disarmed below so the Ok/Err paths own the terminal entry.
+    let mut cancel_guard = CancelGuard {
+        data: Some(CancelData {
+            id: id.clone(),
+            method: method.clone(),
+            url: url.clone(),
+            started,
+            logger,
+        }),
+    };
     let resp_result = rb.send().await;
+    cancel_guard.disarm();
     let duration_ms = started.elapsed().as_millis() as u64;
 
     match resp_result {
@@ -786,7 +870,8 @@ async fn send_logged_with(
 /// entry before `send()` completes, then a matching `phase=response` (or
 /// `phase=error`) entry afterward. Both share the same `id` field for
 /// downstream correlation. This means the user sees the outbound payload even
-/// when the upstream stream stalls or fails mid-flight.
+/// when the upstream stream stalls or fails mid-flight. A future dropped before
+/// `send()` resolves closes the pair with a `phase=cancelled` entry instead.
 ///
 /// **Streaming-aware:** if the response's `Content-Type` is
 /// `text/event-stream` or `application/x-ndjson`, the body is *not* buffered.
@@ -1291,6 +1376,97 @@ mod tests {
         assert!(
             captured.contains("partial"),
             "partial bytes should be captured; got: {captured}"
+        );
+    }
+
+    #[tokio::test]
+    async fn send_logged_emits_cancelled_when_future_dropped_before_response() {
+        // An upstream that accepts the request but never replies (the publicai
+        // 32B hang), with the caller dropping the future before headers arrive:
+        // the log must show request + cancelled, not a dangling request.
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            use tokio::io::AsyncReadExt;
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 4096];
+            let _ = socket.read(&mut buf).await;
+            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+            drop(socket);
+        });
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let log_path = dir.path().join("debug.jsonl");
+        let logger: &'static HttpDebugLogger =
+            Box::leak(Box::new(HttpDebugLogger::open(&log_path).await.unwrap()));
+
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let rb = client
+            .post(format!("http://{addr}/v1/chat/completions"))
+            .header("Content-Type", "application/json")
+            .body(r#"{"stream":true}"#);
+
+        // Drop the send future before the server ever responds.
+        let res = tokio::time::timeout(
+            std::time::Duration::from_millis(250),
+            send_logged_with(rb, logger),
+        )
+        .await;
+        assert!(res.is_err(), "expected the send to be cancelled by timeout");
+
+        let content = tokio::fs::read_to_string(&log_path).await.unwrap();
+        let lines: Vec<&str> = content.lines().collect();
+        assert_eq!(
+            lines.len(),
+            2,
+            "expected request + cancelled entries; got: {content}"
+        );
+        let req: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
+        let cancelled: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
+        assert_eq!(req["phase"], "request");
+        assert_eq!(cancelled["phase"], "cancelled", "second line: {cancelled}");
+        assert_eq!(
+            req["id"], cancelled["id"],
+            "request and cancelled should share id"
+        );
+        // The cancelled entry carries a duration and no status/response.
+        assert!(cancelled["duration_ms"].is_number());
+        assert!(cancelled.get("status").map(|v| v.is_null()).unwrap_or(true));
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn send_logged_does_not_emit_cancelled_on_normal_response() {
+        // A request that completes normally must disarm the guard.
+        let response = "HTTP/1.1 200 OK\r\n\
+                        Content-Type: application/json\r\n\
+                        Content-Length: 17\r\n\
+                        Connection: close\r\n\
+                        \r\n\
+                        {\"text\":\"ok!!\"}\r\n";
+        let (addr, server) = one_shot_server(response).await;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let log_path = dir.path().join("debug.jsonl");
+        let logger: &'static HttpDebugLogger =
+            Box::leak(Box::new(HttpDebugLogger::open(&log_path).await.unwrap()));
+
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let rb = client
+            .post(format!("http://{addr}/v1/messages"))
+            .body(r#"{"q":"hi"}"#);
+        let resp = send_logged_with(rb, logger).await.unwrap();
+        let _ = resp.text().await.unwrap();
+
+        server.await.unwrap();
+
+        let content = tokio::fs::read_to_string(&log_path).await.unwrap();
+        assert!(
+            !content.contains("\"phase\":\"cancelled\""),
+            "normal response must not log a cancelled entry; got: {content}"
         );
     }
 }
