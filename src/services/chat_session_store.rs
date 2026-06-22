@@ -539,10 +539,11 @@ impl ChatSessionStore {
     }
 
     /// Refresh only the durable agent-engine transcript of an existing chat
-    /// session (the engine's raw OpenAI conversation, for exact resume). No-op
-    /// when the session file doesn't exist yet — `save_chat_session_with_id`
-    /// creates it first, then this overwrites the preserved blob with the latest.
-    /// Best-effort: callers treat a failure as non-fatal.
+    /// session (for exact resume). No-op when the session file doesn't exist yet.
+    /// An EMPTY slice CLEARS the stored transcript rather than storing `[]`: after a
+    /// `/rewind` empties or discards the engine, the stale pre-rewind blob must not
+    /// resurface on resume (clearing makes resume seed from the truncated display
+    /// history instead). Best-effort: callers treat a failure as non-fatal.
     pub(crate) async fn save_agent_messages(
         &self,
         session_id: &str,
@@ -552,9 +553,13 @@ impl ChatSessionStore {
         let Ok(mut state) = self.load_session_file(session_id).await else {
             return Ok(());
         };
-        let json = serde_json::to_string(engine_messages)
-            .context("Failed to serialize engine messages")?;
-        state.engine_messages = Some(encrypt(&json)?);
+        state.engine_messages = if engine_messages.is_empty() {
+            None
+        } else {
+            let json = serde_json::to_string(engine_messages)
+                .context("Failed to serialize engine messages")?;
+            Some(encrypt(&json)?)
+        };
         self.save_session_file(&state).await
     }
 

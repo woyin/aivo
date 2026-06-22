@@ -639,14 +639,12 @@ pub(super) enum PickerValue {
     Model(String),
     Key(ApiKey),
     Session(SessionPreview),
-    /// A `/rewind` target. `history_index` is the chat-history index of the user
-    /// message that opened the turn (truncation point). `ordinal` is the engine
-    /// `/rewind` checkpoint for live turns (file revert), or `None` for turns
-    /// restored on resume (conversation-only — no file snapshots).
+    /// A `/rewind` target. `history_index` is the truncation point in the chat
+    /// history; `ordinal` is the matched engine checkpoint (reverts files through
+    /// it), or `None` for turns with no live checkpoint (rewind conversation-only).
     RewindTurn {
         history_index: usize,
         ordinal: Option<usize>,
-        conversation_only: bool,
     },
 }
 

@@ -1,18 +1,17 @@
 //! `/rewind` file-revert via tree-level checkpoints.
 //!
-//! Snapshots the whole working tree at each turn into a *private shadow git
-//! object store* (a tempdir used only as `GIT_DIR`, with `GIT_WORK_TREE` pointed
-//! at the project), and restores it on rewind. Because it operates on the tree —
-//! not individual file edits — it reverts renames, moves, deletes, creates, and
-//! `run_bash`-driven changes uniformly, which the old per-file byte snapshots
-//! could not. The user's real repo (HEAD / index / stash) is never touched: we
-//! only ever read/write our own shadow `GIT_DIR`, and write files into the work
-//! tree on restore (the point of rewind).
+//! Snapshots the working tree at each turn into a *private shadow git object
+//! store* (a tempdir used only as `GIT_DIR`, `GIT_WORK_TREE` pointed at the
+//! project), capturing renames/deletes/creates and `run_bash` changes uniformly.
 //!
-//! Plumbing only — `add`/`write-tree`/`read-tree`/`checkout-index`/`diff` — never
-//! commits or branches. Honors the work tree's `.gitignore`; in a non-git dir it
-//! seeds the shadow `info/exclude` with heavy/ephemeral defaults so snapshots
-//! stay lean. A cheap size guard skips snapshotting a pathologically large tree.
+//! Rewind is SCOPED: [`CheckpointStore::changed_since`] records which paths each
+//! turn touched, and [`CheckpointStore::restore_paths`] reverts only those — so a
+//! `/rewind` never clobbers files the user edited independently between turns. The
+//! user's real repo (HEAD / index / stash) is never touched.
+//!
+//! Plumbing only — `add`/`write-tree`/`read-tree`/`checkout-index`/`diff`/`ls-tree`.
+//! Honors the work tree's `.gitignore`; in a non-git dir seeds the shadow
+//! `info/exclude` with heavy/ephemeral defaults. A size guard skips a huge tree.
 
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -112,58 +111,80 @@ impl CheckpointStore {
         (!sha.is_empty()).then_some(sha)
     }
 
-    /// Restore the work tree to a snapshot tree SHA: rewrite/recreate its files
-    /// and delete anything created since (incl. the new side of a rename), so the
-    /// tree matches exactly. Reports counts for the notice.
-    pub async fn restore(&mut self, tree: &str) -> RestoreReport {
+    /// Work-tree paths that differ from snapshot `tree` right now. Called at a
+    /// turn's end to record what that turn changed, so a later `/rewind` reverts
+    /// only those paths — not files the user edited independently between turns.
+    /// Empty on any git error.
+    pub async fn changed_since(&mut self, tree: &str) -> Vec<PathBuf> {
+        if !self.git_available().await {
+            return Vec::new();
+        }
+        let Some(git_dir) = self.ensure_init().await else {
+            return Vec::new();
+        };
+        // Stage first so newly-created files are seen, then diff `tree` vs index.
+        let _ = self.git(&git_dir).args(["add", "-A"]).output().await;
+        match self
+            .git(&git_dir)
+            .args(["diff", "--name-only", "--cached", "-z"])
+            .arg(tree)
+            .output()
+            .await
+        {
+            Ok(o) if o.status.success() => o
+                .stdout
+                .split(|&b| b == 0)
+                .filter(|s| !s.is_empty())
+                .map(path_from_git_bytes)
+                .collect(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// Restore only `paths` to their content in snapshot `tree`: rewrite the ones
+    /// present in `tree`, delete the rest (created since), and leave every other
+    /// file ALONE. Scoping to `paths` (the union of what the rewound turns changed)
+    /// is what stops a `/rewind` from clobbering the user's independent edits.
+    pub async fn restore_paths(&mut self, tree: &str, paths: &[PathBuf]) -> RestoreReport {
         let err = |e: String| RestoreReport {
             error: Some(e),
             ..Default::default()
         };
+        if paths.is_empty() {
+            return RestoreReport::default();
+        }
         if !self.git_available().await {
             return err("git is unavailable".to_string());
         }
         let Some(git_dir) = self.ensure_init().await else {
             return err("could not init the checkpoint store".to_string());
         };
-        // Capture the current tree first so we know what was added since `tree`.
-        let _ = self.git(&git_dir).args(["add", "-A"]).output().await;
-        let cur = match self.git(&git_dir).arg("write-tree").output().await {
-            Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).trim().to_string(),
-            Ok(o) => return err(stderr_of(&o)),
-            Err(e) => return err(e.to_string()),
+        // Paths in `tree` are restored from it; the rest were created since → delete.
+        let in_tree = match self.tree_has_paths(&git_dir, tree, paths).await {
+            Ok(set) => set,
+            Err(e) => return err(e),
         };
-        if cur == tree {
-            return RestoreReport::default(); // nothing changed since the snapshot
-        }
-        // Make the index `tree`, then force every file in it onto disk.
         match self.git(&git_dir).arg("read-tree").arg(tree).output().await {
             Ok(o) if o.status.success() => {}
             Ok(o) => return err(stderr_of(&o)),
             Err(e) => return err(e.to_string()),
         }
-        match self
-            .git(&git_dir)
-            .args(["checkout-index", "-a", "-f"])
-            .output()
-            .await
-        {
-            Ok(o) if o.status.success() => {}
-            Ok(o) => return err(stderr_of(&o)),
-            Err(e) => return err(e.to_string()),
+        let to_restore: Vec<&PathBuf> = paths.iter().filter(|p| in_tree.contains(*p)).collect();
+        let mut restored = 0usize;
+        if !to_restore.is_empty() {
+            let mut cmd = self.git(&git_dir);
+            cmd.args(["checkout-index", "-f", "--"]);
+            for p in &to_restore {
+                cmd.arg(p);
+            }
+            match cmd.output().await {
+                Ok(o) if o.status.success() => restored = to_restore.len(),
+                Ok(o) => return err(stderr_of(&o)),
+                Err(e) => return err(e.to_string()),
+            }
         }
-        // Files present now but not in `tree` (creates / rename new-side) → delete.
-        let to_delete = match self.diff_names(&git_dir, tree, &cur, "A").await {
-            Ok(paths) => paths,
-            Err(e) => return err(e),
-        };
-        let restored = self
-            .diff_names(&git_dir, tree, &cur, "DM")
-            .await
-            .map(|v| v.len())
-            .unwrap_or(0);
         let mut deleted = 0usize;
-        for rel in &to_delete {
+        for rel in paths.iter().filter(|p| !in_tree.contains(*p)) {
             let path = self.cwd.join(rel);
             if std::fs::remove_file(&path).is_ok() {
                 deleted += 1;
@@ -179,6 +200,31 @@ impl CheckpointStore {
 
     // --- internals ---
 
+    /// Which of `paths` exist in `tree` (NUL-delimited `ls-tree`, scoped to the
+    /// given pathspecs so it doesn't list the whole tree).
+    async fn tree_has_paths(
+        &self,
+        git_dir: &Path,
+        tree: &str,
+        paths: &[PathBuf],
+    ) -> Result<std::collections::HashSet<PathBuf>, String> {
+        let mut cmd = self.git(git_dir);
+        cmd.args(["ls-tree", "-r", "--name-only", "-z", tree, "--"]);
+        for p in paths {
+            cmd.arg(p);
+        }
+        let out = cmd.output().await.map_err(|e| e.to_string())?;
+        if !out.status.success() {
+            return Err(stderr_of(&out));
+        }
+        Ok(out
+            .stdout
+            .split(|&b| b == 0)
+            .filter(|s| !s.is_empty())
+            .map(path_from_git_bytes)
+            .collect())
+    }
+
     /// A `git` command pre-wired with the shadow `GIT_DIR`, the project work tree,
     /// and config that neutralizes the user's environment (no CRLF rewrites on
     /// restore, preserve mode bits, verbatim path output).
@@ -186,9 +232,17 @@ impl CheckpointStore {
         let mut cmd = Command::new("git");
         cmd.env("GIT_DIR", git_dir)
             .env("GIT_WORK_TREE", &self.cwd)
+            // Isolate from the user's git config: a global `core.excludesFile`
+            // would otherwise drop matching files from snapshots (so `/rewind`
+            // couldn't revert them). `GIT_CONFIG_GLOBAL` → a nonexistent path
+            // (git treats it as empty); `-c core.excludesFile=` covers git < 2.32.
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", git_dir.join("aivo-no-global-config"))
             .current_dir(&self.cwd)
             .stdin(Stdio::null())
             .args([
+                "-c",
+                "core.excludesFile=",
                 "-c",
                 "core.autocrlf=false",
                 "-c",
@@ -245,13 +299,14 @@ impl CheckpointStore {
             .unwrap_or(false)
     }
 
-    /// True when the untracked files git would add exceed the size guard. Counts
-    /// entries + sums their sizes without hashing (`ls-files --others`), so it's
-    /// cheap even on a huge tree. A measurement failure does not block.
+    /// True when the files git would snapshot exceed the size guard. Sums sizes
+    /// without hashing (`ls-files`). Counts both tracked (`-c`) and untracked
+    /// (`-o`) files, so a tracked file that balloons later still trips the cap —
+    /// `--others` alone would miss it once the first snapshot tracked everything.
     async fn exceeds_cap(&self, git_dir: &Path) -> bool {
         let out = match self
             .git(git_dir)
-            .args(["ls-files", "--others", "--exclude-standard", "-z"])
+            .args(["ls-files", "-c", "-o", "--exclude-standard", "-z"])
             .output()
             .await
         {
@@ -265,7 +320,7 @@ impl CheckpointStore {
             if files > self.max_files {
                 return true;
             }
-            let path = self.cwd.join(String::from_utf8_lossy(rel).as_ref());
+            let path = self.cwd.join(path_from_git_bytes(rel));
             if let Ok(md) = std::fs::metadata(&path) {
                 bytes = bytes.saturating_add(md.len());
                 if bytes > self.max_bytes {
@@ -274,35 +329,6 @@ impl CheckpointStore {
             }
         }
         false
-    }
-
-    /// Paths changed between trees `from`→`to` matching `--diff-filter=<filter>`,
-    /// relative to the work tree. NUL-delimited so spaces/unicode are verbatim.
-    async fn diff_names(
-        &self,
-        git_dir: &Path,
-        from: &str,
-        to: &str,
-        filter: &str,
-    ) -> Result<Vec<PathBuf>, String> {
-        let out = self
-            .git(git_dir)
-            .args(["diff", "--name-only", "-z"])
-            .arg(format!("--diff-filter={filter}"))
-            .arg(from)
-            .arg(to)
-            .output()
-            .await
-            .map_err(|e| e.to_string())?;
-        if !out.status.success() {
-            return Err(stderr_of(&out));
-        }
-        Ok(out
-            .stdout
-            .split(|&b| b == 0)
-            .filter(|s| !s.is_empty())
-            .map(|s| PathBuf::from(String::from_utf8_lossy(s).into_owned()))
-            .collect())
     }
 
     /// Remove now-empty parent directories of a deleted file, up to (not incl.)
@@ -318,6 +344,21 @@ impl CheckpointStore {
             }
             cur = dir.parent();
         }
+    }
+}
+
+/// Decode a NUL-delimited git path (`-z`) into a `PathBuf`. On Unix, preserve the
+/// bytes verbatim so a non-UTF-8 filename still maps to the real file; on Windows
+/// git emits UTF-8, so a lossy decode is fine.
+fn path_from_git_bytes(bytes: &[u8]) -> PathBuf {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        PathBuf::from(std::ffi::OsStr::from_bytes(bytes))
+    }
+    #[cfg(not(unix))]
+    {
+        PathBuf::from(String::from_utf8_lossy(bytes).into_owned())
     }
 }
 
@@ -357,6 +398,13 @@ mod tests {
         std::fs::read_to_string(cwd.join(rel)).ok()
     }
 
+    /// The real rewind flow a turn drives: record what changed since `tree`, then
+    /// revert only those paths.
+    async fn rewind(store: &mut CheckpointStore, tree: &str) -> RestoreReport {
+        let changed = store.changed_since(tree).await;
+        store.restore_paths(tree, &changed).await
+    }
+
     #[tokio::test]
     async fn snapshot_then_restore_reverts_edit() {
         let dir = tempfile::tempdir().unwrap();
@@ -367,7 +415,7 @@ mod tests {
         };
         let t0 = store.snapshot().await.expect("snapshot");
         write(cwd, "a.rs", "v1");
-        let report = store.restore(&t0).await;
+        let report = rewind(&mut store, &t0).await;
         assert_eq!(read(cwd, "a.rs").as_deref(), Some("v0"));
         assert!(report.error.is_none());
         assert_eq!(report.restored, 1);
@@ -385,7 +433,7 @@ mod tests {
         // Simulate `mv a.rs b.rs` (a bash rename) + an edit of the new name.
         std::fs::rename(cwd.join("a.rs"), cwd.join("b.rs")).unwrap();
         write(cwd, "b.rs", "A edited");
-        let report = store.restore(&t0).await;
+        let report = rewind(&mut store, &t0).await;
         assert_eq!(read(cwd, "a.rs").as_deref(), Some("A"), "old name restored");
         assert!(!cwd.join("b.rs").exists(), "new name removed");
         assert_eq!((report.restored, report.deleted), (1, 1));
@@ -401,7 +449,7 @@ mod tests {
         };
         let t0 = store.snapshot().await.expect("snapshot");
         write(cwd, "sub/new.rs", "n");
-        store.restore(&t0).await;
+        rewind(&mut store, &t0).await;
         assert!(!cwd.join("sub/new.rs").exists());
         assert!(!cwd.join("sub").exists(), "empty dir cleaned");
         assert_eq!(read(cwd, "keep.rs").as_deref(), Some("k"));
@@ -417,9 +465,40 @@ mod tests {
         };
         let t0 = store.snapshot().await.expect("snapshot");
         std::fs::remove_file(cwd.join("a.rs")).unwrap(); // simulate `rm a.rs`
-        let report = store.restore(&t0).await;
+        let report = rewind(&mut store, &t0).await;
         assert_eq!(read(cwd, "a.rs").as_deref(), Some("A"));
         assert_eq!(report.restored, 1);
+    }
+
+    #[tokio::test]
+    async fn rewind_leaves_unrelated_user_edits_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path();
+        write(cwd, "agent.rs", "a0");
+        write(cwd, "mine.rs", "m0");
+        let Some(mut store) = git_or_skip(cwd).await else {
+            return;
+        };
+        let t0 = store.snapshot().await.expect("snapshot");
+        // Agent turn edits only agent.rs; record what it touched (turn end).
+        write(cwd, "agent.rs", "a1");
+        let changed = store.changed_since(&t0).await;
+        // The user then hand-edits an unrelated file, after the turn.
+        write(cwd, "mine.rs", "m-edited");
+        // Rewind reverts agent.rs but preserves mine.rs (whole-tree used to clobber it).
+        let report = store.restore_paths(&t0, &changed).await;
+        assert_eq!(
+            read(cwd, "agent.rs").as_deref(),
+            Some("a0"),
+            "agent edit reverted"
+        );
+        assert_eq!(
+            read(cwd, "mine.rs").as_deref(),
+            Some("m-edited"),
+            "the user's independent edit is preserved"
+        );
+        assert_eq!(report.restored, 1);
+        assert!(report.error.is_none());
     }
 
     #[tokio::test]
@@ -442,7 +521,7 @@ mod tests {
         let mut store = CheckpointStore::new(cwd);
         let t0 = store.snapshot().await.expect("snapshot");
         write(cwd, "build/out", "v1");
-        store.restore(&t0).await;
+        rewind(&mut store, &t0).await;
         // Ignored file is not snapshotted, so it keeps its edited content.
         assert_eq!(read(cwd, "build/out").as_deref(), Some("v1"));
     }
@@ -465,6 +544,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn guard_counts_modified_tracked_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path();
+        write(cwd, "a.rs", "x");
+        // Byte cap of 5 so a later growth of an already-tracked file trips it.
+        let mut store = CheckpointStore::new(cwd).with_caps(usize::MAX, 5);
+        if !store.git_available().await {
+            return;
+        }
+        // First snapshot is under the cap and tracks a.rs in the shadow index.
+        assert!(store.snapshot().await.is_some());
+        // Grow the now-tracked file past the cap. The old guard (`--others` only)
+        // missed tracked files and let this through; it must trip now.
+        write(cwd, "a.rs", "0123456789");
+        assert!(
+            store.snapshot().await.is_none(),
+            "a ballooning tracked file trips the guard"
+        );
+    }
+
+    #[tokio::test]
     async fn dedupe_identical_tree_is_noop() {
         let dir = tempfile::tempdir().unwrap();
         let cwd = dir.path();
@@ -475,7 +575,7 @@ mod tests {
         let t0 = store.snapshot().await.expect("snapshot");
         let t1 = store.snapshot().await.expect("snapshot");
         assert_eq!(t0, t1, "unchanged tree → identical SHA");
-        let report = store.restore(&t0).await;
+        let report = rewind(&mut store, &t0).await;
         assert_eq!((report.restored, report.deleted), (0, 0));
     }
 
@@ -490,7 +590,7 @@ mod tests {
         // Not a git repo at all — the shadow store still snapshots/restores.
         let t0 = store.snapshot().await.expect("snapshot");
         write(cwd, "a.rs", "v1");
-        store.restore(&t0).await;
+        rewind(&mut store, &t0).await;
         assert_eq!(read(cwd, "a.rs").as_deref(), Some("v0"));
     }
 
@@ -507,7 +607,7 @@ mod tests {
         // node_modules is excluded → editing it is invisible to a restore.
         write(cwd, "node_modules/pkg/index.js", "changed");
         write(cwd, "a.rs", "v1");
-        store.restore(&t0).await;
+        rewind(&mut store, &t0).await;
         assert_eq!(
             read(cwd, "a.rs").as_deref(),
             Some("v0"),
@@ -551,7 +651,7 @@ mod tests {
         }
         let t0 = store.snapshot().await.expect("snapshot");
         write(cwd, "tracked.rs", "v1");
-        store.restore(&t0).await;
+        rewind(&mut store, &t0).await;
 
         let head_after = run(&["rev-parse", "HEAD"]).unwrap().stdout;
         assert_eq!(head_before, head_after, "user HEAD unchanged");

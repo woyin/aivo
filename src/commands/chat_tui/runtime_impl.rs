@@ -999,38 +999,37 @@ impl ChatTuiApp {
             return Ok(());
         }
         let turn_count = user_indices.len();
-        // Under a single engine lock: `base` (turns restored on resume — no
-        // checkpoints) and per-checkpoint revertibility (whether the turn has a
-        // tree snapshot). A live turn at history index `u` maps to engine
-        // checkpoint `u - base`; turns outside `base..base+len` (restored / beyond
-        // the live checkpoints) or without a tree snapshot are conversation-only.
-        let mut base: Option<usize> = None;
-        let mut revertible: Vec<bool> = Vec::new();
-        if let Some(session) = self.agent_engine.as_ref()
-            && let Ok(engine) = session.engine.try_lock()
-        {
-            let (b, rev) = engine.rewind_checkpoints();
-            base = Some(b);
-            revertible = rev;
+        // Engine checkpoints, in order: (opening prompt, file-revertible). `sending`
+        // is guarded above, so `lock().await` is uncontended — `try_lock` could
+        // miss transiently and mark every turn conversation-only.
+        let targets: Vec<(String, bool)> = if let Some(session) = self.agent_engine.as_ref() {
+            let engine = session.engine.lock().await;
+            engine.rewind_targets()
+        } else {
+            Vec::new()
+        };
+        // Map display turns onto checkpoints by prompt text from the newest
+        // backward. A turn that doesn't match the next checkpoint (a non-agent turn,
+        // or one trimmed/compacted away, or one predating the engine) is
+        // conversation-only and consumes no checkpoint. Robust to trimming,
+        // compaction, and rebuilds — unlike positional arithmetic, which restored
+        // the wrong tree when the lists drifted.
+        let mut row_ordinal: Vec<Option<usize>> = vec![None; turn_count];
+        let mut row_revertible: Vec<bool> = vec![false; turn_count];
+        let mut remaining = targets.len();
+        for turn_idx in (0..turn_count).rev() {
+            let content = &self.history[user_indices[turn_idx]].content;
+            if remaining > 0 && targets[remaining - 1].0 == *content {
+                remaining -= 1;
+                row_ordinal[turn_idx] = Some(remaining);
+                row_revertible[turn_idx] = targets[remaining].1;
+            }
         }
-        let live_end = base
-            .map(|b| (b + revertible.len()).min(turn_count))
-            .unwrap_or(0);
         let mut items = Vec::with_capacity(turn_count);
         for (turn_idx, &history_index) in user_indices.iter().enumerate() {
-            let conversation_only = match base {
-                Some(b) => {
-                    turn_idx < b
-                        || turn_idx >= live_end
-                        || !revertible.get(turn_idx - b).copied().unwrap_or(false)
-                }
-                None => true,
-            };
-            let ordinal = if conversation_only {
-                None
-            } else {
-                base.map(|b| turn_idx - b)
-            };
+            let ordinal = row_ordinal[turn_idx];
+            // Files won't revert if no checkpoint matched or it has no tree.
+            let conversation_only = !row_revertible[turn_idx];
             let prompt = rewind_excerpt(&self.history[history_index].content);
             let suffix = rewind_label_suffix(conversation_only);
             items.push(PickerEntry {
@@ -1039,7 +1038,6 @@ impl ChatTuiApp {
                 value: PickerValue::RewindTurn {
                     history_index,
                     ordinal,
-                    conversation_only,
                 },
             });
         }
@@ -1063,7 +1061,6 @@ impl ChatTuiApp {
         &mut self,
         history_index: usize,
         ordinal: Option<usize>,
-        conversation_only: bool,
     ) -> Result<()> {
         if self.sending {
             self.notice = Some((
@@ -1086,28 +1083,26 @@ impl ChatTuiApp {
         self.follow_output = true;
 
         let notice = match ordinal {
-            Some(ord) if !conversation_only => {
-                // Restore the working tree via the engine's shadow git store. The
-                // engine is kept (not nulled) so its surviving checkpoints let a
-                // later rewind to an even earlier point still revert. `self.sending`
-                // is guarded above, so the lock is uncontended.
-                let outcome = if let Some(session) = self.agent_engine.as_ref() {
-                    let mut engine = session.engine.lock().await;
-                    Some(engine.rewind_to(ord).await)
-                } else {
-                    None
-                };
-                match outcome {
-                    Some(outcome) => rewind_notice(&outcome),
-                    None => {
-                        self.agent_engine = None;
-                        "Rewound (conversation only — file edits not reverted)".to_string()
-                    }
-                }
+            Some(ord) if self.agent_engine.is_some() => {
+                // Rewind through the engine: truncates the conversation, reverts the
+                // turn's files, keeps earlier checkpoints. Lock is uncontended
+                // (`sending` guarded above).
+                let session = self.agent_engine.as_ref().expect("engine present");
+                let mut engine = session.engine.lock().await;
+                let outcome = engine.rewind_to(ord).await;
+                drop(engine);
+                rewind_notice(&outcome)
             }
             _ => {
-                // No tree snapshot for this turn: rebuild from the trimmed history.
+                // No matching checkpoint (predates the engine, trimmed/compacted, or
+                // non-agent): drop the engine so the next turn re-seeds from the
+                // trimmed history, and clear the durable transcript so a resume
+                // doesn't restore the pre-rewind conversation.
                 self.agent_engine = None;
+                let _ = self
+                    .session_store
+                    .save_agent_messages(&self.session_id, &[])
+                    .await;
                 "Rewound (conversation only — file edits not reverted)".to_string()
             }
         };

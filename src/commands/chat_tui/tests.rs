@@ -1125,7 +1125,7 @@ async fn test_rewind_truncates_history_and_restores_draft() {
 
     // Rewind to the second user turn (history index 2). No live engine in the
     // test app → conversation-only path (ordinal None).
-    app.rewind_to_turn(2, None, true).await.unwrap();
+    app.rewind_to_turn(2, None).await.unwrap();
 
     // That turn and everything after it are gone; the prior exchange stays.
     assert_eq!(app.history.len(), 2);
@@ -1143,7 +1143,7 @@ async fn test_rewind_to_first_turn_clears_history() {
     app.session_id = "rewind-2".to_string();
     seed_two_exchanges(&mut app);
 
-    app.rewind_to_turn(0, None, true).await.unwrap();
+    app.rewind_to_turn(0, None).await.unwrap();
 
     assert!(app.history.is_empty());
     assert_eq!(app.draft, "first question");
@@ -1165,15 +1165,15 @@ async fn test_open_rewind_picker_lists_user_turns_newest_first() {
     assert_eq!(picker.items.len(), 2);
     let PickerValue::RewindTurn {
         history_index,
-        conversation_only,
         ordinal,
     } = &picker.items[0].value
     else {
         panic!("expected a RewindTurn value");
     };
     assert_eq!(*history_index, 2);
-    assert!(*conversation_only);
+    // No live engine in the test app → no checkpoints → conversation-only.
     assert!(ordinal.is_none());
+    assert!(picker.items[0].label.contains("conversation only"));
 }
 
 #[tokio::test]

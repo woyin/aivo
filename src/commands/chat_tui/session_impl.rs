@@ -1218,11 +1218,9 @@ impl ChatTuiApp {
                 PickerValue::RewindTurn {
                     history_index,
                     ordinal,
-                    conversation_only,
                 },
             ) => {
-                self.rewind_to_turn(history_index, ordinal, conversation_only)
-                    .await?;
+                self.rewind_to_turn(history_index, ordinal).await?;
             }
             _ => {}
         }
@@ -1345,12 +1343,14 @@ impl ChatTuiApp {
         {
             let conversation = engine.export_conversation();
             drop(engine);
-            if !conversation.is_empty() {
-                let _ = self
-                    .session_store
-                    .save_agent_messages(&self.session_id, &conversation)
-                    .await;
-            }
+            // Persist even when empty: a `/rewind` to the first turn empties the
+            // engine, and storing that (which clears the blob — see
+            // `save_agent_messages`) keeps resume from restoring the stale
+            // pre-rewind transcript. `try_lock` already skips the mid-turn case.
+            let _ = self
+                .session_store
+                .save_agent_messages(&self.session_id, &conversation)
+                .await;
         }
         Ok(())
     }

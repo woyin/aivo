@@ -255,17 +255,20 @@ impl TurnCtx<'_> {
     }
 }
 
-/// A `/rewind` turn boundary: the index in `messages` of the user message that
-/// opened a turn. Truncating `messages` to this index drops that turn and
-/// everything after it. One is pushed per `run_turn`, in order.
-/// A `/rewind` turn boundary: the index in `messages` of the turn's opening user
+/// A `/rewind` turn boundary: the `messages` index of the turn's opening user
 /// message (truncation point) plus the working-tree snapshot taken at turn start.
-/// `tree` is `None` when git is unavailable or the size guard skipped the
-/// snapshot — that turn rewinds the conversation but not files.
+/// `tree` is `None` when git is unavailable or the guard skipped it (conversation
+/// only). `msg_index` stays valid across compaction via `rebase_checkpoints`.
+///
+/// `changed` is the paths the turn modified (recorded at turn end); a rewind
+/// reverts only the union of these across rewound turns, leaving the user's
+/// independent edits alone. `None` until recorded — an interrupted turn is
+/// finalized lazily by [`AgentEngine::rewind_to`].
 #[derive(Clone)]
 struct Checkpoint {
     msg_index: usize,
     tree: Option<String>,
+    changed: Option<Vec<std::path::PathBuf>>,
 }
 
 /// The result of applying a [`AgentEngine::rewind_to`] — counts for the notice.
@@ -328,22 +331,16 @@ pub struct AgentEngine {
     /// the chat index, so `aivo stats --since` can attribute chat usage. Reset at
     /// the start of every turn.
     turn_usage: SessionTokens,
-    /// `/rewind` support. One checkpoint per `run_turn`, in order:
-    /// `checkpoints[k].msg_index` is where the `k`-th live turn's user message
-    /// sits (truncation point) and `.tree` is the working-tree snapshot taken at
-    /// that turn's start. Empty on a fresh engine; restored turns (resume) get
-    /// none. In-memory (the shadow tree objects live in `checkpoint_store`).
+    /// `/rewind` support: one checkpoint per live `run_turn`, in order. The chat
+    /// TUI maps its display turns onto these by matching prompt text from the
+    /// newest backward (see [`AgentEngine::rewind_targets`]) — robust to history
+    /// trimming, compaction, and rebuilds, which a positional index isn't.
+    /// In-memory (the shadow tree objects live in `checkpoint_store`).
     checkpoints: Vec<Checkpoint>,
     /// Tree-level file snapshot/restore via a shadow git store. `None` until
     /// `/rewind` checkpointing is enabled for this engine (top-level chat only —
     /// sub-engines don't checkpoint). See [`crate::agent::checkpoint`].
     checkpoint_store: Option<crate::agent::checkpoint::CheckpointStore>,
-    /// Count of user turns restored on resume (via `restore_conversation`). Those
-    /// turns predate this live engine and have no checkpoints — the "live turn
-    /// base". A history user-turn at index `u` maps to
-    /// `checkpoints[u - restored_turn_count]`; `u < restored_turn_count` is
-    /// conversation-only (no file revert).
-    restored_turn_count: usize,
     /// `reasoning_effort` to request when thinking is enabled, or `None` when the
     /// model isn't a reasoning model (sending the field then 400s some providers).
     /// Resolved once from the model's snapshot capability at construction.
@@ -424,7 +421,6 @@ impl AgentEngine {
             turn_usage: SessionTokens::default(),
             checkpoints: Vec::new(),
             checkpoint_store: None,
-            restored_turn_count: 0,
             reasoning_effort: default_reasoning_effort(model),
             thinking_flag: None,
         }
@@ -559,6 +555,9 @@ impl AgentEngine {
         self.plan.clear();
         self.touched_files.clear();
         self.notes.clear();
+        // Drop `/rewind` checkpoints: their `msg_index` pointed into the cleared
+        // transcript.
+        self.checkpoints.clear();
     }
 
     /// Seed prior conversation into a freshly built engine (resume, or a mid-chat
@@ -607,11 +606,8 @@ impl AgentEngine {
         if self.messages.len() != 1 {
             return;
         }
-        // These turns predate this engine, so they carry no `/rewind` checkpoints
-        // or file snapshots. Record how many user turns they hold so the TUI can
-        // mark them conversation-only (file revert unavailable) and offset the
-        // checkpoint mapping for turns this live engine runs afterward.
-        self.restored_turn_count = conversation.iter().filter(|m| role(m) == "user").count();
+        // These turns predate this engine: no `checkpoints` entry, so the TUI's
+        // prompt back-match marks them conversation-only (no file revert).
         self.messages.extend(conversation);
         self.rebuild_working_set_from_log();
     }
@@ -788,18 +784,24 @@ impl AgentEngine {
         } else {
             self.messages.len()
         };
-        // Snapshot the working tree at turn start (before any edit) so `/rewind`
-        // can restore the exact tree — renames/deletes/bash changes included.
-        // `None` when checkpointing is disabled (sub-engines), git is absent, or
-        // the tree is too large to snapshot → that turn is conversation-only.
-        let tree = match self.checkpoint_store.as_mut() {
-            Some(store) => store.snapshot().await,
-            None => None,
-        };
-        self.checkpoints.push(Checkpoint {
-            msg_index: turn_start,
-            tree,
-        });
+        // When merging into an interrupted turn (a checkpoint already sits at this
+        // index), reuse it: a second checkpoint would alias `msg_index` (breaking
+        // the back-match) and snapshot a tree with the interrupted turn's partial
+        // edits. The existing pre-edit tree is the right rewind target.
+        let already_checkpointed = self.checkpoints.last().map(|c| c.msg_index) == Some(turn_start);
+        if !already_checkpointed {
+            // Snapshot at turn start (before any edit). `None` when checkpointing
+            // is off (sub-engines), git is absent, or the tree is too large.
+            let tree = match self.checkpoint_store.as_mut() {
+                Some(store) => store.snapshot().await,
+                None => None,
+            };
+            self.checkpoints.push(Checkpoint {
+                msg_index: turn_start,
+                tree,
+                changed: None,
+            });
+        }
         // Merge into a preceding user turn rather than appending a second one —
         // e.g. after a turn cancelled before its first reply, the tail is still a
         // `user` message; a bare append would be two consecutive user messages
@@ -967,6 +969,20 @@ impl AgentEngine {
             context_tokens,
             started.elapsed().as_secs(),
         );
+
+        // Record which paths this turn changed, so a later `/rewind` reverts only
+        // the agent's edits (not the user's). Interrupted turns skip this and are
+        // finalized lazily by `rewind_to`.
+        let changed = match self.checkpoints.last().and_then(|c| c.tree.clone()) {
+            Some(tree) => match self.checkpoint_store.as_mut() {
+                Some(store) => Some(store.changed_since(&tree).await),
+                None => Some(Vec::new()),
+            },
+            None => Some(Vec::new()),
+        };
+        if let Some(cp) = self.checkpoints.last_mut() {
+            cp.changed = changed;
+        }
     }
 
     /// Execute one assistant turn's batch of tool calls, appending a `tool`
@@ -1348,6 +1364,7 @@ Re-run the full command without write confinement?",
                 break; // only [system, last user turn] left — no boundary to drop
             }
             self.messages.drain(1..cut);
+            self.rebase_checkpoints(cut, cut - 1); // keep checkpoint indices valid
         }
         // Threshold well above truncate_str's marker so each pass strictly shrinks
         // the history; bail when nothing sizeable remains.
@@ -1449,29 +1466,55 @@ Re-run the full command without write confinement?",
 
     // --- /rewind: tree checkpoints ---
 
-    /// The live-turn base + per-checkpoint revertibility, for the picker. `base`
-    /// is the count of turns restored on resume (no checkpoints); a history
-    /// user-turn at index `u` maps to checkpoint `u - base`, and the bool says
-    /// whether that turn has a tree snapshot (file-revertible) vs conversation-only.
-    /// Cheap and in-memory (no git).
-    pub fn rewind_checkpoints(&self) -> (usize, Vec<bool>) {
-        (
-            self.restored_turn_count,
-            self.checkpoints.iter().map(|c| c.tree.is_some()).collect(),
-        )
+    /// Per-checkpoint `/rewind` targets in order, for the picker: `(prompt,
+    /// file_revertible)`. The TUI matches these to its display history by prompt
+    /// text from the newest backward, so trims/compaction/rebuilds can't misalign
+    /// the mapping. Cheap and in-memory (no git).
+    pub fn rewind_targets(&self) -> Vec<(String, bool)> {
+        self.checkpoints
+            .iter()
+            .map(|c| {
+                let prompt = self
+                    .messages
+                    .get(c.msg_index)
+                    .and_then(|m| m.get("content"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                (prompt, c.tree.is_some())
+            })
+            .collect()
     }
 
-    /// Rewind to checkpoint `ordinal`: restore the working tree to that turn's
-    /// snapshot (reverting edits/renames/deletes/creates), truncate the
-    /// conversation to the turn's user message, and drop the rewound turns'
-    /// checkpoints (keeping earlier ones so a subsequent rewind still works). The
-    /// live working set (plan, notes, touched files) is re-derived from the
-    /// surviving log. A `None`-tree checkpoint rewinds the conversation only.
+    /// Rewind to checkpoint `ordinal`: revert the files the rewound turns changed
+    /// (scoped to their union, so the user's independent edits are left alone),
+    /// truncate the conversation to the turn's user message, drop the rewound
+    /// checkpoints, and re-derive the working set. A `None`-tree checkpoint rewinds
+    /// the conversation only.
     pub async fn rewind_to(&mut self, ordinal: usize) -> RewindOutcome {
         let mut outcome = RewindOutcome::default();
         let tree = self.checkpoints.get(ordinal).and_then(|c| c.tree.clone());
+        // Union of paths every rewound turn changed; finalize any interrupted turn
+        // (`changed == None`) lazily against the current tree.
+        let mut paths: std::collections::BTreeSet<std::path::PathBuf> =
+            std::collections::BTreeSet::new();
+        for i in ordinal..self.checkpoints.len() {
+            let recorded = self.checkpoints[i].changed.clone();
+            let changed = match recorded {
+                Some(c) => c,
+                None => match self.checkpoints[i].tree.clone() {
+                    Some(t) => match self.checkpoint_store.as_mut() {
+                        Some(store) => store.changed_since(&t).await,
+                        None => Vec::new(),
+                    },
+                    None => Vec::new(),
+                },
+            };
+            paths.extend(changed);
+        }
+        let paths: Vec<std::path::PathBuf> = paths.into_iter().collect();
         if let (Some(tree), Some(store)) = (tree, self.checkpoint_store.as_mut()) {
-            let report = store.restore(&tree).await;
+            let report = store.restore_paths(&tree, &paths).await;
             outcome.restored = report.restored;
             outcome.deleted = report.deleted;
             outcome.error = report.error;
@@ -1543,6 +1586,7 @@ Re-run the full command without write confinement?",
                 json!(format!("{summary}\n\n{original}"))
             };
             self.messages.drain(1..cut);
+            self.rebase_checkpoints(cut, cut - 1); // drain removes cut-1 messages
         } else {
             // Defensive: no user turn at `cut` (shouldn't happen with find_cut) —
             // keep a standalone summary rather than drop it.
@@ -1550,7 +1594,23 @@ Re-run the full command without write confinement?",
                 1..cut,
                 std::iter::once(json!({"role": "user", "content": summary})),
             );
+            self.rebase_checkpoints(cut, cut.saturating_sub(2)); // splice: -cut+1, +1
         }
+    }
+
+    /// Keep `/rewind` checkpoints valid after a front-trim/compaction that removed
+    /// `removed` messages over `messages[1..cut]`: drop checkpoints whose turn was
+    /// folded away (`msg_index < cut`) and shift the survivors down. Without this,
+    /// `rewind_to` would truncate at a stale index after a compaction.
+    fn rebase_checkpoints(&mut self, cut: usize, removed: usize) {
+        self.checkpoints.retain_mut(|cp| {
+            if cp.msg_index >= cut {
+                cp.msg_index -= removed;
+                true
+            } else {
+                false
+            }
+        });
     }
 
     /// Execute a `subagent` tool call: build a fresh sub-engine (same tools minus
@@ -4342,6 +4402,7 @@ mod tests {
         engine.checkpoints.push(Checkpoint {
             msg_index: engine.messages.len(),
             tree: None,
+            changed: None,
         });
         engine
             .messages
@@ -4352,6 +4413,7 @@ mod tests {
         engine.checkpoints.push(Checkpoint {
             msg_index: engine.messages.len(),
             tree: None,
+            changed: None,
         });
         engine
             .messages
@@ -4363,35 +4425,98 @@ mod tests {
         let outcome = engine.rewind_to(1).await;
         // Truncated back to the start of turn 1 (system + turn 0's two messages).
         assert_eq!(engine.messages.len(), 3);
-        let (_, revertible) = engine.rewind_checkpoints();
-        assert_eq!(revertible.len(), 1);
+        let targets = engine.rewind_targets();
+        assert_eq!(targets.len(), 1);
         // No tree on these checkpoints → conversation-only, nothing reverted.
+        assert!(!targets[0].1);
         assert_eq!((outcome.restored, outcome.deleted), (0, 0));
         assert!(outcome.error.is_none());
     }
 
     #[tokio::test]
-    async fn rewind_checkpoints_reports_base_and_revertibility() {
+    async fn rewind_targets_report_prompts_and_revertibility() {
         let dir = tempfile::tempdir().unwrap();
         let mut engine = rewind_engine(dir.path());
-        // Two turns restored on resume (no checkpoints) → base 2.
+        // Two turns restored on resume carry no checkpoints (conversation-only).
         engine.restore_conversation(vec![
             json!({"role": "user", "content": "a"}),
             json!({"role": "assistant", "content": "b"}),
-            json!({"role": "user", "content": "c"}),
-            json!({"role": "assistant", "content": "d"}),
         ]);
+        // A live turn (user "c") with a tree snapshot, then one (user "e") without.
         engine.checkpoints.push(Checkpoint {
             msg_index: engine.messages.len(),
             tree: Some("abc".into()),
+            changed: None,
         });
+        engine
+            .messages
+            .push(json!({"role": "user", "content": "c"}));
+        engine
+            .messages
+            .push(json!({"role": "assistant", "content": "d"}));
         engine.checkpoints.push(Checkpoint {
             msg_index: engine.messages.len(),
             tree: None,
+            changed: None,
         });
-        let (base, revertible) = engine.rewind_checkpoints();
-        assert_eq!(base, 2);
-        assert_eq!(revertible, vec![true, false]);
+        engine
+            .messages
+            .push(json!({"role": "user", "content": "e"}));
+
+        // Targets carry the opening prompt + revertibility, in order.
+        let targets = engine.rewind_targets();
+        assert_eq!(
+            targets,
+            vec![("c".to_string(), true), ("e".to_string(), false)]
+        );
+    }
+
+    #[tokio::test]
+    async fn compaction_rebases_checkpoint_indices() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut engine = rewind_engine(dir.path());
+        // Three turns: [system, u0, a0, u1, a1, u2, a2] with a checkpoint opening
+        // each user turn (indices 1, 3, 5).
+        for (u, a) in [("u0", "a0"), ("u1", "a1"), ("u2", "a2")] {
+            engine.checkpoints.push(Checkpoint {
+                msg_index: engine.messages.len(),
+                tree: None,
+                changed: None,
+            });
+            engine.messages.push(json!({"role": "user", "content": u}));
+            engine
+                .messages
+                .push(json!({"role": "assistant", "content": a}));
+        }
+        assert_eq!(
+            engine
+                .checkpoints
+                .iter()
+                .map(|c| c.msg_index)
+                .collect::<Vec<_>>(),
+            vec![1, 3, 5]
+        );
+
+        // Fold the first turn (cut lands on u1 at index 3).
+        engine.apply_compaction(3, "S");
+
+        // u0's checkpoint dropped; survivors shifted down to stay valid (not stale).
+        // messages is now [system, "S\n\nu1", a1, u2, a2].
+        assert_eq!(
+            engine
+                .checkpoints
+                .iter()
+                .map(|c| c.msg_index)
+                .collect::<Vec<_>>(),
+            vec![1, 3]
+        );
+        assert_eq!(engine.rewind_targets()[1].0, "u2");
+
+        // Rewinding to the last turn truncates at the correct (rebased) index.
+        engine.rewind_to(1).await;
+        assert_eq!(engine.messages.len(), 3);
+        assert_eq!(role(engine.messages.last().unwrap()), "assistant");
+        assert_eq!(engine.messages[2]["content"], "a1");
     }
 
     #[tokio::test]
@@ -4411,6 +4536,7 @@ mod tests {
         engine.checkpoints.push(Checkpoint {
             msg_index: engine.messages.len(),
             tree,
+            changed: None,
         });
         // Simulate the turn: rename + edit (the case byte-snapshots couldn't revert).
         std::fs::rename(p.join("a.txt"), p.join("b.txt")).unwrap();
