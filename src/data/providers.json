@@ -38,5 +38,20 @@
   {"id":"poolside","name":"Poolside","base_url":"https://inference.poolside.ai/v1"},
   {"id":"cloudflare-workers-ai","name":"Cloudflare Workers AI","base_url":"https://api.cloudflare.com/client/v4/accounts/${CLOUDFLARE_ACCOUNT_ID}/ai/v1"},
   {"id":"bedrock","name":"Amazon Bedrock","base_url":"https://bedrock-mantle.${AWS_REGION}.api.aws/v1"},
-  {"id":"publicai","name":"Public AI","base_url":"https://api.publicai.co/v1"}
+  {"id":"publicai","name":"Public AI","base_url":"https://api.publicai.co/v1"},
+  {"id":"sakana","name":"Sakana AI","base_url":"https://api.sakana.ai"},
+  {"id":"stepfun","name":"StepFun","base_url":"https://api.stepfun.com/v1"},
+  {"id":"upstage","name":"Upstage","base_url":"https://api.upstage.ai/v1/solar"},
+  {"id":"ollama-cloud","name":"Ollama Cloud","base_url":"https://ollama.com/v1"},
+  {"id":"llama","name":"Llama","base_url":"https://api.llama.com/compat/v1/"},
+  {"id":"scaleway","name":"Scaleway","base_url":"https://api.scaleway.ai/v1"},
+  {"id":"modelscope","name":"ModelScope","base_url":"https://api-inference.modelscope.cn/v1"},
+  {"id":"siliconflow","name":"SiliconFlow","base_url":"https://api.siliconflow.com/v1"},
+  {"id":"siliconflow-cn","name":"SiliconFlow (China)","base_url":"https://api.siliconflow.cn/v1"},
+  {"id":"requesty","name":"Requesty","base_url":"https://router.requesty.ai/v1"},
+  {"id":"novita-ai","name":"NovitaAI","base_url":"https://api.novita.ai/openai"},
+  {"id":"nebius","name":"Nebius Token Factory","base_url":"https://api.tokenfactory.nebius.com/v1"},
+  {"id":"friendli","name":"Friendli","base_url":"https://api.friendli.ai/serverless/v1"},
+  {"id":"chutes","name":"Chutes","base_url":"https://llm.chutes.ai/v1"},
+  {"id":"baseten","name":"Baseten","base_url":"https://inference.baseten.co/v1"}
 ]
