@@ -1036,6 +1036,8 @@ impl ChatTuiApp {
             // repaint. Processing one event per tick caps consumption at the
             // idle cadence (~40/s), far below the rate a fast drag emits, so the
             // selection would otherwise trail the cursor by a growing backlog.
+            // The draw above already reset `needs_redraw`, so it is true here iff
+            // this pass handled input — the cue to repaint promptly below.
             match self.drain_input(&mut needs_redraw).await {
                 Ok(true) => break Ok(()),
                 Ok(false) => {}
@@ -1048,8 +1050,13 @@ impl ChatTuiApp {
             }
 
             // Non-blocking nap, never a blocking poll — that would freeze the
-            // streaming task on the current-thread runtime.
-            let nap = if self.is_animating() {
+            // streaming task on the current-thread runtime. When this pass
+            // handled input, nap only briefly so the scroll/keystroke repaints
+            // near-instantly and in fine increments instead of trailing the idle
+            // cadence; the short sleep still yields so streaming keeps flowing.
+            let nap = if needs_redraw {
+                INPUT_REPAINT_INTERVAL
+            } else if self.is_animating() {
                 ANIMATING_FRAME_INTERVAL
             } else {
                 IDLE_POLL_INTERVAL

@@ -1097,6 +1097,9 @@ impl ChatTuiApp {
         self.transcript_width = transcript_text_area.width.max(1);
         self.transcript_view_height = view_height;
         let max_scroll = transcript_total_lines.saturating_sub(usize::from(view_height));
+        // Cache the exact value so the scroll handlers don't rebuild the whole
+        // transcript per wheel event (see `effective_max_scroll`).
+        self.last_max_scroll = Some(max_scroll);
         if self.follow_output {
             self.transcript_scroll = max_scroll;
         } else {

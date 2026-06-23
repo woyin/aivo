@@ -1582,7 +1582,7 @@ impl ChatTuiApp {
 
     pub(super) fn scroll_up(&mut self) {
         let step = usize::from(self.transcript_view_height.max(4) / 2);
-        let max_scroll = self.max_scroll();
+        let max_scroll = self.effective_max_scroll();
         if self.follow_output {
             self.transcript_scroll = max_scroll;
             self.follow_output = false;
@@ -1592,7 +1592,7 @@ impl ChatTuiApp {
 
     pub(super) fn scroll_down(&mut self) {
         let step = usize::from(self.transcript_view_height.max(4) / 2);
-        let max_scroll = self.max_scroll();
+        let max_scroll = self.effective_max_scroll();
         self.follow_output = false;
         self.transcript_scroll = (self.transcript_scroll + step.max(1)).min(max_scroll);
         if self.transcript_scroll >= max_scroll {
@@ -1601,7 +1601,7 @@ impl ChatTuiApp {
     }
 
     pub(super) fn scroll_up_lines(&mut self, lines: usize) {
-        let max_scroll = self.max_scroll();
+        let max_scroll = self.effective_max_scroll();
         if self.follow_output {
             self.transcript_scroll = max_scroll;
             self.follow_output = false;
@@ -1610,7 +1610,7 @@ impl ChatTuiApp {
     }
 
     pub(super) fn scroll_down_lines(&mut self, lines: usize) {
-        let max_scroll = self.max_scroll();
+        let max_scroll = self.effective_max_scroll();
         self.follow_output = false;
         self.transcript_scroll = (self.transcript_scroll + lines).min(max_scroll);
         if self.transcript_scroll >= max_scroll {
@@ -1624,8 +1624,16 @@ impl ChatTuiApp {
     }
 
     pub(super) fn scroll_to_bottom(&mut self) {
-        self.transcript_scroll = self.max_scroll();
+        self.transcript_scroll = self.effective_max_scroll();
         self.follow_output = true;
+    }
+
+    /// Max scroll for the hot wheel/key handlers: reuse the value the last
+    /// render computed when it's available (cheap — no rebuild), else recompute.
+    /// The render re-clamps `transcript_scroll` every pass, so a one-frame-stale
+    /// value only ever causes a transient that the next frame corrects.
+    pub(super) fn effective_max_scroll(&self) -> usize {
+        self.last_max_scroll.unwrap_or_else(|| self.max_scroll())
     }
 
     pub(super) fn max_scroll(&self) -> usize {

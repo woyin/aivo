@@ -147,6 +147,7 @@ impl ChatTuiApp {
             transcript_scroll: 0,
             transcript_width: 0,
             transcript_view_height: 0,
+            last_max_scroll: None,
             transcript_hitbox: None,
             jump_to_bottom_hit: None,
             composer_text_area: None,

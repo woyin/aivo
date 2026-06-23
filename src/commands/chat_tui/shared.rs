@@ -48,6 +48,11 @@ pub(super) const DRAG_AUTOSCROLL_INTERVAL: Duration = Duration::from_millis(40);
 // Tight repaint cadence while animating; slower when idle to cut wakeups.
 pub(super) const ANIMATING_FRAME_INTERVAL: Duration = Duration::from_millis(16);
 pub(super) const IDLE_POLL_INTERVAL: Duration = Duration::from_millis(25);
+/// Nap after a pass that handled input: short enough that a scroll/keystroke
+/// repaints near-instantly and in fine increments (not trailing the idle
+/// cadence), but still a real yield so the streaming task keeps progressing on
+/// the current-thread runtime.
+pub(super) const INPUT_REPAINT_INTERVAL: Duration = Duration::from_millis(1);
 /// Typewriter reveal rate. Each animation frame reveals at least
 /// `TYPEWRITER_MIN_CHARS` of the buffered stream text (a steady floor so a slow
 /// trickle still types out) plus `1/TYPEWRITER_CATCHUP_DIVISOR` of whatever
@@ -1481,6 +1486,12 @@ pub(super) struct ChatTuiApp {
     pub(super) transcript_scroll: usize,
     pub(super) transcript_width: u16,
     pub(super) transcript_view_height: u16,
+    /// Max scroll offset the last render computed from the composed rows. The
+    /// hot scroll handlers reuse it (per wheel event) so a fast scroll skips the
+    /// full `build_transcript` rebuild `max_scroll` would do; `None` before the
+    /// first render falls back to recomputing. At most one frame stale, and the
+    /// render re-clamps `transcript_scroll` each pass, so staleness is benign.
+    pub(super) last_max_scroll: Option<usize>,
     pub(super) transcript_hitbox: Option<TranscriptHitbox>,
     /// Click region of the "jump to bottom" pill from the last render; `None` when
     /// it isn't shown (transcript pinned to the bottom, or no overflow).
