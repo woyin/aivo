@@ -62,6 +62,8 @@ impl ChatTuiApp {
         // Reasoning-capable per the snapshot, or implied by advertised levels.
         self.model_supports_thinking =
             limits.caps.is_some_and(|c| c.reasoning) || !self.model_reasoning_efforts.is_empty();
+        // Snapshot vision support (None when absent); gates the pre-flight refusal.
+        self.model_image_input = limits.caps.map(|c| c.image_input);
         // This model's remembered effort, dropped if no longer a valid level.
         self.reasoning_effort = match self
             .session_store

@@ -1614,6 +1614,9 @@ pub(super) struct ChatTuiApp {
     /// `refresh_context_window`); gates the `^T` footer hint so it only advertises
     /// the toggle where thinking can actually appear. Unknown models → false.
     pub(super) model_supports_thinking: bool,
+    /// Snapshot vision support, cached on each model resolve. `Some(false)` =
+    /// text-only (image sends refused pre-flight); `None` = unknown (let through).
+    pub(super) model_image_input: Option<bool>,
     /// `/effort` reasoning level chosen by the user (None = model default);
     /// applied to the engine on build/change and persisted in chat-prefs.
     pub(super) reasoning_effort: Option<String>,

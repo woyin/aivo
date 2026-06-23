@@ -1073,6 +1073,7 @@ fn make_test_app(
         auto_approve_flag: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         show_thinking: true,
         model_supports_thinking: true,
+        model_image_input: None,
         reasoning_effort: None,
         model_reasoning_efforts: Vec::new(),
         queued_messages: Vec::new(),
@@ -8976,4 +8977,86 @@ async fn project_mcp_no_stdio_no_card() {
         "HTTP-only project servers aren't gated (no local exec)"
     );
     let _ = std::fs::remove_dir_all(&repo);
+}
+
+#[test]
+fn test_reframe_image_input_error_leads_with_action() {
+    use super::event_loop_impl::reframe_image_input_error;
+    // The provider's stable wording is reframed with an actionable first line,
+    // keeping the raw envelope below for debuggability.
+    let raw = r#"API returned 400 Bad Request — {"error":{"message":"Error from provider: This model does not support image inputs"}}"#;
+    let out = reframe_image_input_error(raw.to_string(), "glm-5.2");
+    assert!(out.starts_with("glm-5.2 can't read images"), "got: {out}");
+    assert!(out.contains("/model"));
+    assert!(out.contains(raw), "raw envelope retained");
+
+    // Unrelated errors pass through untouched.
+    let other = "API returned 500 Bad Gateway".to_string();
+    assert_eq!(reframe_image_input_error(other.clone(), "glm-5.2"), other);
+}
+
+#[tokio::test]
+async fn test_history_has_image_detects_image_attachment() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    assert!(!app.history_has_image(), "empty history has no image");
+
+    app.history.push(ChatMessage {
+        role: "user".to_string(),
+        content: "just text".to_string(),
+        reasoning_content: None,
+        attachments: vec![MessageAttachment {
+            name: "notes.txt".to_string(),
+            mime_type: "text/plain".to_string(),
+            storage: AttachmentStorage::Inline {
+                data: "abc".to_string(),
+            },
+        }],
+    });
+    assert!(
+        !app.history_has_image(),
+        "a text attachment is not an image"
+    );
+
+    app.history.push(ChatMessage {
+        role: "user".to_string(),
+        content: "look".to_string(),
+        reasoning_content: None,
+        attachments: vec![MessageAttachment {
+            name: "shot.png".to_string(),
+            mime_type: "image/png".to_string(),
+            storage: AttachmentStorage::Inline {
+                data: "iVBOR".to_string(),
+            },
+        }],
+    });
+    assert!(app.history_has_image(), "image attachment detected");
+}
+
+#[tokio::test]
+async fn test_preflight_refuses_image_on_known_text_only_model() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.model = "glm-5.1".to_string();
+    app.model_image_input = Some(false); // snapshot says text-only
+    app.draft_attachments.push(MessageAttachment {
+        name: "shot.png".to_string(),
+        mime_type: "image/png".to_string(),
+        storage: AttachmentStorage::Inline {
+            data: "iVBOR".to_string(),
+        },
+    });
+
+    app.dispatch_user_message("what's in this".to_string(), None)
+        .await
+        .unwrap();
+
+    let (style, msg) = app.notice.clone().expect("a refusal notice is shown");
+    assert_eq!(style, ERROR);
+    assert!(msg.contains("can't read images"), "got: {msg}");
+    // The draft + attachment survive so the user can switch models and resend;
+    // nothing was sent.
+    assert_eq!(app.draft_attachments.len(), 1, "attachment retained");
+    assert!(app.history.is_empty(), "no user turn was pushed");
+    assert!(!app.sending, "no turn started");
 }

@@ -247,6 +247,23 @@ impl ChatTuiApp {
         input: String,
         record: Option<String>,
     ) -> Result<()> {
+        // A known text-only model would 400 on image bytes; refuse here instead,
+        // keeping the draft + attachment so the user can switch models and resend.
+        if self.model_image_input == Some(false)
+            && self
+                .draft_attachments
+                .iter()
+                .any(|a| a.mime_type.starts_with("image/"))
+        {
+            self.notice = Some((
+                ERROR,
+                format!(
+                    "{} can't read images — switch to a vision model (e.g. /model) and resend.",
+                    self.model
+                ),
+            ));
+            return Ok(());
+        }
         let attachments = materialize_attachments(&self.draft_attachments).await?;
         if self.key.is_cursor_acp()
             && let Some(session) = self.cursor_acp_session.as_ref()
@@ -295,21 +312,25 @@ impl ChatTuiApp {
         self.sending = true;
         self.follow_output = true;
 
+        // The agent is text-only and drops attachments, so once an image is in the
+        // conversation, keep every turn on the vision chat (which re-sends history)
+        // rather than the blind agent that would answer "I can't see the image".
+        let conversation_has_image = self.history_has_image();
         if self.key.is_cursor_acp() {
             self.spawn_cursor_turn(input, attachments);
-        } else if self.agent_capable() && attachments.is_empty() {
+        } else if self.agent_capable() && attachments.is_empty() && !conversation_has_image {
             // The API-key path is the native agent: tools + cwd + permission gate.
             // (Attachments/OAuth/copilot fall back to plain chat below.)
             self.spawn_agent_turn(input).await;
         } else {
-            // Surface the silent downgrade: an attachment turns the agent into a
-            // plain vision chat, so its file/shell tools are off for this message.
-            if self.agent_capable() && !attachments.is_empty() {
-                self.notice = Some((
-                    MUTED,
+            // Note the downgrade: an image routes through vision chat, no agent tools.
+            if self.agent_capable() && (!attachments.is_empty() || conversation_has_image) {
+                let msg = if attachments.is_empty() {
+                    "Image in context — plain vision chat (agent tools off until /new)"
+                } else {
                     "Attachment sent as plain chat — agent tools are off for this message"
-                        .to_string(),
-                ));
+                };
+                self.notice = Some((MUTED, msg.to_string()));
             }
             self.spawn_http_turn();
         }
@@ -348,6 +369,15 @@ impl ChatTuiApp {
             self.send_user_message(queued).await?;
         }
         Ok(())
+    }
+
+    /// True when any history message carries an image attachment.
+    pub(super) fn history_has_image(&self) -> bool {
+        self.history.iter().any(|m| {
+            m.attachments
+                .iter()
+                .any(|a| a.mime_type.starts_with("image/"))
+        })
     }
 
     /// True when the current key can drive the in-process agent: a plain API key

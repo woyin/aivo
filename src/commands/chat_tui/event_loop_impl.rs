@@ -870,7 +870,7 @@ impl ChatTuiApp {
             &mut self.draft_attachments,
             &mut self.pending_submit,
         );
-        self.notice = Some((ERROR, err));
+        self.notice = Some((ERROR, reframe_image_input_error(err, &self.model)));
     }
 
     async fn apply_loaded_models(
@@ -1846,6 +1846,18 @@ fn wheel_scroll(offset: u16, up: bool) -> u16 {
 fn is_bare_esc(event: &Event) -> bool {
     matches!(event, Event::Key(k)
         if k.kind == KeyEventKind::Press && k.code == KeyCode::Esc && k.modifiers.is_empty())
+}
+
+/// Lead an image-rejection 400 with an actionable line, for models the snapshot
+/// didn't know were text-only. The provider wording is the cross-vendor signal.
+pub(super) fn reframe_image_input_error(err: String, model: &str) -> String {
+    if err.to_ascii_lowercase().contains("image input") {
+        format!(
+            "{model} can't read images — switch to a vision model (e.g. /model) and resend.\n{err}"
+        )
+    } else {
+        err
+    }
 }
 
 /// The character of a `Char` keypress, else `None` (ignores modifiers — the

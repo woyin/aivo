@@ -197,6 +197,7 @@ impl ChatTuiApp {
             // Set by `refresh_context_window` (called right after construction and
             // on every model switch); false until the first resolve.
             model_supports_thinking: false,
+            model_image_input: None,
             // Loaded per-model by `refresh_context_window` (called right after).
             reasoning_effort: None,
             model_reasoning_efforts: Vec::new(),
