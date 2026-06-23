@@ -173,7 +173,7 @@ pub(super) const SLASH_COMMANDS: &[SlashCommandSpec] = &[
     SlashCommandSpec {
         name: "agent",
         help_label: "/agent [name]",
-        description: "switch agent profile (at chat start)",
+        description: "switch agent profile (bare opens a picker)",
         takes_argument: true,
     },
     SlashCommandSpec {
@@ -658,6 +658,8 @@ pub(super) enum PickerValue {
     },
     /// A `/effort` reasoning level (e.g. `low`/`high`).
     Effort(String),
+    /// A `/agent` profile name (`default` resets to the built-in agent).
+    Agent(String),
 }
 
 /// A model option ready for the picker: stable id and display label.
@@ -698,6 +700,7 @@ pub(super) enum PickerKind {
     Session,
     Rewind,
     Effort,
+    Agent,
 }
 
 #[derive(Clone)]
@@ -1548,7 +1551,7 @@ pub(super) struct ChatTuiApp {
     /// `None` outside of cursor keys and before the first turn.
     pub(super) cursor_acp_session: Option<crate::services::cursor_acp::CursorAcpSession>,
     /// Active top-level agent profile name (`--agent` / `/agent`), from
-    /// `.aivo/agents` / `.claude/agents`. Its role + tool scope are folded into the
+    /// `~/.config/aivo/agents`. Its role + tool scope are folded into the
     /// engine on build. `None` = the default agent. Switchable only at chat start.
     pub(super) active_agent: Option<String>,
     /// A resumed session's durable agent transcript (raw OpenAI messages with

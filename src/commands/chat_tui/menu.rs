@@ -265,6 +265,16 @@ pub(super) fn render_command_menu_rows(
         .collect()
 }
 
+/// Append a ` (current)` marker to a picker label for the in-effect option.
+/// Shared by the pickers that highlight the active choice (`/effort`, `/agent`).
+pub(super) fn picker_current_label(label: String, is_current: bool) -> String {
+    if is_current {
+        format!("{label}  (current)")
+    } else {
+        label
+    }
+}
+
 pub(super) fn picker_kind_noun(kind: &PickerKind) -> &'static str {
     match kind {
         PickerKind::Key => "keys",
@@ -272,6 +282,7 @@ pub(super) fn picker_kind_noun(kind: &PickerKind) -> &'static str {
         PickerKind::Session => "chats",
         PickerKind::Rewind => "turns",
         PickerKind::Effort => "levels",
+        PickerKind::Agent => "agents",
     }
 }
 
@@ -282,6 +293,7 @@ pub(super) fn picker_search_placeholder(kind: &PickerKind) -> &'static str {
         PickerKind::Session => "filter saved chats",
         PickerKind::Rewind => "filter turns",
         PickerKind::Effort => "filter levels",
+        PickerKind::Agent => "filter agents",
     }
 }
 

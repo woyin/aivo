@@ -739,7 +739,7 @@ pub struct ChatArgs {
     )]
     pub key: Option<String>,
 
-    /// Start as a named agent profile from .aivo/agents or .claude/agents
+    /// Start as a named agent profile from ~/.config/aivo/agents
     /// (folds its role + tool scope in). Switch in-chat with `/agent`.
     #[arg(long, value_name = "NAME")]
     pub agent: Option<String>,

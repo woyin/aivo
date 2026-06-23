@@ -109,11 +109,7 @@ impl ChatTuiApp {
             .model_reasoning_efforts
             .iter()
             .map(|level| PickerEntry {
-                label: if current.as_deref() == Some(level) {
-                    format!("{level}  (current)")
-                } else {
-                    level.clone()
-                },
+                label: picker_current_label(level.clone(), current.as_deref() == Some(level)),
                 search_text: level.clone(),
                 value: PickerValue::Effort(level.clone()),
             })
@@ -1315,6 +1311,9 @@ impl ChatTuiApp {
             }
             (PickerKind::Effort, PickerValue::Effort(level)) => {
                 self.apply_reasoning_effort(level).await;
+            }
+            (PickerKind::Agent, PickerValue::Agent(name)) => {
+                self.apply_agent_selection(name).await;
             }
             _ => {}
         }

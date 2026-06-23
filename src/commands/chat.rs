@@ -304,8 +304,7 @@ impl ChatCommand {
         // Agent profile is read-only (discovered from disk, never persisted).
         let (agent_label, agent_model) = match agent {
             Some(name) if !crate::agent::subagents::is_default_agent_name(name) => {
-                let cwd_path = std::env::current_dir().unwrap_or_default();
-                match crate::agent::subagents::discover_subagents(&cwd_path)
+                match crate::agent::subagents::discover_subagents(self.session_store.config_dir())
                     .into_iter()
                     .find(|s| s.name == name)
                 {
@@ -569,8 +568,7 @@ impl ChatCommand {
                 (None, None, None)
             }
             Some(name) => {
-                let cwd_path = std::env::current_dir().unwrap_or_default();
-                match crate::agent::subagents::discover_subagents(&cwd_path)
+                match crate::agent::subagents::discover_subagents(self.session_store.config_dir())
                     .into_iter()
                     .find(|s| s.name == name)
                 {
@@ -945,7 +943,7 @@ impl ChatCommand {
         );
         print_opt(
             "--agent <name>",
-            "Start as an agent profile from .aivo/agents or .claude/agents",
+            "Start as an agent profile from ~/.config/aivo/agents",
         );
         print_opt(
             "-p, --prompt [prompt]",

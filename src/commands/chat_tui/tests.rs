@@ -5455,19 +5455,19 @@ fn test_parse_agent_command() {
     );
 }
 
-/// `/agent` lists, selects (at chat start), clears, rejects unknowns, and is
-/// blocked once a conversation has started. Discovers from a tempdir, never the
-/// real `.aivo/agents` / `.claude/agents`.
+/// `/agent`: bare opens a picker (built-in `default` + profiles, active
+/// pre-selected); picking a row switches; typed `/agent <name>` selects
+/// directly; `default` clears; unknowns error; switching is blocked once a
+/// conversation has started (bare falls back to a read-only notice there).
+/// Discovers from the throwaway store's `<config_dir>/agents`, never the real
+/// `~/.config/aivo/agents`.
 #[tokio::test]
 async fn test_agent_command_dispatch() {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static N: AtomicU64 = AtomicU64::new(0);
-    let dir = std::env::temp_dir().join(format!(
-        "aivo-agent-cmd-{}-{}",
-        std::process::id(),
-        N.fetch_add(1, Ordering::Relaxed)
-    ));
-    let agents = dir.join(".aivo").join("agents");
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    // Sub-agents discover from `<config_dir>/agents`; the throwaway store points
+    // config_dir at a tempdir, keeping this hermetic.
+    let agents = app.session_store.config_dir().join("agents");
     std::fs::create_dir_all(&agents).unwrap();
     std::fs::write(
         agents.join("reviewer.md"),
@@ -5475,17 +5475,34 @@ async fn test_agent_command_dispatch() {
     )
     .unwrap();
 
-    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-    let mut app = make_test_app(tx, rx);
-    app.real_cwd = dir.to_string_lossy().into_owned();
-
-    // Bare /agent lists what's available + the current (default).
+    // Bare /agent opens a picker: built-in `default` (current → pre-selected),
+    // then each profile.
     app.run_agent_command(None).await;
-    let n = app.notice.as_ref().unwrap().1.clone();
-    assert!(n.contains("reviewer"), "notice: {n}");
-    assert!(n.contains("agent: default"), "notice: {n}");
+    let Overlay::Picker(picker) = &app.overlay else {
+        panic!("bare /agent should open a picker");
+    };
+    assert!(matches!(picker.kind, PickerKind::Agent));
+    assert_eq!(picker.items.len(), 2, "default + reviewer");
+    assert_eq!(picker.selected, 0, "default is current → pre-selected");
+    assert!(picker.items[0].label.contains("default"));
+    assert!(picker.items[0].label.contains("(current)"));
+    assert!(picker.items[1].label.contains("reviewer"));
 
-    // Select a known agent at chat start.
+    // Picking the reviewer row applies the switch and closes the picker.
+    app.activate_picker_selection(1).await.unwrap();
+    assert_eq!(app.active_agent.as_deref(), Some("reviewer"));
+    assert!(matches!(app.overlay, Overlay::None));
+
+    // Reopening the picker now pre-selects and marks the active reviewer.
+    app.run_agent_command(None).await;
+    let Overlay::Picker(picker) = &app.overlay else {
+        panic!("picker should reopen");
+    };
+    assert_eq!(picker.selected, 1, "active reviewer pre-selected");
+    assert!(picker.items[1].label.contains("(current)"));
+    app.overlay = Overlay::None;
+
+    // Typed `/agent <name>` still selects directly.
     app.run_agent_command(Some("reviewer".to_string())).await;
     assert_eq!(app.active_agent.as_deref(), Some("reviewer"));
     assert!(app.notice.as_ref().unwrap().1.contains("reviewer"));
@@ -5524,7 +5541,17 @@ async fn test_agent_command_dispatch() {
     );
     assert!(app.notice.as_ref().unwrap().1.contains("/new"));
 
-    let _ = std::fs::remove_dir_all(&dir);
+    // Bare /agent mid-conversation: a read-only notice, never a picker.
+    app.notice = None;
+    app.run_agent_command(None).await;
+    assert!(matches!(app.overlay, Overlay::None), "no picker mid-chat");
+    let n = app.notice.as_ref().unwrap().1.clone();
+    assert!(
+        n.contains("reviewer") && n.contains("/new first"),
+        "notice: {n}"
+    );
+
+    let _ = std::fs::remove_dir_all(app.session_store.config_dir());
 }
 
 #[test]

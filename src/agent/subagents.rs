@@ -8,12 +8,12 @@
 //! to the generic sub-agent. Discovery is progressive-disclosure, mirroring
 //! `skills`: only names + one-line descriptions ride in the system prompt.
 //!
-//! Discovery covers aivo's own dirs (`<project>/.aivo/agents`,
-//! `~/.config/aivo/agents`) AND Claude Code's `.claude/agents` (project + user),
-//! so an existing fleet of `.claude/agents/*.md` works in `aivo chat` unchanged.
-//! Because those carry Claude Code's tool vocabulary (`Read`, `Bash`, …), the
-//! `tools` scope is mapped onto aivo's built-ins and unknown names are ignored
-//! rather than silently stripping every tool.
+//! Discovery covers only aivo's user-global dir (`~/.config/aivo/agents`):
+//! agent profiles are a personal, machine-wide fleet — not per-repo, and not
+//! shared with Claude Code's `.claude/agents`. A profile's `tools:` scope may
+//! still use Claude Code's vocabulary (`Read`, `Bash`, …); it's mapped onto
+//! aivo's built-ins and unknown names are ignored rather than silently
+//! stripping every tool.
 
 use crate::agent::skills::advert_description;
 use std::path::{Path, PathBuf};
@@ -51,19 +51,13 @@ impl Subagent {
     }
 }
 
-/// Discover sub-agents for `cwd`, project dirs before user dirs (a repo shadows a
-/// personal sub-agent of the same name), and aivo's own dir before Claude Code's
-/// within each tier. Each `<root>/<name>.md` is one sub-agent; first name wins.
-pub fn discover_subagents(cwd: &Path) -> Vec<Subagent> {
-    let mut roots = vec![
-        cwd.join(".aivo").join("agents"),
-        cwd.join(".claude").join("agents"),
-    ];
-    if let Some(home) = crate::services::system_env::home_dir() {
-        roots.push(home.join(".config").join("aivo").join("agents"));
-        roots.push(home.join(".claude").join("agents"));
-    }
-    discover_from_roots(&roots)
+/// Discover sub-agents from aivo's user-global agents dir, `<config_dir>/agents`
+/// (i.e. `~/.config/aivo/agents`). `config_dir` is the aivo config directory,
+/// supplied by callers via [`SessionStore::config_dir`] so it stays hermetic
+/// under test. Each `<root>/<name>.md` is one sub-agent; on a duplicate name the
+/// first wins.
+pub fn discover_subagents(config_dir: &Path) -> Vec<Subagent> {
+    discover_from_roots(&[config_dir.join("agents")])
 }
 
 /// Collect sub-agents from `roots` in order, first name winning on collision.

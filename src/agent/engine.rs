@@ -304,7 +304,7 @@ pub struct AgentEngine {
     always: HashSet<String>,
     /// Discovered SKILL.md skills, loaded on demand via the `skill` tool.
     skills: Vec<Skill>,
-    /// Named specialist sub-agents discovered from `.aivo/agents` / `.claude/agents`
+    /// Named specialist sub-agents discovered from `~/.config/aivo/agents`
     /// (top-level engine only — sub-engines drop the `subagent` tool). The
     /// `subagent` tool's `agent` field selects one; `run_subagent` applies its
     /// model + instructions + tool scope. Empty when none are authored.

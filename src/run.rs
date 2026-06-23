@@ -237,8 +237,7 @@ pub async fn run() -> ! {
             // `--agent` compose: `-m` owns the model axis, `--agent` the role +
             // tools, and the profile's model only fills in when no `-m` is given.
             let agent_model: Option<String> = chat_args.agent.as_deref().and_then(|name| {
-                let cwd = std::env::current_dir().ok()?;
-                crate::agent::subagents::discover_subagents(&cwd)
+                crate::agent::subagents::discover_subagents(session_store.config_dir())
                     .into_iter()
                     .find(|s| s.name == name)
                     .and_then(|s| s.model)
