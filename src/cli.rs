@@ -786,6 +786,14 @@ pub struct ChatArgs {
     #[arg(long, value_name = "SIZE")]
     pub max_context: Option<String>,
 
+    /// Shorthand for `--max-context=1m`.
+    #[arg(long = "1m")]
+    pub one_m: bool,
+
+    /// Shorthand for `--max-context=2m`.
+    #[arg(long = "2m")]
+    pub two_m: bool,
+
     /// Print the resolved key, model, endpoint, and agent without connecting
     #[arg(long)]
     pub dry_run: bool,

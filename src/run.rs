@@ -286,7 +286,12 @@ pub async fn run() -> ! {
                     chat_args.json,
                     chat_args.resume,
                     chat_args.agent,
-                    chat_args.max_context,
+                    // `--1m`/`--2m` shorthands collapse into max_context, same
+                    // as the `run` path; chat takes it as a raw window size.
+                    chat_args
+                        .max_context
+                        .or_else(|| chat_args.one_m.then(|| "1m".to_string()))
+                        .or_else(|| chat_args.two_m.then(|| "2m".to_string())),
                     chat_args.dry_run,
                 )
                 .await
