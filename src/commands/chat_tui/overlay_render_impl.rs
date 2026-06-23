@@ -1348,7 +1348,6 @@ const HELP_KEYBINDINGS: &[(&str, &[(&str, &str)])] = &[
         &[
             ("Ctrl+R", "resume a saved chat"),
             ("Ctrl+O", "view last !cmd output in full"),
-            ("Ctrl+T", "toggle thinking"),
             ("Shift+Tab", "toggle agent auto-approve"),
             ("Esc", "cancel / close overlay"),
             ("Ctrl+C", "exit (press twice to confirm)"),

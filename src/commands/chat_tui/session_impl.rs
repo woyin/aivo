@@ -131,13 +131,17 @@ impl ChatTuiApp {
     /// Set the reasoning effort: remember it (per-model) and persist it. The
     /// engine picks it up at the start of the next turn (carried in like the
     /// context window), so we never lock the engine here — that would block the
-    /// event loop on an in-flight turn's guard. Independent of show-thinking.
+    /// event loop on an in-flight turn's guard. Choosing an effort implies you
+    /// want the model to think, so this also turns thinking on if it was off.
     pub(super) async fn apply_reasoning_effort(&mut self, level: String) {
         self.reasoning_effort = Some(level.clone());
         let _ = self
             .session_store
             .set_chat_reasoning_effort(&self.model, Some(&level))
             .await;
+        if !self.thinking_enabled {
+            self.set_thinking_enabled(true).await;
+        }
         self.notice = Some((MUTED, format!("reasoning effort: {level}")));
     }
 
@@ -320,11 +324,18 @@ impl ChatTuiApp {
     /// state. The list is fixed (no filter/add/remove) and each row flips on
     /// Enter/Space.
     pub(super) fn open_config_overlay(&mut self) {
+        // Description varies by model capability — the toggle still persists for the
+        // next thinking-capable model even when this one can't think.
+        let thinking_desc = if self.model_supports_thinking {
+            "let the model reason before answering (shown folded)"
+        } else {
+            "let the model reason (this model has no thinking)"
+        };
         let items = vec![
             ConfigToggle {
-                setting: ConfigSetting::ShowThinking,
-                label: "Show thinking",
-                description: "stream the model's reasoning in a muted block (Ctrl+T)",
+                setting: ConfigSetting::Thinking,
+                label: "Thinking",
+                description: thinking_desc,
             },
             ConfigToggle {
                 setting: ConfigSetting::AutoApprove,
@@ -339,7 +350,7 @@ impl ChatTuiApp {
     /// renderer reads, so a row's checkbox can never drift from the live flag.
     pub(super) fn config_setting_enabled(&self, setting: ConfigSetting) -> bool {
         match setting {
-            ConfigSetting::ShowThinking => self.show_thinking,
+            ConfigSetting::Thinking => self.thinking_enabled,
             ConfigSetting::AutoApprove => self.agent_auto_approve,
         }
     }
@@ -355,26 +366,24 @@ impl ChatTuiApp {
             return;
         };
         match setting {
-            ConfigSetting::ShowThinking => self.set_show_thinking(!self.show_thinking).await,
+            ConfigSetting::Thinking => self.set_thinking_enabled(!self.thinking_enabled).await,
             // Reuse the shared setter so the live atomic + toast stay in lockstep.
             ConfigSetting::AutoApprove => self.set_auto_approve(!self.agent_auto_approve),
         }
     }
 
-    /// Set the show-thinking flag and persist it (best-effort). Both transcript
-    /// fingerprints (history body and volatile tail) key on `show_thinking`, so the
-    /// flip invalidates the memoized render on its own — no revision bump needed.
-    pub(super) async fn set_show_thinking(&mut self, on: bool) {
-        if self.show_thinking == on {
+    /// Set the thinking on/off flag and persist it (best-effort). Both transcript
+    /// fingerprints (history body and volatile tail) key on `thinking_enabled`, so
+    /// the flip invalidates the memoized render on its own — no revision bump needed.
+    /// The engine reads the flag at the start of the next turn, so a mid-session
+    /// toggle applies next turn.
+    pub(super) async fn set_thinking_enabled(&mut self, on: bool) {
+        if self.thinking_enabled == on {
             return;
         }
-        self.show_thinking = on;
-        self.show_toast(if on {
-            "Thinking shown"
-        } else {
-            "Thinking hidden"
-        });
-        let _ = self.session_store.set_chat_show_thinking(on).await;
+        self.thinking_enabled = on;
+        self.show_toast(if on { "Thinking on" } else { "Thinking off" });
+        let _ = self.session_store.set_chat_thinking_enabled(on).await;
     }
 
     /// `ctrl+o`: open the most recent `!cmd`'s full output in a scrollable pager.
@@ -1509,6 +1518,8 @@ impl ChatTuiApp {
             .chat_session_tokens(&self.session_id)
             .await;
         self.history = session.messages;
+        self.expanded_thinking.clear();
+        self.reasoning_durations.clear();
         // Restore the exact agent transcript (tool calls + results with ids) into
         // the next engine build instead of the lossy text seed. `None` for
         // non-agent or pre-feature sessions → falls back to the text seed.

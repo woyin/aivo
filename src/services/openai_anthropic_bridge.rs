@@ -3,7 +3,7 @@ use serde_json::{Value, json};
 use crate::services::bridge_defaults::{
     BRIDGE_DEFAULT_ANTHROPIC_MAX_TOKENS, BRIDGE_FALLBACK_OPENAI_RESPONSE_ID,
 };
-use crate::services::effort::{anthropic_thinking_config, extract_openai_effort};
+use crate::services::effort::{CanonicalEffort, anthropic_thinking_config, extract_openai_effort};
 use crate::services::http_utils::current_unix_ts;
 use crate::services::openai_models::{
     OpenAIChatChoice, OpenAIChatResponse, OpenAIChatResponseMessage, OpenAIChatToolCall,
@@ -205,6 +205,13 @@ pub fn convert_openai_chat_to_anthropic_request(
         }
     }
 
+    // An explicit `thinking` object on the OpenAI body is already Anthropic-shaped —
+    // carry it through verbatim so a caller's explicit disable reaches a Claude
+    // upstream and pre-empts the effort→thinking derivation below.
+    if let Some(thinking) = body.get("thinking").filter(|t| t.is_object()) {
+        req["thinking"] = thinking.clone();
+    }
+
     // OpenAI `reasoning_effort` / `reasoning.effort` → Anthropic effort fields.
     // Without this, callers explicitly opting into reasoning silently get
     // Anthropic's default thinking off — invisible regression for anyone
@@ -214,16 +221,23 @@ pub fn convert_openai_chat_to_anthropic_request(
     // Claude 4 surface). Both are request-level; Anthropic uses whichever
     // it understands and ignores unknown fields.
     if let Some(effort) = extract_openai_effort(body) {
-        if !req.as_object().is_some_and(|m| m.contains_key("thinking"))
-            && let Some(thinking) = anthropic_thinking_config(effort)
-        {
-            req["thinking"] = thinking;
-        }
-        if !req
-            .as_object()
-            .is_some_and(|m| m.contains_key("output_config"))
-        {
-            req["output_config"] = json!({ "effort": effort.to_anthropic_effort() });
+        let has_thinking = req.as_object().is_some_and(|m| m.contains_key("thinking"));
+        if effort == CanonicalEffort::None {
+            // Explicit "off": emit the disable form — merely omitting `thinking`
+            // leaves it on for upstreams that default it on. No `output_config.effort`.
+            if !has_thinking {
+                req["thinking"] = json!({ "type": "disabled" });
+            }
+        } else {
+            if !has_thinking && let Some(thinking) = anthropic_thinking_config(effort) {
+                req["thinking"] = thinking;
+            }
+            if !req
+                .as_object()
+                .is_some_and(|m| m.contains_key("output_config"))
+            {
+                req["output_config"] = json!({ "effort": effort.to_anthropic_effort() });
+            }
         }
     }
 
@@ -1599,7 +1613,8 @@ mod tests {
     }
 
     #[test]
-    fn openai_reasoning_effort_none_does_not_enable_anthropic_thinking() {
+    fn openai_reasoning_effort_none_disables_anthropic_thinking() {
+        // Explicit "off" → thinking:{type:"disabled"}, no output_config.effort.
         let body = json!({
             "model": "claude-opus-4-7",
             "messages": [{"role": "user", "content": "hi"}],
@@ -1611,8 +1626,28 @@ mod tests {
                 default_model: "claude-opus-4-7",
             },
         );
-        assert!(req.get("thinking").is_none());
-        assert_eq!(req["output_config"]["effort"], "low");
+        assert_eq!(req["thinking"]["type"], "disabled");
+        assert!(req.get("output_config").is_none());
+    }
+
+    #[test]
+    fn openai_explicit_thinking_field_passes_through_to_anthropic() {
+        // The agent engine disables thinking on no-"off"-effort providers by
+        // sending the `thinking` field directly (no reasoning_effort). It must
+        // reach a Claude upstream verbatim, not get dropped or overridden.
+        let body = json!({
+            "model": "claude-opus-4-7",
+            "messages": [{"role": "user", "content": "hi"}],
+            "thinking": {"type": "disabled"}
+        });
+        let req = convert_openai_chat_to_anthropic_request(
+            &body,
+            &OpenAIToAnthropicChatConfig {
+                default_model: "claude-opus-4-7",
+            },
+        );
+        assert_eq!(req["thinking"]["type"], "disabled");
+        assert!(req.get("output_config").is_none());
     }
 
     #[test]

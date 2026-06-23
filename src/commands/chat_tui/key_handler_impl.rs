@@ -490,12 +490,6 @@ impl ChatTuiApp {
             return Ok(Some(false));
         }
 
-        // Ctrl+T toggles the live "Thinking" block (the same flag as /config).
-        if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('t')) {
-            self.set_show_thinking(!self.show_thinking).await;
-            return Ok(Some(false));
-        }
-
         let handled = match key.code {
             KeyCode::Esc if self.loading_resume.is_some() => {
                 self.cancel_resume_load();

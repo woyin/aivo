@@ -240,13 +240,18 @@ impl ChatTuiApp {
         // ahead of prose the typewriter hadn't shown yet.
         self.drain_incoming_buffer();
         let content = std::mem::take(&mut self.pending_response);
-        // Carry this segment's reasoning onto the committed message so it persists
-        // (and survives resume) instead of being discarded at every tool boundary.
-        // A reasoning-only segment (the model thought, then called a tool with no
-        // prose) still commits — an empty-content assistant message renders just
-        // the "Thinking" block, in order, before the tool step.
+        self.commit_assistant_segment(content);
+    }
+
+    /// Commit an assistant segment to history with its thinking duration (for the
+    /// folded `▸ thinking · Ns` summary). A reasoning-only segment (thought, then a
+    /// tool call with no prose) still commits — the empty-content message renders
+    /// just the thinking summary before the tool step. Resets the thinking clock so
+    /// the next segment times from its own first reasoning.
+    fn commit_assistant_segment(&mut self, content: String) {
         let reasoning_content = (!self.pending_reasoning.is_empty())
             .then(|| std::mem::take(&mut self.pending_reasoning));
+        let duration_ms = reasoning_content.as_ref().and(self.segment_reasoning_ms());
         if !content.is_empty() || reasoning_content.is_some() {
             self.history.push(ChatMessage {
                 role: "assistant".to_string(),
@@ -254,7 +259,22 @@ impl ChatTuiApp {
                 reasoning_content,
                 attachments: vec![],
             });
+            if let Some(ms) = duration_ms {
+                self.reasoning_durations.insert(self.history.len() - 1, ms);
+            }
         }
+        self.reasoning_started_at = None;
+        self.reasoning_elapsed_ms = None;
+    }
+
+    /// This segment's thinking duration (ms): the value frozen when the answer
+    /// started, else the live elapsed since the first reasoning chunk. `None` if
+    /// no reasoning has streamed this segment.
+    pub(super) fn segment_reasoning_ms(&self) -> Option<u64> {
+        self.reasoning_elapsed_ms.or_else(|| {
+            self.reasoning_started_at
+                .map(|t| t.elapsed().as_millis() as u64)
+        })
     }
 
     /// Live context-fill from the agent engine. A measured step total flows
@@ -540,14 +560,27 @@ impl ChatTuiApp {
             // Buffer the chunk; `tick_typewriter` reveals it into the displayed
             // reply over the next frames so output reads as fast typing instead
             // of arriving in network-sized bursts.
-            ChatResponseChunk::Content(text) => self.incoming_buffer.push_str(&text),
+            ChatResponseChunk::Content(text) => {
+                // Answer starting ends this segment's thinking — freeze the duration
+                // so the folded `▸ thinking · Ns` excludes answer-streaming time.
+                if self.reasoning_started_at.is_some() && self.reasoning_elapsed_ms.is_none() {
+                    self.reasoning_elapsed_ms = self.segment_reasoning_ms();
+                }
+                self.incoming_buffer.push_str(&text);
+            }
             // Live provider-measured usage — the footer's context-fill reads this
             // while `sending` so the stat grows during the turn, not just at the end.
             ChatResponseChunk::Usage(usage) => self.live_usage = Some(usage),
-            // Accumulate the model's reasoning unconditionally; `show_thinking`
+            // Accumulate the model's reasoning unconditionally; `thinking_enabled`
             // gates only the *render* (so toggling /config reveals/hides it
-            // instantly). Committed onto the assistant message at turn end.
-            ChatResponseChunk::Reasoning(text) => self.pending_reasoning.push_str(&text),
+            // instantly). Committed onto the assistant message at turn end. The
+            // first chunk starts this segment's thinking clock.
+            ChatResponseChunk::Reasoning(text) => {
+                if self.reasoning_started_at.is_none() {
+                    self.reasoning_started_at = Some(Instant::now());
+                }
+                self.pending_reasoning.push_str(&text);
+            }
         }
     }
 
@@ -637,16 +670,7 @@ impl ChatTuiApp {
         };
         self.drain_incoming_buffer();
         let partial = std::mem::take(&mut self.pending_response);
-        let reasoning_content = (!self.pending_reasoning.is_empty())
-            .then(|| std::mem::take(&mut self.pending_reasoning));
-        if !partial.is_empty() || reasoning_content.is_some() {
-            self.history.push(ChatMessage {
-                role: "assistant".to_string(),
-                content: partial,
-                reasoning_content,
-                attachments: vec![],
-            });
-        }
+        self.commit_assistant_segment(partial);
         // Reset the turn, fail-closed like an interrupt.
         self.sending = false;
         self.request_started_at = None;
@@ -771,21 +795,10 @@ impl ChatTuiApp {
         };
         self.pending_submit = None;
         self.pending_response.clear();
-        // Carry the turn's reasoning onto the committed message so it stays in the
-        // transcript (and survives resume) instead of vanishing when the live
-        // `pending_reasoning` clears. Rendered only while `show_thinking` is on. A
-        // reasoning-only turn (thinking, then ended on a tool with no closing prose)
-        // still commits so the thinking isn't lost.
-        let reasoning_content = (!self.pending_reasoning.is_empty())
-            .then(|| std::mem::take(&mut self.pending_reasoning));
-        if !content.is_empty() || reasoning_content.is_some() {
-            self.history.push(ChatMessage {
-                role: "assistant".to_string(),
-                content,
-                reasoning_content,
-                attachments: vec![],
-            });
-        }
+        // Carry the turn's reasoning onto the committed message (with its thinking
+        // duration for the folded summary) so it stays in the transcript instead of
+        // vanishing when the live `pending_reasoning` clears.
+        self.commit_assistant_segment(content);
 
         let usage = turn.usage_or_estimate(&prompt_text);
         // Cache for subsequent heartbeat saves, which run without a turn.
@@ -1287,6 +1300,10 @@ impl ChatTuiApp {
                         self.end_drag();
                         self.copy_selection_to_clipboard();
                     }
+                    // A single click on a `▸`/`▾ thinking` header toggles that
+                    // block's inline expansion. Anything else starts a drag-select.
+                    1 if matches!(surface, SelectionSurface::Transcript)
+                        && self.toggle_thinking_at_row(point.row) => {}
                     _ => self.begin_drag(surface, point),
                 }
             }
@@ -1660,6 +1677,57 @@ impl ChatTuiApp {
             row: hitbox.first_row + usize::from(visible_row),
             column,
         })
+    }
+
+    /// History indices of assistant turns that render a `▸ thinking` header, in
+    /// display order — the Nth header row maps to the Nth entry (each such turn
+    /// renders exactly one header row). The live streaming summary is absent: it has
+    /// no history index and isn't expandable inline. Empty when thinking is off.
+    fn reasoning_message_indices(&self) -> Vec<usize> {
+        if !self.thinking_enabled {
+            return Vec::new();
+        }
+        self.history
+            .iter()
+            .enumerate()
+            .filter(|(_, m)| m.role == "assistant")
+            .filter(|(_, m)| {
+                m.reasoning_content
+                    .as_deref()
+                    .is_some_and(|r| !r.trim().is_empty())
+            })
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    /// If transcript `row` is a `▸`/`▾ thinking` header, toggle that block's inline
+    /// expansion and return `true`. Counts header rows from the top to get the
+    /// block's ordinal, then maps it to a committed message via
+    /// [`Self::reasoning_message_indices`] — they stay in lockstep because each
+    /// committed block renders exactly one header row. A click on the live
+    /// streaming summary (ordinal past the committed blocks) is ignored.
+    pub(super) fn toggle_thinking_at_row(&mut self, row: usize) -> bool {
+        let ordinal = {
+            let Some(hitbox) = self.transcript_hitbox.as_ref() else {
+                return false;
+            };
+            if !hitbox.rows.get(row).is_some_and(|r| is_thinking_header(r)) {
+                return false;
+            }
+            hitbox.rows[..=row]
+                .iter()
+                .filter(|r| is_thinking_header(r))
+                .count()
+        };
+        let Some(&idx) = self.reasoning_message_indices().get(ordinal - 1) else {
+            return false;
+        };
+        if !self.expanded_thinking.insert(idx) {
+            self.expanded_thinking.remove(&idx);
+        }
+        // The memoized body keys on `transcript_revision`; bump so the flip repaints.
+        self.transcript_revision = self.transcript_revision.wrapping_add(1);
+        true
     }
 
     /// Maps a mouse position to a `screen_surface` point (absolute coordinates).

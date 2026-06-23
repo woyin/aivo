@@ -1071,7 +1071,7 @@ fn make_test_app(
         agent_permission: None,
         agent_auto_approve: false,
         auto_approve_flag: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-        show_thinking: true,
+        thinking_enabled: true,
         model_supports_thinking: true,
         model_image_input: None,
         reasoning_effort: None,
@@ -1081,6 +1081,10 @@ fn make_test_app(
         pending_mcp_consent: None,
         local_command: None,
         last_local_output: None,
+        expanded_thinking: std::collections::HashSet::new(),
+        reasoning_durations: std::collections::HashMap::new(),
+        reasoning_started_at: None,
+        reasoning_elapsed_ms: None,
     }
 }
 
@@ -1315,10 +1319,10 @@ fn test_build_transcript_shows_pending_status_without_visible_stream() {
 }
 
 #[test]
-fn test_build_transcript_shows_streaming_reasoning_when_enabled() {
+fn test_build_transcript_folds_streaming_reasoning_when_enabled() {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let mut app = make_test_app(tx, rx);
-    app.show_thinking = true;
+    app.thinking_enabled = true;
     app.sending = true;
     app.pending_reasoning = "Inspecting the request".to_string();
     app.pending_response = "Working on it".to_string();
@@ -1326,19 +1330,19 @@ fn test_build_transcript_shows_streaming_reasoning_when_enabled() {
     let transcript = app.build_transcript();
     let plain = transcript.plain_lines.join("\n");
 
-    assert!(plain.contains("Thinking"));
-    assert!(plain.contains("Inspecting the request"));
+    // Live reasoning renders folded so it doesn't expand then collapse as the answer streams.
+    assert!(plain.contains("▸ thinking"));
+    assert!(!plain.contains("Inspecting the request"));
     assert!(plain.contains("Working on it"));
 }
 
 #[test]
-fn test_thinking_shows_before_any_response_text() {
-    // The whole point of the live block: reasoning must render during the
-    // thinking-only gap, BEFORE any answer text has streamed (pending_response
-    // empty). Regression for the cache that only repainted once text arrived.
+fn test_no_folded_summary_during_thinking_only_phase() {
+    // During the thinking-only gap the spinner already shows "thinking", so the
+    // transcript must not also render a folded summary (avoid the double-up).
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let mut app = make_test_app(tx, rx);
-    app.show_thinking = true;
+    app.thinking_enabled = true;
     app.sending = true;
     app.history.push(ChatMessage {
         role: "user".to_string(),
@@ -1350,15 +1354,18 @@ fn test_thinking_shows_before_any_response_text() {
     assert!(app.pending_response.is_empty(), "no answer text yet");
 
     let plain = app.build_transcript().plain_lines.join("\n");
-    assert!(plain.contains("Thinking"));
-    assert!(plain.contains("Working out the approach"));
+    assert!(
+        !plain.contains("▸ thinking"),
+        "no folded summary during the thinking-only phase: {plain}"
+    );
+    assert!(!plain.contains("Working out the approach"));
 }
 
 #[test]
 fn test_build_transcript_hides_streaming_reasoning_when_disabled() {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let mut app = make_test_app(tx, rx);
-    app.show_thinking = false;
+    app.thinking_enabled = false;
     app.sending = true;
     app.pending_reasoning = "Inspecting the request".to_string();
     app.pending_response = "Working on it".to_string();
@@ -1366,27 +1373,23 @@ fn test_build_transcript_hides_streaming_reasoning_when_disabled() {
     let transcript = app.build_transcript();
     let plain = transcript.plain_lines.join("\n");
 
-    assert!(!plain.contains("Thinking"));
+    assert!(!plain.contains("▸ thinking"));
     assert!(!plain.contains("Inspecting the request"));
     assert!(plain.contains("Working on it"));
 }
 
 #[tokio::test]
-async fn effort_command_sets_level_independent_of_thinking_and_validates() {
+async fn effort_command_sets_level_enables_thinking_and_validates() {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let mut app = make_test_app(tx, rx);
     app.model_reasoning_efforts = vec!["low".into(), "medium".into(), "high".into()];
-    app.show_thinking = false;
+    app.thinking_enabled = false;
     app.reasoning_effort = None;
 
-    // `/effort high` sets it (case-insensitive) WITHOUT touching the separate
-    // show-thinking display toggle.
+    // `/effort high` also turns thinking on — picking an effort implies you want the model to reason.
     app.run_effort_command(Some("HIGH".into())).await;
     assert_eq!(app.reasoning_effort.as_deref(), Some("high"));
-    assert!(
-        !app.show_thinking,
-        "setting effort must not flip show-thinking"
-    );
+    assert!(app.thinking_enabled, "setting effort must turn thinking on");
 
     // An unknown level errors and leaves the choice unchanged.
     app.run_effort_command(Some("bogus".into())).await;
@@ -1415,23 +1418,23 @@ async fn effort_command_noop_when_model_has_no_levels() {
 }
 
 #[tokio::test]
-async fn test_config_overlay_toggles_show_thinking() {
+async fn test_config_overlay_toggles_thinking() {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let mut app = make_test_app(tx, rx);
-    app.show_thinking = true;
+    app.thinking_enabled = true;
 
     app.open_config_overlay();
     let Overlay::Config(state) = &app.overlay else {
         panic!("expected config overlay");
     };
-    // First row is "Show thinking"; its rendered state reads the live flag.
-    assert_eq!(state.items[0].setting, ConfigSetting::ShowThinking);
-    assert!(app.config_setting_enabled(ConfigSetting::ShowThinking));
+    // First row is "Thinking"; its rendered state reads the live flag.
+    assert_eq!(state.items[0].setting, ConfigSetting::Thinking);
+    assert!(app.config_setting_enabled(ConfigSetting::Thinking));
 
     // Toggling it flips the live flag (the renderer derives the checkbox from it).
     app.toggle_config_setting(0).await;
-    assert!(!app.show_thinking);
-    assert!(!app.config_setting_enabled(ConfigSetting::ShowThinking));
+    assert!(!app.thinking_enabled);
+    assert!(!app.config_setting_enabled(ConfigSetting::Thinking));
 }
 
 #[test]
@@ -1481,12 +1484,12 @@ fn test_flush_pending_assistant_commits_reasoning_only_segment() {
 #[test]
 fn test_volatile_tail_fp_tracks_reasoning_and_toggle() {
     // Regression: the live "Thinking" block lives in the volatile tail, so its
-    // fingerprint must change as reasoning streams and when show_thinking flips —
+    // fingerprint must change as reasoning streams and when thinking_enabled flips —
     // otherwise the cached tail never repaints during the reasoning-only gap.
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let mut app = make_test_app(tx, rx);
     app.sending = true;
-    app.show_thinking = true;
+    app.thinking_enabled = true;
     app.history.push(ChatMessage {
         role: "user".to_string(),
         content: "hi".to_string(),
@@ -1502,11 +1505,11 @@ fn test_volatile_tail_fp_tracks_reasoning_and_toggle() {
         "fp must change as reasoning streams (pending_response stays empty)"
     );
 
-    app.show_thinking = false;
+    app.thinking_enabled = false;
     let after_toggle = app.volatile_tail_fp();
     assert_ne!(
         after_reasoning, after_toggle,
-        "fp must change when show_thinking flips so a /config toggle repaints"
+        "fp must change when thinking_enabled flips so a /config toggle repaints"
     );
 }
 
@@ -1514,7 +1517,7 @@ fn test_volatile_tail_fp_tracks_reasoning_and_toggle() {
 fn test_thinking_block_has_distinct_bar_color() {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let mut app = make_test_app(tx, rx);
-    app.show_thinking = true;
+    app.thinking_enabled = true;
     app.history.push(ChatMessage {
         role: "assistant".to_string(),
         content: "the answer".to_string(),
@@ -1530,36 +1533,20 @@ fn test_thinking_block_has_distinct_bar_color() {
             .position(|l| l.contains(needle))
             .and_then(|i| t.bar_colors[i])
     };
-    let thinking_bar = bar_for("Thinking");
+    // A committed turn folds its thinking to the `▸ thinking` summary.
+    let thinking_bar = bar_for("▸ thinking");
     let answer_bar = bar_for("the answer");
     assert_eq!(
         thinking_bar,
         Some(MUTED),
-        "thinking block uses the muted bar"
+        "thinking summary uses the muted bar"
     );
     assert_eq!(answer_bar, Some(ACCENT), "answer uses the accent bar");
     assert_ne!(thinking_bar, answer_bar);
 }
 
-#[tokio::test]
-async fn test_ctrl_t_toggles_show_thinking() {
-    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-    let mut app = make_test_app(tx, rx);
-    app.show_thinking = true;
-
-    app.handle_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL))
-        .await
-        .unwrap();
-    assert!(!app.show_thinking, "Ctrl+T turns thinking off");
-
-    app.handle_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL))
-        .await
-        .unwrap();
-    assert!(app.show_thinking, "Ctrl+T turns it back on");
-}
-
 #[test]
-fn test_history_reasoning_renders_only_when_show_thinking() {
+fn test_history_reasoning_folds_when_thinking_enabled() {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let mut app = make_test_app(tx, rx);
     app.history.push(ChatMessage {
@@ -1569,17 +1556,131 @@ fn test_history_reasoning_renders_only_when_show_thinking() {
         attachments: vec![],
     });
 
-    app.show_thinking = true;
+    // On: history shows the folded summary, not the full reasoning (click to expand).
+    app.thinking_enabled = true;
     app.transcript_revision = app.transcript_revision.wrapping_add(1);
     let shown = app.build_transcript().plain_lines.join("\n");
-    assert!(shown.contains("the private chain of thought"));
+    assert!(shown.contains("▸ thinking"), "folded summary present");
+    assert!(
+        !shown.contains("the private chain of thought"),
+        "full reasoning stays folded"
+    );
     assert!(shown.contains("the answer"));
 
-    app.show_thinking = false;
+    app.thinking_enabled = false;
     app.transcript_revision = app.transcript_revision.wrapping_add(1);
     let hidden = app.build_transcript().plain_lines.join("\n");
+    assert!(!hidden.contains("▸ thinking"));
     assert!(!hidden.contains("the private chain of thought"));
     assert!(hidden.contains("the answer"));
+}
+
+#[test]
+fn test_click_thinking_header_toggles_inline_expansion() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.thinking_enabled = true;
+    for (content, reasoning) in [
+        ("first answer", "FIRST cot"),
+        ("second answer", "SECOND cot"),
+    ] {
+        app.history.push(ChatMessage {
+            role: "assistant".to_string(),
+            content: content.to_string(),
+            reasoning_content: Some(reasoning.to_string()),
+            attachments: vec![],
+        });
+    }
+    // Simulate the rendered rows: each assistant turn is an answer line preceded
+    // by its folded `▸ thinking` header, in display (top→bottom) order.
+    let hitbox = |rows: Vec<&str>| {
+        Some(TranscriptHitbox {
+            area: Rect::new(0, 0, 40, 10),
+            first_row: 0,
+            rows: rows.into_iter().map(str::to_string).collect(),
+        })
+    };
+    app.transcript_hitbox = hitbox(vec![
+        "▸ thinking · 1 line",
+        "first answer",
+        "▸ thinking · 1 line",
+        "second answer",
+    ]);
+
+    // Second header → second block (history index 1).
+    assert!(app.toggle_thinking_at_row(2));
+    assert!(app.expanded_thinking.contains(&1));
+    assert!(!app.expanded_thinking.contains(&0));
+
+    // Re-click the now-expanded `▾` header collapses it.
+    app.transcript_hitbox = hitbox(vec![
+        "▸ thinking · 1 line",
+        "first answer",
+        "▾ thinking · 1 line",
+        "  SECOND cot",
+        "second answer",
+    ]);
+    assert!(app.toggle_thinking_at_row(2));
+    assert!(!app.expanded_thinking.contains(&1));
+
+    // First header → first block (history index 0).
+    app.transcript_hitbox = hitbox(vec![
+        "▸ thinking · 1 line",
+        "first answer",
+        "▸ thinking · 1 line",
+        "second answer",
+    ]);
+    assert!(app.toggle_thinking_at_row(0));
+    assert!(app.expanded_thinking.contains(&0));
+
+    // Clicking a non-header (answer / indented content) row does nothing.
+    assert!(!app.toggle_thinking_at_row(1));
+
+    // With thinking off, no headers render, so clicks never resolve a block.
+    app.thinking_enabled = false;
+    assert!(!app.toggle_thinking_at_row(0));
+}
+
+#[test]
+fn test_thinking_summary_shows_duration_else_line_count() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.thinking_enabled = true;
+    app.history.push(ChatMessage {
+        role: "assistant".to_string(),
+        content: "answer".to_string(),
+        reasoning_content: Some("line one\nline two".to_string()),
+        attachments: vec![],
+    });
+
+    // No recorded duration → fall back to the line count.
+    let plain = app.build_transcript().plain_lines.join("\n");
+    assert!(plain.contains("▸ thinking · 2 lines"), "{plain}");
+
+    // A recorded duration → seconds (2300ms rounds to 2s).
+    app.reasoning_durations.insert(0, 2300);
+    app.transcript_revision = app.transcript_revision.wrapping_add(1);
+    let plain = app.build_transcript().plain_lines.join("\n");
+    assert!(plain.contains("▸ thinking · 2s"), "{plain}");
+}
+
+#[test]
+fn test_commit_records_thinking_duration_and_resets_clock() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    // Simulate a segment whose thinking was frozen at 2s when the answer began.
+    app.pending_reasoning = "the chain of thought".to_string();
+    app.pending_response = "the answer".to_string();
+    app.reasoning_elapsed_ms = Some(2000);
+
+    app.flush_pending_assistant();
+
+    let idx = app.history.len() - 1;
+    assert_eq!(app.history[idx].role, "assistant");
+    assert_eq!(app.reasoning_durations.get(&idx), Some(&2000));
+    // The clock resets so the next segment times from its own first reasoning.
+    assert!(app.reasoning_started_at.is_none());
+    assert!(app.reasoning_elapsed_ms.is_none());
 }
 
 #[test]
@@ -2985,14 +3086,24 @@ fn test_hint_bar_reflects_state() {
         bottom_row(|a| a.queued_messages = vec!["next".to_string()]).contains("queued"),
         "queued indicator"
     );
-    // The ^T thinking hint only appears for models that support thinking.
+    // The effort badge shows only when thinking is on for a thinking-capable model with levels.
     assert!(
-        bottom_row(|a| a.model_supports_thinking = true).contains("thinking"),
-        "^T hint shown for thinking-capable models"
+        bottom_row(|a| {
+            a.thinking_enabled = true;
+            a.model_supports_thinking = true;
+            a.model_reasoning_efforts = vec!["high".to_string()];
+        })
+        .contains("effort"),
+        "effort badge shown when thinking on"
     );
     assert!(
-        !bottom_row(|a| a.model_supports_thinking = false).contains("thinking"),
-        "^T hint hidden for models without thinking support"
+        !bottom_row(|a| {
+            a.thinking_enabled = false;
+            a.model_supports_thinking = true;
+            a.model_reasoning_efforts = vec!["high".to_string()];
+        })
+        .contains("effort"),
+        "effort badge hidden when thinking off"
     );
 }
 

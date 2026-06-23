@@ -680,6 +680,12 @@ impl ChatTuiApp {
         // mid-session change applies next turn without locking the engine. `None`
         // leaves the engine's own model default in place.
         let reasoning_effort = self.effective_reasoning_effort();
+        // Thinking on/off, carried in per turn like the effort; off makes the engine
+        // emit the provider-correct disable signal.
+        let thinking_enabled = self.thinking_enabled;
+        // The model's catalog effort levels, so the engine's disable path only sends
+        // a level the provider accepts (e.g. `aivo/starter` has no `none`).
+        let reasoning_efforts = self.model_reasoning_efforts.clone();
         self.response_task = Some(tokio::spawn(async move {
             let client = crate::services::http_utils::router_http_client();
             let ctx = TurnCtx {
@@ -693,6 +699,8 @@ impl ChatTuiApp {
             let mut ui = ChatAgentUi { tx };
             let mut engine = engine.lock().await;
             engine.set_context_window(context_window);
+            engine.set_thinking_enabled(thinking_enabled);
+            engine.set_reasoning_efforts(reasoning_efforts);
             if let Some(effort) = reasoning_effort {
                 engine.set_reasoning_effort(effort);
             }
@@ -1155,6 +1163,10 @@ impl ChatTuiApp {
         }
         let removed = self.history[history_index].clone();
         self.history.truncate(history_index);
+        // Indices shift on truncation — drop inline-expand state and durations so
+        // they can't point at the wrong block.
+        self.expanded_thinking.clear();
+        self.reasoning_durations.clear();
         self.draft = removed.content;
         self.cursor = self.draft.len();
         self.draft_attachments = removed.attachments;
@@ -1519,6 +1531,10 @@ impl ChatTuiApp {
         self.cancel_inflight_request();
         self.overlay = Overlay::None;
         self.history.clear();
+        self.expanded_thinking.clear();
+        self.reasoning_durations.clear();
+        self.reasoning_started_at = None;
+        self.reasoning_elapsed_ms = None;
         self.last_local_output = None;
         self.clear_transcript_selection();
         self.reset_composer();

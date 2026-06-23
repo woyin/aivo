@@ -127,16 +127,23 @@ impl ChatTuiApp {
                 }
                 "assistant" => {
                     let reasoning = self
-                        .show_thinking
+                        .thinking_enabled
                         .then_some(message.reasoning_content.as_deref())
                         .flatten();
-                    // Commit the muted thinking block and the answer as separate
-                    // blocks (distinct left bars); `block` stays empty so the generic
-                    // push below is a no-op for this message.
+                    // Folds to the thinking summary unless this turn's index is in
+                    // `expanded_thinking`. Separate barred blocks give the thinking
+                    // gutter its own color; `block` stays empty so the generic push
+                    // below no-ops.
+                    let collapsed = !self.expanded_thinking.contains(&idx);
+                    let duration_ms = self.reasoning_durations.get(&idx).copied();
                     push_assistant_blocks(
                         &mut lines,
                         &mut bars,
-                        reasoning,
+                        reasoning.map(|text| ReasoningView {
+                            text,
+                            collapsed,
+                            duration_ms,
+                        }),
                         &message.content,
                         text_width,
                         role_bar_color("assistant"),
@@ -227,18 +234,23 @@ impl ChatTuiApp {
         if self.is_transcript_empty() {
             return (lines, bars);
         }
-        // Show the live "Thinking" block while reasoning streams — including the
-        // thinking-only phase before any answer text has arrived (so the user sees
-        // activity during the silent gap). Gated by `show_thinking`.
-        let live_reasoning = (self.show_thinking && !self.pending_reasoning.is_empty())
-            .then_some(self.pending_reasoning.as_str());
-        if live_reasoning.is_some() || !self.pending_response.is_empty() {
+        // Only render the live tail once the answer has started: during the
+        // thinking-only phase the spinner already shows "thinking (Xs ...)", and a
+        // folded `▸ thinking` line here would double it. The summary is frozen at
+        // the answer's start so it matches the committed form (no jump on commit).
+        if !self.pending_response.is_empty() {
+            let live_reasoning = (self.thinking_enabled && !self.pending_reasoning.is_empty())
+                .then_some(self.pending_reasoning.as_str());
             lines.push(blank_line());
             bars.push(None);
             push_assistant_blocks(
                 &mut lines,
                 &mut bars,
-                live_reasoning,
+                live_reasoning.map(|text| ReasoningView {
+                    text,
+                    collapsed: true,
+                    duration_ms: self.segment_reasoning_ms(),
+                }),
                 &self.pending_response,
                 text_width,
                 ACCENT,
@@ -344,9 +356,9 @@ impl ChatTuiApp {
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         self.is_transcript_empty().hash(&mut hasher);
         self.transcript_revision.hash(&mut hasher);
-        // The committed history renders reasoning only while this is on, so a
-        // toggle must invalidate the memoized body.
-        self.show_thinking.hash(&mut hasher);
+        // The committed history renders the folded reasoning summary only while
+        // this is on, so a toggle must invalidate the memoized body.
+        self.thinking_enabled.hash(&mut hasher);
         self.history.len().hash(&mut hasher);
         if let Some(first) = self.history.first() {
             first.role.hash(&mut hasher);
@@ -414,12 +426,11 @@ impl ChatTuiApp {
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         self.is_transcript_empty().hash(&mut hasher);
         self.pending_response.len().hash(&mut hasher);
-        // The live "Thinking" block lives in this tail and streams independently of
-        // the reply text (it has no typewriter), so its length must key the cache
-        // or it never repaints during the reasoning-only gap. `show_thinking` gates
-        // whether it renders, so a /config toggle mid-turn must invalidate too.
+        // `pending_reasoning.len()` keys the live thinking summary's line-count
+        // fallback; `thinking_enabled` gates whether it renders, so a /config
+        // toggle mid-turn must invalidate too.
         self.pending_reasoning.len().hash(&mut hasher);
-        self.show_thinking.hash(&mut hasher);
+        self.thinking_enabled.hash(&mut hasher);
         match &self.local_command {
             Some(run) => {
                 run.command.hash(&mut hasher);
@@ -1723,10 +1734,6 @@ impl ChatTuiApp {
             vec![("esc", "interrupt"), ("type", "queue next")]
         } else {
             let mut idle = vec![("/", "commands"), ("↑", "history")];
-            // Only advertise the thinking toggle where it can actually do something.
-            if self.model_supports_thinking {
-                idle.push(("^T", "thinking"));
-            }
             idle.push(("^C", "exit"));
             idle
         };
@@ -1750,9 +1757,13 @@ impl ChatTuiApp {
     /// when a narrow terminal squeezes this bar.
     fn hint_indicator_spans(&self) -> Vec<Span<'static>> {
         let mut spans: Vec<Span<'static>> = Vec::new();
-        // Reasoning effort (shown for models with levels) — the same effective
-        // level the engine sends, so they can't disagree. Separate from display.
-        if let Some(level) = self.effective_reasoning_effort() {
+        // Reasoning effort — the same effective level the engine sends, so they
+        // can't disagree. Shown only when thinking is on for a thinking-capable
+        // model; hidden when thinking is off (the engine isn't reasoning then).
+        if self.thinking_enabled
+            && self.model_supports_thinking
+            && let Some(level) = self.effective_reasoning_effort()
+        {
             spans.push(Span::styled(
                 format!("effort: {level}"),
                 Style::default().fg(TOOL),

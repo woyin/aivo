@@ -120,6 +120,8 @@ impl ChatTuiApp {
 
     pub(super) fn clear_for_resume_loading(&mut self) {
         self.history.clear();
+        self.expanded_thinking.clear();
+        self.reasoning_durations.clear();
         self.clear_transcript_selection();
         self.reset_composer();
         self.pending_response.clear();

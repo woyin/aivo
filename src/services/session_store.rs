@@ -728,7 +728,9 @@ pub struct MessageAttachment {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ChatToggles {
     pub auto_approve: bool,
-    pub show_thinking: bool,
+    /// Whether the model is asked to think (and its reasoning shown, folded) — the
+    /// single thinking on/off concept. Defaults on.
+    pub thinking_enabled: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1709,20 +1711,25 @@ impl SessionStore {
         self.write_chat_prefs(&prefs).await
     }
 
-    /// The persisted "show the model's thinking" toggle (remembered across `aivo
-    /// chat` sessions, set in the `/config` overlay). Shares chat-prefs.json with
-    /// the auto-approve flag. Defaults to ON — reasoning is high-signal feedback
-    /// during the silent gaps before tool calls — so a missing/unreadable file
-    /// shows thinking rather than silently hiding it.
-    pub async fn get_chat_show_thinking(&self) -> bool {
-        self.get_chat_pref_bool("showThinking", true).await
+    /// The persisted thinking on/off toggle (remembered across `aivo chat`
+    /// sessions, set in the `/config` overlay). Shares chat-prefs.json with the
+    /// auto-approve flag. Defaults to ON — reasoning is high-signal feedback
+    /// during the silent gaps before tool calls. Falls back to the legacy
+    /// `showThinking` key so a pre-rename preference still applies.
+    pub async fn get_chat_thinking_enabled(&self) -> bool {
+        let prefs = self.read_chat_prefs().await;
+        prefs
+            .get("thinkingEnabled")
+            .or_else(|| prefs.get("showThinking"))
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(true)
     }
 
-    /// Persist the show-thinking toggle, preserving any sibling prefs. Best-effort,
+    /// Persist the thinking toggle, preserving any sibling prefs. Best-effort,
     /// written atomically (same path/permissions as the auto-approve flag).
-    pub async fn set_chat_show_thinking(&self, on: bool) -> Result<()> {
+    pub async fn set_chat_thinking_enabled(&self, on: bool) -> Result<()> {
         let mut prefs = self.read_chat_prefs().await;
-        prefs.insert("showThinking".into(), serde_json::Value::Bool(on));
+        prefs.insert("thinkingEnabled".into(), serde_json::Value::Bool(on));
         self.write_chat_prefs(&prefs).await
     }
 
@@ -1773,9 +1780,16 @@ impl SessionStore {
                 .and_then(serde_json::Value::as_bool)
                 .unwrap_or(default)
         };
+        // Current key, with legacy `showThinking` fallback (default on). See
+        // `get_chat_thinking_enabled`.
+        let thinking_enabled = prefs
+            .get("thinkingEnabled")
+            .or_else(|| prefs.get("showThinking"))
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(true);
         ChatToggles {
             auto_approve: bool_or("autoApprove", false),
-            show_thinking: bool_or("showThinking", true),
+            thinking_enabled,
         }
     }
 
@@ -2557,22 +2571,43 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn chat_show_thinking_persists_and_defaults_on() {
+    async fn chat_thinking_enabled_persists_and_defaults_on() {
         let temp_dir = TempDir::new().unwrap();
         let config_path = temp_dir.path().join("config.json");
         let store = SessionStore::with_path(config_path);
 
         // No prefs file yet → defaults to ON (thinking is high-signal).
-        assert!(store.get_chat_show_thinking().await);
+        assert!(store.get_chat_thinking_enabled().await);
 
         // Round-trips both directions across (re)reads, and coexists with the
         // auto-approve flag in the same file.
         store.set_chat_auto_approve(true).await.unwrap();
-        store.set_chat_show_thinking(false).await.unwrap();
-        assert!(!store.get_chat_show_thinking().await);
+        store.set_chat_thinking_enabled(false).await.unwrap();
+        assert!(!store.get_chat_thinking_enabled().await);
         assert!(store.get_chat_auto_approve().await);
-        store.set_chat_show_thinking(true).await.unwrap();
-        assert!(store.get_chat_show_thinking().await);
+        store.set_chat_thinking_enabled(true).await.unwrap();
+        assert!(store.get_chat_thinking_enabled().await);
+    }
+
+    #[tokio::test]
+    async fn chat_thinking_enabled_falls_back_to_legacy_show_thinking() {
+        let temp_dir = TempDir::new().unwrap();
+        let config_path = temp_dir.path().join("config.json");
+        let store = SessionStore::with_path(config_path);
+
+        // A pre-rename prefs file only has `showThinking`; honor it until the
+        // new key is written.
+        let dir = store.config_dir();
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        tokio::fs::write(dir.join("chat-prefs.json"), br#"{"showThinking": false}"#)
+            .await
+            .unwrap();
+        assert!(!store.get_chat_thinking_enabled().await);
+        assert!(!store.get_chat_toggles().await.thinking_enabled);
+
+        // Writing the new key takes precedence on the next read.
+        store.set_chat_thinking_enabled(true).await.unwrap();
+        assert!(store.get_chat_thinking_enabled().await);
     }
 
     #[tokio::test]

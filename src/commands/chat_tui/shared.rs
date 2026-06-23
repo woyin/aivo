@@ -513,8 +513,8 @@ impl McpOverlay {
 /// flip (and where to persist it) without matching on the row's label text.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum ConfigSetting {
-    /// Show the model's streamed reasoning/thinking in a muted block.
-    ShowThinking,
+    /// Whether the model reasons before answering (off stops it entirely).
+    Thinking,
     /// Run the agent's tools without asking (mirrors the Shift+Tab toggle).
     AutoApprove,
 }
@@ -1604,15 +1604,16 @@ pub(super) struct ChatTuiApp {
     /// cursor-agent ACP session reads it on each out-of-process
     /// `request_permission`. Kept in lockstep with `agent_auto_approve`.
     pub(super) auto_approve_flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    /// Show the model's streamed reasoning/thinking in a muted "Thinking" block
-    /// (live, and kept in the transcript afterwards). Toggled in `/config`,
-    /// remembered across sessions. On by default. Reasoning is always captured;
-    /// this only gates whether it's rendered, so toggling it is instant.
-    pub(super) show_thinking: bool,
+    /// Whether the model reasons before answering. On (default): engine requests
+    /// reasoning at the effective effort; off: engine sends the family's "off"
+    /// floor, which the loopback bridge maps to `thinking:{type:"disabled"}` for
+    /// Anthropic upstreams (so off truly stops reasoning, not just hides it).
+    /// Toggled in `/config`, remembered across sessions.
+    pub(super) thinking_enabled: bool,
     /// Whether the current model is known to support reasoning/thinking (from the
     /// model-limits snapshot). Cached on each model resolve (see
-    /// `refresh_context_window`); gates the `^T` footer hint so it only advertises
-    /// the toggle where thinking can actually appear. Unknown models → false.
+    /// `refresh_context_window`); gates the footer effort badge so it only shows
+    /// where thinking can actually appear. Unknown models → false.
     pub(super) model_supports_thinking: bool,
     /// Snapshot vision support, cached on each model resolve. `Some(false)` =
     /// text-only (image sends refused pre-flight); `None` = unknown (let through).
@@ -1633,4 +1634,20 @@ pub(super) struct ChatTuiApp {
     /// Full output of the most recent finished `!cmd`, for the `ctrl+o` pager.
     /// In-memory only (not persisted); see [`LocalCommandOutput`].
     pub(super) last_local_output: Option<LocalCommandOutput>,
+    /// History indices of assistant turns the user expanded inline (full reasoning
+    /// shown in place of the folded summary). In-memory only; cleared when history
+    /// is replaced (new chat, resume, rewind). A toggle bumps `transcript_revision`,
+    /// the body-cache key, so a flip repaints.
+    pub(super) expanded_thinking: std::collections::HashSet<usize>,
+    /// Thinking duration (ms) per committed assistant turn, by history index;
+    /// drives the folded `▸ thinking · Ns` summary. In-memory only, cleared
+    /// alongside `expanded_thinking`.
+    pub(super) reasoning_durations: std::collections::HashMap<usize, u64>,
+    /// When the current segment's reasoning started streaming (first reasoning
+    /// chunk), for the live `▸ thinking · Ns` timer. `None` between segments.
+    pub(super) reasoning_started_at: Option<Instant>,
+    /// The current segment's thinking duration (ms), frozen when the answer began
+    /// streaming so the displayed time excludes answer-streaming. `None` until the
+    /// answer starts (the live timer runs from `reasoning_started_at` until then).
+    pub(super) reasoning_elapsed_ms: Option<u64>,
 }

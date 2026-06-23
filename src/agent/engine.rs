@@ -352,6 +352,17 @@ pub struct AgentEngine {
     /// otherwise (sending the field then 400s some providers). Defaults from the
     /// model's snapshot capability at construction; changed live by `/effort`.
     reasoning_effort: Option<String>,
+    /// Catalog-advertised effort levels, set per turn by the chat layer; used to
+    /// pick a provider-valid "off" effort. Empty when unknown. See `thinking_request`.
+    reasoning_efforts: Vec<String>,
+    /// Whether the model is asked to think this turn. Off makes
+    /// [`Self::thinking_request`] emit a disable signal instead of the level.
+    /// Set per turn from the chat `/config` toggle.
+    thinking_enabled: bool,
+    /// Whether this model can reason at all (from the model-limits snapshot).
+    /// Cached at construction (the engine is rebuilt on model switch) so the
+    /// disable path doesn't send an effort field to a model that would 400 on it.
+    reasoning_capable: bool,
 }
 
 /// The reasoning-effort level to default to: `AIVO_AGENT_REASONING_EFFORT` if
@@ -429,6 +440,9 @@ impl AgentEngine {
             checkpoints: Vec::new(),
             checkpoint_store: None,
             reasoning_effort: default_reasoning_effort(model),
+            reasoning_efforts: Vec::new(),
+            thinking_enabled: true,
+            reasoning_capable: default_reasoning_effort(model).is_some(),
         }
     }
 
@@ -438,12 +452,62 @@ impl AgentEngine {
         self.reasoning_effort = Some(effort);
     }
 
-    /// The `reasoning_effort` to put on this step's request: the model's resolved
-    /// level for a reasoning-capable model, else `None`. Independent of whether
-    /// the chat displays the reasoning (the show-thinking toggle) — effort
-    /// controls how much the model thinks, not whether it's shown.
-    fn reasoning_effort_param(&self) -> Option<&str> {
-        self.reasoning_effort.as_deref()
+    /// Turn the model's thinking on/off for upcoming turns (the `/config`
+    /// toggle). Off makes [`Self::thinking_request`] emit a disable signal
+    /// instead of the chosen level.
+    pub fn set_thinking_enabled(&mut self, on: bool) {
+        self.thinking_enabled = on;
+    }
+
+    /// Set the catalog-advertised effort levels for this turn. See `reasoning_efforts`.
+    pub fn set_reasoning_efforts(&mut self, efforts: Vec<String>) {
+        self.reasoning_efforts = efforts;
+    }
+
+    /// Whether `level` is one the model's catalog advertises (so it won't 400).
+    fn effort_is_valid(&self, level: &str) -> bool {
+        self.reasoning_efforts.iter().any(|e| e == level)
+    }
+
+    /// How to express thinking control on this step's request: `(reasoning_effort,
+    /// emit_thinking_disabled)`.
+    ///
+    /// Enabled → the resolved level (or `None` for a non-reasoning model), no
+    /// disable field. Disabled, for a reasoning-capable model:
+    /// - **gpt-5 / codex**: `"minimal"` — they reject `"none"` alongside tools and
+    ///   reject the `thinking` field.
+    /// - **o-series**: `"low"` — the floor they accept (no none/minimal).
+    /// - **catalog lists `none`/`minimal`**: send it — a real effort-level off.
+    /// - **otherwise** (effort is depth-only, e.g. `aivo/starter`, Anthropic): emit
+    ///   `thinking:{type:"disabled"}` and NO effort — `"none"` isn't in their effort
+    ///   scale (400s), so the separate `thinking` field is the toggle; the
+    ///   OpenAI→Anthropic bridge carries it through.
+    ///
+    /// Capability also accepts a chat-set level/catalog, since alias models (e.g.
+    /// `aivo/starter`) are absent from the snapshot.
+    fn thinking_request(&self) -> (Option<&str>, bool) {
+        if self.thinking_enabled {
+            return (self.reasoning_effort.as_deref(), false);
+        }
+        let capable = self.reasoning_capable
+            || self.reasoning_effort.is_some()
+            || !self.reasoning_efforts.is_empty();
+        if !capable {
+            return (None, false);
+        }
+        let lower = self.model.to_ascii_lowercase();
+        let name = lower.rsplit('/').next().unwrap_or(&lower);
+        if name.starts_with("gpt-5") || name.contains("codex") {
+            (Some("minimal"), false)
+        } else if name.starts_with("o1") || name.starts_with("o3") || name.starts_with("o4") {
+            (Some("low"), false)
+        } else if self.effort_is_valid("none") {
+            (Some("none"), false)
+        } else if self.effort_is_valid("minimal") {
+            (Some("minimal"), false)
+        } else {
+            (None, true)
+        }
     }
 
     /// Enable `/rewind` tree-checkpointing for this engine (top-level chat only;
@@ -826,14 +890,17 @@ impl AgentEngine {
 
             let mut extra = Map::new();
             extra.insert("tool_choice".into(), json!("auto"));
-            // Request reasoning for reasoning-capable models at the resolved
-            // effort. The loopback serve translates `reasoning_effort` to each
-            // upstream's thinking surface (Anthropic `thinking`, Gemini
-            // `thinkingConfig`, OpenAI passthrough). Skipped for non-reasoning
-            // models so strict providers don't 400. Whether the chat *shows* the
-            // reasoning is a separate concern (the show-thinking display toggle).
-            if let Some(effort) = self.reasoning_effort_param() {
+            // Thinking control for this step (see `thinking_request`). The loopback
+            // serve translates `reasoning_effort` to each upstream's surface
+            // (Anthropic `thinking`, Gemini `thinkingConfig`, OpenAI passthrough);
+            // `thinking:{type:"disabled"}` is the separate off-switch where the
+            // effort scale has no "off".
+            let (effort, disable_thinking) = self.thinking_request();
+            if let Some(effort) = effort {
                 extra.insert("reasoning_effort".into(), json!(effort));
+            }
+            if disable_thinking {
+                extra.insert("thinking".into(), json!({ "type": "disabled" }));
             }
             let request = ChatRequest {
                 model: self.model.clone(),
@@ -2420,17 +2487,64 @@ mod tests {
     }
 
     #[test]
-    fn reasoning_effort_param_tracks_capability_not_display() {
+    fn thinking_request_tracks_capability_when_enabled() {
         // Reasoning-capable model: the level is always requested (independent of
         // whether the chat shows thinking); `/effort` changes it.
         let mut engine = AgentEngine::new("/tmp", "o3", "", &[], &[], 0, 0);
-        assert_eq!(engine.reasoning_effort_param(), Some("medium"));
+        assert_eq!(engine.thinking_request(), (Some("medium"), false));
         engine.set_reasoning_effort("high".into());
-        assert_eq!(engine.reasoning_effort_param(), Some("high"));
+        assert_eq!(engine.thinking_request(), (Some("high"), false));
 
         // Non-reasoning model: never requested (would 400 strict providers).
         let plain = AgentEngine::new("/tmp", "gpt-4o", "", &[], &[], 0, 0);
-        assert_eq!(plain.reasoning_effort_param(), None);
+        assert_eq!(plain.thinking_request(), (None, false));
+    }
+
+    #[test]
+    fn thinking_request_disables_per_provider_disable_form() {
+        // gpt-5 / o-series reject `"none"` alongside tools and reject the
+        // `thinking` field → family effort floor instead.
+        let mut g5 = AgentEngine::new("/tmp", "gpt-5", "", &[], &[], 0, 0);
+        g5.set_thinking_enabled(false);
+        assert_eq!(g5.thinking_request(), (Some("minimal"), false));
+        let mut o = AgentEngine::new("/tmp", "o3", "", &[], &[], 0, 0);
+        o.set_thinking_enabled(false);
+        assert_eq!(o.thinking_request(), (Some("low"), false));
+
+        // A catalog that lists `none` → send it (a real effort-level off).
+        let mut has_none = AgentEngine::new("/tmp", "deepseek-reasoner", "", &[], &[], 0, 0);
+        has_none.set_reasoning_efforts(vec!["none".into(), "low".into(), "high".into()]);
+        has_none.set_thinking_enabled(false);
+        assert_eq!(has_none.thinking_request(), (Some("none"), false));
+
+        // Effort scale with no off (e.g. `aivo/starter` → deepseek: low..max, and
+        // absent from the snapshot): emit the `thinking` disable field, NOT an
+        // invalid `"none"` effort (which 400s the provider).
+        let mut alias = AgentEngine::new("/tmp", "aivo/starter", "", &[], &[], 0, 0);
+        assert!(
+            !alias.reasoning_capable,
+            "alias is absent from the snapshot"
+        );
+        alias.set_reasoning_efforts(vec![
+            "low".into(),
+            "medium".into(),
+            "high".into(),
+            "xhigh".into(),
+            "max".into(),
+        ]);
+        alias.set_thinking_enabled(false);
+        assert_eq!(alias.thinking_request(), (None, true));
+
+        // Snapshot-known Anthropic model (no none/minimal in its scale): the
+        // `thinking` field too — the OpenAI→Anthropic bridge carries it through.
+        let mut claude = AgentEngine::new("/tmp", "claude-sonnet-4-5", "", &[], &[], 0, 0);
+        claude.set_thinking_enabled(false);
+        assert_eq!(claude.thinking_request(), (None, true));
+
+        // Genuinely non-reasoning model with no catalog level: stay silent.
+        let mut plain = AgentEngine::new("/tmp", "gpt-4o", "", &[], &[], 0, 0);
+        plain.set_thinking_enabled(false);
+        assert_eq!(plain.thinking_request(), (None, false));
     }
 
     /// Full loop: first model turn emits a write_file tool call (executed

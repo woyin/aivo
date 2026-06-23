@@ -510,11 +510,72 @@ pub(super) fn extend_without_leading_blank(
     lines.extend(rendered);
 }
 
-pub(super) fn render_reasoning_block(lines: &mut Vec<StyledLine>, reasoning: &str) {
-    lines.push(line_with_plain(vec![Span::styled(
-        "Thinking".to_string(),
-        Style::default().fg(MUTED).add_modifier(Modifier::BOLD),
-    )]));
+/// Leading marker of a folded reasoning header (`▸ thinking · N lines`).
+pub(super) const THINKING_SUMMARY_PREFIX: &str = "▸ thinking";
+/// Leading marker of an expanded reasoning header (`▾ thinking · N lines`).
+pub(super) const THINKING_EXPANDED_PREFIX: &str = "▾ thinking";
+
+/// Whether a rendered transcript row is a clickable thinking header (collapsed
+/// `▸` or expanded `▾`). The click handler maps a click back to its block; the
+/// content rows of an expanded block are indented so they don't match.
+pub(super) fn is_thinking_header(row: &str) -> bool {
+    let row = row.trim_start();
+    row.starts_with(THINKING_SUMMARY_PREFIX) || row.starts_with(THINKING_EXPANDED_PREFIX)
+}
+
+/// Human "thinking · X" suffix: a duration when known (`2s`, `1m 5s`), else the
+/// line count as a fallback (e.g. cursor turns / resumed history with no timing).
+fn thinking_suffix(reasoning: &str, duration_ms: Option<u64>) -> String {
+    if let Some(ms) = duration_ms {
+        let secs = (ms + 500) / 1000;
+        return if secs == 0 {
+            "<1s".to_string()
+        } else if secs < 60 {
+            format!("{secs}s")
+        } else if secs % 60 == 0 {
+            format!("{}m", secs / 60)
+        } else {
+            format!("{}m {}s", secs / 60, secs % 60)
+        };
+    }
+    let count = normalized_reasoning_lines(reasoning).len();
+    let unit = if count == 1 { "line" } else { "lines" };
+    format!("{count} {unit}")
+}
+
+fn reasoning_header(prefix: &str, reasoning: &str, duration_ms: Option<u64>) -> StyledLine {
+    line_with_plain(vec![Span::styled(
+        format!("{prefix} · {}", thinking_suffix(reasoning, duration_ms)),
+        Style::default().fg(MUTED).add_modifier(Modifier::ITALIC),
+    )])
+}
+
+/// One-line folded stand-in for a reasoning block. Live and committed thinking
+/// both render this way, so the block keeps constant height across the handoff.
+pub(super) fn render_reasoning_summary(
+    lines: &mut Vec<StyledLine>,
+    reasoning: &str,
+    duration_ms: Option<u64>,
+) {
+    lines.push(reasoning_header(
+        THINKING_SUMMARY_PREFIX,
+        reasoning,
+        duration_ms,
+    ));
+}
+
+/// Expanded form: the `▾ thinking` header above the full reasoning, indented so
+/// content rows aren't matched as headers (see `is_thinking_header`).
+pub(super) fn render_reasoning_block(
+    lines: &mut Vec<StyledLine>,
+    reasoning: &str,
+    duration_ms: Option<u64>,
+) {
+    lines.push(reasoning_header(
+        THINKING_EXPANDED_PREFIX,
+        reasoning,
+        duration_ms,
+    ));
 
     let reasoning_lines = normalized_reasoning_lines(reasoning);
     let mut had_line = false;
@@ -558,7 +619,7 @@ pub(super) fn render_assistant_message(
     width: u16,
 ) {
     if let Some(reasoning) = reasoning.filter(|text| !text.trim().is_empty()) {
-        render_reasoning_block(lines, reasoning);
+        render_reasoning_block(lines, reasoning, None);
         if !content.is_empty() {
             push_styled_line(lines, "", Style::default());
         }
@@ -569,6 +630,14 @@ pub(super) fn render_assistant_message(
     }
 }
 
+/// Reasoning to render alongside an assistant turn: text, fold state, and how
+/// long thinking took (`None` → line-count fallback, see `thinking_suffix`).
+pub(super) struct ReasoningView<'a> {
+    pub(super) text: &'a str,
+    pub(super) collapsed: bool,
+    pub(super) duration_ms: Option<u64>,
+}
+
 /// Push an assistant turn as up to two separately-barred blocks so the muted
 /// "Thinking" block carries a different left border (`MUTED`) than the answer
 /// (`content_bar`). `push_block` paints one gutter color per block, so a distinct
@@ -576,14 +645,19 @@ pub(super) fn render_assistant_message(
 pub(super) fn push_assistant_blocks(
     lines: &mut Vec<StyledLine>,
     bars: &mut Vec<Option<Color>>,
-    reasoning: Option<&str>,
+    reasoning: Option<ReasoningView<'_>>,
     content: &str,
     width: u16,
     content_bar: Color,
 ) {
-    if let Some(reasoning) = reasoning.filter(|text| !text.trim().is_empty()) {
+    if let Some(view) = reasoning.filter(|v| !v.text.trim().is_empty()) {
         let mut block = Vec::new();
-        render_reasoning_block(&mut block, reasoning);
+        // The live tail is always collapsed so it doesn't expand-then-fold mid-turn.
+        if view.collapsed {
+            render_reasoning_summary(&mut block, view.text, view.duration_ms);
+        } else {
+            render_reasoning_block(&mut block, view.text, view.duration_ms);
+        }
         push_block(lines, bars, block, Some(MUTED));
         if !content.is_empty() {
             // A barless blank separates the muted thinking gutter from the answer's.
