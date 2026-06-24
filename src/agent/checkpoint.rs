@@ -712,10 +712,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let cwd = dir.path();
         write(cwd, "a.rs", "x");
-        // A 1ns budget can't outrun spawning `git ls-files`, so the probe times
-        // out → this snapshot is skipped, but file-revert is NOT permanently off.
+        // A zero budget is already elapsed, so the probe times out the instant the
+        // scan pends on its first pipe read → snapshot skipped, file-revert NOT
+        // latched off. (A 1ns budget races: tokio rounds it to the ~ms timer tick,
+        // which a one-file `git ls-files` can beat on a fast machine — flaky on CI.)
         let mut store = CheckpointStore::new(cwd);
-        store.probe_budget = Duration::from_nanos(1);
+        store.probe_budget = Duration::ZERO;
         if !store.git_available().await {
             return;
         }
