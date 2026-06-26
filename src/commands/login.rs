@@ -1,11 +1,12 @@
 //! `aivo login` / `aivo logout` — link this device to a getaivo.dev account.
 //!
 //! Login drives the web app's RFC 8628 device-authorization flow: it prints a
-//! short code, opens the browser to the approval page (where the user signs in
-//! with OAuth), and polls until the device is linked. Approval binds this
-//! machine's Ed25519 device id to the user server-side, so its already-signed
-//! requests resolve to the account's entitlements. No bearer token is stored —
-//! the device key stays the credential; we only record the account for display.
+//! short code + URL and polls until the device is linked (the user signs in
+//! with OAuth at that URL; Enter opens it in a browser but isn't required).
+//! Approval binds this machine's Ed25519 device id to the user server-side, so
+//! its already-signed requests resolve to the account's entitlements. No bearer
+//! token is stored — the device key stays the credential; we only record the
+//! account for display.
 
 use anyhow::Result;
 
@@ -75,8 +76,9 @@ impl LoginCommand {
         // Start the device-authorization request (Ed25519-signed).
         let device = device_auth::start_device_auth(Some(&label)).await?;
 
-        // Show the code + URL. The browser opens only when the user presses
-        // Enter — never automatically, so remote/SSH sessions stay in control.
+        // Show the code + URL. Polling starts immediately, so approval is
+        // detected even if the user never presses Enter (e.g. opens the URL on
+        // their phone); Enter just opens a browser here — optional, not a gate.
         let verify_url = device
             .verification_uri_complete
             .filter(|s| !s.is_empty())
@@ -89,12 +91,14 @@ impl LoginCommand {
         println!("    {}", style::bold(&device.user_code));
         println!("    {} {}", style::dim("at"), style::blue(&verify_url));
         println!();
-        if prompt_enter_to_open().await && browser_open::open_url(&verify_url).is_err() {
-            println!(
-                "  {}",
-                style::dim("(couldn't open a browser — visit the URL above)")
-            );
-        }
+        println!(
+            "  {}",
+            style::dim("Press Enter to open your browser (optional)…")
+        );
+
+        // Open the browser if/when the user presses Enter, concurrently with —
+        // never blocking — the poll below. Aborted once polling finishes.
+        let opener = spawn_browser_opener_on_enter(verify_url.clone());
 
         // Poll until the user approves in the browser.
         let (spinning, spinner_handle) =
@@ -104,6 +108,7 @@ impl LoginCommand {
                 .await;
         style::stop_spinner(&spinning);
         let _ = spinner_handle.await;
+        opener.abort();
         let user = result?;
 
         // Record the account locally for display (no secret stored).
@@ -127,10 +132,6 @@ impl LoginCommand {
             style::success_symbol(),
             style::bold(account.display())
         );
-        println!(
-            "  {}",
-            style::dim("This device is now linked to your aivo account.")
-        );
         Ok(ExitCode::Success)
     }
 
@@ -143,12 +144,13 @@ impl LoginCommand {
         );
         println!(
             "{}",
-            style::dim("Shows a short code + URL; press Enter to open your browser to")
+            style::dim("Shows a short code + URL and waits for you to approve it in the")
         );
         println!(
             "{}",
-            style::dim("approve it, then binds this device to your account (plan + credits).")
+            style::dim("browser (press Enter to open it — optional), then binds this")
         );
+        println!("{}", style::dim("device to your account (plan + credits)."));
         println!();
         println!("{}", style::bold("Options:"));
         println!(
@@ -241,11 +243,18 @@ async fn read_line_if_tty(prompt: &str) -> Option<String> {
     Some(line.trim().to_string())
 }
 
-/// On a TTY, waits for Enter before opening the browser; returns whether to
-/// open it (always false on a non-TTY — leave the URL for the user).
-async fn prompt_enter_to_open() -> bool {
-    let prompt = format!("  {} ", style::dim("Press Enter to open your browser…"));
-    read_line_if_tty(&prompt).await.is_some()
+/// Spawns a detached task that opens `verify_url` when the user presses Enter
+/// on a TTY (no-op on a non-TTY). The caller aborts it once polling ends, so a
+/// never-pressed Enter never gates login — it's purely a convenience.
+fn spawn_browser_opener_on_enter(verify_url: String) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        if read_line_if_tty("").await.is_some() && browser_open::open_url(&verify_url).is_err() {
+            println!(
+                "  {}",
+                style::dim("(couldn't open a browser — visit the URL above)")
+            );
+        }
+    })
 }
 
 /// Default device label: `aivo <version> on <hostname>` when a hostname is
