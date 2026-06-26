@@ -25,10 +25,11 @@ fn render_jump_to_bottom(frame: &mut Frame<'_>, area: Rect) -> Option<Rect> {
     if area.height == 0 {
         return None;
     }
-    // A light chip with dark text reads cleanly against the dark transcript.
+    // A warm off-white chip with dark ink (brand --text-primary on dark) reads
+    // cleanly against the warm-dark transcript.
     let style = Style::default()
-        .fg(Color::Rgb(30, 33, 35))
-        .bg(Color::Rgb(206, 210, 213));
+        .fg(Color::Rgb(26, 23, 18))
+        .bg(Color::Rgb(231, 227, 219));
     let label = [" ↓ Jump to bottom ", " ↓ bottom "]
         .into_iter()
         .find(|l| l.chars().count() as u16 + 2 <= area.width)?;
@@ -1288,7 +1289,7 @@ impl ChatTuiApp {
                         .position(self.transcript_scroll);
                 let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
                     .thumb_style(Style::default().fg(FAINT))
-                    .track_style(Style::default().fg(Color::Rgb(50, 54, 56)))
+                    .track_style(Style::default().fg(Color::Rgb(44, 40, 35)))
                     .begin_symbol(None)
                     .end_symbol(None);
                 frame.render_stateful_widget(scrollbar, transcript_view_area, &mut scrollbar_state);
@@ -1673,7 +1674,7 @@ impl ChatTuiApp {
                 Span::styled(&toast.text, Style::default().fg(color)),
                 Span::raw(" "),
             ]))
-            .style(Style::default().bg(Color::Rgb(24, 26, 27))),
+            .style(Style::default().bg(Color::Rgb(24, 21, 17))),
             toast_area,
         );
     }
@@ -1866,7 +1867,20 @@ impl ChatTuiApp {
         );
         let left_len = display_width(&left_text) as u16;
         let pad = left_width.saturating_sub(left_len);
-        let mut spans = vec![Span::styled(left_text, Style::default().fg(MUTED))];
+        // Status-line hierarchy instead of one flat gray: the model name (first
+        // segment) carries the brand accent as the identity anchor, the ` · `
+        // glue recedes to FAINT, and the host/cwd context stays MUTED.
+        let mut spans: Vec<Span<'static>> = Vec::new();
+        for (index, segment) in left_text.split(" · ").enumerate() {
+            if index > 0 {
+                spans.push(Span::styled(" · ", Style::default().fg(FAINT)));
+            }
+            let color = if index == 0 { ACCENT } else { MUTED };
+            spans.push(Span::styled(
+                segment.to_string(),
+                Style::default().fg(color),
+            ));
+        }
         if right_label_width > 0 {
             spans.push(Span::raw(" ".repeat(usize::from(pad) + 1)));
             spans.push(Span::styled(right_label, Style::default().fg(right_color)));

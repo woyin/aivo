@@ -1553,9 +1553,8 @@ fn test_thinking_block_has_distinct_bar_color() {
     let thinking_bar = bar_for("▸ thought");
     let answer_bar = bar_for("the answer");
     assert_eq!(
-        thinking_bar,
-        Some(THINKING_GUTTER),
-        "thinking summary uses the dim gutter bar"
+        thinking_bar, None,
+        "thinking summary is barless so it recedes as ephemeral meta"
     );
     assert_eq!(answer_bar, Some(ACCENT), "answer uses the accent bar");
     assert_ne!(thinking_bar, answer_bar);

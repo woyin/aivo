@@ -1,33 +1,38 @@
 use super::*;
 
-pub(super) const TEXT: Color = Color::Rgb(224, 225, 221);
-pub(super) const MUTED: Color = Color::Rgb(136, 142, 139);
-pub(super) const FAINT: Color = Color::Rgb(92, 99, 102);
-// Left gutter bar for the folded/expanded `▾ thought` reasoning block: kept much
-// dimmer than the muted reasoning text so the block recedes — a faint trace just
-// above the dark background, not a competing accent.
-pub(super) const THINKING_GUTTER: Color = Color::Rgb(60, 64, 66);
-// GrokNight-style magenta accent on a neutral dark base.
-pub(super) const ACCENT: Color = Color::Rgb(213, 108, 196);
-pub(super) const ASSISTANT: Color = Color::Rgb(174, 202, 161);
-pub(super) const USER: Color = Color::Rgb(166, 193, 226);
-// Agent tool steps (call/result) — a cyan distinct from user blue / assistant green.
-pub(super) const TOOL: Color = Color::Rgb(122, 170, 172);
-pub(super) const LINK: Color = Color::Rgb(142, 181, 219);
-pub(super) const QUOTE: Color = Color::Rgb(143, 164, 146);
-pub(super) const ERROR: Color = Color::Rgb(230, 134, 128);
-pub(super) const WARNING: Color = Color::Rgb(230, 184, 107);
+// Warm-night palette mirroring getaivo.dev's dark theme (aivo-website
+// global.css): warm off-white ink on warm near-black, brand yellow accent, role
+// hues borrowed from the site's syntax tokens so the CLI and the web read as one
+// product. Everything stays muted — accents mark, they don't shout.
+pub(super) const TEXT: Color = Color::Rgb(237, 233, 226); // --text-primary
+pub(super) const MUTED: Color = Color::Rgb(158, 152, 140); // warm secondary ink
+pub(super) const FAINT: Color = Color::Rgb(109, 103, 93); // --text-muted
+// getaivo.dev brand yellow (#DEFC09), toned down for the muted dark palette so
+// it reads as the brand accent without the full neon punch of the raw web color.
+pub(super) const ACCENT: Color = Color::Rgb(206, 226, 70);
+// Assistant = warm jade (site --code-op), pulled clearly off the lime accent.
+pub(super) const ASSISTANT: Color = Color::Rgb(140, 190, 176);
+// User = lavender (site --code-var), the brand's complement to the yellow accent.
+pub(super) const USER: Color = Color::Rgb(181, 164, 235);
+// Agent tool steps (call/result) — a steel cyan distinct from user lavender,
+// assistant jade, and link blue.
+pub(super) const TOOL: Color = Color::Rgb(110, 170, 188);
+pub(super) const LINK: Color = Color::Rgb(143, 178, 222);
+pub(super) const QUOTE: Color = Color::Rgb(150, 150, 128); // warm olive aside
+pub(super) const ERROR: Color = Color::Rgb(228, 128, 114); // warm coral
+pub(super) const WARNING: Color = Color::Rgb(224, 180, 104); // brand gold (--code-string)
 // Inline-diff palette for the compact edit preview under a tool call. The
 // changed line gets a subtle dark tint (not a saturated terminal-diff fill) that
 // fills the full row width (see `fill_trailing_background`) so a wrapped line
 // still reads as one contiguous block; the gutter `+`/`-` is brighter than the
-// code text so the eye lands on the sign.
-pub(super) const DIFF_ADD_BG: Color = Color::Rgb(28, 46, 35);
-pub(super) const DIFF_DEL_BG: Color = Color::Rgb(52, 32, 34);
-pub(super) const DIFF_ADD_FG: Color = Color::Rgb(180, 211, 172);
-pub(super) const DIFF_DEL_FG: Color = Color::Rgb(225, 165, 161);
-pub(super) const DIFF_ADD_SIGN: Color = Color::Rgb(122, 192, 132);
-pub(super) const DIFF_DEL_SIGN: Color = Color::Rgb(231, 122, 116);
+// code text so the eye lands on the sign. Greens echo ASSISTANT jade, reds ERROR
+// coral, so the diff sits inside the warm palette.
+pub(super) const DIFF_ADD_BG: Color = Color::Rgb(26, 42, 32);
+pub(super) const DIFF_DEL_BG: Color = Color::Rgb(48, 30, 30);
+pub(super) const DIFF_ADD_FG: Color = Color::Rgb(168, 204, 182);
+pub(super) const DIFF_DEL_FG: Color = Color::Rgb(224, 162, 154);
+pub(super) const DIFF_ADD_SIGN: Color = Color::Rgb(120, 190, 150);
+pub(super) const DIFF_DEL_SIGN: Color = Color::Rgb(230, 120, 112);
 pub(super) const EMPTY_STATE_TOP_GAP: u16 = 1;
 // No bottom padding: the composer already reserves its own blank spacing row
 // above the divider, so the welcome screen's "Ready" line keeps the same single
@@ -83,9 +88,11 @@ pub(super) const COMMAND_MENU_MAX_ROWS: usize = 7;
 pub(super) const PICKER_ROW_PREFIX_WIDTH: usize = 2;
 /// Lines a PageUp/PageDn moves the `/skills` `/mcp` detail drill-in.
 pub(super) const DETAIL_PAGE_LINES: u16 = 10;
-pub(super) const SELECT_WARM: Color = Color::Rgb(54, 74, 84);
+// Drag-copy wash: a dim warm olive (the brand yellow knocked back into the dark)
+// so a selection reads as brand-tinted rather than a cool steel block.
+pub(super) const SELECT_WARM: Color = Color::Rgb(58, 58, 40);
 /// Brighter selection wash shown for the brief post-copy flash.
-pub(super) const SELECT_FLASH: Color = Color::Rgb(86, 120, 134);
+pub(super) const SELECT_FLASH: Color = Color::Rgb(96, 98, 58);
 
 #[derive(Clone, Copy)]
 pub(super) struct SlashCommandSpec {

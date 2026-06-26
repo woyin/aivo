@@ -236,8 +236,8 @@ fn fill_trailing_background(mut row: StyledLine, width: usize) -> StyledLine {
     row
 }
 
-/// Accent-bar color for a transcript role: user = blue, assistant = magenta
-/// (aivo's voice), agent tool steps = cyan, everything else = muted.
+/// Accent-bar color for a transcript role: user = lavender, assistant = brand
+/// accent (aivo's voice), agent tool steps = cyan, everything else = muted.
 pub(super) fn role_bar_color(role: &str) -> Color {
     match role {
         "user" => USER,
@@ -509,18 +509,15 @@ pub(super) fn render_user_message(
     content: &str,
     attachments: &[MessageAttachment],
 ) {
+    // No `> ` marker: the message renders as plain text and the role is carried
+    // entirely by the lavender gutter bar, so a user turn reads as clean prose.
     let mut had_line = false;
-    for (idx, raw_line) in content.lines().enumerate() {
-        let prefix = if idx == 0 { "> " } else { "  " };
-        push_styled_line(
-            lines,
-            format!("{prefix}{raw_line}"),
-            Style::default().fg(USER),
-        );
+    for raw_line in content.lines() {
+        push_styled_line(lines, raw_line.to_string(), Style::default().fg(TEXT));
         had_line = true;
     }
     if !had_line {
-        push_styled_line(lines, "> ", Style::default().fg(USER));
+        push_styled_line(lines, String::new(), Style::default().fg(TEXT));
     }
     render_user_attachment_lines(lines, attachments);
 }
@@ -595,9 +592,10 @@ pub(super) fn render_reasoning_summary(
         Style::default().fg(MUTED).add_modifier(Modifier::ITALIC),
     )];
     if let Some(preview) = reasoning_preview(reasoning) {
+        // Same MUTED tone as the header so the whole summary reads as one line.
         spans.push(Span::styled(
             format!(" · {preview}"),
-            Style::default().fg(FAINT).add_modifier(Modifier::ITALIC),
+            Style::default().fg(MUTED).add_modifier(Modifier::ITALIC),
         ));
     }
     lines.push(line_with_plain(spans));
@@ -696,10 +694,11 @@ pub(super) struct ReasoningView<'a> {
     pub(super) duration_ms: Option<u64>,
 }
 
-/// Push an assistant turn as up to two separately-barred blocks so the muted
-/// "Thinking" block carries a different left border (`MUTED`) than the answer
-/// (`content_bar`). `push_block` paints one gutter color per block, so a distinct
-/// thinking bar requires committing the reasoning as its own block.
+/// Push an assistant turn as up to two blocks: the muted "Thinking" block is
+/// barless (no gutter bar) so it recedes as ephemeral meta — the `▸ thought`
+/// marker already identifies it — while the answer carries `content_bar`.
+/// `push_block` paints one gutter color per block, so committing the reasoning as
+/// its own block keeps the answer's bar from bleeding up into it.
 pub(super) fn push_assistant_blocks(
     lines: &mut Vec<StyledLine>,
     bars: &mut Vec<Option<Color>>,
@@ -716,9 +715,9 @@ pub(super) fn push_assistant_blocks(
         } else {
             render_reasoning_block(&mut block, view.text, view.duration_ms);
         }
-        push_block(lines, bars, block, Some(THINKING_GUTTER));
+        push_block(lines, bars, block, None);
         if !content.is_empty() {
-            // A barless blank separates the muted thinking gutter from the answer's.
+            // A blank row sets the barless thinking block off from the answer's bar.
             lines.push(blank_line());
             bars.push(None);
         }

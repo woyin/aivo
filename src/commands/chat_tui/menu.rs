@@ -1,8 +1,14 @@
 use super::*;
 
-pub(super) const SELECT_BG: Color = Color::Rgb(78, 108, 136);
-pub(super) const SELECT_TEXT: Color = Color::Rgb(242, 245, 247);
-const SELECT_ACCENT: Color = SELECT_WARM;
+// Selected-row background: a clean, deep brand olive (the accent yellow knocked
+// back into the dark) so a highlighted picker/menu row reads as lit by the
+// accent rather than army-drab — low blue keeps it from graying into mud.
+pub(super) const SELECT_BG: Color = Color::Rgb(80, 92, 36);
+// Primary text + chevron on the bar: near-white, bold — crisp on the olive.
+pub(super) const SELECT_TEXT: Color = Color::Rgb(242, 244, 228);
+// Secondary text on the bar (endpoint URL, session time): a soft near-white,
+// still clearly readable but a touch under the bold-white primary label.
+const SELECT_ACCENT: Color = Color::Rgb(216, 220, 204);
 
 fn picker_content_width(width: u16) -> usize {
     usize::from(width.max(1))
@@ -148,7 +154,9 @@ pub(super) fn command_menu_item_line(
     width: u16,
     label_column_width: usize,
 ) -> Line<'static> {
-    const SELECT_TEXT: Color = SELECT_WARM;
+    // The selected-row chevron sits on the dark transcript, not on SELECT_BG, so
+    // it uses a visible warm gray rather than the dim SELECT_WARM wash color.
+    const SELECT_TEXT: Color = MUTED;
     const COLUMN_GAP: usize = 2;
 
     let content_width = picker_content_width(width);
@@ -342,7 +350,7 @@ pub(super) fn key_picker_item_line(key: &ApiKey, selected: bool, width: u16) -> 
         Style::default()
     };
     let prefix_style = if selected {
-        fill_style.fg(SELECT_ACCENT).add_modifier(Modifier::BOLD)
+        fill_style.fg(SELECT_TEXT).add_modifier(Modifier::BOLD)
     } else {
         fill_style
     };
@@ -379,10 +387,10 @@ pub(super) fn session_picker_item_lines(
     armed_delete: bool,
     width: u16,
 ) -> Vec<Line<'static>> {
-    const SELECT_TIME: Color = SELECT_WARM;
-    const DELETE_BG: Color = Color::Rgb(104, 63, 63);
-    const DELETE_TEXT: Color = Color::Rgb(255, 241, 233);
-    const DELETE_TIME: Color = Color::Rgb(255, 198, 176);
+    const SELECT_TIME: Color = SELECT_ACCENT;
+    const DELETE_BG: Color = Color::Rgb(102, 58, 52);
+    const DELETE_TEXT: Color = Color::Rgb(255, 240, 230);
+    const DELETE_TIME: Color = Color::Rgb(255, 194, 170);
 
     let time = format_session_time(&preview.updated_at);
     let content_width = picker_content_width(width);
@@ -549,7 +557,7 @@ pub(super) fn picker_entry_lines(
                 Style::default()
             };
             let prefix_style = if selected {
-                fill_style.fg(SELECT_ACCENT).add_modifier(Modifier::BOLD)
+                fill_style.fg(SELECT_TEXT).add_modifier(Modifier::BOLD)
             } else {
                 fill_style
             };
