@@ -64,6 +64,7 @@ impl ChatTuiApp {
             shift_index_map_after_removal(&mut self.local_outputs, idx);
             shift_index_set_after_removal(&mut self.expanded_thinking, idx);
             shift_index_set_after_removal(&mut self.expanded_output, idx);
+            shift_index_opt_after_removal(&mut self.plan_card_idx, idx);
         }
     }
 
@@ -178,6 +179,15 @@ fn shift_index_map_after_removal<V>(map: &mut std::collections::HashMap<usize, V
             k => Some((k, v)),
         })
         .collect();
+}
+
+/// Optional-scalar twin of [`shift_index_map_after_removal`].
+fn shift_index_opt_after_removal(opt: &mut Option<usize>, removed: usize) {
+    match *opt {
+        Some(i) if i == removed => *opt = None,
+        Some(i) if i > removed => *opt = Some(i - 1),
+        _ => {}
+    }
 }
 
 /// Set twin of [`shift_index_map_after_removal`].

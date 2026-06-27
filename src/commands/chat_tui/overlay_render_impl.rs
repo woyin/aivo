@@ -1197,7 +1197,7 @@ const HELP_COMMAND_GROUPS: &[(&str, &[&str])] = &[
         "Skills & tools",
         &["skills", "create-skill", "mcp", "agent"],
     ),
-    ("Autonomous", &["goal"]),
+    ("Autonomous", &["plan", "goal"]),
 ];
 
 /// Keybindings grouped for the `/help` overlay (label, then `(key, action)`

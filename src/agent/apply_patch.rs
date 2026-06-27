@@ -1,8 +1,6 @@
-//! OpenAI V4A `apply_patch` grammar: a context-anchored, line-number-free patch
-//! format GPT-5/Codex models are post-trained to emit. Parsed into per-file
-//! changes, then applied with 3-level fuzzy context matching (exact → trailing
-//! whitespace → all whitespace). One `*** Update File` section = one search/
-//! replace, so applies reuse [`crate::agent::tools`]'s atomic write helpers.
+//! OpenAI V4A `apply_patch` grammar: the context-anchored, line-number-free patch
+//! format GPT-5/Codex models emit. Parsed into per-file changes, then applied with
+//! 3-level fuzzy context matching (exact → trailing-ws → all-ws).
 
 use crate::agent::tools::{atomic_write, resolve};
 use std::path::{Path, PathBuf};
@@ -17,7 +15,7 @@ enum Op {
     Ins,
 }
 
-/// A contiguous before/after region of an `Update File`, split on `@@` markers.
+/// One `@@`-delimited hunk: ordered (op, line) pairs.
 type Section = Vec<(Op, String)>;
 
 #[derive(Debug)]
@@ -38,16 +36,15 @@ struct FileChange {
     kind: ChangeKind,
 }
 
-/// A render-ready before/after block (one per Add file or Update section), so the
-/// chat diff card can reuse its line-level differ. `path` carries any rename arrow.
+/// A before/after block for the chat diff card; `path` carries any rename arrow.
 pub struct DiffBlock {
     pub path: String,
     pub old: String,
     pub new: String,
 }
 
-/// Parse the V4A envelope between `*** Begin Patch` and `*** End Patch`. Anything
-/// outside the markers (code fences, a `apply_patch <<'EOF'` heredoc) is ignored.
+/// Parse the V4A body between `*** Begin Patch`/`*** End Patch` (anything outside
+/// the markers — fences, a heredoc wrapper — is ignored).
 fn parse(patch: &str) -> Result<Vec<FileChange>, String> {
     let lines: Vec<String> = patch
         .split('\n')
@@ -139,8 +136,7 @@ fn parse(patch: &str) -> Result<Vec<FileChange>, String> {
     Ok(changes)
 }
 
-/// A hunk body line: ` ` context, `-` deletion, `+` insertion (a bare empty line
-/// is treated as blank context, matching the reference implementation).
+/// ` ` context, `-` deletion, `+` insertion; a bare empty line is blank context.
 fn classify(l: &str) -> Result<(Op, String), String> {
     match l.as_bytes().first() {
         None => Ok((Op::Ctx, String::new())),
@@ -151,9 +147,7 @@ fn classify(l: &str) -> Result<(Op, String), String> {
     }
 }
 
-/// Locate `block` in `lines` at or after `start`, trying exact, then trailing-
-/// whitespace-insensitive, then fully-trimmed matches. Empty block inserts at
-/// `start`. Returns the start index of the match.
+/// Locate `block` at/after `start`, trying exact → trailing-ws → trimmed matches.
 fn find_context(lines: &[&str], block: &[&str], start: usize) -> Option<usize> {
     if block.is_empty() {
         return Some(start.min(lines.len()));
@@ -178,15 +172,13 @@ fn find_context(lines: &[&str], block: &[&str], start: usize) -> Option<usize> {
     None
 }
 
-/// Apply an Update file's sections to `orig`. Each section's "before" (context +
-/// deletions) is located forward from the running position and replaced by its
-/// "after" (context + insertions), so repeated context blocks resolve in order.
+/// Apply an Update's sections to `orig`: each section's context+deletions are
+/// located forward from the running position, so repeated context resolves in order.
 fn apply_update(orig: &str, sections: &[Section]) -> Result<String, String> {
     let lines: Vec<&str> = orig.lines().collect();
     let mut out: Vec<String> = Vec::new();
     let mut pos = 0usize;
     for sec in sections {
-        // "before" = the original lines this section consumes (context + deletions).
         let before: Vec<&str> = sec
             .iter()
             .filter(|(o, _)| *o != Op::Ins)
@@ -195,8 +187,7 @@ fn apply_update(orig: &str, sections: &[Section]) -> Result<String, String> {
         let at = find_context(&lines, &before, pos)
             .ok_or_else(|| format!("could not locate patch context:\n{}", before.join("\n")))?;
         out.extend(lines[pos..at].iter().map(|s| s.to_string()));
-        // Walk file offsets so fuzzy-matched context keeps the file's own text
-        // (whitespace and all), only deletions drop out and insertions come in.
+        // Walk file offsets so fuzzy-matched context keeps the file's own text.
         let mut f = at;
         for (op, text) in sec {
             match op {
@@ -219,8 +210,7 @@ fn apply_update(orig: &str, sections: &[Section]) -> Result<String, String> {
     Ok(result)
 }
 
-/// Every path a patch touches (Update destinations included), for permission
-/// gating and the pinned touched-files set. Empty if the patch doesn't parse.
+/// Every path a patch touches (rename destinations included); empty if unparseable.
 pub fn target_paths(patch: &str) -> Vec<String> {
     let Ok(changes) = parse(patch) else {
         return Vec::new();
@@ -281,9 +271,8 @@ pub fn diff_blocks(patch: &str) -> Vec<DiffBlock> {
     blocks
 }
 
-/// Parse and apply a V4A patch under `cwd`. All-or-nothing on validation errors
-/// (missing files, unmatched context, clobbered adds): every change is computed
-/// in memory first, then written. Returns a one-line summary of files changed.
+/// Parse and apply a V4A patch under `cwd`, computing every change in memory
+/// before writing so a validation error leaves the workspace untouched.
 pub fn apply(patch: &str, cwd: &Path) -> Result<String, String> {
     let changes = parse(patch)?;
     enum Step {

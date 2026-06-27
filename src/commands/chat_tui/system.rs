@@ -707,6 +707,7 @@ pub(super) fn parse_slash_command(input: &str) -> Result<SlashCommand> {
         "mcp" => Ok(SlashCommand::Mcp(argument)),
         "agent" => Ok(SlashCommand::Agent(argument)),
         "goal" => Ok(SlashCommand::Goal(argument)),
+        "plan" => Ok(SlashCommand::Plan(argument)),
         "effort" => Ok(SlashCommand::Effort(argument)),
         "create-skill" => Ok(SlashCommand::CreateSkill(argument)),
         // `undo` kept as a hidden alias for muscle memory; only `/rewind` is advertised.

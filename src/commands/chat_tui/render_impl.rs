@@ -182,18 +182,23 @@ impl ChatTuiApp {
                     // below no-ops.
                     let collapsed = !self.expanded_thinking.contains(&idx);
                     let duration_ms = self.reasoning_durations.get(&idx).copied();
-                    push_assistant_blocks(
-                        &mut lines,
-                        &mut bars,
-                        reasoning.map(|text| ReasoningView {
-                            text,
-                            collapsed,
-                            duration_ms,
-                        }),
-                        &message.content,
-                        text_width,
-                        role_bar_color("assistant"),
-                    );
+                    let view = reasoning.map(|text| ReasoningView {
+                        text,
+                        collapsed,
+                        duration_ms,
+                    });
+                    if self.plan_card_idx == Some(idx) {
+                        push_plan_card(&mut lines, &mut bars, view, &message.content, text_width);
+                    } else {
+                        push_assistant_blocks(
+                            &mut lines,
+                            &mut bars,
+                            view,
+                            &message.content,
+                            text_width,
+                            role_bar_color("assistant"),
+                        );
+                    }
                 }
                 "tool_call" => {
                     let (name, args) = decode_tool_call(&message.content);

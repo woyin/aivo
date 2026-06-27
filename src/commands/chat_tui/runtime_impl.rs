@@ -17,6 +17,25 @@ own line. If anything remains, keep going.";
 const GOAL_CONTINUE: &str = "Continue toward the goal. If the objective is now fully met, reply \
 with exactly `GOAL COMPLETE` and nothing else; otherwise do the next step.";
 
+/// Framing for a `/plan` investigation turn (read-only; the plan is the reply).
+const PLAN_PREAMBLE: &str = "[Plan mode] Investigate this codebase to understand what the task below \
+needs, using ONLY read-only tools (read_file, grep, glob, list_dir). Do NOT modify any files or run \
+state-changing commands. Then write a concise implementation plan: the approach, the specific files \
+to change, and a numbered list of steps. Output the plan as your reply — do not start implementing.\n\n\
+Task: ";
+const PLAN_EXEC_PREAMBLE: &str = "Implement the following plan in this repository. Re-read the files \
+it names, make the edits, and verify as you go.\n\nPlan:\n\n";
+
+/// The plan plus any extra guidance typed after `/plan go`.
+pub(super) fn plan_exec_seed(plan: &str, guidance: &str) -> String {
+    let mut seed = format!("{PLAN_EXEC_PREAMBLE}{plan}");
+    if !guidance.is_empty() {
+        seed.push_str("\n\nAdditional guidance for this execution:\n");
+        seed.push_str(guidance);
+    }
+    seed
+}
+
 fn goal_max_iterations() -> usize {
     std::env::var("AIVO_GOAL_MAX_ITERS")
         .ok()
@@ -560,6 +579,10 @@ impl ChatTuiApp {
             // Enable `/rewind` tree-checkpointing (top-level chat only — sub-engines
             // never call this, so they don't pay the git cost).
             engine.enable_rewind_checkpoints(&real_cwd);
+            // `/plan` investigation turn: strip the mutating tools.
+            if self.capturing_plan {
+                engine.restrict_read_only();
+            }
             // Share the live thinking toggle so the engine requests reasoning (on
             // reasoning-capable models) only while thinking is on.
             // Offer any named specialist sub-agents authored under
@@ -914,6 +937,10 @@ impl ChatTuiApp {
                 self.run_goal_command(arg).await;
                 Ok(false)
             }
+            SlashCommand::Plan(arg) => {
+                self.run_plan_command(arg).await;
+                Ok(false)
+            }
             SlashCommand::Effort(arg) => {
                 self.run_effort_command(arg).await;
                 Ok(false)
@@ -1174,6 +1201,8 @@ impl ChatTuiApp {
         self.local_outputs.clear();
         self.reasoning_durations.clear();
         self.turn_durations.clear();
+        // The plan reply may be truncated away; the in-memory plan stays usable.
+        self.plan_card_idx = None;
         self.draft = removed.content;
         self.cursor = self.draft.len();
         self.draft_attachments = removed.attachments;
@@ -1565,6 +1594,121 @@ impl ChatTuiApp {
             .await
     }
 
+    /// `/plan`: `<objective>` runs a read-only investigation turn that ends with a
+    /// plan; `go` executes the drafted plan in a fresh context (so the messy
+    /// exploration doesn't follow); `stop` discards it; bare reports status.
+    pub(super) async fn run_plan_command(&mut self, arg: Option<String>) {
+        let arg = arg.as_deref().map(str::trim).unwrap_or("");
+        // First word = action; the rest is `go`'s optional guidance. A bare
+        // `_` arm treats the whole `arg` as a new objective.
+        let (head, rest) = match arg.split_once(char::is_whitespace) {
+            Some((h, r)) => (h, r.trim()),
+            None => (arg, ""),
+        };
+        match head {
+            "go" | "run" | "execute" => {
+                if self.sending {
+                    self.notice = Some((
+                        ERROR,
+                        "Wait for the current turn to finish before executing the plan".to_string(),
+                    ));
+                    return;
+                }
+                let Some(plan) = self.pending_plan.take() else {
+                    self.notice = Some((
+                        MUTED,
+                        "No plan yet — /plan <objective> to draft one first".to_string(),
+                    ));
+                    return;
+                };
+                // Fresh context: drop the planning exploration before executing.
+                self.start_new_chat();
+                let msg = plan_exec_seed(&plan, rest);
+                if let Err(e) = self.dispatch_user_message(msg, None).await {
+                    self.notice = Some((ERROR, e.to_string()));
+                    return;
+                }
+                self.notice = Some((MUTED, "Executing the plan in a fresh context".to_string()));
+            }
+            "stop" | "cancel" | "discard" | "off" => {
+                self.capturing_plan = false;
+                self.plan_card_idx = None;
+                let msg = if self.pending_plan.take().is_some() {
+                    "Plan discarded"
+                } else {
+                    "No plan to discard"
+                };
+                self.notice = Some((MUTED, msg.to_string()));
+            }
+            "" => {
+                let msg = if self.pending_plan.is_some() {
+                    "Plan ready — review above, then /plan go to execute it in a fresh context"
+                } else {
+                    "Usage: /plan <objective> — investigate read-only and draft a plan; /plan go to execute it"
+                };
+                self.notice = Some((MUTED, msg.to_string()));
+            }
+            _ => {
+                if self.sending {
+                    self.notice = Some((
+                        ERROR,
+                        "Wait for the current turn to finish before planning".to_string(),
+                    ));
+                    return;
+                }
+                if !self.agent_capable() {
+                    self.notice = Some((
+                        ERROR,
+                        "Plan mode needs the native agent (a plain API key — not OAuth, cursor, or copilot)"
+                            .to_string(),
+                    ));
+                    return;
+                }
+                self.pending_plan = None;
+                self.capturing_plan = true;
+                // Restrict a live engine in place; a not-yet-built one is restricted
+                // at build time (gated on `capturing_plan`).
+                if let Some(session) = self.agent_engine.as_ref() {
+                    session.engine.lock().await.restrict_read_only();
+                }
+                // record: None — draft history keeps only the typed command (see /goal).
+                let first = format!("{PLAN_PREAMBLE}{arg}");
+                if let Err(e) = self.dispatch_user_message(first, None).await {
+                    self.capturing_plan = false;
+                    self.notice = Some((ERROR, e.to_string()));
+                }
+            }
+        }
+    }
+
+    /// After a `/plan` investigation turn finishes, stash the agent's reply as the
+    /// pending plan and prompt the user to review it. No-op outside plan capture.
+    pub(super) fn maybe_capture_plan(&mut self) {
+        if !self.capturing_plan || self.sending {
+            return;
+        }
+        self.capturing_plan = false;
+        // Drop the read-only planning engine so the next turn rebuilds with full tools.
+        self.agent_engine = None;
+        let plan_at = self.history.iter().rposition(|m| m.role == "assistant");
+        let plan = plan_at
+            .map(|i| self.history[i].content.clone())
+            .unwrap_or_default();
+        if plan.trim().is_empty() {
+            self.notice = Some((
+                MUTED,
+                "Planning produced no plan — try /plan <objective> again".to_string(),
+            ));
+            return;
+        }
+        self.pending_plan = Some(plan);
+        self.plan_card_idx = plan_at;
+        self.notice = Some((
+            MUTED,
+            "Plan ready — review above, then /plan go to execute it in a fresh context".to_string(),
+        ));
+    }
+
     pub(super) fn start_new_chat(&mut self) {
         self.discard_resume_state();
         self.cancel_inflight_request(false);
@@ -1592,6 +1736,9 @@ impl ChatTuiApp {
         self.session_tokens = crate::services::session_store::SessionTokens::default();
         self.context_is_estimate = true;
         self.follow_output = true;
+        self.capturing_plan = false;
+        self.pending_plan = None;
+        self.plan_card_idx = None;
         self.notice = None;
         // Drop the cursor-agent session so the next turn opens a fresh ACP
         // session — cursor's server-side chat context shouldn't bleed across
@@ -1614,6 +1761,8 @@ impl ChatTuiApp {
         // autonomous /goal loop, so it can't auto-continue after the dropped turn.
         // The interrupt-with-partial path clears it separately, before this runs.
         self.goal_mode = None;
+        // An interrupted `/plan` investigation must not capture a partial reply.
+        self.capturing_plan = false;
         // An in-process agent turn is in flight when its per-turn serve is up. The
         // engine has ALREADY consumed this turn (and may have run side-effecting
         // tools — file writes, shell commands), and it keeps its own conversation

@@ -1065,6 +1065,9 @@ fn make_test_app(
         active_agent: None,
         pending_agent_messages: None,
         goal_mode: None,
+        capturing_plan: false,
+        pending_plan: None,
+        plan_card_idx: None,
         agent_engine: None,
         agent_route_cache: None,
         mcp_client: None,
@@ -6089,6 +6092,113 @@ fn test_parse_goal_command() {
         parse_slash_command("goal stop").unwrap(),
         SlashCommand::Goal(Some("stop".to_string()))
     );
+}
+
+#[test]
+fn test_parse_plan_command() {
+    assert_eq!(
+        parse_slash_command("plan").unwrap(),
+        SlashCommand::Plan(None)
+    );
+    assert_eq!(
+        parse_slash_command("plan add a cache layer").unwrap(),
+        SlashCommand::Plan(Some("add a cache layer".to_string()))
+    );
+    assert_eq!(
+        parse_slash_command("plan go").unwrap(),
+        SlashCommand::Plan(Some("go".to_string()))
+    );
+}
+
+#[test]
+fn test_plan_exec_seed_appends_guidance() {
+    use super::runtime_impl::plan_exec_seed;
+    let bare = plan_exec_seed("1. do X", "");
+    assert!(bare.ends_with("1. do X"));
+    assert!(!bare.contains("Additional guidance"));
+    let steered = plan_exec_seed("1. do X", "use the existing retry helper");
+    assert!(steered.starts_with(&bare));
+    assert!(steered.contains("Additional guidance for this execution:"));
+    assert!(steered.ends_with("use the existing retry helper"));
+}
+
+/// The plan-card anchor slides down when an earlier history entry is removed
+/// (e.g. an `update_plan` checklist card dropped by `drop_plan_entries`).
+#[tokio::test]
+async fn test_plan_card_idx_shifts_on_removal() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    let msg = |role: &str, c: &str| ChatMessage {
+        role: role.to_string(),
+        content: c.to_string(),
+        reasoning_content: None,
+        attachments: vec![],
+    };
+    app.history.clear();
+    app.history.push(msg("user", "hi")); // 0
+    app.history.push(msg("plan", "[]")); // 1 (checklist card — dropped below)
+    app.history.push(msg("assistant", "plan body")); // 2
+    app.plan_card_idx = Some(2);
+    app.drop_plan_entries();
+    assert_eq!(
+        app.plan_card_idx,
+        Some(1),
+        "anchor follows the assistant down"
+    );
+    assert_eq!(app.history[1].role, "assistant");
+}
+
+/// `/plan` state machine without the dispatch paths (which need a serve): a
+/// finished investigation turn captures its reply as the pending plan; `stop`
+/// discards it; bare reports status; `go` with nothing pending just guides.
+#[tokio::test]
+async fn test_plan_capture_discard_and_status() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    let assistant = |content: &str| ChatMessage {
+        role: "assistant".to_string(),
+        content: content.to_string(),
+        reasoning_content: None,
+        attachments: vec![],
+    };
+
+    // A finished planning turn stashes the reply and prompts for `/plan go`.
+    app.capturing_plan = true;
+    app.history.push(assistant("1. do X\n2. do Y"));
+    app.maybe_capture_plan();
+    assert!(!app.capturing_plan, "capture flag clears");
+    assert_eq!(app.pending_plan.as_deref(), Some("1. do X\n2. do Y"));
+    assert!(app.notice.as_ref().unwrap().1.contains("/plan go"));
+    // The captured reply is anchored as the plan card.
+    assert_eq!(
+        app.plan_card_idx,
+        app.history.iter().rposition(|m| m.role == "assistant")
+    );
+
+    // Bare `/plan` with a plan pending reports it's ready.
+    app.run_plan_command(None).await;
+    assert!(app.notice.as_ref().unwrap().1.contains("review"));
+
+    // `/plan stop` discards the pending plan and unframes the card.
+    app.run_plan_command(Some("stop".to_string())).await;
+    assert!(app.pending_plan.is_none());
+    assert!(app.plan_card_idx.is_none());
+    assert!(app.notice.as_ref().unwrap().1.contains("discarded"));
+
+    // `/plan go` with nothing pending guides instead of dispatching.
+    app.run_plan_command(Some("go".to_string())).await;
+    assert!(app.notice.as_ref().unwrap().1.contains("No plan yet"));
+
+    // `/plan go <guidance>` routes to execute (first word), not a new objective.
+    app.run_plan_command(Some("go also add tests".to_string()))
+        .await;
+    assert!(app.notice.as_ref().unwrap().1.contains("No plan yet"));
+
+    // An empty investigation reply is not captured as a plan.
+    app.capturing_plan = true;
+    app.history.push(assistant("   "));
+    app.maybe_capture_plan();
+    assert!(app.pending_plan.is_none(), "blank reply isn't a plan");
 }
 
 /// `/create-skill` is a first-class built-in command (in `SLASH_COMMANDS` and

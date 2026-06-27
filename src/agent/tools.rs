@@ -173,9 +173,8 @@ pub fn tool_specs() -> Vec<ToolSpec> {
     ]
 }
 
-/// The built-in tool specs tailored to `model`: GPT-5/Codex-family models get
-/// `apply_patch` in place of `edit_file`/`multi_edit` (never both — they'd mix
-/// edit formats), since they're post-trained to emit the V4A patch grammar.
+/// Built-in specs for `model`: GPT-5/Codex get `apply_patch` instead of
+/// `edit_file`/`multi_edit` (never both — they'd mix edit formats).
 pub fn tool_specs_for(model: &str) -> Vec<ToolSpec> {
     let mut specs = tool_specs();
     if uses_apply_patch(model) {
@@ -185,9 +184,7 @@ pub fn tool_specs_for(model: &str) -> Vec<ToolSpec> {
     specs
 }
 
-/// Models that emit OpenAI's V4A `apply_patch` grammar fluently (and produce
-/// malformed exact-string edits otherwise). Mirrors the family gate in engine's
-/// `thinking_request`; the provider prefix (`openai/…`) is stripped first.
+/// Models that emit V4A `apply_patch` fluently (and botch exact-string edits).
 pub fn uses_apply_patch(model: &str) -> bool {
     let lower = model.to_ascii_lowercase();
     let name = lower.rsplit('/').next().unwrap_or(&lower);
@@ -2082,7 +2079,6 @@ mod tests {
 
     #[test]
     fn apply_patch_routing_by_model() {
-        // GPT-5/Codex-family models get apply_patch in place of the string editors.
         for m in ["gpt-5", "openai/gpt-5-codex", "codex-mini", "gpt-4.1-mini"] {
             assert!(uses_apply_patch(m), "{m} should use apply_patch");
             let names: Vec<String> = tool_specs_for(m).into_iter().map(|s| s.name).collect();
@@ -2099,7 +2095,6 @@ mod tests {
                 "{m} kept multi_edit"
             );
         }
-        // Everyone else keeps the string editors and never sees apply_patch.
         for m in [
             "claude-sonnet-4-6",
             "gpt-4o",

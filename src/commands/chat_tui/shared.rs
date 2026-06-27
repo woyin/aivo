@@ -193,6 +193,12 @@ pub(super) const SLASH_COMMANDS: &[SlashCommandSpec] = &[
         takes_argument: true,
     },
     SlashCommandSpec {
+        name: "plan",
+        help_label: "/plan <objective>",
+        description: "investigate read-only, draft a plan, then /plan go [guidance] to execute it",
+        takes_argument: true,
+    },
+    SlashCommandSpec {
         name: "rewind",
         help_label: "/rewind",
         description: "rewind to an earlier turn (reverts file edits)",
@@ -231,6 +237,7 @@ pub(super) fn command_usage_hint(name: &str) -> Option<&'static str> {
         "create-skill" => Some("[what the skill should do]"),
         "agent" => Some("[name|default]"),
         "goal" => Some("<objective> | stop"),
+        "plan" => Some("<objective> | go [guidance] | stop"),
         "model" => Some("[name]"),
         "key" => Some("[id|name]"),
         "resume" => Some("[query]"),
@@ -1227,6 +1234,10 @@ pub(super) enum SlashCommand {
     /// Goal mode: `<objective>` works autonomously until done; bare shows status,
     /// `stop` ends it.
     Goal(Option<String>),
+    /// Plan mode: `<objective>` investigates read-only and drafts an
+    /// implementation plan; `go` executes it in a fresh context; bare shows
+    /// status, `stop` discards the pending plan.
+    Plan(Option<String>),
     /// Reasoning effort: bare opens a picker of the model's levels, `<level>`
     /// sets it directly.
     Effort(Option<String>),
@@ -1589,6 +1600,15 @@ pub(super) struct ChatTuiApp {
     /// agent turns; cleared on completion, the iteration cap, `/goal stop`, an
     /// interrupt, `/new`, resume, or a key/model switch.
     pub(super) goal_mode: Option<GoalState>,
+    /// The in-flight turn is a `/plan` investigation: capture its reply as the
+    /// pending plan when it finishes. Reset on interrupt/cancel/`/new`.
+    pub(super) capturing_plan: bool,
+    /// A drafted plan from `/plan`, awaiting `/plan go` to execute it in a fresh
+    /// context. Cleared on execute, `/plan stop`, or `/new`.
+    pub(super) pending_plan: Option<String>,
+    /// History index of the plan reply, framed as the plan card; shifted on
+    /// history removal (like `turn_durations`), cleared on execute/discard/`/new`.
+    pub(super) plan_card_idx: Option<usize>,
     /// In-process agent for API-key chats (the agent path); `None` until the
     /// first agent turn, rebuilt on key/model switch, cleared on `/new`.
     pub(super) agent_engine: Option<AgentSession>,

@@ -371,6 +371,9 @@ pub struct AgentEngine {
     /// Cached at construction (the engine is rebuilt on model switch) so the
     /// disable path doesn't send an effort field to a model that would 400 on it.
     reasoning_capable: bool,
+    /// Plan mode: mutating tools (writes, edits, `run_bash`, subagent) are refused
+    /// so a `/plan` investigation can't modify the workspace. See `restrict_read_only`.
+    read_only: bool,
 }
 
 /// The reasoning-effort level to default to: `AIVO_AGENT_REASONING_EFFORT` if
@@ -451,7 +454,19 @@ impl AgentEngine {
             reasoning_efforts: Vec::new(),
             thinking_enabled: true,
             reasoning_capable: default_reasoning_effort(model).is_some(),
+            read_only: false,
         }
+    }
+
+    /// Make this engine read-only for `/plan`: hide the mutating tools (and
+    /// `subagent`, which could spawn an editing sub-engine) from the model. The
+    /// execution guard refuses them too, in case one is hallucinated. One-way.
+    pub fn restrict_read_only(&mut self) {
+        self.read_only = true;
+        self.tools_openai.retain(|t| {
+            let name = t["function"]["name"].as_str().unwrap_or("");
+            !tools::is_mutating(name) && name != "subagent"
+        });
     }
 
     /// Set the `reasoning_effort` level (the `/effort` command). Only meaningful
@@ -601,8 +616,7 @@ impl AgentEngine {
             sys["content"] = json!(format!("{cur}\n\n## Your role: {}\n{}", sa.name, sa.body));
         }
         if let Some(allowed) = sa.resolved_tools() {
-            // On a gpt-5/codex engine the string editors are swapped for
-            // `apply_patch`, so an authored `Edit`/`MultiEdit` scope grants it.
+            // An authored `Edit`/`MultiEdit` scope grants `apply_patch` (its stand-in).
             let editor_allowed = allowed.contains(&"edit_file") || allowed.contains(&"multi_edit");
             self.tools_openai.retain(|t| {
                 let name = t["function"]["name"].as_str().unwrap_or("");
@@ -1122,6 +1136,15 @@ impl AgentEngine {
                 continue;
             }
             ui.tool_start(&call.name, &call.arguments);
+            // Plan mode backstop (the tool is also hidden); the error steers the model.
+            if self.read_only && tools::is_mutating(&call.name) {
+                outcomes[i] = Some(Err(
+                    "Plan mode is read-only — do not modify files or run commands. \
+Investigate with read-only tools and write the implementation plan instead."
+                        .to_string(),
+                ));
+                continue;
+            }
             // Confirm only genuinely risky actions: a destructive command, an
             // out-of-cwd write, a blind overwrite of an existing file the model
             // never read, or an external (MCP) tool whose server the user
@@ -1190,6 +1213,12 @@ impl AgentEngine {
                     .and_then(|v| v.as_str())
                     .unwrap_or("");
                 skills::load_skill_result(&self.skills, name)
+            } else if call.name == "subagent" && self.read_only {
+                // A sub-engine isn't read-only; refuse delegation in plan mode.
+                Err(
+                    "Plan mode is read-only — cannot delegate to a subagent while planning."
+                        .to_string(),
+                )
             } else if call.name == "subagent" {
                 // Fresh sub-engine on the same serve/cwd; fold its total into the
                 // footer + turn usage below. Pass the UI + output base so it
@@ -2540,6 +2569,34 @@ mod tests {
             .filter_map(|t| t["function"]["name"].as_str())
             .collect();
         assert!(!tool_names.contains(&"skill"));
+    }
+
+    #[test]
+    fn restrict_read_only_hides_mutating_tools() {
+        let mut engine = AgentEngine::new("/tmp", "m", "", &[], &[], 0, 0);
+        engine.restrict_read_only();
+        assert!(engine.read_only);
+        let names: Vec<&str> = engine
+            .tools_openai
+            .iter()
+            .filter_map(|t| t["function"]["name"].as_str())
+            .collect();
+        // Mutating built-ins + subagent are stripped; read-only ones + plan/notes remain.
+        for gone in [
+            "write_file",
+            "edit_file",
+            "multi_edit",
+            "run_bash",
+            "subagent",
+        ] {
+            assert!(
+                !names.contains(&gone),
+                "{gone} should be hidden in plan mode"
+            );
+        }
+        for kept in ["read_file", "grep", "glob", "list_dir", "update_plan"] {
+            assert!(names.contains(&kept), "{kept} should remain in plan mode");
+        }
     }
 
     #[test]
@@ -4549,8 +4606,7 @@ mod tests {
         assert!(!after.contains(&"run_bash".to_string()));
     }
 
-    /// On a gpt-5/codex engine (string editors swapped for `apply_patch`), an
-    /// authored `Edit` scope still grants the edit tool the model actually has.
+    /// On a gpt-5 engine, an authored `Edit` scope grants `apply_patch`.
     #[test]
     fn apply_profile_edit_scope_grants_apply_patch_on_gpt5() {
         let mut e = AgentEngine::new("/tmp", "gpt-5", "", &[], &[], 0, 0);

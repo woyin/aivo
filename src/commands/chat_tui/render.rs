@@ -1605,10 +1605,8 @@ fn render_edit_diff(lines: &mut Vec<StyledLine>, name: &str, args: &serde_json::
     }
 }
 
-/// Render an `apply_patch` (V4A) tool call as a per-file diff: a faint filename
-/// header (carrying any rename arrow / `(new)`/`(deleted)` tag) over the same
-/// grouped line-level diff used for `edit_file`, so a multi-file patch reviews
-/// like an ordinary edit.
+/// Render an `apply_patch` call as a per-file diff: a filename header over the
+/// same grouped line-level diff used for `edit_file`.
 fn render_patch_diff(lines: &mut Vec<StyledLine>, args: &serde_json::Value) {
     const MAX_LINES: usize = 22;
     const CONTEXT: usize = 3;
@@ -1677,6 +1675,30 @@ fn render_patch_diff(lines: &mut Vec<StyledLine>, args: &serde_json::Value) {
             Style::default().fg(FAINT),
         )]));
     }
+}
+
+/// The captured `/plan` plan as a framed card: header + body + `/plan go` footer
+/// under the tool-hued bar, so it stands apart from an ordinary reply.
+pub(super) fn push_plan_card(
+    lines: &mut Vec<StyledLine>,
+    bars: &mut Vec<Option<Color>>,
+    reasoning: Option<ReasoningView<'_>>,
+    content: &str,
+    width: u16,
+) {
+    push_styled_line(
+        lines,
+        "Implementation plan",
+        Style::default().fg(TOOL).add_modifier(Modifier::BOLD),
+    );
+    bars.push(Some(TOOL));
+    push_assistant_blocks(lines, bars, reasoning, content, width, TOOL);
+    push_styled_line(
+        lines,
+        "review above · /plan go to execute · /plan stop to discard",
+        Style::default().fg(FAINT),
+    );
+    bars.push(Some(TOOL));
 }
 
 /// Render an `update_plan` checklist card: a "Plan N/M done" header over one

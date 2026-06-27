@@ -544,6 +544,8 @@ impl ChatTuiApp {
         // so the model sees the new skills. Runs while not sending, so the engine
         // reset stays lossless.
         self.refresh_skill_commands().await;
+        // Before a queued message can flip `sending` and skip the capture.
+        self.maybe_capture_plan();
         self.drain_queued_message().await?;
         // Autonomous `/goal` loop: if active (and a queued message didn't already
         // start the next turn), continue toward the goal or stop on completion/cap.
