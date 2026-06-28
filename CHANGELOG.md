@@ -1,5 +1,30 @@
 # Changelog
 
+## v0.33.0
+
+The chat agent gets a batch of capability and safety upgrades. A hosted
+`web_search` tool now runs through the aivo gateway (toggle it in `/config`), a
+new `/plan` command kicks off deep planning before you build, and gpt-5/codex
+models route their edits through the V4A `apply_patch` editor. Under
+auto-approve, the agent now hard-confirms catastrophic shell commands, verifies
+its own writes, and surfaces context-window drift. Rounding it out: Cursor
+effort tiers, lazier skill loading, and a handful of chat/stats/pi fixes.
+
+- feat(agent): hosted web_search via aivo gateway + /config toggle (4ea693c)
+- feat(chat): add /plan deep-planning command (5488c8d)
+- feat(agent): route gpt-5/codex models to V4A apply_patch editor (22980d4)
+- feat(agent): verify-after-write sessions + surface context-window drift (782f6b5)
+- feat(agent): hard-confirm catastrophic shell commands under auto-approve (babcd2e)
+- feat(chat): show Cursor effort tier + resolve its context window (2d310bf)
+- perf(agent): load skill bodies lazily, not at discovery (7f953b7)
+- fix(pi): inject real context window by caching catalog metadata (1b3c158)
+- fix(agent): notify on empty-response convergence instead of silent "Done" (ed81178)
+- fix(stats): count Gemini sessions from new .jsonl chat logs (3c07bb0)
+- fix(chat): run /skills add install off the event loop so the TUI doesn't freeze (514aaec)
+- fix(chat): send gpt-5 no-thinking as reasoning_effort=minimal, not none (c5d6b17)
+- fix(account): show tokens only for models (abbf3ba)
+- chore: remove dead code and unused hmac dependency (30af2a6)
+
 ## v0.32.2
 
 New `aivo account` command surfaces your linked-device info and usage with a
