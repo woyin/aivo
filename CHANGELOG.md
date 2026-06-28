@@ -1,5 +1,16 @@
 # Changelog
 
+## v0.33.1
+
+A trio of fixes for the chat agent and Pi. No-thinking turns now read their
+`reasoning_effort` from the model catalog instead of a hardcoded default, the
+sandbox re-run notice clears on the next agent output, and Pi re-fetches
+`/v1/models` when the starter catalog was cached without a context window.
+
+- fix(chat): pick no-thinking reasoning_effort from the model catalog (31a9d93)
+- fix(chat): clear sandbox re-run notice on next agent output (68f82b1)
+- fix(pi): re-fetch /v1/models when starter catalog cached without window (bec5876)
+
 ## v0.33.0
 
 The chat agent gets a batch of capability and safety upgrades. A hosted
