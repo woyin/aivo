@@ -125,6 +125,13 @@ const TOOL_RESULT_CLEAR_MIN: usize = 1_000;
 /// is intact — only the now-stale bytes go.
 const TOOL_RESULT_CLEARED: &str = "[earlier tool output cleared to save context]";
 
+/// One-line diagnostic to stderr, gated by `AIVO_DEBUG=1` (off keeps it out of the TUI).
+fn agent_debug(msg: &str) {
+    if matches!(std::env::var("AIVO_DEBUG").as_deref(), Ok("1")) {
+        eprintln!("aivo[agent]: {msg}");
+    }
+}
+
 const SUMMARY_SYSTEM_PROMPT: &str = "You are compressing a coding-agent conversation to free up \
 context. Write a concise but complete summary under these exact headings:\n\
 ## Goal\n## Constraints & Preferences\n## Progress (Done / In Progress / Blocked)\n\
@@ -594,7 +601,17 @@ impl AgentEngine {
     /// overrides a known one (incl. the test env override).
     pub fn set_context_window(&mut self, window: u32) {
         if self.context_window == 0 && window > 0 {
+            agent_debug(&format!(
+                "context window resolved at model lookup: {window} (was unknown)"
+            ));
             self.context_window = window;
+        } else if window > 0 && window != self.context_window {
+            // Keep the known window, but surface drift so a wrong one can't
+            // silently mis-size compaction.
+            agent_debug(&format!(
+                "context window drift: budgeting {} (assumed) but model lookup reports {window} (served)",
+                self.context_window
+            ));
         }
     }
 
@@ -3855,6 +3872,66 @@ mod tests {
             engine.compaction_window(),
             500_000,
             "a known window takes precedence over the default"
+        );
+    }
+
+    /// Forcing a tiny window + zero keep-recent makes an over-budget transcript
+    /// compact at the boundary; with only stale OLD tool output overflowing,
+    /// `maybe_compact` takes the no-model cheap path (clears them, returns 0).
+    #[tokio::test]
+    async fn forced_tiny_window_compacts_at_boundary_without_a_model_call() {
+        // SAFETY: scoped mutation of an env var no other test reads.
+        unsafe { std::env::set_var("AIVO_AGENT_KEEP_RECENT", "0") };
+
+        let mut engine = AgentEngine::new("/tmp", "m", "", &[], &[], 0, 0);
+        engine.context_window = 20_000; // budget = 20_000 − COMPACT_RESERVE = 4_000
+        let huge = "x".repeat(200_000);
+        engine.messages = vec![
+            json!({"role": "system", "content": "sys"}),
+            json!({"role": "user", "content": "q1"}),
+            json!({"role": "assistant", "content": "", "tool_calls": [
+                {"id": "a", "type": "function", "function": {"name": "read_file", "arguments": "{}"}}]}),
+            json!({"role": "tool", "tool_call_id": "a", "content": huge.clone()}),
+            json!({"role": "user", "content": "q2"}),
+            json!({"role": "assistant", "content": "", "tool_calls": [
+                {"id": "b", "type": "function", "function": {"name": "read_file", "arguments": "{}"}}]}),
+            json!({"role": "tool", "tool_call_id": "b", "content": huge}),
+            json!({"role": "user", "content": "now"}),
+        ];
+        let budget = engine.compaction_window() - COMPACT_RESERVE;
+        assert!(
+            estimate_tokens(&engine.messages) > budget,
+            "transcript must start over budget so the boundary is actually crossed"
+        );
+
+        let client = reqwest::Client::new();
+        let cwd = std::path::Path::new(".");
+        let ctx = turn_ctx(&client, "", cwd);
+        let mut ui = CapturingUi::default();
+        let tokens = engine.maybe_compact(&ctx, &mut ui).await;
+
+        unsafe { std::env::remove_var("AIVO_AGENT_KEEP_RECENT") };
+
+        assert_eq!(tokens, 0, "cheap path must not call the model");
+        assert!(
+            estimate_tokens(&engine.messages) <= budget,
+            "compaction must bring the transcript under budget"
+        );
+        let cleared = engine
+            .messages
+            .iter()
+            .filter(|m| role(m) == "tool")
+            .filter(|m| m.get("content").and_then(|c| c.as_str()) == Some(TOOL_RESULT_CLEARED))
+            .count();
+        assert_eq!(
+            cleared, 2,
+            "stale OLD tool output cleared without a model call"
+        );
+        assert!(
+            ui.notices
+                .iter()
+                .any(|n| n.contains("cleared older tool output")),
+            "the user is told the cheap path ran"
         );
     }
 

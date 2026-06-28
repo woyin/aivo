@@ -126,11 +126,23 @@ impl ChatSessionStore {
             .with_context(|| format!("Failed to create sessions directory: {:?}", sessions_dir))?;
 
         let data = serde_json::to_string_pretty(state).context("Failed to serialize session")?;
-        atomic_write_secure(
-            &self.session_file_path(&state.session_id),
-            data.into_bytes(),
-        )
-        .await
+        let path = self.session_file_path(&state.session_id);
+        atomic_write_secure(&path, data.into_bytes()).await?;
+
+        // Verify-after-write: a mismatch after an atomic write means on-disk
+        // corruption — fail here, not at an opaque parse error on next resume.
+        let written = tokio::fs::read_to_string(&path)
+            .await
+            .with_context(|| format!("verify-after-write: re-read failed for {:?}", path))?;
+        let parsed: ChatSessionState = serde_json::from_str(&written)
+            .context("verify-after-write: written session did not round-trip (parse)")?;
+        if parsed.session_id != state.session_id || parsed.messages != state.messages {
+            anyhow::bail!(
+                "verify-after-write: session {} did not round-trip — on-disk corruption",
+                state.session_id
+            );
+        }
+        Ok(())
     }
 
     // ── Migration ─────────────────────────────────────────────────────────
