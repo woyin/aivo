@@ -2143,6 +2143,68 @@ async fn test_done_marker_skipped_on_errored_turn() {
     );
 }
 
+#[tokio::test]
+async fn test_sandbox_escalation_notice_clears_on_next_output() {
+    use crate::agent::engine::SANDBOX_ESCALATION_NOTICE;
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.tx
+        .send(RuntimeEvent::AgentNotice(
+            SANDBOX_ESCALATION_NOTICE.to_string(),
+        ))
+        .unwrap();
+    app.handle_runtime_events().await.unwrap();
+    assert_eq!(
+        app.notice,
+        Some((MUTED, SANDBOX_ESCALATION_NOTICE.to_string()))
+    );
+    app.tx
+        .send(RuntimeEvent::AgentToolCall {
+            id: None,
+            name: "read_file".to_string(),
+            args: serde_json::json!({"path": "x"}),
+        })
+        .unwrap();
+    app.handle_runtime_events().await.unwrap();
+    assert_eq!(app.notice, None, "next tool clears the ack");
+
+    // Streamed prose clears it too.
+    app.tx
+        .send(RuntimeEvent::AgentNotice(
+            SANDBOX_ESCALATION_NOTICE.to_string(),
+        ))
+        .unwrap();
+    app.handle_runtime_events().await.unwrap();
+    app.tx
+        .send(RuntimeEvent::Delta(ChatResponseChunk::Content(
+            "done".to_string(),
+        )))
+        .unwrap();
+    app.handle_runtime_events().await.unwrap();
+    assert_eq!(app.notice, None, "new prose clears the ack");
+
+    // An unrelated notice in the same slot is left alone.
+    app.tx
+        .send(RuntimeEvent::AgentNotice(
+            "Queued — sends later".to_string(),
+        ))
+        .unwrap();
+    app.handle_runtime_events().await.unwrap();
+    app.tx
+        .send(RuntimeEvent::AgentToolCall {
+            id: None,
+            name: "read_file".to_string(),
+            args: serde_json::json!({"path": "y"}),
+        })
+        .unwrap();
+    app.handle_runtime_events().await.unwrap();
+    assert_eq!(
+        app.notice,
+        Some((MUTED, "Queued — sends later".to_string())),
+        "unrelated notice survives"
+    );
+}
+
 #[test]
 fn test_connection_retry_status_reads_working() {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();

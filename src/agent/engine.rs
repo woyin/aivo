@@ -125,6 +125,10 @@ const TOOL_RESULT_CLEAR_MIN: usize = 1_000;
 /// is intact — only the now-stale bytes go.
 const TOOL_RESULT_CLEARED: &str = "[earlier tool output cleared to save context]";
 
+/// Ack when a sandbox-blocked `run_bash` is approved to re-run unconfined; the
+/// chat TUI clears it on the next agent output so it isn't pinned all turn.
+pub const SANDBOX_ESCALATION_NOTICE: &str = "re-running outside the workspace sandbox (approved)";
+
 /// One-line diagnostic to stderr, gated by `AIVO_DEBUG=1` (off keeps it out of the TUI).
 fn agent_debug(msg: &str) {
     if matches!(std::env::var("AIVO_DEBUG").as_deref(), Ok("1")) {
@@ -1395,7 +1399,7 @@ Re-run the full command without write confinement?",
             // declined (rather than a silent success).
             return outcome.result;
         }
-        ui.notify("re-running outside the workspace sandbox (approved)");
+        ui.notify(SANDBOX_ESCALATION_NOTICE);
         tools::run_bash_unconfined(args, ctx.cwd).await
     }
 

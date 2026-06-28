@@ -308,12 +308,25 @@ impl ChatTuiApp {
         }
     }
 
+    /// Drop the sandbox-escalation ack on the agent's next output. Scoped to that
+    /// exact notice so an unrelated one sharing the slot survives.
+    fn clear_sandbox_escalation_notice(&mut self) {
+        if self
+            .notice
+            .as_ref()
+            .is_some_and(|(_, text)| text == crate::agent::engine::SANDBOX_ESCALATION_NOTICE)
+        {
+            self.notice = None;
+        }
+    }
+
     pub(super) fn apply_agent_tool_call(
         &mut self,
         id: Option<String>,
         name: String,
         args: serde_json::Value,
     ) {
+        self.clear_sandbox_escalation_notice();
         self.flush_pending_assistant();
         // Stamp the status-line action label for the in-flight step.
         let cwd = if self.real_cwd.is_empty() {
@@ -610,6 +623,7 @@ impl ChatTuiApp {
                 if self.reasoning_started_at.is_some() && self.reasoning_elapsed_ms.is_none() {
                     self.reasoning_elapsed_ms = self.segment_reasoning_ms();
                 }
+                self.clear_sandbox_escalation_notice();
                 self.incoming_buffer.push_str(&text);
             }
             // Live provider-measured usage — the footer's context-fill reads this
