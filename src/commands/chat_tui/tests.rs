@@ -170,6 +170,7 @@ async fn test_streamed_steps_keep_scroll_when_user_scrolled_up() {
         Some("1".to_string()),
         "read_file".to_string(),
         serde_json::json!({"path": "x"}),
+        vec![],
     );
     assert!(
         !app.follow_output,
@@ -1897,6 +1898,7 @@ fn test_current_action_label_reflects_phase() {
         None,
         "run_bash".to_string(),
         serde_json::json!({"command": "ls"}),
+        vec![],
     );
     assert_eq!(app.current_action_label().as_deref(), Some("running ls"));
     // Streamed tokens arriving → the step is over, heartbeat only.
@@ -1951,6 +1953,7 @@ fn test_current_action_shows_inline_on_status_line() {
         None,
         "grep".to_string(),
         serde_json::json!({"pattern": "parse_expr"}),
+        vec![],
     );
     // The action replaces "Thinking" on the SAME single status line (no extra
     // line), so the layout never shifts as steps come and go.
@@ -2051,6 +2054,7 @@ fn test_in_flight_tool_card_hidden_until_result() {
         None,
         "run_bash".to_string(),
         serde_json::json!({"command": "lsof -ti:3000"}),
+        vec![],
     );
     // In flight: only the status names it — the `→ run_bash(…)` card is held back
     // so the same action isn't shown twice (the dup the user reported).
@@ -2163,6 +2167,7 @@ async fn test_sandbox_escalation_notice_clears_on_next_output() {
             id: None,
             name: "read_file".to_string(),
             args: serde_json::json!({"path": "x"}),
+            line_starts: vec![],
         })
         .unwrap();
     app.handle_runtime_events().await.unwrap();
@@ -2195,6 +2200,7 @@ async fn test_sandbox_escalation_notice_clears_on_next_output() {
             id: None,
             name: "read_file".to_string(),
             args: serde_json::json!({"path": "y"}),
+            line_starts: vec![],
         })
         .unwrap();
     app.handle_runtime_events().await.unwrap();
@@ -2254,6 +2260,7 @@ fn test_status_label_throttled_to_min_duration() {
         None,
         "grep".to_string(),
         serde_json::json!({"pattern": "foo"}),
+        vec![],
     );
     app.tick_status_throttle();
     assert_eq!(
@@ -3353,6 +3360,80 @@ fn test_edit_diff_rows_carry_add_remove_tints() {
 }
 
 #[test]
+fn test_edit_diff_word_highlight_brightens_only_changed_tokens() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.history.push(ChatMessage {
+        role: "tool_call".to_string(),
+        content: r#"{"name":"edit_file","args":{"path":"a.rs","old_string":"let x = 1;","new_string":"let x = 2;"}}"#.to_string(),
+        reasoning_content: None,
+        attachments: vec![],
+    });
+    let lines = app.build_transcript().lines;
+    // Background of the span carrying exactly `text`, on the line containing `needle`.
+    let span_bg = |needle: &str, text: &str| -> Option<Color> {
+        lines
+            .iter()
+            .find(|l| l.plain.contains(needle))
+            .and_then(|l| l.line.spans.iter().find(|s| s.content.as_ref() == text))
+            .and_then(|s| s.style.bg)
+    };
+    // Only the differing token jumps to the brighter emphasis tint; the shared
+    // run of the line keeps the base tint (the intra-line word diff).
+    assert_eq!(
+        span_bg("- let x = 1;", "1"),
+        Some(DIFF_DEL_HL_BG),
+        "changed token emphasised on the removed line"
+    );
+    assert_eq!(
+        span_bg("- let x = 1;", "let x = "),
+        Some(DIFF_DEL_BG),
+        "common run stays at the base tint"
+    );
+    assert_eq!(
+        span_bg("+ let x = 2;", "2"),
+        Some(DIFF_ADD_HL_BG),
+        "changed token emphasised on the added line"
+    );
+    assert_eq!(
+        span_bg("+ let x = 2;", "let x = "),
+        Some(DIFF_ADD_BG),
+        "common run stays at the base tint"
+    );
+}
+
+#[test]
+fn test_edit_diff_numbers_rows_from_line_starts() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    // `old_string` begins at file line 10 (a=10, b=11, c=12); only the middle
+    // line changes. `line_starts` is the pre-edit probe the runtime stamps.
+    app.history.push(ChatMessage {
+        role: "tool_call".to_string(),
+        content: r#"{"name":"edit_file","args":{"path":"a.rs","old_string":"a\nb\nc","new_string":"a\nB\nc"},"line_starts":[10]}"#.to_string(),
+        reasoning_content: None,
+        attachments: vec![],
+    });
+    let plain = app.build_transcript().plain_lines.join("\n");
+    assert!(
+        plain.contains("11 - b"),
+        "removed line numbered by its old-file offset:\n{plain}"
+    );
+    assert!(
+        plain.contains("11 + B"),
+        "added line numbered by its new-file offset:\n{plain}"
+    );
+    assert!(
+        plain.lines().any(|l| l.contains("10") && l.contains('a')),
+        "leading context carries its file number:\n{plain}"
+    );
+    assert!(
+        plain.lines().any(|l| l.contains("12") && l.contains('c')),
+        "trailing context carries its file number:\n{plain}"
+    );
+}
+
+#[test]
 fn test_edit_diff_shows_context_only_marks_changed_lines() {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let mut app = make_test_app(tx, rx);
@@ -3626,6 +3707,7 @@ fn test_agent_events_build_display_history() {
         None,
         "read_file".to_string(),
         serde_json::json!({"path": "a.rs"}),
+        vec![],
     );
     assert!(app.pending_response.is_empty());
     assert_eq!(app.history.len(), 2);
@@ -3644,6 +3726,7 @@ fn test_agent_events_build_display_history() {
         None,
         "edit_file".to_string(),
         serde_json::json!({"path": "a.rs"}),
+        vec![],
     );
     assert_eq!(app.history.len(), 4);
     assert_eq!(app.history[3].role, "tool_call");
@@ -3660,6 +3743,7 @@ fn test_native_tool_paths_render_relative_to_cwd() {
         None,
         "read_file".to_string(),
         serde_json::json!({"path": "/Users/alice/proj/src/ui/views/panel.rs"}),
+        vec![],
     );
     app.apply_agent_tool_result("128 lines".to_string());
     let plain = app.build_transcript().plain_lines.join("\n");
@@ -3677,7 +3761,7 @@ fn test_native_tool_paths_render_relative_to_cwd() {
         None,
         "read_file".to_string(),
         serde_json::json!({"path": "/Users/alice/proj/src/module/feature/component/section/detail/view/inner/widget.rs"}),
-    );
+    vec![]);
     let plain = app.build_transcript().plain_lines.join("\n");
     assert!(plain.contains("…/"), "expected left-truncation: {plain}");
     assert!(plain.contains("widget.rs"), "basename lost: {plain}");
@@ -3696,7 +3780,12 @@ fn test_tool_result_count_units_by_tool() {
         ("read_file", "line one\nline two", "2 lines"),
     ];
     for (tool, output, expected) in cases {
-        app.apply_agent_tool_call(None, tool.to_string(), serde_json::json!({"path": "x"}));
+        app.apply_agent_tool_call(
+            None,
+            tool.to_string(),
+            serde_json::json!({"path": "x"}),
+            vec![],
+        );
         app.apply_agent_tool_result(output.to_string());
         let plain = app.build_transcript().plain_lines.join("\n");
         assert!(
@@ -3718,6 +3807,7 @@ fn test_batched_tool_results_resolve_unit_and_target_by_position() {
             None,
             "grep".to_string(),
             serde_json::json!({"pattern": pat}),
+            vec![],
         );
     }
     app.apply_agent_tool_result("1: x\n2: y".to_string()); // 2 matches
@@ -3748,7 +3838,12 @@ fn test_adjacent_search_tools_merge_into_one_group() {
         ("grep", "gemini"),
         ("grep", "canary"),
     ] {
-        app.apply_agent_tool_call(None, tool.to_string(), serde_json::json!({"pattern": pat}));
+        app.apply_agent_tool_call(
+            None,
+            tool.to_string(),
+            serde_json::json!({"pattern": pat}),
+            vec![],
+        );
     }
     app.apply_agent_tool_result("a.rs\nb.rs\nc.rs".to_string()); // glob -> 3 files
     app.apply_agent_tool_result("x.rs".to_string());
@@ -3774,6 +3869,7 @@ fn test_run_bash_label_strips_redundant_cd_prefix() {
         None,
         "run_bash".to_string(),
         serde_json::json!({"command": "cd /Users/alice/project/work/aivo && git show f391ffd"}),
+        vec![],
     );
     let plain = app.build_transcript().plain_lines.join("\n");
     assert!(plain.contains("run_bash(git show f391ffd)"), "{plain}");
@@ -3794,11 +3890,13 @@ fn test_detached_results_in_batch_carry_their_target() {
         None,
         "read_file".to_string(),
         serde_json::json!({"path": "src/gemini_router.rs"}),
+        vec![],
     );
     app.apply_agent_tool_call(
         None,
         "grep".to_string(),
         serde_json::json!({"pattern": "400|sanitize"}),
+        vec![],
     );
     app.apply_agent_tool_result("a\nb\nc".to_string()); // read -> 3 lines
     app.apply_agent_tool_result("1:x\n2:y".to_string()); // grep -> 2 matches
@@ -3850,6 +3948,7 @@ fn test_run_bash_label_drops_redirection_noise() {
         None,
         "run_bash".to_string(),
         serde_json::json!({"command": "which aivo 2>/dev/null && aivo --help 2>&1"}),
+        vec![],
     );
     let plain = app.build_transcript().plain_lines.join("\n");
     assert!(plain.contains("which aivo && aivo --help"), "{plain}");
@@ -3886,11 +3985,13 @@ fn test_subagents_render_individually_not_coalesced() {
         None,
         "subagent".to_string(),
         serde_json::json!({"task": "Review the chat API endpoint for gaps"}),
+        vec![],
     );
     app.apply_agent_tool_call(
         None,
         "subagent".to_string(),
         serde_json::json!({"agent": "reviewer", "task": "Audit the auth flow"}),
+        vec![],
     );
     app.apply_agent_tool_result("## Findings\nfirst\nsecond".to_string());
 
@@ -3934,6 +4035,7 @@ fn test_delegating_spinner_label_drops_subagent_word() {
         None,
         "subagent".to_string(),
         serde_json::json!({"task": "Audit the auth flow"}),
+        vec![],
     );
     let activity = app.current_action_label().unwrap_or_default();
     assert_eq!(
@@ -3957,6 +4059,7 @@ fn test_cursor_tool_update_enriches_call_in_place() {
         Some("c1".to_string()),
         "read_file".to_string(),
         serde_json::json!({"path": "Read File"}),
+        vec![],
     );
     let rev_before = app.transcript_revision;
     let plain = app.build_transcript().plain_lines.join("\n");
@@ -4009,6 +4112,7 @@ async fn test_cursor_turn_ending_on_tool_does_not_duplicate_prose() {
         None,
         "edit_file".to_string(),
         serde_json::json!({"path": "a.rs"}),
+        vec![],
     );
     app.apply_agent_tool_result("done".to_string());
     assert!(app.pending_response.is_empty());

@@ -824,6 +824,7 @@ pub(super) fn render_tool_call(
     result: Option<&str>,
     failed: bool,
     cwd: &str,
+    line_starts: &[Option<usize>],
 ) {
     let summary = tool_arg_summary(name, args, cwd);
     let verb_style = if crate::agent::tools::is_mutating(name) {
@@ -856,7 +857,7 @@ pub(super) fn render_tool_call(
     // For edit tools, show a compact diff of what changed so the user can review
     // the agent's edit without opening the file (no-op for tools without a
     // textual old/new, e.g. cursor edits or write_file).
-    render_edit_diff(lines, name, args);
+    render_edit_diff(lines, name, args, line_starts);
     // Cursor stores its result on the call entry (the in-process agent emits a
     // separate `tool_result` line instead) — surface it as a compact `⎿` line,
     // in the error hue when the tool failed.
@@ -886,6 +887,16 @@ pub(super) fn decode_tool_outcome(content: &str) -> (Option<String>, bool) {
     let result = v.get("result").and_then(|x| x.as_str()).map(str::to_string);
     let failed = v.get("failed").and_then(|x| x.as_bool()).unwrap_or(false);
     (result, failed)
+}
+
+/// The per-pair edit start lines a `tool_call` entry carries; empty for non-edit
+/// tools and older entries, which then render without a number gutter.
+pub(super) fn decode_line_starts(content: &str) -> Vec<Option<usize>> {
+    serde_json::from_str::<serde_json::Value>(content)
+        .ok()
+        .and_then(|v| v.get("line_starts").and_then(|x| x.as_array()).cloned())
+        .map(|arr| arr.iter().map(|x| x.as_u64().map(|n| n as usize)).collect())
+        .unwrap_or_default()
 }
 
 /// Decode a `tool_call` history entry's JSON `{name, args}` payload.
@@ -1400,21 +1411,22 @@ enum DiffTag {
     Ins,
 }
 
-/// One display row of a grouped diff: an unchanged context line, a removed or
-/// added line, or a `⋯` marker standing in for a collapsed run of context.
-enum DiffRow<'a> {
-    Context(&'a str),
-    Del(&'a str),
-    Ins(&'a str),
+/// A word-diff segment: `(changed, text)`, `changed` picking the emphasis tint.
+type Seg = (bool, String);
+
+/// A grouped-diff row. `num` is the gutter line number (old-file for `Del`,
+/// new-file for `Context`/`Ins`), `None` when the offset is unknown. Changed
+/// lines carry per-token segments so the word diff brightens only what moved.
+enum DiffRow {
+    Context { num: Option<usize>, text: String },
+    Del { num: Option<usize>, segs: Vec<Seg> },
+    Ins { num: Option<usize>, segs: Vec<Seg> },
     Gap,
 }
 
-/// Line-level LCS diff of `old` vs `new`, so an edit preview marks only the lines
-/// that actually changed and shows the rest as context — the way Claude Code
-/// previews an edit, rather than blindly flagging every old line removed and every
-/// new line added. Removals are emitted before additions within each change run
-/// (git order). Falls back to a plain remove-all / add-all list past a size cap so
-/// a giant rewrite can't trigger the O(n·m) table.
+/// Line-level LCS diff of `old` vs `new`, so only changed lines are flagged and
+/// the rest stays context. Falls back to remove-all/add-all past a size cap so a
+/// giant rewrite can't trigger the O(n·m) table.
 fn diff_lines<'a>(old: &'a str, new: &'a str) -> Vec<(DiffTag, &'a str)> {
     let a: Vec<&str> = old.lines().collect();
     let b: Vec<&str> = new.lines().collect();
@@ -1425,7 +1437,82 @@ fn diff_lines<'a>(old: &'a str, new: &'a str) -> Vec<(DiffTag, &'a str)> {
         ops.extend(b.iter().map(|l| (DiffTag::Ins, *l)));
         return ops;
     }
+    lcs_diff(&a, &b)
+}
 
+/// Split a line into word-diff tokens: identifier runs and whitespace runs each
+/// coalesce; every other char stands alone, so punctuation highlights on its own.
+fn tokenize(s: &str) -> Vec<&str> {
+    #[derive(PartialEq)]
+    enum Class {
+        Word,
+        Space,
+        Other,
+    }
+    let class = |c: char| {
+        if c.is_alphanumeric() || c == '_' {
+            Class::Word
+        } else if c.is_whitespace() {
+            Class::Space
+        } else {
+            Class::Other
+        }
+    };
+    let mut tokens = Vec::new();
+    let mut start = 0;
+    let mut chars = s.char_indices().peekable();
+    while let Some((i, c)) = chars.next() {
+        let cl = class(c);
+        // `Other` chars never merge — each is its own token.
+        let split = match chars.peek() {
+            Some(&(_, next)) => cl == Class::Other || class(next) != cl,
+            None => true,
+        };
+        if split {
+            let end = i + c.len_utf8();
+            tokens.push(&s[start..end]);
+            start = end;
+        }
+    }
+    tokens
+}
+
+/// Intra-line word diff of a paired removed/added line into per-side `(changed,
+/// text)` runs — common runs keep the base tint, changed runs the emphasis tint.
+fn word_segments(old: &str, new: &str) -> (Vec<Seg>, Vec<Seg>) {
+    let a = tokenize(old);
+    let b = tokenize(new);
+    // Past a token cap the O(n·m) table isn't worth it — tint the whole line.
+    if a.len() > 400 || b.len() > 400 {
+        return (
+            vec![(false, old.to_string())],
+            vec![(false, new.to_string())],
+        );
+    }
+    let mut del: Vec<Seg> = Vec::new();
+    let mut ins: Vec<Seg> = Vec::new();
+    let push = |v: &mut Vec<Seg>, changed: bool, tok: &str| match v.last_mut() {
+        Some(last) if last.0 == changed => last.1.push_str(tok),
+        _ => v.push((changed, tok.to_string())),
+    };
+    for (tag, tok) in lcs_diff(&a, &b) {
+        match tag {
+            DiffTag::Equal => {
+                push(&mut del, false, tok);
+                push(&mut ins, false, tok);
+            }
+            DiffTag::Del => push(&mut del, true, tok),
+            DiffTag::Ins => push(&mut ins, true, tok),
+        }
+    }
+    (del, ins)
+}
+
+/// Suffix-LCS diff of two token slices (lines or words), removals before
+/// additions within each change run (git order). Shared by [`diff_lines`] and
+/// [`word_segments`].
+fn lcs_diff<'a>(a: &[&'a str], b: &[&'a str]) -> Vec<(DiffTag, &'a str)> {
+    let (n, m) = (a.len(), b.len());
     // Suffix LCS-length table: lcs[i][j] = LCS length of a[i..], b[j..].
     let mut lcs = vec![vec![0u16; m + 1]; n + 1];
     for i in (0..n).rev() {
@@ -1476,11 +1563,72 @@ fn diff_lines<'a>(old: &'a str, new: &'a str) -> Vec<(DiffTag, &'a str)> {
     ops
 }
 
-/// Trim a diff to the changed lines plus `context` lines of surrounding context
-/// (git's `-U`), collapsing any longer unchanged gap between two kept regions into
-/// a single `⋯`. Leading/trailing context beyond the window is dropped silently.
-/// Returns empty when nothing changed.
-fn group_diff<'a>(ops: &[(DiffTag, &'a str)], context: usize) -> Vec<DiffRow<'a>> {
+/// One before/after text an edit tool touches. Shared by the diff renderer and
+/// the line-number probe so both walk the same pairs.
+pub(super) struct EditDiff {
+    pub(super) path: String,
+    pub(super) old: String,
+    pub(super) new: String,
+}
+
+/// The pairs an edit tool applies, in render order (one per `edit_file`, per
+/// `multi_edit` step, per `apply_patch` hunk) — so `line_starts` aligns by index.
+pub(super) fn edit_diffs(name: &str, args: &serde_json::Value) -> Vec<EditDiff> {
+    let pick = |v: &serde_json::Value, k: &str| {
+        v.get(k).and_then(|x| x.as_str()).unwrap_or("").to_string()
+    };
+    match name {
+        "edit_file" => {
+            let (old, new) = (pick(args, "old_string"), pick(args, "new_string"));
+            if old.is_empty() && new.is_empty() {
+                vec![]
+            } else {
+                vec![EditDiff {
+                    path: pick(args, "path"),
+                    old,
+                    new,
+                }]
+            }
+        }
+        "multi_edit" => {
+            let path = pick(args, "path");
+            args.get("edits")
+                .and_then(|v| v.as_array())
+                .map(|edits| {
+                    edits
+                        .iter()
+                        .map(|e| EditDiff {
+                            path: path.clone(),
+                            old: pick(e, "old_string"),
+                            new: pick(e, "new_string"),
+                        })
+                        .collect()
+                })
+                .unwrap_or_default()
+        }
+        "apply_patch" => args
+            .get("input")
+            .and_then(|v| v.as_str())
+            .map(|input| {
+                crate::agent::apply_patch::diff_blocks(input)
+                    .into_iter()
+                    .map(|b| EditDiff {
+                        path: b.path,
+                        old: b.old,
+                        new: b.new,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default(),
+        _ => vec![],
+    }
+}
+
+/// Diff `old`→`new` into display rows: trim to changed lines ±`context` (git's
+/// `-U`), collapse longer gaps to `⋯`, number kept rows from `start`, and refine
+/// paired del/ins lines into word segments. Empty when nothing changed.
+fn build_hunk(old: &str, new: &str, start: Option<usize>, context: usize) -> Vec<DiffRow> {
+    let ops = diff_lines(old, new);
     if !ops.iter().any(|(t, _)| *t != DiffTag::Equal) {
         return Vec::new();
     }
@@ -1492,110 +1640,222 @@ fn group_diff<'a>(ops: &[(DiffTag, &'a str)], context: usize) -> Vec<DiffRow<'a>
         })
         .collect();
 
+    // One row per op in op order, so `keep` indexes `full` directly. Numbers
+    // advance on the row's own side; segments come from pairing the k-th del with
+    // the k-th ins of a run.
+    let mut full: Vec<DiffRow> = Vec::with_capacity(ops.len());
+    let mut oldn = start;
+    let mut newn = start;
+    let bump = |n: &mut Option<usize>| {
+        if let Some(v) = n {
+            *v += 1;
+        }
+    };
+    let mut i = 0;
+    while i < ops.len() {
+        if ops[i].0 == DiffTag::Equal {
+            full.push(DiffRow::Context {
+                num: newn,
+                text: ops[i].1.to_string(),
+            });
+            bump(&mut oldn);
+            bump(&mut newn);
+            i += 1;
+            continue;
+        }
+        let run_start = i;
+        while i < ops.len() && ops[i].0 != DiffTag::Equal {
+            i += 1;
+        }
+        let dels: Vec<&str> = ops[run_start..i]
+            .iter()
+            .filter(|o| o.0 == DiffTag::Del)
+            .map(|o| o.1)
+            .collect();
+        let inss: Vec<&str> = ops[run_start..i]
+            .iter()
+            .filter(|o| o.0 == DiffTag::Ins)
+            .map(|o| o.1)
+            .collect();
+        let mut del_segs: Vec<Vec<Seg>> = Vec::with_capacity(dels.len());
+        let mut ins_segs: Vec<Vec<Seg>> = Vec::with_capacity(inss.len());
+        for k in 0..dels.len().max(inss.len()) {
+            match (dels.get(k), inss.get(k)) {
+                // Paired removed/added line — refine to word-level segments.
+                (Some(d), Some(n)) => {
+                    let (d_seg, n_seg) = word_segments(d, n);
+                    del_segs.push(d_seg);
+                    ins_segs.push(n_seg);
+                }
+                // Unpaired (pure remove or pure add) — the whole line is the change.
+                (Some(d), None) => del_segs.push(vec![(false, d.to_string())]),
+                (None, Some(n)) => ins_segs.push(vec![(false, n.to_string())]),
+                (None, None) => {}
+            }
+        }
+        for segs in del_segs {
+            full.push(DiffRow::Del { num: oldn, segs });
+            bump(&mut oldn);
+        }
+        for segs in ins_segs {
+            full.push(DiffRow::Ins { num: newn, segs });
+            bump(&mut newn);
+        }
+    }
+
     let mut rows = Vec::new();
     let mut prev_kept: Option<usize> = None;
-    for (i, keep_it) in keep.iter().enumerate() {
-        if !keep_it {
+    for (i, row) in full.into_iter().enumerate() {
+        if !keep[i] {
             continue;
         }
         if prev_kept.is_some_and(|p| i > p + 1) {
             rows.push(DiffRow::Gap);
         }
-        rows.push(match ops[i].0 {
-            DiffTag::Equal => DiffRow::Context(ops[i].1),
-            DiffTag::Del => DiffRow::Del(ops[i].1),
-            DiffTag::Ins => DiffRow::Ins(ops[i].1),
-        });
+        rows.push(row);
         prev_kept = Some(i);
     }
     rows
 }
 
-/// A compact line diff shown under an edit tool call. Removed lines are tinted
-/// red, added lines green — each with a bright `-`/`+` gutter and a full-row
-/// background (filled at wrap time, see `fill_trailing_background`) so a wrapped
-/// line still reads as one contiguous block. Unchanged lines render as dim context
-/// (no gutter, no tint), and only the genuinely changed lines are flagged — a real
-/// line diff (see `diff_lines`), not a blanket remove-all/add-all. Capped so a
-/// large rewrite can't flood the transcript. Renders nothing for tools that carry
-/// no textual diff (cursor edits with empty args, write_file, etc.).
-fn render_edit_diff(lines: &mut Vec<StyledLine>, name: &str, args: &serde_json::Value) {
+/// Decimal width of the largest gutter line number across `rows`, or 0 when none
+/// carries a number — the signal to render without a number column.
+fn diff_num_width<'a>(rows: impl IntoIterator<Item = &'a DiffRow>) -> usize {
+    let num = |row: &DiffRow| match row {
+        DiffRow::Context { num, .. } | DiffRow::Del { num, .. } | DiffRow::Ins { num, .. } => *num,
+        DiffRow::Gap => None,
+    };
+    match rows.into_iter().filter_map(num).max() {
+        Some(n) => n.to_string().len(),
+        None => 0,
+    }
+}
+
+/// Render one diff row. `numw` is the shared number-column width (0 = no column,
+/// for entries that predate line-number capture).
+fn render_diff_row(row: &DiffRow, numw: usize) -> StyledLine {
+    let num_span = |num: Option<usize>| -> Option<Span<'static>> {
+        (numw > 0).then(|| {
+            let text = match num {
+                Some(n) => format!("{n:>numw$}"),
+                None => " ".repeat(numw),
+            };
+            Span::styled(text, Style::default().fg(FAINT))
+        })
+    };
+    match row {
+        DiffRow::Context { num, text } => {
+            let mut spans = Vec::new();
+            spans.extend(num_span(*num));
+            spans.push(Span::styled(
+                format!("   {text}"),
+                Style::default().fg(MUTED),
+            ));
+            line_with_plain(spans)
+        }
+        DiffRow::Del { num, segs } => render_change_row(
+            num_span(*num),
+            '-',
+            segs,
+            DIFF_DEL_BG,
+            DIFF_DEL_HL_BG,
+            DIFF_DEL_FG,
+            DIFF_DEL_SIGN,
+        ),
+        DiffRow::Ins { num, segs } => render_change_row(
+            num_span(*num),
+            '+',
+            segs,
+            DIFF_ADD_BG,
+            DIFF_ADD_HL_BG,
+            DIFF_ADD_FG,
+            DIFF_ADD_SIGN,
+        ),
+        DiffRow::Gap => {
+            let mut spans = Vec::new();
+            spans.extend(num_span(None));
+            spans.push(Span::styled("   ⋯".to_string(), Style::default().fg(FAINT)));
+            line_with_plain(spans)
+        }
+    }
+}
+
+/// A removed/added line: number gutter, bold `+`/`-` sign, then text split into
+/// common runs (`base` tint) and changed runs (`hl` tint). The trailing span keeps
+/// a background so `fill_trailing_background` extends it across a wrapped row.
+fn render_change_row(
+    num: Option<Span<'static>>,
+    sign: char,
+    segs: &[Seg],
+    base: Color,
+    hl: Color,
+    fg: Color,
+    sign_fg: Color,
+) -> StyledLine {
+    let mut spans = Vec::new();
+    spans.extend(num);
+    spans.push(Span::styled(
+        format!(" {sign} "),
+        Style::default()
+            .fg(sign_fg)
+            .bg(base)
+            .add_modifier(Modifier::BOLD),
+    ));
+    if segs.is_empty() {
+        // A blank line changed — keep a (zero-width) tinted span so the row fills.
+        spans.push(Span::styled(
+            String::new(),
+            Style::default().fg(fg).bg(base),
+        ));
+    }
+    for (changed, text) in segs {
+        let bg = if *changed { hl } else { base };
+        spans.push(Span::styled(text.clone(), Style::default().fg(fg).bg(bg)));
+    }
+    line_with_plain(spans)
+}
+
+/// The compact diff card under an edit tool call: removed lines red, added green,
+/// changed tokens brightened, unchanged lines dim context. Capped so a big rewrite
+/// can't flood the transcript; nothing for tools with no textual diff.
+fn render_edit_diff(
+    lines: &mut Vec<StyledLine>,
+    name: &str,
+    args: &serde_json::Value,
+    line_starts: &[Option<usize>],
+) {
     if name == "apply_patch" {
-        render_patch_diff(lines, args);
+        render_patch_diff(lines, args, line_starts);
         return;
     }
     const MAX_DIFF_LINES: usize = 14;
     const CONTEXT: usize = 3;
-    let pick = |v: &serde_json::Value, k: &str| {
-        v.get(k).and_then(|x| x.as_str()).unwrap_or("").to_string()
-    };
-    let pairs: Vec<(String, String)> = match name {
-        "edit_file" => {
-            let (old, new) = (pick(args, "old_string"), pick(args, "new_string"));
-            if old.is_empty() && new.is_empty() {
-                vec![]
-            } else {
-                vec![(old, new)]
-            }
-        }
-        "multi_edit" => args
-            .get("edits")
-            .and_then(|v| v.as_array())
-            .map(|edits| {
-                edits
-                    .iter()
-                    .map(|e| (pick(e, "old_string"), pick(e, "new_string")))
-                    .collect()
-            })
-            .unwrap_or_default(),
-        _ => return,
-    };
+    let diffs = edit_diffs(name, args);
+    if diffs.is_empty() {
+        return;
+    }
 
-    // Diff each edit, separating successive edits in a multi_edit with a `⋯`.
+    // One hunk per edit, separated by a `⋯` in a multi_edit.
     let mut rows: Vec<DiffRow> = Vec::new();
-    for (old, new) in &pairs {
-        let ops = diff_lines(old, new);
-        let grouped = group_diff(&ops, CONTEXT);
-        if grouped.is_empty() {
+    for (i, d) in diffs.iter().enumerate() {
+        let start = line_starts.get(i).copied().flatten();
+        let hunk = build_hunk(&d.old, &d.new, start, CONTEXT);
+        if hunk.is_empty() {
             continue;
         }
         if !rows.is_empty() {
             rows.push(DiffRow::Gap);
         }
-        rows.extend(grouped);
+        rows.extend(hunk);
     }
     if rows.is_empty() {
         return;
     }
 
-    // The tint starts at the text-area edge (no outer indent) so the gutter and
-    // every wrapped continuation row share one left edge — a long changed line
-    // wraps as a single flush block. Context lines align under the gutter.
-    let change_line = |sign: char, text: &str, bg, fg, sign_fg| {
-        line_with_plain(vec![
-            Span::styled(
-                format!(" {sign} "),
-                Style::default()
-                    .fg(sign_fg)
-                    .bg(bg)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(text.to_string(), Style::default().fg(fg).bg(bg)),
-        ])
-    };
+    // No outer indent so a wrapped changed line stays a single flush block.
+    let numw = diff_num_width(&rows);
     for row in rows.iter().take(MAX_DIFF_LINES) {
-        lines.push(match row {
-            DiffRow::Context(text) => line_with_plain(vec![Span::styled(
-                format!("   {text}"),
-                Style::default().fg(MUTED),
-            )]),
-            DiffRow::Del(text) => change_line('-', text, DIFF_DEL_BG, DIFF_DEL_FG, DIFF_DEL_SIGN),
-            DiffRow::Ins(text) => change_line('+', text, DIFF_ADD_BG, DIFF_ADD_FG, DIFF_ADD_SIGN),
-            DiffRow::Gap => line_with_plain(vec![Span::styled(
-                "   ⋯".to_string(),
-                Style::default().fg(FAINT),
-            )]),
-        });
+        lines.push(render_diff_row(row, numw));
     }
     if rows.len() > MAX_DIFF_LINES {
         lines.push(line_with_plain(vec![Span::styled(
@@ -1606,67 +1866,47 @@ fn render_edit_diff(lines: &mut Vec<StyledLine>, name: &str, args: &serde_json::
 }
 
 /// Render an `apply_patch` call as a per-file diff: a filename header over the
-/// same grouped line-level diff used for `edit_file`.
-fn render_patch_diff(lines: &mut Vec<StyledLine>, args: &serde_json::Value) {
+/// same numbered, word-refined diff used for `edit_file`.
+fn render_patch_diff(
+    lines: &mut Vec<StyledLine>,
+    args: &serde_json::Value,
+    line_starts: &[Option<usize>],
+) {
     const MAX_LINES: usize = 22;
     const CONTEXT: usize = 3;
-    let Some(input) = args.get("input").and_then(|v| v.as_str()) else {
-        return;
-    };
-    let blocks = crate::agent::apply_patch::diff_blocks(input);
-    if blocks.is_empty() {
+    let diffs = edit_diffs("apply_patch", args);
+    if diffs.is_empty() {
         return;
     }
 
-    enum Item<'a> {
-        Header(&'a str),
-        Row(DiffRow<'a>),
+    enum Item {
+        Header(String),
+        Row(DiffRow),
     }
     let mut items: Vec<Item> = Vec::new();
     let mut last: Option<&str> = None;
-    for block in &blocks {
-        if last != Some(block.path.as_str()) {
-            items.push(Item::Header(&block.path));
-            last = Some(&block.path);
+    for (i, d) in diffs.iter().enumerate() {
+        if last != Some(d.path.as_str()) {
+            items.push(Item::Header(d.path.clone()));
+            last = Some(&d.path);
         }
-        let ops = diff_lines(&block.old, &block.new);
-        for row in group_diff(&ops, CONTEXT) {
+        let start = line_starts.get(i).copied().flatten();
+        for row in build_hunk(&d.old, &d.new, start, CONTEXT) {
             items.push(Item::Row(row));
         }
     }
 
-    let change_line = |sign: char, text: &str, bg, fg, sign_fg| {
-        line_with_plain(vec![
-            Span::styled(
-                format!(" {sign} "),
-                Style::default()
-                    .fg(sign_fg)
-                    .bg(bg)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(text.to_string(), Style::default().fg(fg).bg(bg)),
-        ])
-    };
+    let numw = diff_num_width(items.iter().filter_map(|it| match it {
+        Item::Row(r) => Some(r),
+        Item::Header(_) => None,
+    }));
     for item in items.iter().take(MAX_LINES) {
         lines.push(match item {
             Item::Header(path) => line_with_plain(vec![Span::styled(
                 format!("  {path}"),
                 Style::default().fg(TOOL),
             )]),
-            Item::Row(DiffRow::Context(text)) => line_with_plain(vec![Span::styled(
-                format!("   {text}"),
-                Style::default().fg(MUTED),
-            )]),
-            Item::Row(DiffRow::Del(text)) => {
-                change_line('-', text, DIFF_DEL_BG, DIFF_DEL_FG, DIFF_DEL_SIGN)
-            }
-            Item::Row(DiffRow::Ins(text)) => {
-                change_line('+', text, DIFF_ADD_BG, DIFF_ADD_FG, DIFF_ADD_SIGN)
-            }
-            Item::Row(DiffRow::Gap) => line_with_plain(vec![Span::styled(
-                "   ⋯".to_string(),
-                Style::default().fg(FAINT),
-            )]),
+            Item::Row(row) => render_diff_row(row, numw),
         });
     }
     if items.len() > MAX_LINES {

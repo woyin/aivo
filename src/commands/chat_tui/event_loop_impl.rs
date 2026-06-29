@@ -47,9 +47,12 @@ impl ChatTuiApp {
             RuntimeEvent::AgentTurnTokens(output) => {
                 self.turn_output_tokens = output;
             }
-            RuntimeEvent::AgentToolCall { id, name, args } => {
-                self.apply_agent_tool_call(id, name, args)
-            }
+            RuntimeEvent::AgentToolCall {
+                id,
+                name,
+                args,
+                line_starts,
+            } => self.apply_agent_tool_call(id, name, args, line_starts),
             RuntimeEvent::AgentToolUpdate {
                 id,
                 args,
@@ -334,6 +337,7 @@ impl ChatTuiApp {
         id: Option<String>,
         name: String,
         args: serde_json::Value,
+        line_starts: Vec<Option<usize>>,
     ) {
         self.clear_sandbox_escalation_notice();
         self.flush_pending_assistant();
@@ -352,6 +356,10 @@ impl ChatTuiApp {
         obj.insert("args".to_string(), args);
         if let Some(id) = id {
             obj.insert("id".to_string(), serde_json::Value::String(id));
+        }
+        // Carry the pre-edit line numbers so the diff card can number rows.
+        if !line_starts.is_empty() {
+            obj.insert("line_starts".to_string(), serde_json::json!(line_starts));
         }
         let content = serde_json::to_string(&serde_json::Value::Object(obj)).unwrap_or(name);
         self.history.push(ChatMessage {

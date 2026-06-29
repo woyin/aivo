@@ -238,7 +238,16 @@ impl ChatTuiApp {
                         advance = run;
                     } else {
                         let (result, failed) = decode_tool_outcome(&message.content);
-                        render_tool_call(&mut block, &name, &args, result.as_deref(), failed, cwd);
+                        let line_starts = decode_line_starts(&message.content);
+                        render_tool_call(
+                            &mut block,
+                            &name,
+                            &args,
+                            result.as_deref(),
+                            failed,
+                            cwd,
+                            &line_starts,
+                        );
                     }
                 }
                 "tool_result" => {

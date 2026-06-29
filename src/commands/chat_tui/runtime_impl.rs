@@ -732,7 +732,10 @@ impl ChatTuiApp {
                 yes: false,
                 auto_approve: Some(&auto_approve),
             };
-            let mut ui = ChatAgentUi { tx };
+            let mut ui = ChatAgentUi {
+                tx,
+                cwd: std::path::PathBuf::from(&cwd),
+            };
             let mut engine = engine.lock().await;
             engine.set_context_window(context_window);
             engine.set_thinking_enabled(thinking_enabled);
@@ -2070,11 +2073,51 @@ fn rewind_notice(outcome: &RewindOutcome) -> String {
     }
 }
 
+/// Start line of each diff pair, found from the pre-edit `old` text — so this
+/// must run before the edit applies. `None` when the file can't be read or `old`
+/// isn't unique (a wrong number is worse than none).
+fn compute_line_starts(
+    cwd: &std::path::Path,
+    name: &str,
+    args: &serde_json::Value,
+) -> Vec<Option<usize>> {
+    let diffs = edit_diffs(name, args);
+    if diffs.is_empty() {
+        return vec![];
+    }
+    let mut cache: std::collections::HashMap<String, Option<String>> =
+        std::collections::HashMap::new();
+    diffs
+        .iter()
+        .map(|d| {
+            // A pure insertion (apply_patch "Add File") begins the file at line 1.
+            if d.old.is_empty() {
+                return (!d.new.is_empty()).then_some(1);
+            }
+            let content = cache
+                .entry(d.path.clone())
+                .or_insert_with(|| {
+                    std::fs::read_to_string(crate::agent::tools::resolve(cwd, &d.path)).ok()
+                })
+                .as_ref()?;
+            let mut hits = content.match_indices(&d.old);
+            let offset = hits.next()?.0;
+            // Ambiguous match → don't risk numbering the wrong site.
+            if hits.next().is_some() {
+                return None;
+            }
+            Some(1 + content[..offset].matches('\n').count())
+        })
+        .collect()
+}
+
 /// Bridges the in-process `AgentEngine` to the chat TUI: engine callbacks become
 /// `RuntimeEvent`s the event loop renders, and a permission request round-trips
 /// through the loop's permission card via a oneshot.
 struct ChatAgentUi {
     tx: UnboundedSender<RuntimeEvent>,
+    /// Workspace root, for resolving an edit's `path` in the pre-edit probe.
+    cwd: std::path::PathBuf,
 }
 
 impl crate::agent::engine::AgentUi for ChatAgentUi {
@@ -2114,11 +2157,15 @@ impl crate::agent::engine::AgentUi for ChatAgentUi {
     }
 
     fn tool_start(&mut self, name: &str, args: &serde_json::Value) {
+        // Runs on the engine thread before the edit applies, so the probe sees
+        // the pre-edit file.
+        let line_starts = compute_line_starts(&self.cwd, name, args);
         self.tx
             .send(RuntimeEvent::AgentToolCall {
                 id: None,
                 name: name.to_string(),
                 args: args.clone(),
+                line_starts,
             })
             .ok();
     }
@@ -2208,9 +2255,13 @@ async fn drive_cursor_turn(
             CursorChunk::Reasoning(t) => {
                 RuntimeEvent::Delta(ChatResponseChunk::Reasoning(t.to_string()))
             }
-            CursorChunk::ToolCall { id, name, args } => {
-                RuntimeEvent::AgentToolCall { id, name, args }
-            }
+            CursorChunk::ToolCall { id, name, args } => RuntimeEvent::AgentToolCall {
+                id,
+                name,
+                args,
+                // Cursor edits carry no file offset to number.
+                line_starts: vec![],
+            },
             CursorChunk::ToolUpdate {
                 id,
                 args,

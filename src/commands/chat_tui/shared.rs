@@ -33,6 +33,9 @@ pub(super) const DIFF_ADD_FG: Color = Color::Rgb(168, 204, 182);
 pub(super) const DIFF_DEL_FG: Color = Color::Rgb(224, 162, 154);
 pub(super) const DIFF_ADD_SIGN: Color = Color::Rgb(120, 190, 150);
 pub(super) const DIFF_DEL_SIGN: Color = Color::Rgb(230, 120, 112);
+// Emphasis tints for the changed tokens in a word-diff line (see `word_segments`).
+pub(super) const DIFF_ADD_HL_BG: Color = Color::Rgb(33, 84, 50);
+pub(super) const DIFF_DEL_HL_BG: Color = Color::Rgb(92, 38, 38);
 pub(super) const EMPTY_STATE_TOP_GAP: u16 = 1;
 // No bottom padding: the composer already reserves its own blank spacing row
 // above the divider, so the welcome screen's "Ready" line keeps the same single
@@ -1304,6 +1307,9 @@ pub(super) enum RuntimeEvent {
         id: Option<String>,
         name: String,
         args: serde_json::Value,
+        /// Pre-edit start line of each diff pair (aligned with `edit_diffs`), so
+        /// the card can number rows; empty for non-edit and cursor calls.
+        line_starts: Vec<Option<usize>>,
     },
     /// Enriches an earlier `AgentToolCall` (matched by `id`) in place: the
     /// resolved target (real path/pattern) and/or a compact result. Cursor only —
