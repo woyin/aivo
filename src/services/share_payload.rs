@@ -1,13 +1,8 @@
 //! Normalized share payload schema and per-source full-transcript extractors.
 //!
-//! `SharePayload` is the lossless, JSON-serializable representation of one
-//! conversation that aivo serves over the share tunnel. Each native source
-//! (claude / codex / gemini / pi / opencode / aivo chat) has its own
-//! `extract_*_full` that maps the source's on-disk shape into this schema.
-//!
-//! Companion to `context_ingest.rs`: that module collapses a session into a
-//! one-line topic + one-line last-response summary for the picker; this one
-//! preserves every message, including tool calls/results.
+//! `SharePayload` is the lossless JSON representation of one conversation served
+//! over the share tunnel; each source has an `extract_*_full` mapping its on-disk
+//! shape into this schema (vs. `context_ingest.rs`, which collapses to a summary).
 
 use anyhow::{Context, Result, anyhow};
 use chrono::{DateTime, Utc};
@@ -22,11 +17,9 @@ use crate::services::session_store::{
 use tokio::fs;
 use tokio::io::{AsyncBufReadExt, BufReader};
 
-/// Wire schema version. Bump on breaking shape changes; the public viewer
-/// keys backward-compat behavior off this.
+/// Wire schema version; bump on breaking shape changes (the viewer keys off it).
 pub const SHARE_SCHEMA_VERSION: &str = "1";
 
-/// Top-level payload: one shared conversation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SharePayload {
     pub schema_version: String,
@@ -114,8 +107,7 @@ pub struct RedactionHit {
 }
 
 impl SharePayload {
-    /// Build a fresh `meta` block with `served_at = now`. Callers may flip
-    /// `live` and fill `redaction_summary` after redaction runs.
+    /// Fresh `meta` with `served_at = now`; callers fill `redaction_summary` later.
     pub fn new_meta(live: bool) -> ShareMeta {
         ShareMeta {
             aivo_version: crate::version::VERSION.to_string(),
@@ -126,8 +118,7 @@ impl SharePayload {
         }
     }
 
-    /// Per-message char count, summed across all text-bearing blocks. Useful
-    /// for size warnings and the preview header.
+    /// Approximate total char count across all message content.
     pub fn approximate_chars(&self) -> usize {
         self.messages
             .iter()
@@ -152,15 +143,13 @@ impl SharePayload {
     }
 }
 
-/// Fold messages whose content is *only* tool_result blocks into the
-/// previous message. Anthropic-style wires (claude) emit each tool
-/// result as a fresh `role: "user"` message; codex emits a separate
-/// `role: "tool"` message. The share viewer always renders those results
-/// inline with the preceding tool_use, so a standalone count of
-/// `messages.len()` overcounts vs. what the viewer (and `aivo logs show`)
-/// actually displays. Collapsing here keeps those counts in sync.
+/// Fold a result-only message (claude emits results as `user`, codex as `tool`)
+/// into the preceding tool_use turn, since the viewer renders them inline.
 fn merge_tool_result_turns(messages: Vec<ShareMessage>) -> Vec<ShareMessage> {
     let mut out: Vec<ShareMessage> = Vec::with_capacity(messages.len());
+    // Chat persists calls/results id-less; mint a shared id per pair as we fold
+    // so the viewer can match them (else the call shows "pending" + orphan result).
+    let mut synthetic_id: u64 = 0;
     for msg in messages {
         let only_tool_results = !msg.content.is_empty()
             && msg
@@ -168,12 +157,35 @@ fn merge_tool_result_turns(messages: Vec<ShareMessage>) -> Vec<ShareMessage> {
                 .iter()
                 .all(|b| matches!(b, ContentBlock::ToolResult { .. }));
         if only_tool_results && let Some(prev) = out.last_mut() {
-            prev.content.extend(msg.content);
+            let mut results = msg.content;
+            for block in &mut results {
+                if let ContentBlock::ToolResult { id: id @ None, .. } = block
+                    && let Some(call_id) =
+                        next_unpaired_call_id(&mut prev.content, &mut synthetic_id)
+                {
+                    *id = Some(call_id);
+                }
+            }
+            prev.content.extend(results);
             continue;
         }
         out.push(msg);
     }
     out
+}
+
+/// Mint a synthetic id for the next id-less `ToolCall` in `content` and return
+/// it, so a freshly-folded `ToolResult` can reference the same id.
+fn next_unpaired_call_id(content: &mut [ContentBlock], counter: &mut u64) -> Option<String> {
+    for block in content.iter_mut() {
+        if let ContentBlock::ToolCall { id: id @ None, .. } = block {
+            *counter += 1;
+            let new_id = format!("chat-tool-{counter}");
+            *id = Some(new_id.clone());
+            return Some(new_id);
+        }
+    }
+    None
 }
 
 /// Flatten a `content` field that may be either a plain string or an array
@@ -201,9 +213,8 @@ fn stringify_block_text(v: &Value) -> String {
 // aivo chat extractor
 // ---------------------------------------------------------------------------
 
-/// Map a `ChatSessionState` (as persisted by `aivo chat`) onto the share
-/// schema. Decryption may fail when the underlying secret is rotated/missing;
-/// the error is surfaced rather than silently producing an empty share.
+/// Map a persisted `aivo chat` session onto the share schema; surfaces the
+/// decryption error rather than producing an empty share.
 pub fn extract_chat_full(
     state: &ChatSessionState,
     project_root: Option<&str>,
@@ -225,8 +236,7 @@ pub fn extract_chat_full(
             map_chat_message(m, timestamp)
         })
         .collect();
-    // Fold agent `tool_result` turns inline with their call, as the claude/codex
-    // extractors do; a plain (tool-free) chat has none, so this is a no-op there.
+    // No-op for a tool-free chat; folds agent tool results inline otherwise.
     let share_messages = merge_tool_result_turns(share_messages);
 
     let project = ProjectInfo {
@@ -258,10 +268,8 @@ pub fn extract_chat_full(
 }
 
 fn map_chat_message(m: StoredChatMessage, timestamp: Option<DateTime<Utc>>) -> ShareMessage {
-    // Agent turns persist `tool_call`/`tool_result` entries (see `aivo chat`'s
-    // engine bridge). Decode them into structured blocks so the viewer renders
-    // tools instead of raw JSON; `merge_tool_result_turns` later folds the
-    // result inline with its call, matching the claude/codex extractors.
+    // Decode persisted tool_call/tool_result entries into structured blocks so
+    // the viewer renders tools, not raw JSON.
     match m.role.as_str() {
         "tool_call" => return map_chat_tool_call(&m.content, timestamp),
         "tool_result" => return map_chat_tool_result(&m.content, timestamp),
@@ -287,8 +295,7 @@ fn map_chat_message(m: StoredChatMessage, timestamp: Option<DateTime<Utc>>) -> S
     }
 }
 
-/// A `tool_call` entry stores `{"name","args"}`; surface it as the assistant's
-/// tool invocation. Falls back to text if the JSON is unexpectedly malformed.
+/// Decode a `{"name","args"}` tool_call entry; falls back to text if malformed.
 fn map_chat_tool_call(raw: &str, timestamp: Option<DateTime<Utc>>) -> ShareMessage {
     let block = serde_json::from_str::<Value>(raw)
         .ok()
@@ -313,9 +320,7 @@ fn map_chat_tool_call(raw: &str, timestamp: Option<DateTime<Utc>>) -> ShareMessa
     }
 }
 
-/// A `tool_result` entry stores the raw tool output; an error is prefixed
-/// `error: ` by the engine bridge. Map it to a `tool` role with a structured
-/// result so the viewer folds it inline with the preceding call.
+/// Decode a `tool_result` entry (errors are `error: `-prefixed by the bridge).
 fn map_chat_tool_result(raw: &str, timestamp: Option<DateTime<Utc>>) -> ShareMessage {
     let block = match raw.strip_prefix("error: ") {
         Some(err) => ContentBlock::ToolResult {
@@ -349,15 +354,11 @@ fn map_attachment(att: MessageAttachment) -> ContentBlock {
     .to_string();
     let (sha256, size_bytes) = match &att.storage {
         AttachmentStorage::Inline { data } => {
-            // `data` is base64; for v1 we hash the raw base64 string rather
-            // than its decoded bytes — the hash is for viewer-side dedup,
-            // not forensics, and decoding would require a base64 dep we
-            // don't otherwise need.
+            // Hash the raw base64 (dedup only, not forensics) to avoid a decode dep.
             (hex_sha256(data.as_bytes()), data.len() as u64)
         }
         AttachmentStorage::FileRef { .. } => {
-            // Don't read the user's filesystem at share time; the path is
-            // surfaced in `name` and the hash is left blank by design.
+            // Don't read the filesystem at share time; hash left blank by design.
             (String::new(), 0)
         }
     };
@@ -382,10 +383,8 @@ fn parse_chat_timestamp(s: &str) -> Option<DateTime<Utc>> {
 // Claude Code extractor
 // ---------------------------------------------------------------------------
 
-/// Extract a full SharePayload from a Claude Code JSONL session file.
-/// Source path is the `.jsonl` file under `~/.claude/projects/<encoded>/`.
-/// Sidechain entries (`isSidechain: true`) are skipped — they're forks of
-/// the main thread, not part of the user's primary conversation.
+/// Extract from a Claude Code JSONL session. Sidechain entries
+/// (`isSidechain: true`) are skipped — forks, not the primary conversation.
 pub async fn extract_claude_full(
     path: &std::path::Path,
     project_root: Option<&str>,
@@ -474,9 +473,8 @@ pub async fn extract_claude_full(
     })
 }
 
-/// Anthropic-style content arrays show up in claude. One block per
-/// JSON entry: `text`, `tool_use`, `tool_result`, `thinking`. Strings are
-/// also accepted (older sessions inline a string `content`).
+/// Parse an Anthropic content array (`text`/`tool_use`/`tool_result`/`thinking`);
+/// a bare string (older sessions) is accepted too.
 fn parse_anthropic_content_array(content: Option<&Value>) -> Vec<ContentBlock> {
     let Some(content) = content else {
         return Vec::new();
@@ -563,10 +561,8 @@ fn parse_anthropic_content_array(content: Option<&Value>) -> Vec<ContentBlock> {
 // Codex extractor
 // ---------------------------------------------------------------------------
 
-/// Extract from a Codex rollout JSONL file. The session_meta payload's `cwd`
-/// is checked against `project_root` (if provided) so a stray rollout doesn't
-/// get attributed to the wrong project. `function_call` / `function_call_output`
-/// entries become tool_call / tool_result blocks.
+/// Extract from a Codex rollout JSONL. Rejects the session if its `cwd` doesn't
+/// match `project_root`, so a stray rollout isn't attributed to the wrong project.
 pub async fn extract_codex_full(
     path: &std::path::Path,
     project_root: Option<&str>,
@@ -751,8 +747,8 @@ fn parse_codex_message_content(payload: &Value) -> Vec<ContentBlock> {
 // Gemini extractor
 // ---------------------------------------------------------------------------
 
-/// Extract a Gemini session JSON file. Gemini's per-message timestamps are
-/// reliable; falls back to top-level `lastUpdated` when missing.
+/// Extract a Gemini session JSON; falls back to `lastUpdated` when per-message
+/// timestamps are missing.
 pub async fn extract_gemini_full(
     path: &std::path::Path,
     project_root: Option<&str>,
@@ -851,9 +847,8 @@ fn stringify_gemini_content(v: Option<&Value>) -> String {
 // Pi extractor
 // ---------------------------------------------------------------------------
 
-/// Extract from a Pi session JSONL. Pi's lines come in two kinds: `session`
-/// (carries the id) and `message` (carries role+content). Tool invocations
-/// aren't represented in Pi's JSONL today, so we surface text only.
+/// Extract from a Pi session JSONL (`session` + `message` lines); text only,
+/// as Pi's JSONL has no tool invocations today.
 pub async fn extract_pi_full(
     path: &std::path::Path,
     project_root: Option<&str>,
@@ -949,9 +944,7 @@ fn stringify_pi_content(v: Option<&Value>) -> String {
 // OpenCode extractor
 // ---------------------------------------------------------------------------
 
-/// Extract from the OpenCode SQLite database. Sync rusqlite work is scheduled
-/// on `spawn_blocking`. The query joins messages → parts ordered chronologically,
-/// then maps each `text` part onto a Text block per message.
+/// Extract from the OpenCode SQLite database (rusqlite on `spawn_blocking`).
 pub async fn extract_opencode_full(
     db_path: &std::path::Path,
     session_id: &str,
@@ -987,9 +980,7 @@ fn opencode_query_one(
         return Err(anyhow!("opencode session '{session_id}' not found"));
     }
 
-    // Walk messages → parts in order. Group parts by message_id into one
-    // ShareMessage per row. We materialize as a Vec then group, which is
-    // simpler than a per-message subquery.
+    // Join messages → parts in order; group parts by message_id into one message.
     let mut stmt = conn.prepare(
         "SELECT m.id,
                 json_extract(m.data, '$.role') AS role,
@@ -1127,8 +1118,7 @@ mod tests {
 
     #[test]
     fn merge_tool_result_turns_folds_alternation() {
-        // user / asst(tool_use) / user(tool_result) / asst(tool_use) / user(tool_result)
-        // collapses to user / asst(tool_use + tool_result) / asst(tool_use + tool_result)
+        // alternating call/result turns collapse into one turn per call.
         let input = vec![
             msg("user", vec![text("hi")]),
             msg("assistant", vec![tool_call("a")]),
@@ -1190,6 +1180,43 @@ mod tests {
             }
             other => panic!("expected tool_result, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn merge_tool_result_turns_pairs_idless_chat_blocks() {
+        // id-less chat call/result should get a shared synthetic id on fold.
+        let input = vec![
+            msg(
+                "assistant",
+                vec![ContentBlock::ToolCall {
+                    id: None,
+                    name: "list_dir".into(),
+                    arguments: serde_json::Value::Null,
+                }],
+            ),
+            msg(
+                "tool",
+                vec![ContentBlock::ToolResult {
+                    id: None,
+                    ok: true,
+                    output: "index.html".into(),
+                    error: None,
+                }],
+            ),
+        ];
+        let out = merge_tool_result_turns(input);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].content.len(), 2);
+        let call_id = match &out[0].content[0] {
+            ContentBlock::ToolCall { id, .. } => id.clone(),
+            other => panic!("expected tool_call, got {other:?}"),
+        };
+        let result_id = match &out[0].content[1] {
+            ContentBlock::ToolResult { id, .. } => id.clone(),
+            other => panic!("expected tool_result, got {other:?}"),
+        };
+        assert!(call_id.is_some(), "call should receive a synthetic id");
+        assert_eq!(call_id, result_id, "call and result must share an id");
     }
 
     #[test]
