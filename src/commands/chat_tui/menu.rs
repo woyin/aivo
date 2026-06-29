@@ -598,11 +598,15 @@ pub(super) fn centered_rect(width_pct: u16, height_pct: u16, area: Rect) -> Rect
         .split(vertical[1])[1]
 }
 
-/// Wrap the composer `draft` into visual rows, hard-wrapping each logical line
+/// Wrap the composer `draft` into visual rows, soft-wrapping each logical line
 /// (split on `\n`) at `text_width` display columns. Returns each row's
 /// `[start, end)` byte range into `draft`. Every visual row carries the same
 /// 2-col left margin in the render (the `> ` prompt on row 0, a hanging indent
 /// elsewhere), so callers wrap at `composer_width - COMPOSER_PREFIX_WIDTH`.
+///
+/// Wraps at word boundaries: an overflowing word moves whole to the next row,
+/// its leading space(s) left on the closed row so rows stay contiguous. A word
+/// wider than `text_width` falls back to a hard mid-word wrap.
 ///
 /// Always returns at least one row (an empty draft → a single empty row), and a
 /// trailing `\n` yields a final empty row so the cursor can rest on the new line.
@@ -618,15 +622,37 @@ pub(super) fn composer_visual_rows(draft: &str, text_width: usize) -> Vec<(usize
         let mut row_start = line_start;
         let mut col = 0usize;
         let mut pos = line_start;
+        // Start of the current word (a break candidate); `None` → hard-wrap mid-word.
+        let mut word_start: Option<usize> = None;
+        let mut prev_space = false;
         for ch in draft[line_start..line_end].chars() {
             let ch_width = UnicodeWidthChar::width(ch).unwrap_or(0);
+            let is_space = ch == ' ' || ch == '\t';
+            if !is_space && prev_space {
+                word_start = Some(pos);
+            }
             if ch_width > 0 && col + ch_width > text_width {
-                rows.push((row_start, pos));
-                row_start = pos;
-                col = 0;
+                match word_start.filter(|&ws| ws > row_start) {
+                    Some(ws) => {
+                        // Move the overflowing word down, re-measuring its consumed part.
+                        rows.push((row_start, ws));
+                        row_start = ws;
+                        col = draft[ws..pos]
+                            .chars()
+                            .map(|c| UnicodeWidthChar::width(c).unwrap_or(0))
+                            .sum();
+                    }
+                    None => {
+                        rows.push((row_start, pos));
+                        row_start = pos;
+                        col = 0;
+                    }
+                }
+                word_start = None;
             }
             col += ch_width;
             pos += ch.len_utf8();
+            prev_space = is_space;
         }
         rows.push((row_start, line_end));
         match rel_nl {

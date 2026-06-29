@@ -70,13 +70,27 @@ fn test_composer_cursor_position_offsets_attachment_rows() {
 
 #[test]
 fn test_composer_visual_rows_wraps_with_hanging_indent() {
-    // 8 text cols per row; "abcdefghij" fills row 0 and wraps "ij" to row 1.
+    // One word, no break opportunity → hard-wraps mid-word: "ij" spills to row 1.
     let rows = composer_visual_rows("abcdefghij", 8);
     assert_eq!(rows, vec![(0, 8), (8, 10)]);
     // A trailing newline yields a final empty row so the caret can rest there.
     assert_eq!(composer_visual_rows("ab\n", 8), vec![(0, 2), (3, 3)]);
     // An empty draft is a single empty row.
     assert_eq!(composer_visual_rows("", 8), vec![(0, 0)]);
+}
+
+#[test]
+fn test_composer_visual_rows_wraps_at_word_boundary() {
+    // "world" overflows → moves whole to row 1; the space stays on row 0.
+    assert_eq!(
+        composer_visual_rows("hello world", 8),
+        vec![(0, 6), (6, 11)]
+    );
+    // Word longer than the row breaks at the boundary, then hard-wraps mid-word.
+    assert_eq!(
+        composer_visual_rows("a bcdefghij", 5),
+        vec![(0, 2), (2, 7), (7, 11)]
+    );
 }
 
 #[test]
