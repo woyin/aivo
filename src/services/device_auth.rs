@@ -115,6 +115,8 @@ pub struct UsageSummary {
     #[serde(default)]
     pub plan: Option<String>,
     #[serde(default)]
+    pub plan_label: Option<String>,
+    #[serde(default)]
     pub billing_mode: Option<String>,
     #[serde(default)]
     pub is_pro: bool,

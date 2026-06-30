@@ -385,6 +385,10 @@ impl ModelsCommand {
         }
 
         let is_starter = is_aivo_starter_base(&key.base_url);
+        // First-party key shows the account plan label, not the raw `aivo-starter` sentinel.
+        let starter_account = is_starter
+            .then(crate::services::account_store::load)
+            .flatten();
         models.sort_by(|a, b| {
             if is_starter {
                 let a_s = a.id.ends_with("/starter");
@@ -412,19 +416,33 @@ impl ModelsCommand {
         };
 
         let label = if searching { "matches" } else { "models" };
+        let provider_cell = if is_starter {
+            let (plan_label, paid) = crate::commands::starter_provider_label(
+                starter_account.as_ref().and_then(|a| a.plan.as_deref()),
+                starter_account
+                    .as_ref()
+                    .and_then(|a| a.plan_label.as_deref()),
+            );
+            crate::commands::paint_plan_cell(paid, &plan_label)
+        } else {
+            style::dim(&key.base_url)
+        };
         eprintln!(
             "{} {} {} via {}",
             style::success_symbol(),
             models.len(),
             label,
-            style::dim(&key.base_url)
+            provider_cell
         );
 
         if json {
-            let payload = serde_json::json!({
+            let mut payload = serde_json::json!({
                 "provider": key.base_url,
                 "models": models,
             });
+            if let Some(plan) = starter_account.as_ref().and_then(|a| a.plan.as_deref()) {
+                payload["plan"] = serde_json::json!(plan);
+            }
             println!("{}", serde_json::to_string_pretty(&payload)?);
         } else {
             let widths = ColumnWidths::from_models(&models);

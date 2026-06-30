@@ -64,24 +64,30 @@ pub(crate) fn truncate_url_for_display(url: &str, max_len: usize) -> String {
     format!("{prefix}…{suffix}")
 }
 
-/// Provider-cell label for the first-party aivo key: the canonical cached plan
-/// (`aivo-pro`, …), or the free-tier sentinel when starter/not logged in.
-/// Returns `(label, is_paid)` so callers pad first, then colour — green when
-/// paid, dim otherwise.
-pub(crate) fn starter_provider_label(cached_plan: Option<&str>) -> (String, bool) {
-    match cached_plan {
-        Some(p) if !p.is_empty() => (p.to_string(), true),
-        _ => (crate::constants::AIVO_STARTER_SENTINEL.to_string(), false),
+/// Provider-cell label for the first-party aivo key: the plan label (or slug)
+/// when paid, else the free-tier sentinel. Returns `(label, is_paid)`.
+pub(crate) fn starter_provider_label(
+    cached_plan: Option<&str>,
+    cached_label: Option<&str>,
+) -> (String, bool) {
+    match cached_plan.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(plan) => {
+            let display = cached_label
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .unwrap_or(plan);
+            (display.to_string(), true)
+        }
+        None => (crate::constants::AIVO_STARTER_SENTINEL.to_string(), false),
     }
 }
 
-/// Colours a first-party key cell by plan — green when paid, dim otherwise — so
-/// the key name and its plan label share one colour.
+/// First-party key cell colour: green when paid, magenta for the free starter.
 pub(crate) fn paint_plan_cell(paid: bool, text: &str) -> String {
     if paid {
         crate::style::green(text)
     } else {
-        crate::style::dim(text)
+        crate::style::magenta(text)
     }
 }
 
@@ -190,11 +196,11 @@ mod tests {
     #[test]
     fn starter_provider_label_falls_back_to_sentinel() {
         assert_eq!(
-            starter_provider_label(None),
+            starter_provider_label(None, None),
             (crate::constants::AIVO_STARTER_SENTINEL.to_string(), false)
         );
         assert_eq!(
-            starter_provider_label(Some("")),
+            starter_provider_label(Some(""), Some("ignored")),
             (crate::constants::AIVO_STARTER_SENTINEL.to_string(), false)
         );
     }
@@ -202,7 +208,19 @@ mod tests {
     #[test]
     fn starter_provider_label_uses_plan_when_paid() {
         assert_eq!(
-            starter_provider_label(Some("aivo-pro")),
+            starter_provider_label(Some("aivo-pro"), None),
+            ("aivo-pro".to_string(), true)
+        );
+    }
+
+    #[test]
+    fn starter_provider_label_prefers_server_label() {
+        assert_eq!(
+            starter_provider_label(Some("aivo-friend"), Some("Friend")),
+            ("Friend".to_string(), true)
+        );
+        assert_eq!(
+            starter_provider_label(Some("aivo-pro"), Some("  ")),
             ("aivo-pro".to_string(), true)
         );
     }

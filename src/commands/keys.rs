@@ -1140,8 +1140,12 @@ impl KeysCommand {
     async fn list_keys(&self, json: bool) -> Result<ExitCode> {
         let keys = self.session_store.get_keys().await?;
         let selected_key_id = self.selected_key_id().await;
-        let cached_plan = account_store::load().and_then(|a| a.plan);
-        let plan_json = serde_json::to_value(&cached_plan).unwrap_or(Value::Null);
+        let cached_account = account_store::load();
+        let cached_plan = cached_account.as_ref().and_then(|a| a.plan.as_deref());
+        let cached_label = cached_account
+            .as_ref()
+            .and_then(|a| a.plan_label.as_deref());
+        let plan_json = serde_json::to_value(cached_plan).unwrap_or(Value::Null);
 
         if json {
             let payload: Vec<Value> = keys
@@ -1174,9 +1178,8 @@ impl KeysCommand {
             };
             let id_padded = format!("{:<3}", key.short_id());
             let name_padded = format!("{:<width$}", key.name, width = max_name_len);
-            // First-party key: name shares the plan label's colour (green when paid).
             let starter = is_aivo_starter_base(&key.base_url)
-                .then(|| starter_provider_label(cached_plan.as_deref()));
+                .then(|| starter_provider_label(cached_plan, cached_label));
             let name_col = match &starter {
                 Some((_, paid)) => paint_plan_cell(*paid, &name_padded),
                 None => name_padded,
@@ -1201,8 +1204,12 @@ impl KeysCommand {
     async fn list_keys_with_ping(&self, json: bool) -> Result<ExitCode> {
         let keys = self.session_store.get_keys().await?;
         let selected_key_id = self.selected_key_id().await;
-        let cached_plan = account_store::load().and_then(|a| a.plan);
-        let plan_json = serde_json::to_value(&cached_plan).unwrap_or(Value::Null);
+        let cached_account = account_store::load();
+        let cached_plan = cached_account.as_ref().and_then(|a| a.plan.as_deref());
+        let cached_label = cached_account
+            .as_ref()
+            .and_then(|a| a.plan_label.as_deref());
+        let plan_json = serde_json::to_value(cached_plan).unwrap_or(Value::Null);
 
         if json {
             let mut ping_by_id: HashMap<String, Value> = HashMap::new();
@@ -1250,9 +1257,8 @@ impl KeysCommand {
             };
             let id_padded = format!("{:<3}", key.short_id());
             let name_padded = format!("{:<width$}", key.name, width = max_name_len);
-            // First-party key: name shares the plan label's colour (green when paid).
             let starter = is_aivo_starter_base(&key.base_url)
-                .then(|| starter_provider_label(cached_plan.as_deref()));
+                .then(|| starter_provider_label(cached_plan, cached_label));
             let name_col = match &starter {
                 Some((_, paid)) => paint_plan_cell(*paid, &name_padded),
                 None => name_padded,

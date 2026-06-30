@@ -28,6 +28,9 @@ pub struct Account {
     /// Cached from the last usage fetch; absent in pre-plan `account.json` files.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub plan: Option<String>,
+    /// Human plan label from the gateway; display prefers it over `plan`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan_label: Option<String>,
 }
 
 impl Account {
@@ -96,22 +99,41 @@ pub fn canonical_plan(plan: Option<&str>, is_pro: bool) -> Option<String> {
     }
 }
 
-/// Updates only the cached `plan` on the stored account (load-modify-save).
-/// No-op when not logged in (no `account.json`) or already current.
-pub async fn update_plan(plan: Option<String>) -> Result<()> {
+/// Updates the cached `plan` + human `plan_label` on the stored account
+/// (load-modify-save). No-op when not logged in (no `account.json`) or current.
+pub async fn update_plan(plan: Option<String>, plan_label: Option<String>) -> Result<()> {
     let Some(mut account) = load() else {
         return Ok(());
     };
-    if account.plan == plan {
+    if account.plan == plan && account.plan_label == plan_label {
         return Ok(());
     }
     account.plan = plan;
+    account.plan_label = plan_label;
     save(&account).await
 }
 
-/// Best-effort refresh of the cached plan from a usage fetch's `(plan, is_pro)`.
-pub async fn cache_plan_from(plan: Option<&str>, is_pro: bool) {
-    let _ = update_plan(canonical_plan(plan, is_pro)).await;
+/// Canonical `(plan, plan_label)` from a usage fetch; the label is kept only on
+/// a paid plan (blank → dropped, so display falls back to the slug).
+pub fn canonical_plan_with_label(
+    plan: Option<&str>,
+    is_pro: bool,
+    plan_label: Option<&str>,
+) -> (Option<String>, Option<String>) {
+    let canonical = canonical_plan(plan, is_pro);
+    let label = canonical.as_ref().and_then(|_| {
+        plan_label
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    });
+    (canonical, label)
+}
+
+/// Best-effort refresh of the cached plan + label from a usage fetch.
+pub async fn cache_plan_from(plan: Option<&str>, is_pro: bool, plan_label: Option<&str>) {
+    let (canonical, label) = canonical_plan_with_label(plan, is_pro, plan_label);
+    let _ = update_plan(canonical, label).await;
 }
 
 #[cfg(test)]
@@ -126,6 +148,7 @@ mod tests {
             name: Some("Ann".into()),
             linked_at: "2026-06-25T00:00:00Z".into(),
             plan: None,
+            plan_label: None,
         }
     }
 
@@ -166,6 +189,7 @@ mod tests {
     fn round_trips_with_plan() {
         let mut a = sample();
         a.plan = Some("aivo-pro".into());
+        a.plan_label = Some("Pro".into());
         let json = serde_json::to_vec_pretty(&a).unwrap();
         let back: Account = serde_json::from_slice(&json).unwrap();
         assert_eq!(a, back);

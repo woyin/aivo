@@ -78,7 +78,12 @@ impl AccountCommand {
             })
             .await;
             if let AccountUsage::Linked(s) = &usage {
-                account_store::cache_plan_from(s.plan.as_deref(), s.is_pro).await;
+                account_store::cache_plan_from(
+                    s.plan.as_deref(),
+                    s.is_pro,
+                    s.plan_label.as_deref(),
+                )
+                .await;
             }
             return info_json(sync, usage);
         }
@@ -105,7 +110,12 @@ impl AccountCommand {
 
         match spin(" Loading usage…", device_auth::fetch_account_usage()).await {
             AccountUsage::Linked(s) => {
-                account_store::cache_plan_from(s.plan.as_deref(), s.is_pro).await;
+                account_store::cache_plan_from(
+                    s.plan.as_deref(),
+                    s.is_pro,
+                    s.plan_label.as_deref(),
+                )
+                .await;
                 print_plan_block(&s);
             }
             AccountUsage::Unlinked | AccountUsage::Unknown => println!(
@@ -135,7 +145,12 @@ impl AccountCommand {
                 ExitCode::Success
             }
             AccountUsage::Linked(s) if as_json => {
-                account_store::cache_plan_from(s.plan.as_deref(), s.is_pro).await;
+                account_store::cache_plan_from(
+                    s.plan.as_deref(),
+                    s.is_pro,
+                    s.plan_label.as_deref(),
+                )
+                .await;
                 match serde_json::to_string_pretty(&*s) {
                     Ok(out) => {
                         println!("{out}");
@@ -148,7 +163,12 @@ impl AccountCommand {
                 }
             }
             AccountUsage::Linked(s) => {
-                account_store::cache_plan_from(s.plan.as_deref(), s.is_pro).await;
+                account_store::cache_plan_from(
+                    s.plan.as_deref(),
+                    s.is_pro,
+                    s.plan_label.as_deref(),
+                )
+                .await;
                 print_usage(&s);
                 ExitCode::Success
             }
@@ -199,15 +219,21 @@ impl AccountCommand {
     }
 }
 
-/// Plan name for display: the server's `plan`, else derived from `is_pro`.
+/// Plan label for display: server `plan_label`, then the `plan` slug, else `is_pro`.
 fn plan_label(s: &UsageSummary) -> String {
-    s.plan.clone().unwrap_or_else(|| {
-        if s.is_pro {
-            "pro".into()
-        } else {
-            "starter".into()
-        }
-    })
+    s.plan_label
+        .as_deref()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .map(str::to_string)
+        .or_else(|| s.plan.clone())
+        .unwrap_or_else(|| {
+            if s.is_pro {
+                "pro".into()
+            } else {
+                "starter".into()
+            }
+        })
 }
 
 /// Renders a cap as a human number, or "∞" when there's no cap (None or 0).
@@ -559,6 +585,18 @@ mod tests {
         s.is_pro = true;
         assert_eq!(plan_label(&s), "pro");
         s.plan = Some("aivo-pro".into());
+        assert_eq!(plan_label(&s), "aivo-pro");
+    }
+
+    #[test]
+    fn plan_label_prefers_server_label() {
+        let mut s = UsageSummary {
+            plan: Some("aivo-pro".into()),
+            ..Default::default()
+        };
+        s.plan_label = Some("Pro".into());
+        assert_eq!(plan_label(&s), "Pro");
+        s.plan_label = Some("  ".into());
         assert_eq!(plan_label(&s), "aivo-pro");
     }
 

@@ -138,11 +138,13 @@ impl LoginCommand {
         // is linked now, so fetch the plan and cache it too — `aivo keys`/`aivo
         // info` then reflect it without a network call. A failed fetch just
         // leaves the plan unknown (starter); `aivo account` refreshes it later.
-        let plan = match device_auth::fetch_account_usage().await {
-            device_auth::AccountUsage::Linked(s) => {
-                account_store::canonical_plan(s.plan.as_deref(), s.is_pro)
-            }
-            _ => None,
+        let (plan, plan_label) = match device_auth::fetch_account_usage().await {
+            device_auth::AccountUsage::Linked(s) => account_store::canonical_plan_with_label(
+                s.plan.as_deref(),
+                s.is_pro,
+                s.plan_label.as_deref(),
+            ),
+            _ => (None, None),
         };
         let account = account_store::Account {
             user_id: user.id,
@@ -150,6 +152,7 @@ impl LoginCommand {
             name: user.name,
             linked_at: chrono::Utc::now().to_rfc3339(),
             plan,
+            plan_label,
         };
         account_store::save(&account).await?;
 
@@ -240,8 +243,9 @@ pub(crate) async fn sync_account_status() -> AccountSync {
                 email: user.email,
                 name: user.name,
                 linked_at,
-                // Preserve the cached plan — this status sync doesn't fetch it.
+                // Preserve the cached plan + label — this status sync doesn't fetch them.
                 plan: local.as_ref().and_then(|a| a.plan.clone()),
+                plan_label: local.as_ref().and_then(|a| a.plan_label.clone()),
             };
             if local.as_ref() != Some(&account) {
                 let _ = account_store::save(&account).await;

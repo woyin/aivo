@@ -124,7 +124,11 @@ impl InfoCommand {
                 })
                 .await;
             } else {
-                let cached_plan = account_store::load().and_then(|a| a.plan);
+                let cached_account = account_store::load();
+                let cached_plan = cached_account.as_ref().and_then(|a| a.plan.as_deref());
+                let cached_label = cached_account
+                    .as_ref()
+                    .and_then(|a| a.plan_label.as_deref());
                 for key in &keys {
                     let is_selected = selected_key_id == Some(key.id.as_str());
                     let marker = if is_selected {
@@ -136,7 +140,7 @@ impl InfoCommand {
                         format!("{:width$}", key.display_name(), width = max_name_len);
                     // First-party key: name shares the plan label's colour (green when paid).
                     let starter = is_aivo_starter_base(&key.base_url)
-                        .then(|| starter_provider_label(cached_plan.as_deref()));
+                        .then(|| starter_provider_label(cached_plan, cached_label));
                     let name_col = match &starter {
                         Some((_, paid)) => paint_plan_cell(*paid, &name_padded),
                         None => name_padded,
