@@ -195,11 +195,30 @@ fn http_client() -> reqwest::Client {
         .unwrap_or_else(|_| reqwest::Client::new())
 }
 
+/// Display name for this host's OS (e.g. "macOS").
+fn os_label() -> &'static str {
+    match std::env::consts::OS {
+        "macos" => "macOS",
+        "windows" => "Windows",
+        "linux" => "Linux",
+        other => other,
+    }
+}
+
+/// Body for `POST /api/device/code`: label plus this machine's OS + arch.
+fn device_code_body(label: Option<&str>) -> serde_json::Value {
+    serde_json::json!({
+        "label": label,
+        "os": os_label(),
+        "arch": std::env::consts::ARCH,
+    })
+}
+
 /// Starts a device-authorization request. `label` is an optional human label
 /// shown in the account's device list (e.g. "aivo CLI on host").
 pub async fn start_device_auth(label: Option<&str>) -> Result<DeviceCodeResponse> {
     let url = format!("{}/api/device/code", website_base_url());
-    let body = serde_json::json!({ "label": label });
+    let body = device_code_body(label);
     let req = http_client()
         .post(&url)
         .header("Accept", CONTENT_TYPE_JSON)
@@ -452,6 +471,21 @@ mod tests {
         assert_eq!(r.expires_in, 600);
         assert_eq!(r.interval, 5);
         assert!(r.verification_uri_complete.is_none());
+    }
+
+    #[test]
+    fn device_code_body_carries_os_and_arch() {
+        let body = device_code_body(Some("work laptop"));
+        assert_eq!(body["label"], "work laptop");
+        assert_eq!(body["arch"], std::env::consts::ARCH);
+        assert!(body["os"].as_str().is_some_and(|s| !s.is_empty()));
+    }
+
+    #[test]
+    fn device_code_body_allows_absent_label() {
+        let body = device_code_body(None);
+        assert!(body["label"].is_null());
+        assert!(body["os"].as_str().is_some_and(|s| !s.is_empty()));
     }
 
     #[test]
