@@ -1,5 +1,22 @@
 # Changelog
 
+## v0.34.0
+
+Account and sharing lead this release. `aivo chat` can now live-share a
+session as it happens via the `--live` flag or the in-chat `/live`
+command.
+
+- feat(chat): live-share via `--live` flag and `/live` command (ef05049)
+- feat(keys): show first-party key's plan in `aivo keys`/`info` (d8e650c)
+- feat(account): show estimated cost in `aivo account usage` (77d2ddb)
+- feat(account): prefer server plan_label over raw slug in plan displays (f25dac6)
+- feat(update): nudge when a newer version is available (a6338cd)
+- feat(login): send device OS + arch in device-auth request (55c333f)
+- perf(chat): make starter model validation non-blocking on launch (533ba91)
+- fix(chat): remember chat as the last tool picked in `aivo run` (ed63ec8)
+- fix(agent): expand ~ to $HOME in file-tool path resolver (ed777d0)
+- docs(help): trim ping shortcut, refresh <tool> list (f1b4363)
+
 ## v0.33.2
 
 More chat-agent hardening. The agent now repairs malformed tool calls (with
