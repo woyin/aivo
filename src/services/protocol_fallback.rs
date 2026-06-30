@@ -132,7 +132,12 @@ pub fn should_bail_on_mismatch(
     if classification.is_terminal && attempt > 0 {
         return true;
     }
-    if attempt == 0 && route_proven {
+    // Pin-trust: an attempt-0 mismatch on a proven route is usually the request's
+    // fault, not the route's — bail instead of fanning out. Exception: a
+    // format-unsupported signal means the proven shape is wrong for *this*
+    // request (e.g. a gateway that serves claude only via Anthropic Messages),
+    // so keep probing to find the shape that works.
+    if attempt == 0 && route_proven && !classification.is_format_unsupported {
         return true;
     }
     false
@@ -466,6 +471,7 @@ mod tests {
             is_terminal,
             is_rate_limited: false,
             is_semantic_rejection,
+            is_format_unsupported: false,
             quirk_hint: None,
         }
     }
@@ -475,6 +481,7 @@ mod tests {
             is_terminal: true,
             is_rate_limited: true,
             is_semantic_rejection: false,
+            is_format_unsupported: false,
             quirk_hint: None,
         }
     }
@@ -530,6 +537,21 @@ mod tests {
         // it instead of fanning out across 4 unrelated protocol shapes.
         let c = cls(false, false);
         assert!(should_bail_on_mismatch(0, &c, true));
+    }
+
+    #[test]
+    fn no_bail_on_proven_route_when_format_unsupported() {
+        // A format-unsupported signal means the proven shape is wrong for *this*
+        // request (e.g. a gateway serving claude only via Anthropic Messages), so
+        // the cascade must keep probing even on a confirmed route.
+        let c = AttemptClassification {
+            is_terminal: false,
+            is_rate_limited: false,
+            is_semantic_rejection: false,
+            is_format_unsupported: true,
+            quirk_hint: None,
+        };
+        assert!(!should_bail_on_mismatch(0, &c, true));
     }
 
     #[test]
@@ -604,6 +626,7 @@ mod tests {
             is_terminal: false,
             is_rate_limited: false,
             is_semantic_rejection: true,
+            is_format_unsupported: false,
             quirk_hint: Some("requires_reasoning_content"),
         };
         let d = mismatch_directive(
@@ -639,6 +662,7 @@ mod tests {
             is_terminal: false,
             is_rate_limited: false,
             is_semantic_rejection: true,
+            is_format_unsupported: false,
             quirk_hint: Some("requires_reasoning_content"),
         };
         let d = mismatch_directive(

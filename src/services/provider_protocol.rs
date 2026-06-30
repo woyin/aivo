@@ -323,6 +323,11 @@ pub struct AttemptClassification {
     /// window.
     pub is_rate_limited: bool,
     pub is_semantic_rejection: bool,
+    /// The upstream rejected the wire format itself (keep probing other shapes);
+    /// distinct from a wrong-model rejection. Bypasses the pin-trust bail so a
+    /// route confirmed under one shape can still switch when a later request
+    /// needs a different one (e.g. a gateway serving claude only via Anthropic).
+    pub is_format_unsupported: bool,
     pub quirk_hint: Option<&'static str>,
 }
 
@@ -344,6 +349,7 @@ pub fn classify_failed_attempt(status: u16, body: &str) -> AttemptClassification
         is_terminal,
         is_rate_limited,
         is_semantic_rejection,
+        is_format_unsupported,
         quirk_hint,
     }
 }
@@ -353,10 +359,23 @@ pub fn classify_failed_attempt(status: u16, body: &str) -> AttemptClassification
 /// or model-selection failure, so fallback should keep probing other formats.
 pub fn is_format_unsupported_error(body: &str) -> bool {
     let lower = body.to_ascii_lowercase();
-    lower.contains("format")
+    if lower.contains("format")
         && (lower.contains("not supported")
             || lower.contains("not support")
             || lower.contains("unsupported"))
+    {
+        return true;
+    }
+    // Some gateways serve a model only under a different wire protocol and say so
+    // ("Model X must be called via /…/messages (Anthropic Messages shape)"). That's
+    // a protocol mismatch, not a model error — keep probing so the cascade reaches
+    // the Anthropic candidate. Anchor on a path/`anthropic` so bare "messages"
+    // prose isn't matched.
+    lower.contains("messages shape")
+        || (lower.contains("must be called via")
+            && (lower.contains("/messages")
+                || lower.contains("messages api")
+                || lower.contains("anthropic")))
 }
 
 /// True when an error body names a *model* problem (`{"error":"Model not found"}`)
@@ -705,6 +724,25 @@ mod tests {
         assert!(!c.is_terminal);
         assert!(!c.is_semantic_rejection);
         assert!(c.quirk_hint.is_none());
+    }
+
+    #[test]
+    fn classify_keeps_probing_on_anthropic_messages_shape_redirect() {
+        // A gateway serving claude only via the Anthropic Messages shape returns a
+        // 400 telling us so; that's a protocol mismatch, so the cascade must keep
+        // probing (reach the Anthropic candidate), not bail as a wrong-model error.
+        let body = r#"{"error":{"message":"Model \"claude-sonnet-4-6\" must be called via /provider/v1/messages (Anthropic Messages shape).","type":"invalid_request_error","param":"model","code":"unsupported_model"}}"#;
+        assert!(is_format_unsupported_error(body));
+        let c = classify_failed_attempt(400, body);
+        assert!(!c.is_semantic_rejection);
+        assert!(!c.is_terminal);
+    }
+
+    #[test]
+    fn format_unsupported_ignores_bare_messages_prose() {
+        assert!(!is_format_unsupported_error(
+            r#"{"error":"the 'messages' field must be called via the documented schema"}"#
+        ));
     }
 
     #[test]

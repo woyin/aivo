@@ -155,6 +155,7 @@ pub(crate) async fn send_openai_chat(
 ) -> Result<RouterResponse> {
     normalize_openai_request_model(body, context.is_openrouter, context.is_copilot);
     migrate_max_tokens_for_reasoning_models(body);
+    strip_non_function_tools(body);
     // Surface OpenAI's GPT-5.4 Chat Completions restriction (no tools when
     // reasoning_effort is "none") with a clear local 400 instead of letting
     // the upstream reject and producing a generic error the user has to
@@ -277,6 +278,28 @@ fn migrate_max_tokens_for_reasoning_models(body: &mut Value) {
     }
     if let Some(value) = legacy {
         obj.insert("max_completion_tokens".to_string(), value);
+    }
+}
+
+/// OpenAI Chat Completions only accepts `tools[].type == "function"`. Server
+/// tools like `{type:"web_search"}` (Anthropic/Responses-native) reach this
+/// passthrough when a model is served over an OpenAI-compatible gateway — e.g.
+/// a `claude-*` model on a third-party endpoint — and 400 ("expected function").
+/// Drop them so the request succeeds; the Anthropic/Gemini bridges (separate
+/// paths) still translate these server tools natively.
+pub(crate) fn strip_non_function_tools(body: &mut Value) {
+    if let Some(tools) = body.get_mut("tools").and_then(|t| t.as_array_mut()) {
+        tools.retain(|t| t.get("type").and_then(|v| v.as_str()) == Some("function"));
+    }
+    if body
+        .get("tools")
+        .and_then(|t| t.as_array())
+        .is_some_and(|a| a.is_empty())
+        && let Some(obj) = body.as_object_mut()
+    {
+        obj.remove("tools");
+        // A `tool_choice` with no tools 400s the OpenAI Chat upstream.
+        obj.remove("tool_choice");
     }
 }
 
@@ -764,6 +787,57 @@ mod tests {
         migrate_max_tokens_for_reasoning_models(&mut body);
         assert!(body.get("max_tokens").is_none());
         assert!(body.get("max_completion_tokens").is_none());
+    }
+
+    #[test]
+    fn strip_non_function_tools_drops_server_tools() {
+        // `{type:"web_search"}` alongside function tools 400s an OpenAI Chat
+        // endpoint ("expected function"); it must be dropped, function tools kept.
+        let mut body = json!({
+            "model": "claude-sonnet-4-6",
+            "tools": [
+                {"type": "function", "function": {"name": "read_file"}},
+                {"type": "web_search"}
+            ]
+        });
+        strip_non_function_tools(&mut body);
+        let tools = body["tools"].as_array().unwrap();
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0]["function"]["name"], "read_file");
+    }
+
+    #[test]
+    fn strip_non_function_tools_removes_empty_tools_key() {
+        let mut body = json!({"model": "x", "tools": [{"type": "web_search"}]});
+        strip_non_function_tools(&mut body);
+        assert!(body.get("tools").is_none());
+    }
+
+    #[test]
+    fn strip_non_function_tools_drops_orphaned_tool_choice() {
+        let mut body = json!({
+            "model": "claude-sonnet-4-6",
+            "tools": [{"type": "web_search"}],
+            "tool_choice": "required"
+        });
+        strip_non_function_tools(&mut body);
+        assert!(body.get("tools").is_none());
+        assert!(body.get("tool_choice").is_none());
+    }
+
+    #[test]
+    fn strip_non_function_tools_keeps_tool_choice_when_function_tools_survive() {
+        let mut body = json!({
+            "model": "claude-sonnet-4-6",
+            "tools": [
+                {"type": "function", "function": {"name": "read_file"}},
+                {"type": "web_search"}
+            ],
+            "tool_choice": "auto"
+        });
+        strip_non_function_tools(&mut body);
+        assert_eq!(body["tools"].as_array().unwrap().len(), 1);
+        assert_eq!(body["tool_choice"], "auto");
     }
 
     #[test]

@@ -7,6 +7,7 @@ use anyhow::Result;
 use reqwest::header::{HeaderMap, HeaderValue};
 use serde_json::{Value, json};
 
+use crate::services::effort;
 use crate::services::model_names::transform_model_for_provider;
 
 const ANTHROPIC_CACHE_CONTROL_BREAKPOINT_LIMIT: usize = 4;
@@ -253,15 +254,10 @@ impl RequestPatch for AnthropicVersionPatch {
     }
 }
 
-/// Reconciles the `thinking` field with per-model capabilities.
-///
-/// Claude Code 2.x sends `thinking:{type:"adaptive"}` regardless of the
-/// routed model, but adaptive is only accepted on Opus 4.7/4.6, Sonnet 4.6,
-/// and Mythos — older models 400 with a discriminated-union error on
-/// compliant upstreams. Strip adaptive on unsupporting models, strip the
-/// paired `output_config.effort` only when the target model is not known to
-/// support effort, and rewrite `enabled` → `adaptive` on Opus 4.7 (which
-/// dropped manual mode entirely).
+/// Reconciles `thinking` with per-model capabilities (version cuts delegate to
+/// `crate::services::effort`, so this native path and the bridge stay in sync):
+/// strip adaptive where unsupported (with its paired effort), rewrite
+/// `enabled`+`budget_tokens` → `adaptive`, and omit `disabled` on Fable/Mythos.
 pub struct ThinkingNormalizationPatch;
 
 impl RequestPatch for ThinkingNormalizationPatch {
@@ -286,14 +282,17 @@ impl RequestPatch for ThinkingNormalizationPatch {
         };
 
         match type_str.as_str() {
-            "adaptive" if !model_supports_adaptive_thinking(&model) => {
+            "adaptive" if !effort::anthropic_supports_adaptive_thinking(&model) => {
                 obj.remove("thinking");
-                if !model_supports_output_effort(&model) {
+                if !effort::anthropic_supports_output_effort(&model) {
                     drop_output_config_effort(obj);
                 }
             }
-            "enabled" if model_rejects_enabled_thinking(&model) => {
+            "enabled" if effort::anthropic_thinking_uses_adaptive(&model) => {
                 rewrite_enabled_to_adaptive(obj);
+            }
+            "disabled" if effort::anthropic_rejects_disabled_thinking(&model) => {
+                obj.remove("thinking");
             }
             _ => {}
         }
@@ -330,51 +329,6 @@ fn rewrite_enabled_to_adaptive(obj: &mut serde_json::Map<String, Value>) {
     new_thinking.remove("budget_tokens");
     new_thinking.insert("type".to_string(), Value::String("adaptive".to_string()));
     obj.insert("thinking".to_string(), Value::Object(new_thinking));
-}
-
-/// Strips any slash provider prefix or dotted platform prefix, lowercases,
-/// and converts dots to dashes so capability matching works regardless of
-/// which transform the request has been through. Claude Code sends
-/// `claude-opus-4-7`; OpenRouter's rename produces
-/// `anthropic/claude-opus-4.7`; Bedrock-style IDs can look like
-/// `us.anthropic.claude-sonnet-4-6`.
-fn normalize_model_for_match(model: &str) -> String {
-    let lower = model.to_ascii_lowercase();
-    let bare = lower.split('/').next_back().unwrap_or(&lower);
-    let bare = bare.find("claude-").map(|idx| &bare[idx..]).unwrap_or(bare);
-    bare.replace('.', "-")
-}
-
-/// True if `model` (already normalized) starts with `prefix` followed by a
-/// model-component boundary — end of string or `-`. Prevents
-/// `claude-opus-4-60` from matching `claude-opus-4-6`.
-fn matches_model_prefix(model: &str, prefix: &str) -> bool {
-    if !model.starts_with(prefix) {
-        return false;
-    }
-    matches!(model.as_bytes().get(prefix.len()), None | Some(b'-'))
-}
-
-fn model_supports_adaptive_thinking(model: &str) -> bool {
-    let n = normalize_model_for_match(model);
-    matches_model_prefix(&n, "claude-opus-4-7")
-        || matches_model_prefix(&n, "claude-opus-4-6")
-        || matches_model_prefix(&n, "claude-sonnet-4-6")
-        || matches_model_prefix(&n, "claude-mythos")
-}
-
-fn model_supports_output_effort(model: &str) -> bool {
-    let n = normalize_model_for_match(model);
-    matches_model_prefix(&n, "claude-mythos")
-        || matches_model_prefix(&n, "claude-opus-4-7")
-        || matches_model_prefix(&n, "claude-opus-4-6")
-        || matches_model_prefix(&n, "claude-sonnet-4-6")
-        || matches_model_prefix(&n, "claude-opus-4-5")
-}
-
-fn model_rejects_enabled_thinking(model: &str) -> bool {
-    let n = normalize_model_for_match(model);
-    matches_model_prefix(&n, "claude-opus-4-7")
 }
 
 #[cfg(test)]
@@ -899,14 +853,55 @@ mod tests {
     }
 
     #[test]
-    fn matches_model_prefix_respects_component_boundary() {
-        // Avoid `claude-opus-4-6` matching a hypothetical `claude-opus-4-60`.
-        assert!(matches_model_prefix("claude-opus-4-6", "claude-opus-4-6"));
-        assert!(matches_model_prefix(
-            "claude-opus-4-6-20260101",
-            "claude-opus-4-6"
-        ));
-        assert!(!matches_model_prefix("claude-opus-4-60", "claude-opus-4-6"));
+    fn thinking_patch_keeps_adaptive_on_opus_4_8() {
+        let mut body = json!({
+            "model": "claude-opus-4-8",
+            "thinking": {"type": "adaptive"}
+        });
+        run_thinking_patch(&mut body);
+        assert_eq!(body["thinking"], json!({"type": "adaptive"}));
+    }
+
+    #[test]
+    fn thinking_patch_keeps_adaptive_on_fable() {
+        let mut body = json!({
+            "model": "claude-fable-5",
+            "thinking": {"type": "adaptive"}
+        });
+        run_thinking_patch(&mut body);
+        assert_eq!(body["thinking"], json!({"type": "adaptive"}));
+    }
+
+    #[test]
+    fn thinking_patch_rewrites_enabled_to_adaptive_on_opus_4_8_and_fable() {
+        for model in ["claude-opus-4-8", "claude-fable-5"] {
+            let mut body = json!({
+                "model": model,
+                "thinking": {"type": "enabled", "budget_tokens": 16000}
+            });
+            run_thinking_patch(&mut body);
+            assert_eq!(body["thinking"], json!({"type": "adaptive"}), "{model}");
+        }
+    }
+
+    #[test]
+    fn thinking_patch_omits_disabled_on_fable() {
+        let mut body = json!({
+            "model": "claude-fable-5",
+            "thinking": {"type": "disabled"}
+        });
+        run_thinking_patch(&mut body);
+        assert!(body.get("thinking").is_none());
+    }
+
+    #[test]
+    fn thinking_patch_keeps_disabled_on_opus_4_8() {
+        let mut body = json!({
+            "model": "claude-opus-4-8",
+            "thinking": {"type": "disabled"}
+        });
+        run_thinking_patch(&mut body);
+        assert_eq!(body["thinking"], json!({"type": "disabled"}));
     }
 
     #[test]

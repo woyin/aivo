@@ -3,7 +3,10 @@ use serde_json::{Value, json};
 use crate::services::bridge_defaults::{
     BRIDGE_DEFAULT_ANTHROPIC_MAX_TOKENS, BRIDGE_FALLBACK_OPENAI_RESPONSE_ID,
 };
-use crate::services::effort::{CanonicalEffort, anthropic_thinking_config, extract_openai_effort};
+use crate::services::effort::{
+    CanonicalEffort, anthropic_thinking_config, anthropic_thinking_uses_adaptive,
+    extract_openai_effort,
+};
 use crate::services::http_utils::current_unix_ts;
 use crate::services::openai_models::{
     OpenAIChatChoice, OpenAIChatResponse, OpenAIChatResponseMessage, OpenAIChatToolCall,
@@ -222,15 +225,22 @@ pub fn convert_openai_chat_to_anthropic_request(
     // it understands and ignores unknown fields.
     if let Some(effort) = extract_openai_effort(body) {
         let has_thinking = req.as_object().is_some_and(|m| m.contains_key("thinking"));
+        // Claude 4.7+/Fable reject `thinking.budget_tokens` and take adaptive
+        // thinking; older models take the numeric budget.
+        let adaptive = anthropic_thinking_uses_adaptive(model);
         if effort == CanonicalEffort::None {
-            // Explicit "off": emit the disable form — merely omitting `thinking`
-            // leaves it on for upstreams that default it on. No `output_config.effort`.
-            if !has_thinking {
+            // Explicit "off": emit the disable form — but Fable/adaptive-only models
+            // 400 on `{type:"disabled"}`, so omit `thinking` for them instead.
+            if !has_thinking && !adaptive {
                 req["thinking"] = json!({ "type": "disabled" });
             }
         } else {
-            if !has_thinking && let Some(thinking) = anthropic_thinking_config(effort) {
-                req["thinking"] = thinking;
+            if !has_thinking {
+                if adaptive {
+                    req["thinking"] = json!({ "type": "adaptive" });
+                } else if let Some(thinking) = anthropic_thinking_config(effort) {
+                    req["thinking"] = thinking;
+                }
             }
             if !req
                 .as_object()
@@ -1579,15 +1589,16 @@ mod tests {
 
     #[test]
     fn openai_reasoning_effort_high_maps_to_anthropic_thinking_and_output_config() {
+        // Pre-4.7 Claude takes the numeric `budget_tokens`.
         let body = json!({
-            "model": "claude-opus-4-7",
+            "model": "claude-opus-4-5",
             "messages": [{"role": "user", "content": "hi"}],
             "reasoning_effort": "high"
         });
         let req = convert_openai_chat_to_anthropic_request(
             &body,
             &OpenAIToAnthropicChatConfig {
-                default_model: "claude-opus-4-7",
+                default_model: "claude-opus-4-5",
             },
         );
         assert_eq!(req["thinking"]["type"], "enabled");
@@ -1596,16 +1607,58 @@ mod tests {
     }
 
     #[test]
+    fn openai_reasoning_effort_on_claude_4_7_plus_uses_adaptive_not_budget() {
+        // Opus 4.7+/Fable 400 on `thinking.budget_tokens`; the bridge must send
+        // adaptive thinking instead (regression for the default-effort 400).
+        for model in ["claude-opus-4-8", "claude-opus-4-7", "claude-fable-5"] {
+            let body = json!({
+                "model": model,
+                "messages": [{"role": "user", "content": "hi"}],
+                "reasoning_effort": "medium"
+            });
+            let req = convert_openai_chat_to_anthropic_request(
+                &body,
+                &OpenAIToAnthropicChatConfig {
+                    default_model: model,
+                },
+            );
+            assert_eq!(req["thinking"]["type"], "adaptive", "model={model}");
+            assert!(
+                req["thinking"].get("budget_tokens").is_none(),
+                "model={model} must not carry budget_tokens"
+            );
+            assert_eq!(req["output_config"]["effort"], "medium", "model={model}");
+        }
+    }
+
+    #[test]
+    fn openai_reasoning_effort_none_omits_thinking_on_fable() {
+        // Fable 400s on `{type:"disabled"}`; "off" must omit thinking entirely.
+        let body = json!({
+            "model": "claude-fable-5",
+            "messages": [{"role": "user", "content": "hi"}],
+            "reasoning_effort": "none"
+        });
+        let req = convert_openai_chat_to_anthropic_request(
+            &body,
+            &OpenAIToAnthropicChatConfig {
+                default_model: "claude-fable-5",
+            },
+        );
+        assert!(req.get("thinking").is_none());
+    }
+
+    #[test]
     fn openai_reasoning_effort_xhigh_maps_to_anthropic_max_effort() {
         let body = json!({
-            "model": "claude-opus-4-7",
+            "model": "claude-opus-4-5",
             "messages": [{"role": "user", "content": "hi"}],
             "reasoning_effort": "xhigh"
         });
         let req = convert_openai_chat_to_anthropic_request(
             &body,
             &OpenAIToAnthropicChatConfig {
-                default_model: "claude-opus-4-7",
+                default_model: "claude-opus-4-5",
             },
         );
         assert_eq!(req["thinking"]["budget_tokens"], 32000);
@@ -1614,16 +1667,16 @@ mod tests {
 
     #[test]
     fn openai_reasoning_effort_none_disables_anthropic_thinking() {
-        // Explicit "off" → thinking:{type:"disabled"}, no output_config.effort.
+        // Explicit "off" on pre-4.7 Claude → thinking:{type:"disabled"}, no effort.
         let body = json!({
-            "model": "claude-opus-4-7",
+            "model": "claude-opus-4-5",
             "messages": [{"role": "user", "content": "hi"}],
             "reasoning_effort": "none"
         });
         let req = convert_openai_chat_to_anthropic_request(
             &body,
             &OpenAIToAnthropicChatConfig {
-                default_model: "claude-opus-4-7",
+                default_model: "claude-opus-4-5",
             },
         );
         assert_eq!(req["thinking"]["type"], "disabled");

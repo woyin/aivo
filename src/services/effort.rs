@@ -159,6 +159,68 @@ pub(crate) fn gemini_uses_thinking_level(model: &str) -> bool {
     major >= 3
 }
 
+/// Normalize for matching: lowercase, drop `/` and platform prefixes (keep from
+/// `claude-`), dots→dashes (so OpenRouter `claude-opus-4.7` == `claude-opus-4-7`).
+fn normalize_claude_model(model: &str) -> String {
+    let lower = model.to_ascii_lowercase();
+    let bare = lower.rsplit('/').next().unwrap_or(&lower);
+    let bare = bare.find("claude-").map(|i| &bare[i..]).unwrap_or(bare);
+    bare.replace('.', "-")
+}
+
+/// `(major, minor)` of a normalized `claude-opus-…` id; a trailing date suffix
+/// is ignored (only the first two numeric components are read).
+fn claude_opus_version(name: &str) -> Option<(u32, u32)> {
+    let rest = name.strip_prefix("claude-opus-")?;
+    let mut nums = rest.split('-').filter_map(|s| s.parse::<u32>().ok());
+    Some((nums.next().unwrap_or(0), nums.next().unwrap_or(0)))
+}
+
+/// `prefix` match at a component boundary (so `claude-sonnet-4-6` ≠ `…-4-60`).
+fn claude_prefix_at_boundary(name: &str, prefix: &str) -> bool {
+    name.starts_with(prefix) && matches!(name.as_bytes().get(prefix.len()), None | Some(b'-'))
+}
+
+/// Reject `thinking.budget_tokens` (400) → must use adaptive: Fable/Mythos and
+/// Opus 4.7+. Single source of truth; `ThinkingNormalizationPatch` delegates here.
+pub(crate) fn anthropic_thinking_uses_adaptive(model: &str) -> bool {
+    let name = normalize_claude_model(model);
+    if name.contains("fable") || name.contains("mythos") {
+        return true;
+    }
+    matches!(claude_opus_version(&name), Some((major, minor)) if major > 4 || (major == 4 && minor >= 7))
+}
+
+/// Accept `thinking:{type:"adaptive"}` — Claude 4.6+ (pre-4.6 400s on it).
+pub(crate) fn anthropic_supports_adaptive_thinking(model: &str) -> bool {
+    let name = normalize_claude_model(model);
+    if name.contains("fable") || name.contains("mythos") {
+        return true;
+    }
+    if claude_prefix_at_boundary(&name, "claude-sonnet-4-6") {
+        return true;
+    }
+    matches!(claude_opus_version(&name), Some((major, minor)) if major > 4 || (major == 4 && minor >= 6))
+}
+
+/// Accept `output_config.effort` — Fable/Mythos, Sonnet 4.6, Opus 4.5+.
+pub(crate) fn anthropic_supports_output_effort(model: &str) -> bool {
+    let name = normalize_claude_model(model);
+    if name.contains("fable") || name.contains("mythos") {
+        return true;
+    }
+    if claude_prefix_at_boundary(&name, "claude-sonnet-4-6") {
+        return true;
+    }
+    matches!(claude_opus_version(&name), Some((major, minor)) if major > 4 || (major == 4 && minor >= 5))
+}
+
+/// Reject `thinking:{type:"disabled"}` (400) → omit instead: Fable/Mythos.
+pub(crate) fn anthropic_rejects_disabled_thinking(model: &str) -> bool {
+    let name = normalize_claude_model(model);
+    name.contains("fable") || name.contains("mythos")
+}
+
 /// Extract a canonical effort from an OpenAI request body. Looks at:
 /// 1. `reasoning_effort` (Chat Completions)
 /// 2. `reasoning.effort` (Responses API)
@@ -458,6 +520,94 @@ mod tests {
         assert!(cfg.get("thinking_level").is_none());
         let max = gemini_thinking_config(CanonicalEffort::Max, false).expect("max maps");
         assert_eq!(max["thinkingBudget"], 24576);
+    }
+
+    #[test]
+    fn anthropic_adaptive_thinking_gates_on_version() {
+        // Opus 4.7+ and Fable/Mythos reject budget_tokens → adaptive.
+        assert!(anthropic_thinking_uses_adaptive("claude-opus-4-8"));
+        assert!(anthropic_thinking_uses_adaptive("claude-opus-4-7"));
+        assert!(anthropic_thinking_uses_adaptive("claude-fable-5"));
+        assert!(anthropic_thinking_uses_adaptive(
+            "anthropic/claude-mythos-5"
+        ));
+        // Older Claude keeps the numeric budget.
+        assert!(!anthropic_thinking_uses_adaptive("claude-opus-4-6"));
+        assert!(!anthropic_thinking_uses_adaptive("claude-opus-4-5"));
+        assert!(!anthropic_thinking_uses_adaptive("claude-sonnet-4-6"));
+        assert!(!anthropic_thinking_uses_adaptive("claude-3-5-sonnet"));
+        assert!(!anthropic_thinking_uses_adaptive("gpt-5"));
+    }
+
+    #[test]
+    fn anthropic_adaptive_gate_normalizes_dotted_and_prefixed_ids() {
+        assert!(anthropic_thinking_uses_adaptive(
+            "anthropic/claude-opus-4.7"
+        ));
+        assert!(anthropic_thinking_uses_adaptive(
+            "us.anthropic.claude-opus-4-8"
+        ));
+        assert!(anthropic_thinking_uses_adaptive("claude-opus-4-7-20260120"));
+        assert!(!anthropic_thinking_uses_adaptive(
+            "anthropic/claude-opus-4.6"
+        ));
+    }
+
+    #[test]
+    fn anthropic_supports_adaptive_thinking_covers_4_6_plus() {
+        for m in [
+            "claude-opus-4-6",
+            "claude-opus-4-7",
+            "claude-opus-4-8",
+            "claude-sonnet-4-6",
+            "claude-fable-5",
+            "anthropic/claude-mythos-5",
+            "anthropic/claude-opus-4.6",
+            "us.anthropic.claude-sonnet-4-6",
+            "claude-opus-4-6-20260120",
+        ] {
+            assert!(anthropic_supports_adaptive_thinking(m), "{m} → adaptive");
+        }
+        for m in [
+            "claude-opus-4-5",
+            "claude-sonnet-4-5",
+            "claude-haiku-4-5",
+            "claude-3-5-sonnet",
+            "claude-sonnet-4-60",
+            "gpt-5",
+        ] {
+            assert!(
+                !anthropic_supports_adaptive_thinking(m),
+                "{m} → not adaptive"
+            );
+        }
+    }
+
+    #[test]
+    fn anthropic_supports_output_effort_covers_4_5_plus_and_fable() {
+        for m in [
+            "claude-opus-4-5",
+            "claude-opus-4-8",
+            "claude-sonnet-4-6",
+            "claude-fable-5",
+            "anthropic/claude-mythos-5",
+        ] {
+            assert!(anthropic_supports_output_effort(m), "{m} → effort");
+        }
+        for m in ["claude-sonnet-4-5", "claude-haiku-4-5", "claude-3-5-sonnet"] {
+            assert!(!anthropic_supports_output_effort(m), "{m} → no effort");
+        }
+    }
+
+    #[test]
+    fn anthropic_rejects_disabled_thinking_only_fable_mythos() {
+        assert!(anthropic_rejects_disabled_thinking("claude-fable-5"));
+        assert!(anthropic_rejects_disabled_thinking(
+            "anthropic/claude-mythos-5"
+        ));
+        assert!(!anthropic_rejects_disabled_thinking("claude-opus-4-8"));
+        assert!(!anthropic_rejects_disabled_thinking("claude-opus-4-7"));
+        assert!(!anthropic_rejects_disabled_thinking("claude-haiku-4-5"));
     }
 
     #[test]
