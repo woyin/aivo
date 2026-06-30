@@ -248,6 +248,62 @@ fn pct_styled(used: u64, cap: u64) -> String {
     }
 }
 
+/// USD like the dashboard's fmtUsd: cents under $1k, compact above.
+fn fmt_usd(n: f64) -> String {
+    if n >= 1_000.0 {
+        format!("${}", format_human(n.round() as u64))
+    } else {
+        format!("${:.2}", n.max(0.0))
+    }
+}
+
+fn fmt_usd_cap(cap: Option<f64>) -> String {
+    match cap {
+        Some(c) if c > 0.0 => fmt_usd(c),
+        _ => "∞".to_string(),
+    }
+}
+
+/// Whole cents, so cost reuses the integer meter/pct.
+fn usd_cents(v: f64) -> u64 {
+    (v * 100.0).round().max(0.0) as u64
+}
+
+/// Pre-rendered so integer and USD rows share one column-width pass.
+struct MeterRow {
+    name: &'static str,
+    used: String,
+    cap: String,
+    pct: String,
+    meter: String,
+}
+
+fn meter_row(
+    name: &'static str,
+    used: String,
+    cap: String,
+    used_n: u64,
+    cap_n: Option<u64>,
+) -> MeterRow {
+    let (pct, meter) = match cap_n {
+        Some(c) if c > 0 => (
+            pct_styled(used_n, c),
+            style::meter(used_n, c, style::METER_WIDTH),
+        ),
+        _ => (
+            style::dim(format!("{:>4}", "—")),
+            style::meter(0, 0, style::METER_WIDTH),
+        ),
+    };
+    MeterRow {
+        name,
+        used,
+        cap,
+        pct,
+        meter,
+    }
+}
+
 /// Plan / subscription / device-count block for `aivo account info`.
 fn print_plan_block(s: &UsageSummary) {
     println!("{} {}", style::bold("Plan:"), plan_label(s));
@@ -314,27 +370,59 @@ fn print_usage(s: &UsageSummary) {
     style::print_header(&header);
 
     println!();
-    let meters = [
-        ("Requests", s.rpd, s.limits.rpd),
-        ("Tokens", s.tpd, s.limits.tpd),
-        ("Searches", s.searches, s.limits.spd),
-        ("RPM", s.rpm, s.limits.rpm),
+    // Cost sits after Tokens, matching the dashboard.
+    let rows = [
+        meter_row(
+            "Requests",
+            format_human(s.rpd),
+            cap_or_infinity(s.limits.rpd),
+            s.rpd,
+            s.limits.rpd,
+        ),
+        meter_row(
+            "Tokens",
+            format_human(s.tpd),
+            cap_or_infinity(s.limits.tpd),
+            s.tpd,
+            s.limits.tpd,
+        ),
+        meter_row(
+            "Cost",
+            fmt_usd(s.cpd),
+            fmt_usd_cap(s.limits.cpd),
+            usd_cents(s.cpd),
+            s.limits.cpd.map(usd_cents),
+        ),
+        meter_row(
+            "Searches",
+            format_human(s.searches),
+            cap_or_infinity(s.limits.spd),
+            s.searches,
+            s.limits.spd,
+        ),
+        meter_row(
+            "RPM",
+            format_human(s.rpm),
+            cap_or_infinity(s.limits.rpm),
+            s.rpm,
+            s.limits.rpm,
+        ),
     ];
-    let name_w = meters
+    let name_w = rows
         .iter()
-        .map(|(l, ..)| l.len())
+        .map(|r| r.name.len())
         .max()
         .unwrap_or(0)
         .max("Today".len());
-    let used_w = meters
+    let used_w = rows
         .iter()
-        .map(|(_, u, _)| format_human(*u).len())
+        .map(|r| r.used.len())
         .max()
         .unwrap_or(0)
         .max("used".len());
-    let cap_w = meters
+    let cap_w = rows
         .iter()
-        .map(|(_, _, c)| cap_or_infinity(*c).len())
+        .map(|r| r.cap.len())
         .max()
         .unwrap_or(0)
         .max("limit".len());
@@ -344,22 +432,11 @@ fn print_usage(s: &UsageSummary) {
         style::dim(format!("{:>used_w$}", "used")),
         style::dim(format!("{:>cap_w$}", "limit")),
     );
-    for (label, used, cap) in meters {
-        let pn = style::cyan(format!("{label:<name_w$}"));
-        let pu = colorize_unit(&format!("{:>used_w$}", format_human(used)));
-        let pc = colorize_unit(&format!("{:>cap_w$}", cap_or_infinity(cap)));
-        // `%` before the meter keeps it near the numbers; no cap → dash + empty rail.
-        let (pct, meter) = match cap {
-            Some(c) if c > 0 => (
-                pct_styled(used, c),
-                style::meter(used, c, style::METER_WIDTH),
-            ),
-            _ => (
-                style::dim(format!("{:>4}", "—")),
-                style::meter(0, 0, style::METER_WIDTH),
-            ),
-        };
-        println!("{pn} {pu} {pc}  {pct}  {meter}");
+    for r in &rows {
+        let pn = style::cyan(format!("{:<name_w$}", r.name));
+        let pu = colorize_unit(&format!("{:>used_w$}", r.used));
+        let pc = colorize_unit(&format!("{:>cap_w$}", r.cap));
+        println!("{pn} {pu} {pc}  {}  {}", r.pct, r.meter);
     }
 
     println!();
@@ -451,6 +528,28 @@ mod tests {
     #[test]
     fn print_usage_zero_plan_does_not_panic() {
         print_usage(&UsageSummary::default());
+    }
+
+    #[test]
+    fn fmt_usd_keeps_cents_then_compacts() {
+        assert_eq!(fmt_usd(0.0), "$0.00");
+        assert_eq!(fmt_usd(0.01), "$0.01");
+        assert_eq!(fmt_usd(5.0), "$5.00");
+        assert_eq!(fmt_usd(1234.0), "$1.2K");
+    }
+
+    #[test]
+    fn fmt_usd_cap_infinity_when_uncapped() {
+        assert_eq!(fmt_usd_cap(None), "∞");
+        assert_eq!(fmt_usd_cap(Some(0.0)), "∞");
+        assert_eq!(fmt_usd_cap(Some(5.0)), "$5.00");
+    }
+
+    #[test]
+    fn usd_cents_rounds_to_whole_cents() {
+        assert_eq!(usd_cents(0.0), 0);
+        assert_eq!(usd_cents(0.01), 1);
+        assert_eq!(usd_cents(5.0), 500);
     }
 
     #[test]
