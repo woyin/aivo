@@ -1629,8 +1629,18 @@ Re-run the full command without write confinement?",
     /// output, then hard-trims.
     fn force_fit_budget(&mut self) {
         let budget = self.compaction_budget_estimate();
-        let cut = find_cut(&self.messages, keep_recent_tokens());
+        let mut cut = find_cut(&self.messages, keep_recent_tokens());
+        // Single long turn (resume) has no interior user boundary → fall back so
+        // `enforce_budget` doesn't drop the whole prior turn to `[system, user]`.
+        if cut <= 1 {
+            cut = find_cut(&self.messages, 0);
+        }
         self.clear_stale_tool_results(cut);
+        // No summary round-trip is safe mid-overflow; fold a model-free marker.
+        if cut > 1 && self.messages.get(cut).map(role) == Some("user") {
+            let note = self.mechanical_summary();
+            self.apply_compaction(cut, &note);
+        }
         self.enforce_budget(budget);
     }
 
@@ -1646,7 +1656,12 @@ Re-run the full command without write confinement?",
         if total <= budget {
             return 0;
         }
-        let cut = find_cut(&self.messages, keep_recent_tokens());
+        let mut cut = find_cut(&self.messages, keep_recent_tokens());
+        // Single long turn (resume) has no interior user boundary → summarize into
+        // the latest user turn instead of `enforce_budget` hard-dropping it.
+        if cut <= 1 {
+            cut = find_cut(&self.messages, 0);
+        }
 
         // Cheap pass first: if clearing the bulky raw output of OLD tool messages
         // (file dumps, command output the model has already acted on, sitting
@@ -4523,6 +4538,40 @@ mod tests {
         );
     }
 
+    /// Overflow recovery on a resumed single long turn keeps a marker for the
+    /// dropped work instead of vanishing to `[system, latest-user]`.
+    #[test]
+    fn force_fit_recovery_keeps_prior_context_on_single_long_turn() {
+        let mut engine = AgentEngine::new("/tmp", "m", "", &[], &[], 0, 0);
+        engine.context_window = 20_000; // budget = 20_000 − COMPACT_RESERVE = 4_000
+        let big = "reasoning ".repeat(4_000);
+        let mut messages = vec![
+            json!({"role": "system", "content": "sys"}),
+            json!({"role": "user", "content": "original task: fix the shell tool"}),
+        ];
+        for i in 0..4 {
+            messages.push(json!({"role": "assistant", "content": format!("step {i}: {big}")}));
+        }
+        messages.push(json!({"role": "user", "content": "continue"}));
+        engine.messages = messages;
+
+        engine.force_fit_budget();
+
+        let budget = engine.compaction_budget_estimate();
+        assert!(
+            estimate_tokens(&engine.messages) <= budget,
+            "recovery must fit the budget"
+        );
+        let last = engine.messages.last().unwrap();
+        assert_eq!(role(last), "user");
+        assert!(content_str(last).contains("continue"), "latest turn kept");
+        assert!(
+            content_str(last).contains("[Summary of earlier conversation]"),
+            "dropped prior turn must leave a marker, not vanish: {}",
+            content_str(last)
+        );
+    }
+
     /// A huge RECENT tool result fills the keep window; an OLDER one before the cut
     /// gets stubbed.
     #[test]
@@ -4633,6 +4682,49 @@ mod tests {
                 .iter()
                 .any(|n| n.contains("cleared older tool output")),
             "the user is told the cheap path ran"
+        );
+    }
+
+    /// A resumed single long turn over budget keeps its prior context as a folded
+    /// summary instead of `enforce_budget` dropping it to `[system, latest-user]`.
+    #[tokio::test]
+    async fn resume_single_long_turn_keeps_prior_context_on_compaction() {
+        let mut engine = AgentEngine::new("/tmp", "m", "", &[], &[], 0, 0);
+        engine.context_window = 20_000; // budget = 20_000 − COMPACT_RESERVE = 4_000
+        // Assistant-only run: no tool results for the cheap clear path to reclaim.
+        let big = "reasoning ".repeat(4_000);
+        let mut messages = vec![
+            json!({"role": "system", "content": "sys"}),
+            json!({"role": "user", "content": "original task: fix the shell tool"}),
+        ];
+        for i in 0..4 {
+            messages.push(json!({"role": "assistant", "content": format!("step {i}: {big}")}));
+        }
+        messages.push(json!({"role": "user", "content": "continue"}));
+        engine.messages = messages;
+        let budget = engine.compaction_window() - COMPACT_RESERVE;
+        assert!(
+            estimate_tokens(&engine.messages) > budget,
+            "transcript must start over budget"
+        );
+
+        let client = reqwest::Client::new();
+        let cwd = std::path::Path::new(".");
+        let ctx = turn_ctx(&client, "", cwd); // empty base → summary fails → mechanical fold
+        let mut ui = CapturingUi::default();
+        engine.maybe_compact(&ctx, &mut ui).await;
+
+        assert!(
+            estimate_tokens(&engine.messages) <= budget,
+            "compaction must fit the budget"
+        );
+        let last = engine.messages.last().unwrap();
+        assert_eq!(role(last), "user");
+        assert!(content_str(last).contains("continue"), "latest turn kept");
+        assert!(
+            content_str(last).contains("[Summary of earlier conversation]"),
+            "the dropped prior turn must be summarized in, not silently discarded: {}",
+            content_str(last)
         );
     }
 
