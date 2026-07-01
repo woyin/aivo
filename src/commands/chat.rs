@@ -65,6 +65,7 @@ mod chat_tui;
 // commands (notably `aivo context` / `--context`) can reuse its time/text
 // formatters. Re-export at this scope so the chat module still references it
 // without `super::`.
+use super::chat_agent_oneshot;
 use super::chat_tui_format;
 
 /// Max entries in the composer's per-directory recall view (the up-arrow list
@@ -291,6 +292,7 @@ impl ChatCommand {
         attachments: &[String],
         key_override: Option<ApiKey>,
         one_shot: Option<&str>,
+        agent_mode: bool,
         max_context: Option<u64>,
     ) -> Result<ExitCode> {
         let hf = model_input.as_deref().is_some_and(|m| {
@@ -363,7 +365,11 @@ impl ChatCommand {
             "{} {}",
             style::bold("Mode:  "),
             if one_shot.is_some() {
-                "one-shot (-p)"
+                if agent_mode {
+                    "one-shot agent (-e)"
+                } else {
+                    "one-shot (-p)"
+                }
             } else {
                 "interactive TUI"
             },
@@ -404,6 +410,7 @@ impl ChatCommand {
         max_context: Option<String>,
         dry_run: bool,
         share: bool,
+        agent_mode: bool,
     ) -> ExitCode {
         match self
             .execute_internal(
@@ -417,6 +424,7 @@ impl ChatCommand {
                 max_context,
                 dry_run,
                 share,
+                agent_mode,
             )
             .await
         {
@@ -441,6 +449,7 @@ impl ChatCommand {
         max_context: Option<String>,
         dry_run: bool,
         share: bool,
+        agent_mode: bool,
     ) -> Result<ExitCode> {
         // Validate `--max-context` up front so a malformed value fails fast.
         let max_context: Option<u64> = match max_context.as_deref() {
@@ -462,6 +471,7 @@ impl ChatCommand {
                     &attachments,
                     key_override,
                     one_shot.as_deref(),
+                    agent_mode,
                     max_context,
                 )
                 .await;
@@ -624,8 +634,31 @@ impl ChatCommand {
                 let stdin_context = read_stdin_if_piped()?;
                 compose_one_shot_prompt(&input, stdin_context.as_deref())
             };
-            let one_shot_attachments = materialize_attachments(&pending_attachments).await?;
+            // -e runs the agent (text-only, serve-reachable keys); -p falls through to plain.
+            if agent_mode {
+                if !chat_agent_oneshot::key_is_agent_capable(&key) {
+                    anyhow::bail!(
+                        "-e/--exec needs a standard API key; this key can't run the in-process agent"
+                    );
+                }
+                if !attachments.is_empty() {
+                    anyhow::bail!("-e/--exec is text-only — drop --attach");
+                }
+                self.session_store
+                    .record_selection(&key.id, "chat", Some(&raw_model))
+                    .await?;
+                return chat_agent_oneshot::run_one_shot_agent(
+                    &self.session_store,
+                    &self.cache,
+                    &key,
+                    &raw_model,
+                    one_shot_input,
+                    max_context,
+                )
+                .await;
+            }
 
+            let one_shot_attachments = materialize_attachments(&pending_attachments).await?;
             let history = vec![ChatMessage {
                 role: "user".to_string(),
                 content: one_shot_input,
@@ -855,9 +888,7 @@ impl ChatCommand {
         println!();
         println!(
             "{}",
-            style::dim(
-                "Start the interactive chat TUI with streaming responses, or send one prompt with -p."
-            )
+            style::dim("Interactive chat TUI, or one prompt with -p (plain) / -e (agent).")
         );
         println!(
             "{}",
@@ -872,45 +903,28 @@ impl ChatCommand {
                 style::dim(desc)
             );
         };
-        print_opt(
-            "-m, --model <model>",
-            "Specify AI model (saved for next session)",
-        );
-        print_opt(
-            "-k, --key <id|name>",
-            "Select API key by ID or name (-k opens key picker)",
-        );
+        print_opt("-m, --model <model>", "Model to use (saved for next time)");
+        print_opt("-k, --key <id|name>", "API key by id/name (bare = picker)");
         print_opt(
             "-p, --prompt [prompt]",
-            "Send one prompt and exit (reads stdin when no value given; -x is a legacy alias)",
+            "One prompt, plain reply, exit (no tools)",
         );
         print_opt(
-            "-r, --refresh",
-            "Bypass model cache and fetch a fresh list for the picker",
+            "-e, --exec [prompt]",
+            "One prompt, run the agent, exit (tools)",
         );
-        print_opt(
-            "--resume [last|id]",
-            "Resume a saved chat: picker (bare), most recent (last), or by session id",
-        );
-        print_opt(
-            "--share",
-            "Share this chat live to a viewer URL (needs `aivo login`; toggle in-chat with /share)",
-        );
-        print_opt(
-            "--attach <path>",
-            "Queue a text file or image for the next message",
-        );
-        print_opt(
-            "--json",
-            "Print upstream provider's raw JSON response (requires -p; useful for scripting)",
-        );
+        print_opt("-r, --refresh", "Refresh the model list (skip cache)");
+        print_opt("--resume [last|id]", "Resume a saved chat (bare/last/id)");
+        print_opt("--share", "Share this chat live (needs `aivo login`)");
+        print_opt("--attach <path>", "Attach a file or image to the message");
+        print_opt("--json", "Raw provider JSON (with -p)");
         print_opt(
             "--max-context <size>",
-            "Set the context window for a model aivo doesn't know yet (e.g. 200k, 1m); session-only",
+            "Override context window (e.g. 200k)",
         );
         print_opt(
             "--dry-run",
-            "Print the resolved key, model, and endpoint without connecting",
+            "Show resolved key/model/endpoint, don't connect",
         );
         println!();
         println!("{}", style::bold("Examples:"));
@@ -918,15 +932,11 @@ impl ChatCommand {
         println!("  {}", style::dim("aivo chat -m claude-sonnet-4-5"));
         println!(
             "  {}",
-            style::dim("aivo chat --attach README.md --attach screenshot.png")
-        );
-        println!(
-            "  {}",
             style::dim("aivo chat -p \"Explain Rust lifetimes\"")
         );
         println!(
             "  {}",
-            style::dim("git diff | aivo chat -p \"Summarize changes in one sentence\"")
+            style::dim("aivo chat -e \"make the failing test pass\"")
         );
     }
 }

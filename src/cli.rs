@@ -819,7 +819,7 @@ pub struct ChatArgs {
     #[arg(long, value_name = "last|SESSION_ID", num_args = 0..=1, default_missing_value = "")]
     pub resume: Option<String>,
 
-    /// Send one prompt and exit; reads stdin when no value given
+    /// Send one prompt and exit; reads stdin when no value given (plain single-turn, no tools)
     #[arg(
         short = 'p',
         long = "prompt",
@@ -830,6 +830,18 @@ pub struct ChatArgs {
         default_missing_value = ""
     )]
     pub prompt: Option<String>,
+
+    /// Run the agent (tools + multi-step loop) on one prompt and exit; reads stdin
+    /// when no value given. Like -p but agentic. Text-only; conflicts with -p.
+    #[arg(
+        short = 'e',
+        long = "exec",
+        value_name = "PROMPT",
+        num_args = 0..=1,
+        default_missing_value = "",
+        conflicts_with = "prompt"
+    )]
+    pub exec: Option<String>,
 
     /// Print the upstream provider's raw JSON response (requires -p; useful for scripting)
     #[arg(long, requires = "prompt")]

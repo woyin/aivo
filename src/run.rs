@@ -300,11 +300,14 @@ pub async fn run() -> ! {
             } else {
                 None
             };
+            // -e runs the agent (auto-approved tools); -p a plain completion (clap-exclusive).
+            let agent_mode = chat_args.exec.is_some();
+            let one_shot = chat_args.exec.take().or_else(|| chat_args.prompt.take());
             let command = ChatCommand::new(session_store, models_cache.clone());
             command
                 .execute(
                     model,
-                    chat_args.prompt,
+                    one_shot,
                     chat_args.attachments,
                     chat_args.refresh,
                     key_override,
@@ -318,6 +321,7 @@ pub async fn run() -> ! {
                         .or_else(|| chat_args.two_m.then(|| "2m".to_string())),
                     chat_args.dry_run,
                     chat_args.share,
+                    agent_mode,
                 )
                 .await
         }

@@ -33,3 +33,4 @@ memory/
 
 # Python cache (canary fake provider)
 __pycache__/
+eval

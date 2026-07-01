@@ -94,6 +94,7 @@ pub(crate) fn paint_plan_cell(paid: bool, text: &str) -> String {
 pub mod account;
 pub mod alias;
 pub mod chat;
+pub(crate) mod chat_agent_oneshot;
 pub(crate) mod chat_request_builder;
 pub(crate) mod chat_response_parser;
 pub(crate) mod chat_tui_format;

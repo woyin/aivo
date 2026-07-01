@@ -833,6 +833,20 @@ pub fn router_http_client() -> reqwest::Client {
     router_http_client_with_timeout(300)
 }
 
+/// Like [`router_http_client`] but never routes through an env proxy — for the
+/// in-process loopback serve (`127.0.0.1`), which an `http_proxy`/`ALL_PROXY` set
+/// for external traffic can't reach (the request would hang).
+pub fn router_http_client_loopback() -> reqwest::Client {
+    aivo_http_client_builder()
+        .no_proxy()
+        .connect_timeout(std::time::Duration::from_secs(30))
+        .timeout(std::time::Duration::from_secs(300))
+        .pool_max_idle_per_host(10)
+        .tcp_keepalive(std::time::Duration::from_secs(60))
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new())
+}
+
 /// Per-read inactivity timeout, no overall budget — for multi-GB body streams.
 pub fn router_http_streaming_client(read_timeout_secs: u64) -> reqwest::Client {
     aivo_http_client_builder()
