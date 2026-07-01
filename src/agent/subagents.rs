@@ -145,9 +145,10 @@ pub fn normalize_tool_name(name: &str) -> Option<&'static str> {
     Some(match canon.as_str() {
         "read" | "readfile" | "view" | "cat" | "openfile" => "read_file",
         "write" | "writefile" | "create" | "createfile" | "newfile" => "write_file",
-        "edit" | "editfile" | "strreplace" | "strreplaceeditor" | "apply" | "applypatch" => {
-            "edit_file"
-        }
+        "edit" | "editfile" | "strreplace" | "strreplaceeditor" => "edit_file",
+        // apply_patch is its own built-in (V4A patch via `input`), NOT edit_file
+        // (which needs path/old/new) — mapping it to edit_file breaks GPT-5/Codex.
+        "apply" | "applypatch" | "patch" => "apply_patch",
         "multiedit" | "multiedits" => "multi_edit",
         "bash" | "shell" | "runbash" | "terminal" | "exec" | "command" | "run" => "run_bash",
         "grep" | "search" | "ripgrep" | "rg" | "searchtext" => "grep",
@@ -413,6 +414,13 @@ mod tests {
         assert_eq!(normalize_tool_name("Glob"), Some("glob"));
         assert_eq!(normalize_tool_name("WebFetch"), Some("web_fetch"));
         assert_eq!(normalize_tool_name("Frobnicate"), None);
+        // apply_patch is idempotent and distinct from edit_file — mapping it to
+        // edit_file (different arg schema) breaks GPT-5/Codex editing entirely.
+        assert_eq!(normalize_tool_name("apply_patch"), Some("apply_patch"));
+        assert_eq!(normalize_tool_name("applypatch"), Some("apply_patch"));
+        assert_eq!(normalize_tool_name("apply"), Some("apply_patch"));
+        assert_eq!(normalize_tool_name("str_replace_editor"), Some("edit_file"));
+        assert_eq!(normalize_tool_name("edit_file"), Some("edit_file"));
     }
 
     #[test]

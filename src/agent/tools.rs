@@ -6,6 +6,7 @@
 //! (`skill` and `update_plan` are engine-handled, not dispatched here.)
 
 use crate::agent::protocol::ToolSpec;
+use crate::agent::subagents;
 use serde_json::{Value, json};
 use std::io::Read;
 use std::net::{IpAddr, Ipv6Addr};
@@ -866,6 +867,12 @@ pub fn preview(name: &str, args: &Value) -> Option<String> {
 /// Execute a tool. Returns Ok(result) or Err(message); errors are fed back to
 /// the model as a tool result so it can self-correct (they don't abort the loop).
 pub async fn execute(name: &str, args: &Value, cwd: &Path) -> Result<String, String> {
+    // Normalize known aliases (e.g. "shell" / "bash" → "run_bash") before
+    // dispatching, so external APIs that use different tool names still work.
+    let name = match subagents::normalize_tool_name(name) {
+        Some(n) => n,
+        None => name,
+    };
     match name {
         "read_file" => read_file(args, cwd),
         "list_dir" => list_dir(args, cwd),
@@ -2722,6 +2729,28 @@ mod tests {
             assert!(
                 !names.iter().any(|n| n == "apply_patch"),
                 "{m} got apply_patch"
+            );
+        }
+    }
+
+    /// `execute` must route `apply_patch` (the advertised tool for GPT-5/Codex) to
+    /// the V4A applier, not to `edit_file` — the normalize table once collapsed the
+    /// two, which errored on the missing `path` arg and broke editing for those
+    /// models. Also covers dispatch through an alias.
+    #[tokio::test]
+    async fn execute_routes_apply_patch_not_to_edit_file() {
+        for name in ["apply_patch", "applyPatch"] {
+            let dir = tmp();
+            let patch = "*** Begin Patch\n*** Add File: made.txt\n+hi\n*** End Patch";
+            execute(name, &json!({ "input": patch }), &dir)
+                .await
+                .unwrap_or_else(|e| panic!("{name} should apply a patch, got: {e}"));
+            assert_eq!(
+                std::fs::read_to_string(dir.join("made.txt"))
+                    .unwrap()
+                    .trim(),
+                "hi",
+                "{name} did not write the patched file"
             );
         }
     }

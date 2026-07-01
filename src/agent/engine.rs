@@ -768,16 +768,21 @@ impl AgentEngine {
             sys["content"] = json!(format!("{cur}\n\n## Your role: {}\n{}", sa.name, sa.body));
         }
         if let Some(allowed) = sa.resolved_tools() {
-            // An authored `Edit`/`MultiEdit` scope grants `apply_patch` (its stand-in).
-            let editor_allowed = allowed.contains(&"edit_file") || allowed.contains(&"multi_edit");
+            // The edit tools are one equivalence class: authoring any of them grants
+            // whichever the model actually advertises (`apply_patch` on GPT-5/Codex,
+            // `edit_file`/`multi_edit` elsewhere), so an `Edit` scope never disarms.
+            let editor_allowed = allowed.contains(&"edit_file")
+                || allowed.contains(&"multi_edit")
+                || allowed.contains(&"apply_patch");
             self.tools_openai.retain(|t| {
                 let name = t["function"]["name"].as_str().unwrap_or("");
+                let is_editor = matches!(name, "edit_file" | "multi_edit" | "apply_patch");
                 // `update_plan`/`take_note` have no side effects outside the engine,
                 // so a scoped specialist keeps planning + note-taking regardless.
                 name == "update_plan"
                     || name == "take_note"
                     || allowed.contains(&name)
-                    || (name == "apply_patch" && editor_allowed)
+                    || (is_editor && editor_allowed)
             });
         }
     }
@@ -1339,10 +1344,11 @@ impl AgentEngine {
         let mut sequential_idx: Vec<usize> = Vec::new();
 
         for (i, call) in tool_calls.iter().enumerate() {
+            let n = subagents::normalize_tool_name(&call.name).unwrap_or(&call.name);
             // The plan tool renders as its own checklist card, not a generic
             // tool step, and never needs permission — resolve it up front. Its
             // result still joins history below so the call↔result invariant holds.
-            if call.name == "update_plan" {
+            if n == "update_plan" {
                 let content = match plan::parse_plan(&call.arguments) {
                     Ok(mut items) => {
                         // The engine owns plan progression: fill in steps the
@@ -1360,9 +1366,9 @@ impl AgentEngine {
                 outcomes[i] = Some(Ok(content));
                 continue;
             }
-            ui.tool_start(&call.name, &call.arguments);
+            ui.tool_start(n, &call.arguments);
             // Plan mode backstop (the tool is also hidden); the error steers the model.
-            if self.read_only && tools::is_mutating(&call.name) {
+            if self.read_only && tools::is_mutating(n) {
                 outcomes[i] = Some(Err(
                     "Plan mode is read-only — do not modify files or run commands. \
 Investigate with read-only tools and write the implementation plan instead."
@@ -1374,8 +1380,8 @@ Investigate with read-only tools and write the implementation plan instead."
             // out-of-cwd write, a blind overwrite of an existing file the model
             // never read, or an external (MCP) tool whose server the user
             // marked untrusted. Everything else runs uninterrupted.
-            let needs_confirm = tools::is_dangerous(&call.name, &call.arguments, ctx.cwd)
-                || self.write_clobbers_unread(&call.name, &call.arguments, ctx.cwd)
+            let needs_confirm = tools::is_dangerous(n, &call.arguments, ctx.cwd)
+                || self.write_clobbers_unread(n, &call.arguments, ctx.cwd)
                 || self
                     .external
                     .as_ref()
@@ -1383,20 +1389,20 @@ Investigate with read-only tools and write the implementation plan instead."
             // A hard floor: an unrecoverable command (wipe `/`, format a disk, …) is
             // confirmed even under auto-approve, and never remembered. Off a TTY
             // `ask_permission` fails closed. See tools::is_catastrophic.
-            let catastrophic = tools::is_catastrophic(&call.name, &call.arguments);
-            let pkey = permission_key(&call.name, &call.arguments);
+            let catastrophic = tools::is_catastrophic(n, &call.arguments);
+            let pkey = permission_key(n, &call.arguments);
             let allowed = if catastrophic {
-                let preview = tools::preview(&call.name, &call.arguments);
+                let preview = tools::preview(n, &call.arguments);
                 // Allow and AlwaysAllow both run it once only — never persisted.
                 !matches!(
-                    ui.ask_permission(&call.name, preview.as_deref()).await,
+                    ui.ask_permission(n, preview.as_deref()).await,
                     Decision::Deny
                 )
             } else if !needs_confirm || ctx.auto_approve_enabled() || self.always.contains(&pkey) {
                 true
             } else {
-                let preview = tools::preview(&call.name, &call.arguments);
-                match ui.ask_permission(&call.name, preview.as_deref()).await {
+                let preview = tools::preview(n, &call.arguments);
+                match ui.ask_permission(n, preview.as_deref()).await {
                     Decision::Allow => true,
                     Decision::AlwaysAllow => {
                         self.always.insert(pkey);
@@ -1416,7 +1422,7 @@ Investigate with read-only tools and write the implementation plan instead."
                 .external
                 .as_ref()
                 .is_some_and(|e| e.handles(&call.name));
-            if tools::is_parallel_safe(&call.name) && !shadowed {
+            if tools::is_parallel_safe(n) && !shadowed {
                 parallel_idx.push(i);
             } else {
                 sequential_idx.push(i);
@@ -1440,7 +1446,8 @@ Investigate with read-only tools and write the implementation plan instead."
         // (subagent token folding) or the workspace, so concurrency is unsafe.
         for &i in &sequential_idx {
             let call = &tool_calls[i];
-            let result = if call.name == "skill" {
+            let n = subagents::normalize_tool_name(&call.name).unwrap_or(&call.name);
+            let result = if n == "skill" {
                 // Resolved from the engine's discovered skills, not tools::execute.
                 let name = call
                     .arguments
@@ -1448,13 +1455,13 @@ Investigate with read-only tools and write the implementation plan instead."
                     .and_then(|v| v.as_str())
                     .unwrap_or("");
                 skills::load_skill_result(&self.skills, name)
-            } else if call.name == "subagent" && self.read_only {
+            } else if n == "subagent" && self.read_only {
                 // A sub-engine isn't read-only; refuse delegation in plan mode.
                 Err(
                     "Plan mode is read-only — cannot delegate to a subagent while planning."
                         .to_string(),
                 )
-            } else if call.name == "subagent" {
+            } else if n == "subagent" {
                 // Fresh sub-engine on the same serve/cwd; fold its total into the
                 // footer + turn usage below. Pass the UI + output base so it
                 // forwards live token growth.
@@ -1468,7 +1475,7 @@ Investigate with read-only tools and write the implementation plan instead."
                     }
                     Err(e) => Err(e),
                 }
-            } else if call.name == "take_note" {
+            } else if n == "take_note" {
                 // Durable scratchpad: append to notes (capped, oldest dropped).
                 // Pinned into compaction + rebuilt on resume so it outlives the
                 // turns. Held in the engine, so it runs in the ordered pass.
@@ -1483,15 +1490,16 @@ Investigate with read-only tools and write the implementation plan instead."
                     Err(e) => Err(e),
                 }
             } else if let Some(ext) = self.external.clone().filter(|e| e.handles(&call.name)) {
-                // MCP (or other) external tool — routed to its source.
+                // MCP (or other) external tool — keyed on its raw advertised name
+                // (`mcp__*`), never normalized; matches the shadow check above.
                 ext.call(&call.name, &call.arguments).await
-            } else if call.name == "run_bash" {
+            } else if n == "run_bash" {
                 // Run confined; if the sandbox blocks a write, offer an
                 // in-session escape hatch instead of a dead-end error.
                 self.run_bash_with_escalation(ctx, ui, &call.arguments)
                     .await
             } else {
-                tools::execute(&call.name, &call.arguments, ctx.cwd).await
+                tools::execute(n, &call.arguments, ctx.cwd).await
             };
             outcomes[i] = Some(result);
         }
@@ -1499,15 +1507,18 @@ Investigate with read-only tools and write the implementation plan instead."
         // Emit results and append tool messages in the original call order so
         // the call↔result pairing the providers require stays intact.
         for (i, call) in tool_calls.iter().enumerate() {
+            let n = subagents::normalize_tool_name(&call.name).unwrap_or(&call.name);
             let result = outcomes[i]
                 .take()
                 .unwrap_or_else(|| Err("tool produced no result".to_string()));
             // update_plan already surfaced via plan_updated; the rest report here.
-            if call.name != "update_plan" {
-                ui.tool_result(&call.name, &result);
+            // Use the normalized name so the result label matches tool_start's and
+            // touched-file tracking recognizes aliased reads/writes.
+            if n != "update_plan" {
+                ui.tool_result(n, &result);
             }
             if result.is_ok() {
-                self.record_touched_file(&call.name, &call.arguments);
+                self.record_touched_file(n, &call.arguments);
             }
             let content = match result {
                 Ok(c) => c,
@@ -5631,6 +5642,28 @@ mod tests {
         assert!(
             after.contains(&"apply_patch".to_string()),
             "lost editor on gpt-5"
+        );
+        assert!(after.contains(&"read_file".to_string()));
+        assert!(!after.contains(&"run_bash".to_string()));
+    }
+
+    /// The reverse of the gpt-5 case: an authored `apply_patch` scope grants the
+    /// `edit_file` the model actually advertises — the edit family is one class,
+    /// so scoping is symmetric regardless of which member the author named.
+    #[test]
+    fn apply_profile_apply_patch_scope_grants_edit_file_off_codex() {
+        let mut e = AgentEngine::new("/tmp", "claude-sonnet-4-6", "", &[], &[], 0, 0);
+        e.drop_subagent_tool();
+        assert!(tool_names(&e).contains(&"edit_file".to_string()));
+        e.apply_profile(&subagent(
+            "patcher",
+            None,
+            Some(vec!["read_file", "apply_patch"]),
+        ));
+        let after = tool_names(&e);
+        assert!(
+            after.contains(&"edit_file".to_string()),
+            "lost editor off codex"
         );
         assert!(after.contains(&"read_file".to_string()));
         assert!(!after.contains(&"run_bash".to_string()));
