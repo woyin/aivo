@@ -334,6 +334,17 @@ pub fn is_catastrophic(name: &str, args: &Value) -> bool {
             .unwrap_or(false)
 }
 
+/// A `run_bash` command that mutates remote/cloud/API state (see
+/// [`bash_mutates_remote`]); the engine confirms it even under auto-approve.
+pub fn is_remote_side_effect(name: &str, args: &Value) -> bool {
+    name == "run_bash"
+        && args
+            .get("command")
+            .and_then(|c| c.as_str())
+            .map(bash_mutates_remote)
+            .unwrap_or(false)
+}
+
 /// True when a path resolves outside the working directory (absolute elsewhere,
 /// `..` traversal, or **through a symlink** that points out of the project) —
 /// editing outside the project is worth confirming.
@@ -685,6 +696,345 @@ fn pipes_into_interpreter(cmd: &str) -> bool {
         let rest: Vec<&str> = words.collect();
         rest.is_empty() || rest.iter().any(|a| matches!(*a, "-" | "-c" | "-s"))
     })
+}
+
+// --- remote side-effect classifier ---
+//
+// Flags `run_bash` commands that mutate remote/cloud/API state (deploy, publish,
+// DELETE) the workspace card can't undo. Best-effort like [`bash_looks_destructive`];
+// biased to leave reads alone and under-flag rather than nag.
+
+fn is_mutating_http_method(m: &str) -> bool {
+    ["POST", "PUT", "PATCH", "DELETE"]
+        .iter()
+        .any(|v| m.eq_ignore_ascii_case(v))
+}
+
+/// Cloud/infra-CLI subcommand verbs that write remote state; read verbs
+/// (get/list/describe/…) are absent so routine queries don't prompt.
+const EXACT_REMOTE_VERBS: &[&str] = &[
+    "create",
+    "delete",
+    "remove",
+    "rm",
+    "destroy",
+    "update",
+    "modify",
+    "edit",
+    "patch",
+    "put",
+    "set",
+    "add",
+    "apply",
+    "install",
+    "uninstall",
+    "upgrade",
+    "rollback",
+    "deploy",
+    "publish",
+    "unpublish",
+    "release",
+    "push",
+    "upload",
+    "send",
+    "register",
+    "deregister",
+    "attach",
+    "detach",
+    "associate",
+    "disassociate",
+    "enable",
+    "disable",
+    "import",
+    "restore",
+    "cancel",
+    "purge",
+    "drop",
+    "scale",
+    "provision",
+    "mb",
+    "rb",
+    "up",
+    "revoke",
+    "grant",
+    "merge",
+    "close",
+    "reopen",
+    "rename",
+    "transfer",
+    "fork",
+    "dispatch",
+    "rerun",
+    "sync",
+    "promote",
+    "cordon",
+    "uncordon",
+    "drain",
+    "evict",
+    "annotate",
+    "label",
+    "expose",
+    "autoscale",
+    "start",
+    "stop",
+    "restart",
+    "reboot",
+    "resume",
+    "pause",
+    "undo",
+    "taint",
+    "untaint",
+    "deprecate",
+    "yank",
+];
+
+/// AWS-style `verb-noun` prefixes (`delete-object`, `run-instances`). Only used on
+/// a hyphenated token, so a bare word like `run` (`gh run list`) never trips it.
+const DASH_REMOTE_VERBS: &[&str] = &[
+    "create",
+    "delete",
+    "remove",
+    "update",
+    "modify",
+    "put",
+    "set",
+    "add",
+    "terminate",
+    "run",
+    "reboot",
+    "start",
+    "stop",
+    "reset",
+    "send",
+    "publish",
+    "deploy",
+    "register",
+    "deregister",
+    "attach",
+    "detach",
+    "associate",
+    "disassociate",
+    "enable",
+    "disable",
+    "import",
+    "restore",
+    "cancel",
+    "purge",
+    "drop",
+    "revoke",
+    "grant",
+    "promote",
+    "copy",
+    "move",
+    "replace",
+    "apply",
+    "restart",
+    "resume",
+    "scale",
+    "tag",
+    "untag",
+    "authorize",
+    "allocate",
+    "provision",
+    "rebuild",
+    "redeploy",
+    "rollback",
+    "upgrade",
+    "downgrade",
+];
+
+/// Scan the subcommand path (non-flag tokens before the first `-flag`) for a
+/// mutating verb. Stopping at the first flag keeps a flag value (`--title
+/// "delete old"`) from tripping it.
+fn leading_subcommand_mutates(args: &[&str]) -> bool {
+    for &tok in args {
+        if tok.starts_with('-') {
+            break;
+        }
+        let t = tok.to_ascii_lowercase();
+        if EXACT_REMOTE_VERBS.contains(&t.as_str()) {
+            return true;
+        }
+        if let Some((verb, rest)) = t.split_once('-')
+            && !rest.is_empty()
+            && DASH_REMOTE_VERBS.contains(&verb)
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// True when one of `verbs` heads the subcommand — for tools that are mostly local
+/// (`docker rm`, `npm install`), where only a short explicit set writes remotely.
+fn has_leading_verb(args: &[&str], verbs: &[&str]) -> bool {
+    args.iter()
+        .take_while(|a| !a.starts_with('-'))
+        .any(|a| verbs.iter().any(|v| a.eq_ignore_ascii_case(v)))
+}
+
+/// `curl` mutates on a mutating method (`-X POST`) or a request body (`-d`, `-F`,
+/// `-T`, `--json`) without an explicit GET/HEAD. Case-sensitive: `-F` form ≠ `-f`
+/// fail, `-T` upload ≠ `-t`.
+fn curl_is_mutating(args: &[&str]) -> bool {
+    let mut method_mutates = false;
+    let mut method_readonly = false;
+    let mut has_body = false;
+    let mut it = args.iter().peekable();
+    while let Some(&a) = it.next() {
+        let method = if a == "-X" || a == "--request" {
+            it.next().copied()
+        } else {
+            a.strip_prefix("-X").filter(|m| !m.is_empty())
+        };
+        if let Some(m) = method {
+            if is_mutating_http_method(m) {
+                method_mutates = true;
+            } else if m.eq_ignore_ascii_case("GET") || m.eq_ignore_ascii_case("HEAD") {
+                method_readonly = true;
+            }
+            continue;
+        }
+        // `-G`/`--get` sends any `-d` data as a GET query string, not a body.
+        if a == "-G" || a == "--get" {
+            method_readonly = true;
+        }
+        if a == "-F"
+            || a == "--form"
+            || a == "-T"
+            || a == "--upload-file"
+            || a == "-d"
+            || a == "--json"
+            || a.starts_with("--data")
+        {
+            has_body = true;
+        }
+    }
+    method_mutates || (has_body && !method_readonly)
+}
+
+/// `wget` mutates only with an explicit non-GET method or a POST/body payload;
+/// its default (and the common case) is a read-only download.
+fn wget_is_mutating(args: &[&str]) -> bool {
+    let mut it = args.iter().peekable();
+    while let Some(&a) = it.next() {
+        if a == "--method" {
+            if it.peek().is_some_and(|m| is_mutating_http_method(m)) {
+                return true;
+            }
+        } else if let Some(m) = a.strip_prefix("--method=") {
+            if is_mutating_http_method(m) {
+                return true;
+            }
+        } else if a.starts_with("--post-data")
+            || a.starts_with("--post-file")
+            || a.starts_with("--body-data")
+            || a.starts_with("--body-file")
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// HTTPie (`http`/`https`/`xh`): a leading positional METHOD token that mutates.
+fn httpie_is_mutating(args: &[&str]) -> bool {
+    args.iter()
+        .take_while(|a| !a.starts_with('-'))
+        .any(|a| is_mutating_http_method(a))
+}
+
+/// `gh api …` defaults to GET; a mutating `-X/--method` or a field flag (which
+/// forces a non-GET request) makes it mutate.
+fn gh_api_mutates(args: &[&str]) -> bool {
+    if args.first().is_none_or(|a| !a.eq_ignore_ascii_case("api")) {
+        return false;
+    }
+    let mut it = args.iter().peekable();
+    while let Some(&a) = it.next() {
+        if a == "-X" || a == "--method" {
+            if it.peek().is_some_and(|m| is_mutating_http_method(m)) {
+                return true;
+            }
+        } else if let Some(m) = a.strip_prefix("--method=") {
+            if is_mutating_http_method(m) {
+                return true;
+            }
+        } else if matches!(a, "-f" | "-F" | "--field" | "--raw-field" | "--input")
+            || a.starts_with("--field=")
+            || a.starts_with("--raw-field=")
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// Classify one already-split simple command by its program.
+fn segment_mutates_remote(base: &str, args: &[&str]) -> bool {
+    match base {
+        "curl" => curl_is_mutating(args),
+        "wget" => wget_is_mutating(args),
+        "http" | "https" | "xh" | "xhs" => httpie_is_mutating(args),
+        "gh" | "glab" => leading_subcommand_mutates(args) || gh_api_mutates(args),
+        "aws" | "gcloud" | "gsutil" | "az" | "oci" | "doctl" | "ibmcloud" | "kubectl" | "oc"
+        | "terraform" | "tofu" | "terragrunt" | "pulumi" | "flux" | "argocd" | "eksctl" => {
+            leading_subcommand_mutates(args)
+        }
+        // Helm's `create`/`repo add` are local, so list its remote verbs explicitly.
+        "helm" => has_leading_verb(
+            args,
+            &[
+                "install",
+                "upgrade",
+                "uninstall",
+                "delete",
+                "rollback",
+                "push",
+            ],
+        ),
+        // Deploy / hosting CLIs push to prod.
+        "vercel" | "netlify" | "flyctl" | "fly" | "railway" | "heroku" | "wrangler"
+        | "supabase" | "firebase" | "eb" | "serverless" | "sls" | "now" | "surge" | "amplify"
+        | "convex" | "render" => has_leading_verb(
+            args,
+            &[
+                "deploy", "publish", "release", "up", "promote", "rollback", "ship", "push",
+            ],
+        ),
+        // Container / package registries: publishing is public + hard to retract.
+        "docker" | "podman" | "nerdctl" => has_leading_verb(args, &["push"]),
+        "npm" | "pnpm" | "yarn" | "bun" => {
+            has_leading_verb(args, &["publish", "unpublish", "deprecate"])
+        }
+        "cargo" => has_leading_verb(args, &["publish", "yank"]),
+        "gem" => has_leading_verb(args, &["push", "yank"]),
+        "twine" => has_leading_verb(args, &["upload", "register"]),
+        _ => false,
+    }
+}
+
+/// Powers [`is_remote_side_effect`] and the card's ⚠ label. Kept case-sensitive
+/// (unlike the destructive walk) because `curl -F` (form) ≠ `-f` (fail).
+pub fn bash_mutates_remote(cmd: &str) -> bool {
+    for seg in cmd.split(['\n', ';', '|', '&']) {
+        let all: Vec<&str> = seg.split_whitespace().collect();
+        let tokens = effective_command(&all); // see-through sudo/env/nice
+        let Some(&cmd0) = tokens.first() else {
+            continue;
+        };
+        let base = cmd0.rsplit('/').next().unwrap_or(cmd0).to_ascii_lowercase();
+        // `sh -c 'curl -X POST …'` hides the real command in a quoted arg — rescan it.
+        if INTERPRETERS.contains(&base.as_str())
+            && interpreter_inline_code(seg).is_some_and(|inner| bash_mutates_remote(&inner))
+        {
+            return true;
+        }
+        if segment_mutates_remote(&base, &tokens[1..]) {
+            return true;
+        }
+    }
+    false
 }
 
 /// Split a command line into tokens, honoring single/double quotes and stripping
@@ -3143,6 +3493,103 @@ mod tests {
         assert!(!bash_is_catastrophic("format-hex file.bin")); // not Format-Volume
         assert!(!bash_is_catastrophic("Get-ChildItem C:\\")); // read-only
         assert!(!bash_is_catastrophic("cipher /e .\\secret")); // encrypt, not /w
+    }
+
+    #[test]
+    fn remote_mutation_flags_outward_writes() {
+        // HTTP clients: a mutating method or a request body.
+        assert!(bash_mutates_remote("curl -X POST https://api/x -d '{}'"));
+        assert!(bash_mutates_remote("curl -XDELETE https://api/x"));
+        assert!(bash_mutates_remote("curl --request PUT https://api/x"));
+        assert!(bash_mutates_remote(
+            "curl -F file=@a.zip https://api/upload"
+        ));
+        assert!(bash_mutates_remote("curl -T a.txt https://api/put"));
+        assert!(bash_mutates_remote("curl --json '{}' https://api/x"));
+        assert!(bash_mutates_remote("wget --method=DELETE https://api/x"));
+        assert!(bash_mutates_remote("http POST example.com key=val"));
+        // Cloud / infra / deploy CLIs.
+        assert!(bash_mutates_remote("gh repo delete owner/name --yes"));
+        assert!(bash_mutates_remote("gh release create v1"));
+        assert!(bash_mutates_remote("gh api repos/o/r -X DELETE"));
+        assert!(bash_mutates_remote("gh api repos/o/r/issues -f title=x"));
+        assert!(bash_mutates_remote("aws s3 rm s3://bucket/key"));
+        assert!(bash_mutates_remote(
+            "aws ec2 terminate-instances --instance-ids i-1"
+        ));
+        assert!(bash_mutates_remote(
+            "aws ec2 run-instances --image-id ami-1"
+        ));
+        assert!(bash_mutates_remote("gcloud compute instances create vm-1"));
+        assert!(bash_mutates_remote("gcloud app deploy"));
+        assert!(bash_mutates_remote("az group delete --name rg"));
+        assert!(bash_mutates_remote("az webapp up"));
+        assert!(bash_mutates_remote("kubectl delete pod x"));
+        assert!(bash_mutates_remote("kubectl apply -f d.yaml"));
+        assert!(bash_mutates_remote("kubectl rollout restart deploy/x"));
+        assert!(bash_mutates_remote("helm upgrade rel chart"));
+        assert!(bash_mutates_remote("helm uninstall rel"));
+        assert!(bash_mutates_remote("terraform apply -auto-approve"));
+        assert!(bash_mutates_remote("terraform destroy"));
+        assert!(bash_mutates_remote("docker push repo/img:tag"));
+        assert!(bash_mutates_remote("npm publish"));
+        assert!(bash_mutates_remote("cargo publish"));
+        assert!(bash_mutates_remote("vercel deploy --prod"));
+        assert!(bash_mutates_remote("flyctl deploy"));
+        assert!(bash_mutates_remote("railway up"));
+        // See-through wrappers.
+        assert!(bash_mutates_remote("sudo kubectl delete ns team"));
+        assert!(bash_mutates_remote("sh -c 'curl -X POST https://api/x'"));
+        // Any segment in a pipeline / chain.
+        assert!(bash_mutates_remote(
+            "cat body.json | curl -X POST -d @- https://api/x"
+        ));
+    }
+
+    #[test]
+    fn remote_mutation_leaves_reads_alone() {
+        // Plain GETs / downloads.
+        assert!(!bash_mutates_remote("curl https://example.com"));
+        assert!(!bash_mutates_remote("curl -fsSL https://example.com/x")); // -f is --fail, not --form
+        assert!(!bash_mutates_remote("curl -X GET https://api/x"));
+        assert!(!bash_mutates_remote("curl -G -d q=1 https://api/search")); // -G ⇒ GET query
+        assert!(!bash_mutates_remote("wget https://example.com/file.tgz"));
+        // Read-only cloud queries.
+        assert!(!bash_mutates_remote("gh pr list"));
+        assert!(!bash_mutates_remote("gh run list"));
+        assert!(!bash_mutates_remote("gh repo view owner/name"));
+        assert!(!bash_mutates_remote("gh api repos/o/r"));
+        assert!(!bash_mutates_remote("aws s3 ls s3://bucket"));
+        assert!(!bash_mutates_remote("aws ec2 describe-instances"));
+        assert!(!bash_mutates_remote("gcloud compute instances list"));
+        assert!(!bash_mutates_remote("az account show"));
+        assert!(!bash_mutates_remote("kubectl get pods"));
+        assert!(!bash_mutates_remote("kubectl rollout status deploy/x"));
+        assert!(!bash_mutates_remote("helm list"));
+        assert!(!bash_mutates_remote("helm create mychart")); // local scaffold
+        assert!(!bash_mutates_remote("terraform plan"));
+        assert!(!bash_mutates_remote("docker ps"));
+        assert!(!bash_mutates_remote("docker build -t x ."));
+        assert!(!bash_mutates_remote("docker rm container")); // local
+        assert!(!bash_mutates_remote("npm install")); // local download
+        assert!(!bash_mutates_remote("cargo build"));
+        assert!(!bash_mutates_remote("git push")); // git handled by the destructive walk
+        // Local file work that shares a verb word.
+        assert!(!bash_mutates_remote("rm -rf ./build"));
+        assert!(!bash_mutates_remote("ls -la"));
+        // Public wrapper only fires for run_bash.
+        assert!(is_remote_side_effect(
+            "run_bash",
+            &json!({ "command": "gh repo delete o/r" })
+        ));
+        assert!(!is_remote_side_effect(
+            "run_bash",
+            &json!({ "command": "gh pr list" })
+        ));
+        assert!(!is_remote_side_effect(
+            "write_file",
+            &json!({ "path": "a.txt", "content": "" })
+        ));
     }
 
     #[test]

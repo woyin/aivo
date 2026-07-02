@@ -1324,6 +1324,10 @@ Investigate with read-only tools and write the implementation plan instead."
                     .is_some_and(|e| e.requires_approval(&call.name));
             // Hard floor: an unrecoverable command is confirmed even under auto-approve, never remembered; off a TTY fails closed.
             let catastrophic = tools::is_catastrophic(n, &call.arguments);
+            // Remote mutation: also confirmed under auto-approve, but AlwaysAllow may
+            // remember it so a deploy loop isn't re-prompted each identical call.
+            let remote_side_effect =
+                !catastrophic && tools::is_remote_side_effect(n, &call.arguments);
             let pkey = permission_key(n, &call.arguments);
             let allowed = if catastrophic {
                 let preview = tools::preview(n, &call.arguments);
@@ -1332,6 +1336,16 @@ Investigate with read-only tools and write the implementation plan instead."
                     ui.ask_permission(n, preview.as_deref()).await,
                     Decision::Deny
                 )
+            } else if remote_side_effect && !self.always.contains(&pkey) {
+                let preview = tools::preview(n, &call.arguments);
+                match ui.ask_permission(n, preview.as_deref()).await {
+                    Decision::Allow => true,
+                    Decision::AlwaysAllow => {
+                        self.always.insert(pkey);
+                        true
+                    }
+                    Decision::Deny => false,
+                }
             } else if !needs_confirm || ctx.auto_approve_enabled() || self.always.contains(&pkey) {
                 true
             } else {
@@ -2359,11 +2373,13 @@ If the same approach keeps failing the same way, change tactics rather than repe
 genuinely unrunnable case is a sandbox write-block (a tool result noting writes are confined to the \
 workspace), and even then the user is prompted to re-run it outside the sandbox — so keep going \
 rather than handing the command back.\n\n\
-That action bias is for read-only and easily-reversible local work. The approval prompt only \
-catches local file and history damage — it does NOT catch outward-facing or hard-to-undo \
-actions. Before you send a mutating request to a remote API (POST/PUT/DELETE), publish or \
+That action bias is for read-only and easily-reversible local work. The approval card catches \
+local file and history damage, and common remote-mutating shell commands (`curl -X POST/PUT/DELETE`, \
+`gh`, `aws`, `gcloud`, `kubectl`, `helm`, `terraform`, `npm publish`, `docker push`, deploy CLIs, …) \
+now raise it even under auto-approve. But it does NOT catch every outward-facing or hard-to-undo \
+action. Before you send any other mutating request to a remote API (POST/PUT/DELETE), publish or \
 deploy, send mail, or delete remote, cloud, or database data, say plainly what you're about to \
-do and wait for the user to confirm, even though no approval card appears. And handle credentials \
+do and wait for the user to confirm. And handle credentials \
 with care: don't open secret-bearing files (`.env`, private keys, \
 cloud-credential or token stores) unless the task truly needs them, never surface a secret's \
 value in your reply or send it off-box, and never print, log, hard-code, or commit secrets or \
@@ -3232,6 +3248,36 @@ mod tests {
         )
         .await;
 
+        assert_eq!(ui.ask_tools, vec!["run_bash"]);
+    }
+
+    /// A remote mutation (`gh repo delete`) prompts even with auto-approve on; the
+    /// mock denies, so the outward-facing action never runs.
+    #[tokio::test]
+    async fn remote_side_effect_prompts_even_under_auto_approve() {
+        let dir = tmp();
+        let bash = tool_call_sse(
+            "run_bash",
+            json!({ "command": "gh repo delete acme/prod --yes" }),
+        );
+        let port = spawn_sse_sequence(vec![bash, FINAL_TEXT_SSE.to_string()]);
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let base = format!("http://127.0.0.1:{port}");
+        let mut engine = AgentEngine::new(&dir.display().to_string(), "m", "", &[], &[], 0, 0);
+        // turn_ctx sets yes:true (auto-approve); deny so the delete never fires.
+        let mut ui = CapturingUi {
+            deny: true,
+            ..Default::default()
+        };
+        run_session(
+            &mut engine,
+            &turn_ctx(&client, &base, &dir),
+            Some("remove the prod repo".into()),
+            &mut ui,
+        )
+        .await;
+
+        // Prompted despite auto-approve (deny keeps the delete from running).
         assert_eq!(ui.ask_tools, vec!["run_bash"]);
     }
 
@@ -4979,7 +5025,8 @@ mod tests {
             "Never report a fix as working or a task as done unless you've observed it pass"
         ));
         assert!(p.contains("Don't commit, push, create"));
-        assert!(p.contains("does NOT catch outward-facing or hard-to-undo"));
+        assert!(p.contains("does NOT catch every outward-facing or hard-to-undo"));
+        assert!(p.contains("now raise it even under auto-approve")); // common remote mutations are gated
         assert!(p.contains("wait for the user to confirm"));
         assert!(p.contains("never invent file contents")); // don't fabricate
         assert!(p.contains("never print, log, hard-code, or commit secrets")); // secrets hygiene

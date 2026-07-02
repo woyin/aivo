@@ -1028,12 +1028,21 @@ impl ChatTuiApp {
         let Some(pending) = self.agent_permission.as_ref() else {
             return;
         };
-        let destructive = pending.tool == "run_bash"
-            && pending
-                .preview
-                .as_deref()
-                .map(crate::agent::tools::bash_looks_destructive)
-                .unwrap_or(false);
+        // Flag a run_bash card: locally destructive, or a remote mutation.
+        // Destructive wins the label when both apply.
+        let cmd = if pending.tool == "run_bash" {
+            pending.preview.as_deref()
+        } else {
+            None
+        };
+        let flag_line = if cmd.is_some_and(crate::agent::tools::bash_looks_destructive) {
+            Some("⚠ looks destructive")
+        } else if cmd.is_some_and(crate::agent::tools::bash_mutates_remote) {
+            Some("⚠ remote side effect")
+        } else {
+            None
+        };
+        let destructive = flag_line.is_some();
 
         // The card rests just above the composer's divider line (a narrower card
         // would otherwise leave that full-width rule poking out past its right
@@ -1069,8 +1078,8 @@ impl ChatTuiApp {
             .map(|s| display_width(s.content.as_ref()))
             .sum();
         let mut content_w = display_width(&heading).max(keys_w);
-        if destructive {
-            content_w = content_w.max(display_width("⚠ looks destructive"));
+        if let Some(flag) = flag_line {
+            content_w = content_w.max(display_width(flag));
         }
         for &raw in preview.iter().take(preview_take) {
             content_w = content_w.max(display_width(raw));
@@ -1102,9 +1111,9 @@ impl ChatTuiApp {
                 )));
             }
         }
-        if destructive {
+        if let Some(flag) = flag_line {
             lines.push(Line::from(Span::styled(
-                "⚠ looks destructive".to_string(),
+                flag.to_string(),
                 Style::default().fg(WARNING).add_modifier(Modifier::BOLD),
             )));
         }

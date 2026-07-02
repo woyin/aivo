@@ -1,6 +1,7 @@
 //! Headless one-shot agent: `aivo chat -e "<task>"` runs the real `AgentEngine`
 //! (tools + multi-step loop) to completion and exits. Answer → stdout, tool/step
-//! activity → stderr. Auto-approves mutations; catastrophic commands fail closed.
+//! activity → stderr. Auto-approves mutations; catastrophic commands and remote
+//! side effects (deploy/publish/DELETE) fail closed.
 
 use std::io::Write;
 use std::path::Path;
@@ -303,7 +304,8 @@ impl AgentUi for HeadlessAgentUi {
         _tool: &'a str,
         _preview: Option<&'a str>,
     ) -> BoxFuture<'a, Decision> {
-        // Only catastrophic commands reach here (ctx.yes auto-approves the rest); fail closed.
+        // Only catastrophic commands and remote side effects reach here (ctx.yes
+        // auto-approves the rest); no human to confirm, so fail closed.
         Box::pin(async move { Decision::Deny })
     }
 }
