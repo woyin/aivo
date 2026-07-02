@@ -174,11 +174,9 @@ impl ShareCommand {
         println!();
         println!(
             "{}",
-            style::dim("Share an AI session (claude, codex, gemini, pi, opencode, chat) via a")
-        );
-        println!(
-            "{}",
-            style::dim("tunneled, ephemeral viewer URL. Closing the process invalidates the link.")
+            style::dim(
+                "Share an AI session (claude, codex, gemini, pi, opencode, chat) via a tunneled, ephemeral viewer URL. Closing the process invalidates the link."
+            )
         );
         println!();
         let print_opt = |flag: &str, desc: &str| {
@@ -191,22 +189,16 @@ impl ShareCommand {
         println!("{}", style::bold("Arguments:"));
         print_opt(
             "[SESSION_ID]",
-            "Any unique id prefix from `aivo logs`; omit to open the picker",
+            "Unique id prefix from `aivo logs` (omit → picker)",
         );
         println!();
         println!("{}", style::bold("Options:"));
         print_opt(
             "--no-redact",
-            "Skip redaction (default: scrub API keys, OAuth tokens, $HOME, secret env)",
+            "Skip redaction of keys, tokens, $HOME, secrets",
         );
-        print_opt(
-            "--all",
-            "Picker shows sessions from every project (default: current cwd)",
-        );
-        print_opt(
-            "--open",
-            "Open the share URL in the default browser once the link is ready",
-        );
+        print_opt("--all", "Pick from every project (default: current cwd)");
+        print_opt("--open", "Open the share URL in the browser when ready");
         println!();
         println!("{}", style::bold("Examples:"));
         println!(

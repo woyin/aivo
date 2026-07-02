@@ -266,24 +266,20 @@ impl AliasCommand {
         println!();
         println!(
             "{}",
-            style::dim("Create, list, or remove aliases. Two flavors share one namespace:")
+            style::dim("Create, list, or remove aliases. Two kinds share one namespace:")
         );
         println!(
             "{}",
             style::dim(
-                "  model — short name → model name; works wherever -m / --model is accepted."
+                "  model → a model name (use with -m/--model);  launch → a tool+flags preset (run via `aivo run <name>`)."
             )
-        );
-        println!(
-            "{}",
-            style::dim("  launch — short name → preset (tool + flags); run via `aivo run <name>`.")
         );
         println!();
         println!("{}", style::bold("Commands:"));
         let print_row = |label: &str, desc: &str| {
             println!(
                 "  {}{}",
-                style::cyan(format!("{:<22}", label)),
+                style::cyan(format!("{:<24}", label)),
                 style::dim(desc)
             );
         };
@@ -297,7 +293,7 @@ impl AliasCommand {
         let print_opt = |flag: &str, desc: &str| {
             println!(
                 "  {}{}",
-                style::cyan(format!("{:<22}", flag)),
+                style::cyan(format!("{:<24}", flag)),
                 style::dim(desc)
             );
         };
@@ -305,18 +301,11 @@ impl AliasCommand {
         println!();
         println!("{}", style::bold("Examples:"));
         println!("  {}", style::dim("aivo alias fast=claude-haiku-4-5"));
-        println!("  {}", style::dim("aivo alias best claude-sonnet-4-6"));
         println!(
             "  {}",
             style::dim("aivo alias quick claude --key work --model fast --max-context 1m")
         );
         println!("  {}", style::dim("aivo run quick"));
-        println!(
-            "  {}",
-            style::dim("aivo run quick --model other  # override one flag")
-        );
-        println!("  {}", style::dim("aivo alias rm quick"));
-        println!("  {}", style::dim("aivo alias --json"));
     }
 }
 

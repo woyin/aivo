@@ -196,17 +196,10 @@ impl LoginCommand {
         println!();
         println!(
             "{}",
-            style::dim("Sign in to your aivo account and link this device.")
+            style::dim(
+                "Sign in to your aivo account and link this device (shows a code + URL to approve in the browser)."
+            )
         );
-        println!(
-            "{}",
-            style::dim("Shows a short code + URL and waits for you to approve it in the")
-        );
-        println!(
-            "{}",
-            style::dim("browser (press Enter to open it — optional), then binds this")
-        );
-        println!("{}", style::dim("device to your account (plan + credits)."));
         println!();
         println!("{}", style::bold("Options:"));
         println!(
@@ -430,21 +423,15 @@ impl LogoutCommand {
         println!();
         println!(
             "{}",
-            style::dim("Unlink this device from your aivo account.")
-        );
-        println!(
-            "{}",
-            style::dim("Removes the server-side device link and clears the local record;")
-        );
-        println!(
-            "{}",
-            style::dim("you'll need `aivo login` again to use your plan on this device.")
+            style::dim(
+                "Unlink this device from your aivo account (clears the server link and local record; `aivo login` to re-link)."
+            )
         );
         println!();
         println!("{}", style::bold("Options:"));
         println!(
             "  {}{}",
-            style::cyan(format!("{:<10}", "-y, --yes")),
+            style::cyan(format!("{:<12}", "-y, --yes")),
             style::dim("Skip the confirmation prompt")
         );
     }

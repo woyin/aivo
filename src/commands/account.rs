@@ -208,12 +208,7 @@ impl AccountCommand {
         print_cmd("open", "Open your account dashboard in the browser");
         println!();
         println!("{}", style::bold("Examples:"));
-        for c in [
-            "aivo account",
-            "aivo account usage",
-            "aivo account usage --json",
-            "aivo account login",
-        ] {
+        for c in ["aivo account", "aivo account usage", "aivo account login"] {
             println!("  {}", style::dim(c));
         }
     }

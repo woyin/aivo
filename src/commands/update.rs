@@ -39,11 +39,9 @@ impl UpdateCommand {
         println!();
         println!(
             "{}",
-            style::dim("Update the CLI tool to the latest version.")
-        );
-        println!(
-            "{}",
-            style::dim("Delegates to Homebrew when installed that way.")
+            style::dim(
+                "Update the CLI tool to the latest version (delegates to Homebrew when installed that way)."
+            )
         );
         println!();
         println!("{}", style::bold("Options:"));
@@ -54,22 +52,12 @@ impl UpdateCommand {
                 style::dim(desc)
             );
         };
-        print_opt(
-            "-f, --force",
-            "Force update even if installed via a package manager",
-        );
-        print_opt(
-            "--rollback",
-            "Restore the previous version from the last update backup",
-        );
-        print_opt(
-            "--sync-model-data",
-            "Refresh model data from models.dev; leaves the binary alone",
-        );
+        print_opt("-f, --force", "Force update even if via a package manager");
+        print_opt("--rollback", "Restore the previous version (last backup)");
+        print_opt("--sync-model-data", "Refresh model data from models.dev");
         println!();
         println!("{}", style::bold("Examples:"));
         println!("  {}", style::dim("aivo update"));
-        println!("  {}", style::dim("aivo update --force"));
         println!("  {}", style::dim("aivo update --rollback"));
         println!("  {}", style::dim("aivo update --sync-model-data"));
     }

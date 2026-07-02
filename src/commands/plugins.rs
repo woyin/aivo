@@ -56,8 +56,7 @@ impl PluginsCommand {
         println!(
             "{}",
             style::dim(
-                "Manage plugins — sibling `aivo-<name>` binaries under ~/.config/aivo/plugins.\n\
-                 Once installed, `aivo <name> …` (or `aivo run <name> …`) runs the plugin."
+                "Manage plugins — sibling `aivo-<name>` binaries. Once installed, `aivo <name> …` runs the plugin."
             )
         );
         println!();
@@ -65,30 +64,22 @@ impl PluginsCommand {
         let row = |a: &str, b: &str| {
             println!("  {}  {}", style::cyan(format!("{:<26}", a)), style::dim(b));
         };
-        row(
-            "list",
-            "Show installed plugins and where each resolves (default)",
-        );
+        row("list", "Show installed plugins (default)");
         row(
             "install <source> [--name N]",
-            "Install from a path, URL, github:owner/repo, npm:pkg, or cargo:crate",
+            "From a path, URL, github:, npm:, or cargo:",
         );
         row(
             "update [name]",
-            "Re-install from the recorded source (all plugins if no name)",
+            "Re-install from recorded source (all if no name)",
         );
         row("rm <name> [-y]", "Remove an installed plugin");
         println!();
         println!("{}", style::bold("Examples:"));
         for ex in [
-            "aivo plugins",
             "aivo plugins install ./target/release/aivo-amp",
             "aivo plugins install github:owner/aivo-amp",
-            "aivo plugins install npm:aivo-foo",
-            "aivo plugins install cargo:aivo-bar",
-            "aivo plugins update amp",
             "aivo plugins rm amp",
-            "aivo amp --help        # run an installed plugin",
         ] {
             println!("  {}", style::dim(ex));
         }

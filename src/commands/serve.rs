@@ -240,13 +240,7 @@ impl ServeCommand {
         println!(
             "{}",
             style::dim(
-                "Start a local OpenAI-compatible server. Without REF, proxies to the active provider key."
-            )
-        );
-        println!(
-            "{}",
-            style::dim(
-                "With REF (hf:<owner>/<repo>[:<quant>] or https://huggingface.co/...) spawns a local llama-server."
+                "Start a local OpenAI-compatible server. Proxies to the active key, or serves a local llama-server when given a hf:/URL REF."
             )
         );
         println!();
@@ -263,14 +257,8 @@ impl ServeCommand {
             "--host <ADDR>",
             "Host address to bind to (default: 127.0.0.1)",
         );
-        print_opt(
-            "-k, --key <id|name>",
-            "Select API key by ID or name (-k opens key picker)",
-        );
-        print_opt(
-            "--log [PATH]",
-            "Log requests as JSONL (stdout, or to file if PATH given)",
-        );
+        print_opt("-k, --key <id|name>", "Select API key by ID or name");
+        print_opt("--log [PATH]", "Log requests as JSONL (stdout, or to PATH)");
         print_opt("--failover", "Enable multi-key failover on 429/5xx errors");
         print_opt("--cors", "Enable CORS headers for browser-based clients");
         print_opt(
@@ -279,23 +267,15 @@ impl ServeCommand {
         );
         print_opt(
             "--auth-token [TOKEN]",
-            "Require bearer token (auto-generated if no value given)",
+            "Require bearer token (auto-generated if omitted)",
         );
         println!();
         println!("{}", style::bold("Examples:"));
         println!("  {}", style::dim("aivo serve"));
         println!("  {}", style::dim("aivo serve --host 0.0.0.0 -p 8080"));
-        println!("  {}", style::dim("aivo serve -k openrouter"));
-        println!("  {}", style::dim("aivo serve --log | jq ."));
-        println!("  {}", style::dim("aivo serve --log /tmp/requests.jsonl"));
-        println!("  {}", style::dim("aivo serve --cors --timeout 60"));
         println!(
             "  {}",
             style::dim("aivo serve hf:Qwen/Qwen2.5-0.5B-Instruct-GGUF")
-        );
-        println!(
-            "  {}",
-            style::dim("aivo serve https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct-GGUF --cors")
         );
     }
 }

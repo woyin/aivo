@@ -369,10 +369,6 @@ impl InfoCommand {
             "{}",
             style::dim("Show system info, keys, tools, and directory state.")
         );
-        println!(
-            "{}",
-            style::dim("With --ping, also pings all keys and shows a pass/fail summary.")
-        );
         println!();
         println!("{}", style::bold("Options:"));
         let print_opt = |flag: &str, desc: &str| {
@@ -388,7 +384,6 @@ impl InfoCommand {
         println!("{}", style::bold("Examples:"));
         println!("  {}", style::dim("aivo info"));
         println!("  {}", style::dim("aivo info --ping"));
-        println!("  {}", style::dim("aivo info --json"));
         println!(
             "  {}",
             style::dim("aivo info --ping --json | jq '.keys[] | select(.ping.ok==false)'")

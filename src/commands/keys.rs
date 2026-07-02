@@ -3174,7 +3174,7 @@ impl KeysCommand {
 fn keys_help_row(label: &str, desc: &str) {
     println!(
         "  {}{}",
-        style::cyan(format!("{:<23}", label)),
+        style::cyan(format!("{:<24}", label)),
         style::dim(desc)
     );
 }
@@ -3206,14 +3206,10 @@ fn print_help_overview() {
     keys_help_row("export <file>", "Write keys to a password-encrypted file");
     keys_help_row("import <file>", "Merge keys from a password-encrypted file");
     println!();
-    println!("{}", style::bold("Add Flags:"));
-    keys_help_row("--name <name>", "Set key name");
-    keys_help_row("--base-url <url>", "Set provider base URL");
-    keys_help_row("--key <api-key>", "Set provider API key");
-    println!();
-    println!("{}", style::bold("List Flags:"));
-    keys_help_row("--ping", "List keys with live ping status");
-    keys_help_row("--json", "Output list as JSON (secret is never included)");
+    println!(
+        "{}",
+        style::dim("Flags: --ping/--json (list), --name/--base-url/--key (add). See <cmd> --help.")
+    );
     println!();
     println!("{}", style::bold("Examples:"));
     println!("  {}", style::dim("aivo keys"));
@@ -3222,11 +3218,6 @@ fn print_help_overview() {
         "  {}",
         style::dim("aivo keys add --name abc --base-url https://example.io --key sk-...")
     );
-    println!("  {}", style::dim("aivo keys --json"));
-    println!(
-        "  {}",
-        style::dim("aivo keys --ping --json | jq '.[] | select(.ping.ok==false)'")
-    );
 }
 
 fn print_help_use() {
@@ -3234,11 +3225,9 @@ fn print_help_use() {
     println!();
     println!(
         "{}",
-        style::dim("Activate an API key as the default for run/chat/serve/etc.")
-    );
-    println!(
-        "{}",
-        style::dim("Bare `aivo keys use` opens the interactive picker.")
+        style::dim(
+            "Activate an API key as the default for run/chat/serve (bare opens the picker)."
+        )
     );
     println!();
     println!("{}", style::bold("Examples:"));
@@ -3265,7 +3254,6 @@ fn print_help_add() {
     println!();
     println!("{}", style::bold("Examples:"));
     println!("  {}", style::dim("aivo keys add"));
-    println!("  {}", style::dim("aivo keys add cursor"));
     println!("  {}", style::dim("aivo keys add openrouter"));
     println!(
         "  {}",
@@ -3317,11 +3305,9 @@ fn print_help_reauth() {
     println!();
     println!(
         "{}",
-        style::dim("Re-authenticate a stored key: OAuth re-login for codex/gemini/claude/copilot,")
-    );
-    println!(
-        "{}",
-        style::dim("or in-place rotation for plain API keys. Bare form opens the picker.")
+        style::dim(
+            "Re-authenticate a stored key: OAuth re-login (codex/gemini/claude/copilot) or rotate a plain API key. Bare opens the picker."
+        )
     );
     println!();
     println!("{}", style::bold("Examples:"));
@@ -3420,10 +3406,6 @@ fn print_help_import() {
         style::dim("aivo keys import https://gist.example.com/raw/abc.aivo")
     );
     println!("  {}", style::dim("aivo keys import keys.aivo --overwrite"));
-    println!(
-        "  {}",
-        style::dim("printf '%s' \"$PW\" | aivo keys import keys.aivo --password-stdin --overwrite")
-    );
 }
 
 // Formats an API key as a choice string for interactive selectors.

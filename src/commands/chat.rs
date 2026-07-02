@@ -928,8 +928,6 @@ impl ChatCommand {
         );
         println!();
         println!("{}", style::bold("Examples:"));
-        println!("  {}", style::dim("aivo chat"));
-        println!("  {}", style::dim("aivo chat -m claude-sonnet-4-5"));
         println!(
             "  {}",
             style::dim("aivo chat -p \"Explain Rust lifetimes\"")

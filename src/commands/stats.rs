@@ -708,7 +708,7 @@ impl StatsCommand {
         };
         print_opt(
             "--by <NAME>",
-            "Filter to one tool (claude, codex, gemini, opencode, pi, chat, or a plugin)",
+            "Filter to one tool or plugin (e.g. claude, chat)",
         );
         print_opt("-n, --numbers", "Exact numbers instead of human-readable");
         print_opt("-r, --refresh", "Bypass cache and re-read all data files");
@@ -716,7 +716,7 @@ impl StatsCommand {
         print_opt("-a, --all", "Show all models (default: top 20)");
         print_opt(
             "-d, --detailed",
-            "Expand By model to input/output/cached/total columns",
+            "Expand per-model to input/output/cached/total",
         );
         print_opt(
             "--since <DURATION>",
@@ -727,16 +727,7 @@ impl StatsCommand {
         println!("{}", style::bold("Examples:"));
         println!("  {}", style::dim("aivo stats"));
         println!("  {}", style::dim("aivo stats --by claude"));
-        println!("  {}", style::dim("aivo stats --by claude -n"));
-        println!("  {}", style::dim("aivo stats --by omp"));
-        println!("  {}", style::dim("aivo stats -n"));
-        println!("  {}", style::dim("aivo stats -s openrouter"));
         println!("  {}", style::dim("aivo stats --since 7d"));
-        println!("  {}", style::dim("aivo stats --by claude --since 24h"));
-        println!(
-            "  {}",
-            style::dim("aivo stats --json | jq '.totals.tokens'")
-        );
     }
 }
 

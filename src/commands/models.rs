@@ -468,12 +468,6 @@ impl ModelsCommand {
             "{}",
             style::dim("List available models from the active API key's provider.")
         );
-        println!(
-            "{}",
-            style::dim(
-                "Calls /v1/models (OpenAI/Anthropic-compatible), /v1beta/models (Google), or /ai/models/search (Cloudflare)."
-            )
-        );
         println!();
         println!("{}", style::bold("Options:"));
         let print_opt = |flag: &str, desc: &str| {
@@ -483,10 +477,7 @@ impl ModelsCommand {
                 style::dim(desc)
             );
         };
-        print_opt(
-            "-k, --key <id|name>",
-            "Select API key by ID or name (-k opens key picker)",
-        );
+        print_opt("-k, --key <id|name>", "Select API key by ID or name");
         print_opt("-r, --refresh", "Bypass cache and fetch fresh model list");
         print_opt("-s, --search <query>", "Filter models by substring match");
         print_opt("--json", "Output model list as JSON instead of a table");
@@ -494,8 +485,6 @@ impl ModelsCommand {
         println!("{}", style::bold("Examples:"));
         println!("  {}", style::dim("aivo models"));
         println!("  {}", style::dim("aivo models -s sonnet"));
-        println!("  {}", style::dim("aivo models --key openrouter"));
-        println!("  {}", style::dim("aivo models --refresh"));
         println!("  {}", style::dim("aivo models --json | jq '.models[].id'"));
     }
 }

@@ -513,74 +513,37 @@ fn print_help_overview() {
     println!();
     println!(
         "{}",
-        style::dim("Unified session list: aivo chat sessions, native CLI sessions (claude,")
-    );
-    println!(
-        "{}",
-        style::dim("codex, gemini, pi, opencode). `aivo logs share` picks")
-    );
-    println!(
-        "{}",
-        style::dim("from this same list. Use --by run / --by serve to see launch events.")
+        style::dim(
+            "Unified session list — aivo chat + native CLI sessions (claude, codex, gemini, pi, opencode). Use --by run / --by serve for launch events."
+        )
     );
     println!();
     println!("{}", style::bold("Commands:"));
-    logs_help_row(
-        "list",
-        "List recent rows from all sources (newest first; default when omitted)",
-    );
-    logs_help_row(
-        "show [id]",
-        "Show one row in detail; omit id to open the picker",
-    );
+    logs_help_row("list", "Recent rows, newest first (default)");
+    logs_help_row("show [id]", "Show one row in detail (omit id → picker)");
     logs_help_row(
         "share [id]",
-        "Share a session via tunneled viewer URL; omit id to open the picker",
+        "Share a session via viewer URL (omit id → picker)",
     );
-    logs_help_row(
-        "prune",
-        "Remove logs.db chat events whose session file was deleted",
-    );
+    logs_help_row("prune", "Remove logs.db events whose session file is gone");
     println!();
     println!("{}", style::bold("Filters:"));
-    logs_help_row("-n, --limit <N>", "Maximum rows after merge (default: 20)");
-    logs_help_row(
-        "--json",
-        "Output JSON (tagged union: log_entry|native_session)",
-    );
-    logs_help_row(
-        "--watch",
-        "Continuously refresh (1s poll across all sources)",
-    );
-    logs_help_row("--jsonl", "Emit newly seen rows as JSONL while watching");
+    logs_help_row("-n, --limit <N>", "Max rows after merge (default: 20)");
+    logs_help_row("--by <name>", "Any source above, or a plugin name");
     logs_help_row("-s, --search <query>", "Search title/topic/body text");
     logs_help_row(
-        "--by <name>",
-        "Sessions: chat | claude | codex | gemini | pi | opencode | native",
+        "-a, --all",
+        "Every project (else current cwd; --cwd <path>)",
     );
+    logs_help_row("--since / --until <t>", "Bound results by time");
     logs_help_row(
-        "",
-        "Events:   run | serve  (launch records / HTTP requests)",
+        "--model / -k <v>",
+        "Filter by model / saved key (logs.db only)",
     );
+    logs_help_row("--errors", "Only HTTP >= 400 or non-zero exit");
     logs_help_row(
-        "",
-        "Plugins:  <plugin name>  (e.g. omp, amp — that agent's runs)",
-    );
-    logs_help_row(
-        "--model <model>",
-        "Filter by model substring (logs.db only)",
-    );
-    logs_help_row("-k, --key <id|name>", "Filter by saved key (logs.db only)");
-    logs_help_row(
-        "--cwd <path>",
-        "Filter to a specific cwd (default: current cwd)",
-    );
-    logs_help_row("-a, --all", "Show rows from every project (no cwd filter)");
-    logs_help_row("--since <time>", "Only show rows on or after this time");
-    logs_help_row("--until <time>", "Only show rows on or before this time");
-    logs_help_row(
-        "--errors",
-        "Only HTTP >= 400 or non-zero exit (logs.db only)",
+        "--json / --watch",
+        "JSON output / live refresh (--jsonl to stream)",
     );
     println!();
     println!("{}", style::bold("Examples:"));
@@ -590,33 +553,12 @@ fn print_help_overview() {
     );
     println!(
         "  {}",
-        style::dim("aivo logs --all               # every project")
-    );
-    println!(
-        "  {}",
-        style::dim("aivo logs --by claude         # only native claude sessions")
-    );
-    println!(
-        "  {}",
         style::dim("aivo logs --by run            # launch events (tool, model, exit code)")
-    );
-    println!(
-        "  {}",
-        style::dim("aivo logs --by native         # only native CLI sessions")
     );
     println!(
         "  {}",
         style::dim("aivo logs show 1335c631       # any unique id prefix works")
     );
-    println!(
-        "  {}",
-        style::dim("aivo logs share               # pick a session and share it")
-    );
-    println!(
-        "  {}",
-        style::dim("aivo logs share 1335c631      # share by id prefix")
-    );
-    println!("  {}", style::dim("aivo logs --watch --jsonl"));
 }
 
 fn print_help_show() {
@@ -624,13 +566,10 @@ fn print_help_show() {
     println!();
     println!(
         "{}",
-        style::dim("Show full detail for a single row: logs.db id or native session id.")
+        style::dim(
+            "Show full detail for one row (logs.db id or native session id; any unique prefix). Omit the id to open the picker."
+        )
     );
-    println!(
-        "{}",
-        style::dim("Any unique id prefix works (matches the prefix shown in `aivo logs`).")
-    );
-    println!("{}", style::dim("Omit the id to open the picker."));
     println!();
     println!("{}", style::bold("Examples:"));
     println!(
@@ -645,35 +584,22 @@ fn print_help_share() {
     println!();
     println!(
         "{}",
-        style::dim("Share a session via a tunneled viewer URL. The viewer follows the session")
-    );
-    println!(
-        "{}",
-        style::dim("live as it changes; secrets and $HOME paths are redacted.")
-    );
-    println!(
-        "{}",
-        style::dim("Omit the id to open the picker. `aivo share` is an alias for this command.")
+        style::dim(
+            "Share a session via a tunneled, live viewer URL (secrets and $HOME redacted). Omit the id to open the picker; `aivo share` is an alias."
+        )
     );
     println!();
     println!("{}", style::bold("Options:"));
     logs_help_row(
         "--no-redact",
-        "Skip redaction (API keys, OAuth tokens, $HOME, secret-shaped env)",
+        "Skip redaction of keys, tokens, $HOME, secrets",
     );
-    logs_help_row(
-        "--all",
-        "Pick from sessions in every project, not just the current cwd",
-    );
-    logs_help_row(
-        "--open",
-        "Open the share URL in the default browser once ready",
-    );
+    logs_help_row("--all", "Pick from every project (default: current cwd)");
+    logs_help_row("--open", "Open the share URL in the browser when ready");
     println!();
     println!("{}", style::bold("Examples:"));
     println!("  {}", style::dim("aivo logs share"));
     println!("  {}", style::dim("aivo logs share 1335c631"));
-    println!("  {}", style::dim("aivo logs share --open"));
 }
 
 fn print_help_prune() {
@@ -681,11 +607,9 @@ fn print_help_prune() {
     println!();
     println!(
         "{}",
-        style::dim("Delete chat events in logs.db whose underlying session file is gone. Prompts")
-    );
-    println!(
-        "{}",
-        style::dim("for confirmation unless --force is set. Native session files are not touched.")
+        style::dim(
+            "Delete logs.db chat events whose session file is gone (prompts unless --force). Native session files are not touched."
+        )
     );
     println!();
     println!("{}", style::bold("Options:"));

@@ -43,74 +43,33 @@ impl HfCommand {
     pub fn print_help() {
         println!("{} aivo hf [SUBCOMMAND]", style::bold("Usage:"));
         println!();
-        println!(
-            "{}",
-            style::dim(
-                "Manage cached HuggingFace GGUF files under ~/.config/aivo/cache/huggingface."
-            )
-        );
+        println!("{}", style::dim("Manage cached HuggingFace GGUF files."));
         println!();
         println!("{}", style::bold("Subcommands:"));
         let row = |a: &str, b: &str| {
             println!("  {}  {}", style::cyan(format!("{:<24}", a)), style::dim(b));
         };
-        row(
-            "list [--verbose]",
-            "Show cached repos (default; or files with --verbose)",
-        );
+        row("list [--verbose]", "Show cached repos (default)");
         row(
             "pull <ref|path>",
-            "Download a HF GGUF, or import a local `.gguf` into the cache",
+            "Download a GGUF, or import a local .gguf",
         );
-        row(
-            "rm <repo> [--quant <q>]",
-            "Delete one quant (or whole repo with --all)",
-        );
+        row("rm <repo> [--quant <q>]", "Delete one quant (or --all)");
         row("clean [-y]", "Delete every cached repo");
         println!();
         println!("{}", style::bold("Examples:"));
         for ex in [
-            "aivo hf",
-            "aivo hf list --verbose",
             "aivo hf pull hf:Qwen/Qwen2.5-0.5B-Instruct-GGUF",
-            "aivo hf pull hf:bartowski/Llama-3.2-3B-Instruct-GGUF:Q5_K_M",
-            "aivo hf pull hf:Qwen/Qwen2.5-0.5B-Instruct-GGUF --refresh",
-            "aivo hf pull ~/Downloads/Llama-3.2-3B-Instruct-Q5_K_M.gguf",
             "aivo hf pull ./my-model.gguf --as me/my-model",
-            "aivo hf rm bartowski/Llama-3.2-3B-Instruct-GGUF --quant Q5_K_M",
             "aivo hf rm bartowski/Llama-3.2-3B-Instruct-GGUF --all -y",
-            "aivo hf clean -y",
         ] {
             println!("  {}", style::dim(ex));
         }
         println!();
-        println!("{}", style::bold("Environment (llama-server runs):"));
-        row(
-            "AIVO_LLAMA_CTX=<n>",
-            "Context size override (default: min(model's training ctx, 65536))",
-        );
-        row(
-            "AIVO_LLAMA_ARGS=<args>",
-            "Extra llama-server flags, appended last (override anything aivo set)",
-        );
-        row(
-            "AIVO_LLAMA_MMPROJ=off",
-            "Skip the auto-detected mmproj projector (vision input)",
-        );
-        row(
-            "AIVO_LLAMA_DRAFT=off",
-            "Skip the auto-detected MTP draft model (speculative decoding)",
-        );
-        row(
-            "AIVO_LLAMA_NGL=<n>",
-            "GPU layer count (AIVO_GPU=cpu disables)",
-        );
-        println!();
+        println!("{}", style::bold("Environment (llama-server):"));
         println!(
-            "{}",
-            style::dim(
-                "Gated/private repos (e.g. google/gemma-*) need an HF token: set HF_TOKEN or run `huggingface-cli login`."
-            )
+            "  {}",
+            style::dim("AIVO_LLAMA_CTX / ARGS / MMPROJ / DRAFT / NGL   (see README)")
         );
     }
 }

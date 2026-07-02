@@ -466,12 +466,8 @@ impl RunCommand {
             _ => {
                 println!(
                     "{}",
-                    style::dim("Launch an AI coding assistant with local API keys.")
-                );
-                println!(
-                    "{}",
                     style::dim(
-                        "When no tool is provided, `aivo run` opens an interactive picker of agents and plugins."
+                        "Launch an AI coding assistant with local API keys; no tool opens an interactive picker."
                     )
                 );
             }
@@ -483,7 +479,7 @@ impl RunCommand {
         let print_opt = |flag: &str, desc: &str| {
             println!(
                 "  {}{}",
-                style::cyan(format!("{:<26}", flag)),
+                style::cyan(format!("{:<28}", flag)),
                 style::dim(desc)
             );
         };
@@ -516,16 +512,8 @@ impl RunCommand {
                 &label("Claude only: override subagent slot (bare = picker)"),
             );
             print_opt(
-                "--haiku-model <m>",
-                &label("Claude only: what `/model haiku` resolves to (bare = picker)"),
-            );
-            print_opt(
-                "--sonnet-model <m>",
-                &label("Claude only: what `/model sonnet` resolves to (bare = picker)"),
-            );
-            print_opt(
-                "--opus-model <m>",
-                &label("Claude only: what `/model opus` resolves to (bare = picker)"),
+                "--haiku|sonnet|opus-model",
+                &label("Claude only: what `/model <name>` resolves to (bare = picker)"),
             );
         }
 
@@ -533,31 +521,25 @@ impl RunCommand {
         if is("claude") {
             print_opt(
                 "--max-context <size>",
-                "Opt every model slot into a larger context window (e.g. 1m, 2m)",
+                "Larger context window (e.g. 1m, 2m)",
             );
             print_opt("--1m", "Shorthand for --max-context=1m");
             print_opt("--2m", "Shorthand for --max-context=2m");
         } else {
             print_opt(
                 "--max-context <size>",
-                "Set the context window for a model aivo doesn't know yet (e.g. 200k, 1m)",
+                "Context window for unknown models (e.g. 200k)",
             );
         }
         if tool != Some("codex-app") {
-            print_opt(
-                "-c, --context[=<id>]",
-                "Inject one past session (bare = picker; id from `aivo logs --by native`)",
-            );
+            print_opt("-c, --context[=<id>]", "Inject one past session");
         }
 
         section("Key & Auth:");
-        print_opt(
-            "-k, --key <id|name>",
-            "Select API key by ID or name (-k opens key picker)",
-        );
+        print_opt("-k, --key <id|name>", "Select API key by ID or name");
         if is("claude") || is("codex") || is("codex-app") {
             let relogin_desc = if generic {
-                "Force OAuth re-login for the selected key (codex / codex-app / claude)"
+                "Force OAuth re-login (codex/codex-app/claude)"
             } else {
                 "Force OAuth re-login for the selected key"
             };
@@ -567,14 +549,11 @@ impl RunCommand {
         section("Run:");
         print_opt("-r, --refresh", "Bypass cache and fetch fresh model list");
         print_opt("--env <k=v>", "Inject environment variable");
-        print_opt(
-            "--dry-run",
-            "Print resolved command and environment without launching",
-        );
+        print_opt("--dry-run", "Print the resolved command without launching");
         if is("pi") {
             print_opt(
                 "--transparent",
-                &label("Pi only: talk to upstream natively (router is the default)"),
+                &label("Pi only: bypass the router (talk natively)"),
             );
         }
 
@@ -602,7 +581,6 @@ impl RunCommand {
             Some("claude") => {
                 println!("  {}", style::dim("aivo claude"));
                 println!("  {}", style::dim("aivo claude --model claude-sonnet-4.5"));
-                println!("  {}", style::dim("aivo claude --1m -k work"));
                 println!("  {}", style::dim("aivo claude \"fix the login bug\""));
             }
             Some("codex") => {
@@ -636,8 +614,6 @@ impl RunCommand {
                 );
                 println!("  {}", style::dim("aivo claude \"fix the login bug\""));
                 println!("  {}", style::dim("aivo codex \"refactor this function\""));
-                println!("  {}", style::dim("aivo codex-app ."));
-                println!("  {}", style::dim("aivo gemini \"explain this code\""));
             }
         }
     }
