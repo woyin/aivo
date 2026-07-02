@@ -30,18 +30,16 @@ impl ChatTuiApp {
             || self.selection_flash_until.is_some()
     }
 
-    /// Drop a fully-completed plan card so a finished checklist doesn't linger
-    /// into the next task. A completed plan stays pinned (as a done marker) until
-    /// the user sends their next message, at which point this clears it — see the
-    /// pinned plan panel in `render_main`. An unfinished plan is left alone.
-    pub(super) fn clear_completed_plan(&mut self) {
-        let complete = self
+    /// At the next user turn, drop a plan card that's fully completed (done marker)
+    /// or unstarted (an abandoned proposal). A mid-execution plan is left alone.
+    pub(super) fn clear_stale_plan(&mut self) {
+        let stale = self
             .history
             .iter()
             .rev()
             .find(|m| m.role == "plan")
-            .is_some_and(|m| plan_all_completed(&m.content));
-        if complete {
+            .is_some_and(|m| plan_all_completed(&m.content) || plan_unstarted(&m.content));
+        if stale {
             self.drop_plan_entries();
         }
     }

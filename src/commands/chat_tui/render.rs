@@ -2063,6 +2063,23 @@ pub(super) fn plan_all_completed(content: &str) -> bool {
         })
 }
 
+/// True when no step is past `pending` — a proposed plan not yet executed. Dropped
+/// at the next user turn (`clear_stale_plan`); an approved one is re-emitted anyway.
+pub(super) fn plan_unstarted(content: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(content)
+        .ok()
+        .and_then(|v| v.as_array().cloned())
+        .is_some_and(|items| {
+            !items.is_empty()
+                && items.iter().all(|i| {
+                    !matches!(
+                        i.get("status").and_then(|s| s.as_str()),
+                        Some("in_progress") | Some("completed")
+                    )
+                })
+        })
+}
+
 /// Display width of a string (sum of per-character terminal widths).
 fn cell_width(s: &str) -> usize {
     s.chars()

@@ -2183,7 +2183,7 @@ fn test_done_marker_stays_above_new_input_after_plan_clear() {
     app.turn_durations.insert(1, 78_000);
 
     // The next user message clears the completed plan, then appends.
-    app.clear_completed_plan();
+    app.clear_stale_plan();
     app.history.push(ChatMessage {
         role: "user".to_string(),
         content: "second task".to_string(),
@@ -2227,7 +2227,7 @@ fn test_clear_completed_plan_shifts_index_maps() {
     app.turn_durations.insert(2, 5_000);
     app.expanded_thinking.insert(2);
 
-    app.clear_completed_plan();
+    app.clear_stale_plan();
 
     assert_eq!(app.turn_durations.get(&2), None, "stale key dropped");
     assert_eq!(app.turn_durations.get(&1), Some(&5_000), "shifted down one");
@@ -2398,6 +2398,43 @@ async fn test_sandbox_escalation_notice_clears_on_next_output() {
         Some((MUTED, "Queued — sends later".to_string())),
         "unrelated notice survives"
     );
+}
+
+#[tokio::test]
+async fn test_retry_notice_clears_on_recovery_not_stuck() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.tx
+        .send(RuntimeEvent::AgentNotice(
+            "connection issue — retrying (2/3)…".to_string(),
+        ))
+        .unwrap();
+    app.handle_runtime_events().await.unwrap();
+    assert!(app.retrying, "retry flag set");
+    assert!(app.notice.is_some());
+
+    // Output resumes → recovered → notice + flag clear, not stuck.
+    app.tx
+        .send(RuntimeEvent::Delta(ChatResponseChunk::Content(
+            "ok".to_string(),
+        )))
+        .unwrap();
+    app.handle_runtime_events().await.unwrap();
+    assert_eq!(app.notice, None, "retry notice cleared on recovery");
+    assert!(!app.retrying);
+
+    // A real error notice must NOT be cleared by later output.
+    app.tx
+        .send(RuntimeEvent::AgentError("LLM error: boom".to_string()))
+        .unwrap();
+    app.handle_runtime_events().await.unwrap();
+    app.tx
+        .send(RuntimeEvent::Delta(ChatResponseChunk::Content(
+            "x".to_string(),
+        )))
+        .unwrap();
+    app.handle_runtime_events().await.unwrap();
+    assert!(app.notice.is_some(), "unrelated error notice survives");
 }
 
 #[test]
@@ -4696,13 +4733,28 @@ fn test_completed_plan_clears_on_next_user_message() {
 
     // The next user message clears it — `send_user_message` runs this before
     // pushing the turn, so a done plan doesn't linger into a new task.
-    app.clear_completed_plan();
+    app.clear_stale_plan();
     assert_eq!(plan_count(&app), 0, "done plan cleared on next message");
 
-    // An UNFINISHED plan is never auto-cleared — work is still in progress.
-    app.apply_agent_plan(serde_json::json!([{"step": "a", "status": "in_progress"}]));
-    app.clear_completed_plan();
+    // A mid-execution plan (some pending, some done) is never auto-cleared.
+    app.apply_agent_plan(serde_json::json!([
+        {"step": "a", "status": "completed"},
+        {"step": "b", "status": "pending"},
+    ]));
+    app.clear_stale_plan();
     assert_eq!(plan_count(&app), 1, "an active plan must not be cleared");
+
+    // An all-pending proposal is stale once the user moves on — cleared on pivot.
+    app.apply_agent_plan(serde_json::json!([
+        {"step": "a", "status": "pending"},
+        {"step": "b", "status": "pending"},
+    ]));
+    app.clear_stale_plan();
+    assert_eq!(
+        plan_count(&app),
+        0,
+        "unstarted proposal cleared on next message"
+    );
 }
 
 fn dummy_agent_session() -> AgentSession {

@@ -339,6 +339,18 @@ impl ChatTuiApp {
         }
     }
 
+    /// Drop a "…retrying…" notice once the turn recovers or ends so it can't stay
+    /// stuck. Scoped to retry text so a real error notice survives.
+    fn clear_retry_notice(&mut self) {
+        if self
+            .notice
+            .as_ref()
+            .is_some_and(|(_, text)| text.contains("retrying"))
+        {
+            self.notice = None;
+        }
+    }
+
     pub(super) fn apply_agent_tool_call(
         &mut self,
         id: Option<String>,
@@ -584,6 +596,8 @@ impl ChatTuiApp {
             }
         }
         self.retrying = false;
+        // A retry that recovered on the final step has no later chunk to clear it.
+        self.clear_retry_notice();
         self.sending = false;
         self.request_started_at = None;
         self.response_task = None;
@@ -679,6 +693,7 @@ impl ChatTuiApp {
     fn apply_runtime_delta(&mut self, delta: ChatResponseChunk) {
         // Any chunk is progress — a prior connection retry has recovered.
         self.retrying = false;
+        self.clear_retry_notice();
         match delta {
             // Buffer the chunk; `tick_typewriter` reveals it into the displayed
             // reply over the next frames so output reads as fast typing instead

@@ -328,10 +328,9 @@ impl ChatTuiApp {
             attachments: attachments.clone(),
         });
         self.request_started_at = Some(Instant::now());
-        // A finished plan stays pinned as a done marker until now; a new user
-        // message starts (possibly) new work, so clear a completed checklist so it
+        // A new message starts (possibly) new work — drop a stale plan card so it
         // doesn't linger above the composer into an unrelated task.
-        self.clear_completed_plan();
+        self.clear_stale_plan();
         self.history.push(ChatMessage {
             role: "user".to_string(),
             content: input.clone(),
