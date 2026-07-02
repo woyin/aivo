@@ -1411,6 +1411,17 @@ pub(super) enum RuntimeEvent {
         preview: Option<String>,
         reply: tokio::sync::oneshot::Sender<crate::agent::protocol::Decision>,
     },
+    /// The agent's `switch_model`/`set_effort` tools: apply the change and reply to the
+    /// waiting engine task (Ok = confirmation, Err = why not). Same oneshot pattern as
+    /// [`AgentPermission`](Self::AgentPermission).
+    AgentSwitchModel {
+        model: String,
+        reply: tokio::sync::oneshot::Sender<std::result::Result<String, String>>,
+    },
+    AgentSetEffort {
+        level: String,
+        reply: tokio::sync::oneshot::Sender<std::result::Result<String, String>>,
+    },
     /// Live context-window fill from the agent engine mid-turn: `measured` true =
     /// a provider step total (exact), false = a chars/4 request estimate. Moves
     /// the footer's context stat during an agent turn instead of only at the end.

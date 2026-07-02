@@ -93,6 +93,9 @@ pub enum Commands {
     /// Alias for `aivo logs share` — share a session via tunneled viewer URL.
     /// Both forms accept the same flags.
     Share(ShareArgs),
+
+    /// Print a concise guide to using aivo (also read by the built-in chat agent)
+    Guide,
 }
 
 /// Arguments for `aivo login`.

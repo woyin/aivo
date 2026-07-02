@@ -1052,6 +1052,22 @@ pub(super) fn tool_action_label(name: &str, args: &serde_json::Value, cwd: &str)
     if name == "take_note" {
         return "taking a note".to_string();
     }
+    if name == "switch_model" {
+        let m = args.get("model").and_then(|v| v.as_str()).unwrap_or("");
+        return if m.is_empty() {
+            "switching model".to_string()
+        } else {
+            format!("switching model to {m}")
+        };
+    }
+    if name == "set_effort" {
+        let l = args.get("level").and_then(|v| v.as_str()).unwrap_or("");
+        return if l.is_empty() {
+            "setting effort".to_string()
+        } else {
+            format!("setting effort to {l}")
+        };
+    }
     let verb = match name {
         "read_file" => "reading",
         "edit_file" | "multi_edit" => "editing",

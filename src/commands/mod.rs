@@ -87,6 +87,7 @@ pub(crate) mod chat_agent_oneshot;
 pub(crate) mod chat_request_builder;
 pub(crate) mod chat_response_parser;
 pub(crate) mod chat_tui_format;
+pub mod guide;
 pub mod hf;
 pub mod info;
 pub mod keys;

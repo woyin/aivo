@@ -10752,3 +10752,81 @@ fn test_pty_run_collapses_carriage_return_overwrites() {
         "carriage-return overwrites collapse to the final state"
     );
 }
+
+// ---- agent session-control tools (switch_model / set_effort) ----
+
+fn model_choice(id: &str) -> ModelChoice {
+    ModelChoice {
+        id: id.to_string(),
+        label: id.to_string(),
+    }
+}
+
+#[test]
+fn resolve_model_request_exact_and_unique_substring() {
+    let choices = [
+        model_choice("anthropic/claude-opus-4-8"),
+        model_choice("openai/gpt-5"),
+        model_choice("openai/gpt-5-mini"),
+    ];
+    // exact id wins even though it's also a substring of another
+    assert_eq!(
+        super::session_impl::resolve_model_request("OPENAI/GPT-5", &choices).unwrap(),
+        "openai/gpt-5"
+    );
+    assert_eq!(
+        super::session_impl::resolve_model_request("opus", &choices).unwrap(),
+        "anthropic/claude-opus-4-8"
+    );
+}
+
+#[test]
+fn resolve_model_request_ambiguous_and_missing() {
+    let choices = [
+        model_choice("openai/gpt-5"),
+        model_choice("openai/gpt-5-mini"),
+    ];
+    // substring of both, no exact "gpt-5" id → ambiguous
+    let err = super::session_impl::resolve_model_request("gpt-5", &choices).unwrap_err();
+    assert!(err.contains("ambiguous"));
+    assert!(err.contains("openai/gpt-5") && err.contains("openai/gpt-5-mini"));
+    let miss = super::session_impl::resolve_model_request("llama", &choices).unwrap_err();
+    assert!(miss.contains("no model matches") && miss.contains("/model"));
+    // empty catalog accepts the raw string
+    assert_eq!(
+        super::session_impl::resolve_model_request("whatever", &[]).unwrap(),
+        "whatever"
+    );
+}
+
+#[tokio::test]
+async fn agent_set_effort_validates_against_levels() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.raw_model = "gpt-5".to_string();
+    app.model = "gpt-5".to_string();
+    app.model_reasoning_efforts = vec!["low".into(), "medium".into(), "high".into()];
+
+    let ok = app.agent_set_effort("High".to_string()).await.unwrap();
+    assert!(ok.contains("high"));
+    assert_eq!(app.reasoning_effort.as_deref(), Some("high"));
+
+    // invalid level rejected, effort unchanged
+    let err = app.agent_set_effort("turbo".to_string()).await.unwrap_err();
+    assert!(err.contains("low, medium, high"));
+    assert_eq!(app.reasoning_effort.as_deref(), Some("high"));
+
+    app.model_reasoning_efforts.clear();
+    let none = app.agent_set_effort("high".to_string()).await.unwrap_err();
+    assert!(none.contains("no reasoning-effort levels"));
+}
+
+#[tokio::test]
+async fn agent_switch_model_noops_when_already_on_it() {
+    // The already-on-it short-circuit returns before any catalog fetch (no network).
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.raw_model = "gpt-5".to_string();
+    let msg = app.agent_switch_model("GPT-5".to_string()).await.unwrap();
+    assert!(msg.contains("Already using gpt-5"));
+}

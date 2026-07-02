@@ -289,7 +289,15 @@ pub fn is_parallel_safe(name: &str) -> bool {
 pub fn is_read_only(name: &str) -> bool {
     matches!(
         name,
-        "read_file" | "list_dir" | "glob" | "grep" | "web_fetch" | "web_search"
+        "read_file"
+            | "list_dir"
+            | "glob"
+            | "grep"
+            | "web_fetch"
+            | "web_search"
+            // Session controls — change session state, not the workspace.
+            | "switch_model"
+            | "set_effort"
     )
 }
 

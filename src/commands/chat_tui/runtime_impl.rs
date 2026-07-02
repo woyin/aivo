@@ -606,6 +606,13 @@ impl ChatTuiApp {
             } else {
                 engine.set_confirm_before_build();
             }
+            // Interactive chat only — headless (`-e`) and sub-agents build engines elsewhere.
+            engine.set_chat_session_context(crate::agent::engine::ChatSessionContext {
+                model_label: self.raw_model.clone(),
+                provider_label: self.key.display_name().to_string(),
+                effort: self.effective_reasoning_effort(),
+                effort_levels: self.model_reasoning_efforts.clone(),
+            });
             // Share the live thinking toggle so the engine requests reasoning (on
             // reasoning-capable models) only while thinking is on.
             // Offer any named specialist sub-agents authored under
@@ -2218,6 +2225,44 @@ impl crate::agent::engine::AgentUi for ChatAgentUi {
                 return Decision::Deny;
             }
             rx.await.unwrap_or(Decision::Deny)
+        })
+    }
+
+    fn switch_chat_model<'a>(
+        &'a mut self,
+        model: &'a str,
+    ) -> futures::future::BoxFuture<'a, Result<String, String>> {
+        let tx = self.tx.clone();
+        let model = model.to_string();
+        Box::pin(async move {
+            let (reply, rx) = tokio::sync::oneshot::channel();
+            if tx
+                .send(RuntimeEvent::AgentSwitchModel { model, reply })
+                .is_err()
+            {
+                return Err("chat session is no longer running".to_string());
+            }
+            rx.await
+                .unwrap_or_else(|_| Err("chat session is no longer running".to_string()))
+        })
+    }
+
+    fn set_chat_effort<'a>(
+        &'a mut self,
+        level: &'a str,
+    ) -> futures::future::BoxFuture<'a, Result<String, String>> {
+        let tx = self.tx.clone();
+        let level = level.to_string();
+        Box::pin(async move {
+            let (reply, rx) = tokio::sync::oneshot::channel();
+            if tx
+                .send(RuntimeEvent::AgentSetEffort { level, reply })
+                .is_err()
+            {
+                return Err("chat session is no longer running".to_string());
+            }
+            rx.await
+                .unwrap_or_else(|_| Err("chat session is no longer running".to_string()))
         })
     }
 }

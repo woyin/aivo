@@ -208,6 +208,53 @@ impl ChatTuiApp {
         Ok(())
     }
 
+    /// Back the agent's `switch_model` tool: resolve `requested` against the catalog and
+    /// `apply_model` it (takes effect next turn). Err = why not, so the agent can guide to `/model`.
+    pub(super) async fn agent_switch_model(
+        &mut self,
+        requested: String,
+    ) -> std::result::Result<String, String> {
+        let requested = requested.trim().to_string();
+        if requested.is_empty() {
+            return Err("no model given".to_string());
+        }
+        if self.raw_model.eq_ignore_ascii_case(&requested) {
+            return Ok(format!("Already using {}.", self.raw_model));
+        }
+        let choices = load_model_choices(&self.client, &self.key, &self.cache).await;
+        let resolved = resolve_model_request(&requested, &choices)?;
+        self.apply_model(resolved.clone())
+            .await
+            .map_err(|e| format!("couldn't switch model: {e}"))?;
+        Ok(format!(
+            "Switched to {resolved}. It takes effect on the user's next message; the conversation \
+is preserved."
+        ))
+    }
+
+    /// Back the agent's `set_effort` tool: validate `level` against the model's levels and apply it.
+    pub(super) async fn agent_set_effort(
+        &mut self,
+        level: String,
+    ) -> std::result::Result<String, String> {
+        let level = level.trim().to_ascii_lowercase();
+        if self.model_reasoning_efforts.is_empty() {
+            return Err(format!(
+                "{} has no reasoning-effort levels to set.",
+                self.raw_model
+            ));
+        }
+        if !self.model_reasoning_efforts.contains(&level) {
+            return Err(format!(
+                "'{level}' isn't a valid effort for {}. Options: {}.",
+                self.raw_model,
+                self.model_reasoning_efforts.join(", ")
+            ));
+        }
+        self.apply_reasoning_effort(level.clone()).await;
+        Ok(format!("Reasoning effort set to {level}."))
+    }
+
     pub(super) async fn complete_key_switch(
         &mut self,
         key: ApiKey,
@@ -1887,6 +1934,41 @@ pub(super) fn enabled_skill_commands(rows: &[SkillToggle]) -> Vec<SkillCommand> 
             description: i.description.clone(),
         })
         .collect()
+}
+
+/// Resolve the agent's requested model against `choices`: exact id > unique substring >
+/// ambiguity/miss error. An empty catalog (provider lists nothing) accepts the raw string.
+pub(super) fn resolve_model_request(
+    requested: &str,
+    choices: &[ModelChoice],
+) -> std::result::Result<String, String> {
+    if choices.is_empty() {
+        return Ok(requested.to_string());
+    }
+    if let Some(c) = choices
+        .iter()
+        .find(|c| c.id.eq_ignore_ascii_case(requested))
+    {
+        return Ok(c.id.clone());
+    }
+    let needle = requested.to_ascii_lowercase();
+    let matches: Vec<&ModelChoice> = choices
+        .iter()
+        .filter(|c| c.id.to_ascii_lowercase().contains(&needle))
+        .collect();
+    match matches.as_slice() {
+        [one] => Ok(one.id.clone()),
+        [] => Err(format!(
+            "no model matches '{requested}'. Ask the user to run /model to pick, or give an exact id."
+        )),
+        many => {
+            let sample: Vec<&str> = many.iter().take(6).map(|c| c.id.as_str()).collect();
+            Err(format!(
+                "'{requested}' is ambiguous — matches: {}. Ask the user which one, or suggest /model.",
+                sample.join(", ")
+            ))
+        }
+    }
 }
 
 /// Fetch model metadata for the picker, falling back to cached IDs on error.

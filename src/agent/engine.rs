@@ -290,6 +290,24 @@ pub trait AgentUi: Send {
         tool: &'a str,
         preview: Option<&'a str>,
     ) -> BoxFuture<'a, Decision>;
+    /// The `switch_model` tool. Default declines — only the chat TUI drives it.
+    fn switch_chat_model<'a>(
+        &'a mut self,
+        _model: &'a str,
+    ) -> BoxFuture<'a, Result<String, String>> {
+        Box::pin(async {
+            Err("Switching model is only available in interactive `aivo chat`.".to_string())
+        })
+    }
+    /// The `set_effort` tool. Default declines — only the chat TUI drives it.
+    fn set_chat_effort<'a>(&'a mut self, _level: &'a str) -> BoxFuture<'a, Result<String, String>> {
+        Box::pin(async {
+            Err(
+                "Changing reasoning effort is only available in interactive `aivo chat`."
+                    .to_string(),
+            )
+        })
+    }
 }
 
 /// Extra tools beyond the built-ins — currently MCP servers. The engine advertises
@@ -429,8 +447,20 @@ pub struct AgentEngine {
     confirm_before_build: bool,
     /// First-party branding (aivo-starter): present as aivo, not the upstream model.
     first_party: bool,
+    /// Interactive chat only: the `switch_model`/`set_effort` tools are advertised.
+    session_controls: bool,
     /// `(system, tools)` prefix fingerprint from the last turn; checked under `AIVO_DEBUG`.
     prefix_fp: Option<(u64, u64)>,
+}
+
+/// Live `aivo chat` session facts injected into the system prompt so the agent can answer
+/// "what model am I on?" and knows how to change model/effort/key. `model_label` is the
+/// user-facing `raw_model` (safe under first-party branding); `provider_label` is the key name.
+pub struct ChatSessionContext {
+    pub model_label: String,
+    pub provider_label: String,
+    pub effort: Option<String>,
+    pub effort_levels: Vec<String>,
 }
 
 /// Default reasoning-effort level: `AIVO_AGENT_REASONING_EFFORT` or `"medium"`.
@@ -517,6 +547,7 @@ impl AgentEngine {
             read_only: false,
             confirm_before_build: false,
             first_party: false,
+            session_controls: false,
             prefix_fp: None,
         }
     }
@@ -553,6 +584,49 @@ impl AgentEngine {
         };
         if let Some(s) = content.as_str() {
             *content = Value::String(format!("{s}\n\n{CONFIRM_BEFORE_BUILD}"));
+        }
+    }
+
+    /// Interactive chat only: append the live session facts + switch guidance to the system
+    /// prompt (in place, like [`Self::set_first_party`]) and advertise `switch_model`/`set_effort`.
+    pub fn set_chat_session_context(&mut self, ctx: ChatSessionContext) {
+        if self.session_controls {
+            return;
+        }
+        self.session_controls = true;
+        self.tools_openai
+            .push(tool_to_openai(switch_model_tool_spec()));
+        self.tools_openai
+            .push(tool_to_openai(set_effort_tool_spec()));
+        let effort_clause = match &ctx.effort {
+            Some(e) => format!(", reasoning effort: `{e}`"),
+            None => String::new(),
+        };
+        let levels_clause = if ctx.effort_levels.is_empty() {
+            "This model exposes no reasoning-effort levels.".to_string()
+        } else {
+            format!(
+                "This model's effort levels: {}.",
+                ctx.effort_levels.join(", ")
+            )
+        };
+        let block = format!(
+            "This is an interactive `aivo chat` session (not a plain shell). Live setup — model: \
+`{model}`, provider: `{provider}`{effort_clause}. When the user asks what model, provider, or \
+effort they're on, answer from these facts directly. The user can change them live with the \
+slash commands `/model [name]`, `/key [name]` (switches provider/key — starts a fresh chat), \
+and `/effort [level]`. You can change the model or reasoning effort YOURSELF when the user asks: \
+call `switch_model` (pass the model id or a distinctive part) or `set_effort` — don't tell the \
+user you're unable to switch. For a key/provider change, tell them to run `/key` (it starts a new \
+chat, so you shouldn't do it for them). {levels_clause}",
+            model = ctx.model_label,
+            provider = ctx.provider_label,
+        );
+        let Some(content) = self.messages.first_mut().and_then(|m| m.get_mut("content")) else {
+            return;
+        };
+        if let Some(s) = content.as_str() {
+            *content = Value::String(format!("{s}\n\n{block}"));
         }
     }
 
@@ -1452,6 +1526,16 @@ Investigate with read-only tools and write the implementation plan instead."
                     }
                     Err(e) => Err(e),
                 }
+            } else if n == "switch_model" {
+                match call.arguments.get("model").and_then(|v| v.as_str()) {
+                    Some(m) if !m.trim().is_empty() => ui.switch_chat_model(m.trim()).await,
+                    _ => Err("switch_model: missing `model`.".to_string()),
+                }
+            } else if n == "set_effort" {
+                match call.arguments.get("level").and_then(|v| v.as_str()) {
+                    Some(l) if !l.trim().is_empty() => ui.set_chat_effort(l.trim()).await,
+                    _ => Err("set_effort: missing `level`.".to_string()),
+                }
             } else if let Some(ext) = self.external.clone().filter(|e| e.handles(&call.name)) {
                 // External tool — keyed on its raw advertised name (`mcp__*`), never normalized (matches the shadow check).
                 ext.call(&call.name, &call.arguments).await
@@ -2144,6 +2228,44 @@ use its role instead of a generic sub-agent.",
     }
 }
 
+/// Engine-handled — routed to `AgentUi::switch_chat_model`, not `tools::execute`.
+fn switch_model_tool_spec() -> ToolSpec {
+    ToolSpec {
+        name: "switch_model".to_string(),
+        description: "Switch the model powering THIS aivo chat session when the user asks for a \
+different one. Pass the model id or a distinctive part of it (e.g. \"opus\", \"gpt-5\"). The switch \
+takes effect on the user's next message and the conversation is preserved. If the name is \
+ambiguous or unavailable you'll get candidates back — relay them or suggest `/model`."
+            .to_string(),
+        parameters: json!({
+            "type": "object",
+            "properties": {
+                "model": {"type": "string", "description": "Model id, or a distinctive part of it, to switch to."}
+            },
+            "required": ["model"]
+        }),
+    }
+}
+
+/// Engine-handled — routed to `AgentUi::set_chat_effort`.
+fn set_effort_tool_spec() -> ToolSpec {
+    ToolSpec {
+        name: "set_effort".to_string(),
+        description:
+            "Set the reasoning-effort level for THIS aivo chat session (e.g. low, medium, \
+high) when the user asks. Only valid for models that expose effort levels — you'll get the valid \
+options back if the level or the current model doesn't support it."
+                .to_string(),
+        parameters: json!({
+            "type": "object",
+            "properties": {
+                "level": {"type": "string", "description": "Effort level to set (e.g. low, medium, high)."}
+            },
+            "required": ["level"]
+        }),
+    }
+}
+
 /// Capturing UI for a sub-agent run. `cur_text` holds the in-flight step's text,
 /// rolling into `last_nonempty` at each new step. The answer is the converging step's
 /// text, falling back to the last non-empty step (so an answer emitted alongside the
@@ -2470,7 +2592,9 @@ after looking. When several lookups are independent — multiple file reads, gre
 searches — issue them in one turn; aivo runs read-only tools in parallel.\n\n\
 You are part of aivo, so you can inspect aivo itself: for questions about its API keys, models, \
 providers, configuration, or usage, run the `aivo` command (e.g. `aivo keys list`, `aivo \
-models`, `aivo stats`) or read the usage from `aivo --help-json`. Two commands are the \
+models`, `aivo stats`) or read the usage from `aivo --help-json`. For how-to and \"how do I…\" \
+questions about aivo, run `aivo guide` (a built-in usage guide) rather than searching the web. \
+Two commands are the \
 exception: `aivo account login` and `logout` are interactive and act on the user's own device — \
 tell the user to run those in their own terminal rather than running them yourself (run headless \
 they just block until they time out).\n\n\
@@ -5830,6 +5954,117 @@ mod tests {
             .as_str()
             .unwrap_or_default()
             .to_string()
+    }
+
+    #[test]
+    fn chat_session_context_injects_facts_and_tools() {
+        let mut e = AgentEngine::new("/tmp", "gpt-5", "", &[], &[], 0, 0);
+        assert!(!system_content(&e).contains("interactive `aivo chat` session"));
+        assert!(!tool_names(&e).contains(&"switch_model".to_string()));
+
+        e.set_chat_session_context(ChatSessionContext {
+            model_label: "gpt-5".to_string(),
+            provider_label: "openrouter".to_string(),
+            effort: Some("high".to_string()),
+            effort_levels: vec!["low".into(), "medium".into(), "high".into()],
+        });
+        let p = system_content(&e);
+        assert!(p.contains("interactive `aivo chat` session"));
+        assert!(p.contains("gpt-5") && p.contains("openrouter") && p.contains("high"));
+        assert!(p.contains("/model") && p.contains("switch_model") && p.contains("/key"));
+        let names = tool_names(&e);
+        assert!(names.contains(&"switch_model".to_string()));
+        assert!(names.contains(&"set_effort".to_string()));
+        // single-system-message invariant + idempotent
+        assert_eq!(e.messages.len(), 1);
+        e.set_chat_session_context(ChatSessionContext {
+            model_label: "x".into(),
+            provider_label: "y".into(),
+            effort: None,
+            effort_levels: vec![],
+        });
+        assert_eq!(
+            tool_names(&e)
+                .iter()
+                .filter(|n| *n == "switch_model")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn chat_session_context_reports_no_effort_levels() {
+        let mut e = AgentEngine::new("/tmp", "some-model", "", &[], &[], 0, 0);
+        e.set_chat_session_context(ChatSessionContext {
+            model_label: "some-model".into(),
+            provider_label: "prov".into(),
+            effort: None,
+            effort_levels: vec![],
+        });
+        assert!(system_content(&e).contains("no reasoning-effort levels"));
+    }
+
+    #[tokio::test]
+    async fn session_control_tools_route_to_ui_callbacks() {
+        #[derive(Default)]
+        struct SwitchUi {
+            switched: Vec<String>,
+            efforts: Vec<String>,
+        }
+        impl AgentUi for SwitchUi {
+            fn assistant_text(&mut self, _: &str) {}
+            fn tool_start(&mut self, _: &str, _: &Value) {}
+            fn tool_result(&mut self, _: &str, _: &Result<String, String>) {}
+            fn notify(&mut self, _: &str) {}
+            fn footer(&mut self, _: Option<&str>, _: usize, _: u64, _: u64, _: u64) {}
+            fn ask_permission<'a>(
+                &'a mut self,
+                _: &'a str,
+                _: Option<&'a str>,
+            ) -> BoxFuture<'a, Decision> {
+                Box::pin(async { Decision::Allow })
+            }
+            fn switch_chat_model<'a>(
+                &'a mut self,
+                model: &'a str,
+            ) -> BoxFuture<'a, Result<String, String>> {
+                self.switched.push(model.to_string());
+                Box::pin(async { Ok("switched".to_string()) })
+            }
+            fn set_chat_effort<'a>(
+                &'a mut self,
+                level: &'a str,
+            ) -> BoxFuture<'a, Result<String, String>> {
+                self.efforts.push(level.to_string());
+                Box::pin(async { Ok("ok".to_string()) })
+            }
+        }
+
+        let mut e = AgentEngine::new("/tmp", "gpt-5", "", &[], &[], 0, 0);
+        let client = reqwest::Client::new();
+        let cwd = std::path::Path::new(".");
+        let ctx = turn_ctx(&client, "", cwd);
+        let mut ui = SwitchUi::default();
+        let calls = vec![
+            ToolCall {
+                id: "1".into(),
+                name: "switch_model".into(),
+                arguments: json!({"model": "opus"}),
+            },
+            ToolCall {
+                id: "2".into(),
+                name: "set_effort".into(),
+                arguments: json!({"level": "high"}),
+            },
+        ];
+        e.execute_tool_batch(&ctx, &mut ui, &calls).await;
+        assert_eq!(ui.switched, vec!["opus".to_string()]);
+        assert_eq!(ui.efforts, vec!["high".to_string()]);
+
+        // The default trait impl (non-chat host) declines.
+        let mut plain = CapturingUi::default();
+        let declined = plain.switch_chat_model("opus").await.unwrap_err();
+        assert!(declined.contains("interactive"));
     }
 
     /// With no subagents the tool stays generic — no `agent` field, no listing.

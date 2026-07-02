@@ -132,6 +132,14 @@ impl ChatTuiApp {
                 // regardless of scroll), so don't yank the transcript to the
                 // bottom — a user reading earlier output keeps their place.
             }
+            RuntimeEvent::AgentSwitchModel { model, reply } => {
+                let result = self.agent_switch_model(model).await;
+                let _ = reply.send(result);
+            }
+            RuntimeEvent::AgentSetEffort { level, reply } => {
+                let result = self.agent_set_effort(level).await;
+                let _ = reply.send(result);
+            }
             RuntimeEvent::AgentFinished {
                 steps,
                 tokens,

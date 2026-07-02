@@ -204,6 +204,7 @@ pub async fn run() -> ! {
             Commands::Hf(_) => crate::commands::hf::HfCommand::print_help(),
             Commands::Plugins(_) => PluginsCommand::print_help(),
             Commands::Share(_) => ShareCommand::print_help(),
+            Commands::Guide => commands::guide::print_guide(),
         }
         process::exit(0);
     }
@@ -803,6 +804,11 @@ pub async fn run() -> ! {
         Commands::Share(share_args) => {
             let command = ShareCommand::new(session_store);
             command.execute(share_args).await
+        }
+
+        Commands::Guide => {
+            commands::guide::print_guide();
+            ExitCode::Success
         }
 
         Commands::Update(update_args) if update_args.rollback => {
