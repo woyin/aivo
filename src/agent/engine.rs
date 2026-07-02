@@ -2446,7 +2446,10 @@ follow them. (Skip them for questions, chat, or read-only exploration.)",
             guides.join(", ")
         ));
     }
-    p.push_str(&skills::skills_prompt_section(skills));
+    p.push_str(&skills::skills_prompt_section(
+        skills,
+        std::path::Path::new(cwd),
+    ));
     if !date.is_empty() {
         p.push_str(&format!("\n\nCurrent date: {date}."));
     }
