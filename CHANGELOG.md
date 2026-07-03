@@ -1,5 +1,21 @@
 # Changelog
 
+## v0.36.0
+
+The `chat` command is now `code` — the rename signals the agent's growing role.
+Copilot can drive the native agent (with `/responses` fallback), the agent engine
+got a major refactor with stronger safety guards, self-verification, a grant store,
+and LSP integration. Resume is now session-local so it can't override the key's
+default model, and the grid renderer handles tabs and control cells cleanly so
+diffs never ghost.
+
+- feat(code): let Copilot drive the native agent, with /responses fallback (607f0d5)
+- feat(code): confirm model switch with a "Now using <model>" notice (a9ecbcc)
+- feat(agent): refactor agent engine with addn safety, self-verify, grant store, LSP etc. (4ed4aa2)
+- refactor: rename `chat` command to `code` (fa4638e)
+- fix(code): keep resume session-local so it can't reset the key's default model (8a11b6f)
+- fix(chat): expand tabs and scrub control cells so diffs don't ghost the grid (719772c)
+
 ## v0.35.0
 
 The chat agent takes center stage. `aivo chat` is now fully the native agent:
