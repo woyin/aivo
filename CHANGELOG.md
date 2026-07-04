@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.36.1
+
+- feat(code): widen thinking window to 4 lines and use ✓ for multi-select (dc05f87)
+- feat(code): speed up the typewriter reveal animation (a9f98fb)
+- fix(code): un-send a still-pending message on Esc (d9c5cf9)
+- feat(code): plan-approval, multi-select ask_user, and edit-review gate (b882976)
+- feat(code): add ask_user tool and rework thinking display (f213ec6)
+
 ## v0.36.0
 
 The `chat` command is now `code` — the rename signals the agent's growing role.
