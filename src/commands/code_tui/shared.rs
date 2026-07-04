@@ -99,9 +99,9 @@ pub(super) const STATUS_MIN_DURATION: Duration = Duration::from_millis(1500);
 /// `TYPEWRITER_MIN_CHARS` of the buffered stream text (a steady floor so a slow
 /// trickle still types out) plus `1/TYPEWRITER_CATCHUP_DIVISOR` of whatever
 /// backlog remains, so a fast burst catches up in a few frames. At the ~60fps
-/// animating cadence this empties even a long reply in well under a second while
-/// still reading as fast typing.
-pub(super) const TYPEWRITER_MIN_CHARS: usize = 10;
+/// animating cadence the floor alone types ~1800 chars/sec, so even a long reply
+/// empties well under a second while still reading as fast typing.
+pub(super) const TYPEWRITER_MIN_CHARS: usize = 30;
 pub(super) const TYPEWRITER_CATCHUP_DIVISOR: usize = 2;
 
 /// Upper bound on input events drained in a single event-loop pass. A fast
