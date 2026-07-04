@@ -298,6 +298,8 @@ pub fn is_read_only(name: &str) -> bool {
             // Session controls — change session state, not the workspace.
             | "switch_model"
             | "set_effort"
+            // Interactive prompt — reads the user's answer, touches nothing.
+            | "ask_user"
     )
 }
 

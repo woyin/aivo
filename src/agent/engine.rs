@@ -10,6 +10,7 @@ use std::time::Instant;
 use futures::future::BoxFuture;
 use serde_json::{Map, Value, json};
 
+use crate::agent::ask;
 use crate::agent::guards::{self, batch_sig, page_read_key};
 use crate::agent::notes;
 use crate::agent::plan::{self, PlanItem};
@@ -142,6 +143,22 @@ pub trait AgentUi: Send {
         Box::pin(async {
             Err(
                 "Changing reasoning effort is only available in interactive `aivo code`."
+                    .to_string(),
+            )
+        })
+    }
+    /// The `ask_user` tool: pose a question with selectable options and return the
+    /// user's answer as the tool result. Async so the chat TUI can await the card.
+    /// Default declines — headless/sub-agents have no interactive user.
+    fn ask_user<'a>(
+        &'a mut self,
+        _question: &'a str,
+        _options: &'a [crate::agent::ask::AskOption],
+        _allow_free_text: bool,
+    ) -> BoxFuture<'a, Result<String, String>> {
+        Box::pin(async {
+            Err(
+                "Asking the user a question is only available in interactive `aivo code`."
                     .to_string(),
             )
         })
@@ -467,6 +484,8 @@ impl AgentEngine {
             .push(tool_to_openai(switch_model_tool_spec()));
         self.tools_openai
             .push(tool_to_openai(set_effort_tool_spec()));
+        self.tools_openai
+            .push(tool_to_openai(crate::agent::ask::ask_user_tool_spec()));
         let effort_clause = match &ctx.effort {
             Some(e) => format!(", reasoning effort: `{e}`"),
             None => String::new(),
@@ -487,7 +506,11 @@ slash commands `/model [name]`, `/key [name]` (switches provider/key — starts 
 and `/effort [level]`. You can change the model or reasoning effort YOURSELF when the user asks: \
 call `switch_model` (pass the model id or a distinctive part) or `set_effort` — don't tell the \
 user you're unable to switch. For a key/provider change, tell them to run `/key` (it starts a new \
-chat, so you shouldn't do it for them). {levels_clause}",
+chat, so you shouldn't do it for them). {levels_clause} When you need a decision from the user and \
+the answer is one of a few options — a yes/no, a this-or-that, approving a plan — call `ask_user` \
+with those options so they can pick, instead of ending your turn with a plain-text question; the \
+answer returns as the tool result and you continue. Ask in prose only for genuinely open-ended \
+questions.",
             model = ctx.model_label,
             provider = ctx.provider_label,
         );
@@ -1551,6 +1574,14 @@ Investigate with read-only tools and write the implementation plan instead."
                 match call.arguments.get("level").and_then(|v| v.as_str()) {
                     Some(l) if !l.trim().is_empty() => ui.set_chat_effort(l.trim()).await,
                     _ => Err("set_effort: missing `level`.".to_string()),
+                }
+            } else if n == "ask_user" {
+                match ask::parse_ask(&call.arguments) {
+                    Ok((question, options, allow_free_text)) => ui
+                        .ask_user(&question, &options, allow_free_text)
+                        .await
+                        .map(|answer| ask::confirmation(&answer)),
+                    Err(e) => Err(e),
                 }
             } else if let Some(ext) = self.external.clone().filter(|e| e.handles(&call.name)) {
                 // External tool — keyed on its raw advertised name (`mcp__*`), never normalized (matches the shadow check).
@@ -5033,6 +5064,7 @@ mod tests {
         let names = tool_names(&e);
         assert!(names.contains(&"switch_model".to_string()));
         assert!(names.contains(&"set_effort".to_string()));
+        assert!(names.contains(&"ask_user".to_string()));
         // single-system-message invariant + idempotent
         assert_eq!(e.messages.len(), 1);
         e.set_chat_session_context(ChatSessionContext {
@@ -5068,6 +5100,7 @@ mod tests {
         struct SwitchUi {
             switched: Vec<String>,
             efforts: Vec<String>,
+            asked: Vec<(String, Vec<String>, bool)>,
         }
         impl AgentUi for SwitchUi {
             fn assistant_text(&mut self, _: &str) {}
@@ -5096,6 +5129,20 @@ mod tests {
                 self.efforts.push(level.to_string());
                 Box::pin(async { Ok("ok".to_string()) })
             }
+            fn ask_user<'a>(
+                &'a mut self,
+                question: &'a str,
+                options: &'a [crate::agent::ask::AskOption],
+                allow_free_text: bool,
+            ) -> BoxFuture<'a, Result<String, String>> {
+                self.asked.push((
+                    question.to_string(),
+                    options.iter().map(|o| o.label.clone()).collect(),
+                    allow_free_text,
+                ));
+                let answer = options.first().map(|o| o.label.clone()).unwrap_or_default();
+                Box::pin(async move { Ok(answer) })
+            }
         }
 
         let mut e = AgentEngine::new("/tmp", "gpt-5", "", &[], &[], 0, 0);
@@ -5114,10 +5161,27 @@ mod tests {
                 name: "set_effort".into(),
                 arguments: json!({"level": "high"}),
             },
+            ToolCall {
+                id: "3".into(),
+                name: "ask_user".into(),
+                arguments: json!({
+                    "question": "Add release notes now?",
+                    "options": [{"label": "You add them"}, {"label": "Auto-generate"}],
+                    "allow_free_text": false
+                }),
+            },
         ];
         e.execute_tool_batch(&ctx, &mut ui, &calls).await;
         assert_eq!(ui.switched, vec!["opus".to_string()]);
         assert_eq!(ui.efforts, vec!["high".to_string()]);
+        assert_eq!(
+            ui.asked,
+            vec![(
+                "Add release notes now?".to_string(),
+                vec!["You add them".to_string(), "Auto-generate".to_string()],
+                false
+            )]
+        );
 
         // The default trait impl (non-chat host) declines.
         let mut plain = CapturingUi::default();

@@ -1340,7 +1340,7 @@ fn render_detail_lines(
 
 /// Greedy word-wrap to `width` display columns (for error text / descriptions in
 /// a drill-in). A single word wider than `width` overflows rather than splitting.
-fn wrap_chars(text: &str, width: usize) -> Vec<String> {
+pub(super) fn wrap_chars(text: &str, width: usize) -> Vec<String> {
     if width == 0 {
         return Vec::new();
     }

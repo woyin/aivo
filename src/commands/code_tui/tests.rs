@@ -1182,6 +1182,7 @@ fn make_test_app(
         pending_mcp_auth: std::collections::HashMap::new(),
         agent_serve: None,
         agent_permission: None,
+        agent_ask: None,
         agent_auto_approve: false,
         auto_approve_flag: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         thinking_enabled: true,
@@ -1441,38 +1442,43 @@ fn test_build_transcript_shows_pending_status_without_visible_stream() {
 }
 
 #[test]
-fn test_build_transcript_folds_streaming_reasoning_when_enabled() {
+fn test_streaming_reasoning_windows_when_answering() {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let mut app = make_test_app(tx, rx);
     app.thinking_enabled = true;
+    app.transcript_width = 80;
     app.sending = true;
-    app.pending_reasoning = "Inspecting the request\nThen the second detail".to_string();
+    // Once the answer starts, the finished thought shows the same bounded window
+    // (most recent rows) above the reply — not the whole thing.
+    app.pending_reasoning =
+        "Inspecting the request\nSecond detail\nThird detail\nFourth detail".to_string();
     app.pending_response = "Working on it".to_string();
 
     let transcript = app.build_transcript();
     let plain = transcript.plain_lines.join("\n");
 
-    // Live reasoning renders folded so it doesn't expand then collapse as the
-    // answer streams: the ▸ summary previews the first line, the rest stays folded.
-    assert!(plain.contains("▸ thought"));
     assert!(
-        plain.contains("Inspecting the request"),
-        "first-line gist in fold"
+        plain.contains("▸"),
+        "windowed-with-more shows the ▸ expand chevron: {plain}"
     );
     assert!(
-        !plain.contains("Then the second detail"),
-        "later lines stay folded"
+        plain.contains("Fourth detail"),
+        "most recent line in the window"
+    );
+    assert!(
+        !plain.contains("Inspecting the request"),
+        "earliest line scrolls off the window"
     );
     assert!(plain.contains("Working on it"));
 }
 
 #[test]
-fn test_no_folded_summary_during_thinking_only_phase() {
-    // During the thinking-only gap the Thinking heartbeat already signals activity,
-    // so the transcript must not also render a folded summary (avoid the double-up).
+fn test_streams_thinking_window_during_thinking_only_phase() {
+    // Thinking-only gap: the reasoning streams live as a rolling window.
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let mut app = make_test_app(tx, rx);
     app.thinking_enabled = true;
+    app.transcript_width = 80;
     app.sending = true;
     app.history.push(ChatMessage {
         role: "user".to_string(),
@@ -1484,11 +1490,78 @@ fn test_no_folded_summary_during_thinking_only_phase() {
     assert!(app.pending_response.is_empty(), "no answer text yet");
 
     let plain = app.build_transcript().plain_lines.join("\n");
+    assert!(plain.contains("✻"), "streaming window marker: {plain}");
+    assert!(
+        plain.contains("Working out the approach"),
+        "live thought is shown: {plain}"
+    );
     assert!(
         !plain.contains("▸ thought"),
-        "no folded summary during the thinking-only phase: {plain}"
+        "not the committed fold: {plain}"
     );
-    assert!(!plain.contains("Working out the approach"));
+}
+
+#[test]
+fn test_thinking_window_shows_only_recent_lines() {
+    // The live window keeps only the most recent THINKING_WINDOW_LINES lines;
+    // older ones scroll off so it never grows unbounded.
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.thinking_enabled = true;
+    app.sending = true;
+    app.pending_reasoning = "aaa\nbbb\nccc\nddd\neee".to_string();
+    assert!(app.pending_response.is_empty());
+
+    let plain = app.build_transcript().plain_lines.join("\n");
+    assert!(
+        plain.contains("ccc") && plain.contains("ddd") && plain.contains("eee"),
+        "recent lines visible: {plain}"
+    );
+    assert!(
+        !plain.contains("aaa") && !plain.contains("bbb"),
+        "older lines scroll off: {plain}"
+    );
+}
+
+#[test]
+fn test_thinking_wrapped_lines_hang_indented_under_marker() {
+    // A long thought that soft-wraps keeps its continuation rows indented under
+    // the `✻` marker (pre-wrapped to the content width so the transcript wrapper
+    // leaves the already-fitted rows alone).
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.thinking_enabled = true;
+    app.transcript_width = 46;
+    app.history.push(ChatMessage {
+        role: "assistant".to_string(),
+        content: "Here are the changes.".to_string(),
+        reasoning_content: Some(
+            "The user is asking which files changed — likely in the git working \
+directory. I should check git status and recent git log."
+                .to_string(),
+        ),
+        attachments: vec![],
+    });
+    app.transcript_revision = app.transcript_revision.wrapping_add(1);
+    let full = app.build_transcript();
+    let wrapped = wrap_transcript(&full.lines, &full.bar_colors, app.transcript_width);
+    let think: Vec<&String> = wrapped
+        .rows
+        .iter()
+        .filter(|r| r.contains("git") || r.starts_with("✻"))
+        .collect();
+    assert!(
+        think.len() >= 2,
+        "the thought wrapped to multiple rows: {think:?}"
+    );
+    assert!(think[0].starts_with("✻ "), "first row carries the marker");
+    // Every continuation row is indented (two spaces), never flush left.
+    for row in &think[1..] {
+        assert!(
+            row.starts_with("  ") && !row.starts_with("✻"),
+            "wrapped row must hang-indent under the marker: {row:?}"
+        );
+    }
 }
 
 #[test]
@@ -1504,6 +1577,7 @@ fn test_build_transcript_hides_streaming_reasoning_when_disabled() {
     let plain = transcript.plain_lines.join("\n");
 
     assert!(!plain.contains("▸ thought"));
+    assert!(!plain.contains("✻"));
     assert!(!plain.contains("Inspecting the request"));
     assert!(plain.contains("Working on it"));
 }
@@ -1670,6 +1744,7 @@ fn test_thinking_block_has_distinct_bar_color() {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let mut app = make_test_app(tx, rx);
     app.thinking_enabled = true;
+    app.transcript_width = 80;
     app.history.push(ChatMessage {
         role: "assistant".to_string(),
         content: "the answer".to_string(),
@@ -1685,49 +1760,62 @@ fn test_thinking_block_has_distinct_bar_color() {
             .position(|l| l.contains(needle))
             .and_then(|i| t.bar_colors[i])
     };
-    // A committed turn folds its thinking to the `▸ thought` summary.
-    let thinking_bar = bar_for("▸ thought");
+    // A committed turn shows its thinking in full, marked with `✻`, barless.
+    let thinking_bar = bar_for("the reasoning");
     let answer_bar = bar_for("the answer");
     assert_eq!(
         thinking_bar, None,
-        "thinking summary is barless so it recedes as ephemeral meta"
+        "thinking block is barless so it recedes as ephemeral meta"
     );
     assert_eq!(answer_bar, Some(ACCENT), "answer uses the accent bar");
     assert_ne!(thinking_bar, answer_bar);
 }
 
 #[test]
-fn test_history_reasoning_folds_when_thinking_enabled() {
+fn test_history_reasoning_windows_when_thinking_enabled() {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let mut app = make_test_app(tx, rx);
+    app.transcript_width = 80;
     app.history.push(ChatMessage {
         role: "assistant".to_string(),
         content: "the answer".to_string(),
-        reasoning_content: Some("the gist line\nthe private chain of thought".to_string()),
+        reasoning_content: Some(
+            "the gist line\nsecond thought\nthird thought\nthe private chain of thought"
+                .to_string(),
+        ),
         attachments: vec![],
     });
 
-    // On: the folded summary previews the first line; later lines stay folded
-    // (click to expand the full reasoning).
+    // On: a bounded window shows the most recent lines behind the `▸` expand
+    // chevron; earlier lines scroll off (expand to see them).
     app.thinking_enabled = true;
     app.transcript_revision = app.transcript_revision.wrapping_add(1);
     let shown = app.build_transcript().plain_lines.join("\n");
-    assert!(shown.contains("▸ thought"), "folded summary present");
+    assert!(shown.contains("▸"), "windowed-with-more shows ▸: {shown}");
     assert!(
-        shown.contains("the gist line"),
-        "first line previews in the fold"
+        shown.contains("the private chain of thought"),
+        "most recent line is in the window"
     );
     assert!(
-        !shown.contains("the private chain of thought"),
-        "later reasoning lines stay folded"
+        !shown.contains("the gist line"),
+        "the earliest line scrolls off the window"
     );
     assert!(shown.contains("the answer"));
+
+    // Expanded (user clicked): the chevron flips to `▾` and every line shows.
+    app.expanded_thinking.insert(0);
+    app.transcript_revision = app.transcript_revision.wrapping_add(1);
+    let expanded = app.build_transcript().plain_lines.join("\n");
+    assert!(expanded.contains("▾"), "expanded shows ▾: {expanded}");
+    assert!(
+        expanded.contains("the gist line") && expanded.contains("the private chain of thought"),
+        "expanding reveals every line: {expanded}"
+    );
 
     app.thinking_enabled = false;
     app.transcript_revision = app.transcript_revision.wrapping_add(1);
     let hidden = app.build_transcript().plain_lines.join("\n");
-    assert!(!hidden.contains("▸ thought"));
-    assert!(!hidden.contains("the gist line"));
+    assert!(!hidden.contains("✻"));
     assert!(!hidden.contains("the private chain of thought"));
     assert!(hidden.contains("the answer"));
 }
@@ -1749,7 +1837,7 @@ fn test_click_thinking_header_toggles_inline_expansion() {
         });
     }
     // Simulate the rendered rows: each assistant turn is an answer line preceded
-    // by its folded `▸ thought` header, in display (top→bottom) order.
+    // by its full-thought `✻` header, in display (top→bottom) order.
     let hitbox = |rows: Vec<&str>| {
         Some(TranscriptHitbox {
             area: Rect::new(0, 0, 40, 10),
@@ -1758,23 +1846,22 @@ fn test_click_thinking_header_toggles_inline_expansion() {
         })
     };
     app.transcript_hitbox = hitbox(vec![
-        "▸ thought · 1 line",
+        "✻ FIRST cot",
         "first answer",
-        "▸ thought · 1 line",
+        "✻ SECOND cot",
         "second answer",
     ]);
 
-    // Second header → second block (history index 1).
+    // Click the second thought's `✻` header → expand block 1.
     assert!(app.toggle_thinking_at_row(2));
     assert!(app.expanded_thinking.contains(&1));
     assert!(!app.expanded_thinking.contains(&0));
 
-    // Re-click the now-expanded `▾` header collapses it.
+    // Expanded now leads with `▾`; clicking it collapses back to the window.
     app.transcript_hitbox = hitbox(vec![
-        "▸ thought · 1 line",
+        "✻ FIRST cot",
         "first answer",
-        "▾ thought · 1 line",
-        "  SECOND cot",
+        "▾ SECOND cot",
         "second answer",
     ]);
     assert!(app.toggle_thinking_at_row(2));
@@ -1782,9 +1869,9 @@ fn test_click_thinking_header_toggles_inline_expansion() {
 
     // First header → first block (history index 0).
     app.transcript_hitbox = hitbox(vec![
-        "▸ thought · 1 line",
+        "✻ FIRST cot",
         "first answer",
-        "▸ thought · 1 line",
+        "✻ SECOND cot",
         "second answer",
     ]);
     assert!(app.toggle_thinking_at_row(0));
@@ -1799,26 +1886,61 @@ fn test_click_thinking_header_toggles_inline_expansion() {
 }
 
 #[test]
-fn test_thinking_summary_shows_duration_else_line_count() {
+fn test_committed_thinking_windows_and_expands_on_click() {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let mut app = make_test_app(tx, rx);
     app.thinking_enabled = true;
+    app.transcript_width = 80;
+    // Short (≤ window): everything already fits, marked `✻`.
     app.history.push(ChatMessage {
         role: "assistant".to_string(),
         content: "answer".to_string(),
         reasoning_content: Some("line one\nline two".to_string()),
         attachments: vec![],
     });
-
-    // No recorded duration → fall back to the line count.
     let plain = app.build_transcript().plain_lines.join("\n");
-    assert!(plain.contains("▸ thought · 2 lines"), "{plain}");
+    assert!(plain.contains("✻"), "thinking marker present: {plain}");
+    assert!(
+        plain.contains("line one") && plain.contains("line two"),
+        "short thought fits entirely in the window: {plain}"
+    );
 
-    // A recorded duration → seconds (2300ms rounds to 2s).
-    app.reasoning_durations.insert(0, 2300);
+    // Long (> window): the window shows only the most recent rows; earliest scroll
+    // off — until the user expands it.
+    app.history.push(ChatMessage {
+        role: "assistant".to_string(),
+        content: "answer2".to_string(),
+        reasoning_content: Some("alpha\nbeta\ngamma\ndelta".to_string()),
+        attachments: vec![],
+    });
     app.transcript_revision = app.transcript_revision.wrapping_add(1);
     let plain = app.build_transcript().plain_lines.join("\n");
-    assert!(plain.contains("▸ thought for 2s"), "{plain}");
+    // Short thought keeps `✻` (nothing hidden); the long one shows `▸` (more to
+    // reveal) and is not yet expanded.
+    assert!(plain.contains("✻"), "short thought keeps ✻: {plain}");
+    assert!(
+        plain.contains("▸"),
+        "long windowed thought shows ▸: {plain}"
+    );
+    assert!(!plain.contains("▾"), "nothing expanded yet: {plain}");
+    assert!(plain.contains("delta"), "most recent line shown: {plain}");
+    assert!(
+        !plain.contains("alpha"),
+        "earliest line scrolls off: {plain}"
+    );
+
+    // Expand the long one (index 1): the marker flips to `▾` and every line shows.
+    app.expanded_thinking.insert(1);
+    app.transcript_revision = app.transcript_revision.wrapping_add(1);
+    let plain = app.build_transcript().plain_lines.join("\n");
+    assert!(
+        plain.contains("▾"),
+        "expanded thought carries the ▾ marker: {plain}"
+    );
+    assert!(
+        plain.contains("alpha") && plain.contains("delta"),
+        "expanding reveals every line: {plain}"
+    );
 }
 
 #[test]
@@ -10486,6 +10608,135 @@ fn test_permission_card_native_always_label_is_plain() {
         !screen.contains("this session"),
         "native 'always' is scoped, not session-wide:\n{screen}"
     );
+}
+
+fn ask_options(labels: &[&str]) -> Vec<crate::agent::ask::AskOption> {
+    labels
+        .iter()
+        .map(|l| crate::agent::ask::AskOption {
+            label: (*l).to_string(),
+            description: None,
+        })
+        .collect()
+}
+
+/// The `ask_user` card: ↓ moves the highlight, Enter picks it, and the chosen
+/// label is sent back to the waiting engine task as the answer.
+#[tokio::test]
+async fn test_ask_card_arrow_then_enter_selects_option() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    let (reply, answer_rx) = tokio::sync::oneshot::channel::<std::result::Result<String, String>>();
+    app.agent_ask = Some(PendingAskUser {
+        question: "Add release notes now?".to_string(),
+        options: ask_options(&["Yes, I'll write them", "You add them", "No, auto-generate"]),
+        allow_free_text: true,
+        selected: 0,
+        reply,
+    });
+
+    app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE))
+        .await
+        .unwrap();
+    app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        .await
+        .unwrap();
+
+    assert!(app.agent_ask.is_none(), "answering resolves the card");
+    assert_eq!(answer_rx.await.unwrap(), Ok("You add them".to_string()));
+}
+
+/// A digit key jumps straight to that option and picks it (numbered-menu style).
+#[tokio::test]
+async fn test_ask_card_digit_picks_option() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    let (reply, answer_rx) = tokio::sync::oneshot::channel::<std::result::Result<String, String>>();
+    app.agent_ask = Some(PendingAskUser {
+        question: "Pick one".to_string(),
+        options: ask_options(&["alpha", "beta", "gamma"]),
+        allow_free_text: true,
+        selected: 0,
+        reply,
+    });
+
+    app.handle_key(KeyEvent::new(KeyCode::Char('3'), KeyModifiers::NONE))
+        .await
+        .unwrap();
+
+    assert!(app.agent_ask.is_none());
+    assert_eq!(answer_rx.await.unwrap(), Ok("gamma".to_string()));
+}
+
+/// With free text allowed, typing an answer and pressing Enter submits the draft
+/// as the answer (rather than queueing it as a chat message).
+#[tokio::test]
+async fn test_ask_card_free_text_answer() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    let (reply, answer_rx) = tokio::sync::oneshot::channel::<std::result::Result<String, String>>();
+    app.agent_ask = Some(PendingAskUser {
+        question: "Which version?".to_string(),
+        options: ask_options(&["patch", "minor"]),
+        allow_free_text: true,
+        selected: 0,
+        reply,
+    });
+
+    app.draft = "0.36.0".to_string();
+    app.cursor = app.draft.len();
+    app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        .await
+        .unwrap();
+
+    assert!(app.agent_ask.is_none());
+    assert!(app.draft.is_empty(), "the draft is consumed as the answer");
+    assert_eq!(answer_rx.await.unwrap(), Ok("0.36.0".to_string()));
+}
+
+/// Esc dismisses the card; the engine's `ask_user` future then resolves to an
+/// error it surfaces as the tool result.
+#[tokio::test]
+async fn test_ask_card_esc_dismisses() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    let (reply, answer_rx) = tokio::sync::oneshot::channel::<std::result::Result<String, String>>();
+    app.agent_ask = Some(PendingAskUser {
+        question: "Proceed?".to_string(),
+        options: ask_options(&["Yes", "No"]),
+        allow_free_text: false,
+        selected: 0,
+        reply,
+    });
+
+    app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+        .await
+        .unwrap();
+
+    assert!(app.agent_ask.is_none(), "Esc resolves the card");
+    assert!(answer_rx.await.unwrap().is_err());
+}
+
+/// The card renders the question, the numbered options, and the nav hint.
+#[test]
+fn test_ask_card_renders_question_and_options() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    let (reply, _rx) = tokio::sync::oneshot::channel::<std::result::Result<String, String>>();
+    app.agent_ask = Some(PendingAskUser {
+        question: "Add release notes now?".to_string(),
+        options: ask_options(&["You add them", "Auto-generate"]),
+        allow_free_text: true,
+        selected: 0,
+        reply,
+    });
+    let (screen, _rows) = render_full_screen(&mut app, 70, 20);
+    assert!(
+        screen.contains("Add release notes now?"),
+        "question missing:\n{screen}"
+    );
+    assert!(screen.contains("You add them"), "option missing:\n{screen}");
+    assert!(screen.contains("select"), "nav hint missing:\n{screen}");
 }
 
 /// Messages submitted while a turn is in flight queue in order — a second one

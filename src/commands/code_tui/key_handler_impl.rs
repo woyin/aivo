@@ -58,6 +58,15 @@ impl CodeTuiApp {
             return self.handle_editor_key(key).await;
         }
 
+        // The `ask_user` card owns nav/selection on an empty composer; keys fall
+        // through to the editor once a free-text answer is being typed.
+        if self.agent_ask.is_some() {
+            if self.handle_ask_user_key(key) {
+                return Ok(false);
+            }
+            return self.handle_editor_key(key).await;
+        }
+
         if let Some(should_exit) = self.handle_overlay_key(key).await? {
             return Ok(should_exit);
         }
@@ -137,6 +146,124 @@ impl CodeTuiApp {
             let _ = pending.reply.send(decision);
         }
         true
+    }
+
+    /// Resolve a key against the `ask_user` card. On an empty composer: ↑/↓
+    /// (Ctrl+P/N) move, a digit picks, Enter picks the highlighted, Esc dismisses.
+    /// While a free-text answer is being typed, Enter submits it. Returns `true`
+    /// when consumed, `false` to hand the key to the editor.
+    fn handle_ask_user_key(&mut self, key: KeyEvent) -> bool {
+        let Some(ask) = self.agent_ask.as_ref() else {
+            return false;
+        };
+        let len = ask.options.len();
+        let allow_free_text = ask.allow_free_text;
+
+        // Esc dismisses regardless of composer state — Esc is never message text.
+        if matches!(key.code, KeyCode::Esc) {
+            self.dismiss_ask_user();
+            return true;
+        }
+
+        // Mid-composing a free-text answer: Enter submits the draft as the answer;
+        // every other key falls through so the user keeps typing.
+        if !self.draft.is_empty() {
+            if allow_free_text
+                && matches!(key.code, KeyCode::Enter)
+                && !key.modifiers.contains(KeyModifiers::CONTROL)
+            {
+                let answer = self.draft.trim().to_string();
+                if answer.is_empty() {
+                    return false;
+                }
+                self.record_draft_history(&answer);
+                self.draft.clear();
+                self.cursor = 0;
+                self.command_menu.reset();
+                self.draft_history_index = None;
+                self.draft_history_stash = None;
+                self.answer_ask_user(answer);
+                return true;
+            }
+            return false;
+        }
+
+        // Empty composer: the card owns navigation + selection.
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        match key.code {
+            KeyCode::Up => {
+                self.move_ask_selection(-1);
+                true
+            }
+            KeyCode::Char('p') if ctrl => {
+                self.move_ask_selection(-1);
+                true
+            }
+            KeyCode::Down => {
+                self.move_ask_selection(1);
+                true
+            }
+            KeyCode::Char('n') if ctrl => {
+                self.move_ask_selection(1);
+                true
+            }
+            KeyCode::Enter if !ctrl => {
+                let idx = self.agent_ask.as_ref().map(|a| a.selected).unwrap_or(0);
+                self.select_ask_option(idx);
+                true
+            }
+            // A 1–9 digit picks that option (numbered-menu style).
+            KeyCode::Char(c) if c.is_ascii_digit() && c != '0' => {
+                let idx = (c as usize) - ('1' as usize);
+                if idx < len {
+                    self.select_ask_option(idx);
+                    true
+                } else {
+                    !allow_free_text
+                }
+            }
+            // Otherwise fall through to the editor when free text is allowed, else
+            // the card swallows the key.
+            _ => !allow_free_text,
+        }
+    }
+
+    /// Move the `ask_user` highlight by `delta`, clamped to the option range.
+    fn move_ask_selection(&mut self, delta: isize) {
+        if let Some(ask) = self.agent_ask.as_mut() {
+            let last = ask.options.len().saturating_sub(1);
+            ask.selected = (ask.selected as isize + delta).clamp(0, last as isize) as usize;
+        }
+    }
+
+    /// Pick option `idx` and send its label back to the waiting engine task.
+    fn select_ask_option(&mut self, idx: usize) {
+        let Some(ask) = self.agent_ask.take() else {
+            return;
+        };
+        let answer = ask
+            .options
+            .get(idx)
+            .map(|o| o.label.clone())
+            .unwrap_or_default();
+        let _ = ask.reply.send(Ok(answer));
+    }
+
+    /// Send a free-text answer back to the waiting engine task.
+    fn answer_ask_user(&mut self, answer: String) {
+        if let Some(ask) = self.agent_ask.take() {
+            let _ = ask.reply.send(Ok(answer));
+        }
+    }
+
+    /// Dismiss the card without answering — the engine gets the stop-don't-decide
+    /// directive as the tool result.
+    fn dismiss_ask_user(&mut self) {
+        if let Some(ask) = self.agent_ask.take() {
+            let _ = ask
+                .reply
+                .send(Err(crate::agent::ask::DISMISSED_DIRECTIVE.to_string()));
+        }
     }
 
     /// Set session auto-approve and mirror it to the shared live flag the running

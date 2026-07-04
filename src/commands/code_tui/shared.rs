@@ -1443,6 +1443,14 @@ pub(super) enum RuntimeEvent {
         level: String,
         reply: tokio::sync::oneshot::Sender<std::result::Result<String, String>>,
     },
+    /// The agent's `ask_user` tool: show the card, reply with the answer. Same
+    /// oneshot pattern as [`AgentPermission`](Self::AgentPermission).
+    AgentAskUser {
+        question: String,
+        options: Vec<crate::agent::ask::AskOption>,
+        allow_free_text: bool,
+        reply: tokio::sync::oneshot::Sender<std::result::Result<String, String>>,
+    },
     /// Live context-window fill from the agent engine mid-turn: `measured` true =
     /// a provider step total (exact), false = a chars/4 request estimate. Moves
     /// the footer's context stat during an agent turn instead of only at the end.
@@ -1508,6 +1516,17 @@ pub(super) struct PendingPermission {
     pub(super) tool: String,
     pub(super) preview: Option<String>,
     pub(super) reply: tokio::sync::oneshot::Sender<crate::agent::protocol::Decision>,
+}
+
+/// A pending `ask_user` card: `reply` delivers the chosen/typed answer to the
+/// waiting engine task (`selected` = highlighted option). Dropping it unreplied
+/// resolves the engine's future to an error.
+pub(super) struct PendingAskUser {
+    pub(super) question: String,
+    pub(super) options: Vec<crate::agent::ask::AskOption>,
+    pub(super) allow_free_text: bool,
+    pub(super) selected: usize,
+    pub(super) reply: tokio::sync::oneshot::Sender<std::result::Result<String, String>>,
 }
 
 /// Active `/goal` autonomous loop: after each agent turn the app auto-continues
@@ -1760,6 +1779,8 @@ pub(super) struct CodeTuiApp {
     )>,
     /// Pending tool-permission card, while the agent waits for the user's y/n/a.
     pub(super) agent_permission: Option<PendingPermission>,
+    /// Pending `ask_user` question card, while the agent waits for the user's pick.
+    pub(super) agent_ask: Option<PendingAskUser>,
     /// Session decision on spawning a repo's project `.mcp.json` stdio servers.
     pub(super) project_mcp_consent: ProjectMcpConsent,
     /// Pending consent card for project MCP servers (held back until decided).
@@ -1816,14 +1837,14 @@ pub(super) struct CodeTuiApp {
     /// output shown in place of the folded preview). In-memory only; cleared with
     /// `expanded_thinking`. A toggle bumps `transcript_revision` so the flip repaints.
     pub(super) expanded_output: std::collections::HashSet<usize>,
-    /// History indices of assistant turns the user expanded inline (full reasoning
-    /// shown in place of the folded summary). In-memory only; cleared when history
-    /// is replaced (new chat, resume, rewind). A toggle bumps `transcript_revision`,
-    /// the body-cache key, so a flip repaints.
+    /// History indices of assistant turns the user COLLAPSED (folded to the `▸`
+    /// summary). Thoughts show in full by default, so this set holds the exceptions.
+    /// In-memory only; cleared when history is replaced (new chat, resume, rewind).
+    /// A toggle bumps `transcript_revision`, the body-cache key, so a flip repaints.
     pub(super) expanded_thinking: std::collections::HashSet<usize>,
-    /// Thinking duration (ms) per committed assistant turn, by history index;
-    /// drives the folded `▸ thought for Ns` summary. In-memory only, cleared
-    /// alongside `expanded_thinking`.
+    /// Thinking duration (ms) per committed assistant turn, by history index.
+    /// Recorded but no longer surfaced (thoughts show content, not timing).
+    /// In-memory only, cleared alongside `expanded_thinking`.
     pub(super) reasoning_durations: std::collections::HashMap<usize, u64>,
     /// Wall time (ms) a finished turn took, by the history index of its last entry;
     /// drives the `✶ Done in …` marker. In-memory only, cleared with `expanded_thinking`.

@@ -140,6 +140,20 @@ impl CodeTuiApp {
                 let result = self.agent_set_effort(level).await;
                 let _ = reply.send(result);
             }
+            RuntimeEvent::AgentAskUser {
+                question,
+                options,
+                allow_free_text,
+                reply,
+            } => {
+                self.agent_ask = Some(PendingAskUser {
+                    question,
+                    options,
+                    allow_free_text,
+                    selected: 0,
+                    reply,
+                });
+            }
             RuntimeEvent::AgentFinished {
                 steps,
                 tokens,
@@ -611,6 +625,7 @@ impl CodeTuiApp {
         self.response_task = None;
         self.pending_submit = None;
         self.agent_permission = None;
+        self.agent_ask = None;
         self.stop_agent_serve();
         // Adopt + persist the protocol the serve negotiated this turn.
         self.persist_agent_route().await;
@@ -827,6 +842,7 @@ impl CodeTuiApp {
         self.request_started_at = None;
         self.pending_submit = None;
         self.agent_permission = None;
+        self.agent_ask = None;
         self.queued_messages.clear();
         self.stop_agent_serve();
         self.follow_output = true;

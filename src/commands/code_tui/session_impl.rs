@@ -1646,6 +1646,7 @@ is preserved."
         // session's thread (`/new` and key/model switches reset it the same way).
         self.agent_engine = None;
         self.agent_permission = None;
+        self.agent_ask = None;
         self.stop_agent_serve();
         self.session_id = session.session_id;
         // Re-seed the running token total from the stored entry so further turns

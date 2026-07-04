@@ -1746,6 +1746,7 @@ impl CodeTuiApp {
         // A fresh chat must not inherit a resumed session's pending transcript.
         self.pending_agent_messages = None;
         self.agent_permission = None;
+        self.agent_ask = None;
         self.stop_agent_serve();
     }
 
@@ -1773,6 +1774,7 @@ impl CodeTuiApp {
         // (the dropped reply makes the engine's awaiting tool fail closed).
         self.stop_agent_serve();
         self.agent_permission = None;
+        self.agent_ask = None;
         self.queued_messages.clear();
         if was_sending && let Some(session) = self.cursor_acp_session.as_ref() {
             // Fire-and-forget session/cancel so the agent stops generating
@@ -1841,6 +1843,7 @@ impl CodeTuiApp {
         // Tear down an agent turn's serve / permission card if this was one.
         self.stop_agent_serve();
         self.agent_permission = None;
+        self.agent_ask = None;
         self.queued_messages.clear();
 
         let partial = std::mem::take(&mut self.pending_response);
@@ -2267,6 +2270,34 @@ impl crate::agent::engine::AgentUi for ChatAgentUi {
             }
             rx.await
                 .unwrap_or_else(|_| Err("session is no longer running".to_string()))
+        })
+    }
+
+    fn ask_user<'a>(
+        &'a mut self,
+        question: &'a str,
+        options: &'a [crate::agent::ask::AskOption],
+        allow_free_text: bool,
+    ) -> futures::future::BoxFuture<'a, Result<String, String>> {
+        let tx = self.tx.clone();
+        let question = question.to_string();
+        let options = options.to_vec();
+        Box::pin(async move {
+            let (reply, rx) = tokio::sync::oneshot::channel();
+            if tx
+                .send(RuntimeEvent::AgentAskUser {
+                    question,
+                    options,
+                    allow_free_text,
+                    reply,
+                })
+                .is_err()
+            {
+                return Err("session is no longer running".to_string());
+            }
+            // A dropped card (interrupt / session end) reads as a dismissal.
+            rx.await
+                .unwrap_or_else(|_| Err(crate::agent::ask::DISMISSED_DIRECTIVE.to_string()))
         })
     }
 }

@@ -5,6 +5,7 @@
 //! the shared data types; `serve_client` is the streaming provider call.
 
 pub mod apply_patch;
+pub mod ask;
 pub mod checkpoint;
 pub mod compaction;
 pub mod engine;

@@ -223,6 +223,7 @@ impl CodeTuiApp {
             pending_mcp_auth: std::collections::HashMap::new(),
             agent_serve: None,
             agent_permission: None,
+            agent_ask: None,
             agent_auto_approve: auto_approve,
             auto_approve_flag: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
                 auto_approve,

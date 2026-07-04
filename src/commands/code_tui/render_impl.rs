@@ -183,17 +183,9 @@ impl CodeTuiApp {
                         .thinking_enabled
                         .then_some(message.reasoning_content.as_deref())
                         .flatten();
-                    // Folds to the thinking summary unless this turn's index is in
-                    // `expanded_thinking`. Separate barred blocks give the thinking
-                    // gutter its own color; `block` stays empty so the generic push
-                    // below no-ops.
-                    let collapsed = !self.expanded_thinking.contains(&idx);
-                    let duration_ms = self.reasoning_durations.get(&idx).copied();
-                    let view = reasoning.map(|text| ReasoningView {
-                        text,
-                        collapsed,
-                        duration_ms,
-                    });
+                    // Windowed by default; expanded only for turns the user clicked.
+                    let expanded = self.expanded_thinking.contains(&idx);
+                    let view = reasoning.map(|text| ReasoningView { text, expanded });
                     if self.plan_card_idx == Some(idx) {
                         push_plan_card(&mut lines, &mut bars, view, &message.content, text_width);
                     } else {
@@ -334,11 +326,18 @@ impl CodeTuiApp {
         if self.is_transcript_empty() {
             return (lines, bars);
         }
-        // Only render the live tail once the answer has started: during the
-        // thinking-only phase the spinner already shows "thinking (Xs ...)", and a
-        // folded `▸ thought` line here would double it. The summary is frozen at
-        // the answer's start so it matches the committed form (no jump on commit).
-        if !self.pending_response.is_empty() {
+        if self.pending_response.is_empty() {
+            // Thinking-only phase: stream the reasoning as a rolling window so the
+            // user watches it think (the spinner carries elapsed/tokens).
+            if self.thinking_enabled && reasoning_is_substantive(&self.pending_reasoning) {
+                lines.push(blank_line());
+                bars.push(None);
+                let mut block = Vec::new();
+                render_reasoning_window(&mut block, &self.pending_reasoning, text_width);
+                push_block(&mut lines, &mut bars, block, None);
+            }
+        } else {
+            // Answer started: show the same window above the streaming reply.
             let live_reasoning = (self.thinking_enabled
                 && reasoning_is_substantive(&self.pending_reasoning))
             .then_some(self.pending_reasoning.as_str());
@@ -349,8 +348,7 @@ impl CodeTuiApp {
                 &mut bars,
                 live_reasoning.map(|text| ReasoningView {
                     text,
-                    collapsed: true,
-                    duration_ms: self.segment_reasoning_ms(),
+                    expanded: false,
                 }),
                 &self.pending_response,
                 text_width,
@@ -859,6 +857,8 @@ impl CodeTuiApp {
             self.render_mcp_consent_card(frame, composer_area, outer);
         } else if self.agent_permission.is_some() {
             self.render_permission_card(frame, composer_area, outer);
+        } else if self.agent_ask.is_some() {
+            self.render_ask_user_card(frame, composer_area, outer);
         }
 
         // Snapshot the finished screen so a drag can copy from anywhere on it,
@@ -1162,6 +1162,130 @@ impl CodeTuiApp {
             .border_style(Style::default().fg(ACCENT))
             .title(Span::styled(
                 " permission ",
+                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+            ));
+        let inner = block.inner(card).inner(ratatui::layout::Margin {
+            vertical: 0,
+            horizontal: 1,
+        });
+        frame.render_widget(block, card);
+        frame.render_widget(Paragraph::new(Text::from(lines)), inner);
+    }
+
+    /// The `ask_user` card: question, numbered pick-list (`❯` = highlighted), key
+    /// hint. Floats above the composer like the permission card, clamped to the
+    /// rows above.
+    fn render_ask_user_card(&self, frame: &mut Frame<'_>, composer_area: Rect, frame_area: Rect) {
+        let Some(ask) = self.agent_ask.as_ref() else {
+            return;
+        };
+        let anchor = composer_area.y.saturating_sub(1);
+        let max_total = anchor.saturating_sub(frame_area.y).max(1);
+        let max_width = composer_area.width.min(frame_area.width).max(1);
+        let inner_cap = usize::from(max_width.saturating_sub(4)).max(1);
+
+        // Question wraps to at most 3 lines; options render as "N. label — desc".
+        let mut q_lines = super::overlay_render_impl::wrap_chars(&ask.question, inner_cap);
+        q_lines.truncate(3);
+        let opt_plain: Vec<String> = ask
+            .options
+            .iter()
+            .enumerate()
+            .map(|(i, o)| match &o.description {
+                Some(d) => format!("{}. {} — {}", i + 1, o.label, d),
+                None => format!("{}. {}", i + 1, o.label),
+            })
+            .collect();
+
+        // Size to the widest visible line (question / option+marker / keys).
+        let keys = ask_user_keys_line(ask.allow_free_text);
+        let keys_w: usize = keys
+            .spans
+            .iter()
+            .map(|s| display_width(s.content.as_ref()))
+            .sum();
+        let mut content_w = keys_w;
+        for l in &q_lines {
+            content_w = content_w.max(display_width(l));
+        }
+        for s in &opt_plain {
+            content_w = content_w.max(display_width(s) + 2);
+        }
+        let width = (content_w as u16).saturating_add(4).clamp(1, max_width);
+        let inner_width = usize::from(width.saturating_sub(4)).max(1);
+
+        // Assemble lines; trim the option list from the bottom if the card would
+        // overrun the space above the composer (keys/question stay visible).
+        let mut lines: Vec<Line<'static>> = Vec::new();
+        for l in &q_lines {
+            lines.push(Line::from(Span::styled(
+                truncate_for_display_width(l, inner_width),
+                Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
+            )));
+        }
+        lines.push(Line::from(""));
+        // Fixed chrome after the options: blank + keys + 2 borders.
+        let chrome_after = 3usize;
+        let option_budget = usize::from(max_total)
+            .saturating_sub(lines.len() + chrome_after)
+            .max(1);
+        let shown = ask.options.len().min(option_budget);
+        for (i, opt) in ask.options.iter().enumerate().take(shown) {
+            let selected = i == ask.selected;
+            let marker_style = if selected {
+                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(FAINT)
+            };
+            let label_style = if selected {
+                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(TEXT)
+            };
+            let mut spans = vec![
+                Span::styled(if selected { "❯ " } else { "  " }, marker_style),
+                Span::styled(format!("{}. ", i + 1), Style::default().fg(MUTED)),
+            ];
+            // The description (FAINT) only shows if it still fits after the label.
+            let label = truncate_for_display_width(&opt.label, inner_width.saturating_sub(3));
+            let used = display_width(&label) + 3;
+            spans.push(Span::styled(label, label_style));
+            if let Some(desc) = opt
+                .description
+                .as_deref()
+                .filter(|_| used + 3 < inner_width)
+            {
+                let room = inner_width - used - 3;
+                spans.push(Span::styled(
+                    format!(" — {}", truncate_for_display_width(desc, room)),
+                    Style::default().fg(FAINT),
+                ));
+            }
+            lines.push(Line::from(spans));
+        }
+        if shown < ask.options.len() {
+            lines.push(Line::from(Span::styled(
+                format!("  …{} more", ask.options.len() - shown),
+                Style::default().fg(FAINT),
+            )));
+        }
+        lines.push(Line::from(""));
+        lines.push(keys);
+
+        let height = (lines.len() as u16 + 2).min(max_total);
+        let y = anchor.saturating_sub(height).max(frame_area.y);
+        let card = Rect {
+            x: composer_area.x,
+            y,
+            width,
+            height,
+        };
+        frame.render_widget(Clear, card);
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(ACCENT))
+            .title(Span::styled(
+                " question ",
                 Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
             ));
         let inner = block.inner(card).inner(ratatui::layout::Margin {
@@ -2026,6 +2150,8 @@ impl CodeTuiApp {
             vec![("y", "run"), ("a", "always"), ("n", "deny")]
         } else if self.agent_permission.is_some() {
             vec![("y", "allow"), ("n", "deny"), ("a", "always")]
+        } else if self.agent_ask.is_some() {
+            vec![("↑↓", "move"), ("↵", "select"), ("esc", "dismiss")]
         } else if self.sending {
             vec![("esc", "interrupt"), ("type", "queue next")]
         } else {
@@ -2293,6 +2419,33 @@ fn permission_keys_line(tool: &str, composing: bool) -> Line<'static> {
         keycap("n", ERROR),
         label(" deny"),
     ])
+}
+
+/// The `ask_user` card's key-hint row (with a "type your own" note when allowed).
+fn ask_user_keys_line(allow_free_text: bool) -> Line<'static> {
+    let keycap = |key: &str| {
+        Span::styled(
+            key.to_string(),
+            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+        )
+    };
+    let label = |text: &str| Span::styled(text.to_string(), Style::default().fg(MUTED));
+    let gap = || Span::styled("    ".to_string(), Style::default().fg(FAINT));
+    let mut spans = vec![
+        keycap("↑↓"),
+        label(" move"),
+        gap(),
+        keycap("↵"),
+        label(" select"),
+    ];
+    if allow_free_text {
+        spans.push(gap());
+        spans.push(label("type your own"));
+    }
+    spans.push(gap());
+    spans.push(keycap("esc"));
+    spans.push(label(" dismiss"));
+    Line::from(spans)
 }
 
 #[cfg(test)]
