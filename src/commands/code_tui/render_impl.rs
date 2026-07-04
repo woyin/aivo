@@ -1206,7 +1206,7 @@ impl CodeTuiApp {
             .iter()
             .map(|s| display_width(s.content.as_ref()))
             .sum();
-        // Multi-select prefixes each option with a "[x] " checkbox.
+        // Multi-select prefixes each option with a "[✓] " checkbox.
         let box_w = if ask.multi_select { 4 } else { 0 };
         let mut content_w = keys_w;
         for l in &q_lines {
@@ -1258,7 +1258,7 @@ impl CodeTuiApp {
                     Style::default().fg(FAINT)
                 };
                 spans.push(Span::styled(
-                    if checked { "[x] " } else { "[ ] " },
+                    if checked { "[✓] " } else { "[ ] " },
                     box_style,
                 ));
             }

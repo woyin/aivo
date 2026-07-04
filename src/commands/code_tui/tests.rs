@@ -1454,7 +1454,8 @@ fn test_streaming_reasoning_windows_when_answering() {
     // Once the answer starts, the finished thought shows the same bounded window
     // (most recent rows) above the reply — not the whole thing.
     app.pending_reasoning =
-        "Inspecting the request\nSecond detail\nThird detail\nFourth detail".to_string();
+        "Inspecting the request\nSecond detail\nThird detail\nExtra detail\nFourth detail"
+            .to_string();
     app.pending_response = "Working on it".to_string();
 
     let transcript = app.build_transcript();
@@ -1517,13 +1518,13 @@ fn test_thinking_window_shows_only_recent_lines() {
 
     let plain = app.build_transcript().plain_lines.join("\n");
     assert!(
-        plain.contains("ccc") && plain.contains("ddd") && plain.contains("eee"),
+        plain.contains("bbb")
+            && plain.contains("ccc")
+            && plain.contains("ddd")
+            && plain.contains("eee"),
         "recent lines visible: {plain}"
     );
-    assert!(
-        !plain.contains("aaa") && !plain.contains("bbb"),
-        "older lines scroll off: {plain}"
-    );
+    assert!(!plain.contains("aaa"), "older lines scroll off: {plain}");
 }
 
 #[test]
@@ -1783,7 +1784,7 @@ fn test_history_reasoning_windows_when_thinking_enabled() {
         role: "assistant".to_string(),
         content: "the answer".to_string(),
         reasoning_content: Some(
-            "the gist line\nsecond thought\nthird thought\nthe private chain of thought"
+            "the gist line\nsecond thought\nthird thought\nfourth thought\nthe private chain of thought"
                 .to_string(),
         ),
         attachments: vec![],
@@ -1913,7 +1914,7 @@ fn test_committed_thinking_windows_and_expands_on_click() {
     app.history.push(ChatMessage {
         role: "assistant".to_string(),
         content: "answer2".to_string(),
-        reasoning_content: Some("alpha\nbeta\ngamma\ndelta".to_string()),
+        reasoning_content: Some("alpha\nbeta\ngamma\ndelta\nepsilon".to_string()),
         attachments: vec![],
     });
     app.transcript_revision = app.transcript_revision.wrapping_add(1);
@@ -1926,7 +1927,7 @@ fn test_committed_thinking_windows_and_expands_on_click() {
         "long windowed thought shows ▸: {plain}"
     );
     assert!(!plain.contains("▾"), "nothing expanded yet: {plain}");
-    assert!(plain.contains("delta"), "most recent line shown: {plain}");
+    assert!(plain.contains("epsilon"), "most recent line shown: {plain}");
     assert!(
         !plain.contains("alpha"),
         "earliest line scrolls off: {plain}"
@@ -4614,11 +4615,12 @@ fn test_typewriter_reveals_buffer_progressively() {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let mut app = make_test_app(tx, rx);
 
-    // 14 chars: the floor (10) dominates the 1/2 catch-up (7), revealing 10 on
+    // 34 chars: the floor (30) dominates the 1/2 catch-up (17), revealing 30 on
     // the first frame.
-    app.incoming_buffer = "你好世界一二三四五六七八九十".to_string();
+    let full = "字".repeat(34);
+    app.incoming_buffer = full.clone();
     assert!(app.tick_typewriter());
-    assert_eq!(app.pending_response, "你好世界一二三四五六"); // exactly 10 chars, no split glyph
+    assert_eq!(app.pending_response, "字".repeat(30)); // exactly 30 chars, no split glyph
     assert_eq!(app.incoming_buffer.chars().count(), 4);
 
     // Drains fully over the next frames, never losing or splitting a char.
@@ -4627,7 +4629,7 @@ fn test_typewriter_reveals_buffer_progressively() {
         guard += 1;
         assert!(guard < 100, "typewriter should converge");
     }
-    assert_eq!(app.pending_response, "你好世界一二三四五六七八九十");
+    assert_eq!(app.pending_response, full);
     assert!(app.incoming_buffer.is_empty());
 }
 
@@ -10929,7 +10931,7 @@ async fn test_ask_card_multi_select_digit_toggles_box() {
     );
     let (screen, _rows) = render_full_screen(&mut app, 70, 20);
     assert!(
-        screen.contains("[x]"),
+        screen.contains("[✓]"),
         "the toggled box shows checked:\n{screen}"
     );
 

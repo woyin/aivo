@@ -543,7 +543,7 @@ pub(super) const THINKING_MARKER: &str = "✻";
 pub(super) const THINKING_COLLAPSED_MARKER: &str = "▸";
 pub(super) const THINKING_EXPANDED_MARKER: &str = "▾";
 /// A thought shows at most this many rows; older rows scroll off (expand for the rest).
-pub(super) const THINKING_WINDOW_LINES: usize = 3;
+pub(super) const THINKING_WINDOW_LINES: usize = 4;
 
 fn thinking_marker(has_more: bool, expanded: bool) -> &'static str {
     match (has_more, expanded) {
