@@ -286,12 +286,14 @@ impl CodeCommand {
     /// endpoint, sandbox dir, and mode the way a real launch would — but performs
     /// no HTTP, persistence, model picker, or server spawn. HF refs show a
     /// placeholder endpoint (llama-server is not started).
+    #[allow(clippy::too_many_arguments)]
     async fn print_code_dry_run(
         &self,
         model_input: Option<String>,
         attachments: &[String],
         key_override: Option<ApiKey>,
         one_shot: Option<&str>,
+        initial_prompt: bool,
         agent_mode: bool,
         max_context: Option<u64>,
     ) -> Result<ExitCode> {
@@ -370,6 +372,8 @@ impl CodeCommand {
                 } else {
                     "one-shot (-p)"
                 }
+            } else if initial_prompt {
+                "interactive TUI (positional prompt sent first)"
             } else {
                 "interactive TUI"
             },
@@ -400,6 +404,7 @@ impl CodeCommand {
         &self,
         model: Option<String>,
         one_shot: Option<String>,
+        initial_prompt: Option<String>,
         attachments: Vec<String>,
         refresh: bool,
         key_override: Option<ApiKey>,
@@ -417,6 +422,7 @@ impl CodeCommand {
             .execute_internal(
                 model,
                 one_shot,
+                initial_prompt,
                 attachments,
                 refresh,
                 key_override,
@@ -445,6 +451,7 @@ impl CodeCommand {
         &self,
         model_flag: Option<String>,
         one_shot: Option<String>,
+        initial_prompt: Option<String>,
         attachments: Vec<String>,
         refresh: bool,
         key_override: Option<ApiKey>,
@@ -482,6 +489,7 @@ impl CodeCommand {
                     &attachments,
                     key_override,
                     one_shot.as_deref(),
+                    initial_prompt.is_some(),
                     agent_mode,
                     max_context,
                 )
@@ -888,6 +896,7 @@ impl CodeCommand {
             initial_draft_attachments: pending_attachments,
             startup_notice,
             initial_resume: resume,
+            initial_prompt,
             max_context,
             share,
         })
@@ -898,13 +907,17 @@ impl CodeCommand {
 
     pub fn print_help() {
         println!(
-            "{} aivo code [REF] [--model <model>] [-p [prompt]] [--attach <path> ...]",
+            "{} aivo code [\"<text>\"|REF] [--model <model>] [-p [prompt]] [--attach <path> ...]",
             style::bold("Usage:")
         );
         println!();
         println!(
             "{}",
             style::dim("Interactive coding agent TUI, or one prompt with -p (plain) / -e (agent).")
+        );
+        println!(
+            "{}",
+            style::dim("Positional text opens the TUI with it sent as the first message.")
         );
         println!(
             "{}",
@@ -968,6 +981,10 @@ impl CodeCommand {
         );
         println!();
         println!("{}", style::bold("Examples:"));
+        println!(
+            "  {}",
+            style::dim("aivo code \"Make the failing test pass\"")
+        );
         println!(
             "  {}",
             style::dim("aivo code -p \"Explain Rust lifetimes\"")
@@ -2797,6 +2814,7 @@ mod tests {
             .execute(
                 None,
                 Some("hi".to_string()),
+                None,
                 Vec::new(),
                 false,
                 None,

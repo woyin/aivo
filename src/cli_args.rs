@@ -110,7 +110,7 @@ pub(crate) fn rewrite_cli_args(
 /// True when `s` looks like a subcommand name — only `[a-z0-9-]` chars.
 /// Gates the bare-prompt rewrite: anything with whitespace, uppercase,
 /// punctuation, or non-ASCII can't be a command name and is prompt-shaped.
-fn is_subcommand_shaped(s: &str) -> bool {
+pub(crate) fn is_subcommand_shaped(s: &str) -> bool {
     !s.is_empty()
         && s.chars()
             .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')

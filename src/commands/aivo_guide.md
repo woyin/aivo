@@ -135,6 +135,7 @@ project and runs shell commands, prompting for risky actions.
 
 ```
 aivo code                     # interactive agent TUI
+aivo code "<text>"            # TUI with the text sent as the first message
 -m, --model <model>           pick a model (remembered per key; bare = picker)
 -k, --key <id|name>           API key by id/name (bare = picker)
 -p, --prompt [prompt]         one prompt, plain reply, exit (no tools)

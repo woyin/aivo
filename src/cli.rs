@@ -938,9 +938,10 @@ pub struct LogsArgs {
 /// Arguments for the code command
 #[derive(Args, Debug, Clone)]
 pub struct CodeArgs {
-    /// Optional positional: `hf:<owner>/<repo>[:<quant>]` short ref or
-    /// `https://huggingface.co/...` URL. Equivalent to `-m <REF>` with
-    /// the local llama-server lifecycle wired up.
+    /// Optional positional: an `hf:<owner>/<repo>[:<quant>]` ref or
+    /// `https://huggingface.co/...` URL (as `-m <REF>`), or free text —
+    /// opens the TUI with it sent as the first message. Bare `[a-z0-9-]`
+    /// words are rejected; one-shot prompts use `-p`/`-e`.
     #[arg(value_name = "REF")]
     pub reference: Option<String>,
 

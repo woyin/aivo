@@ -460,6 +460,7 @@ impl StartCommand {
             .execute(
                 model,
                 None,
+                None,
                 Vec::new(),
                 args.refresh,
                 key_override,

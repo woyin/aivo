@@ -287,6 +287,7 @@ pub(super) async fn run_chat_tui(params: CodeTuiParams) -> Result<()> {
         original_hook(info);
     }));
     let initial_resume = params.initial_resume.clone();
+    let initial_prompt = params.initial_prompt.clone();
     let share = params.share;
     let mut app = CodeTuiApp::new(params).await?;
     app.refresh_context_window().await;
@@ -317,6 +318,13 @@ pub(super) async fn run_chat_tui(params: CodeTuiParams) -> Result<()> {
         if let Err(err) = app.open_resume_picker(query).await {
             app.notice = Some((ERROR, format!("Resume failed: {err:#}")));
         }
+    }
+    // Positional `aivo code "<text>"`: first turn starts now, streams in once
+    // the event loop renders.
+    if let Some(prompt) = initial_prompt
+        && let Err(err) = app.send_user_message(prompt).await
+    {
+        app.notice = Some((ERROR, format!("Failed to send: {err:#}")));
     }
     // The event loop starts the share once the session settles (an async
     // `--resume` could still be loading a different session id here).

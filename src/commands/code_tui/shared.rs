@@ -337,6 +337,8 @@ pub(crate) struct CodeTuiParams {
     /// `--resume` request: `Some("")` opens the session picker at startup,
     /// `Some(id)` jumps straight to that session, `None` starts fresh.
     pub initial_resume: Option<String>,
+    /// Positional `aivo code "<text>"`: auto-sent as the first message.
+    pub initial_prompt: Option<String>,
     /// `--max-context <SIZE>` manual context-window override (tokens). Session-only.
     pub max_context: Option<u64>,
     /// `--share`: start live sharing at launch (device-link verified beforehand).

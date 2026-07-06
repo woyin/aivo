@@ -71,21 +71,44 @@ fn is_hf_takeover(model: Option<&str>) -> bool {
     }
 }
 
-/// `aivo code <REF>`'s positional is HF-only, but a non-HF positional is the
-/// user's one-shot prompt — the same way the top-level `aivo "..."` rewrites to
-/// `aivo code -p "..."`. Without this, `aivo code "hello world"` would dead-end
-/// on a "ref only" error. Lift such a positional into `prompt` (an explicit
-/// `-p` still wins) and clear the ref slot so it never reaches the
-/// model-ref/HF path. A bare `-` maps to the empty-string prompt so `execute`
-/// reads it from stdin, matching bare `aivo code -p`.
-fn lift_code_positional_to_prompt(args: &mut CodeArgs) {
-    if let Some(raw) = args.reference.clone()
-        && !is_hf_takeover(Some(raw.as_str()))
-    {
-        let lifted = if raw == "-" { String::new() } else { raw };
-        args.prompt.get_or_insert(lifted);
-        args.reference = None;
+#[derive(Debug, PartialEq)]
+enum CodePositionalReject {
+    /// Bare `[a-z0-9-]` word — a (typo'd) subcommand, not text.
+    NotACommand(String),
+    /// Text alongside a flag that already owns the prompt slot.
+    Conflicts(String, &'static str),
+}
+
+/// Classifies `aivo code <positional>`: a model ref stays in `reference`, a
+/// bare `-` lifts into the empty prompt (stdin, matching bare `aivo code -p`),
+/// and free text returns `Ok(Some(_))` — sent as the TUI's first message
+/// (unlike top-level `aivo "..."`, which stays a one-shot `-p`).
+fn take_code_initial_prompt(args: &mut CodeArgs) -> Result<Option<String>, CodePositionalReject> {
+    let Some(raw) = args.reference.clone() else {
+        return Ok(None);
+    };
+    if is_hf_takeover(Some(raw.as_str())) {
+        return Ok(None);
     }
+    if raw == "-" {
+        args.prompt.get_or_insert(String::new());
+        args.reference = None;
+        return Ok(None);
+    }
+    if raw.is_empty() || crate::cli_args::is_subcommand_shaped(&raw) {
+        return Err(CodePositionalReject::NotACommand(raw));
+    }
+    if args.prompt.is_some() {
+        return Err(CodePositionalReject::Conflicts(raw, "-p/--prompt"));
+    }
+    if args.exec.is_some() {
+        return Err(CodePositionalReject::Conflicts(raw, "-e/--exec"));
+    }
+    if args.resume.is_some() {
+        return Err(CodePositionalReject::Conflicts(raw, "--resume"));
+    }
+    args.reference = None;
+    Ok(Some(raw))
 }
 
 async fn maybe_init_http_debug(value: &Option<String>) {
@@ -282,7 +305,35 @@ pub async fn run() -> ! {
         Commands::Code(mut code_args) => {
             maybe_init_http_debug(&code_args.debug).await;
             let key_explicit = code_args.key.is_some();
-            lift_code_positional_to_prompt(&mut code_args);
+            let initial_prompt = match take_code_initial_prompt(&mut code_args) {
+                Ok(prompt) => prompt,
+                Err(CodePositionalReject::NotACommand(raw)) => {
+                    eprintln!(
+                        "{} `aivo code` got an unexpected argument: {raw:?}",
+                        style::red("Error:"),
+                    );
+                    eprintln!(
+                        "  {}",
+                        style::dim(
+                            "Expected a subcommand (mcp, skills), a model ref (`hf:<owner>/<repo>` or `https://huggingface.co/...`), or text to open the TUI with."
+                        ),
+                    );
+                    eprintln!(
+                        "  {}",
+                        style::dim(
+                            "A bare word reads as a subcommand — for a prompt use `aivo code -p \"...\"` or `aivo \"...\"`."
+                        ),
+                    );
+                    process::exit(ExitCode::UserError.code());
+                }
+                Err(CodePositionalReject::Conflicts(raw, flag)) => {
+                    eprintln!(
+                        "{} `aivo code {raw:?}` can't be combined with {flag} — pick one way to start the session.",
+                        style::red("Error:"),
+                    );
+                    process::exit(ExitCode::UserError.code());
+                }
+            };
             // Positional lifts into model; explicit -m still wins.
             let model_input = code_args
                 .model
@@ -322,6 +373,7 @@ pub async fn run() -> ! {
                 .execute(
                     model,
                     one_shot,
+                    initial_prompt,
                     code_args.attachments,
                     code_args.refresh,
                     key_override,
@@ -462,7 +514,7 @@ pub async fn run() -> ! {
                         eprintln!(
                             "  {}",
                             style::dim(
-                                "Use `aivo code \"<prompt>\"` for a one-shot message, or `aivo code` for the TUI."
+                                "Use `aivo code -p \"<prompt>\"` for a one-shot message, or `aivo code` for the TUI."
                             )
                         );
                     } else {
@@ -1188,29 +1240,30 @@ mod tests {
     }
 
     #[test]
-    fn non_hf_positional_becomes_one_shot_prompt() {
-        // The reported bug: `aivo code "hello world"` dead-ended on a "ref only"
-        // error. It must become a one-shot prompt instead.
+    fn free_text_positional_becomes_initial_tui_prompt() {
         let mut a = code_args(&["aivo", "chat", "hello world"]);
-        lift_code_positional_to_prompt(&mut a);
-        assert_eq!(a.prompt.as_deref(), Some("hello world"));
+        assert_eq!(
+            take_code_initial_prompt(&mut a),
+            Ok(Some("hello world".to_string()))
+        );
         assert_eq!(a.reference, None);
+        assert_eq!(a.prompt, None);
     }
 
     #[test]
-    fn bare_word_positional_becomes_prompt() {
-        // A single bare word is ambiguous at the top level (falls through as a
-        // subcommand), but after an explicit `chat` it's unambiguously a prompt.
-        let mut a = code_args(&["aivo", "chat", "hello"]);
-        lift_code_positional_to_prompt(&mut a);
-        assert_eq!(a.prompt.as_deref(), Some("hello"));
-        assert_eq!(a.reference, None);
+    fn bare_word_positional_is_rejected() {
+        let mut a = code_args(&["aivo", "chat", "mpc"]);
+        assert_eq!(
+            take_code_initial_prompt(&mut a),
+            Err(CodePositionalReject::NotACommand("mpc".to_string()))
+        );
+        assert_eq!(a.prompt, None);
     }
 
     #[test]
     fn hf_positional_stays_a_model_ref() {
         let mut a = code_args(&["aivo", "chat", "hf:Qwen/Qwen2.5-0.5B-Instruct-GGUF"]);
-        lift_code_positional_to_prompt(&mut a);
+        assert_eq!(take_code_initial_prompt(&mut a), Ok(None));
         assert_eq!(
             a.reference.as_deref(),
             Some("hf:Qwen/Qwen2.5-0.5B-Instruct-GGUF")
@@ -1219,17 +1272,33 @@ mod tests {
     }
 
     #[test]
-    fn explicit_prompt_wins_over_positional() {
-        let mut a = code_args(&["aivo", "chat", "POS", "-p", "PFLAG"]);
-        lift_code_positional_to_prompt(&mut a);
-        assert_eq!(a.prompt.as_deref(), Some("PFLAG"));
-        assert_eq!(a.reference, None);
+    fn positional_conflicts_with_explicit_prompt() {
+        let mut a = code_args(&["aivo", "chat", "Fix the tests", "-p", "PFLAG"]);
+        assert_eq!(
+            take_code_initial_prompt(&mut a),
+            Err(CodePositionalReject::Conflicts(
+                "Fix the tests".to_string(),
+                "-p/--prompt"
+            ))
+        );
+    }
+
+    #[test]
+    fn positional_conflicts_with_resume() {
+        let mut a = code_args(&["aivo", "chat", "Fix the tests", "--resume", "last"]);
+        assert_eq!(
+            take_code_initial_prompt(&mut a),
+            Err(CodePositionalReject::Conflicts(
+                "Fix the tests".to_string(),
+                "--resume"
+            ))
+        );
     }
 
     #[test]
     fn bare_dash_positional_reads_from_stdin() {
         let mut a = code_args(&["aivo", "chat", "-"]);
-        lift_code_positional_to_prompt(&mut a);
+        assert_eq!(take_code_initial_prompt(&mut a), Ok(None));
         assert_eq!(a.prompt.as_deref(), Some(""));
         assert_eq!(a.reference, None);
     }
@@ -1237,7 +1306,7 @@ mod tests {
     #[test]
     fn explicit_prompt_wins_over_bare_dash() {
         let mut a = code_args(&["aivo", "chat", "-", "-p", "PFLAG"]);
-        lift_code_positional_to_prompt(&mut a);
+        assert_eq!(take_code_initial_prompt(&mut a), Ok(None));
         assert_eq!(a.prompt.as_deref(), Some("PFLAG"));
         assert_eq!(a.reference, None);
     }
