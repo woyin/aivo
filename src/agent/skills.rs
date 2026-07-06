@@ -96,6 +96,14 @@ pub fn user_skills_dir() -> Option<PathBuf> {
     crate::services::system_env::home_dir().map(|h| h.join(".config/aivo/skills"))
 }
 
+/// The project-tier dir `/skills add -p/--project` writes into: the repo's
+/// tool-neutral `.agents/skills` rather than aivo's own `.aivo/skills`, so a
+/// skill installed for the team is also picked up by the other agents that read
+/// the shared location (pi, grok, Gemini CLI).
+pub fn project_skills_dir(cwd: &Path) -> PathBuf {
+    cwd.join(".agents").join("skills")
+}
+
 pub(crate) const PLACEHOLDER_DESCRIPTION: &str =
     "One-line summary of what this skill does and when to use it.";
 
@@ -149,18 +157,12 @@ pub fn is_repo_local(dir: &Path, cwd: &Path) -> bool {
         .any(|d| dir.starts_with(cwd.join(d).join("skills")))
 }
 
-/// Scaffold a new user skill at `~/.config/aivo/skills/<name>/SKILL.md` from a
-/// template (frontmatter + a placeholder body) for the user to fill in. Returns
-/// the created `SKILL.md` path. `Err` on an invalid name, a missing home dir, or
-/// a name that already exists (we never overwrite an existing skill).
-pub fn scaffold_skill(name: &str, description: &str) -> Result<PathBuf, String> {
-    let root = user_skills_dir().ok_or("no home directory")?;
-    scaffold_skill_at(&root, name, description)
-}
-
-/// Inner with the root dir injected, so a test can scaffold into a tempdir
-/// instead of the real `~/.config/aivo/skills`.
-fn scaffold_skill_at(root: &Path, name: &str, description: &str) -> Result<PathBuf, String> {
+/// Scaffold a new skill at `<root>/<name>/SKILL.md` from a template
+/// (frontmatter + a placeholder body) for the user to fill in; `root` is
+/// [`user_skills_dir`] or, for `-p/--project`, [`project_skills_dir`]. Returns
+/// the created `SKILL.md` path. `Err` on an invalid name or a name that already
+/// exists (we never overwrite an existing skill).
+pub fn scaffold_skill_at(root: &Path, name: &str, description: &str) -> Result<PathBuf, String> {
     if !is_valid_skill_name(name) {
         return Err("Skill name must be letters, digits, '-' or '_'".to_string());
     }
@@ -261,34 +263,22 @@ impl Drop for StagedInstall {
 }
 
 impl StagedInstall {
-    /// Which staged skills already exist in the user skills dir, index-aligned
-    /// with `skills`.
-    pub fn already_installed(&self) -> Vec<bool> {
-        let dest = user_skills_dir();
+    /// Which staged skills already exist under `dest_root`, index-aligned with
+    /// `skills`.
+    pub fn already_installed_in(&self, dest_root: &Path) -> Vec<bool> {
         self.skills
             .iter()
             .map(|s| {
-                dest.as_ref().is_some_and(|root| {
-                    let folder = skill_folder_name(&s.name);
-                    !folder.is_empty() && root.join(folder).exists()
-                })
+                let folder = skill_folder_name(&s.name);
+                !folder.is_empty() && dest_root.join(folder).exists()
             })
             .collect()
     }
 
-    /// Copy the named staged skills into `~/.config/aivo/skills`. An existing
-    /// name is skipped, or replaced in place when `update_existing`.
-    pub fn install(
-        &self,
-        names: &[String],
-        update_existing: bool,
-    ) -> Result<InstallReport, String> {
-        let dest_root = user_skills_dir().ok_or("no home directory")?;
-        self.install_into(&dest_root, names, update_existing)
-    }
-
-    /// Inner with the destination root injected (tests install into a tempdir).
-    fn install_into(
+    /// Copy the named staged skills into `dest_root` ([`user_skills_dir`], or
+    /// [`project_skills_dir`] for `-p/--project`). An existing name is skipped,
+    /// or replaced in place when `update_existing`.
+    pub fn install_into(
         &self,
         dest_root: &Path,
         names: &[String],
@@ -346,13 +336,44 @@ impl StagedInstall {
 }
 
 /// Re-fetch installed skills from their recorded sources and replace them:
-/// `Some(name)` for one, `None` for every skill carrying provenance.
+/// `Some(name)` for one, `None` for every skill carrying provenance. Scans each
+/// install root (project `.agents/skills` before the user dir, matching
+/// discovery precedence) and updates a skill inside the root it lives in.
 pub async fn update_installed_skills(
+    roots: &[PathBuf],
     only: Option<&str>,
     progress: Option<DownloadProgress>,
 ) -> Result<InstallReport, String> {
-    let dest_root = user_skills_dir().ok_or("no home directory")?;
-    update_installed_skills_in(&dest_root, only, progress).await
+    match only {
+        Some(name) => {
+            for root in roots {
+                if read_root(root).iter().any(|s| s.name == name) {
+                    return update_installed_skills_in(root, Some(name), progress).await;
+                }
+            }
+            Err(format!(
+                "no skill named `{name}` among the installed skills"
+            ))
+        }
+        None => {
+            let mut report = InstallReport::default();
+            let mut any_source = false;
+            for root in roots {
+                if !read_root(root)
+                    .iter()
+                    .any(|s| skill_source(&s.dir).is_some())
+                {
+                    continue;
+                }
+                any_source = true;
+                report.merge(update_installed_skills_in(root, None, progress.clone()).await?);
+            }
+            if !any_source {
+                return Err("no installed skills have a recorded source to update from".to_string());
+            }
+            Ok(report)
+        }
+    }
 }
 
 /// Inner with the skills root injected (tests update inside a tempdir).
@@ -494,20 +515,10 @@ pub async fn stage_install(
     })
 }
 
-/// Fetch + discover, then install when unambiguous (`only`: name / `"*"` /
-/// sole skill); a multi-skill source with no filter comes back as `Pick`.
-pub async fn install_or_stage(
-    source: &str,
-    only: Option<&str>,
-    progress: Option<DownloadProgress>,
-) -> Result<InstallOrStage, String> {
-    let dest_root = user_skills_dir().ok_or("no home directory")?;
-    install_or_stage_into(&dest_root, source, only, progress).await
-}
-
-/// Inner with the destination root injected, so a test installs into a tempdir
-/// instead of the real `~/.config/aivo/skills`.
-async fn install_or_stage_into(
+/// Fetch + discover, then install into `dest_root` when unambiguous (`only`:
+/// name / `"*"` / sole skill); a multi-skill source with no filter comes back
+/// as `Pick`, which the picker resolves against the same `dest_root`.
+pub async fn install_or_stage_into(
     dest_root: &Path,
     source: &str,
     only: Option<&str>,
@@ -1840,6 +1851,67 @@ mod tests {
         let bare = tmp();
         write_skill(&bare, "solo", "---\nname: solo\ndescription: d\n---\nx\n");
         let err = update_installed_skills_in(&bare, None, None)
+            .await
+            .unwrap_err();
+        assert!(err.contains("recorded source"), "{err}");
+    }
+
+    /// The multi-root wrapper updates each skill inside the root it lives in
+    /// (project + user), named or bare, with the error paths intact.
+    #[tokio::test]
+    async fn update_scans_all_install_roots() {
+        let src = tmp();
+        write_skill(&src, "proj", "---\nname: proj\ndescription: d\n---\nv1\n");
+        write_skill(&src, "user", "---\nname: user\ndescription: d\n---\nv1\n");
+        let project_root = tmp();
+        let user_root = tmp();
+        let staged = stage_install(src.to_str().unwrap(), None).await.unwrap();
+        staged
+            .install_into(&project_root, &["proj".to_string()], false)
+            .unwrap();
+        staged
+            .install_into(&user_root, &["user".to_string()], false)
+            .unwrap();
+        for name in ["proj", "user"] {
+            std::fs::write(
+                src.join(name).join("SKILL.md"),
+                format!("---\nname: {name}\ndescription: d\n---\nv2\n"),
+            )
+            .unwrap();
+        }
+        let roots = vec![project_root.clone(), user_root.clone()];
+
+        // A named update finds the skill in whichever root holds it.
+        let report = update_installed_skills(&roots, Some("user"), None)
+            .await
+            .unwrap();
+        assert_eq!(report.updated, ["user"]);
+        assert!(
+            std::fs::read_to_string(user_root.join("user").join("SKILL.md"))
+                .unwrap()
+                .contains("v2")
+        );
+        assert!(
+            std::fs::read_to_string(project_root.join("proj").join("SKILL.md"))
+                .unwrap()
+                .contains("v1"),
+            "a named update must not touch the other root"
+        );
+
+        // Bare update sweeps every root, replacing each skill in place.
+        let report = update_installed_skills(&roots, None, None).await.unwrap();
+        assert_eq!(report.updated, ["proj", "user"]);
+        assert!(
+            std::fs::read_to_string(project_root.join("proj").join("SKILL.md"))
+                .unwrap()
+                .contains("v2")
+        );
+
+        let err = update_installed_skills(&roots, Some("ghost"), None)
+            .await
+            .unwrap_err();
+        assert!(err.contains("no skill named `ghost`"), "{err}");
+        let err = update_installed_skills(&[tmp()], None, None)
             .await
             .unwrap_err();
         assert!(err.contains("recorded source"), "{err}");

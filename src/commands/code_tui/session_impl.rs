@@ -563,7 +563,7 @@ is preserved."
             _ => {
                 self.notice = Some((
                     ERROR,
-                    "Usage: /skills [add <name>|<github:owner/repo> …] [rm <name>] [update [name]]"
+                    "Usage: /skills [add [-p] <name>|<github:owner/repo> …] [rm <name>] [update [name]]"
                         .to_string(),
                 ));
                 Ok(())
@@ -593,40 +593,73 @@ is preserved."
         Ok(())
     }
 
-    /// Handle the `/skills` add-input. A first token that isn't a bare skill name
+    /// Handle the `/skills` add-input. A `-p`/`--project` flag (leading or
+    /// trailing) targets the repo's `.agents/skills` instead of
+    /// `~/.config/aivo/skills`. A first token that isn't a bare skill name
     /// (a `github:owner/repo`, a github.com URL, or a local path) is INSTALLED
     /// from that source (the rest is an optional `<skill-name>` filter or `*`);
-    /// otherwise `name [description…]` SCAFFOLDS a template under
-    /// `~/.config/aivo/skills`. Either way the overlay reopens.
+    /// otherwise `name [description…]` SCAFFOLDS a template. Either way the
+    /// overlay reopens.
     pub(super) async fn submit_skill_add(&mut self, input: String) -> Result<()> {
-        let input = input.trim();
+        let (input, project) = split_project_flag(&input);
         let (first, rest) = match input.split_once(char::is_whitespace) {
             Some((a, b)) => (a, b.trim()),
-            None => (input, ""),
+            None => (input.as_str(), ""),
         };
+        // A flag-like token that survived `split_project_flag` is a typo or a
+        // mid-line `-p`: reject it up front — before a download (a bad filter
+        // used to surface only after the fetch) and before scaffolding a
+        // folder literally named `--foo` (dashes are valid name chars).
+        let stray_flag = if first.starts_with('-') {
+            Some(first)
+        } else {
+            rest.split_whitespace()
+                .next()
+                .filter(|t| t.starts_with('-'))
+        };
+        if let Some(flag) = stray_flag {
+            self.notice = Some((
+                ERROR,
+                format!(
+                    "Unknown option `{flag}` — only -p/--project is supported (at the start or end)"
+                ),
+            ));
+            return Ok(());
+        }
         // A scaffold name is `[A-Za-z0-9_-]`; anything else (a `/`, `:`, `.`, URL)
         // is an install source.
         if !first.is_empty() && !crate::agent::skills::is_valid_skill_name(first) {
             let only = (!rest.is_empty()).then(|| rest.to_string());
             return self
-                .install_skill_from_source(first.to_string(), only)
+                .install_skill_from_source(first.to_string(), only, project)
                 .await;
         }
 
-        let (name, description) = match parse_skill_add_input(input) {
+        let (name, description) = match parse_skill_add_input(&input) {
             Ok(parsed) => parsed,
             Err(msg) => {
                 self.notice = Some((ERROR, msg));
                 return Ok(());
             }
         };
-        match crate::agent::skills::scaffold_skill(&name, &description) {
+        let root = match self.skills_dest_root(project) {
+            Ok(root) => root,
+            Err(e) => {
+                self.notice = Some((ERROR, format!("Failed to add skill: {e}")));
+                return Ok(());
+            }
+        };
+        match crate::agent::skills::scaffold_skill_at(&root, &name, &description) {
             Ok(path) => {
                 // A freshly scaffolded skill starts enabled, clearing any stale
                 // disabled flag left by a same-name skill removed earlier.
                 self.session_store.set_skill_enabled(&name, true).await.ok();
                 self.agent_engine = None;
-                self.notice = Some((MUTED, skill_add_success_notice(&name, &description, &path)));
+                let mut notice = skill_add_success_notice(&name, &description, &path);
+                if project {
+                    notice.push_str(PROJECT_SKILL_NOTE);
+                }
+                self.notice = Some((MUTED, notice));
             }
             Err(e) => {
                 self.notice = Some((ERROR, format!("Failed to add skill: {e}")));
@@ -636,19 +669,45 @@ is preserved."
         self.open_skills_overlay().await
     }
 
-    /// Install skill(s) from an online/local source into `~/.config/aivo/skills`,
-    /// following the `skills/*/SKILL.md` convention. `only` is an optional skill-
-    /// name filter (`*` = all). A multi-skill source with no filter lists the
-    /// names so the user can re-run with one (or `*`).
+    /// Resolve where `/skills add` writes: the user-global dir, or with
+    /// `-p/--project` the repo's tool-neutral `.agents/skills`.
+    fn skills_dest_root(&self, project: bool) -> std::result::Result<std::path::PathBuf, String> {
+        if project {
+            let cwd = if self.real_cwd.is_empty() {
+                "."
+            } else {
+                self.real_cwd.as_str()
+            };
+            Ok(crate::agent::skills::project_skills_dir(
+                std::path::Path::new(cwd),
+            ))
+        } else {
+            crate::agent::skills::user_skills_dir().ok_or_else(|| "no home directory".to_string())
+        }
+    }
+
+    /// Install skill(s) from an online/local source into `~/.config/aivo/skills`
+    /// (or the repo's `.agents/skills` when `project`), following the
+    /// `skills/*/SKILL.md` convention. `only` is an optional skill-name filter
+    /// (`*` = all). A multi-skill source with no filter lists the names so the
+    /// user can re-run with one (or `*`).
     pub(super) async fn install_skill_from_source(
         &mut self,
         source: String,
         only: Option<String>,
+        project: bool,
     ) -> Result<()> {
         if self.installing_skill.is_some() {
             self.notice = Some((WARNING, "A skill install is already running".to_string()));
             return Ok(());
         }
+        let dest_root = match self.skills_dest_root(project) {
+            Ok(root) => root,
+            Err(e) => {
+                self.notice = Some((ERROR, format!("Failed to install skill: {e}")));
+                return Ok(());
+            }
+        };
         // Fetch on a background task; an unambiguous choice installs there and
         // arrives as `SkillInstalled`, a multi-skill source as `SkillInstallPick`.
         let progress = SkillInstallProgress::new(source.clone(), "Fetching");
@@ -659,22 +718,30 @@ is preserved."
         let tx = self.tx.clone();
         tokio::spawn(async move {
             use crate::agent::skills::InstallOrStage;
-            let event =
-                match crate::agent::skills::install_or_stage(&source, only.as_deref(), Some(bytes))
-                    .await
-                {
-                    Ok(InstallOrStage::Installed(report)) => RuntimeEvent::SkillInstalled {
-                        source,
-                        result: Ok(report),
-                    },
-                    Ok(InstallOrStage::Pick(staged)) => {
-                        RuntimeEvent::SkillInstallPick { source, staged }
-                    }
-                    Err(e) => RuntimeEvent::SkillInstalled {
-                        source,
-                        result: Err(e),
-                    },
-                };
+            let event = match crate::agent::skills::install_or_stage_into(
+                &dest_root,
+                &source,
+                only.as_deref(),
+                Some(bytes),
+            )
+            .await
+            {
+                Ok(InstallOrStage::Installed(report)) => RuntimeEvent::SkillInstalled {
+                    source,
+                    project,
+                    result: Ok(report),
+                },
+                Ok(InstallOrStage::Pick(staged)) => RuntimeEvent::SkillInstallPick {
+                    source,
+                    project,
+                    staged,
+                },
+                Err(e) => RuntimeEvent::SkillInstalled {
+                    source,
+                    project,
+                    result: Err(e),
+                },
+            };
             tx.send(event).ok();
         });
         // Open the install modal in its loading state right away; the pick/
@@ -685,6 +752,7 @@ is preserved."
         ) {
             self.overlay = Overlay::SkillInstall(SkillInstallOverlay {
                 source: overlay_source,
+                project,
                 ..Default::default()
             });
         }
@@ -696,6 +764,7 @@ is preserved."
     pub(super) async fn apply_skill_installed(
         &mut self,
         source: String,
+        project: bool,
         result: std::result::Result<crate::agent::skills::InstallReport, String>,
     ) -> Result<()> {
         self.installing_skill = None;
@@ -707,7 +776,7 @@ is preserved."
                 if !report.installed.is_empty() || !report.updated.is_empty() {
                     self.agent_engine = None;
                 }
-                self.notice = Some(install_report_notice(&source, &report));
+                self.notice = Some(install_report_notice(&source, project, &report));
             }
             Err(e) => self.notice = Some((ERROR, format!("Failed to install skill: {e}"))),
         }
@@ -725,6 +794,7 @@ is preserved."
     pub(super) async fn apply_skill_install_pick(
         &mut self,
         source: String,
+        project: bool,
         staged: crate::agent::skills::StagedInstall,
     ) -> Result<()> {
         self.installing_skill = None;
@@ -741,7 +811,14 @@ is preserved."
             ));
             return Ok(());
         }
-        let installed = staged.already_installed();
+        let dest_root = match self.skills_dest_root(project) {
+            Ok(root) => root,
+            Err(e) => {
+                self.notice = Some((ERROR, format!("Failed to install skill: {e}")));
+                return Ok(());
+            }
+        };
+        let installed = staged.already_installed_in(&dest_root);
         let items: Vec<InstallPickItem> = staged
             .skills
             .iter()
@@ -755,10 +832,11 @@ is preserved."
                 installed,
             })
             .collect();
-        self.staged_skill_install = Some(staged);
+        self.staged_skill_install = Some((staged, project));
         self.notice = None;
         self.overlay = Overlay::SkillInstall(SkillInstallOverlay {
             source,
+            project,
             items,
             selected: 0,
             query: String::new(),
@@ -776,16 +854,27 @@ is preserved."
             _ => String::new(),
         };
         self.overlay = Overlay::None;
-        let Some(staged) = self.staged_skill_install.take() else {
+        let Some((staged, project)) = self.staged_skill_install.take() else {
             return self.open_skills_overlay().await;
+        };
+        let dest_root = match self.skills_dest_root(project) {
+            Ok(root) => root,
+            Err(e) => {
+                self.notice = Some((ERROR, format!("Failed to install skill: {e}")));
+                return self.open_skills_overlay().await;
+            }
         };
         self.installing_skill = Some(SkillInstallProgress::new(source.clone(), "Installing"));
         let tx = self.tx.clone();
         tokio::task::spawn_blocking(move || {
             // update_existing: a marked installed row is an explicit replace ask.
-            let result = staged.install(&names, true);
-            tx.send(RuntimeEvent::SkillInstalled { source, result })
-                .ok();
+            let result = staged.install_into(&dest_root, &names, true);
+            tx.send(RuntimeEvent::SkillInstalled {
+                source,
+                project,
+                result,
+            })
+            .ok();
         });
         // Land back on /skills, where the spinner row shows until the copy ends.
         self.open_skills_overlay().await
@@ -804,11 +893,21 @@ is preserved."
     }
 
     /// `/skills update [name]`: re-fetch from the recorded source and replace
-    /// in place; bare form updates everything with provenance.
+    /// in place; bare form updates everything with provenance, across both
+    /// install roots (the repo's `.agents/skills` and the user dir).
     pub(super) async fn update_skills_command(&mut self, name: Option<String>) -> Result<()> {
         if self.installing_skill.is_some() {
             self.notice = Some((WARNING, "A skill install is already running".to_string()));
             return Ok(());
+        }
+        // Project root first, matching discovery precedence: a name shadowed by
+        // the repo updates the copy the agent actually sees.
+        let mut roots = Vec::new();
+        if let Ok(root) = self.skills_dest_root(true) {
+            roots.push(root);
+        }
+        if let Ok(root) = self.skills_dest_root(false) {
+            roots.push(root);
         }
         let label = name
             .clone()
@@ -820,9 +919,11 @@ is preserved."
         let tx = self.tx.clone();
         tokio::spawn(async move {
             let result =
-                crate::agent::skills::update_installed_skills(name.as_deref(), Some(bytes)).await;
+                crate::agent::skills::update_installed_skills(&roots, name.as_deref(), Some(bytes))
+                    .await;
             tx.send(RuntimeEvent::SkillInstalled {
                 source: label,
+                project: false,
                 result,
             })
             .ok();
@@ -2011,6 +2112,34 @@ fn dedupe_name(base: String, existing: &std::collections::HashSet<String>) -> St
         .unwrap_or(base)
 }
 
+/// Appended to a `-p/--project` add/install notice: repo-local skills are
+/// advertised to the model inside `<untrusted>` (the dir changes under `git
+/// pull`), which would surprise a user who just installed the skill themselves.
+/// Inline (` · `), not `\n` — the notice renders as one line and scrubs control
+/// chars, so a newline would mash the two sentences together.
+pub(super) const PROJECT_SKILL_NOTE: &str =
+    " · project skill — commit it to share; the agent advertises repo skills as untrusted";
+
+/// Split a leading or trailing `-p`/`--project` off a `/skills add` line. Only
+/// the edges are checked so a scaffold description containing a literal `-p`
+/// mid-sentence survives.
+pub(super) fn split_project_flag(input: &str) -> (String, bool) {
+    let trimmed = input.trim();
+    for flag in ["--project", "-p"] {
+        if let Some(rest) = trimmed.strip_prefix(flag)
+            && (rest.is_empty() || rest.starts_with(char::is_whitespace))
+        {
+            return (rest.trim().to_string(), true);
+        }
+        if let Some(rest) = trimmed.strip_suffix(flag)
+            && (rest.is_empty() || rest.ends_with(char::is_whitespace))
+        {
+            return (rest.trim().to_string(), true);
+        }
+    }
+    (trimmed.to_string(), false)
+}
+
 /// Parse a `/skills add` line into `(name, description)`: the first whitespace-
 /// delimited token is the (folder-safe) name, the rest is a free-text one-line
 /// description (empty is fine — a placeholder is templated in). `Err` is a
@@ -2055,8 +2184,10 @@ pub(super) fn skill_add_success_notice(
 }
 
 /// One-line notice for a finished install; warning-hued when nothing changed.
+/// A `project` install appends where it landed and the untrusted caveat.
 pub(super) fn install_report_notice(
     source: &str,
+    project: bool,
     report: &crate::agent::skills::InstallReport,
 ) -> (ratatui::style::Color, String) {
     let installed = &report.installed;
@@ -2088,8 +2219,14 @@ pub(super) fn install_report_notice(
         ));
     }
     let mut msg = parts.join(" · ");
+    if project {
+        msg.push_str(" → ./.agents/skills");
+    }
     if !skipped.is_empty() {
         msg.push_str(&format!(" (already installed: {})", skipped.join(", ")));
+    }
+    if project {
+        msg.push_str(PROJECT_SKILL_NOTE);
     }
     (MUTED, msg)
 }

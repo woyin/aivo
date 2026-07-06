@@ -279,7 +279,7 @@ pub(super) fn command_usage_hint(name: &str) -> Option<&'static str> {
     match name {
         // Richer than a placeholder — teaches the subcommand grammar.
         "mcp" => Some("[add <command> [args…] | rm <name>]"),
-        "skills" => Some("[add <name>|<github:owner/repo> | rm <name>]"),
+        "skills" => Some("[add [-p] <name>|<github:owner/repo> | rm <name>]"),
         "create-skill" => Some("[what the skill should do]"),
         "goal" => Some("<objective> | stop"),
         "plan" => Some("<objective> | go [guidance] | stop"),
@@ -565,6 +565,8 @@ pub(super) struct InstallPickItem {
 #[derive(Clone, Debug, Default)]
 pub(super) struct SkillInstallOverlay {
     pub(super) source: String,
+    /// `-p/--project`: installing into the repo's `.agents/skills`.
+    pub(super) project: bool,
     pub(super) items: Vec<InstallPickItem>,
     pub(super) selected: usize,
     pub(super) query: String,
@@ -1701,11 +1703,14 @@ pub(super) enum RuntimeEvent {
     /// A background `/skills add <source>` install finished, off the event loop.
     SkillInstalled {
         source: String,
+        /// `-p/--project`: the install targeted the repo's `.agents/skills`.
+        project: bool,
         result: std::result::Result<crate::agent::skills::InstallReport, String>,
     },
     /// A fetch found several skills — the staged tree is handed to the picker.
     SkillInstallPick {
         source: String,
+        project: bool,
         staged: crate::agent::skills::StagedInstall,
     },
     /// A `/share` (or `--share`) start finished: `Ok` the handle, `Err` the reason.
@@ -2105,8 +2110,8 @@ pub(super) struct CodeTuiApp {
     /// In-flight skill install; drives the progress row and idle status line.
     pub(super) installing_skill: Option<SkillInstallProgress>,
     /// Held here, not in the (cloned-every-render) overlay, so the temp tree is
-    /// deleted exactly once.
-    pub(super) staged_skill_install: Option<crate::agent::skills::StagedInstall>,
+    /// deleted exactly once. The bool is the pick's `-p/--project` destination.
+    pub(super) staged_skill_install: Option<(crate::agent::skills::StagedInstall, bool)>,
     /// Active share, `None` when not sharing; its presence drives the footer
     /// `● sharing` badge. Stopped on `/share stop`, `/new`, resume, and exit.
     pub(super) live_share: Option<crate::services::share_live::LiveShareHandle>,

@@ -212,11 +212,18 @@ impl CodeTuiApp {
                 exit_code,
                 truncated,
             } => self.finish_local_command(exit_code, truncated).await?,
-            RuntimeEvent::SkillInstalled { source, result } => {
-                self.apply_skill_installed(source, result).await?
-            }
-            RuntimeEvent::SkillInstallPick { source, staged } => {
-                self.apply_skill_install_pick(source, staged).await?
+            RuntimeEvent::SkillInstalled {
+                source,
+                project,
+                result,
+            } => self.apply_skill_installed(source, project, result).await?,
+            RuntimeEvent::SkillInstallPick {
+                source,
+                project,
+                staged,
+            } => {
+                self.apply_skill_install_pick(source, project, staged)
+                    .await?
             }
             RuntimeEvent::LiveShareReady(result) => self.apply_live_share_ready(result),
         }

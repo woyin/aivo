@@ -7644,6 +7644,7 @@ fn test_skill_install_overlay_renders_picker() {
     let mut app = make_test_app(tx, rx);
     app.overlay = Overlay::SkillInstall(SkillInstallOverlay {
         source: "github:anthropics/skills".to_string(),
+        project: false,
         items: vec![
             InstallPickItem {
                 name: "alpha".to_string(),
@@ -7683,6 +7684,10 @@ fn test_skill_install_overlay_renders_picker() {
     assert!(
         screen.contains("from github:anthropics/skills"),
         "missing source line:\n{screen}"
+    );
+    assert!(
+        screen.contains("into ~/.config/aivo/skills (user)"),
+        "missing destination line:\n{screen}"
     );
     assert!(screen.contains("alpha"), "missing skill row:\n{screen}");
     assert!(
@@ -7805,6 +7810,7 @@ async fn test_skill_install_loading_state_renders_and_esc_closes() {
 fn test_skill_install_picker_marks_installed_for_update() {
     let mut state = SkillInstallOverlay {
         source: "github:o/r".to_string(),
+        project: false,
         items: vec![
             InstallPickItem {
                 name: "fresh".to_string(),
@@ -7927,6 +7933,40 @@ async fn test_skills_install_multi_source_opens_picker() {
     let _ = std::fs::remove_dir_all(&pack);
 }
 
+/// `-p` rides the whole install pipeline: flag parse → staged pick → overlay
+/// marked as a project install (nothing is written until names are picked).
+#[tokio::test]
+async fn test_skills_install_project_flag_reaches_picker() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    let pack = write_skill_pack();
+
+    app.submit_skill_add(format!("-p {}", pack.display()))
+        .await
+        .unwrap();
+    for _ in 0..1000 {
+        app.handle_runtime_events().await.unwrap();
+        if matches!(&app.overlay, Overlay::SkillInstall(s) if !s.items.is_empty()) {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    let Overlay::SkillInstall(state) = &app.overlay else {
+        panic!("picker must open: {:?}", app.notice);
+    };
+    assert!(state.project, "picker must carry the -p destination");
+    assert_eq!(state.source, pack.display().to_string(), "flag stripped");
+    assert!(
+        matches!(app.staged_skill_install, Some((_, true))),
+        "staged pick must remember the project destination"
+    );
+
+    app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+        .await
+        .unwrap();
+    let _ = std::fs::remove_dir_all(&pack);
+}
+
 /// Notice wording per report shape.
 #[test]
 fn test_install_report_notice_wording() {
@@ -7934,6 +7974,7 @@ fn test_install_report_notice_wording() {
     use crate::agent::skills::InstallReport;
     let (_, msg) = install_report_notice(
         "src",
+        false,
         &InstallReport {
             installed: vec!["a".into()],
             updated: vec![],
@@ -7943,6 +7984,7 @@ fn test_install_report_notice_wording() {
     assert_eq!(msg, "Installed skill: a");
     let (_, msg) = install_report_notice(
         "src",
+        false,
         &InstallReport {
             installed: vec!["a".into(), "b".into()],
             updated: vec![],
@@ -7952,6 +7994,7 @@ fn test_install_report_notice_wording() {
     assert_eq!(msg, "Installed skills: a, b (already installed: c)");
     let (color, msg) = install_report_notice(
         "src",
+        false,
         &InstallReport {
             installed: vec![],
             updated: vec![],
@@ -7962,6 +8005,7 @@ fn test_install_report_notice_wording() {
     assert_eq!(color, WARNING);
     let (_, msg) = install_report_notice(
         "src",
+        false,
         &InstallReport {
             installed: vec!["a".into()],
             updated: vec!["u".into(), "v".into()],
@@ -7969,8 +8013,91 @@ fn test_install_report_notice_wording() {
         },
     );
     assert_eq!(msg, "Installed skill: a · Updated skills: u, v");
-    let (color, _) = install_report_notice("src", &InstallReport::default());
+    // `-p/--project`: destination and the untrusted caveat are spelled out.
+    let (_, msg) = install_report_notice(
+        "src",
+        true,
+        &InstallReport {
+            installed: vec!["a".into()],
+            updated: vec![],
+            skipped_existing: vec![],
+        },
+    );
+    assert!(
+        msg.starts_with("Installed skill: a → ./.agents/skills"),
+        "{msg}"
+    );
+    assert!(msg.contains("untrusted"), "{msg}");
+    let (color, _) = install_report_notice("src", false, &InstallReport::default());
     assert_eq!(color, WARNING);
+}
+
+/// A flag-like token other than `-p/--project` is rejected up front — no
+/// download for the install path, no folder named `--foo` for the scaffold path.
+#[tokio::test]
+async fn test_skill_add_rejects_unknown_options_before_fetch() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+
+    app.submit_skill_add("--foo github:o/r".to_string())
+        .await
+        .unwrap();
+    assert!(
+        matches!(&app.notice, Some((_, msg)) if msg.contains("Unknown option `--foo`")),
+        "unknown leading flag must error: {:?}",
+        app.notice
+    );
+    assert!(app.installing_skill.is_none(), "no fetch may start");
+
+    // A bad filter used to surface only after the whole source was downloaded.
+    app.submit_skill_add("github:o/r --bogus".to_string())
+        .await
+        .unwrap();
+    assert!(
+        matches!(&app.notice, Some((_, msg)) if msg.contains("Unknown option `--bogus`")),
+        "unknown filter flag must error before the fetch: {:?}",
+        app.notice
+    );
+    assert!(app.installing_skill.is_none(), "no fetch may start");
+
+    // Mid-line `-p` is guided to the edges rather than silently treated as a name.
+    app.submit_skill_add("github:o/r -p alpha".to_string())
+        .await
+        .unwrap();
+    assert!(
+        matches!(&app.notice, Some((_, msg)) if msg.contains("Unknown option `-p`")),
+        "mid-line -p must point at the start/end rule: {:?}",
+        app.notice
+    );
+}
+
+/// `-p`/`--project` is recognized at either edge of the add line, and only there.
+#[test]
+fn test_split_project_flag() {
+    use super::session_impl::split_project_flag;
+    assert_eq!(
+        split_project_flag("-p github:o/r"),
+        ("github:o/r".to_string(), true)
+    );
+    assert_eq!(
+        split_project_flag("github:o/r --project"),
+        ("github:o/r".to_string(), true)
+    );
+    assert_eq!(split_project_flag("--project"), (String::new(), true));
+    assert_eq!(
+        split_project_flag("github:o/r"),
+        ("github:o/r".to_string(), false)
+    );
+    // Mid-line `-p` belongs to the description, not the flag.
+    assert_eq!(
+        split_project_flag("deploy pass -p to the deploy script"),
+        ("deploy pass -p to the deploy script".to_string(), false)
+    );
+    // `-project` (one dash) is not the flag and must survive intact.
+    assert_eq!(
+        split_project_flag("-project x"),
+        ("-project x".to_string(), false)
+    );
 }
 
 /// An unrelated open overlay is not replaced; the stage drops with a hint.
@@ -8943,7 +9070,7 @@ fn test_composer_command_hint() {
     set(&mut app, "/skills");
     assert!(
         app.composer_command_hint()
-            .is_some_and(|h| h.contains("add <name>")),
+            .is_some_and(|h| h.contains("add [-p] <name>")),
         "/skills should ghost the add/rm syntax"
     );
 

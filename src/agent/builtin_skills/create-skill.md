@@ -14,7 +14,7 @@ A skill is a folder holding a `SKILL.md` with YAML frontmatter (`name`, `descrip
 - Project: `./.agents/skills`, `./.aivo/skills`, `./.claude/skills`
 - User: `~/.agents/skills`, `~/.config/aivo/skills`, `~/.claude/skills`
 
-`~/.config/aivo/skills/<name>/` is the dir aivo owns and the one `/skills add` scaffolds into. Discovery is on-demand, so a skill you create is usable immediately — no restart: the user can run it with `/<name>` right away, it shows up in `/skills`, and the model starts offering it (via the `skill` tool) from the next turn on.
+`~/.config/aivo/skills/<name>/` is the dir aivo owns and the one `/skills add` scaffolds into; `/skills add -p` (or `--project`) targets the repo's `./.agents/skills` instead — for skills meant to ship with the project (note: the agent advertises repo-local skills as untrusted content). Discovery is on-demand, so a skill you create is usable immediately — no restart: the user can run it with `/<name>` right away, it shows up in `/skills`, and the model starts offering it (via the `skill` tool) from the next turn on.
 
 ```
 skill-name/
@@ -38,7 +38,7 @@ Ask about edge cases and example inputs proactively. Come back with context rath
 
 ## Step 2 — Write the SKILL.md
 
-Create the folder and file. The fastest path is to scaffold a template and edit it: tell the user to run `/skills add <name> [one-line description]` (this writes `~/.config/aivo/skills/<name>/SKILL.md`), or just write the folder yourself with your file tools. Then fill in:
+Create the folder and file. The fastest path is to scaffold a template and edit it: tell the user to run `/skills add <name> [one-line description]` (this writes `~/.config/aivo/skills/<name>/SKILL.md`; add `-p` to write into the repo's `./.agents/skills` for a skill that ships with the project), or just write the folder yourself with your file tools. If it isn't obvious whether the skill is personal or belongs to this repo, ask — default to personal, and to project when the workflow being captured is specific to this codebase. Then fill in:
 
 - **name** — the identifier (and folder name): letters, digits, `-`, `_`.
 - **description** — the single most important field, and your *entire* triggering budget. aivo advertises only the **first sentence** of the description to the model (it cuts at the first `". "`, capped at ~160 chars); that one sentence is all the model sees when deciding whether to reach for the skill. So write ONE sentence that states what the skill does AND its key when-to-use cues. Critically: don't write "Does X. Use when Y" — aivo drops everything after that first period, so "Use when Y" would never reach the model. Keep the trigger cues inside that first sentence (commas/dashes, not new sentences). Models tend to *under*-trigger, so lean slightly pushy: not "Build a dashboard," but "Build a fast internal-metrics dashboard whenever the user wants to show dashboards, data viz, or any company metrics — even without the word 'dashboard'."
@@ -114,4 +114,4 @@ Note on aivo specifically: a skill can also be invoked deterministically as `/<n
 
 ## When you're done
 
-Tell the user where the skill lives and how to use it: the model will load it automatically when the description matches, or they can type `/<name>` to run it directly. They can enable/disable or remove it from the `/skills` overlay. If they want it available in another project, copy the folder into that repo's `.aivo/skills/` (or keep it under `~/.config/aivo/skills/` to have it everywhere).
+Tell the user where the skill lives and how to use it: the model will load it automatically when the description matches, or they can type `/<name>` to run it directly. They can enable/disable or remove it from the `/skills` overlay. If they want it available in another project, copy the folder into that repo's `./.agents/skills/` (or keep it under `~/.config/aivo/skills/` to have it everywhere).

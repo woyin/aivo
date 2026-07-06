@@ -537,6 +537,10 @@ impl CodeTuiApp {
                     "e.g.  changelog Summarize the git log   ·   github:anthropics/skills",
                     Style::default().fg(FAINT),
                 )),
+                Line::from(Span::styled(
+                    "-p / --project installs into ./.agents/skills (shared via the repo)",
+                    Style::default().fg(FAINT),
+                )),
             ]);
             footer = vec![("Enter", "save"), ("Esc", "cancel")];
         } else if state.items.is_empty() {
@@ -754,11 +758,19 @@ impl CodeTuiApp {
 
         let inner_width = usize::from(list_pane.width).saturating_sub(2).max(1);
         let mut rows: Vec<Line> = Vec::new();
-        if !state.items.is_empty() {
+        // Source + destination header, in the loading state too — where an
+        // install lands (user vs project) should be visible before Enter.
+        if !state.source.is_empty() {
             rows.push(Line::from(Span::styled(
                 truncate_for_display_width(&format!("from {}", state.source), inner_width),
                 Style::default().fg(FAINT),
             )));
+            let dest = if state.project {
+                "into ./.agents/skills (project)"
+            } else {
+                "into ~/.config/aivo/skills (user)"
+            };
+            rows.push(Line::from(Span::styled(dest, Style::default().fg(FAINT))));
             rows.push(Line::from(""));
         }
         let mut selected_pos = 0usize;
