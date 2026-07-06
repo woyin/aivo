@@ -170,8 +170,8 @@ Type `/help` for the full list. Slash commands:
 Other input: `!cmd` runs a local shell command; `//` / `!!` escape to literal text.
 
 Keys: `Enter` send · `Ctrl+J` newline · `Tab` complete · `Ctrl+V` paste text/image ·
-`Shift+Tab` toggle auto-approve · `Ctrl+R` resume · `Ctrl+M` model picker · `Ctrl+O` pager for a
-`!cmd` · `Esc` cancel/close · `Ctrl+C` twice to exit.
+`Ctrl+X Ctrl+E` edit draft in $EDITOR · `Shift+Tab` toggle auto-approve · `Ctrl+R` resume ·
+`Ctrl+O` pager for a `!cmd` · `Esc` cancel/close · `Ctrl+C` twice to exit.
 
 `/config` toggles: Thinking, Auto-approve tools, aivo web search, Agent tools (off = plain chat,
 no tools). The agent can also change the live model/effort itself when you ask (it calls its

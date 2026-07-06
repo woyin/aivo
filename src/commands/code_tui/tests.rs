@@ -1062,6 +1062,47 @@ async fn test_ctrl_c_pending_resets_on_other_key() {
     assert!(app.notice.is_none());
 }
 
+#[tokio::test]
+async fn test_ctrl_x_ctrl_e_chord_requests_external_edit() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+
+    app.handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL))
+        .await
+        .unwrap();
+    assert!(app.pending_ctrl_x);
+    assert!(!app.pending_external_edit);
+
+    app.handle_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL))
+        .await
+        .unwrap();
+    assert!(!app.pending_ctrl_x);
+    assert!(app.pending_external_edit);
+}
+
+#[tokio::test]
+async fn test_ctrl_x_chord_cancelled_by_other_key() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+
+    app.handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL))
+        .await
+        .unwrap();
+    assert!(app.pending_ctrl_x);
+
+    app.handle_key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE))
+        .await
+        .unwrap();
+    assert!(!app.pending_ctrl_x);
+    assert!(!app.pending_external_edit);
+    assert_eq!(app.draft, "h");
+
+    app.handle_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL))
+        .await
+        .unwrap();
+    assert!(!app.pending_external_edit);
+}
+
 fn make_test_app(
     tx: tokio::sync::mpsc::UnboundedSender<RuntimeEvent>,
     rx: tokio::sync::mpsc::UnboundedReceiver<RuntimeEvent>,
@@ -1170,6 +1211,8 @@ fn make_test_app(
         picker_hitbox: None,
         overlay_detail_area: None,
         exit_confirm_pending: false,
+        pending_ctrl_x: false,
+        pending_external_edit: false,
         cursor_acp_session: None,
         pending_agent_messages: None,
         goal_mode: None,

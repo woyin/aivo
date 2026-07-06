@@ -1355,6 +1355,11 @@ impl CodeTuiApp {
                 Err(err) => break Err(err),
             }
 
+            if std::mem::take(&mut self.pending_external_edit) {
+                self.edit_draft_in_external_editor(&mut terminal).await;
+                needs_redraw = true;
+            }
+
             // Spinner advances only while animating.
             if self.is_animating() {
                 self.frame_tick = self.frame_tick.wrapping_add(1);
@@ -1454,6 +1459,72 @@ impl CodeTuiApp {
             return Ok(true);
         }
         Ok(false)
+    }
+
+    /// Ctrl+X Ctrl+E: suspend the TUI, edit the draft in `$VISUAL`/`$EDITOR`, load it back.
+    /// The terminal is restored even on failure; errors become a notice, the draft is kept.
+    async fn edit_draft_in_external_editor(
+        &mut self,
+        terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+    ) {
+        let editor = external_editor_command();
+        let _ = disable_raw_mode();
+        let _ = execute!(
+            terminal.backend_mut(),
+            LeaveAlternateScreen,
+            DisableBracketedPaste,
+            DisableMouseCapture
+        );
+        let _ = terminal.show_cursor();
+
+        let result = self.run_editor_on_draft(&editor).await;
+
+        // Mirror `setup_terminal` on the live handle.
+        let _ = enable_raw_mode();
+        let _ = execute!(
+            terminal.backend_mut(),
+            EnterAlternateScreen,
+            EnableBracketedPaste
+        );
+        if chat_mouse_enabled() {
+            let _ = execute!(terminal.backend_mut(), EnableMouseCapture);
+        }
+        let _ = terminal.clear();
+
+        if let Err(err) = result {
+            self.notice = Some((ERROR, format!("External edit failed: {err:#}")));
+        }
+    }
+
+    async fn run_editor_on_draft(&mut self, editor: &[String]) -> Result<()> {
+        use anyhow::Context as _;
+        let file = tempfile::Builder::new()
+            .prefix("aivo-draft-")
+            .suffix(".md")
+            .tempfile()
+            .context("create temp file")?;
+        std::fs::write(file.path(), &self.draft).context("write draft")?;
+        let status = tokio::process::Command::new(&editor[0])
+            .args(&editor[1..])
+            .arg(file.path())
+            .stdin(std::process::Stdio::inherit())
+            .stdout(std::process::Stdio::inherit())
+            .stderr(std::process::Stdio::inherit())
+            .status()
+            .await
+            .with_context(|| format!("launch `{}` (set $VISUAL or $EDITOR)", editor[0]))?;
+        if !status.success() {
+            anyhow::bail!("`{}` exited with {status}; draft kept", editor[0]);
+        }
+        let text = std::fs::read_to_string(file.path()).context("read edited draft")?;
+        // Editors append a final newline and may save CRLF; neither belongs in the composer.
+        let text = text.replace("\r\n", "\n");
+        let text = text.trim_end_matches('\n');
+        self.leave_history_navigation();
+        self.draft = text.to_string();
+        self.cursor = self.draft.len();
+        self.sync_command_menu_state();
+        Ok(())
     }
 
     /// Feeds one freshly-read event through the [`EscReassembly`] state machine.
@@ -2353,6 +2424,20 @@ fn wheel_scroll(offset: u16, up: bool) -> u16 {
     } else {
         offset.saturating_add(WHEEL_LINES)
     }
+}
+
+/// `$VISUAL` then `$EDITOR` (shlex-split so `code --wait` works), else a platform default.
+fn external_editor_command() -> Vec<String> {
+    for var in ["VISUAL", "EDITOR"] {
+        if let Ok(value) = env::var(var)
+            && let Some(parts) = shlex::split(&value)
+            && !parts.is_empty()
+        {
+            return parts;
+        }
+    }
+    let default = if cfg!(windows) { "notepad" } else { "vi" };
+    vec![default.to_string()]
 }
 
 /// `true` when `event` is an unmodified `Esc` keypress.

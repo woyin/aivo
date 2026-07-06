@@ -1913,6 +1913,7 @@ const HELP_KEYBINDINGS: &[(&str, &[(&str, &str)])] = &[
             ("Ctrl+J", "insert newline"),
             ("Tab", "complete command or path"),
             ("Ctrl+V", "paste clipboard text/image"),
+            ("Ctrl+X Ctrl+E", "edit draft in $EDITOR"),
         ],
     ),
     (

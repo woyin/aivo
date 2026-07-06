@@ -212,6 +212,8 @@ impl CodeTuiApp {
             picker_hitbox: None,
             overlay_detail_area: None,
             exit_confirm_pending: false,
+            pending_ctrl_x: false,
+            pending_external_edit: false,
             cursor_acp_session: None,
             pending_agent_messages: None,
             goal_mode: None,

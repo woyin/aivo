@@ -24,6 +24,15 @@ enum OverlayKeyAction {
 
 impl CodeTuiApp {
     pub(super) async fn handle_key(&mut self, key: KeyEvent) -> Result<bool> {
+        // Ctrl+X Ctrl+E chord: Ctrl+E completes it; any other key cancels and runs normally.
+        if std::mem::take(&mut self.pending_ctrl_x)
+            && matches!(key.code, KeyCode::Char('e'))
+            && key.modifiers.contains(KeyModifiers::CONTROL)
+        {
+            self.pending_external_edit = true;
+            return Ok(false);
+        }
+
         if matches!(key.code, KeyCode::Char('c')) && key.modifiers.contains(KeyModifiers::CONTROL) {
             if self.exit_confirm_pending {
                 return Ok(true);
@@ -1040,13 +1049,7 @@ impl CodeTuiApp {
                 self.open_resume_picker(None).await?;
                 true
             }
-            KeyCode::Char('m')
-                if key.modifiers.contains(KeyModifiers::CONTROL)
-                    && self.loading_resume.is_none() =>
-            {
-                self.open_model_picker(None, ModelSelectionTarget::CurrentChat, false);
-                true
-            }
+            // No Ctrl+M binding — terminals send CR for it, i.e. Enter without the kitty protocol.
             _ => false,
         };
 
@@ -1141,6 +1144,9 @@ impl CodeTuiApp {
                 // as the Delete key).
                 self.delete_char_at_cursor();
                 self.sync_command_menu_state();
+            }
+            KeyCode::Char('x') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.pending_ctrl_x = true;
             }
             KeyCode::Backspace => {
                 self.leave_history_navigation();
