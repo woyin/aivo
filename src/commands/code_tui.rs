@@ -136,6 +136,7 @@ impl CodeTuiApp {
             raw_model: params.raw_model,
             model: params.model,
             billed_model: None,
+            turn_model: None,
             format: initial_format,
             history: params.initial_history,
             draft: String::new(),

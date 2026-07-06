@@ -433,6 +433,7 @@ mod tests {
             let body = build_openai_chat_request(
                 model,
                 &[ChatMessage {
+                    model: None,
                     role: "user".to_string(),
                     content: "hi".to_string(),
                     reasoning_content: None,
@@ -452,6 +453,7 @@ mod tests {
             let body = build_openai_chat_request(
                 model,
                 &[ChatMessage {
+                    model: None,
                     role: "user".to_string(),
                     content: "hi".to_string(),
                     reasoning_content: None,
@@ -471,6 +473,7 @@ mod tests {
             let body = build_openai_chat_request(
                 model,
                 &[ChatMessage {
+                    model: None,
                     role: "user".to_string(),
                     content: "hi".to_string(),
                     reasoning_content: None,
@@ -492,6 +495,7 @@ mod tests {
         let gpt5 = build_responses_request(
             "gpt-5.4",
             &[ChatMessage {
+                model: None,
                 role: "user".to_string(),
                 content: "hi".to_string(),
                 reasoning_content: None,
@@ -505,6 +509,7 @@ mod tests {
         let gpt4o = build_responses_request(
             "gpt-4o",
             &[ChatMessage {
+                model: None,
                 role: "user".to_string(),
                 content: "hi".to_string(),
                 reasoning_content: None,
@@ -521,6 +526,7 @@ mod tests {
         let body = build_anthropic_request(
             "claude-sonnet-4-6",
             &[ChatMessage {
+                model: None,
                 role: "user".to_string(),
                 content: "hi".to_string(),
                 reasoning_content: None,
@@ -537,6 +543,7 @@ mod tests {
         let g25 = build_google_request(
             "gemini-2.5-pro",
             &[ChatMessage {
+                model: None,
                 role: "user".to_string(),
                 content: "hi".to_string(),
                 reasoning_content: None,
@@ -552,6 +559,7 @@ mod tests {
         let g15 = build_google_request(
             "gemini-1.5-pro",
             &[ChatMessage {
+                model: None,
                 role: "user".to_string(),
                 content: "hi".to_string(),
                 reasoning_content: None,
@@ -567,6 +575,7 @@ mod tests {
         let request = build_openai_chat_request(
             "gpt-4o",
             &[ChatMessage {
+                model: None,
                 role: "user".to_string(),
                 content: "Review these".to_string(),
                 reasoning_content: None,
@@ -604,6 +613,7 @@ mod tests {
         let with_cap = build_openai_chat_request(
             "deepseek-chat",
             &[ChatMessage {
+                model: None,
                 role: "user".to_string(),
                 content: "hi".to_string(),
                 reasoning_content: None,
@@ -621,6 +631,7 @@ mod tests {
         let without_cap = build_openai_chat_request(
             "gpt-4o",
             &[ChatMessage {
+                model: None,
                 role: "user".to_string(),
                 content: "hi".to_string(),
                 reasoning_content: None,
@@ -638,6 +649,7 @@ mod tests {
         let request = build_anthropic_request(
             "claude-sonnet-4-5",
             &[ChatMessage {
+                model: None,
                 role: "user".to_string(),
                 content: String::new(),
                 reasoning_content: None,
@@ -664,6 +676,7 @@ mod tests {
         let request = build_responses_request(
             "gpt-5.4",
             &[ChatMessage {
+                model: None,
                 role: "user".to_string(),
                 content: "hello".to_string(),
                 reasoning_content: None,
@@ -687,12 +700,14 @@ mod tests {
             "gpt-5.4",
             &[
                 ChatMessage {
+                    model: None,
                     role: "system".to_string(),
                     content: "You are helpful.".to_string(),
                     reasoning_content: None,
                     attachments: vec![],
                 },
                 ChatMessage {
+                    model: None,
                     role: "user".to_string(),
                     content: "hi".to_string(),
                     reasoning_content: None,
@@ -712,6 +727,7 @@ mod tests {
         let request = build_responses_request(
             "gpt-5.4",
             &[ChatMessage {
+                model: None,
                 role: "user".to_string(),
                 content: "Review this".to_string(),
                 reasoning_content: None,
@@ -747,6 +763,7 @@ mod tests {
         let request = build_google_request(
             "gemini-1.5-flash",
             &[ChatMessage {
+                model: None,
                 role: "user".to_string(),
                 content: "hello".to_string(),
                 reasoning_content: None,
@@ -767,12 +784,14 @@ mod tests {
             "gemini-1.5-flash",
             &[
                 ChatMessage {
+                    model: None,
                     role: "system".to_string(),
                     content: "You are helpful.".to_string(),
                     reasoning_content: None,
                     attachments: vec![],
                 },
                 ChatMessage {
+                    model: None,
                     role: "user".to_string(),
                     content: "hi".to_string(),
                     reasoning_content: None,
@@ -796,18 +815,21 @@ mod tests {
             "gemini-1.5-flash",
             &[
                 ChatMessage {
+                    model: None,
                     role: "user".to_string(),
                     content: "hi".to_string(),
                     reasoning_content: None,
                     attachments: vec![],
                 },
                 ChatMessage {
+                    model: None,
                     role: "assistant".to_string(),
                     content: "hello!".to_string(),
                     reasoning_content: None,
                     attachments: vec![],
                 },
                 ChatMessage {
+                    model: None,
                     role: "user".to_string(),
                     content: "thanks".to_string(),
                     reasoning_content: None,
@@ -828,6 +850,7 @@ mod tests {
         let request = build_google_request(
             "gemini-1.5-flash",
             &[ChatMessage {
+                model: None,
                 role: "user".to_string(),
                 content: "describe this".to_string(),
                 reasoning_content: None,

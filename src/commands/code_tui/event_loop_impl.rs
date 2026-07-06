@@ -301,6 +301,7 @@ impl CodeTuiApp {
             entry["interrupted"] = serde_json::Value::Bool(true);
         }
         self.history.push(ChatMessage {
+            model: None,
             role: "local_command".to_string(),
             content: entry.to_string(),
             reasoning_content: None,
@@ -352,6 +353,7 @@ impl CodeTuiApp {
         let duration_ms = reasoning_content.as_ref().and(self.segment_reasoning_ms());
         if !content.is_empty() || reasoning_content.is_some() {
             self.history.push(ChatMessage {
+                model: self.turn_model.clone(),
                 role: "assistant".to_string(),
                 content,
                 reasoning_content,
@@ -447,6 +449,7 @@ impl CodeTuiApp {
         }
         let content = serde_json::to_string(&serde_json::Value::Object(obj)).unwrap_or(name);
         self.history.push(ChatMessage {
+            model: None,
             role: "tool_call".to_string(),
             content,
             reasoning_content: None,
@@ -600,6 +603,7 @@ impl CodeTuiApp {
 
     pub(super) fn apply_agent_tool_result(&mut self, content: String) {
         self.history.push(ChatMessage {
+            model: None,
             role: "tool_result".to_string(),
             content,
             reasoning_content: None,
@@ -620,6 +624,7 @@ impl CodeTuiApp {
         // Drop the prior card (with index-map fixup), re-append the latest below.
         self.drop_plan_entries();
         self.history.push(ChatMessage {
+            model: None,
             role: "plan".to_string(),
             content,
             reasoning_content: None,
@@ -1191,6 +1196,7 @@ impl CodeTuiApp {
             let partial = std::mem::take(&mut self.pending_response);
             self.pending_reasoning.clear();
             self.history.push(ChatMessage {
+                model: self.turn_model.clone(),
                 role: "assistant".to_string(),
                 content: partial,
                 reasoning_content: None,

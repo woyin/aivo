@@ -85,6 +85,9 @@ pub struct ChatMessage {
     pub reasoning_content: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub attachments: Vec<MessageAttachment>,
+    /// Producing model (assistant turns only); `None` on pre-feature sessions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
 }
 
 /// Which API format the provider speaks
@@ -684,6 +687,7 @@ impl CodeCommand {
 
             let one_shot_attachments = materialize_attachments(&pending_attachments).await?;
             let history = vec![ChatMessage {
+                model: None,
                 role: "user".to_string(),
                 content: one_shot_input,
                 reasoning_content: None,
@@ -1417,6 +1421,7 @@ fn build_one_shot_persist_inputs(
 ) -> (Vec<StoredChatMessage>, String, String) {
     let mut full_history = user_history.to_vec();
     full_history.push(ChatMessage {
+        model: (!raw_model.is_empty()).then(|| raw_model.to_string()),
         role: "assistant".to_string(),
         content: assistant_content,
         reasoning_content: assistant_reasoning.and_then(normalize_reasoning_content),
@@ -1432,6 +1437,7 @@ fn to_stored_messages(history: &[ChatMessage]) -> Vec<StoredChatMessage> {
     history
         .iter()
         .map(|message| StoredChatMessage {
+            model: message.model.clone(),
             role: message.role.clone(),
             content: message.content.clone(),
             reasoning_content: message.reasoning_content.clone(),
@@ -2836,6 +2842,7 @@ mod tests {
     #[test]
     fn build_one_shot_persist_inputs_includes_assistant_turn() {
         let user_history = vec![ChatMessage {
+            model: None,
             role: "user".to_string(),
             content: "hello world".to_string(),
             reasoning_content: None,
@@ -2871,6 +2878,7 @@ mod tests {
     #[test]
     fn build_one_shot_persist_inputs_drops_empty_reasoning() {
         let user_history = vec![ChatMessage {
+            model: None,
             role: "user".to_string(),
             content: "ping".to_string(),
             reasoning_content: None,
@@ -3027,6 +3035,7 @@ data: {\"choices\":[{\"delta\":{\"content\":\" world\"}}],\"usage\":{\"prompt_to
         let client = reqwest::Client::builder().no_proxy().build().unwrap();
         let spinning = Arc::new(AtomicBool::new(false));
         let messages = [ChatMessage {
+            model: None,
             role: "user".to_string(),
             content: "hi".to_string(),
             reasoning_content: None,
@@ -3098,6 +3107,7 @@ data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"tex
         let client = reqwest::Client::builder().no_proxy().build().unwrap();
         let spinning = Arc::new(AtomicBool::new(false));
         let messages = [ChatMessage {
+            model: None,
             role: "user".to_string(),
             content: "hi".to_string(),
             reasoning_content: None,
@@ -3124,6 +3134,7 @@ data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"tex
     #[test]
     fn test_chat_message_serialization() {
         let msg = ChatMessage {
+            model: None,
             role: "user".to_string(),
             content: "hello".to_string(),
             reasoning_content: Some("hidden".to_string()),

@@ -288,8 +288,7 @@ fn map_chat_message(m: StoredChatMessage, timestamp: Option<DateTime<Utc>>) -> S
     ShareMessage {
         role: m.role,
         timestamp,
-        // aivo code stores model at the session level only, never per-turn.
-        model: None,
+        model: m.model,
         reasoning: m.reasoning_content,
         content,
     }
@@ -1262,6 +1261,7 @@ mod tests {
 
         let messages = vec![
             StoredChatMessage {
+                model: None,
                 role: "user".into(),
                 content: "Why does pagination break?".into(),
                 reasoning_content: None,
@@ -1270,6 +1270,7 @@ mod tests {
                 attachments: None,
             },
             StoredChatMessage {
+                model: None,
                 role: "assistant".into(),
                 content: "The cursor is unset on first page.".into(),
                 reasoning_content: Some("checked the helper".into()),
@@ -1324,6 +1325,7 @@ mod tests {
         use crate::services::session_crypto::encrypt;
 
         let messages = vec![StoredChatMessage {
+            model: None,
             role: "user".into(),
             content: "look at this".into(),
             reasoning_content: None,
@@ -1390,11 +1392,49 @@ mod tests {
     }
 
     #[test]
+    fn extract_chat_full_maps_per_message_model() {
+        use crate::services::session_crypto::encrypt;
+
+        let msg = |model: Option<&str>, role: &str, content: &str| StoredChatMessage {
+            model: model.map(str::to_string),
+            role: role.into(),
+            content: content.into(),
+            reasoning_content: None,
+            id: None,
+            timestamp: None,
+            attachments: None,
+        };
+        let messages = vec![
+            msg(None, "user", "q1"),
+            msg(Some("model-a"), "assistant", "a1"),
+            msg(None, "user", "q2"),
+            msg(Some("model-b"), "assistant", "a2"),
+        ];
+        let state = CodeSessionState {
+            session_id: "s".into(),
+            key_id: "k".into(),
+            base_url: "u".into(),
+            cwd: "/tmp".into(),
+            model: "model-b".into(),
+            messages: encrypt(&serde_json::to_string(&messages).unwrap()).unwrap(),
+            engine_messages: None,
+            updated_at: String::new(),
+            created_at: String::new(),
+        };
+
+        let payload = extract_chat_full(&state, None).unwrap();
+        assert_eq!(payload.messages[0].model, None);
+        assert_eq!(payload.messages[1].model.as_deref(), Some("model-a"));
+        assert_eq!(payload.messages[3].model.as_deref(), Some("model-b"));
+    }
+
+    #[test]
     fn extract_chat_full_maps_agent_tool_turns() {
         use crate::services::session_crypto::encrypt;
 
         let messages = vec![
             StoredChatMessage {
+                model: None,
                 role: "user".into(),
                 content: "create out.txt".into(),
                 reasoning_content: None,
@@ -1403,6 +1443,7 @@ mod tests {
                 attachments: None,
             },
             StoredChatMessage {
+                model: None,
                 role: "tool_call".into(),
                 content: r#"{"name":"write_file","args":{"path":"out.txt"}}"#.into(),
                 reasoning_content: None,
@@ -1411,6 +1452,7 @@ mod tests {
                 attachments: None,
             },
             StoredChatMessage {
+                model: None,
                 role: "tool_result".into(),
                 content: "wrote out.txt".into(),
                 reasoning_content: None,
@@ -1419,6 +1461,7 @@ mod tests {
                 attachments: None,
             },
             StoredChatMessage {
+                model: None,
                 role: "tool_call".into(),
                 content: r#"{"name":"read_file","args":{"path":"missing"}}"#.into(),
                 reasoning_content: None,
@@ -1427,6 +1470,7 @@ mod tests {
                 attachments: None,
             },
             StoredChatMessage {
+                model: None,
                 role: "tool_result".into(),
                 content: "error: no such file".into(),
                 reasoning_content: None,
@@ -1435,6 +1479,7 @@ mod tests {
                 attachments: None,
             },
             StoredChatMessage {
+                model: None,
                 role: "assistant".into(),
                 content: "Done.".into(),
                 reasoning_content: None,

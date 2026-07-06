@@ -869,6 +869,7 @@ mod tests {
 
         // Persist one chat session via the SessionStore so get_code_session finds it.
         let messages = vec![StoredChatMessage {
+            model: None,
             role: "user".into(),
             content: "hi".into(),
             reasoning_content: None,
@@ -910,6 +911,7 @@ mod tests {
         let ctx = ctx_with_tempdirs(&temp, temp.path().to_path_buf());
 
         let messages = vec![StoredChatMessage {
+            model: None,
             role: "user".into(),
             content: "hi".into(),
             reasoning_content: None,

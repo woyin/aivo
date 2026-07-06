@@ -111,6 +111,8 @@ impl CodeTuiApp {
         // (intro, spacing) is `None`; each message block paints its role color.
         let mut bars: Vec<Option<Color>> = Vec::new();
         let mut previous_role: Option<&str> = None;
+        // Last stamped assistant model; unstamped (pre-feature) turns don't reset it.
+        let mut previous_model: Option<&str> = None;
 
         if self.is_transcript_empty() {
             push_styled_line(&mut lines, "", Style::default());
@@ -166,6 +168,22 @@ impl CodeTuiApp {
             if should_add_message_spacing(previous_role, message.role.as_str()) {
                 push_message_spacing(&mut lines);
                 bars.resize(lines.len(), None);
+            }
+            // Model-switch divider; mirrors the share viewer's phase divider.
+            if message.role == "assistant"
+                && let Some(model) = message.model.as_deref()
+            {
+                if previous_model.is_some_and(|prev| prev != model) {
+                    push_styled_line(
+                        &mut lines,
+                        format!("model → {model}"),
+                        Style::default().fg(MUTED).add_modifier(Modifier::ITALIC),
+                    );
+                    bars.push(None);
+                    push_styled_line(&mut lines, String::new(), Style::default());
+                    bars.push(None);
+                }
+                previous_model = Some(model);
             }
             let mut block = Vec::new();
             let mut advance = 1;

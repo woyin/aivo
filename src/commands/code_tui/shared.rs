@@ -364,6 +364,7 @@ pub(super) fn decrypt_to_chat_messages(
         .decrypt_messages()?
         .into_iter()
         .map(|m| ChatMessage {
+            model: m.model,
             role: m.role,
             content: m.content,
             reasoning_content: m.reasoning_content,
@@ -1920,6 +1921,9 @@ pub(super) struct CodeTuiApp {
     /// saves (no fresh turn in scope) can still write `billed_model` to
     /// the session index. Cleared on key/model switch and resume.
     pub(super) billed_model: Option<String>,
+    /// `raw_model` frozen at dispatch — a mid-turn switch applies next turn, so
+    /// assistant commits stamp from here, never from live `raw_model`.
+    pub(super) turn_model: Option<String>,
     pub(super) format: ChatFormat,
     pub(super) history: Vec<ChatMessage>,
     pub(super) draft: String,

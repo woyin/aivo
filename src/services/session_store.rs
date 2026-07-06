@@ -769,6 +769,9 @@ pub struct StoredChatMessage {
     pub timestamp: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub attachments: Option<Vec<MessageAttachment>>,
+    /// Producing model (assistant turns only); absent on pre-feature sessions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -3076,6 +3079,7 @@ mod tests {
                 "gpt-4o",
                 None,
                 &[StoredChatMessage {
+                    model: None,
                     role: "user".to_string(),
                     content: "hello".to_string(),
                     reasoning_content: None,
@@ -3113,6 +3117,7 @@ mod tests {
                 "gpt-4o-mini",
                 None,
                 &[StoredChatMessage {
+                    model: None,
                     role: "user".to_string(),
                     content: "second".to_string(),
                     reasoning_content: None,
@@ -3331,9 +3336,26 @@ mod tests {
     }
 
     #[test]
+    fn stored_chat_message_model_optional_and_roundtrips() {
+        // Pre-feature JSON parses; None is omitted on write.
+        let legacy: StoredChatMessage =
+            serde_json::from_str(r#"{"role":"assistant","content":"hi"}"#).unwrap();
+        assert_eq!(legacy.model, None);
+        assert!(!serde_json::to_string(&legacy).unwrap().contains("model"));
+        let stamped = StoredChatMessage {
+            model: Some("m1".into()),
+            ..legacy
+        };
+        let json = serde_json::to_string(&stamped).unwrap();
+        let back: StoredChatMessage = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.model.as_deref(), Some("m1"));
+    }
+
+    #[test]
     fn test_chat_session_messages_current_format_roundtrip() {
         let msgs = vec![
             StoredChatMessage {
+                model: None,
                 role: "user".into(),
                 content: "ping".into(),
                 reasoning_content: None,
@@ -3342,6 +3364,7 @@ mod tests {
                 attachments: None,
             },
             StoredChatMessage {
+                model: None,
                 role: "assistant".into(),
                 content: "pong".into(),
                 reasoning_content: None,

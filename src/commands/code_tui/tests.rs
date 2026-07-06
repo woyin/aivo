@@ -1135,6 +1135,7 @@ fn make_test_app(
         raw_model: String::new(),
         model: String::new(),
         billed_model: None,
+        turn_model: None,
         format: ChatFormat::OpenAI,
         history: Vec::new(),
         draft: String::new(),
@@ -1276,6 +1277,7 @@ fn test_resumable_session_id_skips_empty_history() {
 
     // Once something has been said, the exit hint points back at this session.
     app.history.push(ChatMessage {
+        model: None,
         role: "user".to_string(),
         content: "hi".to_string(),
         reasoning_content: None,
@@ -1292,6 +1294,7 @@ fn seed_two_exchanges(app: &mut CodeTuiApp) {
         ("assistant", "second answer"),
     ] {
         app.history.push(ChatMessage {
+            model: None,
             role: role.to_string(),
             content: content.to_string(),
             reasoning_content: None,
@@ -1535,6 +1538,7 @@ fn test_streams_thinking_window_during_thinking_only_phase() {
     app.transcript_width = 80;
     app.sending = true;
     app.history.push(ChatMessage {
+        model: None,
         role: "user".to_string(),
         content: "hi".to_string(),
         reasoning_content: None,
@@ -1587,6 +1591,7 @@ fn test_thinking_wrapped_lines_hang_indented_under_marker() {
     app.thinking_enabled = true;
     app.transcript_width = 46;
     app.history.push(ChatMessage {
+        model: None,
         role: "assistant".to_string(),
         content: "Here are the changes.".to_string(),
         reasoning_content: Some(
@@ -1771,6 +1776,7 @@ fn test_volatile_tail_fp_tracks_reasoning_and_toggle() {
     app.sending = true;
     app.thinking_enabled = true;
     app.history.push(ChatMessage {
+        model: None,
         role: "user".to_string(),
         content: "hi".to_string(),
         reasoning_content: None,
@@ -1800,6 +1806,7 @@ fn test_thinking_block_has_distinct_bar_color() {
     app.thinking_enabled = true;
     app.transcript_width = 80;
     app.history.push(ChatMessage {
+        model: None,
         role: "assistant".to_string(),
         content: "the answer".to_string(),
         reasoning_content: Some("the reasoning".to_string()),
@@ -1831,6 +1838,7 @@ fn test_history_reasoning_windows_when_thinking_enabled() {
     let mut app = make_test_app(tx, rx);
     app.transcript_width = 80;
     app.history.push(ChatMessage {
+        model: None,
         role: "assistant".to_string(),
         content: "the answer".to_string(),
         reasoning_content: Some(
@@ -1884,6 +1892,7 @@ fn test_click_thinking_header_toggles_inline_expansion() {
         ("second answer", "SECOND cot"),
     ] {
         app.history.push(ChatMessage {
+            model: None,
             role: "assistant".to_string(),
             content: content.to_string(),
             reasoning_content: Some(reasoning.to_string()),
@@ -1947,6 +1956,7 @@ fn test_committed_thinking_windows_and_expands_on_click() {
     app.transcript_width = 80;
     // Short (≤ window): everything already fits, marked `✻`.
     app.history.push(ChatMessage {
+        model: None,
         role: "assistant".to_string(),
         content: "answer".to_string(),
         reasoning_content: Some("line one\nline two".to_string()),
@@ -1962,6 +1972,7 @@ fn test_committed_thinking_windows_and_expands_on_click() {
     // Long (> window): the window shows only the most recent rows; earliest scroll
     // off — until the user expands it.
     app.history.push(ChatMessage {
+        model: None,
         role: "assistant".to_string(),
         content: "answer2".to_string(),
         reasoning_content: Some("alpha\nbeta\ngamma\ndelta\nepsilon".to_string()),
@@ -2002,12 +2013,14 @@ fn test_finished_turn_renders_done_marker() {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let mut app = make_test_app(tx, rx);
     app.history.push(ChatMessage {
+        model: None,
         role: "user".to_string(),
         content: "fix it".to_string(),
         reasoning_content: None,
         attachments: vec![],
     });
     app.history.push(ChatMessage {
+        model: None,
         role: "assistant".to_string(),
         content: "done".to_string(),
         reasoning_content: None,
@@ -2050,6 +2063,7 @@ fn test_composer_placeholder_stays_plain_when_history_has_reasoning() {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let mut app = make_test_app(tx, rx);
     app.history.push(ChatMessage {
+        model: None,
         role: "assistant".to_string(),
         content: "answer".to_string(),
         reasoning_content: Some("private reasoning".to_string()),
@@ -2360,18 +2374,21 @@ fn test_done_marker_stays_above_new_input_after_plan_clear() {
     // A finished turn: a reply, then a completed plan pinned in its panel. The
     // Done marker is stamped on the last VISIBLE entry (the reply, idx 1).
     app.history.push(ChatMessage {
+        model: None,
         role: "user".to_string(),
         content: "first task".to_string(),
         reasoning_content: None,
         attachments: vec![],
     });
     app.history.push(ChatMessage {
+        model: None,
         role: "assistant".to_string(),
         content: "the reply".to_string(),
         reasoning_content: None,
         attachments: vec![],
     });
     app.history.push(ChatMessage {
+        model: None,
         role: "plan".to_string(),
         content: r#"[{"step":"a","status":"completed"}]"#.to_string(),
         reasoning_content: None,
@@ -2382,6 +2399,7 @@ fn test_done_marker_stays_above_new_input_after_plan_clear() {
     // The next user message clears the completed plan, then appends.
     app.clear_stale_plan();
     app.history.push(ChatMessage {
+        model: None,
         role: "user".to_string(),
         content: "second task".to_string(),
         reasoning_content: None,
@@ -2403,18 +2421,21 @@ fn test_clear_completed_plan_shifts_index_maps() {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let mut app = make_test_app(tx, rx);
     app.history.push(ChatMessage {
+        model: None,
         role: "assistant".to_string(),
         content: "a".to_string(),
         reasoning_content: None,
         attachments: vec![],
     });
     app.history.push(ChatMessage {
+        model: None,
         role: "plan".to_string(),
         content: r#"[{"step":"a","status":"completed"}]"#.to_string(),
         reasoning_content: None,
         attachments: vec![],
     });
     app.history.push(ChatMessage {
+        model: None,
         role: "assistant".to_string(),
         content: "b".to_string(),
         reasoning_content: None,
@@ -2506,6 +2527,7 @@ async fn test_done_marker_skipped_on_errored_turn() {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let mut app = make_test_app(tx, rx);
     app.history.push(ChatMessage {
+        model: None,
         role: "user".to_string(),
         content: "hi".to_string(),
         reasoning_content: None,
@@ -2738,6 +2760,7 @@ fn test_intro_column_stable_from_empty_to_message() {
     let empty_col = aivo_col(&mut app);
 
     app.history.push(ChatMessage {
+        model: None,
         role: "assistant".to_string(),
         content: "hi".to_string(),
         reasoning_content: None,
@@ -3340,6 +3363,7 @@ fn test_long_reply_scrolls_to_show_last_line() {
         .join(" ");
     body.push_str(" TAILWORD");
     app.history.push(ChatMessage {
+        model: None,
         role: "assistant".to_string(),
         content: body,
         reasoning_content: None,
@@ -3377,6 +3401,7 @@ fn test_transcript_cache_reuses_across_frames_until_content_changes() {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let mut app = make_test_app(tx, rx);
     app.history.push(ChatMessage {
+        model: None,
         role: "assistant".to_string(),
         content: "# Heading\n\nSome **markdown** reply.".to_string(),
         reasoning_content: None,
@@ -3408,6 +3433,7 @@ fn test_transcript_cache_reuses_across_frames_until_content_changes() {
 
     // Appending a message changes the fingerprint → the cache rebuilds.
     app.history.push(ChatMessage {
+        model: None,
         role: "user".to_string(),
         content: "another turn".to_string(),
         reasoning_content: None,
@@ -3448,6 +3474,7 @@ fn test_permission_card_anchored_above_composer() {
     // Some history so the composer is pushed toward the bottom of the screen.
     for _ in 0..4 {
         app.history.push(ChatMessage {
+            model: None,
             role: "assistant".to_string(),
             content: "working on it".to_string(),
             reasoning_content: None,
@@ -3549,6 +3576,7 @@ fn test_spinner_animation_does_not_invalidate_transcript_cache() {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let mut app = make_test_app(tx, rx);
     app.history.push(ChatMessage {
+        model: None,
         role: "user".to_string(),
         content: "hi".to_string(),
         reasoning_content: None,
@@ -3598,6 +3626,7 @@ fn test_streaming_tokens_do_not_invalidate_history_body_cache() {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let mut app = make_test_app(tx, rx);
     app.history.push(ChatMessage {
+        model: None,
         role: "assistant".to_string(),
         content: "# Heading\n\nSome **markdown** reply.".to_string(),
         reasoning_content: None,
@@ -3660,12 +3689,14 @@ fn test_streaming_composed_render_matches_full_transcript() {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let mut app = make_test_app(tx, rx);
     app.history.push(ChatMessage {
+        model: None,
         role: "user".to_string(),
         content: "explain the plan in detail please".to_string(),
         reasoning_content: None,
         attachments: vec![],
     });
     app.history.push(ChatMessage {
+        model: None,
         role: "assistant".to_string(),
         content:
             "# Heading\n\nA committed reply with **markdown** and a fairly long line that wraps."
@@ -3711,6 +3742,7 @@ fn streaming_reply_cache_invalidates_on_change() {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let mut app = make_test_app(tx, rx);
     app.history.push(ChatMessage {
+        model: None,
         role: "user".to_string(),
         content: "go".to_string(),
         reasoning_content: None,
@@ -3867,6 +3899,7 @@ fn test_edit_diff_rows_carry_add_remove_tints() {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let mut app = make_test_app(tx, rx);
     app.history.push(ChatMessage {
+        model: None,
         role: "tool_call".to_string(),
         content: r#"{"name":"edit_file","args":{"path":"src/a.rs","old_string":"let x = 1;","new_string":"let x = 2;"}}"#.to_string(),
         reasoning_content: None,
@@ -3893,6 +3926,7 @@ fn test_edit_diff_word_highlight_brightens_only_changed_tokens() {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let mut app = make_test_app(tx, rx);
     app.history.push(ChatMessage {
+        model: None,
         role: "tool_call".to_string(),
         content: r#"{"name":"edit_file","args":{"path":"a.rs","old_string":"let x = 1;","new_string":"let x = 2;"}}"#.to_string(),
         reasoning_content: None,
@@ -3938,6 +3972,7 @@ fn test_edit_diff_numbers_rows_from_line_starts() {
     // `old_string` begins at file line 10 (a=10, b=11, c=12); only the middle
     // line changes. `line_starts` is the pre-edit probe the runtime stamps.
     app.history.push(ChatMessage {
+        model: None,
         role: "tool_call".to_string(),
         content: r#"{"name":"edit_file","args":{"path":"a.rs","old_string":"a\nb\nc","new_string":"a\nB\nc"},"line_starts":[10]}"#.to_string(),
         reasoning_content: None,
@@ -3968,6 +4003,7 @@ fn test_edit_diff_shows_context_only_marks_changed_lines() {
     let mut app = make_test_app(tx, rx);
     // Only the middle line changes; the first and last are shared context.
     app.history.push(ChatMessage {
+        model: None,
         role: "tool_call".to_string(),
         content: r#"{"name":"edit_file","args":{"path":"src/a.rs","old_string":"fn a() {\n    let y = 2;\n}","new_string":"fn a() {\n    let y = 20;\n}"}}"#.to_string(),
         reasoning_content: None,
@@ -4010,6 +4046,7 @@ fn test_edit_diff_trims_context_and_collapses_gap() {
     // Two far-apart changes (first and last line) with a long unchanged middle.
     // Context is limited to a few lines, so the middle collapses to a `⋯`.
     app.history.push(ChatMessage {
+        model: None,
         role: "tool_call".to_string(),
         content: r#"{"name":"edit_file","args":{"path":"x.rs","old_string":"A\nc1\nc2\nc3\nMID\nc5\nc6\nc7\nB","new_string":"A2\nc1\nc2\nc3\nMID\nc5\nc6\nc7\nB2"}}"#.to_string(),
         reasoning_content: None,
@@ -4051,6 +4088,7 @@ fn test_hint_bar_reflects_state() {
         let mut app = make_test_app(tx, rx);
         // A long transcript so the footer fills to the terminal's bottom row.
         app.history.push(ChatMessage {
+            model: None,
             role: "assistant".to_string(),
             content: (0..40)
                 .map(|i| format!("line {i}"))
@@ -4491,6 +4529,7 @@ fn test_punctuation_only_reasoning_renders_no_thought_row() {
     let mut app = make_test_app(tx, rx);
     app.thinking_enabled = true;
     app.history.push(ChatMessage {
+        model: None,
         role: "assistant".to_string(),
         content: "the answer".to_string(),
         reasoning_content: Some("...".to_string()),
@@ -4628,6 +4667,7 @@ async fn test_cursor_turn_ending_on_tool_does_not_duplicate_prose() {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let mut app = make_test_app(tx, rx);
     app.history.push(ChatMessage {
+        model: None,
         role: "user".to_string(),
         content: "fix it".to_string(),
         reasoning_content: None,
@@ -4695,6 +4735,7 @@ async fn test_finish_deferred_until_typewriter_drains() {
     let mut app = make_test_app(tx, rx);
     app.sending = true;
     app.history.push(ChatMessage {
+        model: None,
         role: "user".to_string(),
         content: "hi".to_string(),
         reasoning_content: None,
@@ -4744,18 +4785,21 @@ fn test_build_transcript_renders_tool_steps() {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let mut app = make_test_app(tx, rx);
     app.history.push(ChatMessage {
+        model: None,
         role: "user".to_string(),
         content: "fix it".to_string(),
         reasoning_content: None,
         attachments: vec![],
     });
     app.history.push(ChatMessage {
+        model: None,
         role: "tool_call".to_string(),
         content: r#"{"name":"read_file","args":{"path":"src/parser.rs"}}"#.to_string(),
         reasoning_content: None,
         attachments: vec![],
     });
     app.history.push(ChatMessage {
+        model: None,
         role: "tool_result".to_string(),
         // Realistic read_file output: right-aligned line numbers + tab + content.
         content: "     1\t/**\n     2\t * sum\n     3\t */".to_string(),
@@ -4800,6 +4844,7 @@ fn test_build_transcript_renders_tool_steps() {
 #[test]
 fn test_agent_seed_turns_folds_tool_steps() {
     let msg = |role: &str, content: &str| ChatMessage {
+        model: None,
         role: role.to_string(),
         content: content.to_string(),
         reasoning_content: None,
@@ -4839,12 +4884,14 @@ fn test_build_transcript_renders_edit_diff() {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let mut app = make_test_app(tx, rx);
     app.history.push(ChatMessage {
+        model: None,
         role: "tool_call".to_string(),
         content: r#"{"name":"edit_file","args":{"path":"src/a.rs","old_string":"let x = 1;","new_string":"let x = 2;"}}"#.to_string(),
         reasoning_content: None,
         attachments: vec![],
     });
     app.history.push(ChatMessage {
+        model: None,
         role: "tool_result".to_string(),
         content: "edited src/a.rs".to_string(),
         reasoning_content: None,
@@ -4876,6 +4923,7 @@ fn test_build_transcript_prettifies_mcp_tool_name() {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let mut app = make_test_app(tx, rx);
     app.history.push(ChatMessage {
+        model: None,
         role: "tool_call".to_string(),
         content: r#"{"name":"mcp__filesystem__read_file","args":{}}"#.to_string(),
         reasoning_content: None,
@@ -4896,6 +4944,7 @@ fn test_plan_renders_in_pinned_panel_not_inline() {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let mut app = make_test_app(tx, rx);
     app.history.push(ChatMessage {
+        model: None,
         role: "plan".to_string(),
         content: r#"[{"step":"scan code","status":"completed"},{"step":"write fix","status":"in_progress"},{"step":"run tests","status":"pending"}]"#.to_string(),
         reasoning_content: None,
@@ -4966,6 +5015,7 @@ fn test_completed_plan_hidden_from_panel() {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let mut app = make_test_app(tx, rx);
     app.history.push(ChatMessage {
+        model: None,
         role: "plan".to_string(),
         content: r#"[{"step":"scan code","status":"completed"},{"step":"write fix","status":"completed"}]"#.to_string(),
         reasoning_content: None,
@@ -4993,6 +5043,7 @@ fn test_long_plan_windows_to_five_with_more_marker() {
         plan.push(serde_json::json!({"step": format!("step {i}"), "status": status}));
     }
     app.history.push(ChatMessage {
+        model: None,
         role: "plan".to_string(),
         content: serde_json::Value::Array(plan).to_string(),
         reasoning_content: None,
@@ -5256,6 +5307,7 @@ fn test_apply_agent_plan_keeps_single_card() {
     // A plan after real work still keeps ONE card, relocated to the latest point
     // (so the transcript never stacks a near-identical copy after each batch).
     app.history.push(ChatMessage {
+        model: None,
         role: "tool_call".to_string(),
         content: "{}".to_string(),
         reasoning_content: None,
@@ -5275,6 +5327,7 @@ fn test_build_transcript_coalesces_consecutive_tool_calls() {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let mut app = make_test_app(tx, rx);
     app.history.push(ChatMessage {
+        model: None,
         role: "user".to_string(),
         content: "study the sidebar".to_string(),
         reasoning_content: None,
@@ -5283,6 +5336,7 @@ fn test_build_transcript_coalesces_consecutive_tool_calls() {
     // Cursor-style: a run of read_file calls with no interleaved results.
     for path in ["src/sidebar.rs", "src/session.rs", "src/time.rs"] {
         app.history.push(ChatMessage {
+            model: None,
             role: "tool_call".to_string(),
             content: format!(r#"{{"name":"read_file","args":{{"path":"{path}"}}}}"#),
             reasoning_content: None,
@@ -5291,6 +5345,7 @@ fn test_build_transcript_coalesces_consecutive_tool_calls() {
     }
     // A different kind right after starts a new run (not merged with the reads).
     app.history.push(ChatMessage {
+        model: None,
         role: "tool_call".to_string(),
         content: r#"{"name":"grep","args":{"pattern":"hover"}}"#.to_string(),
         reasoning_content: None,
@@ -5323,6 +5378,7 @@ fn test_render_main_paints_per_role_accent_gutter() {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let mut app = make_test_app(tx, rx);
     app.history.push(ChatMessage {
+        model: None,
         role: "user".to_string(),
         content: "ping".to_string(),
         reasoning_content: None,
@@ -5330,6 +5386,7 @@ fn test_render_main_paints_per_role_accent_gutter() {
     });
     // Long enough to wrap across several rows at width 24.
     app.history.push(ChatMessage {
+        model: None,
         role: "assistant".to_string(),
         content: "alpha beta gamma delta epsilon zeta eta theta iota kappa".to_string(),
         reasoning_content: None,
@@ -5385,6 +5442,7 @@ fn test_render_main_uses_full_height_for_long_transcript() {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let mut app = make_test_app(tx, rx);
     app.history.push(ChatMessage {
+        model: None,
         role: "assistant".to_string(),
         content: (0..40)
             .map(|index| format!("line {index}"))
@@ -5417,6 +5475,7 @@ async fn test_mouse_wheel_scrolls_only_inside_transcript_hitbox() {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let mut app = make_test_app(tx, rx);
     app.history.push(ChatMessage {
+        model: None,
         role: "assistant".to_string(),
         content: (0..40)
             .map(|index| format!("line {index}"))
@@ -5524,6 +5583,7 @@ fn test_selection_highlight_preserves_rendered_text_and_foreground() {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let mut normal = make_test_app(tx, rx);
     normal.history.push(ChatMessage {
+        model: None,
         role: "assistant".to_string(),
         content: "A **styled** answer with enough words to wrap across multiple visual lines."
             .to_string(),
@@ -5651,6 +5711,7 @@ async fn test_mouse_drag_coordinates_map_to_transcript_rows() {
     // A populated transcript hitbox only exists with real content; an empty
     // transcript routes selection to the screen surface (see `selection_target`).
     app.history.push(ChatMessage {
+        model: None,
         role: "user".to_string(),
         content: "x".to_string(),
         reasoning_content: None,
@@ -5796,6 +5857,7 @@ async fn jump_to_bottom_pill_shows_when_scrolled_up_and_clicks_to_latest() {
     // Enough turns to overflow an 80x24 viewport, so the jump-to-bottom pill applies.
     for i in 0..40 {
         app.history.push(ChatMessage {
+            model: None,
             role: if i % 2 == 0 { "user" } else { "assistant" }.to_string(),
             content: format!("message line {i}"),
             reasoning_content: None,
@@ -6009,6 +6071,7 @@ async fn test_drag_to_bottom_edge_arms_and_advances_autoscroll() {
     // Real content so max_scroll() (which rebuilds from history) leaves room to
     // scroll past the 4-row viewport.
     app.history.push(ChatMessage {
+        model: None,
         role: "assistant".to_string(),
         content: (0..40)
             .map(|i| format!("line {i}"))
@@ -6061,6 +6124,7 @@ async fn test_drag_to_top_edge_arms_and_advances_autoscroll() {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let mut app = make_test_app(tx, rx);
     app.history.push(ChatMessage {
+        model: None,
         role: "assistant".to_string(),
         content: (0..40)
             .map(|i| format!("line {i}"))
@@ -6157,6 +6221,7 @@ fn test_highlight_does_not_wash_blank_cells_past_text() {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let mut app = make_test_app(tx, rx);
     app.history.push(ChatMessage {
+        model: None,
         role: "assistant".to_string(),
         content: "hi".to_string(),
         reasoning_content: None,
@@ -6913,6 +6978,7 @@ async fn test_skill_turn_renders_compact_not_body() {
     };
     let expanded = super::runtime_impl::expand_skill_invocation(&skill, Some("歌曲"));
     app.history.push(ChatMessage {
+        model: None,
         role: "user".to_string(),
         content: expanded,
         reasoning_content: None,
@@ -7340,6 +7406,7 @@ async fn test_plan_card_idx_shifts_on_removal() {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let mut app = make_test_app(tx, rx);
     let msg = |role: &str, c: &str| ChatMessage {
+        model: None,
         role: role.to_string(),
         content: c.to_string(),
         reasoning_content: None,
@@ -7367,6 +7434,7 @@ async fn test_plan_capture_discard_and_status() {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let mut app = make_test_app(tx, rx);
     let assistant = |content: &str| ChatMessage {
+        model: None,
         role: "assistant".to_string(),
         content: content.to_string(),
         reasoning_content: None,
@@ -7540,6 +7608,7 @@ async fn test_goal_loop_stops_on_marker_and_cap() {
     let mut app = make_test_app(tx, rx);
 
     let assistant = |content: &str| ChatMessage {
+        model: None,
         role: "assistant".to_string(),
         content: content.to_string(),
         reasoning_content: None,
@@ -8837,6 +8906,7 @@ fn session_picker_fixture() -> (PickerState, SessionPreview) {
 
 fn preview_chat_message(role: &str, content: &str) -> ChatMessage {
     ChatMessage {
+        model: None,
         role: role.to_string(),
         content: content.to_string(),
         reasoning_content: None,
@@ -9782,6 +9852,7 @@ async fn test_skill_drill_in_scrolls_long_body() {
 #[test]
 fn test_restore_cancelled_submission_puts_prompt_back() {
     let mut history = vec![ChatMessage {
+        model: None,
         role: "user".to_string(),
         content: "draft".to_string(),
         reasoning_content: None,
@@ -10063,6 +10134,7 @@ fn test_local_command_long_line_wraps_in_full() {
     })
     .to_string();
     app.history.push(ChatMessage {
+        model: None,
         role: "local_command".to_string(),
         content,
         reasoning_content: None,
@@ -10119,6 +10191,7 @@ fn test_render_main_local_command_no_clip() {
     })
     .to_string();
     app.history.push(ChatMessage {
+        model: None,
         role: "local_command".to_string(),
         content,
         reasoning_content: None,
@@ -10287,6 +10360,7 @@ async fn test_open_model_picker_keeps_inflight_turn() {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let mut app = make_test_app(tx, rx);
     app.history.push(ChatMessage {
+        model: None,
         role: "user".to_string(),
         content: "draft".to_string(),
         reasoning_content: None,
@@ -10313,6 +10387,7 @@ async fn test_cancel_keeps_user_turn_for_in_process_agent_turn() {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let mut app = make_test_app(tx, rx);
     app.history.push(ChatMessage {
+        model: None,
         role: "user".to_string(),
         content: "edit the config".to_string(),
         reasoning_content: None,
@@ -10354,6 +10429,7 @@ async fn test_interrupt_inflight_request_keeps_partial_response() {
     app.cwd = "/tmp/demo".to_string();
     app.session_id = "session-123".to_string();
     app.history.push(ChatMessage {
+        model: None,
         role: "user".to_string(),
         content: "draft".to_string(),
         reasoning_content: None,
@@ -10422,6 +10498,7 @@ async fn test_interrupt_empty_restores_draft() {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let mut app = make_test_app(tx, rx);
     app.history.push(ChatMessage {
+        model: None,
         role: "user".to_string(),
         content: "first message".to_string(),
         reasoning_content: None,
@@ -10458,6 +10535,7 @@ async fn test_interrupt_empty_keeps_typed_draft() {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let mut app = make_test_app(tx, rx);
     app.history.push(ChatMessage {
+        model: None,
         role: "user".to_string(),
         content: "first message".to_string(),
         reasoning_content: None,
@@ -10490,6 +10568,7 @@ async fn test_interrupt_empty_agent_turn_restores_draft() {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let mut app = make_test_app(tx, rx);
     app.history.push(ChatMessage {
+        model: None,
         role: "user".to_string(),
         content: "edit the config".to_string(),
         reasoning_content: None,
@@ -10522,12 +10601,14 @@ async fn test_interrupt_empty_agent_turn_with_tool_keeps_turn() {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let mut app = make_test_app(tx, rx);
     app.history.push(ChatMessage {
+        model: None,
         role: "user".to_string(),
         content: "edit the config".to_string(),
         reasoning_content: None,
         attachments: vec![],
     });
     app.history.push(ChatMessage {
+        model: None,
         role: "tool_call".to_string(),
         content: "{\"name\":\"edit_file\"}".to_string(),
         reasoning_content: None,
@@ -10562,6 +10643,7 @@ async fn test_recover_dead_response_task_resets_stuck_turn() {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let mut app = make_test_app(tx, rx);
     app.history.push(ChatMessage {
+        model: None,
         role: "user".to_string(),
         content: "do it".to_string(),
         reasoning_content: None,
@@ -10779,12 +10861,14 @@ fn test_session_preview_uses_last_user_message() {
         title: session_title_from_messages(
             &[
                 ChatMessage {
+                    model: None,
                     role: "assistant".to_string(),
                     content: "Hi".to_string(),
                     reasoning_content: None,
                     attachments: vec![],
                 },
                 ChatMessage {
+                    model: None,
                     role: "user".to_string(),
                     content: "What is the deployment status for api gateway?".to_string(),
                     reasoning_content: None,
@@ -10807,12 +10891,14 @@ fn test_session_preview_text_uses_two_latest_turns() {
     let preview = session_preview_text_from_messages(
         &[
             ChatMessage {
+                model: None,
                 role: "user".to_string(),
                 content: "hello".to_string(),
                 reasoning_content: None,
                 attachments: vec![],
             },
             ChatMessage {
+                model: None,
                 role: "assistant".to_string(),
                 content: "hi there".to_string(),
                 reasoning_content: None,
@@ -10876,6 +10962,7 @@ async fn test_begin_resume_load_clears_transcript_before_result() {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let mut app = make_test_app(tx, rx);
     app.history.push(ChatMessage {
+        model: None,
         role: "user".to_string(),
         content: "old".to_string(),
         reasoning_content: None,
@@ -10909,6 +10996,7 @@ async fn test_begin_resume_load_clears_transcript_before_result() {
 
 fn one_user_message(content: &str) -> Vec<crate::services::session_store::StoredChatMessage> {
     vec![crate::services::session_store::StoredChatMessage {
+        model: None,
         role: "user".to_string(),
         content: content.to_string(),
         reasoning_content: None,
@@ -11057,6 +11145,7 @@ async fn test_resume_last_in_session_skips_current_chat() {
     app.session_id = "current-sess".to_string();
     app.raw_model = "claude".to_string();
     app.history.push(ChatMessage {
+        model: None,
         role: "user".to_string(),
         content: "live conversation".to_string(),
         reasoning_content: None,
@@ -11094,6 +11183,7 @@ async fn test_open_resume_picker_saves_current_unsaved_session() {
     app.session_id = "fresh-session".to_string();
     app.raw_model = "claude".to_string();
     app.history.push(ChatMessage {
+        model: None,
         role: "user".to_string(),
         content: "hello from a new chat".to_string(),
         reasoning_content: None,
@@ -11141,6 +11231,7 @@ async fn test_delete_picker_selection_removes_saved_chat() {
             None,
             &[
                 crate::services::session_store::StoredChatMessage {
+                    model: None,
                     role: "user".to_string(),
                     content: "hello".to_string(),
                     reasoning_content: None,
@@ -11149,6 +11240,7 @@ async fn test_delete_picker_selection_removes_saved_chat() {
                     attachments: None,
                 },
                 crate::services::session_store::StoredChatMessage {
+                    model: None,
                     role: "assistant".to_string(),
                     content: "hi there".to_string(),
                     reasoning_content: None,
@@ -11222,6 +11314,7 @@ async fn test_ctrl_d_requires_confirmation_before_delete() {
             "claude",
             None,
             &[crate::services::session_store::StoredChatMessage {
+                model: None,
                 role: "user".to_string(),
                 content: "hello".to_string(),
                 reasoning_content: None,
@@ -11294,6 +11387,7 @@ async fn test_resume_loaded_failure_restores_previous_state() {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let mut app = make_test_app(tx.clone(), rx);
     app.history.push(ChatMessage {
+        model: None,
         role: "user".to_string(),
         content: "old".to_string(),
         reasoning_content: None,
@@ -11360,6 +11454,7 @@ async fn test_resume_resets_agent_engine() {
         session_id: "resumed".to_string(),
         raw_model: "claude".to_string(),
         messages: vec![ChatMessage {
+            model: None,
             role: "user".to_string(),
             content: "earlier turn".to_string(),
             reasoning_content: None,
@@ -11409,6 +11504,7 @@ async fn test_resume_does_not_overwrite_persisted_default_model() {
         session_id: "resumed".to_string(),
         raw_model: "google/gemma-4-31b-it".to_string(),
         messages: vec![ChatMessage {
+            model: None,
             role: "user".to_string(),
             content: "earlier turn".to_string(),
             reasoning_content: None,
@@ -11465,6 +11561,7 @@ async fn test_resume_lists_sessions_regardless_of_cwd() {
             "claude",
             None,
             &[crate::services::session_store::StoredChatMessage {
+                model: None,
                 role: "user".into(),
                 content: "older".into(),
                 reasoning_content: None,
@@ -11489,6 +11586,7 @@ async fn test_resume_lists_sessions_regardless_of_cwd() {
     app.session_id = "real-cwd-sess".to_string();
     app.raw_model = "claude".to_string();
     app.history.push(ChatMessage {
+        model: None,
         role: "user".to_string(),
         content: "remember me".to_string(),
         reasoning_content: None,
@@ -11526,6 +11624,7 @@ async fn test_persist_history_writes_session_tokens_to_index() {
     app.session_id = "tok-sess".to_string();
     app.raw_model = "claude".to_string();
     app.history.push(ChatMessage {
+        model: None,
         role: "user".to_string(),
         content: "hi".to_string(),
         reasoning_content: None,
@@ -11580,12 +11679,14 @@ async fn test_log_agent_turn_records_under_real_cwd() {
     app.session_id = "agent-sess".to_string();
     app.raw_model = "claude".to_string();
     app.history.push(ChatMessage {
+        model: None,
         role: "user".to_string(),
         content: "do the thing".to_string(),
         reasoning_content: None,
         attachments: vec![],
     });
     app.history.push(ChatMessage {
+        model: None,
         role: "assistant".to_string(),
         content: "done".to_string(),
         reasoning_content: None,
@@ -11628,6 +11729,7 @@ async fn test_flush_for_exit_persists_partial_response_when_streaming() {
     app.session_id = "exit-session".to_string();
     app.raw_model = "claude".to_string();
     app.history.push(ChatMessage {
+        model: None,
         role: "user".to_string(),
         content: "tell me a story".to_string(),
         reasoning_content: None,
@@ -11669,6 +11771,7 @@ async fn test_flush_for_exit_persists_user_only_history() {
     app.session_id = "user-only-session".to_string();
     app.raw_model = "claude".to_string();
     app.history.push(ChatMessage {
+        model: None,
         role: "user".to_string(),
         content: "tell me a story".to_string(),
         reasoning_content: None,
@@ -12654,6 +12757,7 @@ async fn test_history_has_image_detects_image_attachment() {
     assert!(!app.history_has_image(), "empty history has no image");
 
     app.history.push(ChatMessage {
+        model: None,
         role: "user".to_string(),
         content: "just text".to_string(),
         reasoning_content: None,
@@ -12671,6 +12775,7 @@ async fn test_history_has_image_detects_image_attachment() {
     );
 
     app.history.push(ChatMessage {
+        model: None,
         role: "user".to_string(),
         content: "look".to_string(),
         reasoning_content: None,
@@ -12908,4 +13013,103 @@ async fn agent_switch_model_noops_when_already_on_it() {
     app.raw_model = "gpt-5".to_string();
     let msg = app.agent_switch_model("GPT-5".to_string()).await.unwrap();
     assert!(msg.contains("Already using gpt-5"));
+}
+
+/// Assistant turns are stamped with their dispatch-time model, and the
+/// transcript draws a `model →` divider where the stamp changes.
+#[test]
+fn model_switch_stamps_turns_and_renders_divider() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+
+    // Turn 1 dispatched on model-a.
+    app.history.push(ChatMessage {
+        model: None,
+        role: "user".to_string(),
+        content: "first question".to_string(),
+        reasoning_content: None,
+        attachments: vec![],
+    });
+    app.turn_model = Some("model-a".to_string());
+    // Mid-turn switch: the running turn must keep its dispatch-time stamp.
+    app.raw_model = "model-b".to_string();
+    app.pending_response = "answer one".to_string();
+    app.flush_pending_assistant();
+    assert_eq!(
+        app.history.last().unwrap().model.as_deref(),
+        Some("model-a")
+    );
+
+    // Turn 2 dispatched on model-b.
+    app.history.push(ChatMessage {
+        model: None,
+        role: "user".to_string(),
+        content: "second question".to_string(),
+        reasoning_content: None,
+        attachments: vec![],
+    });
+    app.turn_model = Some("model-b".to_string());
+    app.pending_response = "answer two".to_string();
+    app.flush_pending_assistant();
+    assert_eq!(
+        app.history.last().unwrap().model.as_deref(),
+        Some("model-b")
+    );
+
+    let body = app.build_transcript_history_body(80);
+    let rows = wrap_transcript(&body.lines, &body.bar_colors, 80).rows;
+    // One divider at the boundary; none above the first stamped turn.
+    assert_eq!(
+        rows.iter()
+            .filter(|r| r.contains("model → model-b"))
+            .count(),
+        1
+    );
+    assert!(rows.iter().all(|r| !r.contains("model → model-a")));
+    let first = rows.iter().position(|r| r.contains("answer one")).unwrap();
+    let divider = rows
+        .iter()
+        .position(|r| r.contains("model → model-b"))
+        .unwrap();
+    let second = rows.iter().position(|r| r.contains("answer two")).unwrap();
+    assert!(first < divider && divider < second);
+}
+
+/// Unstamped (pre-feature) history renders no divider.
+#[test]
+fn unstamped_history_renders_no_model_divider() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    for (role, content) in [
+        ("user", "q1"),
+        ("assistant", "a1"),
+        ("user", "q2"),
+        ("assistant", "a2"),
+    ] {
+        app.history.push(ChatMessage {
+            model: None,
+            role: role.to_string(),
+            content: content.to_string(),
+            reasoning_content: None,
+            attachments: vec![],
+        });
+    }
+    let body = app.build_transcript_history_body(80);
+    let rows = wrap_transcript(&body.lines, &body.bar_colors, 80).rows;
+    assert!(rows.iter().all(|r| !r.contains("model →")));
+}
+
+/// Dispatch freezes the selected model into `turn_model`.
+#[tokio::test]
+async fn test_dispatch_captures_turn_model() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    // Non-agent key keeps the send on the lightweight plain-chat path.
+    app.key.base_url = "claude-oauth".to_string();
+    app.raw_model = "model-a".to_string();
+
+    app.dispatch_user_message("hello".to_string(), None)
+        .await
+        .unwrap();
+    assert_eq!(app.turn_model.as_deref(), Some("model-a"));
 }

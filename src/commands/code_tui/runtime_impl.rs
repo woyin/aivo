@@ -332,6 +332,7 @@ impl CodeTuiApp {
         // doesn't linger above the composer into an unrelated task.
         self.clear_stale_plan();
         self.history.push(ChatMessage {
+            model: None,
             role: "user".to_string(),
             content: input.clone(),
             reasoning_content: None,
@@ -341,6 +342,7 @@ impl CodeTuiApp {
         // prior selection would point at the wrong content — drop it.
         self.clear_transcript_selection();
         self.sending = true;
+        self.turn_model = (!self.raw_model.is_empty()).then(|| self.raw_model.clone());
         self.follow_output = true;
 
         let conversation_has_image = self.history_has_image();
@@ -746,6 +748,7 @@ impl CodeTuiApp {
             None
         } else {
             let msg = ChatMessage {
+                model: None,
                 role: "user".to_string(),
                 content: input.clone(),
                 reasoning_content: None,
@@ -889,6 +892,7 @@ impl CodeTuiApp {
         let tx = self.tx.clone();
         // Turn state: block the composer, show status; flag the freed-delta report.
         self.sending = true;
+        self.turn_model = (!self.raw_model.is_empty()).then(|| self.raw_model.clone());
         self.request_started_at = Some(Instant::now());
         self.compact_before = Some(before);
         self.response_task = Some(tokio::spawn(async move {
@@ -1909,6 +1913,7 @@ impl CodeTuiApp {
         self.request_started_at = None;
         self.follow_output = true;
         self.history.push(ChatMessage {
+            model: self.turn_model.clone(),
             role: "assistant".to_string(),
             content: partial,
             reasoning_content,

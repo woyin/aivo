@@ -725,6 +725,7 @@ mod tests {
 
     fn sample_messages() -> Vec<StoredChatMessage> {
         vec![StoredChatMessage {
+            model: None,
             role: "user".to_string(),
             content: "hello world".to_string(),
             reasoning_content: None,
@@ -1123,6 +1124,7 @@ mod tests {
     fn compute_session_title_uses_last_user_message() {
         let messages = vec![
             StoredChatMessage {
+                model: None,
                 role: "user".to_string(),
                 content: "first question".to_string(),
                 reasoning_content: None,
@@ -1131,6 +1133,7 @@ mod tests {
                 attachments: None,
             },
             StoredChatMessage {
+                model: None,
                 role: "assistant".to_string(),
                 content: "answer".to_string(),
                 reasoning_content: None,
@@ -1139,6 +1142,7 @@ mod tests {
                 attachments: None,
             },
             StoredChatMessage {
+                model: None,
                 role: "user".to_string(),
                 content: "second question".to_string(),
                 reasoning_content: None,
@@ -1162,6 +1166,7 @@ mod tests {
     fn compute_session_preview_joins_recent_messages() {
         let messages = vec![
             StoredChatMessage {
+                model: None,
                 role: "user".to_string(),
                 content: "hello  world".to_string(),
                 reasoning_content: None,
@@ -1170,6 +1175,7 @@ mod tests {
                 attachments: None,
             },
             StoredChatMessage {
+                model: None,
                 role: "assistant".to_string(),
                 content: "hi  there".to_string(),
                 reasoning_content: None,
@@ -1192,6 +1198,7 @@ mod tests {
     #[test]
     fn title_and_preview_skip_agent_tool_entries() {
         let msg = |role: &str, content: &str| StoredChatMessage {
+            model: None,
             role: role.to_string(),
             content: content.to_string(),
             reasoning_content: None,
