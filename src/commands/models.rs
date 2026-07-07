@@ -91,12 +91,12 @@ struct OpenAIModel {
 }
 
 impl OpenAIModel {
-    fn into_model_info(self) -> ModelInfo {
+    fn into_model_info(self, price_scale: f64) -> ModelInfo {
         let context_tokens = self.find_context();
         let context = context_tokens.map(format_token_count);
         let max_output_tokens = self.find_max_output();
         let max_output = max_output_tokens.map(format_token_count);
-        let (input_price, output_price) = self.find_pricing();
+        let (input_price, output_price) = self.find_pricing(price_scale);
         let multiplier = self.find_multiplier();
         let reasoning_efforts = self.find_reasoning_efforts();
         ModelInfo {
@@ -144,6 +144,7 @@ impl OpenAIModel {
                 && !k.contains("price")
                 && !k.contains("cost")
                 && let Some(n) = http_utils::parse_token_u64(val)
+                && n > 0
             {
                 return Some(n);
             }
@@ -152,6 +153,7 @@ impl OpenAIModel {
         self.extra
             .get("max_input_tokens")
             .and_then(http_utils::parse_token_u64)
+            .filter(|&n| n > 0)
     }
 
     /// Search for a max-output field: max_tokens, max_output_tokens,
@@ -166,6 +168,7 @@ impl OpenAIModel {
                 || k == "max_output")
                 && !k.contains("price")
                 && let Some(n) = http_utils::parse_token_u64(val)
+                && n > 0
             {
                 return Some(n);
             }
@@ -178,6 +181,7 @@ impl OpenAIModel {
                     if k.contains("max")
                         && (k.contains("output") || k.contains("completion") || k.contains("token"))
                         && let Some(n) = http_utils::parse_token_u64(v2)
+                        && n > 0
                     {
                         return Some(n);
                     }
@@ -187,9 +191,16 @@ impl OpenAIModel {
         None
     }
 
-    /// Search for pricing info in a nested "pricing"/"price" object,
-    /// looking for input/prompt and output/completion fields.
-    fn find_pricing(&self) -> (Option<String>, Option<String>) {
+    fn find_pricing(&self, price_scale: f64) -> (Option<String>, Option<String>) {
+        let (input, output) = self.raw_pricing();
+        (
+            input.and_then(|v| format_scaled_price(v, price_scale)),
+            output.and_then(|v| format_scaled_price(v, price_scale)),
+        )
+    }
+
+    /// Raw (input, output) prices from a nested "pricing"/"price" object.
+    fn raw_pricing(&self) -> (Option<f64>, Option<f64>) {
         for (key, val) in &self.extra {
             let k = key.to_ascii_lowercase();
             if (k == "pricing" || k == "price" || k == "prices")
@@ -201,10 +212,7 @@ impl OpenAIModel {
                     obj,
                     &["output", "completion", "output_cost", "output_price"],
                 );
-                return (
-                    input.and_then(|s| format_price_per_million(&s)),
-                    output.and_then(|s| format_price_per_million(&s)),
-                );
+                return (input, output);
             }
         }
         (None, None)
@@ -212,14 +220,14 @@ impl OpenAIModel {
 }
 
 /// Search a pricing object for a field matching one of the candidate names.
-fn find_price_value(obj: &serde_json::Map<String, Value>, candidates: &[&str]) -> Option<String> {
+fn find_price_value(obj: &serde_json::Map<String, Value>, candidates: &[&str]) -> Option<f64> {
     for candidate in candidates {
         if let Some(val) = obj.get(*candidate) {
             if let Some(s) = val.as_str() {
-                return Some(s.to_string());
+                return s.trim().parse().ok();
             }
             if let Some(n) = val.as_f64() {
-                return Some(n.to_string());
+                return Some(n);
             }
         }
     }
@@ -627,21 +635,45 @@ fn status_hint(status: reqwest::StatusCode) -> Option<&'static str> {
     }
 }
 
-/// Convert a `/v1/models` price to a `$`-prefixed, 2-decimal per-1M display.
-///
-/// Providers report either per-token (OpenRouter — "0.000003") or per-million
-/// (publicai — "0.15"). Per-token prices are always tiny, so any value >= 0.001
-/// is already per-million and isn't scaled (else "0.15" became "$150000").
-fn format_price_per_million(raw: &str) -> Option<String> {
-    let price: f64 = raw.parse().ok()?;
-    if price <= 0.0 {
+/// Per-1M multipliers for the quoting conventions seen in the wild:
+/// per-1M (publicai), per-1K (some relay gateways), per-token (OpenRouter).
+const PRICE_SCALES: [f64; 3] = [1.0, 1_000.0, 1_000_000.0];
+
+/// Dollars-per-1M band that real model prices land in.
+const SANE_PER_M: std::ops::RangeInclusive<f64> = 0.01..=1_000.0;
+
+/// A lone price is ambiguous (0.0003: per-token $300/1M or per-1K $0.30/1M),
+/// so every price in the response votes for each scale landing it in-band;
+/// ties take the smallest multiplier (budget per-1K far outnumbers premium
+/// per-token in practice).
+fn infer_price_scale(models: &[OpenAIModel]) -> f64 {
+    let mut votes = [0u32; PRICE_SCALES.len()];
+    for m in models {
+        let (input, output) = m.raw_pricing();
+        for v in [input, output].into_iter().flatten() {
+            if v <= 0.0 {
+                continue;
+            }
+            for (slot, scale) in votes.iter_mut().zip(PRICE_SCALES) {
+                if SANE_PER_M.contains(&(v * scale)) {
+                    *slot += 1;
+                }
+            }
+        }
+    }
+    let best = votes.iter().copied().max().unwrap_or(0);
+    if best == 0 {
+        return 1.0;
+    }
+    let winner = votes.iter().position(|&v| v == best).unwrap_or(0);
+    PRICE_SCALES[winner]
+}
+
+fn format_scaled_price(raw: f64, scale: f64) -> Option<String> {
+    if raw <= 0.0 {
         return None;
     }
-    let per_m = if price >= 0.001 {
-        price
-    } else {
-        price * 1_000_000.0
-    };
+    let per_m = raw * scale;
     Some(format!("${per_m:.2}"))
 }
 
@@ -1014,7 +1046,13 @@ async fn fetch_models_detailed_filtered(
             }
 
             let resp: OpenAIModelsResponse = response.json().await?;
-            Ok::<_, anyhow::Error>(resp.data.into_iter().map(|m| m.into_model_info()).collect())
+            let scale = infer_price_scale(&resp.data);
+            Ok::<_, anyhow::Error>(
+                resp.data
+                    .into_iter()
+                    .map(|m| m.into_model_info(scale))
+                    .collect(),
+            )
         }
         ModelListingStrategy::Ollama => {
             crate::services::ollama::ensure_ready().await?;
@@ -1041,11 +1079,12 @@ async fn fetch_models_detailed_filtered(
             }
 
             let resp: OpenAIModelsResponse = response.json().await?;
+            let scale = infer_price_scale(&resp.data);
             Ok(resp
                 .data
                 .into_iter()
                 .filter(|m| is_copilot_chat_model(&m.id))
-                .map(|m| m.into_model_info())
+                .map(|m| m.into_model_info(scale))
                 .collect())
         }
         ModelListingStrategy::CursorAcp => {
@@ -1112,7 +1151,12 @@ async fn fetch_models_detailed_filtered(
             }
 
             let resp: OpenAIModelsResponse = response.json().await?;
-            Ok(resp.data.into_iter().map(|m| m.into_model_info()).collect())
+            let scale = infer_price_scale(&resp.data);
+            Ok(resp
+                .data
+                .into_iter()
+                .map(|m| m.into_model_info(scale))
+                .collect())
         }
         ModelListingStrategy::CloudflareSearch => {
             let cloudflare_base = cloudflare_ai_base(base)
@@ -1188,8 +1232,13 @@ async fn fetch_models_detailed_filtered(
                 let body = response.text().await.unwrap_or_default();
                 match serde_json::from_str::<OpenAIModelsResponse>(&body) {
                     Ok(resp) => {
-                        success =
-                            Some(resp.data.into_iter().map(|m| m.into_model_info()).collect());
+                        let scale = infer_price_scale(&resp.data);
+                        success = Some(
+                            resp.data
+                                .into_iter()
+                                .map(|m| m.into_model_info(scale))
+                                .collect(),
+                        );
                         break;
                     }
                     Err(e) => {
@@ -2036,38 +2085,98 @@ mod tests {
         assert!(!tool_supports_default_model(AIToolType::Opencode, &[]));
     }
 
+    fn priced_models(prices: &[(f64, f64)]) -> Vec<OpenAIModel> {
+        prices
+            .iter()
+            .enumerate()
+            .map(|(i, (input, output))| {
+                serde_json::from_value(serde_json::json!({
+                    "id": format!("m{i}"),
+                    "pricing": {"prompt": input, "completion": output},
+                }))
+                .unwrap()
+            })
+            .collect()
+    }
+
     #[test]
-    fn format_price_scales_per_token_values() {
-        // OpenRouter/Vercel report per-token (tiny) values; always 2 decimals.
+    fn price_scale_per_token_openrouter_style() {
+        let models = priced_models(&[(0.0000005, 0.0000015), (0.000003, 0.000015)]);
+        let scale = infer_price_scale(&models);
+        assert_eq!(scale, 1_000_000.0);
         assert_eq!(
-            format_price_per_million("0.0000005").as_deref(),
-            Some("$0.50")
-        );
-        assert_eq!(
-            format_price_per_million("0.000003").as_deref(),
+            format_scaled_price(0.000003, scale).as_deref(),
             Some("$3.00")
         );
-        // Even the priciest realistic model ($200/1M) stays per-token.
+        // A premium model ($200/1M) rides the response-wide vote.
+        let models = priced_models(&[(0.000003, 0.000015), (0.00004, 0.0002)]);
+        assert_eq!(infer_price_scale(&models), 1_000_000.0);
+    }
+
+    #[test]
+    fn price_scale_per_thousand_relay_style() {
+        // 0.0003/0.0012 straddled the old >=0.001 threshold ($300.00/$0.00).
+        let models = priced_models(&[
+            (0.00014, 0.00028),
+            (0.0003, 0.0012),
+            (0.0006, 0.003),
+            (0.0013, 0.0043),
+        ]);
+        let scale = infer_price_scale(&models);
+        assert_eq!(scale, 1_000.0);
         assert_eq!(
-            format_price_per_million("0.0002").as_deref(),
+            format_scaled_price(0.00014, scale).as_deref(),
+            Some("$0.14")
+        );
+        assert_eq!(format_scaled_price(0.0012, scale).as_deref(), Some("$1.20"));
+        assert_eq!(format_scaled_price(0.0043, scale).as_deref(), Some("$4.30"));
+    }
+
+    #[test]
+    fn price_scale_per_million_publicai_style() {
+        let models = priced_models(&[(0.15, 0.2), (2.92, 200.0)]);
+        let scale = infer_price_scale(&models);
+        assert_eq!(scale, 1.0);
+        assert_eq!(format_scaled_price(0.15, scale).as_deref(), Some("$0.15"));
+        assert_eq!(
+            format_scaled_price(200.0, scale).as_deref(),
             Some("$200.00")
         );
     }
 
     #[test]
-    fn format_price_keeps_per_million_values() {
-        // publicai reports per-million dollars directly — must not be scaled.
-        assert_eq!(format_price_per_million("0.15").as_deref(), Some("$0.15"));
-        assert_eq!(format_price_per_million("0.2").as_deref(), Some("$0.20"));
-        assert_eq!(format_price_per_million("2.92").as_deref(), Some("$2.92"));
-        assert_eq!(format_price_per_million("200").as_deref(), Some("$200.00"));
+    fn price_scale_defaults_without_votes() {
+        assert_eq!(infer_price_scale(&[]), 1.0);
+        assert_eq!(infer_price_scale(&priced_models(&[(0.0, 0.0)])), 1.0);
     }
 
     #[test]
-    fn format_price_rejects_zero_and_garbage() {
-        assert_eq!(format_price_per_million("0"), None);
-        assert_eq!(format_price_per_million("-1"), None);
-        assert_eq!(format_price_per_million("free"), None);
+    fn format_price_rejects_zero_and_negative() {
+        assert_eq!(format_scaled_price(0.0, 1.0), None);
+        assert_eq!(format_scaled_price(-1.0, 1_000_000.0), None);
+    }
+
+    #[test]
+    fn zero_context_and_max_tokens_treated_as_absent() {
+        // Vercel reports 0 for video/embedding models; "0/0" is meaningless.
+        let m: OpenAIModel = serde_json::from_value(serde_json::json!({
+            "id": "wan-t2v",
+            "context_window": 0,
+            "max_tokens": 0,
+        }))
+        .unwrap();
+        assert_eq!(m.find_context(), None);
+        assert_eq!(m.find_max_output(), None);
+    }
+
+    #[test]
+    fn raw_pricing_parses_string_values() {
+        let m: OpenAIModel = serde_json::from_value(serde_json::json!({
+            "id": "m",
+            "pricing": {"prompt": "0.000003", "completion": "free"},
+        }))
+        .unwrap();
+        assert_eq!(m.raw_pricing(), (Some(0.000003), None));
     }
 
     #[test]
