@@ -243,6 +243,18 @@ impl CodeTuiApp {
             RuntimeEvent::LiveShareReady { share_gen, result } => {
                 self.apply_live_share_ready(share_gen, result)
             }
+            RuntimeEvent::AccountLoginPrompt {
+                account_gen,
+                result,
+            } => self.apply_account_login_prompt(account_gen, result),
+            RuntimeEvent::AccountLoginDone {
+                account_gen,
+                result,
+            } => self.apply_account_login_done(account_gen, result).await,
+            RuntimeEvent::AccountLogoutDone {
+                account_gen,
+                result,
+            } => self.apply_account_logout_done(account_gen, result).await,
         }
         Ok(())
     }

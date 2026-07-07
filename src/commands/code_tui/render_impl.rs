@@ -940,6 +940,8 @@ impl CodeTuiApp {
 
         if self.pending_mcp_consent.is_some() {
             self.render_mcp_consent_card(frame, composer_area, outer);
+        } else if self.pending_logout.is_some() {
+            self.render_logout_confirm_card(frame, composer_area, outer);
         } else if self.agent_permission.is_some() {
             self.render_permission_card(frame, composer_area, outer);
         } else if self.agent_ask.is_some() {
@@ -954,6 +956,9 @@ impl CodeTuiApp {
             if let (Some(s), Some(r)) = (clamped, self.agent_review.as_mut()) {
                 r.scroll = s;
             }
+        } else if self.account_login.is_some() {
+            // Last: passive status — decision cards win the slot.
+            self.render_login_card(frame, composer_area, outer);
         }
 
         // Snapshot the finished screen so a drag can copy from anywhere on it,
@@ -1135,6 +1140,83 @@ impl CodeTuiApp {
         });
         frame.render_widget(block, card);
         frame.render_widget(Paragraph::new(Text::from(lines)), inner);
+    }
+
+    /// The `/logout` y/n confirm card (owns the keyboard, like MCP consent).
+    fn render_logout_confirm_card(
+        &self,
+        frame: &mut Frame<'_>,
+        composer_area: Rect,
+        frame_area: Rect,
+    ) {
+        let Some(account) = self.pending_logout.as_ref() else {
+            return;
+        };
+        let lines = vec![
+            Line::from(vec![
+                Span::styled("Unlink this device from ", Style::default().fg(TEXT)),
+                Span::styled(
+                    account.clone(),
+                    Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled("?", Style::default().fg(TEXT)),
+            ]),
+            Line::from(Span::styled(
+                "This device drops to the free tier until you sign in again.",
+                Style::default().fg(MUTED),
+            )),
+            Line::from(""),
+            account_keys_line(&[("y", ASSISTANT, "sign out"), ("n", ERROR, "cancel")]),
+        ];
+        render_account_card(
+            frame,
+            composer_area,
+            frame_area,
+            "sign out of aivo",
+            WARNING,
+            lines,
+        );
+    }
+
+    /// The `/login` status card: code + URL + waiting state. Passive — it never
+    /// owns the keyboard (see `handle_login_card_key`), so typing stays live.
+    fn render_login_card(&self, frame: &mut Frame<'_>, composer_area: Rect, frame_area: Rect) {
+        let Some(card) = self.account_login.as_ref() else {
+            return;
+        };
+        let lines = vec![
+            Line::from(vec![
+                Span::styled(
+                    "Confirm this code in your browser:  ",
+                    Style::default().fg(TEXT),
+                ),
+                Span::styled(
+                    card.user_code.clone(),
+                    Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+                ),
+            ]),
+            Line::from(Span::styled(
+                card.open_url.clone(),
+                Style::default().fg(LINK),
+            )),
+            Line::from(Span::styled(
+                "Waiting for approval…",
+                Style::default().fg(MUTED),
+            )),
+            Line::from(""),
+            account_keys_line(&[
+                ("Enter", ASSISTANT, "open browser"),
+                ("Esc", ERROR, "cancel"),
+            ]),
+        ];
+        render_account_card(
+            frame,
+            composer_area,
+            frame_area,
+            "sign in to aivo",
+            ACCENT,
+            lines,
+        );
     }
 
     /// Card asking the user to approve a mutating agent tool. Anchored directly
@@ -2673,6 +2755,86 @@ fn permission_heading(tool: &str) -> String {
         "edit_file" | "multi_edit" => "Edit a file?".to_string(),
         other => format!("Allow {other}?"),
     }
+}
+
+/// Content-sized bordered card for the account flows. Placed below the
+/// composer's footer when the dead space there fits it (a short session must
+/// not cover the banner/transcript while empty rows sit unused); a full screen
+/// falls back to the above-the-composer permission-card slot.
+fn render_account_card(
+    frame: &mut Frame<'_>,
+    composer_area: Rect,
+    frame_area: Rect,
+    title: &str,
+    border: Color,
+    mut lines: Vec<Line<'static>>,
+) {
+    let needed = lines.len() as u16 + 2;
+    let anchor = composer_area.y.saturating_sub(1);
+    let above_budget = anchor.saturating_sub(frame_area.y).max(1);
+    // +3: the 2-row footer (status + hint bar) plus a blank gap.
+    let below_top = composer_area
+        .y
+        .saturating_add(composer_area.height)
+        .saturating_add(3);
+    let below_budget = frame_area
+        .y
+        .saturating_add(frame_area.height)
+        .saturating_sub(below_top);
+    let below = below_budget >= needed;
+    let budget = if below { below_budget } else { above_budget };
+    // Tight slot: shed spacer rows before clipping content (key hints).
+    if lines.len() as u16 + 2 > budget {
+        lines.retain(|l| l.width() > 0);
+    }
+    let content_w = lines.iter().map(Line::width).max().unwrap_or(0);
+    let max_width = composer_area.width.min(frame_area.width).max(1);
+    let width = (content_w as u16).saturating_add(4).clamp(1, max_width);
+    let height = (lines.len() as u16 + 2).min(budget);
+    let y = if below {
+        below_top
+    } else {
+        anchor.saturating_sub(height).max(frame_area.y)
+    };
+    let card = Rect {
+        x: composer_area.x,
+        y,
+        width,
+        height,
+    };
+    frame.render_widget(Clear, card);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(border))
+        .title(Span::styled(
+            format!(" {title} "),
+            Style::default().fg(border).add_modifier(Modifier::BOLD),
+        ));
+    let inner = block.inner(card).inner(ratatui::layout::Margin {
+        vertical: 0,
+        horizontal: 1,
+    });
+    frame.render_widget(block, card);
+    frame.render_widget(Paragraph::new(Text::from(lines)), inner);
+}
+
+/// Color-coded `key label` hint row for the account cards.
+fn account_keys_line(keys: &[(&'static str, Color, &'static str)]) -> Line<'static> {
+    let mut spans = Vec::new();
+    for (i, (key, color, label)) in keys.iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::styled("    ".to_string(), Style::default().fg(FAINT)));
+        }
+        spans.push(Span::styled(
+            key.to_string(),
+            Style::default().fg(*color).add_modifier(Modifier::BOLD),
+        ));
+        spans.push(Span::styled(
+            format!(" {label}"),
+            Style::default().fg(MUTED),
+        ));
+    }
+    Line::from(spans)
 }
 
 /// The project-MCP consent choices row: run once / always (this repo) / deny,

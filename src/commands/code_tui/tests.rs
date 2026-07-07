@@ -263,13 +263,27 @@ async fn test_help_overlay_groups_lists_every_command_and_scrolls() {
         assert!(top.contains(group), "missing command group {group}:\n{top}");
     }
     for command in SLASH_COMMANDS {
+        // Account commands are hidden on this (non-aivo) test key.
+        if !app.slash_command_visible(command.name) {
+            assert!(
+                !top.contains(command.help_label),
+                "hidden command {} leaked into help:\n{top}",
+                command.help_label
+            );
+            continue;
+        }
         assert!(
             top.contains(command.help_label),
             "command {} missing from help:\n{top}",
             command.help_label
         );
     }
-    // Every command is grouped, so the completeness-guard "More" bucket is empty.
+    // The aivo-only account group is absent on a BYOK key.
+    assert!(
+        !top.contains("aivo account"),
+        "account group shown on a non-aivo key:\n{top}"
+    );
+    // Every visible command is grouped, so the completeness-guard "More" bucket is empty.
     assert!(
         !top.contains("More"),
         "unexpected ungrouped commands:\n{top}"
@@ -303,6 +317,214 @@ async fn test_help_overlay_groups_lists_every_command_and_scrolls() {
         .await
         .unwrap();
     assert!(matches!(app.overlay, Overlay::None));
+}
+
+#[tokio::test]
+async fn test_account_commands_gated_to_aivo_key() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+
+    // The default test key is BYOK → account commands are hidden and refused.
+    assert!(!app.is_aivo_account_key());
+    for name in ["login", "logout", "usage"] {
+        assert!(
+            !app.slash_command_visible(name),
+            "/{name} should be hidden on a BYOK key"
+        );
+    }
+    // `/usage` on a BYOK key is a no-op with a hint — no task spawned.
+    app.run_usage_command().await;
+    assert!(app.account_task.is_none());
+    assert!(
+        app.notice
+            .as_ref()
+            .is_some_and(|(_, m)| m.contains("aivo provider")),
+        "expected the aivo-only hint, got {:?}",
+        app.notice
+    );
+
+    // On the bundled aivo starter key the three commands surface.
+    app.key.base_url = crate::constants::AIVO_STARTER_SENTINEL.to_string();
+    assert!(app.is_aivo_account_key());
+    for name in ["login", "logout", "usage"] {
+        assert!(
+            app.slash_command_visible(name),
+            "/{name} should show on the aivo key"
+        );
+    }
+    // The `/` menu now offers them.
+    let entries = app.matching_command_entries("login");
+    assert!(
+        entries.iter().any(|e| e.label() == "/login"),
+        "/login missing from the menu on the aivo key"
+    );
+}
+
+#[tokio::test]
+async fn test_account_login_card_flow_and_stale_generation() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.key.base_url = crate::constants::AIVO_STARTER_SENTINEL.to_string();
+
+    // Stand in for `run_login_command` (no network poll): notice, no card yet.
+    app.account_gen = 7;
+    app.notice = Some((MUTED, "Starting sign-in…".to_string()));
+    assert!(app.account_login.is_none());
+
+    // The device code + URL arrive → the card appears, notice cleared.
+    app.apply_account_login_prompt(
+        7,
+        Ok((
+            "WXYZ-1234".to_string(),
+            "https://getaivo.dev/device?code=WXYZ-1234".to_string(),
+        )),
+    );
+    assert!(app.notice.is_none(), "starting notice not cleared");
+    let (frame, _) = render_full_screen(&mut app, 80, 24);
+    assert!(frame.contains("sign in to aivo"), "title missing:\n{frame}");
+    assert!(frame.contains("WXYZ-1234"), "code missing:\n{frame}");
+    assert!(
+        frame.contains("Waiting for approval…"),
+        "status missing:\n{frame}"
+    );
+    assert!(
+        frame.contains("Enter open browser"),
+        "key hints missing:\n{frame}"
+    );
+    // Empty session parks the composer at top → the card takes the space below.
+    assert!(
+        frame.find("Ask anything").unwrap() < frame.find("sign in to aivo").unwrap(),
+        "card should sit below the parked composer:\n{frame}"
+    );
+
+    // A prompt stamped with a stale generation is ignored (card stays).
+    app.apply_account_login_prompt(3, Err("boom".to_string()));
+    assert!(app.account_login.is_some(), "stale error dropped the card");
+
+    // Esc with a non-empty composer belongs to the draft — the card stays.
+    app.draft = "half a thought".to_string();
+    app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+        .await
+        .unwrap();
+    assert!(app.account_login.is_some(), "Esc stole the draft's key");
+
+    // Esc on an empty composer cancels: card gone, generation bumped.
+    app.draft.clear();
+    app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+        .await
+        .unwrap();
+    assert!(app.account_login.is_none());
+    assert_ne!(app.account_gen, 7, "cancel must invalidate the flow");
+
+    // A late success for the cancelled flow is dropped (no login notice).
+    app.apply_account_login_done(7, Ok("Logged in as x".to_string()))
+        .await;
+    assert!(
+        app.notice
+            .as_ref()
+            .is_some_and(|(_, m)| m.contains("cancelled")),
+        "late result overwrote the cancel notice: {:?}",
+        app.notice
+    );
+
+    // A current-generation success drops the TUI's starter catalog.
+    let sentinel = crate::constants::AIVO_STARTER_SENTINEL;
+    app.cache
+        .set(sentinel, vec!["aivo/starter".to_string()])
+        .await;
+    let account_gen = app.account_gen;
+    app.apply_account_login_done(account_gen, Ok("Logged in as x".to_string()))
+        .await;
+    assert!(
+        app.cache.model_ids(sentinel).await.is_none(),
+        "login left the TUI's starter catalog stale"
+    );
+}
+
+#[tokio::test]
+async fn test_account_usage_runs_the_cli_as_a_local_command() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.key.base_url = crate::constants::AIVO_STARTER_SENTINEL.to_string();
+
+    // `/usage` runs the CLI itself through the `!` machinery.
+    app.run_usage_command().await;
+    let run = app
+        .local_command
+        .as_ref()
+        .expect("no local command spawned");
+    assert_eq!(run.command, "aivo account usage");
+    // Kill it before it does anything — this test is wiring-only.
+    app.interrupt_local_command().await.unwrap();
+    assert!(app.local_command.is_none());
+
+    // A second `/usage` while one is still streaming is refused like any `!cmd`.
+    app.run_usage_command().await;
+    assert!(app.local_command.is_some());
+    app.run_usage_command().await;
+    assert!(
+        app.notice
+            .as_ref()
+            .is_some_and(|(_, m)| m.contains("already running")),
+        "expected the busy notice, got {:?}",
+        app.notice
+    );
+    app.interrupt_local_command().await.unwrap();
+}
+
+#[tokio::test]
+async fn test_logout_confirm_card_and_stale_done() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+
+    // The confirm card owns the keyboard: n dismisses without unlinking.
+    app.pending_logout = Some("me@example.com".to_string());
+    let (frame, _) = render_full_screen(&mut app, 80, 24);
+    assert!(
+        frame.contains("sign out of aivo"),
+        "title missing:\n{frame}"
+    );
+    assert!(
+        frame.contains("me@example.com"),
+        "account missing:\n{frame}"
+    );
+    app.handle_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE))
+        .await
+        .unwrap();
+    assert!(app.pending_logout.is_none());
+    assert!(app.account_task.is_none(), "deny must not spawn an unlink");
+
+    // A stale unlink result is ignored; the current one lands as a notice.
+    let sentinel = crate::constants::AIVO_STARTER_SENTINEL;
+    app.cache
+        .set(sentinel, vec!["aivo/starter".to_string()])
+        .await;
+    app.account_gen = 4;
+    app.apply_account_logout_done(1, Ok(())).await;
+    assert!(
+        app.notice
+            .as_ref()
+            .is_none_or(|(_, m)| !m.contains("Logged out")),
+        "stale result produced a notice: {:?}",
+        app.notice
+    );
+    assert!(
+        app.cache.model_ids(sentinel).await.is_some(),
+        "stale result cleared the catalog"
+    );
+    app.apply_account_logout_done(4, Ok(())).await;
+    assert!(
+        app.notice
+            .as_ref()
+            .is_some_and(|(_, m)| m.contains("Logged out")),
+        "expected the logout confirmation, got {:?}",
+        app.notice
+    );
+    // The TUI's own catalog (distinct from the shared instance) dropped too.
+    assert!(
+        app.cache.model_ids(sentinel).await.is_none(),
+        "logout left the TUI's starter catalog stale"
+    );
 }
 
 #[test]
@@ -1118,7 +1340,16 @@ fn make_test_app(
             let dir = std::env::temp_dir().join(format!("aivo-test-{}-{n}", std::process::id()));
             SessionStore::with_path(dir.join("config.json"))
         },
-        cache: ModelsCache::new(),
+        // Same isolation: `new()` points at the real models-cache.json and the
+        // account flows write through this instance.
+        cache: {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static N: AtomicU64 = AtomicU64::new(0);
+            let n = N.fetch_add(1, Ordering::Relaxed);
+            let dir =
+                std::env::temp_dir().join(format!("aivo-test-cache-{}-{n}", std::process::id()));
+            ModelsCache::with_path(dir.join("models-cache.json"))
+        },
         client: reqwest::Client::new(),
         key: ApiKey::new_with_protocol(
             "test".to_string(),
@@ -1265,6 +1496,10 @@ fn make_test_app(
         live_share: None,
         live_share_starting: false,
         live_requested: false,
+        account_gen: 0,
+        account_task: None,
+        account_login: None,
+        pending_logout: None,
     }
 }
 

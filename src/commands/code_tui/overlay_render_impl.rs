@@ -379,25 +379,32 @@ impl CodeTuiApp {
             .unwrap_or(0);
         let mut shown: Vec<&str> = Vec::new();
         for (group, names) in HELP_COMMAND_GROUPS {
+            // Drop commands hidden for the active key; skip empty groups whole.
+            let visible: Vec<&SlashCommandSpec> = names
+                .iter()
+                .filter_map(|name| SLASH_COMMANDS.iter().find(|c| c.name == *name))
+                .filter(|c| self.slash_command_visible(c.name))
+                .collect();
+            if visible.is_empty() {
+                continue;
+            }
             lines.push(Line::from(""));
             lines.push(Line::from(Span::styled(format!("  {group}"), group_style)));
-            for name in *names {
-                if let Some(command) = SLASH_COMMANDS.iter().find(|c| c.name == *name) {
-                    shown.push(command.name);
-                    lines.push(help_kv_row(
-                        command.help_label,
-                        command.description,
-                        cmd_col,
-                        cmd_style,
-                    ));
-                }
+            for command in visible {
+                shown.push(command.name);
+                lines.push(help_kv_row(
+                    command.help_label,
+                    command.description,
+                    cmd_col,
+                    cmd_style,
+                ));
             }
         }
         // Completeness guard: a command missing from every group above (e.g. one
         // added later) still shows here rather than silently vanishing.
         let leftover: Vec<_> = SLASH_COMMANDS
             .iter()
-            .filter(|c| !shown.contains(&c.name))
+            .filter(|c| !shown.contains(&c.name) && self.slash_command_visible(c.name))
             .collect();
         if !leftover.is_empty() {
             lines.push(Line::from(""));
@@ -1901,6 +1908,8 @@ const HELP_COMMAND_GROUPS: &[(&str, &[&str])] = &[
     ("Context", &["attach", "detach", "compact"]),
     ("Skills & tools", &["skills", "create-skill", "mcp"]),
     ("Autonomous", &["plan", "goal"]),
+    // Shown only on the aivo provider (hidden by `slash_command_visible`).
+    ("aivo account", &["login", "usage", "logout"]),
 ];
 
 /// Keybindings grouped for the `/help` overlay (label, then `(key, action)`

@@ -1160,6 +1160,18 @@ impl CodeTuiApp {
                 self.run_share_command(arg).await;
                 Ok(false)
             }
+            SlashCommand::Login => {
+                self.run_login_command().await;
+                Ok(false)
+            }
+            SlashCommand::Logout => {
+                self.run_logout_command().await;
+                Ok(false)
+            }
+            SlashCommand::Usage => {
+                self.run_usage_command().await;
+                Ok(false)
+            }
             SlashCommand::Help => {
                 self.open_help_overlay();
                 Ok(false)

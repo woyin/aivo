@@ -262,6 +262,25 @@ pub(super) const SLASH_COMMANDS: &[SlashCommandSpec] = &[
         description: "share this session to a viewer URL (stop to end)",
         takes_argument: true,
     },
+    // aivo-provider only — hidden on BYOK keys (see `slash_command_visible`).
+    SlashCommandSpec {
+        name: "login",
+        help_label: "/login",
+        description: "sign in to your aivo account",
+        takes_argument: false,
+    },
+    SlashCommandSpec {
+        name: "logout",
+        help_label: "/logout",
+        description: "sign out of your aivo account",
+        takes_argument: false,
+    },
+    SlashCommandSpec {
+        name: "usage",
+        help_label: "/usage",
+        description: "show your aivo plan and usage",
+        takes_argument: false,
+    },
     SlashCommandSpec {
         name: "help",
         help_label: "/help",
@@ -884,6 +903,14 @@ impl ConfigOverlay {
             self.selected = (self.selected + 1).min(self.items.len() - 1);
         }
     }
+}
+
+/// `/login` waiting for approval: a passive status card (a card, not a modal —
+/// the poll can run for minutes and must not block typing), created only once
+/// the device code arrives.
+pub(super) struct AccountLoginCard {
+    pub(super) user_code: String,
+    pub(super) open_url: String,
 }
 
 /// Filter + rank toggle-overlay rows: name matches (scored by `score_match`:
@@ -1639,6 +1666,10 @@ pub(super) enum SlashCommand {
     /// Share this chat: bare/`start` opens a viewer URL (re-shown if already
     /// live); `stop` ends it.
     Share(Option<String>),
+    /// aivo account flows (aivo provider only).
+    Login,
+    Logout,
+    Usage,
     Help,
 }
 
@@ -1842,6 +1873,21 @@ pub(super) enum RuntimeEvent {
         /// `live_share_gen` at start time; stale (dropped) after a stop//new//resume.
         share_gen: u64,
         result: std::result::Result<crate::services::share_live::LiveShareHandle, String>,
+    },
+    /// `/login`: device code + verification URL, or failure to start.
+    AccountLoginPrompt {
+        account_gen: u64,
+        result: std::result::Result<(String, String), String>,
+    },
+    /// `/login` resolved — `Ok` is the ready-to-show notice.
+    AccountLoginDone {
+        account_gen: u64,
+        result: std::result::Result<String, String>,
+    },
+    /// `/logout`: the server-side unlink resolved.
+    AccountLogoutDone {
+        account_gen: u64,
+        result: std::result::Result<(), String>,
     },
 }
 
@@ -2280,4 +2326,14 @@ pub(super) struct CodeTuiApp {
     /// `--share` requested but not yet started — `maybe_start_live_share` defers it
     /// until the session settles so it pins the final session id.
     pub(super) live_requested: bool,
+    /// Account-flow generation — bumped on start/cancel so a superseded flow's
+    /// late result is dropped (mirrors `live_share_gen`).
+    pub(super) account_gen: u64,
+    /// In-flight login poll / unlink, aborted on cancel so an escaped login
+    /// can't write `account.json` after the user walked away.
+    pub(super) account_task: Option<JoinHandle<()>>,
+    /// `/login` waiting for approval — the status card.
+    pub(super) account_login: Option<AccountLoginCard>,
+    /// `/logout` awaiting its y/n confirm; the account display name.
+    pub(super) pending_logout: Option<String>,
 }

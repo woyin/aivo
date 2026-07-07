@@ -154,41 +154,7 @@ impl LoginCommand {
             }
         };
 
-        // Record the account locally for display (no secret stored). The device
-        // is linked now, so fetch the plan and cache it too — `aivo keys`/`aivo
-        // info` then reflect it without a network call. A failed fetch just
-        // leaves the plan unknown (starter); `aivo account` refreshes it later.
-        let (plan, plan_label) = match device_auth::fetch_account_usage().await {
-            device_auth::AccountUsage::Linked(s) => account_store::canonical_plan_with_label(
-                s.plan.as_deref(),
-                s.is_pro,
-                s.plan_label.as_deref(),
-            ),
-            _ => (None, None),
-        };
-        let account = account_store::Account {
-            user_id: user.id,
-            email: user.email,
-            name: user.name,
-            linked_at: chrono::Utc::now().to_rfc3339(),
-            plan,
-            plan_label,
-        };
-        // Different account/plan → the cached starter catalog is the old profile's.
-        let profile_changed = account_store::load()
-            .map(|prev| prev.user_id != account.user_id || prev.plan != account.plan)
-            .unwrap_or(true);
-        account_store::save(&account).await?;
-        if profile_changed {
-            clear_starter_model_cache().await;
-        }
-
-        // Ensure a device-signed key exists so the binding is usable now.
-        if let Some((starter, is_new_user)) = self.session_store.ensure_starter_key().await
-            && is_new_user
-        {
-            let _ = self.session_store.set_active_key(&starter.id).await;
-        }
+        let account = finalize_login(user, &self.session_store).await?;
 
         println!(
             "  {} Logged in as {}",
@@ -291,6 +257,46 @@ pub(crate) async fn sync_account_status() -> AccountSync {
         }
         device_auth::DeviceStatus::Unknown => AccountSync::Unverified(local),
     }
+}
+
+/// Post-approval bookkeeping shared by `aivo login` and the TUI `/login`:
+/// cache the account + plan for display (no secret stored), drop the starter
+/// catalog on a profile change, and ensure a device-signed key exists.
+pub(crate) async fn finalize_login(
+    user: device_auth::LinkedUser,
+    session_store: &SessionStore,
+) -> Result<account_store::Account> {
+    let (plan, plan_label) = match device_auth::fetch_account_usage().await {
+        device_auth::AccountUsage::Linked(s) => account_store::canonical_plan_with_label(
+            s.plan.as_deref(),
+            s.is_pro,
+            s.plan_label.as_deref(),
+        ),
+        _ => (None, None),
+    };
+    let account = account_store::Account {
+        user_id: user.id,
+        email: user.email,
+        name: user.name,
+        linked_at: chrono::Utc::now().to_rfc3339(),
+        plan,
+        plan_label,
+    };
+    // Different account/plan → the cached starter catalog is the old profile's.
+    let profile_changed = account_store::load()
+        .map(|prev| prev.user_id != account.user_id || prev.plan != account.plan)
+        .unwrap_or(true);
+    account_store::save(&account).await?;
+    if profile_changed {
+        clear_starter_model_cache().await;
+    }
+
+    if let Some((starter, is_new_user)) = session_store.ensure_starter_key().await
+        && is_new_user
+    {
+        let _ = session_store.set_active_key(&starter.id).await;
+    }
+    Ok(account)
 }
 
 /// Drops the cached `aivo/starter` catalog after a login-profile change.

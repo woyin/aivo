@@ -240,6 +240,8 @@ impl CodeTuiApp {
     pub(super) fn matching_command_entries(&self, query: &str) -> Vec<ComposerMenuEntry> {
         let mut entries: Vec<ComposerMenuEntry> = filter_slash_commands(query)
             .into_iter()
+            // Account commands are hidden on BYOK keys.
+            .filter(|command| self.slash_command_visible(command.name))
             .map(ComposerMenuEntry::Command)
             .collect();
         for skill in filter_skill_commands(&self.skill_commands, query) {

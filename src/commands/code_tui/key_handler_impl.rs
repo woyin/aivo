@@ -61,6 +61,12 @@ impl CodeTuiApp {
             return Ok(false);
         }
 
+        // The `/logout` confirm card likewise owns the keyboard until decided.
+        if self.pending_logout.is_some() {
+            self.handle_logout_confirm_key(key);
+            return Ok(false);
+        }
+
         // A pending tool-permission card owns the decision keys (y/a/n), but only
         // while the composer is empty. If the user is mid-composing a queued
         // message those keystrokes belong to that message — letting them decide
@@ -97,6 +103,11 @@ impl CodeTuiApp {
                 return Ok(false);
             }
             return self.handle_editor_key(key).await;
+        }
+
+        // The `/login` status card consumes Enter/Esc only on an empty composer.
+        if self.account_login.is_some() && self.handle_login_card_key(key) {
+            return Ok(false);
         }
 
         if let Some(should_exit) = self.handle_overlay_key(key).await? {

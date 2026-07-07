@@ -54,6 +54,8 @@ mod system;
 #[path = "code_tui/shared.rs"]
 mod shared;
 
+#[path = "code_tui/account_impl.rs"]
+mod account_impl;
 #[path = "code_tui/app_state_impl.rs"]
 mod app_state_impl;
 #[path = "code_tui/event_loop_impl.rs"]
@@ -275,6 +277,10 @@ impl CodeTuiApp {
             live_share_starting: false,
             live_share_gen: 0,
             live_requested: false,
+            account_gen: 0,
+            account_task: None,
+            account_login: None,
+            pending_logout: None,
         })
     }
 }
