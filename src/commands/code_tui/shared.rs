@@ -1893,8 +1893,8 @@ pub(super) struct PendingPlanApproval {
 }
 
 /// Active `/goal` autonomous loop: after each agent turn the app auto-continues
-/// toward `objective` (self-checking for completion) until the agent signals
-/// done, `iteration` hits `max`, or the user interrupts. `None` = not in goal mode.
+/// toward `objective` until the completion marker, the `max` turn cap, an errored
+/// turn, or a user interrupt. `iteration` = 1-based turn number. `None` = off.
 #[derive(Clone)]
 pub(super) struct GoalState {
     pub(super) objective: String,

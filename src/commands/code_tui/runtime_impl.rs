@@ -6,7 +6,7 @@ use crate::services::acp_client::PromptEvent;
 use crate::services::cursor_acp::{self, CursorAcpSession, CursorChunk, CursorTurnResult};
 use anyhow::Context;
 
-/// Default cap on autonomous `/goal` continuations (override: `AIVO_GOAL_MAX_ITERS`).
+/// Default cap on total `/goal` turns (override: `AIVO_GOAL_MAX_ITERS`).
 const GOAL_DEFAULT_MAX_ITERS: usize = 20;
 /// Framing prepended to the first `/goal` turn so the agent knows the contract.
 const GOAL_PREAMBLE: &str = "[Goal mode] Work autonomously toward this objective, doing as many \
@@ -36,12 +36,14 @@ fn goal_max_iterations() -> usize {
         .unwrap_or(GOAL_DEFAULT_MAX_ITERS)
 }
 
-/// Whether an assistant reply carries the goal-completion marker on its own line.
-/// Deliberately strict (a whole-line match) so prose *mentioning* the marker —
-/// e.g. "I'll say GOAL COMPLETE when done" — doesn't end the loop prematurely.
+/// Whole-line match so prose mentioning the marker doesn't end the loop; trims
+/// markdown wrapping (the prompts show the marker in backticks, models echo them).
 fn signals_goal_complete(text: &str) -> bool {
-    text.lines()
-        .any(|line| line.trim().eq_ignore_ascii_case("GOAL COMPLETE"))
+    text.lines().any(|line| {
+        line.trim()
+            .trim_matches(|c: char| matches!(c, '`' | '*' | '_' | '.' | '!' | ' '))
+            .eq_ignore_ascii_case("GOAL COMPLETE")
+    })
 }
 
 /// Build the message a `/<skill> [args]` invocation sends to the model. If the
@@ -363,6 +365,15 @@ impl CodeTuiApp {
                     "Attachment sent as plain chat — agent tools are off for this message"
                 };
                 self.notice = Some((MUTED, msg.to_string()));
+            }
+            // Plain chat's finish path never auto-continues — a goal falling back
+            // here would strand the loop, so disarm it and say why.
+            if self.goal_mode.take().is_some() {
+                self.notice = Some((
+                    ERROR,
+                    "Goal mode stopped — this message went out as plain chat (no agent tools)"
+                        .to_string(),
+                ));
             }
             self.spawn_http_turn();
         }
@@ -1527,7 +1538,7 @@ impl CodeTuiApp {
                             obj.push('…');
                         }
                         format!(
-                            "Goal: \"{}\" (step {}/{}) — /goal stop to end",
+                            "Goal: \"{}\" (turn {}/{}) — /goal stop to end",
                             obj, g.iteration, g.max
                         )
                     }
@@ -1569,7 +1580,7 @@ impl CodeTuiApp {
                 }
                 self.goal_mode = Some(GoalState {
                     objective: objective.to_string(),
-                    iteration: 0,
+                    iteration: 1,
                     max: goal_max_iterations(),
                 });
                 let first = format!("{GOAL_PREAMBLE}\n\nObjective: {objective}");
@@ -1580,6 +1591,15 @@ impl CodeTuiApp {
                 if let Err(e) = self.dispatch_user_message(first, None).await {
                     self.goal_mode = None;
                     self.notice = Some((ERROR, e.to_string()));
+                    return;
+                }
+                // Dispatch can disarm the goal (plain-chat route) or decline to
+                // send (image guard); an armed goal with nothing in flight stalls.
+                if self.goal_mode.is_none() {
+                    return;
+                }
+                if !self.sending {
+                    self.goal_mode = None;
                     return;
                 }
                 // `send_user_message` clears the notice; hint about unattended runs after.
@@ -1594,14 +1614,13 @@ impl CodeTuiApp {
         }
     }
 
-    /// After an agent turn finishes, drive the active `/goal` loop: stop on the
-    /// completion marker, otherwise auto-continue with a self-checking prompt until
-    /// the iteration cap. No-op when not in goal mode or a turn is already in flight
-    /// (e.g. a queued user message took over — the goal resumes after it finishes).
+    /// Drive the active `/goal` loop after a turn: stop on the completion marker,
+    /// an errored turn, or the turn cap; otherwise auto-send the continuation.
     pub(super) async fn maybe_continue_goal(&mut self) -> Result<()> {
-        if self.goal_mode.is_none() || self.sending {
+        if self.goal_mode.is_none() {
             return Ok(());
         }
+        // Checked even mid-queued-turn: the rev-find skips the newer user message.
         let last_reply = self
             .history
             .iter()
@@ -1610,11 +1629,20 @@ impl CodeTuiApp {
             .map(|m| m.content.clone())
             .unwrap_or_default();
         if signals_goal_complete(&last_reply) {
-            let steps = self.goal_mode.take().map(|g| g.iteration).unwrap_or(0);
-            self.notice = Some((
-                MUTED,
-                format!("Goal complete (after {steps} continuation(s))"),
-            ));
+            let turns = self.goal_mode.take().map(|g| g.iteration).unwrap_or(0);
+            let s = if turns == 1 { "" } else { "s" };
+            self.notice = Some((MUTED, format!("Goal complete (in {turns} turn{s})")));
+            return Ok(());
+        }
+        // An errored turn must not auto-repeat — stop and keep the error visible.
+        if let Some((color, msg)) = self.notice.as_mut()
+            && *color == ERROR
+        {
+            msg.push_str(" — goal mode stopped");
+            self.goal_mode = None;
+            return Ok(());
+        }
+        if self.sending {
             return Ok(());
         }
         let Some(goal) = self.goal_mode.as_mut() else {
@@ -1627,26 +1655,50 @@ impl CodeTuiApp {
             self.notice = Some((
                 MUTED,
                 format!(
-                    "Goal mode stopped at the {max}-step cap (/goal <objective> to keep going)"
+                    "Goal mode stopped at the {max}-turn cap (/goal <objective> to keep going)"
                 ),
             ));
             return Ok(());
         }
-        // Auto-continuation: the model gets the self-check prompt, but it must not
-        // leak into ↑/↓ recall — record nothing (see `run_goal_command`).
-        self.dispatch_user_message(GOAL_CONTINUE.to_string(), None)
-            .await
+        // Machine text: record nothing (↑/↓ recall) and stash the composer so the
+        // dispatch can't wipe a mid-turn draft or attach the user's staged files.
+        let draft = std::mem::take(&mut self.draft);
+        let cursor = self.cursor;
+        let attachments = std::mem::take(&mut self.draft_attachments);
+        let sent = self
+            .dispatch_user_message(GOAL_CONTINUE.to_string(), None)
+            .await;
+        self.draft = draft;
+        self.cursor = cursor;
+        self.draft_attachments = attachments;
+        self.sync_command_menu_state();
+        match sent {
+            // Propagating would abort the event loop over one bad dispatch.
+            Err(e) => {
+                self.goal_mode = None;
+                self.notice = Some((ERROR, format!("{e} — goal mode stopped")));
+            }
+            // Dispatch declined to send; an armed goal with nothing in flight stalls.
+            Ok(()) => {
+                if !self.sending {
+                    self.goal_mode = None;
+                }
+            }
+        }
+        Ok(())
     }
 
-    /// Enter plan mode: quiet the other modes (exclusive), restrict a live engine
-    /// in place (a not-yet-built one enters at build time). `false` when the key
-    /// can't drive the native agent. No toast — callers word their own.
+    /// Enter plan mode: quiet the other modes (exclusive, incl. `/goal`), restrict
+    /// a live engine in place (a not-yet-built one enters at build time). `false`
+    /// when the key can't drive the native agent. No toast — callers word their own.
     pub(super) async fn enter_plan_mode(&mut self) -> bool {
         if !self.agent_capable() {
             return false;
         }
         self.set_auto_quiet(false);
         self.set_review_quiet(false);
+        // A goal would auto-continue into the read-only engine; mirror /goal's gate.
+        self.goal_mode = None;
         self.plan_mode = true;
         self.plan_exit_pending = false;
         self.pending_plan = None;
@@ -1741,6 +1793,7 @@ impl CodeTuiApp {
                     self.queue_command(SlashCommand::Plan(None), "/plan");
                     return;
                 }
+                let goal_stopped = self.goal_mode.is_some();
                 if !self.enter_plan_mode().await {
                     self.notice = Some((
                         ERROR,
@@ -1751,8 +1804,12 @@ impl CodeTuiApp {
                 }
                 self.notice = Some((
                     MUTED,
-                    "Plan mode — describe what to plan; read-only until you approve the plan"
-                        .to_string(),
+                    if goal_stopped {
+                        "Goal mode stopped — plan mode is read-only until you approve the plan"
+                    } else {
+                        "Plan mode — describe what to plan; read-only until you approve the plan"
+                    }
+                    .to_string(),
                 ));
             }
             _ => {
@@ -1760,6 +1817,7 @@ impl CodeTuiApp {
                     self.queue_command(SlashCommand::Plan(Some(arg.to_string())), "/plan");
                     return;
                 }
+                let goal_stopped = self.goal_mode.is_some();
                 if !self.enter_plan_mode().await {
                     self.notice = Some((
                         ERROR,
@@ -1773,6 +1831,8 @@ impl CodeTuiApp {
                 // error path so the flag and engine restriction stay consistent.
                 if let Err(e) = self.dispatch_user_message(arg.to_string(), None).await {
                     self.notice = Some((ERROR, e.to_string()));
+                } else if goal_stopped {
+                    self.notice = Some((MUTED, "Goal mode stopped — planning instead".to_string()));
                 }
             }
         }

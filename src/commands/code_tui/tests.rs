@@ -7830,7 +7830,7 @@ async fn test_goal_machine_text_never_enters_draft_history() {
     assert_eq!(app.draft_history, vec!["/goal x".to_string()]);
 }
 
-/// The goal loop ends on the completion marker and at the iteration cap (both
+/// The goal loop ends on the completion marker and at the turn cap (both
 /// terminal — neither sends another turn). Exercises `signals_goal_complete`.
 #[tokio::test]
 async fn test_goal_loop_stops_on_marker_and_cap() {
@@ -7874,6 +7874,245 @@ async fn test_goal_loop_stops_on_marker_and_cap() {
     // Not in goal mode → no-op.
     app.maybe_continue_goal().await.unwrap();
     assert!(app.goal_mode.is_none());
+}
+
+/// The marker counts when markdown-wrapped (models echo the prompts' backticks);
+/// prose around the words still doesn't.
+#[tokio::test]
+async fn test_goal_marker_tolerates_markdown_wrapping() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+
+    let assistant = |content: &str| ChatMessage {
+        model: None,
+        role: "assistant".to_string(),
+        content: content.to_string(),
+        reasoning_content: None,
+        attachments: vec![],
+    };
+
+    for reply in [
+        "`GOAL COMPLETE`",
+        "**GOAL COMPLETE**",
+        "All tests pass.\n\ngoal complete.",
+        "done\n`GOAL COMPLETE.`",
+    ] {
+        app.history.clear();
+        app.history.push(assistant(reply));
+        app.goal_mode = Some(GoalState {
+            objective: "x".to_string(),
+            iteration: 2,
+            max: 20,
+        });
+        app.maybe_continue_goal().await.unwrap();
+        assert!(app.goal_mode.is_none(), "marker ends the loop: {reply:?}");
+    }
+
+    // `sending` blocks the continuation dispatch so only the check runs.
+    for reply in [
+        "I will reply GOAL COMPLETE once everything is finished.",
+        "- [ ] GOAL COMPLETE",
+    ] {
+        app.history.clear();
+        app.history.push(assistant(reply));
+        app.goal_mode = Some(GoalState {
+            objective: "x".to_string(),
+            iteration: 2,
+            max: 20,
+        });
+        app.sending = true;
+        app.maybe_continue_goal().await.unwrap();
+        assert!(
+            app.goal_mode.is_some(),
+            "prose must not end the loop: {reply:?}"
+        );
+        app.sending = false;
+    }
+}
+
+/// An errored turn stops the loop instead of replaying to the cap, and the
+/// error notice stays visible.
+#[tokio::test]
+async fn test_goal_stops_on_errored_turn() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+
+    app.goal_mode = Some(GoalState {
+        objective: "x".to_string(),
+        iteration: 3,
+        max: 20,
+    });
+    app.history.push(ChatMessage {
+        model: None,
+        role: "assistant".to_string(),
+        content: "partial work".to_string(),
+        reasoning_content: None,
+        attachments: vec![],
+    });
+    app.notice = Some((ERROR, "LLM error: insufficient credits".to_string()));
+
+    app.maybe_continue_goal().await.unwrap();
+
+    assert!(app.goal_mode.is_none(), "an errored turn ends the loop");
+    assert!(!app.sending, "no continuation was sent");
+    let (style, msg) = app.notice.clone().unwrap();
+    assert_eq!(style, ERROR);
+    assert!(msg.contains("insufficient credits"), "error kept: {msg}");
+    assert!(msg.contains("goal mode stopped"), "stop noted: {msg}");
+}
+
+/// The goal turn's marker ends the loop even when a queued user message already
+/// started the next turn — otherwise the completed goal burns an extra round.
+#[tokio::test]
+async fn test_goal_completion_detected_while_queued_message_runs() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+
+    app.goal_mode = Some(GoalState {
+        objective: "x".to_string(),
+        iteration: 2,
+        max: 20,
+    });
+    app.history.push(ChatMessage {
+        model: None,
+        role: "assistant".to_string(),
+        content: "done\nGOAL COMPLETE".to_string(),
+        reasoning_content: None,
+        attachments: vec![],
+    });
+    // The queued message's user turn is already in flight.
+    app.history.push(ChatMessage {
+        model: None,
+        role: "user".to_string(),
+        content: "also rename the module".to_string(),
+        reasoning_content: None,
+        attachments: vec![],
+    });
+    app.sending = true;
+
+    app.maybe_continue_goal().await.unwrap();
+
+    assert!(app.goal_mode.is_none(), "marker ends the loop mid-queue");
+    assert!(app.notice.as_ref().unwrap().1.contains("Goal complete"));
+}
+
+/// The synthetic continuation must not consume a draft typed mid-turn; a
+/// plain-chat route also disarms the loop (its finish never auto-continues).
+#[tokio::test]
+async fn test_goal_continuation_preserves_composer_draft() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    // Non-agent key (OAuth) keeps the send on the lightweight plain-chat path.
+    app.key.base_url = "claude-oauth".to_string();
+
+    app.goal_mode = Some(GoalState {
+        objective: "x".to_string(),
+        iteration: 1,
+        max: 20,
+    });
+    app.history.push(ChatMessage {
+        model: None,
+        role: "assistant".to_string(),
+        content: "still working".to_string(),
+        reasoning_content: None,
+        attachments: vec![],
+    });
+    app.draft = "half-typed reply".to_string();
+    app.cursor = 4;
+
+    app.maybe_continue_goal().await.unwrap();
+
+    assert_eq!(app.draft, "half-typed reply", "draft survives the dispatch");
+    assert_eq!(app.cursor, 4, "cursor survives the dispatch");
+    let last = app.history.last().unwrap();
+    assert_eq!(last.role, "user");
+    assert!(
+        last.content.starts_with("Continue toward the goal"),
+        "the continuation still went out: {}",
+        last.content
+    );
+    assert!(app.goal_mode.is_none(), "plain-chat route disarms the loop");
+    assert!(app.notice.as_ref().unwrap().1.contains("plain chat"));
+}
+
+/// `/goal` where dispatch falls back to plain chat (image in history, vision
+/// unconfirmed) must not arm a loop `finish_response` will never drive.
+#[tokio::test]
+async fn test_goal_start_disarms_on_plain_chat_route() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.model_image_input = None; // vision support unknown → plain-chat fallback
+    app.history.push(ChatMessage {
+        model: None,
+        role: "user".to_string(),
+        content: "look".to_string(),
+        reasoning_content: None,
+        attachments: vec![MessageAttachment {
+            name: "shot.png".to_string(),
+            mime_type: "image/png".to_string(),
+            storage: AttachmentStorage::Inline {
+                data: "iVBOR".to_string(),
+            },
+        }],
+    });
+
+    app.run_goal_command(Some("fix it".to_string())).await;
+
+    assert!(
+        app.goal_mode.is_none(),
+        "plain-chat route must not arm a loop"
+    );
+    assert!(
+        app.sending,
+        "the objective still went out as a plain message"
+    );
+    assert!(app.notice.as_ref().unwrap().1.contains("plain chat"));
+}
+
+/// `/goal` whose first dispatch is refused outright (staged image on a known
+/// text-only model) must not leave an armed loop with nothing in flight.
+#[tokio::test]
+async fn test_goal_start_cleared_when_dispatch_refuses() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.model_image_input = Some(false); // snapshot says text-only
+    app.draft_attachments.push(MessageAttachment {
+        name: "shot.png".to_string(),
+        mime_type: "image/png".to_string(),
+        storage: AttachmentStorage::Inline {
+            data: "iVBOR".to_string(),
+        },
+    });
+
+    app.run_goal_command(Some("describe the screenshot".to_string()))
+        .await;
+
+    assert!(
+        app.goal_mode.is_none(),
+        "refused send must not arm the loop"
+    );
+    assert!(!app.sending, "nothing went out");
+    assert!(app.notice.as_ref().unwrap().1.contains("can't read images"));
+    assert_eq!(app.draft_attachments.len(), 1, "attachment kept for resend");
+}
+
+/// Entering plan mode stops an active goal loop (mirrors `/goal`'s refusal to
+/// start while planning).
+#[tokio::test]
+async fn test_plan_entry_stops_goal_mode() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+
+    app.goal_mode = Some(GoalState {
+        objective: "ship".to_string(),
+        iteration: 3,
+        max: 20,
+    });
+    app.run_plan_command(None).await;
+
+    assert!(app.plan_mode, "plan mode is on");
+    assert!(app.goal_mode.is_none(), "plan entry ends the goal loop");
+    assert!(app.notice.as_ref().unwrap().1.contains("Goal mode stopped"));
 }
 
 /// The composer rule shows a live `/goal` step indicator (and the auto-approve
