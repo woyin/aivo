@@ -17,23 +17,15 @@ going.";
 const GOAL_CONTINUE: &str = "Continue toward the goal. If the objective is now fully met, reply \
 with exactly `GOAL COMPLETE` and nothing else; otherwise do the next step.";
 
-/// Framing for a `/plan` investigation turn (read-only; the plan is the reply).
-const PLAN_PREAMBLE: &str = "[Plan mode] Investigate this codebase to understand what the task below \
-needs, using ONLY read-only tools (read_file, grep, glob, list_dir). Do NOT modify any files or run \
-state-changing commands. Then write a concise implementation plan: the approach, the specific files \
-to change, and a numbered list of steps. Output the plan as your reply — do not start implementing.\n\n\
-Task: ";
-const PLAN_EXEC_PREAMBLE: &str = "Implement the following plan in this repository. Re-read the files \
-it names, make the edits, and verify as you go.\n\nPlan:\n\n";
-
-/// The plan plus any extra guidance typed after `/plan go`.
-pub(super) fn plan_exec_seed(plan: &str, guidance: &str) -> String {
-    let mut seed = format!("{PLAN_EXEC_PREAMBLE}{plan}");
+/// The `/plan go` message — the plan is already in engine history, so only the
+/// go-ahead + guidance is sent.
+pub(super) fn plan_go_message(guidance: &str) -> String {
+    let mut msg = "The plan above is approved — implement it now.".to_string();
     if !guidance.is_empty() {
-        seed.push_str("\n\nAdditional guidance for this execution:\n");
-        seed.push_str(guidance);
+        msg.push_str("\n\nAdditional guidance: ");
+        msg.push_str(guidance);
     }
-    seed
+    msg
 }
 
 fn goal_max_iterations() -> usize {
@@ -554,6 +546,12 @@ impl CodeTuiApp {
     async fn spawn_agent_turn(&mut self, input: String, attachments: Vec<MessageAttachment>) {
         use crate::agent::engine::{AgentEngine, TurnCtx};
 
+        // Sync an existing engine to the session mode before the turn — applies a
+        // mode switch deferred while the previous turn held the engine lock.
+        if let Some(session) = self.agent_engine.as_ref() {
+            session.engine.lock().await.set_plan_mode(self.plan_mode);
+        }
+        self.plan_exit_pending = false;
         // The agent works in the real launch directory — NOT chat's sandbox
         // (`self.cwd`). It reads/edits the user's actual project.
         let real_cwd = if self.real_cwd.is_empty() {
@@ -623,13 +621,9 @@ impl CodeTuiApp {
             // Enable `/rewind` tree-checkpointing (top-level chat only — sub-engines
             // never call this, so they don't pay the git cost).
             engine.enable_rewind_checkpoints(&real_cwd);
-            // `/plan` investigation strips mutating tools; otherwise (interactive)
-            // the agent confirms before a big build. Read-only makes the latter moot.
-            if self.capturing_plan {
-                engine.restrict_read_only();
-            } else {
-                engine.set_confirm_before_build();
-            }
+            // Interactive: the agent confirms before a big build. (Plan mode is
+            // applied LAST, below, so it strips from the fully assembled tool list.)
+            engine.set_confirm_before_build();
             // Interactive chat only — headless (`-e`) and sub-agents build engines elsewhere.
             engine.set_chat_session_context(crate::agent::engine::ChatSessionContext {
                 model_label: self.raw_model.clone(),
@@ -698,6 +692,11 @@ impl CodeTuiApp {
                 let disabled = self.effective_disabled_mcp_servers().await;
                 self.connect_mcp_with_consent(real_cwd.clone(), disabled)
                     .await;
+            }
+            // Re-enter plan mode on a rebuilt engine, last — so it strips from the
+            // fully assembled tool list (`set_subagents`/MCP add tools above).
+            if self.plan_mode {
+                engine.set_plan_mode(true);
             }
             self.agent_engine = Some(AgentSession {
                 key_id: self.key.id.clone(),
@@ -1552,6 +1551,14 @@ impl CodeTuiApp {
                     self.queue_command(SlashCommand::Goal(Some(objective.to_string())), "/goal");
                     return;
                 }
+                if self.plan_mode {
+                    self.notice = Some((
+                        ERROR,
+                        "Plan mode is read-only — approve the plan or /plan stop before /goal"
+                            .to_string(),
+                    ));
+                    return;
+                }
                 if !self.agent_capable() {
                     self.notice = Some((
                         ERROR,
@@ -1631,13 +1638,52 @@ impl CodeTuiApp {
             .await
     }
 
-    /// `/plan`: `<objective>` runs a read-only investigation turn that ends with a
-    /// plan; `go` executes the drafted plan in a fresh context (so the messy
-    /// exploration doesn't follow); `stop` discards it; bare reports status.
+    /// Enter plan mode: quiet the other modes (exclusive), restrict a live engine
+    /// in place (a not-yet-built one enters at build time). `false` when the key
+    /// can't drive the native agent. No toast — callers word their own.
+    pub(super) async fn enter_plan_mode(&mut self) -> bool {
+        if !self.agent_capable() {
+            return false;
+        }
+        self.set_auto_quiet(false);
+        self.set_review_quiet(false);
+        self.plan_mode = true;
+        self.plan_exit_pending = false;
+        self.pending_plan = None;
+        // While sending, the turn task holds the lock — the restriction lands via
+        // the mode sync at the next `spawn_agent_turn`.
+        if !self.sending
+            && let Some(session) = self.agent_engine.as_ref()
+        {
+            session.engine.lock().await.set_plan_mode(true);
+        }
+        true
+    }
+
+    /// Leave plan mode, restoring the engine's tools in place (no rebuild — history
+    /// stays intact for same-session execution). Deferred while a turn holds the
+    /// lock (`plan_exit_pending`). No toast — callers word their own.
+    pub(super) async fn leave_plan_mode(&mut self, discard_draft: bool) {
+        self.plan_mode = false;
+        if discard_draft {
+            self.pending_plan = None;
+            self.plan_card_idx = None;
+        }
+        if self.sending {
+            self.plan_exit_pending = true;
+            return;
+        }
+        if let Some(session) = self.agent_engine.as_ref() {
+            session.engine.lock().await.set_plan_mode(false);
+        }
+        self.plan_exit_pending = false;
+    }
+
+    /// `/plan`: `[objective]` enters plan mode; `go [guidance]` approves a drafted
+    /// plan and executes it in the same session; `stop` leaves.
     pub(super) async fn run_plan_command(&mut self, arg: Option<String>) {
         let arg = arg.as_deref().map(str::trim).unwrap_or("");
-        // First word = action; the rest is `go`'s optional guidance. A bare
-        // `_` arm treats the whole `arg` as a new objective.
+        // First word = action; the rest is `go`'s optional guidance.
         let (head, rest) = match arg.split_once(char::is_whitespace) {
             Some((h, r)) => (h, r.trim()),
             None => (arg, ""),
@@ -1648,46 +1694,54 @@ impl CodeTuiApp {
                     self.queue_command(SlashCommand::Plan(Some(arg.to_string())), "/plan go");
                     return;
                 }
-                let Some(plan) = self.pending_plan.take() else {
+                if self.pending_plan.is_none() {
                     self.notice = Some((
                         MUTED,
-                        "No plan yet — /plan <objective> to draft one first".to_string(),
+                        "No plan yet — /plan <objective> to draft one first (or approve on the plan card)"
+                            .to_string(),
                     ));
                     return;
-                };
-                // Fresh context: drop the planning exploration before executing.
-                self.start_new_chat();
-                let msg = plan_exec_seed(&plan, rest);
-                if let Err(e) = self.dispatch_user_message(msg, None).await {
+                }
+                // Same session — the plan is already in the engine's history.
+                self.leave_plan_mode(true).await;
+                if let Err(e) = self
+                    .dispatch_user_message(plan_go_message(rest), None)
+                    .await
+                {
                     self.notice = Some((ERROR, e.to_string()));
                     return;
                 }
-                self.notice = Some((MUTED, "Executing the plan in a fresh context".to_string()));
+                self.notice = Some((MUTED, "Executing the approved plan".to_string()));
             }
             "stop" | "cancel" | "discard" | "off" => {
-                self.capturing_plan = false;
-                self.plan_card_idx = None;
-                let msg = if self.pending_plan.take().is_some() {
-                    "Plan discarded"
-                } else {
-                    "No plan to discard"
+                if self.sending {
+                    self.queue_command(SlashCommand::Plan(Some("stop".to_string())), "/plan stop");
+                    return;
+                }
+                let was_on = self.plan_mode || self.pending_plan.is_some();
+                let had_plan = self.pending_plan.is_some();
+                self.leave_plan_mode(true).await;
+                let msg = match (was_on, had_plan) {
+                    (true, true) => "Plan mode off — plan discarded",
+                    (true, false) => "Plan mode off",
+                    (false, _) => "Plan mode isn't on",
                 };
                 self.notice = Some((MUTED, msg.to_string()));
             }
             "" => {
-                let msg = if self.pending_plan.is_some() {
-                    "Plan ready — review above, then /plan go to execute it in a fresh context"
-                } else {
-                    "Usage: /plan <objective> — investigate read-only and draft a plan; /plan go to execute it"
-                };
-                self.notice = Some((MUTED, msg.to_string()));
-            }
-            _ => {
-                if self.sending {
-                    self.queue_command(SlashCommand::Plan(Some(arg.to_string())), "/plan");
+                if self.plan_mode {
+                    self.notice = Some((
+                        MUTED,
+                        "Plan mode is on — approve the plan card (or /plan go), or /plan stop to leave"
+                            .to_string(),
+                    ));
                     return;
                 }
-                if !self.agent_capable() {
+                if self.sending {
+                    self.queue_command(SlashCommand::Plan(None), "/plan");
+                    return;
+                }
+                if !self.enter_plan_mode().await {
                     self.notice = Some((
                         ERROR,
                         "Plan mode needs the native agent (an API key or Copilot — not OAuth or cursor)"
@@ -1695,48 +1749,56 @@ impl CodeTuiApp {
                     ));
                     return;
                 }
-                self.pending_plan = None;
-                self.capturing_plan = true;
-                // Restrict a live engine in place; a not-yet-built one is restricted
-                // at build time (gated on `capturing_plan`).
-                if let Some(session) = self.agent_engine.as_ref() {
-                    session.engine.lock().await.restrict_read_only();
+                self.notice = Some((
+                    MUTED,
+                    "Plan mode — describe what to plan; read-only until you approve the plan"
+                        .to_string(),
+                ));
+            }
+            _ => {
+                if self.sending {
+                    self.queue_command(SlashCommand::Plan(Some(arg.to_string())), "/plan");
+                    return;
                 }
-                // record: None — draft history keeps only the typed command (see /goal).
-                let first = format!("{PLAN_PREAMBLE}{arg}");
-                if let Err(e) = self.dispatch_user_message(first, None).await {
-                    self.capturing_plan = false;
+                if !self.enter_plan_mode().await {
+                    self.notice = Some((
+                        ERROR,
+                        "Plan mode needs the native agent (an API key or Copilot — not OAuth or cursor)"
+                            .to_string(),
+                    ));
+                    return;
+                }
+                // Bare objective (the directive lives in the system prompt);
+                // record: None keeps it out of ↑/↓ recall. Keep plan mode on the
+                // error path so the flag and engine restriction stay consistent.
+                if let Err(e) = self.dispatch_user_message(arg.to_string(), None).await {
                     self.notice = Some((ERROR, e.to_string()));
                 }
             }
         }
     }
 
-    /// After a `/plan` investigation turn finishes, stash the agent's reply as the
-    /// pending plan and prompt the user to review it. No-op outside plan capture.
-    pub(super) fn maybe_capture_plan(&mut self) {
-        if !self.capturing_plan || self.sending {
+    /// After a plan-mode turn that ended WITHOUT an approval, stash the agent's
+    /// last reply as the drafted plan (for `/plan go`) and frame it as the plan
+    /// card. Plan mode and the read-only engine persist. No-op otherwise.
+    pub(super) fn capture_plan_draft(&mut self) {
+        if !self.plan_mode || self.sending {
             return;
         }
-        self.capturing_plan = false;
-        // Drop the read-only planning engine so the next turn rebuilds with full tools.
-        self.agent_engine = None;
         let plan_at = self.history.iter().rposition(|m| m.role == "assistant");
         let plan = plan_at
             .map(|i| self.history[i].content.clone())
             .unwrap_or_default();
+        // An empty reply (all tool calls / interrupted) leaves any prior draft as-is.
         if plan.trim().is_empty() {
-            self.notice = Some((
-                MUTED,
-                "Planning produced no plan — try /plan <objective> again".to_string(),
-            ));
             return;
         }
         self.pending_plan = Some(plan);
         self.plan_card_idx = plan_at;
         self.notice = Some((
             MUTED,
-            "Plan ready — review above, then /plan go to execute it in a fresh context".to_string(),
+            "Plan drafted — approve on the card or /plan go; keep refining, or /plan stop to leave"
+                .to_string(),
         ));
     }
 
@@ -1769,7 +1831,8 @@ impl CodeTuiApp {
         self.session_tokens = crate::services::session_store::SessionTokens::default();
         self.context_is_estimate = true;
         self.follow_output = true;
-        self.capturing_plan = false;
+        self.plan_mode = false;
+        self.plan_exit_pending = false;
         self.pending_plan = None;
         self.plan_card_idx = None;
         self.notice = None;
@@ -1784,6 +1847,7 @@ impl CodeTuiApp {
         self.agent_permission = None;
         self.agent_ask = None;
         self.agent_review = None;
+        self.agent_plan_approval = None;
         self.stop_agent_serve();
     }
 
@@ -1796,8 +1860,16 @@ impl CodeTuiApp {
         // autonomous /goal loop, so it can't auto-continue after the dropped turn.
         // The interrupt-with-partial path clears it separately, before this runs.
         self.goal_mode = None;
-        // An interrupted `/plan` investigation must not capture a partial reply.
-        self.capturing_plan = false;
+        // Plan mode persists across an interrupt (it's a session mode). Apply a
+        // deferred discard-exit opportunistically; if the turn task still holds
+        // the lock, the flag stays set and the next dispatch/turn-end applies it.
+        if self.plan_exit_pending
+            && let Some(session) = self.agent_engine.as_ref()
+            && let Ok(mut engine) = session.engine.try_lock()
+        {
+            engine.set_plan_mode(false);
+            self.plan_exit_pending = false;
+        }
         // An in-process agent turn is in flight when its per-turn serve is up. The
         // engine has ALREADY consumed this turn (and may have run side-effecting
         // tools — file writes, shell commands), and it keeps its own conversation
@@ -1813,6 +1885,7 @@ impl CodeTuiApp {
         self.agent_permission = None;
         self.agent_ask = None;
         self.agent_review = None;
+        self.agent_plan_approval = None;
         self.queued_messages.clear();
         self.queued_commands.clear();
         if was_sending && let Some(session) = self.cursor_acp_session.as_ref() {
@@ -1898,6 +1971,7 @@ impl CodeTuiApp {
         self.agent_permission = None;
         self.agent_ask = None;
         self.agent_review = None;
+        self.agent_plan_approval = None;
         self.queued_messages.clear();
         self.queued_commands.clear();
 
@@ -2356,6 +2430,27 @@ impl crate::agent::engine::AgentUi for ChatAgentUi {
             // A dropped card (interrupt / session end) reads as a dismissal.
             rx.await
                 .unwrap_or_else(|_| Err(crate::agent::ask::DISMISSED_DIRECTIVE.to_string()))
+        })
+    }
+
+    fn approve_plan<'a>(
+        &'a mut self,
+        plan: &'a str,
+    ) -> futures::future::BoxFuture<'a, Result<crate::agent::protocol::PlanDecision, String>> {
+        let tx = self.tx.clone();
+        let plan = plan.to_string();
+        Box::pin(async move {
+            let (reply, rx) = tokio::sync::oneshot::channel();
+            if tx
+                .send(RuntimeEvent::AgentPlanApproval { plan, reply })
+                .is_err()
+            {
+                return Err("session is no longer running".to_string());
+            }
+            // A dropped card (interrupt / session end) reads as a dismissal.
+            rx.await.unwrap_or_else(|_| {
+                Err(crate::agent::plan_mode::PLAN_APPROVAL_DISMISSED.to_string())
+            })
         })
     }
 

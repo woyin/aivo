@@ -14,7 +14,10 @@ use crate::agent::ask;
 use crate::agent::guards::{self, batch_sig, page_read_key};
 use crate::agent::notes;
 use crate::agent::plan::{self, PlanItem};
-use crate::agent::protocol::{AssistantMessage, ChatRequest, Decision, ToolCall, ToolSpec};
+use crate::agent::plan_mode;
+use crate::agent::protocol::{
+    AssistantMessage, ChatRequest, Decision, PlanDecision, ToolCall, ToolSpec,
+};
 use crate::agent::request::{assistant_to_openai, role, tool_to_openai};
 use crate::agent::retry::{
     error_is_retryable, is_context_overflow_error, resolve_max_steps, retry_delay,
@@ -162,6 +165,16 @@ pub trait AgentUi: Send {
                 "Asking the user a question is only available in interactive `aivo code`."
                     .to_string(),
             )
+        })
+    }
+    /// The `exit_plan_mode` tool: show the plan and await the user's verdict on the
+    /// approval card. Default declines — headless/sub-agents have no interactive user.
+    fn approve_plan<'a>(
+        &'a mut self,
+        _plan: &'a str,
+    ) -> BoxFuture<'a, Result<PlanDecision, String>> {
+        Box::pin(async {
+            Err("Plan approval is only available in interactive `aivo code`.".to_string())
         })
     }
     /// Show the pending edits and return the user's verdict. Only reached with the
@@ -313,9 +326,11 @@ pub struct AgentEngine {
     /// Whether this model can reason at all (snapshot). Cached at construction so the
     /// disable path doesn't send an effort field that would 400.
     reasoning_capable: bool,
-    /// Plan mode: mutating tools refused so a `/plan` investigation can't modify the
-    /// workspace. See `restrict_read_only`.
+    /// Plan mode: mutating tools refused so planning can't modify the workspace.
+    /// Reversible — see `set_plan_mode`.
     read_only: bool,
+    /// Tool specs stripped by `set_plan_mode(true)`, restored verbatim on exit.
+    plan_mode_stash: Vec<Value>,
     /// Unattended `-e` only: reject a text turn that admits it isn't done (or trails
     /// off mid-step) and nudge to continue, rather than accept it as the final answer.
     require_completion: bool,
@@ -429,6 +444,7 @@ impl AgentEngine {
             agent_tools_enabled: true,
             reasoning_capable: default_reasoning_effort(model).is_some(),
             read_only: false,
+            plan_mode_stash: Vec::new(),
             require_completion: false,
             self_correct: false,
             confirm_before_build: false,
@@ -540,14 +556,42 @@ questions.",
         }
     }
 
-    /// Read-only mode for `/plan`: hide mutating tools + `subagent`. The execution
-    /// guard also refuses them (in case one is hallucinated). One-way.
-    pub fn restrict_read_only(&mut self) {
-        self.read_only = true;
-        self.tools_openai.retain(|t| {
-            let name = t["function"]["name"].as_str().unwrap_or("");
-            !tools::is_mutating(name) && name != "subagent"
-        });
+    /// Reversible read-only mode. On: stash file-mutating tools + `subagent`,
+    /// advertise `exit_plan_mode`, append the directive. Off: restore the stashed
+    /// specs verbatim (no rebuild — history survives into same-turn execution).
+    /// `run_bash` stays offered (confirmation-gated). Idempotent both ways.
+    pub fn set_plan_mode(&mut self, on: bool) {
+        if on == self.read_only {
+            return;
+        }
+        self.read_only = on;
+        if on {
+            let (stashed, kept) = std::mem::take(&mut self.tools_openai)
+                .into_iter()
+                .partition(|t| {
+                    let name = t["function"]["name"].as_str().unwrap_or("");
+                    (tools::is_mutating(name) && name != "run_bash") || name == "subagent"
+                });
+            self.plan_mode_stash = stashed;
+            self.tools_openai = kept;
+            self.tools_openai
+                .push(tool_to_openai(plan_mode::exit_plan_mode_tool_spec()));
+        } else {
+            self.tools_openai
+                .retain(|t| t["function"]["name"].as_str() != Some("exit_plan_mode"));
+            self.tools_openai
+                .extend(std::mem::take(&mut self.plan_mode_stash));
+        }
+        let directive = format!("\n\n{}", plan_mode::PLAN_MODE_DIRECTIVE);
+        if let Some(content) = self.messages.first_mut().and_then(|m| m.get_mut("content"))
+            && let Some(s) = content.as_str()
+        {
+            *content = Value::String(if on {
+                format!("{s}{directive}")
+            } else {
+                s.replacen(&directive, "", 1)
+            });
+        }
     }
 
     /// Enable the headless completion gate (unattended `-e`): a text-only turn that
@@ -1387,11 +1431,11 @@ questions.",
                 continue;
             }
             ui.tool_start(n, &call.arguments);
-            // Plan mode backstop (the tool is also hidden); the error steers the model.
-            if self.read_only && tools::is_mutating(n) {
+            // Backstop for a hallucinated mutating tool (also hidden from the schema).
+            if self.read_only && tools::is_mutating(n) && n != "run_bash" {
                 outcomes[i] = Some(Err(
-                    "Plan mode is read-only — do not modify files or run commands. \
-Investigate with read-only tools and write the implementation plan instead."
+                    "Plan mode is read-only — do not modify files. Investigate, or call \
+`exit_plan_mode` with your plan."
                         .to_string(),
                 ));
                 continue;
@@ -1407,11 +1451,15 @@ Investigate with read-only tools and write the implementation plan instead."
                     .is_some_and(|e| e.requires_approval(&call.name));
             // Hard floor: an unrecoverable command is confirmed even under auto-approve, never remembered; off a TTY fails closed.
             let catastrophic = tools::is_catastrophic(n, &call.arguments);
+            // Plan-mode bash confirms per call (allow-once, bypasses -y/auto/grants
+            // like `catastrophic`); provably read-only inspection is exempt.
+            let plan_bash =
+                self.read_only && n == "run_bash" && !tools::is_readonly_command(&call.arguments);
             // Remote mutation: also confirmed under auto-approve, but AlwaysAllow may
             // remember it so a deploy loop isn't re-prompted each identical call.
             let remote_side_effect =
                 !catastrophic && tools::is_remote_side_effect(n, &call.arguments);
-            let allowed = if catastrophic {
+            let allowed = if catastrophic || plan_bash {
                 let preview = tools::preview(n, &call.arguments);
                 // Allow and AlwaysAllow both run it once only — never remembered.
                 !matches!(
@@ -1632,6 +1680,32 @@ Investigate with read-only tools and write the implementation plan instead."
                         .await
                         .map(|answer| ask::confirmation(&answer)),
                     Err(e) => Err(e),
+                }
+            } else if n == "exit_plan_mode" {
+                if !self.read_only {
+                    Err(
+                        "exit_plan_mode: not in plan mode (the plan was already approved or \
+planning is off) — continue with the task."
+                            .to_string(),
+                    )
+                } else {
+                    match plan_mode::parse_exit_plan(&call.arguments) {
+                        Ok(plan) => match ui.approve_plan(&plan).await {
+                            Ok(PlanDecision::Approve) => {
+                                // Restore tools now so this turn continues into execution.
+                                self.set_plan_mode(false);
+                                Ok(plan_mode::PLAN_APPROVED_RESULT.to_string())
+                            }
+                            Ok(PlanDecision::KeepPlanning { feedback }) => {
+                                Ok(plan_mode::keep_planning_result(feedback.as_deref()))
+                            }
+                            Ok(PlanDecision::Discard) => {
+                                Ok(plan_mode::PLAN_DISCARDED_RESULT.to_string())
+                            }
+                            Err(e) => Err(e),
+                        },
+                        Err(e) => Err(e),
+                    }
                 }
             } else if let Some(ext) = self.external.clone().filter(|e| e.handles(&call.name)) {
                 // External tool — keyed on its raw advertised name (`mcp__*`), never normalized (matches the shadow check).
@@ -2309,6 +2383,10 @@ mod tests {
         discards: usize,
         /// Each forwarded sub-agent step: `(agent, tool, step)`.
         sub_activity: Vec<(String, String, usize)>,
+        /// Verdict `approve_plan` replies with (`None` → dismissed).
+        plan_decision: Option<crate::agent::protocol::PlanDecision>,
+        /// The plan text of each `approve_plan` call, in order.
+        approved_plans: Vec<String>,
     }
     impl AgentUi for CapturingUi {
         fn assistant_text(&mut self, t: &str) {
@@ -2355,6 +2433,16 @@ mod tests {
                 } else {
                     Decision::Allow
                 }
+            })
+        }
+        fn approve_plan<'a>(
+            &'a mut self,
+            plan: &'a str,
+        ) -> BoxFuture<'a, Result<PlanDecision, String>> {
+            self.approved_plans.push(plan.to_string());
+            let decision = self.plan_decision.clone();
+            Box::pin(async move {
+                decision.ok_or_else(|| plan_mode::PLAN_APPROVAL_DISMISSED.to_string())
             })
         }
     }
@@ -2588,31 +2676,350 @@ mod tests {
     }
 
     #[test]
-    fn restrict_read_only_hides_mutating_tools() {
+    fn plan_mode_hides_mutating_tools_but_keeps_bash() {
         let mut engine = AgentEngine::new("/tmp", "m", "", &[], &[], 0, 0);
-        engine.restrict_read_only();
+        engine.set_plan_mode(true);
         assert!(engine.read_only);
-        let names: Vec<&str> = engine
-            .tools_openai
-            .iter()
-            .filter_map(|t| t["function"]["name"].as_str())
-            .collect();
-        // Mutating built-ins + subagent are stripped; read-only ones + plan/notes remain.
-        for gone in [
-            "write_file",
-            "edit_file",
-            "multi_edit",
-            "run_bash",
-            "subagent",
-        ] {
+        let names = tool_names(&engine);
+        // File-mutating built-ins + subagent are stripped; run_bash stays
+        // (confirmation-gated per call), as do read-only tools + plan/notes.
+        for gone in ["write_file", "edit_file", "multi_edit", "subagent"] {
             assert!(
-                !names.contains(&gone),
+                !names.iter().any(|n| n == gone),
                 "{gone} should be hidden in plan mode"
             );
         }
-        for kept in ["read_file", "grep", "glob", "list_dir", "update_plan"] {
-            assert!(names.contains(&kept), "{kept} should remain in plan mode");
+        for kept in [
+            "read_file",
+            "grep",
+            "glob",
+            "list_dir",
+            "run_bash",
+            "update_plan",
+            "exit_plan_mode",
+        ] {
+            assert!(
+                names.iter().any(|n| n == kept),
+                "{kept} should be offered in plan mode"
+            );
         }
+        let system = engine.messages[0]["content"].as_str().unwrap();
+        assert!(system.contains(crate::agent::plan_mode::PLAN_MODE_DIRECTIVE));
+    }
+
+    #[test]
+    fn set_plan_mode_round_trips_tools_and_directive() {
+        // Both editor families: edit_file/multi_edit models and apply_patch models.
+        for model in ["m", "gpt-5"] {
+            let mut engine = AgentEngine::new("/tmp", model, "", &[], &[], 0, 0);
+            let before_tools = tool_names(&engine);
+            let before_system = engine.messages[0]["content"].as_str().unwrap().to_string();
+
+            engine.set_plan_mode(true);
+            engine.set_plan_mode(true); // idempotent on
+            engine.set_plan_mode(false);
+            engine.set_plan_mode(false); // idempotent off
+
+            assert!(!engine.read_only, "model={model}");
+            let mut after = tool_names(&engine);
+            let mut before = before_tools.clone();
+            after.sort();
+            before.sort();
+            assert_eq!(after, before, "model={model}: tool set restored exactly");
+            assert!(!after.iter().any(|n| n == "exit_plan_mode"));
+            assert_eq!(
+                engine.messages[0]["content"].as_str().unwrap(),
+                before_system,
+                "model={model}: directive stripped exactly"
+            );
+        }
+    }
+
+    /// Tool-result message contents from history, in order.
+    fn tool_result_texts(engine: &AgentEngine) -> Vec<String> {
+        engine
+            .messages
+            .iter()
+            .filter(|m| role(m) == "tool")
+            .filter_map(|m| m["content"].as_str().map(str::to_string))
+            .collect()
+    }
+
+    /// In plan mode a non-allowlisted `run_bash` call prompts EVERY time —
+    /// neither `-y` (ctx.yes) nor an `AlwaysAllow` answer suppresses the next one.
+    #[tokio::test]
+    async fn plan_mode_bash_always_prompts() {
+        let dir = tmp();
+        // `touch` is not in the read-only allowlist — it mutates the workspace.
+        let bash = tool_call_sse("run_bash", json!({ "command": "touch probe.txt" }));
+        let port = spawn_sse_sequence(vec![bash.clone(), bash, FINAL_TEXT_SSE.to_string()]);
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let base = format!("http://127.0.0.1:{port}");
+        let mut engine = AgentEngine::new(&dir.display().to_string(), "m", "", &[], &[], 0, 0);
+        engine.set_plan_mode(true);
+        let mut ui = CapturingUi {
+            always_allow: true,
+            ..Default::default()
+        };
+        run_session(
+            &mut engine,
+            &turn_ctx(&client, &base, &dir), // yes: true — must not bypass either
+            Some("inspect".into()),
+            &mut ui,
+        )
+        .await;
+
+        assert_eq!(ui.ask_tools, vec!["run_bash", "run_bash"]);
+        assert!(
+            dir.join("probe.txt").exists(),
+            "the confirmed command actually ran"
+        );
+        assert!(engine.read_only, "plan mode persists through the turn");
+    }
+
+    /// A recognized read-only inspection command runs in plan mode with NO
+    /// prompt, even with auto-approve off — it can't break the read-only promise.
+    #[tokio::test]
+    async fn plan_mode_readonly_bash_skips_prompt() {
+        let dir = tmp();
+        let bash = tool_call_sse(
+            "run_bash",
+            json!({ "command": format!("cd {} && git diff --cached --stat", dir.display()) }),
+        );
+        let echo = tool_call_sse("run_bash", json!({ "command": "echo readonly-probe" }));
+        let port = spawn_sse_sequence(vec![bash, echo, FINAL_TEXT_SSE.to_string()]);
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let base = format!("http://127.0.0.1:{port}");
+        let mut engine = AgentEngine::new(&dir.display().to_string(), "m", "", &[], &[], 0, 0);
+        engine.set_plan_mode(true);
+        let mut ui = CapturingUi::default();
+        let ctx = TurnCtx {
+            client: &client,
+            serve_base: &base,
+            auth: None,
+            cwd: &dir,
+            yes: false, // no auto-approve anywhere — the exemption alone applies
+            auto_approve: None,
+            review_edits: None,
+        };
+        run_session(&mut engine, &ctx, Some("inspect".into()), &mut ui).await;
+
+        assert_eq!(ui.asks, 0, "read-only inspection never prompts");
+        assert!(
+            tool_result_texts(&engine)
+                .iter()
+                .any(|c| c.contains("readonly-probe")),
+            "the commands ran"
+        );
+        assert!(engine.read_only, "plan mode persists");
+    }
+
+    /// A plan-mode batch: `write_file` is refused with the steering error while a
+    /// read-only `run_bash` in the same batch runs (promptless — allowlisted).
+    #[tokio::test]
+    async fn plan_mode_refuses_write_but_allows_readonly_bash() {
+        let dir = tmp();
+        let batch = batch_tool_call_sse(&[
+            (
+                "c1",
+                "write_file",
+                json!({"path": "out.txt", "content": "hi"}),
+            ),
+            ("c2", "run_bash", json!({"command": "echo probe"})),
+        ]);
+        let port = spawn_sse_sequence(vec![batch, FINAL_TEXT_SSE.to_string()]);
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let base = format!("http://127.0.0.1:{port}");
+        let mut engine = AgentEngine::new(&dir.display().to_string(), "m", "", &[], &[], 0, 0);
+        engine.set_plan_mode(true);
+        let mut ui = CapturingUi::default();
+        run_session(
+            &mut engine,
+            &turn_ctx(&client, &base, &dir),
+            Some("plan it".into()),
+            &mut ui,
+        )
+        .await;
+
+        let results = tool_result_texts(&engine);
+        assert!(
+            results.iter().any(|c| c.contains("Plan mode is read-only")),
+            "write_file refused: {results:?}"
+        );
+        assert!(
+            results.iter().any(|c| c.contains("probe")),
+            "confirmed bash ran: {results:?}"
+        );
+        assert!(
+            !dir.join("out.txt").exists(),
+            "no file written in plan mode"
+        );
+    }
+
+    /// Approval mid-turn restores full tools so the SAME turn continues into
+    /// execution: exit_plan_mode → approve → write_file succeeds → converges.
+    #[tokio::test]
+    async fn exit_plan_mode_approve_restores_and_continues() {
+        let dir = tmp();
+        let exit = tool_call_sse("exit_plan_mode", json!({"plan": "1. write out.txt"}));
+        let port = spawn_sse_sequence(vec![
+            exit,
+            WRITE_TOOL_SSE.to_string(),
+            FINAL_TEXT_SSE.to_string(),
+        ]);
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let base = format!("http://127.0.0.1:{port}");
+        let mut engine = AgentEngine::new(&dir.display().to_string(), "m", "", &[], &[], 0, 0);
+        engine.set_plan_mode(true);
+        let mut ui = CapturingUi {
+            plan_decision: Some(PlanDecision::Approve),
+            ..Default::default()
+        };
+        run_session(
+            &mut engine,
+            &turn_ctx(&client, &base, &dir),
+            Some("plan then build".into()),
+            &mut ui,
+        )
+        .await;
+
+        assert_eq!(ui.approved_plans, vec!["1. write out.txt"]);
+        assert!(!engine.read_only, "approval exits plan mode");
+        let results = tool_result_texts(&engine);
+        assert!(
+            results
+                .iter()
+                .any(|c| c.contains(plan_mode::PLAN_APPROVED_RESULT)),
+            "approval result fed back: {results:?}"
+        );
+        assert!(
+            dir.join("out.txt").exists(),
+            "the same turn continued into a successful write"
+        );
+    }
+
+    #[tokio::test]
+    async fn exit_plan_mode_keep_planning_stays_read_only() {
+        let dir = tmp();
+        let exit = tool_call_sse("exit_plan_mode", json!({"plan": "1. do X"}));
+        let port = spawn_sse_sequence(vec![exit, FINAL_TEXT_SSE.to_string()]);
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let base = format!("http://127.0.0.1:{port}");
+        let mut engine = AgentEngine::new(&dir.display().to_string(), "m", "", &[], &[], 0, 0);
+        engine.set_plan_mode(true);
+        let mut ui = CapturingUi {
+            plan_decision: Some(PlanDecision::KeepPlanning {
+                feedback: Some("cover the error path too".into()),
+            }),
+            ..Default::default()
+        };
+        run_session(
+            &mut engine,
+            &turn_ctx(&client, &base, &dir),
+            Some("plan it".into()),
+            &mut ui,
+        )
+        .await;
+
+        assert!(engine.read_only, "keep-planning stays in plan mode");
+        let results = tool_result_texts(&engine);
+        assert!(
+            results
+                .iter()
+                .any(|c| c.contains("cover the error path too")),
+            "feedback fed back: {results:?}"
+        );
+    }
+
+    /// Discard tells the model to stop but the engine stays read-only for the rest
+    /// of the turn (the TUI exits the mode after the turn ends).
+    #[tokio::test]
+    async fn exit_plan_mode_discard_stays_read_only() {
+        let dir = tmp();
+        let exit = tool_call_sse("exit_plan_mode", json!({"plan": "1. do X"}));
+        let port = spawn_sse_sequence(vec![exit, FINAL_TEXT_SSE.to_string()]);
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let base = format!("http://127.0.0.1:{port}");
+        let mut engine = AgentEngine::new(&dir.display().to_string(), "m", "", &[], &[], 0, 0);
+        engine.set_plan_mode(true);
+        let mut ui = CapturingUi {
+            plan_decision: Some(PlanDecision::Discard),
+            ..Default::default()
+        };
+        run_session(
+            &mut engine,
+            &turn_ctx(&client, &base, &dir),
+            Some("plan it".into()),
+            &mut ui,
+        )
+        .await;
+
+        assert!(engine.read_only);
+        assert!(
+            tool_result_texts(&engine)
+                .iter()
+                .any(|c| c.contains(plan_mode::PLAN_DISCARDED_RESULT))
+        );
+    }
+
+    /// An empty `plan` argument is a steering error, not a card.
+    #[tokio::test]
+    async fn exit_plan_mode_empty_plan_errors() {
+        let dir = tmp();
+        let exit = tool_call_sse("exit_plan_mode", json!({}));
+        let port = spawn_sse_sequence(vec![exit, FINAL_TEXT_SSE.to_string()]);
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let base = format!("http://127.0.0.1:{port}");
+        let mut engine = AgentEngine::new(&dir.display().to_string(), "m", "", &[], &[], 0, 0);
+        engine.set_plan_mode(true);
+        let mut ui = CapturingUi {
+            plan_decision: Some(PlanDecision::Approve),
+            ..Default::default()
+        };
+        run_session(
+            &mut engine,
+            &turn_ctx(&client, &base, &dir),
+            Some("plan it".into()),
+            &mut ui,
+        )
+        .await;
+
+        assert!(ui.approved_plans.is_empty(), "no card for an empty plan");
+        assert!(engine.read_only);
+        assert!(
+            tool_result_texts(&engine)
+                .iter()
+                .any(|c| c.contains("missing `plan`"))
+        );
+    }
+
+    /// A hallucinated call outside plan mode gets a steering error (never a card).
+    #[tokio::test]
+    async fn exit_plan_mode_outside_plan_mode_errors() {
+        let dir = tmp();
+        let exit = tool_call_sse("exit_plan_mode", json!({"plan": "1. do X"}));
+        let port = spawn_sse_sequence(vec![exit, FINAL_TEXT_SSE.to_string()]);
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let base = format!("http://127.0.0.1:{port}");
+        let mut engine = AgentEngine::new(&dir.display().to_string(), "m", "", &[], &[], 0, 0);
+        let mut ui = CapturingUi {
+            plan_decision: Some(PlanDecision::Approve),
+            ..Default::default()
+        };
+        run_session(
+            &mut engine,
+            &turn_ctx(&client, &base, &dir),
+            Some("hi".into()),
+            &mut ui,
+        )
+        .await;
+
+        assert!(ui.approved_plans.is_empty());
+        assert!(
+            tool_result_texts(&engine)
+                .iter()
+                .any(|c| c.contains("not in plan mode"))
+        );
     }
 
     #[test]

@@ -1217,7 +1217,8 @@ fn make_test_app(
         cursor_acp_session: None,
         pending_agent_messages: None,
         goal_mode: None,
-        capturing_plan: false,
+        plan_mode: false,
+        plan_exit_pending: false,
         pending_plan: None,
         plan_card_idx: None,
         agent_engine: None,
@@ -1233,6 +1234,7 @@ fn make_test_app(
         agent_permission: None,
         agent_ask: None,
         agent_review: None,
+        agent_plan_approval: None,
         agent_auto_approve: false,
         auto_approve_flag: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         agent_review_edits: false,
@@ -3526,13 +3528,13 @@ fn test_permission_card_anchored_above_composer() {
         "card bottom must sit one row (the divider) above the composer:\n{screen}"
     );
     // The divider directly under the card is the full-width composer rule — now
-    // always carrying the auto-approve badge (here "off", since a card only
-    // shows when auto-approve is off) — so the narrower card never leaves it
-    // poking out past the card's right edge.
+    // always carrying the mode badge (here "default", since a card only shows
+    // when auto-approve is off) — so the narrower card never leaves it poking
+    // out past the card's right edge.
     let divider = &rows[bottom_border_row + 1];
     assert!(
-        divider.contains('─') && divider.contains("auto-approve"),
-        "full-width composer rule (with the auto-approve badge) must sit under the card:\n{screen}"
+        divider.contains('─') && divider.contains("default"),
+        "full-width composer rule (with the mode badge) must sit under the card:\n{screen}"
     );
 
     // The card is sized to its content, not stretched across the full 60-col
@@ -4140,19 +4142,26 @@ fn test_hint_bar_reflects_state() {
         bottom_row(|a| a.sending = true).contains("interrupt"),
         "sending hint bar"
     );
-    // Auto-approve rides the composer rule, not the bottom hint bar, and BOTH
-    // states are shown so the mode + its toggle key are always discoverable.
+    // The mode badge rides the composer rule, not the bottom hint bar, and every
+    // mode is shown so the current state + its cycle key stay discoverable.
+    // Matched by each badge's unique glyph: a wide glyph splits across buffer
+    // cells (breaking adjacent-text matches) and the rotating welcome tip can
+    // contain the bare mode words.
     assert!(
-        full_screen(|a| a.agent_auto_approve = true).contains("auto-approve: on"),
-        "auto-approve ON badge on composer rule"
+        full_screen(|a| a.agent_auto_approve = true).contains('⚡'),
+        "auto badge on composer rule"
     );
     assert!(
-        full_screen(|a| a.agent_auto_approve = false).contains("auto-approve: off"),
-        "auto-approve OFF state shown on composer rule (discoverable)"
+        full_screen(|a| a.agent_auto_approve = false).contains("default (shift+tab)"),
+        "default mode shown on composer rule (discoverable)"
     );
     assert!(
-        !bottom_row(|a| a.agent_auto_approve = true).contains("auto-approve"),
-        "auto-approve no longer in the bottom hint bar"
+        full_screen(|a| a.agent_review_edits = true).contains('✎'),
+        "review badge on composer rule"
+    );
+    assert!(
+        !bottom_row(|a| a.agent_auto_approve = true).contains('⚡'),
+        "the mode badge is not in the bottom hint bar"
     );
     assert!(
         bottom_row(|a| a.queued_messages = vec!["next".to_string()]).contains("queued"),
@@ -5687,20 +5696,21 @@ async fn test_auto_approve_toggle_shows_toast_not_notice() {
     assert!(
         app.toast
             .as_ref()
-            .is_some_and(|t| t.text.contains("Auto-approve ON")),
+            .is_some_and(|t| t.text.contains("Auto mode")),
         "toggle should flash a toast"
     );
 
-    // Toggling back off behaves the same way.
+    // The next press cycles into plan mode — same toast-not-notice contract.
     app.handle_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::NONE))
         .await
         .unwrap();
     assert!(!app.agent_auto_approve);
+    assert!(app.plan_mode, "auto cycles into plan mode");
     assert!(app.notice.is_none());
     assert!(
         app.toast
             .as_ref()
-            .is_some_and(|t| t.text.contains("Auto-approve off"))
+            .is_some_and(|t| t.text.contains("Plan mode"))
     );
 }
 
@@ -7388,15 +7398,14 @@ fn test_parse_plan_command() {
 }
 
 #[test]
-fn test_plan_exec_seed_appends_guidance() {
-    use super::runtime_impl::plan_exec_seed;
-    let bare = plan_exec_seed("1. do X", "");
-    assert!(bare.ends_with("1. do X"));
+fn test_plan_go_message_appends_guidance() {
+    use super::runtime_impl::plan_go_message;
+    let bare = plan_go_message("");
+    assert!(bare.contains("approved"));
     assert!(!bare.contains("Additional guidance"));
-    let steered = plan_exec_seed("1. do X", "use the existing retry helper");
+    let steered = plan_go_message("use the existing retry helper");
     assert!(steered.starts_with(&bare));
-    assert!(steered.contains("Additional guidance for this execution:"));
-    assert!(steered.ends_with("use the existing retry helper"));
+    assert!(steered.contains("Additional guidance: use the existing retry helper"));
 }
 
 /// The plan-card anchor slides down when an earlier history entry is removed
@@ -7426,9 +7435,10 @@ async fn test_plan_card_idx_shifts_on_removal() {
     assert_eq!(app.history[1].role, "assistant");
 }
 
-/// `/plan` state machine without the dispatch paths (which need a serve): a
-/// finished investigation turn captures its reply as the pending plan; `stop`
-/// discards it; bare reports status; `go` with nothing pending just guides.
+/// Plan-mode state machine without the dispatch paths (which need a serve):
+/// a finished plan-mode turn drafts its reply as the pending plan while the
+/// MODE PERSISTS; `stop` leaves the mode; bare reports status / enters it;
+/// `go` with nothing pending just guides.
 #[tokio::test]
 async fn test_plan_capture_discard_and_status() {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
@@ -7441,11 +7451,12 @@ async fn test_plan_capture_discard_and_status() {
         attachments: vec![],
     };
 
-    // A finished planning turn stashes the reply and prompts for `/plan go`.
-    app.capturing_plan = true;
+    // A finished plan-mode turn stashes the reply as the draft — and stays in
+    // plan mode (persistent until approved or stopped).
+    app.plan_mode = true;
     app.history.push(assistant("1. do X\n2. do Y"));
-    app.maybe_capture_plan();
-    assert!(!app.capturing_plan, "capture flag clears");
+    app.capture_plan_draft();
+    assert!(app.plan_mode, "plan mode persists after a draft");
     assert_eq!(app.pending_plan.as_deref(), Some("1. do X\n2. do Y"));
     assert!(app.notice.as_ref().unwrap().1.contains("/plan go"));
     // The captured reply is anchored as the plan card.
@@ -7454,12 +7465,13 @@ async fn test_plan_capture_discard_and_status() {
         app.history.iter().rposition(|m| m.role == "assistant")
     );
 
-    // Bare `/plan` with a plan pending reports it's ready.
+    // Bare `/plan` while in plan mode reports status.
     app.run_plan_command(None).await;
-    assert!(app.notice.as_ref().unwrap().1.contains("review"));
+    assert!(app.notice.as_ref().unwrap().1.contains("Plan mode is on"));
 
-    // `/plan stop` discards the pending plan and unframes the card.
+    // `/plan stop` leaves plan mode, discarding the draft and the card frame.
     app.run_plan_command(Some("stop".to_string())).await;
+    assert!(!app.plan_mode);
     assert!(app.pending_plan.is_none());
     assert!(app.plan_card_idx.is_none());
     assert!(app.notice.as_ref().unwrap().1.contains("discarded"));
@@ -7473,11 +7485,229 @@ async fn test_plan_capture_discard_and_status() {
         .await;
     assert!(app.notice.as_ref().unwrap().1.contains("No plan yet"));
 
-    // An empty investigation reply is not captured as a plan.
-    app.capturing_plan = true;
+    // An empty reply leaves the draft untouched (all-tool-call turns).
+    app.plan_mode = true;
     app.history.push(assistant("   "));
-    app.maybe_capture_plan();
+    app.capture_plan_draft();
     assert!(app.pending_plan.is_none(), "blank reply isn't a plan");
+
+    // An interrupt keeps plan mode on (regression: the old one-way read-only
+    // restriction leaked past the mode when the engine survived a cancel).
+    app.cancel_inflight_request(super::CancelKind::Discard);
+    assert!(app.plan_mode, "plan mode persists across an interrupt");
+    app.run_plan_command(Some("stop".to_string())).await;
+    assert!(!app.plan_mode);
+}
+
+/// Bare `/plan` enters plan mode without dispatching a turn; the approval-card
+/// verdicts pick the exit mode Claude Code-style: 1 = approve + auto-approve,
+/// 2 = approve + manual approval, 3 = keep planning.
+#[tokio::test]
+async fn test_plan_mode_enter_and_approval_verdicts() {
+    use crate::agent::protocol::PlanDecision;
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+
+    // Bare `/plan` while off enters the mode (no engine yet — build-time entry).
+    app.run_plan_command(None).await;
+    assert!(app.plan_mode);
+    assert!(app.notice.as_ref().unwrap().1.contains("Plan mode"));
+
+    // Approve & auto-approve: mode off, execution continues unattended.
+    let (reply, mut rx1) = tokio::sync::oneshot::channel();
+    app.agent_plan_approval = Some(super::PendingPlanApproval {
+        body: vec![],
+        scroll: 0,
+        selected: 0,
+        reply,
+    });
+    app.pick_plan_approval_option(0);
+    assert!(!app.plan_mode, "approval exits plan mode");
+    assert!(!app.plan_exit_pending);
+    assert!(app.agent_auto_approve, "option 1 lands in auto mode");
+    assert!(!app.agent_review_edits, "modes are exclusive");
+    assert!(
+        app.auto_approve_flag
+            .load(std::sync::atomic::Ordering::Relaxed),
+        "live flag follows so the running turn sees it"
+    );
+    assert_eq!(rx1.try_recv().unwrap(), Ok(PlanDecision::Approve));
+
+    // Approve with per-edit review: mode off, review mode on.
+    app.plan_mode = true;
+    let (reply, mut rx2) = tokio::sync::oneshot::channel();
+    app.agent_plan_approval = Some(super::PendingPlanApproval {
+        body: vec![],
+        scroll: 0,
+        selected: 0,
+        reply,
+    });
+    app.pick_plan_approval_option(1);
+    assert!(!app.plan_mode);
+    assert!(!app.agent_auto_approve, "option 2 lands in review mode");
+    assert!(app.agent_review_edits, "each edit will show a diff");
+    assert!(
+        app.review_edits_flag
+            .load(std::sync::atomic::Ordering::Relaxed),
+        "live review flag follows mid-turn"
+    );
+    assert_eq!(rx2.try_recv().unwrap(), Ok(PlanDecision::Approve));
+
+    // Keep planning: mode stays on.
+    app.plan_mode = true;
+    let (reply, mut rx3) = tokio::sync::oneshot::channel();
+    app.agent_plan_approval = Some(super::PendingPlanApproval {
+        body: vec![],
+        scroll: 0,
+        selected: 0,
+        reply,
+    });
+    app.pick_plan_approval_option(2);
+    assert!(app.plan_mode, "keep-planning stays in plan mode");
+    assert_eq!(
+        rx3.try_recv().unwrap(),
+        Ok(PlanDecision::KeepPlanning { feedback: None })
+    );
+}
+
+/// Shift+Tab cycles the agent mode Claude Code-style: default → auto → plan →
+/// review → default, with the modes mutually exclusive. Mid-turn the plan step
+/// is skipped (the engine can't be restricted while a turn holds it).
+#[tokio::test]
+async fn test_shift_tab_cycles_agent_modes() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    let mode = |app: &super::CodeTuiApp| {
+        (
+            app.agent_auto_approve,
+            app.plan_mode,
+            app.agent_review_edits,
+        )
+    };
+    assert_eq!(mode(&app), (false, false, false), "starts in default");
+
+    // default → auto.
+    app.cycle_agent_mode().await;
+    assert_eq!(mode(&app), (true, false, false));
+
+    // auto → plan (auto forced off: exclusive).
+    app.cycle_agent_mode().await;
+    assert_eq!(mode(&app), (false, true, false), "auto cycles into plan");
+    assert!(
+        !app.auto_approve_flag
+            .load(std::sync::atomic::Ordering::Relaxed)
+    );
+
+    // plan → review (the drafted plan would survive; here there is none).
+    app.cycle_agent_mode().await;
+    assert_eq!(mode(&app), (false, false, true), "plan cycles into review");
+    assert!(
+        app.review_edits_flag
+            .load(std::sync::atomic::Ordering::Relaxed),
+        "live review flag follows"
+    );
+
+    // review → default.
+    app.cycle_agent_mode().await;
+    assert_eq!(mode(&app), (false, false, false), "full circle");
+
+    // Mid-turn: auto → review directly — plan entry is skipped while sending.
+    app.cycle_agent_mode().await; // default → auto
+    app.sending = true;
+    app.cycle_agent_mode().await;
+    assert_eq!(mode(&app), (false, false, true), "plan is skipped mid-turn");
+    app.cycle_agent_mode().await; // review → default
+    app.sending = false;
+
+    // Leaving plan mid-turn defers the engine restore (badge flips now).
+    app.plan_mode = true;
+    app.sending = true;
+    app.cycle_agent_mode().await;
+    assert!(!app.plan_mode);
+    assert!(app.agent_review_edits, "plan still cycles into review");
+    assert!(app.plan_exit_pending, "engine restore deferred to turn end");
+}
+
+/// Shift+Tab on a permission card during plan mode allows that one call only —
+/// it must NOT silently enable auto-approve (plan mode has no auto-approve).
+#[tokio::test]
+async fn test_permission_card_shift_tab_in_plan_mode_allows_once() {
+    use crate::agent::protocol::Decision;
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.plan_mode = true;
+    let (reply, mut rx1) = tokio::sync::oneshot::channel();
+    app.agent_permission = Some(super::PendingPermission {
+        tool: "run_bash".to_string(),
+        preview: Some("cargo build".to_string()),
+        reply,
+    });
+    let consumed = app.handle_permission_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT));
+    assert!(consumed);
+    assert_eq!(rx1.try_recv().unwrap(), Decision::Allow);
+    assert!(app.plan_mode, "still planning");
+    assert!(!app.agent_auto_approve, "auto-approve NOT enabled");
+}
+
+/// An `exit_plan_mode` tool call renders as the plan card (the plan is the
+/// payload), not as an opaque `→ exit_plan_mode(…)` row.
+#[test]
+fn test_exit_plan_mode_call_renders_plan_card() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.history.push(ChatMessage {
+        model: None,
+        role: "tool_call".to_string(),
+        content:
+            r#"{"name":"exit_plan_mode","args":{"plan":"1. refactor the gate\n2. add tests"}}"#
+                .to_string(),
+        reasoning_content: None,
+        attachments: vec![],
+    });
+    let lines = app.build_transcript().lines;
+    assert!(
+        lines.iter().any(|l| l.plain == "Implementation plan"),
+        "plan card header shown"
+    );
+    assert!(
+        lines.iter().any(|l| l.plain.contains("refactor the gate")),
+        "plan body shown"
+    );
+    assert!(
+        !lines.iter().any(|l| l.plain.contains("exit_plan_mode")),
+        "no raw tool-call row"
+    );
+}
+
+/// The composer rule shows the persistent `◇ plan` indicator while plan mode is
+/// on (and not while it's off), carries the cycle hint, and tints the rule ACCENT.
+#[tokio::test]
+async fn test_plan_badge_on_composer_rule() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    let plain = |line: &ratatui::text::Line<'_>| -> String {
+        line.spans.iter().map(|s| s.content.as_ref()).collect()
+    };
+
+    let off = app.composer_rule_line(80);
+    assert!(!plain(&off).contains("plan"));
+    assert!(plain(&off).contains("default"), "default mode shown");
+    // Every mode carries the cycle hint.
+    assert!(plain(&off).contains("(shift+tab)"));
+
+    app.plan_mode = true;
+    let on = app.composer_rule_line(80);
+    assert!(plain(&on).contains("◇ plan"));
+    assert!(plain(&on).contains("(shift+tab)"));
+    // The rule dashes tint ACCENT in plan mode (FAINT otherwise).
+    let dash_color = |line: &ratatui::text::Line<'_>| {
+        line.spans
+            .iter()
+            .find(|s| s.content.contains('─'))
+            .and_then(|s| s.style.fg)
+    };
+    assert_eq!(dash_color(&on), Some(ACCENT), "plan rule is accent-tinted");
+    assert_eq!(dash_color(&off), Some(FAINT), "default rule is faint");
 }
 
 /// `/create-skill` is a first-class built-in command (in `SLASH_COMMANDS` and
@@ -7655,7 +7885,7 @@ fn test_composer_rule_shows_goal_step_indicator() {
 
     let off = plain_text_from_spans(&app.composer_rule_line(80).spans);
     assert!(!off.contains("goal"), "no goal badge when off: {off:?}");
-    assert!(off.contains("auto-approve"));
+    assert!(off.contains("default"), "mode badge shows: {off:?}");
 
     app.goal_mode = Some(GoalState {
         objective: "ship it".to_string(),
@@ -7664,10 +7894,7 @@ fn test_composer_rule_shows_goal_step_indicator() {
     });
     let on = plain_text_from_spans(&app.composer_rule_line(80).spans);
     assert!(on.contains("goal 2/20"), "goal step indicator: {on:?}");
-    assert!(
-        on.contains("auto-approve"),
-        "auto-approve badge stays: {on:?}"
-    );
+    assert!(on.contains("default"), "mode badge stays: {on:?}");
     assert!(
         display_width(&on) <= 80,
         "rule fits width: {}",
@@ -8386,11 +8613,11 @@ async fn test_skills_delete_arms_then_cancels() {
 }
 
 #[tokio::test]
-async fn test_shift_tab_toggles_auto_approve() {
+async fn test_shift_tab_cycles_modes_through_handle_key() {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let mut app = make_test_app(tx, rx);
-    assert!(!app.agent_auto_approve);
-    // Shift+Tab arrives as BackTab — toggles auto-approve on.
+    assert!(!app.agent_auto_approve && !app.plan_mode);
+    // Shift+Tab arrives as BackTab — normal → auto-approve.
     app.handle_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::NONE))
         .await
         .unwrap();
@@ -8398,22 +8625,33 @@ async fn test_shift_tab_toggles_auto_approve() {
         app.agent_auto_approve,
         "Shift+Tab should enable auto-approve"
     );
-    // The shared LIVE flag the running agent turn reads tracks the toggle.
+    // The shared LIVE flag the running agent turn reads tracks the mode.
     assert!(
         app.auto_approve_flag
             .load(std::sync::atomic::Ordering::Relaxed),
         "live flag follows auto-approve ON"
     );
-    // The Tab+SHIFT form some terminals send toggles it back off.
+    // The Tab+SHIFT form some terminals send — auto-approve → plan mode.
     app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::SHIFT))
         .await
         .unwrap();
-    assert!(!app.agent_auto_approve, "Tab+SHIFT should disable it");
+    assert!(app.plan_mode, "second press cycles into plan mode");
+    assert!(!app.agent_auto_approve, "modes are mutually exclusive");
     assert!(
         !app.auto_approve_flag
             .load(std::sync::atomic::Ordering::Relaxed),
         "live flag follows auto-approve OFF"
     );
+    // Third press — plan → review.
+    app.handle_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::NONE))
+        .await
+        .unwrap();
+    assert!(!app.plan_mode && app.agent_review_edits);
+    // Fourth press — review → default.
+    app.handle_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::NONE))
+        .await
+        .unwrap();
+    assert!(!app.plan_mode && !app.agent_auto_approve && !app.agent_review_edits);
     // Ctrl+O is no longer an auto-approve alias (Shift+Tab only).
     app.handle_key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL))
         .await

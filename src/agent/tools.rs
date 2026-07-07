@@ -355,6 +355,138 @@ pub fn is_remote_side_effect(name: &str, args: &Value) -> bool {
             .unwrap_or(false)
 }
 
+/// Plan-mode allowlist: `true` only for provably read-only inspection commands,
+/// which run without the per-call confirmation. Fail-closed (worst case: prompt).
+pub fn is_readonly_command(args: &Value) -> bool {
+    args.get("command")
+        .and_then(|c| c.as_str())
+        .map(bash_is_readonly)
+        .unwrap_or(false)
+}
+
+/// Every segment must be a known inspection binary with no write-capable syntax
+/// (substitution, non-pseudo-device redirect). Quotes are NOT parsed — a quoted
+/// `$(…)`/`>` fails closed (a prompt), never a false pass.
+fn bash_is_readonly(cmd: &str) -> bool {
+    let cmd = cmd.trim();
+    if cmd.is_empty()
+        || cmd.contains("$(")
+        || cmd.contains('`')
+        || cmd.contains("<(")
+        || cmd.contains(">(")
+        || has_file_write_redirect(cmd)
+    {
+        return false;
+    }
+    // Drop fd-dups (`2>&1`, `>&2`, …) before the walk: their `&` would otherwise
+    // read as a control operator and mint a bogus `1`/`2` segment.
+    let scrubbed = cmd
+        .replace("2>&1", "")
+        .replace("1>&2", "")
+        .replace(">&1", "")
+        .replace(">&2", "");
+    let mut saw_command = false;
+    for seg in scrubbed.split(['\n', ';', '|', '&']) {
+        let tokens: Vec<&str> = seg.split_whitespace().collect();
+        let Some(&cmd0) = tokens.first() else {
+            continue;
+        };
+        saw_command = true;
+        // An env-var prefix (`FOO=bar cmd`) hides the real command.
+        if cmd0.contains('=') {
+            return false;
+        }
+        let base = cmd0.rsplit('/').next().unwrap_or(cmd0);
+        let ok = match base {
+            "cd" | "ls" | "pwd" | "cat" | "head" | "tail" | "wc" | "file" | "stat" | "du"
+            | "df" | "which" | "date" | "echo" | "printf" | "tree" | "realpath" | "dirname"
+            | "basename" | "uname" | "type" | "grep" | "egrep" | "fgrep" | "rg" | "jq" | "diff"
+            | "cmp" | "cut" | "uniq" | "tr" | "nl" | "column" | "strings" | "true" => true,
+            // `sort -o file` writes; plain sort only prints.
+            "sort" => !tokens
+                .iter()
+                .any(|t| *t == "-o" || t.starts_with("--output")),
+            // `-delete` removes matches; `-exec` family runs arbitrary commands;
+            // `-fprint*` writes files.
+            "find" => !tokens.iter().any(|t| {
+                matches!(*t, "-delete" | "-exec" | "-execdir" | "-ok" | "-okdir")
+                    || t.starts_with("-fprint")
+            }),
+            "git" => git_subcommand_is_readonly(&tokens),
+            _ => false,
+        };
+        if !ok {
+            return false;
+        }
+    }
+    saw_command
+}
+
+/// Any `>`/`>>` output redirect whose target is not a safe `/dev/` pseudo-device
+/// or a bare fd dup (`2>&1`). Input redirects (`<`, heredocs) don't write.
+fn has_file_write_redirect(cmd: &str) -> bool {
+    let mut search = cmd;
+    while let Some(pos) = search.find('>') {
+        let mut rest = &search[pos + 1..];
+        if let Some(stripped) = rest.strip_prefix('>') {
+            rest = stripped;
+        }
+        search = rest;
+        let target = rest.trim_start();
+        // An fd dup (`2>&1`, `>&2`) writes nothing to disk.
+        if target.starts_with('&') {
+            continue;
+        }
+        let target: String = target.chars().take_while(|c| !c.is_whitespace()).collect();
+        let dev_name = target.strip_prefix("/dev/").map(|dev| {
+            dev.chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                .collect::<String>()
+        });
+        if !dev_name.is_some_and(|name| SAFE_DEVICES.contains(&name.as_str())) {
+            return true;
+        }
+    }
+    false
+}
+
+/// `git <sub>` where `<sub>` only reads; an unrecognized global flag fails closed.
+fn git_subcommand_is_readonly(tokens: &[&str]) -> bool {
+    let mut it = tokens.iter().skip(1);
+    while let Some(&t) = it.next() {
+        match t {
+            // `-c key=value` executes: `core.fsmonitor` runs on `status`, `core.pager` on output.
+            "-c" => return false,
+            "-C" => {
+                it.next();
+            }
+            "--no-pager" | "-P" => {}
+            _ if t.starts_with('-') => return false,
+            _ => {
+                return matches!(
+                    t,
+                    "status"
+                        | "log"
+                        | "diff"
+                        | "show"
+                        | "blame"
+                        | "shortlog"
+                        | "describe"
+                        | "rev-parse"
+                        | "ls-files"
+                        | "ls-tree"
+                        | "cat-file"
+                        | "grep"
+                        | "reflog"
+                        | "show-ref"
+                        | "count-objects"
+                );
+            }
+        }
+    }
+    false // bare `git` — nothing to judge
+}
+
 /// True when a path resolves outside the working directory (absolute elsewhere,
 /// `..` traversal, or **through a symlink** that points out of the project) —
 /// editing outside the project is worth confirming.
@@ -3474,6 +3606,60 @@ mod tests {
             "write_file",
             &json!({ "path": "/", "content": "" })
         ));
+    }
+
+    #[test]
+    fn readonly_command_allowlist() {
+        // Inspection commands and combinations of them read as read-only.
+        assert!(bash_is_readonly("git diff --cached --stat"));
+        assert!(bash_is_readonly(
+            "cd /Users/yc/project/work/aivo && git diff --cached --stat"
+        ));
+        assert!(bash_is_readonly("git log --oneline -20"));
+        assert!(bash_is_readonly("git -C sub --no-pager status"));
+        assert!(bash_is_readonly("ls -la src/"));
+        assert!(bash_is_readonly("rg 'fn main' src | head -5"));
+        assert!(bash_is_readonly("grep -rn pattern . ; wc -l file"));
+        assert!(bash_is_readonly("find . -name '*.rs' -newer Cargo.toml"));
+        assert!(bash_is_readonly("cat Cargo.toml | grep version"));
+        assert!(bash_is_readonly("sort names.txt | uniq -c"));
+        assert!(bash_is_readonly("echo hi 2>/dev/null"));
+        assert!(bash_is_readonly("git status 2>&1 | tail -3"));
+        assert!(bash_is_readonly("/usr/bin/git blame src/main.rs"));
+
+        // Anything that can write, run hidden code, or isn't recognized fails closed.
+        assert!(!bash_is_readonly("git push"));
+        assert!(!bash_is_readonly("git commit -m x"));
+        assert!(!bash_is_readonly("git")); // bare — nothing to judge
+        assert!(!bash_is_readonly("git --work-tree=/x diff")); // unknown global flag
+        // `-c` config values EXECUTE (fsmonitor runs during `status`) — a
+        // "read-only" subcommand doesn't make the flag safe.
+        assert!(!bash_is_readonly("git -c core.fsmonitor=/tmp/pwn status"));
+        assert!(!bash_is_readonly("git -c core.pager=evil log"));
+        assert!(!bash_is_readonly("rm -rf build"));
+        assert!(!bash_is_readonly("touch probe.txt"));
+        assert!(!bash_is_readonly("cargo build"));
+        assert!(!bash_is_readonly("cargo tree")); // may fetch + write the lockfile
+        assert!(!bash_is_readonly("ls && cargo test")); // one bad segment poisons all
+        assert!(!bash_is_readonly("git diff > out.txt")); // file redirect
+        assert!(!bash_is_readonly("echo hi >> log.txt"));
+        assert!(!bash_is_readonly("sort -o sorted.txt names.txt"));
+        assert!(!bash_is_readonly("find . -name '*.tmp' -delete"));
+        assert!(!bash_is_readonly("find . -exec rm {} \\;"));
+        assert!(!bash_is_readonly("echo $(rm -rf /)")); // command substitution
+        assert!(!bash_is_readonly("cat `find / -name id_rsa`"));
+        assert!(!bash_is_readonly("diff <(sort a) <(sort b)")); // process substitution
+        assert!(!bash_is_readonly("FOO=bar ls")); // env prefix hides the command
+        assert!(!bash_is_readonly("sh -c 'ls'")); // interpreter — opaque
+        assert!(!bash_is_readonly(""));
+        assert!(!bash_is_readonly("&&"));
+
+        // The public wrapper reads the run_bash `command` argument.
+        assert!(is_readonly_command(
+            &json!({ "command": "git diff --stat" })
+        ));
+        assert!(!is_readonly_command(&json!({ "command": "cargo build" })));
+        assert!(!is_readonly_command(&json!({})));
     }
 
     #[test]

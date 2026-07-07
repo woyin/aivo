@@ -218,7 +218,8 @@ impl CodeTuiApp {
             cursor_acp_session: None,
             pending_agent_messages: None,
             goal_mode: None,
-            capturing_plan: false,
+            plan_mode: false,
+            plan_exit_pending: false,
             pending_plan: None,
             plan_card_idx: None,
             agent_engine: None,
@@ -234,9 +235,12 @@ impl CodeTuiApp {
             agent_permission: None,
             agent_ask: None,
             agent_review: None,
-            agent_auto_approve: auto_approve,
+            agent_plan_approval: None,
+            // The modes are exclusive; prefs saved by an older build could have
+            // both on — review (the safer one) wins on load.
+            agent_auto_approve: auto_approve && !review_edits,
             auto_approve_flag: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
-                auto_approve,
+                auto_approve && !review_edits,
             )),
             agent_review_edits: review_edits,
             review_edits_flag: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(

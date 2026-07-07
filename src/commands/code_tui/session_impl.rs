@@ -393,7 +393,7 @@ is preserved."
             ConfigToggle {
                 setting: ConfigSetting::AutoApprove,
                 label: "Auto-approve tools",
-                description: "run write/edit/bash without asking (Shift+Tab)",
+                description: "run write/edit/bash without asking (Shift+Tab cycles modes)",
             },
             ConfigToggle {
                 setting: ConfigSetting::ReviewEdits,
@@ -438,9 +438,27 @@ is preserved."
         };
         match setting {
             ConfigSetting::Thinking => self.set_thinking_enabled(!self.thinking_enabled).await,
-            // Reuse the shared setter so the live atomic + toast stay in lockstep.
-            ConfigSetting::AutoApprove => self.set_auto_approve(!self.agent_auto_approve),
-            ConfigSetting::ReviewEdits => self.set_review_edits(!self.agent_review_edits),
+            // Modes are exclusive: turning one on leaves the others.
+            ConfigSetting::AutoApprove => {
+                let on = !self.agent_auto_approve;
+                if on {
+                    if self.plan_mode {
+                        self.leave_plan_mode(false).await;
+                    }
+                    self.set_review_quiet(false);
+                }
+                self.set_auto_approve(on)
+            }
+            ConfigSetting::ReviewEdits => {
+                let on = !self.agent_review_edits;
+                if on {
+                    if self.plan_mode {
+                        self.leave_plan_mode(false).await;
+                    }
+                    self.set_auto_quiet(false);
+                }
+                self.set_review_edits(on)
+            }
             ConfigSetting::UseWebSearch => {
                 self.set_web_search_enabled(!self.web_search_enabled).await
             }
@@ -2222,6 +2240,7 @@ is preserved."
         self.agent_permission = None;
         self.agent_ask = None;
         self.agent_review = None;
+        self.agent_plan_approval = None;
         self.stop_agent_serve();
         self.session_id = session.session_id;
         // Re-seed the running token total from the stored entry so further turns

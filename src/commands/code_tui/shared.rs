@@ -54,7 +54,7 @@ pub(super) const EMPTY_STATE_BOTTOM_GAP: u16 = 0;
 /// Rotating welcome-banner hints. Keep each terse; name a real affordance.
 pub(super) const WELCOME_TIPS: &[&str] = &[
     "start a line with ! to run a shell command",
-    "Shift+Tab toggles auto-approve for the agent's tools",
+    "Shift+Tab cycles mode: default → auto → plan → review",
     "/rewind undoes the agent's file edits",
     "/goal <task> keeps working on its own until it's done",
     "Ctrl+R reopens a past session",
@@ -62,7 +62,7 @@ pub(super) const WELCOME_TIPS: &[&str] = &[
     "/effort changes how hard the model thinks",
     "/skills and /mcp manage the agent's extra tools",
     "/compact summarizes older turns to free up context",
-    "/plan investigates read-only without changing files",
+    "/plan plans read-only — approve the plan and it builds",
     "/model switches models without losing the thread",
     "/config toggles thinking and tool auto-approve",
     "/copy grabs a past reply to your clipboard",
@@ -228,8 +228,8 @@ pub(super) const SLASH_COMMANDS: &[SlashCommandSpec] = &[
     },
     SlashCommandSpec {
         name: "plan",
-        help_label: "/plan <objective>",
-        description: "investigate read-only, draft a plan, then /plan go [guidance] to execute it",
+        help_label: "/plan [objective]",
+        description: "plan mode: investigate read-only, then approve the plan to execute it",
         takes_argument: true,
     },
     SlashCommandSpec {
@@ -282,7 +282,7 @@ pub(super) fn command_usage_hint(name: &str) -> Option<&'static str> {
         "skills" => Some("[add [-p] <name>|<github:owner/repo> | rm <name>]"),
         "create-skill" => Some("[what the skill should do]"),
         "goal" => Some("<objective> | stop"),
-        "plan" => Some("<objective> | go [guidance] | stop"),
+        "plan" => Some("[objective] | go [guidance] | stop"),
         "share" => Some("[stop]"),
         "compact" => Some("[fast]"),
         "model" => Some("[name]"),
@@ -1780,6 +1780,14 @@ pub(super) enum RuntimeEvent {
         items: Vec<crate::agent::review::ReviewItem>,
         reply: tokio::sync::oneshot::Sender<crate::agent::review::ReviewDecision>,
     },
+    /// The agent's `exit_plan_mode` tool: show the plan + approval card, reply with
+    /// the verdict. Same oneshot pattern as [`AgentPermission`](Self::AgentPermission).
+    AgentPlanApproval {
+        plan: String,
+        reply: tokio::sync::oneshot::Sender<
+            std::result::Result<crate::agent::protocol::PlanDecision, String>,
+        >,
+    },
     /// Live context-window fill from the agent engine mid-turn: `measured` true =
     /// a provider step total (exact), false = a chars/4 request estimate. Moves
     /// the footer's context stat during an agent turn instead of only at the end.
@@ -1877,6 +1885,18 @@ pub(super) struct PendingReview {
     pub(super) body: Vec<ratatui::text::Line<'static>>,
     pub(super) scroll: u16,
     pub(super) reply: tokio::sync::oneshot::Sender<crate::agent::review::ReviewDecision>,
+}
+
+/// A pending plan-approval card (`exit_plan_mode`): the plan as precomputed
+/// scrollable `body`, the highlighted `selected` option, and `reply`. Dropping it
+/// unreplied resolves to the dismissal directive (plan mode stays on).
+pub(super) struct PendingPlanApproval {
+    pub(super) body: Vec<ratatui::text::Line<'static>>,
+    pub(super) scroll: u16,
+    pub(super) selected: usize,
+    pub(super) reply: tokio::sync::oneshot::Sender<
+        std::result::Result<crate::agent::protocol::PlanDecision, String>,
+    >,
 }
 
 /// Active `/goal` autonomous loop: after each agent turn the app auto-continues
@@ -2096,11 +2116,15 @@ pub(super) struct CodeTuiApp {
     /// agent turns; cleared on completion, the iteration cap, `/goal stop`, an
     /// interrupt, `/new`, resume, or a key/model switch.
     pub(super) goal_mode: Option<GoalState>,
-    /// The in-flight turn is a `/plan` investigation: capture its reply as the
-    /// pending plan when it finishes. Reset on interrupt/cancel/`/new`.
-    pub(super) capturing_plan: bool,
-    /// A drafted plan from `/plan`, awaiting `/plan go` to execute it in a fresh
-    /// context. Cleared on execute, `/plan stop`, or `/new`.
+    /// Plan mode is on: read-only, persists across turns/interrupts until the plan
+    /// is approved or `/plan stop`.
+    pub(super) plan_mode: bool,
+    /// Plan exited mid-turn but the live engine's tools are still stripped: restore
+    /// them at the next safe async point (turn end / cancel / next dispatch), never
+    /// while the model is still running.
+    pub(super) plan_exit_pending: bool,
+    /// A drafted plan (a plan-mode reply that ended without `exit_plan_mode`),
+    /// awaiting `/plan go`. Cleared on execute, `/plan stop`, or `/new`.
     pub(super) pending_plan: Option<String>,
     /// History index of the plan reply, framed as the plan card; shifted on
     /// history removal (like `turn_durations`), cleared on execute/discard/`/new`.
@@ -2154,6 +2178,9 @@ pub(super) struct CodeTuiApp {
     pub(super) agent_ask: Option<PendingAskUser>,
     /// Pending edit-review card, while the agent waits for approve/reject.
     pub(super) agent_review: Option<PendingReview>,
+    /// Pending plan-approval card (`exit_plan_mode`), while the agent waits for
+    /// the verdict.
+    pub(super) agent_plan_approval: Option<PendingPlanApproval>,
     /// Session decision on spawning a repo's project `.mcp.json` stdio servers.
     pub(super) project_mcp_consent: ProjectMcpConsent,
     /// Pending consent card for project MCP servers (held back until decided).

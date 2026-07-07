@@ -17,6 +17,7 @@ pub mod mcp;
 pub mod mcp_import;
 pub mod notes;
 pub mod plan;
+pub mod plan_mode;
 pub mod protocol;
 pub mod request;
 pub mod retry;

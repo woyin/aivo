@@ -205,7 +205,14 @@ impl CodeTuiApp {
                     let expanded = self.expanded_thinking.contains(&idx);
                     let view = reasoning.map(|text| ReasoningView { text, expanded });
                     if self.plan_card_idx == Some(idx) {
-                        push_plan_card(&mut lines, &mut bars, view, &message.content, text_width);
+                        push_plan_card(
+                            &mut lines,
+                            &mut bars,
+                            view,
+                            &message.content,
+                            text_width,
+                            Some("approve on the card · /plan go [guidance] · /plan stop to leave"),
+                        );
                     } else {
                         push_assistant_blocks(
                             &mut lines,
@@ -219,6 +226,14 @@ impl CodeTuiApp {
                 }
                 "tool_call" => {
                     let (name, args) = decode_tool_call(&message.content);
+                    // Render the plan payload as a card, not an opaque tool row.
+                    if name == "exit_plan_mode" {
+                        let plan = args.get("plan").and_then(|v| v.as_str()).unwrap_or("");
+                        push_plan_card(&mut lines, &mut bars, None, plan, text_width, None);
+                        previous_role = Some(message.role.as_str());
+                        idx += 1;
+                        continue;
+                    }
                     // Coalesce a run of adjacent same-verb calls into one line (see
                     // `tool_group_key`). Subagents are the exception — each is a
                     // distinct unit of work, so render it on its own line with its
@@ -928,6 +943,8 @@ impl CodeTuiApp {
             self.render_permission_card(frame, composer_area, outer);
         } else if self.agent_ask.is_some() {
             self.render_ask_user_card(frame, composer_area, outer);
+        } else if self.agent_plan_approval.is_some() {
+            self.render_plan_approval_card(frame, composer_area, outer);
         } else if self.agent_review.is_some() {
             self.render_review_card(frame, composer_area, outer);
         }
@@ -1453,6 +1470,97 @@ impl CodeTuiApp {
         frame.render_widget(Paragraph::new(Text::from(lines)), inner);
     }
 
+    /// The plan-approval card (`exit_plan_mode`): heading, the scrollable rendered
+    /// plan, and the three verdicts. Floats above the composer like the review card.
+    fn render_plan_approval_card(
+        &self,
+        frame: &mut Frame<'_>,
+        composer_area: Rect,
+        frame_area: Rect,
+    ) {
+        let Some(pending) = self.agent_plan_approval.as_ref() else {
+            return;
+        };
+        let anchor = composer_area.y.saturating_sub(1);
+        let max_total = anchor.saturating_sub(frame_area.y).max(1);
+        let max_width = composer_area.width.min(frame_area.width).max(1);
+        let inner_width = usize::from(max_width.saturating_sub(4)).max(1);
+
+        // heading + blank + (plan…) + blank + 3 options + blank + keys + 2 borders;
+        // one more row is reserved for the "+N more" marker when the plan overflows.
+        let chrome = 10u16;
+        let body_budget = usize::from(max_total.saturating_sub(chrome)).max(1);
+        let scroll = usize::from(pending.scroll).min(pending.body.len().saturating_sub(1));
+        let visible = pending.body.len().saturating_sub(scroll).min(body_budget);
+
+        let mut lines: Vec<Line<'static>> = Vec::new();
+        lines.push(Line::from(Span::styled(
+            truncate_for_display_width("Implementation plan — ready for review", inner_width),
+            Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
+        )));
+        lines.push(Line::from(""));
+        for line in pending.body.iter().skip(scroll).take(visible) {
+            lines.push(line.clone());
+        }
+        let remaining = pending.body.len().saturating_sub(scroll + visible);
+        if remaining > 0 {
+            lines.push(Line::from(Span::styled(
+                format!("  … +{remaining} more (PgUp/PgDn scroll)"),
+                Style::default().fg(FAINT),
+            )));
+        }
+        lines.push(Line::from(""));
+        const OPTIONS: [&str; 3] = [
+            "Approve — execute with auto-approve",
+            "Approve — review each edit first",
+            "Keep planning — type feedback below",
+        ];
+        for (i, opt) in OPTIONS.iter().enumerate() {
+            let selected = i == pending.selected;
+            let (marker_style, label_style) = if selected {
+                (
+                    Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+                    Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+                )
+            } else {
+                (Style::default().fg(FAINT), Style::default().fg(TEXT))
+            };
+            lines.push(Line::from(vec![
+                Span::styled(if selected { "❯ " } else { "  " }, marker_style),
+                Span::styled(format!("{}. ", i + 1), Style::default().fg(MUTED)),
+                Span::styled(
+                    truncate_for_display_width(opt, inner_width.saturating_sub(5)),
+                    label_style,
+                ),
+            ]));
+        }
+        lines.push(Line::from(""));
+        lines.push(plan_approval_keys_line());
+
+        let height = (lines.len() as u16 + 2).min(max_total);
+        let y = anchor.saturating_sub(height).max(frame_area.y);
+        let card = Rect {
+            x: composer_area.x,
+            y,
+            width: max_width,
+            height,
+        };
+        frame.render_widget(Clear, card);
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(ACCENT))
+            .title(Span::styled(
+                " plan ",
+                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+            ));
+        let inner = block.inner(card).inner(ratatui::layout::Margin {
+            vertical: 0,
+            horizontal: 1,
+        });
+        frame.render_widget(block, card);
+        frame.render_widget(Paragraph::new(Text::from(lines)), inner);
+    }
+
     pub(super) fn render_main(&mut self, frame: &mut Frame<'_>, area: Rect) -> Rect {
         let composer_height = self.composer_height(area.width);
         // Two rows: the status line + the contextual shortcut hint bar.
@@ -1685,17 +1793,29 @@ impl CodeTuiApp {
     pub(super) fn composer_rule_line(&self, width: u16) -> Line<'static> {
         let width = usize::from(width);
         // In `!cmd` shell mode the prompt's top line picks up the magenta shell
-        // hue, matching the tinted draft text so shell mode reads at a glance.
+        // hue; in plan mode the whole rule tints ACCENT so the read-only session is
+        // unmistakable. Shell wins (the tinted draft must match).
         let rule_style = if self.draft_is_shell_command() {
             Style::default().fg(SHELL)
+        } else if self.plan_mode {
+            Style::default().fg(ACCENT)
         } else {
             Style::default().fg(FAINT)
         };
-        let (badge, badge_style) = if self.agent_auto_approve {
-            ("⚡ auto-approve: on", Style::default().fg(WARNING))
+        // The mode badge — one slot, since the four modes are exclusive.
+        let (badge, badge_style) = if self.plan_mode {
+            (
+                "◇ plan",
+                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+            )
+        } else if self.agent_auto_approve {
+            ("⚡ auto", Style::default().fg(WARNING))
+        } else if self.agent_review_edits {
+            ("✎ review", Style::default().fg(TOOL))
         } else {
-            ("⇧⇥ auto-approve: off", Style::default().fg(MUTED))
+            ("default", Style::default().fg(MUTED))
         };
+        const CYCLE_HINT: &str = " (shift+tab)";
         // Left title on the rule. While recalling input history, show
         // `History {pos}/{total}` — the newest entry reads as total/total and
         // counts down as you scroll further back — preceded by two rule dashes
@@ -1720,19 +1840,19 @@ impl CodeTuiApp {
             (String::new(), Style::default(), 0usize)
         };
         let trailing = 2usize;
-        // Badge cell width including one space of padding on each side.
-        let badge_w = display_width(badge) + 2;
+        // Badge + faint cycle hint, one space of padding each side.
+        let badge_w = display_width(badge) + display_width(CYCLE_HINT) + 2;
         let left_w = if left_text.is_empty() {
             0
         } else {
             left_lead + display_width(&left_text)
         };
         if width <= left_w + badge_w + trailing + 2 {
-            // Too narrow to inset both — keep the safety-critical auto-approve badge.
+            // Too narrow to inset it all — keep just the mode badge (drop the hint).
             return Line::from(Span::styled(badge.to_string(), badge_style));
         }
         let fill = width - left_w - badge_w - trailing;
-        let mut spans = Vec::with_capacity(5);
+        let mut spans = Vec::with_capacity(6);
         if !left_text.is_empty() {
             if left_lead > 0 {
                 spans.push(Span::styled("─".repeat(left_lead), rule_style));
@@ -1740,7 +1860,11 @@ impl CodeTuiApp {
             spans.push(Span::styled(left_text, left_style));
         }
         spans.push(Span::styled("─".repeat(fill), rule_style));
-        spans.push(Span::styled(format!(" {badge} "), badge_style));
+        spans.push(Span::styled(format!(" {badge}"), badge_style));
+        spans.push(Span::styled(
+            format!("{CYCLE_HINT} "),
+            Style::default().fg(FAINT),
+        ));
         spans.push(Span::styled("─".repeat(trailing), rule_style));
         Line::from(spans)
     }
@@ -2260,6 +2384,7 @@ impl CodeTuiApp {
         let left_text = build_footer_text(
             &self.raw_model,
             &self.key.base_url,
+            &self.key.name,
             self.display_cwd(),
             self.git_branch.as_deref(),
             left_width.saturating_sub(badge_w),
@@ -2635,6 +2760,33 @@ fn ask_user_keys_line(allow_free_text: bool, multi_select: bool) -> Line<'static
     spans.push(keycap("esc"));
     spans.push(label(" dismiss"));
     Line::from(spans)
+}
+
+/// The plan-approval card's key-hint row.
+fn plan_approval_keys_line() -> Line<'static> {
+    let keycap = |key: &str| {
+        Span::styled(
+            key.to_string(),
+            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+        )
+    };
+    let label = |text: &str| Span::styled(text.to_string(), Style::default().fg(MUTED));
+    let gap = || Span::styled("    ".to_string(), Style::default().fg(FAINT));
+    Line::from(vec![
+        keycap("↑↓"),
+        label(" choose"),
+        gap(),
+        keycap("↵"),
+        label(" confirm"),
+        gap(),
+        keycap("⇞⇟"),
+        label(" scroll"),
+        gap(),
+        label("type feedback"),
+        gap(),
+        keycap("esc"),
+        label(" dismiss"),
+    ])
 }
 
 /// The edit-review card's key-hint row.

@@ -82,6 +82,15 @@ impl CodeTuiApp {
             return self.handle_editor_key(key).await;
         }
 
+        // The plan-approval card: nav/verdict on an empty composer; typed text
+        // becomes keep-planning feedback (Enter submits it).
+        if self.agent_plan_approval.is_some() {
+            if self.handle_plan_approval_key(key) {
+                return Ok(false);
+            }
+            return self.handle_editor_key(key).await;
+        }
+
         // Same draft-guard as the permission card so a queued message isn't corrupted.
         if self.agent_review.is_some() {
             if self.handle_review_key(key) {
@@ -116,13 +125,19 @@ impl CodeTuiApp {
     /// waiting engine task. Returns `true` if the key was consumed as a decision
     /// or card chord, `false` if it should fall through to the composer (so the
     /// user can keep typing a queued message while the card stays up).
-    fn handle_permission_key(&mut self, key: KeyEvent) -> bool {
+    pub(super) fn handle_permission_key(&mut self, key: KeyEvent) -> bool {
         use crate::agent::protocol::Decision;
-        // Shift+Tab while the card is up: enable auto-approve AND approve this
-        // pending request, so "turn on auto-approve" takes effect on the request
-        // in front of you — not just the next turn. (A card only shows when
-        // auto-approve is off, so the toggle always means "turn on" here.)
+        // Shift+Tab: allow this request AND turn on auto-approve, so the chord
+        // takes effect on the card in front of you. In plan mode there's no
+        // auto-approve — just allow this one call; the session stays read-only.
         if is_auto_approve_toggle(key) {
+            if self.plan_mode {
+                if let Some(pending) = self.agent_permission.take() {
+                    let _ = pending.reply.send(Decision::Allow);
+                }
+                self.show_toast("Allowed once — plan mode stays read-only");
+                return true;
+            }
             self.set_auto_approve(true);
             if let Some(pending) = self.agent_permission.take() {
                 let _ = pending.reply.send(Decision::Allow);
@@ -334,6 +349,165 @@ impl CodeTuiApp {
         }
     }
 
+    /// Resolve a key against the plan-approval card. Empty composer: ↑/↓ (Ctrl+P/N)
+    /// move the highlight, PgUp/PgDn scroll the plan, 1–3 pick, Enter picks the
+    /// highlighted, `y` approves. Typed text is keep-planning feedback — Enter
+    /// submits it; Esc dismisses (plan mode stays on). `true` when consumed.
+    fn handle_plan_approval_key(&mut self, key: KeyEvent) -> bool {
+        use crate::agent::protocol::PlanDecision;
+        if self.agent_plan_approval.is_none() {
+            return false;
+        }
+        // Esc dismisses regardless of composer state — Esc is never message text.
+        if matches!(key.code, KeyCode::Esc) {
+            if let Some(pending) = self.agent_plan_approval.take() {
+                let _ = pending.reply.send(Err(
+                    crate::agent::plan_mode::PLAN_APPROVAL_DISMISSED.to_string()
+                ));
+            }
+            self.show_toast("Plan not approved — still in plan mode");
+            return true;
+        }
+        // Mid-composing feedback: Enter sends it as "keep planning"; every other
+        // key falls through so the user keeps typing.
+        if !self.draft.is_empty() {
+            if matches!(key.code, KeyCode::Enter) && !key.modifiers.contains(KeyModifiers::CONTROL)
+            {
+                let feedback = self.draft.trim().to_string();
+                if feedback.is_empty() {
+                    return false;
+                }
+                self.record_draft_history(&feedback);
+                self.draft.clear();
+                self.cursor = 0;
+                self.command_menu.reset();
+                self.draft_history_index = None;
+                self.draft_history_stash = None;
+                self.resolve_plan_approval(
+                    PlanDecision::KeepPlanning {
+                        feedback: Some(feedback),
+                    },
+                    false,
+                );
+                return true;
+            }
+            return false;
+        }
+        // Empty composer: the card owns navigation + the verdict keys.
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        match key.code {
+            KeyCode::Up => {
+                self.move_plan_approval_selection(-1);
+                true
+            }
+            KeyCode::Char('p') if ctrl => {
+                self.move_plan_approval_selection(-1);
+                true
+            }
+            KeyCode::Down => {
+                self.move_plan_approval_selection(1);
+                true
+            }
+            KeyCode::Char('n') if ctrl => {
+                self.move_plan_approval_selection(1);
+                true
+            }
+            KeyCode::PageUp => {
+                self.scroll_plan_approval(-5);
+                true
+            }
+            KeyCode::PageDown => {
+                self.scroll_plan_approval(5);
+                true
+            }
+            KeyCode::Enter if !ctrl => {
+                let idx = self
+                    .agent_plan_approval
+                    .as_ref()
+                    .map(|p| p.selected)
+                    .unwrap_or(0);
+                self.pick_plan_approval_option(idx);
+                true
+            }
+            KeyCode::Char(c) if ('1'..='3').contains(&c) => {
+                self.pick_plan_approval_option((c as usize) - ('1' as usize));
+                true
+            }
+            // Anything else falls through to the editor so feedback can be typed.
+            // (No `y` accelerator: options 1 and 2 both approve — ambiguous.)
+            _ => false,
+        }
+    }
+
+    /// Move the plan-approval highlight by `delta`, clamped to the 3 options.
+    fn move_plan_approval_selection(&mut self, delta: isize) {
+        if let Some(pending) = self.agent_plan_approval.as_mut() {
+            pending.selected = (pending.selected as isize + delta).clamp(0, 2) as usize;
+        }
+    }
+
+    /// Scroll the plan body by `delta` rows, clamped to its length.
+    fn scroll_plan_approval(&mut self, delta: isize) {
+        if let Some(pending) = self.agent_plan_approval.as_mut() {
+            let max = (pending.body.len().saturating_sub(1)) as isize;
+            pending.scroll = (pending.scroll as isize + delta).clamp(0, max.max(0)) as u16;
+        }
+    }
+
+    /// Resolve by option index — approval also picks the exit mode: 0 approve +
+    /// auto, 1 approve + review, 2 keep planning. (Discard = Esc then `/plan stop`.)
+    pub(super) fn pick_plan_approval_option(&mut self, idx: usize) {
+        use crate::agent::protocol::PlanDecision;
+        match idx {
+            0 => self.resolve_plan_approval(PlanDecision::Approve, true),
+            1 => self.resolve_plan_approval(PlanDecision::Approve, false),
+            2 => self.resolve_plan_approval(PlanDecision::KeepPlanning { feedback: None }, false),
+            _ => {}
+        }
+    }
+
+    /// Send the verdict to the waiting engine task and flip the TUI mode: approval
+    /// exits plan mode into auto or review mode (per `auto_approve`).
+    pub(super) fn resolve_plan_approval(
+        &mut self,
+        decision: crate::agent::protocol::PlanDecision,
+        auto_approve: bool,
+    ) {
+        use crate::agent::protocol::PlanDecision;
+        let Some(pending) = self.agent_plan_approval.take() else {
+            return;
+        };
+        match &decision {
+            PlanDecision::Approve => {
+                self.plan_mode = false;
+                self.pending_plan = None;
+                self.plan_card_idx = None;
+                self.set_auto_quiet(auto_approve);
+                self.set_review_quiet(!auto_approve);
+                self.show_toast(if auto_approve {
+                    "Plan approved — executing with auto-approve"
+                } else {
+                    "Plan approved — executing; each edit shows a diff to approve"
+                });
+            }
+            PlanDecision::KeepPlanning { feedback } => {
+                self.show_toast(if feedback.is_some() {
+                    "Feedback sent — still planning"
+                } else {
+                    "Keeping planning — still read-only"
+                });
+            }
+            // Unreachable from the card (no discard option); kept for completeness.
+            PlanDecision::Discard => {
+                self.plan_mode = false;
+                self.pending_plan = None;
+                self.plan_card_idx = None;
+                self.plan_exit_pending = true;
+            }
+        }
+        let _ = pending.reply.send(Ok(decision));
+    }
+
     /// Resolve a key against the edit-review card: on an empty composer `y`/Enter
     /// approve, `n` rejects, arrows scroll. Esc always rejects; decision/scroll keys
     /// fall through while a queued message is being typed. `true` when consumed.
@@ -395,28 +569,63 @@ impl CodeTuiApp {
         }
     }
 
+    /// Shift+Tab: cycle the mutually-exclusive agent modes default → auto → plan
+    /// → review → default. Plan entry falls through to review mid-turn (the engine
+    /// can't be restricted while a turn holds it) or when the key lacks the agent.
+    pub(super) async fn cycle_agent_mode(&mut self) {
+        if self.plan_mode {
+            self.leave_plan_mode(false).await;
+            self.set_review_quiet(true);
+            self.show_toast("Review mode — every edit shows a diff to approve");
+        } else if self.agent_review_edits {
+            self.set_review_quiet(false);
+            self.show_toast("Default mode — only risky actions ask first");
+        } else if self.agent_auto_approve {
+            self.set_auto_quiet(false);
+            if !self.sending && self.enter_plan_mode().await {
+                self.show_toast("Plan mode — read-only until you approve a plan");
+            } else {
+                self.set_review_quiet(true);
+                self.show_toast("Review mode — every edit shows a diff to approve");
+            }
+        } else {
+            self.set_auto_quiet(true);
+            self.show_toast("Auto mode — the agent runs tools without asking");
+        }
+    }
+
+    /// Flip auto-approve (field + live atomic) without a toast.
+    pub(super) fn set_auto_quiet(&mut self, on: bool) {
+        self.agent_auto_approve = on;
+        self.auto_approve_flag
+            .store(on, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Flip edit-review (field + live atomic) without a toast.
+    pub(super) fn set_review_quiet(&mut self, on: bool) {
+        self.agent_review_edits = on;
+        self.review_edits_flag
+            .store(on, std::sync::atomic::Ordering::Relaxed);
+    }
+
     /// Set session auto-approve and mirror it to the shared live flag the running
     /// agent turn reads (native engine + cursor ACP), with a fading toast. A
     /// toast — not a persistent notice — so the confirmation flashes and vanishes
     /// instead of sitting pinned above the input for the rest of the session.
     pub(super) fn set_auto_approve(&mut self, on: bool) {
-        self.agent_auto_approve = on;
-        self.auto_approve_flag
-            .store(on, std::sync::atomic::Ordering::Relaxed);
+        self.set_auto_quiet(on);
         self.show_toast(if on {
-            "Auto-approve ON — the agent runs tools without asking"
+            "Auto mode — the agent runs tools without asking"
         } else {
-            "Auto-approve off — the agent will ask before write/edit/bash"
+            "Auto-approve off — risky actions ask first"
         });
     }
 
     /// Set edit-review and mirror it to the live flag, with a toast (cf. `set_auto_approve`).
     pub(super) fn set_review_edits(&mut self, on: bool) {
-        self.agent_review_edits = on;
-        self.review_edits_flag
-            .store(on, std::sync::atomic::Ordering::Relaxed);
+        self.set_review_quiet(on);
         self.show_toast(if on {
-            "Review edits ON — the agent shows edits for approval before writing"
+            "Review mode — the agent shows edits for approval before writing"
         } else {
             "Review edits off — in-cwd edits apply without a review card"
         });
@@ -982,10 +1191,10 @@ impl CodeTuiApp {
             return Ok(Some(false));
         }
 
-        // Shift+Tab toggles session auto-approve for the agent — aligned with
-        // Claude Code's Shift+Tab permission-mode switch.
+        // Shift+Tab cycles the agent mode (normal → auto-approve → plan) —
+        // aligned with Claude Code's Shift+Tab permission-mode cycle.
         if is_auto_approve_toggle(key) {
-            self.set_auto_approve(!self.agent_auto_approve);
+            self.cycle_agent_mode().await;
             return Ok(Some(false));
         }
 

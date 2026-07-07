@@ -2067,14 +2067,15 @@ fn render_patch_diff(
     }
 }
 
-/// The captured `/plan` plan as a framed card: header + body + `/plan go` footer
-/// under the tool-hued bar, so it stands apart from an ordinary reply.
+/// A plan as a framed card (header + body + optional footer hint) so it stands
+/// apart from an ordinary reply.
 pub(super) fn push_plan_card(
     lines: &mut Vec<StyledLine>,
     bars: &mut Vec<Option<Color>>,
     reasoning: Option<ReasoningView<'_>>,
     content: &str,
     width: u16,
+    footer: Option<&str>,
 ) {
     push_styled_line(
         lines,
@@ -2083,12 +2084,10 @@ pub(super) fn push_plan_card(
     );
     bars.push(Some(TOOL));
     push_assistant_blocks(lines, bars, reasoning, content, width, TOOL);
-    push_styled_line(
-        lines,
-        "review above · /plan go to execute · /plan stop to discard",
-        Style::default().fg(FAINT),
-    );
-    bars.push(Some(TOOL));
+    if let Some(footer) = footer {
+        push_styled_line(lines, footer, Style::default().fg(FAINT));
+        bars.push(Some(TOOL));
+    }
 }
 
 pub(super) const PLAN_MAX_VISIBLE: usize = 5;

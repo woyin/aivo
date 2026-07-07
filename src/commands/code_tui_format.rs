@@ -96,11 +96,17 @@ pub(super) fn estimate_context_tokens(history: &[ChatMessage]) -> u64 {
 pub(super) fn build_footer_text(
     model: &str,
     base_url: &str,
+    key_name: &str,
     cwd: &str,
     branch: Option<&str>,
     width: u16,
 ) -> String {
-    let host = footer_host_label(base_url);
+    // Prefer the user's key name; fall back to the provider host from the URL.
+    let host = if key_name.trim().is_empty() {
+        footer_host_label(base_url)
+    } else {
+        key_name.trim().to_string()
+    };
     // Prefer the full (home-abbreviated) path so the agent's working dir is clear;
     // fall back to the basename, then drop the cwd, as width shrinks.
     let cwd_full = footer_cwd_label(cwd);
@@ -361,6 +367,7 @@ mod tests {
             build_footer_text(
                 "gpt-4o",
                 "https://openrouter.ai/api/v1",
+                "",
                 "/tmp/project",
                 None,
                 80
@@ -372,6 +379,7 @@ mod tests {
             build_footer_text(
                 "gpt-4o",
                 "https://openrouter.ai/api/v1",
+                "",
                 "/tmp/project",
                 None,
                 34
@@ -383,6 +391,7 @@ mod tests {
             build_footer_text(
                 "gpt-4o",
                 "https://openrouter.ai/api/v1",
+                "",
                 "/tmp/project",
                 None,
                 22
@@ -394,6 +403,7 @@ mod tests {
             build_footer_text(
                 "gpt-4o",
                 "https://openrouter.ai/api/v1",
+                "",
                 "/tmp/project",
                 None,
                 6
@@ -409,6 +419,7 @@ mod tests {
             build_footer_text(
                 "gpt-4o",
                 "https://openrouter.ai/api/v1",
+                "",
                 "/tmp/project",
                 Some("feat/agent"),
                 80
@@ -420,6 +431,7 @@ mod tests {
             build_footer_text(
                 "gpt-4o",
                 "https://openrouter.ai/api/v1",
+                "",
                 "/tmp/project",
                 Some("main"),
                 40
@@ -431,6 +443,7 @@ mod tests {
             build_footer_text(
                 "gpt-4o",
                 "https://openrouter.ai/api/v1",
+                "",
                 "/tmp/project",
                 Some("main"),
                 35
@@ -442,8 +455,37 @@ mod tests {
             build_footer_text(
                 "gpt-4o",
                 "https://openrouter.ai/api/v1",
+                "",
                 "/tmp/project",
                 Some(""),
+                80
+            ),
+            "gpt-4o · openrouter.ai · /tmp/project"
+        );
+    }
+
+    #[test]
+    fn test_build_footer_text_prefers_key_name_over_host() {
+        // A non-empty key name replaces the URL-derived host.
+        assert_eq!(
+            build_footer_text(
+                "gpt-4o",
+                "https://openrouter.ai/api/v1",
+                "my-router",
+                "/tmp/project",
+                None,
+                80
+            ),
+            "gpt-4o · my-router · /tmp/project"
+        );
+        // Blank/whitespace name falls back to the host.
+        assert_eq!(
+            build_footer_text(
+                "gpt-4o",
+                "https://openrouter.ai/api/v1",
+                "  ",
+                "/tmp/project",
+                None,
                 80
             ),
             "gpt-4o · openrouter.ai · /tmp/project"
@@ -459,6 +501,7 @@ mod tests {
         let out = build_footer_text(
             "gpt-4o",
             "https://openrouter.ai/api/v1",
+            "",
             "/tmp/项目",
             None,
             32,

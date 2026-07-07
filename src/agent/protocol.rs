@@ -54,6 +54,15 @@ pub enum Decision {
     AlwaysAllow,
 }
 
+/// The user's verdict on an `exit_plan_mode` plan (plan-mode approval card).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PlanDecision {
+    Approve,
+    KeepPlanning { feedback: Option<String> },
+    Discard,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

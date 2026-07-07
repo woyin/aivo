@@ -187,6 +187,21 @@ impl CodeTuiApp {
                     reply,
                 });
             }
+            RuntimeEvent::AgentPlanApproval { plan, reply } => {
+                // Precompute the rendered plan so the frame render stays pure.
+                let width = self.transcript_width.saturating_sub(6).max(40);
+                let body: Vec<ratatui::text::Line<'static>> =
+                    super::render::render_markdown_lines(&plan, width)
+                        .into_iter()
+                        .map(|l| l.line)
+                        .collect();
+                self.agent_plan_approval = Some(PendingPlanApproval {
+                    body,
+                    scroll: 0,
+                    selected: 0,
+                    reply,
+                });
+            }
             RuntimeEvent::AgentFinished {
                 steps,
                 tokens,
@@ -675,6 +690,7 @@ impl CodeTuiApp {
         self.agent_permission = None;
         self.agent_ask = None;
         self.agent_review = None;
+        self.agent_plan_approval = None;
         self.stop_agent_serve();
         // Adopt + persist the protocol the serve negotiated this turn.
         self.persist_agent_route().await;
@@ -712,8 +728,15 @@ impl CodeTuiApp {
         // so the model sees the new skills. Runs while not sending, so the engine
         // reset stays lossless.
         self.refresh_skill_commands().await;
+        // The turn is over — apply a deferred plan-discard tool restore.
+        if self.plan_exit_pending {
+            if let Some(session) = self.agent_engine.as_ref() {
+                session.engine.lock().await.set_plan_mode(false);
+            }
+            self.plan_exit_pending = false;
+        }
         // Before a queued message can flip `sending` and skip the capture.
-        self.maybe_capture_plan();
+        self.capture_plan_draft();
         // Commands queued mid-turn run first (a queued `/plan go` needs the plan
         // captured above; a queued `/compact` should fold before the next message).
         self.drain_queued_commands().await;
@@ -896,6 +919,7 @@ impl CodeTuiApp {
         self.agent_permission = None;
         self.agent_ask = None;
         self.agent_review = None;
+        self.agent_plan_approval = None;
         self.queued_messages.clear();
         self.queued_commands.clear();
         self.stop_agent_serve();
