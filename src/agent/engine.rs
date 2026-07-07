@@ -3033,9 +3033,11 @@ mod tests {
             );
         }
         // …non-reasoning models and unknown ids never send it (would 400 strict providers).
+        // claude-3-haiku, not 3.5-sonnet: the latter's folded key now unions to a
+        // reasoning-capable upstream listing after the dash alias was dropped.
         for model in [
             "gpt-4o",
-            "claude-3-5-sonnet",
+            "claude-3-haiku",
             "definitely-not-a-real-model-xyz",
         ] {
             assert_eq!(

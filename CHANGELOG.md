@@ -1,5 +1,24 @@
 # Changelog
 
+## v0.37.0
+
+MCP gets a unified CLI, skills gain split-pane pickers and project scoping, and the code agent adds a persistent model-driven plan mode. Session transcripts are now stored as plain JSON (no more at-rest encryption), and every assistant turn shows which model produced it.
+
+- feat(mcp): new `aivo code mcp` CLI with per-tool toggles, ${VAR} expansion, retry, import, and project scope (011ea49, b843255, f14ffe6, 63fc392)
+- feat(code): redesign `/plan` as a persistent, model-driven plan mode (a661251)
+- feat(code): split-pane modals for /skills, /mcp, and /resume (45a5d80)
+- feat(code): skill-install picker with deep GitHub URLs, updates, and live progress (b73917e)
+- feat(code): stamp each assistant turn with the model that produced it (7ddf7fb)
+- feat(code): store session transcripts as plain JSON, drop at-rest encryption (bc15e0b)
+- feat(code): positional text opens the TUI as the first message (00db678)
+- feat(code): Ctrl+X Ctrl+E opens the draft in $VISUAL/$EDITOR (594179c)
+- feat(code): make slash commands usable while a turn is in flight (0b69e3a)
+- feat(code): add -p/--project options for /skills (71760a6)
+- feat(plugins): wrap list output to terminal width, show provenance (b462633)
+- fix(models): infer price scale per response, hide zero token limits (0961439)
+- fix(login): clear starter model cache on login-profile change (8e4bffe)
+- chore(deps): bump crossbeam-epoch 0.9.18 -> 0.9.20 (RUSTSEC-2026-0204) (265a908)
+
 ## v0.36.2
 
 - feat(bridge): translate OpenAI structured outputs to Anthropic (5a87e8e)
