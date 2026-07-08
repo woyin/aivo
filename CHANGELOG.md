@@ -1,5 +1,21 @@
 # Changelog
 
+## v0.38.0
+
+A big upgrade to the `aivo code` agent. Subagents now leave durable artifacts, the `/goal` autonomous loop gains verification and safer stops, `/context` becomes a full context-window breakdown, and you can inject repo and context files with `-c`. The TUI also picks up `/login`, `/logout`, and `/usage` account commands, a collapsed one-row footer, and a full-autonomy auto-approve mode.
+
+- feat(code): durable subagent artifacts, curated notes, goal verify, and background jobs (e0c0f16, 0c3a9c0)
+- feat(code): inject context files with `-c/--context`, add a `/context` window breakdown, and scope `/resume` to the cwd (12b4df7, b876529, 980a0c0)
+- feat(code): full-autonomy auto-approve mode, granting remote mutations by command family (e42f5f2)
+- feat(code): add `/login`, `/logout`, and `/usage` account commands to the TUI (57be213)
+- feat(code): collapse the TUI footer to one row with effort beside context (a3cfefa, ea24382)
+- feat(code): rebrand the TUI banner as "aivo code" with version (7c28ebe)
+- fix(code): harden the `/goal` loop's stop conditions and require a confirming Esc to stop (fcdade1, adecb7e)
+- fix(code): set the model directly for `/model <name>` (30ae5b5)
+- fix(code): repair stale-state leaks across the TUI slash commands (3db8412)
+- fix(code): keep review/plan card keys visible and height stable on overflow (b64bc01)
+- perf(logs): head-only native-session parse for the interactive listing (0558aa8)
+
 ## v0.37.0
 
 MCP gets a unified CLI, skills gain split-pane pickers and project scoping, and the code agent adds a persistent model-driven plan mode. Session transcripts are now stored as plain JSON (no more at-rest encryption), and every assistant turn shows which model produced it.
