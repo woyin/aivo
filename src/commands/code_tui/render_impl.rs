@@ -1678,8 +1678,9 @@ impl CodeTuiApp {
 
     pub(super) fn render_main(&mut self, frame: &mut Frame<'_>, area: Rect) -> Rect {
         let composer_height = self.composer_height(area.width);
-        // Status line always; hint bar adds a second row only when it has content.
-        let footer_height = if self.hint_bar_has_content() { 2 } else { 1 };
+        // The footer is a single fixed row: just the status line. No hint bar, so
+        // the layout never shifts up or down as turns start and finish.
+        let footer_height = 1u16;
         // The pinned plan/task-list panel sits between the transcript and the
         // composer (a faint top rule + the wrapped checklist), so progress stays
         // visible instead of scrolling away under later tool calls. Sized from the
@@ -1889,14 +1890,7 @@ impl CodeTuiApp {
             frame.set_cursor_position((cursor_x, cursor_y));
         }
 
-        let footer_rows = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([Constraint::Length(1), Constraint::Length(1)])
-            .split(footer_outer);
-        self.render_footer(frame, footer_rows[0]);
-        if footer_rows[1].height > 0 {
-            self.render_hint_bar(frame, footer_rows[1]);
-        }
+        self.render_footer(frame, footer_outer);
         composer_area
     }
 
@@ -2400,7 +2394,10 @@ impl CodeTuiApp {
                     Style::default().fg(FAINT),
                 )
             } else {
-                Span::styled(" Ask anything · / for commands", Style::default().fg(FAINT))
+                Span::styled(
+                    " Ask, plan, or build · / for commands",
+                    Style::default().fg(FAINT),
+                )
             };
             lines.push(Line::from(vec![prompt, placeholder]));
             return Text::from(lines);
@@ -2556,66 +2553,6 @@ impl CodeTuiApp {
         frame.render_widget(Paragraph::new(Line::from(spans)), area);
     }
 
-    /// Contextual shortcut bar: the most relevant keys for the current state on
-    /// the left, plus the queued-message indicator on the right.
-    pub(super) fn render_hint_bar(&self, frame: &mut Frame<'_>, area: Rect) {
-        let left = self.hint_key_spans();
-        let right = self.hint_indicator_spans();
-        let span_w = |spans: &[Span]| -> usize {
-            spans
-                .iter()
-                .map(|s| display_width(s.content.as_ref()))
-                .sum()
-        };
-        let total = usize::from(area.width);
-        let left_w = span_w(&left);
-        let right_w = span_w(&right);
-        let mut spans = left;
-        if right_w > 0 && total > left_w + right_w + 1 {
-            spans.push(Span::raw(" ".repeat(total - left_w - right_w)));
-            spans.extend(right);
-        }
-        frame.render_widget(Paragraph::new(Line::from(spans)), area);
-    }
-
-    /// The left-hand key hints, chosen by the current state.
-    fn hint_key_spans(&self) -> Vec<Span<'static>> {
-        let pairs: Vec<(&str, &str)> = if self.pending_mcp_consent.is_some() {
-            vec![("y", "run"), ("a", "always"), ("n", "deny")]
-        } else if self.agent_permission.is_some() {
-            vec![("y", "allow"), ("n", "deny"), ("a", "always")]
-        } else if let Some(ask) = self.agent_ask.as_ref() {
-            if ask.multi_select {
-                vec![("↑↓", "move"), ("space", "toggle"), ("↵", "confirm")]
-            } else {
-                vec![("↑↓", "move"), ("↵", "select"), ("esc", "dismiss")]
-            }
-        } else if self.agent_review.is_some() {
-            vec![("y", "approve"), ("n", "reject"), ("↑↓", "scroll")]
-        } else if self.sending {
-            vec![("esc", "interrupt"), ("type", "queue next")]
-        } else {
-            Vec::new() // Idle: no key hints; the footer is a single status-line row.
-        };
-        let mut spans = Vec::new();
-        for (idx, (keycap, label)) in pairs.iter().enumerate() {
-            if idx > 0 {
-                spans.push(Span::styled("   ".to_string(), Style::default().fg(FAINT)));
-            }
-            spans.push(Span::styled(keycap.to_string(), Style::default().fg(MUTED)));
-            spans.push(Span::styled(
-                format!(" {label}"),
-                Style::default().fg(FAINT),
-            ));
-        }
-        spans
-    }
-
-    /// Whether the hint bar has content — key hints or a queued dot. Idle → false.
-    fn hint_bar_has_content(&self) -> bool {
-        !self.hint_key_spans().is_empty() || !self.hint_indicator_spans().is_empty()
-    }
-
     /// Effort tier for the status line: Cursor's from the model id, else the engine's
     /// effective level (only while thinking is on, so the two can't disagree).
     pub(super) fn footer_effort_label(&self) -> Option<String> {
@@ -2626,18 +2563,6 @@ impl CodeTuiApp {
         } else {
             None
         }
-    }
-
-    /// Right-hand hint-bar indicator: just the queued-message dot.
-    fn hint_indicator_spans(&self) -> Vec<Span<'static>> {
-        let queued = self.queued_messages.len() + self.queued_commands.len();
-        if queued == 0 {
-            return Vec::new();
-        }
-        vec![Span::styled(
-            format!("● {queued} queued"),
-            Style::default().fg(ACCENT),
-        )]
     }
 
     /// Present-tense label for the in-flight tool step (e.g. `running grep`), or

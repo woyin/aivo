@@ -393,7 +393,7 @@ async fn test_account_login_card_flow_and_stale_generation() {
     );
     // Empty session parks the composer at top → the card takes the space below.
     assert!(
-        frame.find("Ask anything").unwrap() < frame.find("sign in to aivo").unwrap(),
+        frame.find("Ask, plan, or build").unwrap() < frame.find("sign in to aivo").unwrap(),
         "card should sit below the parked composer:\n{frame}"
     );
 
@@ -2318,7 +2318,7 @@ fn test_composer_placeholder_stays_plain_when_history_has_reasoning() {
     let line = app.render_composer_text().lines[0].clone();
     let plain = plain_text_from_spans(&line.spans);
 
-    assert_eq!(plain, ">  Ask anything · / for commands");
+    assert_eq!(plain, ">  Ask, plan, or build · / for commands");
 }
 
 #[test]
@@ -4350,15 +4350,16 @@ fn test_edit_diff_trims_context_and_collapses_gap() {
 }
 
 #[test]
-fn test_hint_bar_reflects_state() {
+fn test_footer_is_single_status_row() {
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
 
-    // Render the app, returning just the bottom row (the hint bar).
-    fn bottom_row(configure: impl Fn(&mut CodeTuiApp)) -> String {
+    // Render the app, returning just the footer row — a single status line now
+    // (there is no hint bar), pinned to the terminal's bottom row.
+    fn footer_text(configure: impl Fn(&mut CodeTuiApp)) -> String {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let mut app = make_test_app(tx, rx);
-        // A long transcript so the footer fills to the terminal's bottom row.
+        // A long transcript so the footer sits on the terminal's bottom rows.
         app.history.push(ChatMessage {
             model: None,
             role: "assistant".to_string(),
@@ -4377,11 +4378,12 @@ fn test_hint_bar_reflects_state() {
             })
             .unwrap();
         let buf = terminal.backend().buffer().clone();
-        let mut row = String::new();
+        // The footer is a single row (the status line) at the terminal's bottom.
+        let mut text = String::new();
         for x in 0..80u16 {
-            row.push_str(buf[(x, 11)].symbol());
+            text.push_str(buf[(x, 11)].symbol());
         }
-        row
+        text
     }
 
     // The whole rendered screen as one string, for state shown outside the bottom
@@ -4407,19 +4409,17 @@ fn test_hint_bar_reflects_state() {
         screen
     }
 
-    // Idle: no key hints; the footer is one row (the status line + context meter).
-    let idle = bottom_row(|_| {});
+    // The footer is a single row: the status line (context meter) in every state.
+    let idle = footer_text(|_| {});
     assert!(idle.contains("tokens"), "idle status line: {idle:?}");
+    // No hint bar — no contextual key hints ever leak into the footer.
+    assert!(!idle.contains("send"), "no idle key hints: {idle:?}");
     assert!(
-        !idle.contains("commands"),
-        "idle key hints retired: {idle:?}"
+        !footer_text(|a| a.sending = true).contains("interrupt"),
+        "no sending hint bar — footer stays status-only"
     );
-    assert!(
-        bottom_row(|a| a.sending = true).contains("interrupt"),
-        "sending hint bar"
-    );
-    // The mode badge rides the composer rule, not the bottom hint bar, and every
-    // mode is shown so the current state + its cycle key stay discoverable.
+    // The mode badge rides the composer rule, not the footer, and every mode is
+    // shown so the current state + its cycle key stay discoverable.
     // Matched by each badge's unique glyph: a wide glyph splits across buffer
     // cells (breaking adjacent-text matches) and the rotating welcome tip can
     // contain the bare mode words.
@@ -4436,16 +4436,12 @@ fn test_hint_bar_reflects_state() {
         "review badge on composer rule"
     );
     assert!(
-        !bottom_row(|a| a.agent_auto_approve = true).contains('⚡'),
-        "the mode badge is not in the bottom hint bar"
-    );
-    assert!(
-        bottom_row(|a| a.queued_messages = vec!["next".to_string()]).contains("queued"),
-        "queued indicator"
+        !footer_text(|a| a.agent_auto_approve = true).contains('⚡'),
+        "the mode badge is not in the footer"
     );
     // Effort tier (bare value) shows on the status line only when thinking is on.
     assert!(
-        bottom_row(|a| {
+        footer_text(|a| {
             a.thinking_enabled = true;
             a.model_supports_thinking = true;
             a.model_reasoning_efforts = vec!["high".to_string()];
@@ -4454,7 +4450,7 @@ fn test_hint_bar_reflects_state() {
         "effort tier shown when thinking on"
     );
     assert!(
-        !bottom_row(|a| {
+        !footer_text(|a| {
             a.thinking_enabled = false;
             a.model_supports_thinking = true;
             a.model_reasoning_efforts = vec!["high".to_string()];
@@ -5746,7 +5742,7 @@ fn test_render_main_uses_full_height_for_long_transcript() {
         })
         .unwrap();
 
-    // Composer bottom = height (12) minus the footer (1 row when idle, as here).
+    // Composer bottom = height (12) minus the footer's single row.
     assert_eq!(composer_area.y + composer_area.height, 11);
     assert_eq!(app.transcript_hitbox.as_ref().unwrap().area.y, 0);
     // 80 cols minus the 2-col accent gutter; the overflow transcript keeps full
@@ -12041,7 +12037,7 @@ fn test_empty_composer_placeholder_reserves_cursor_cell() {
     let app = make_test_app(tx, rx);
     let line = app.render_composer_text().lines[0].clone();
     let plain = plain_text_from_spans(&line.spans);
-    assert_eq!(plain, ">  Ask anything · / for commands");
+    assert_eq!(plain, ">  Ask, plan, or build · / for commands");
 }
 
 #[test]
@@ -13587,6 +13583,18 @@ fn test_ask_card_renders_question_and_options() {
         selected: 0,
         reply,
     });
+    // A transcript pushes the composer to the bottom so the floating card has room
+    // above it to render its own key-hint line (there's no hint-bar fallback now).
+    app.history.push(ChatMessage {
+        model: None,
+        role: "assistant".to_string(),
+        content: (0..30)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        reasoning_content: None,
+        attachments: vec![],
+    });
     let (screen, _rows) = render_full_screen(&mut app, 70, 20);
     assert!(
         screen.contains("Add release notes now?"),
@@ -13655,6 +13663,18 @@ async fn test_ask_card_multi_select_digit_toggles_box() {
         reply,
     });
 
+    // A transcript pushes the composer to the bottom so the card has room to show
+    // its own key-hint line (there's no hint-bar fallback now).
+    app.history.push(ChatMessage {
+        model: None,
+        role: "assistant".to_string(),
+        content: (0..30)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        reasoning_content: None,
+        attachments: vec![],
+    });
     let (screen, _rows) = render_full_screen(&mut app, 70, 20);
     assert!(screen.contains("[ ]"), "unchecked boxes render:\n{screen}");
     assert!(
@@ -13715,6 +13735,18 @@ fn test_review_card_renders_diff_and_keys() {
         body,
         scroll: 0,
         reply,
+    });
+    // A transcript pushes the composer to the bottom so the card has room to show
+    // its own y/n key line (there's no hint-bar fallback now).
+    app.history.push(ChatMessage {
+        model: None,
+        role: "assistant".to_string(),
+        content: (0..30)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        reasoning_content: None,
+        attachments: vec![],
     });
     let (screen, _rows) = render_full_screen(&mut app, 80, 24);
     assert!(
@@ -13896,19 +13928,6 @@ async fn test_queued_messages_fifo_no_clobber() {
     assert!(
         notice.contains("2 waiting"),
         "the notice reflects the queue count: {notice}"
-    );
-}
-
-/// The queued indicator shows the real count, not a hardcoded "1".
-#[test]
-fn test_queued_indicator_shows_count() {
-    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-    let mut app = make_test_app(tx, rx);
-    app.queued_messages = vec!["a".to_string(), "b".to_string(), "c".to_string()];
-    let (screen, _rows) = render_full_screen(&mut app, 80, 16);
-    assert!(
-        screen.contains("3 queued"),
-        "the indicator must show the queue length:\n{screen}"
     );
 }
 
