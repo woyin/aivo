@@ -121,6 +121,9 @@ impl CodeTuiApp {
         }
 
         push_transcript_intro(&mut lines, text_width);
+        // Tip stays pinned above the conversation; frozen once non-empty, so safe
+        // to memoize.
+        lines.extend(self.welcome_status_lines());
         push_message_spacing(&mut lines);
         bars.resize(lines.len(), None);
 
@@ -589,7 +592,8 @@ impl CodeTuiApp {
             bars.push(None);
         }
         lines.push(spinner);
-        bars.push(Some(ACCENT));
+        // No accent bar — the status line is chrome, not a message.
+        bars.push(None);
     }
 
     /// A cheap O(1) fingerprint of everything the cached *history body* depends
@@ -813,7 +817,7 @@ impl CodeTuiApp {
                 tail_bars.push(None);
             }
             tail.push(spinner.clone());
-            tail_bars.push(Some(ACCENT));
+            tail_bars.push(None);
             let wrapped_tail = wrap_transcript(&tail, &tail_bars, text_width);
             text_lines.extend(wrapped_tail.text.lines);
             rows.extend(wrapped_tail.rows);
@@ -2103,11 +2107,7 @@ impl CodeTuiApp {
             // Inset width, matching what `render_empty_state` draws into.
             let mut rows = self.transcript_intro_lines(width.saturating_sub(ACCENT_GUTTER_WIDTH));
             // Reserve the chip + tip height too, matching `render_empty_state`.
-            rows.extend(
-                self.welcome_status_lines()
-                    .iter()
-                    .map(|line| plain_text_from_spans(&line.spans)),
-            );
+            rows.extend(self.welcome_status_lines().into_iter().map(|sl| sl.plain));
             rows.extend(self.notice_plain_lines(content_width));
             rows.extend(self.spinner_status_plain_lines(content_width));
             wrap_plain_lines(&rows, content_width).len() as u16
@@ -2319,7 +2319,7 @@ impl CodeTuiApp {
         let mut lines = lines;
         // Chip + tip on the fresh welcome only, never the resume-loading screen.
         if self.loading_resume.is_none() {
-            lines.extend(self.welcome_status_lines());
+            lines.extend(self.welcome_status_lines().into_iter().map(|sl| sl.line));
         }
         if let Some(spans) = notice_spans(self.notice.as_ref()) {
             lines.push(Line::from(""));
@@ -2353,15 +2353,16 @@ impl CodeTuiApp {
         (!parts.is_empty()).then(|| parts.join(" · "))
     }
 
-    /// Blank spacer, optional capability chip, then the rotating tip. Must stay in
-    /// lockstep with `empty_state_height`, which measures the same lines.
-    fn welcome_status_lines(&self) -> Vec<Line<'static>> {
-        let mut lines = vec![Line::from("")];
+    /// Blank spacer, optional capability chip, then the rotating tip. Shared by
+    /// the empty state, the transcript intro, and `empty_state_height` (kept in
+    /// lockstep, measuring the same lines).
+    fn welcome_status_lines(&self) -> Vec<StyledLine> {
+        let mut lines = vec![blank_line()];
         if let Some(chip) = self.welcome_capabilities_label() {
-            lines.push(Line::from(Span::styled(chip, Style::default().fg(MUTED))));
+            lines.push(line_plain(chip, Style::default().fg(MUTED)));
         }
         let tip = WELCOME_TIPS[self.welcome_tip_index % WELCOME_TIPS.len()];
-        lines.push(Line::from(vec![
+        lines.push(line_with_plain(vec![
             // MUTED hint (up from FAINT) so the tip reads on dim terminals.
             Span::styled("✶ Tip  ", Style::default().fg(ACCENT)),
             Span::styled(tip.to_string(), Style::default().fg(MUTED)),
