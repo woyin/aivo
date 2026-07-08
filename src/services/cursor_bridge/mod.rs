@@ -345,7 +345,7 @@ pub(crate) async fn acquire_session_slot(
     if state.prewarming.load(Ordering::SeqCst) > 0 && !existing.is_empty() {
         return wait_for_any_slot(existing).await;
     }
-    {
+    let all_slots = {
         let mut pool = state.pool.lock().await;
         // Re-sweep under the pool mutex before expanding: a prewarm or
         // another acquirer may have released between the initial try_lock
@@ -363,11 +363,11 @@ pub(crate) async fn acquire_session_slot(
             // The new slot has no other waiters, so this resolves immediately.
             return slot.lock_owned().await;
         }
-    }
-    // Cap reached — block on the first slot. Round-robin between slots would
-    // be marginally fairer but the launched tool rarely keeps all three
-    // pegged, so a deterministic pick keeps the code simple.
-    existing[0].clone().lock_owned().await
+        // Cap reached and all busy — race locks over the FULL pool (not the
+        // stale entry-time `existing`, which can be empty on a cold start).
+        pool.clone()
+    };
+    wait_for_any_slot(all_slots).await
 }
 
 /// Race `lock_owned()` across every slot, returning whichever lock resolves
@@ -679,10 +679,15 @@ where
 
     let input_tokens = estimate_tokens(&prompt);
     let blocks = cursor_acp::assemble_prompt_blocks(&prompt, image_blocks);
-    let mut stream = session
-        .prompt_with_blocks(blocks)
-        .await
-        .context("cursor-agent session/prompt")?;
+    let mut stream = match session.prompt_with_blocks(blocks).await {
+        Ok(s) => s,
+        Err(e) => {
+            // A failed prompt write means a dead cursor-agent child — evict so
+            // the next request reopens instead of 502ing on the corpse forever.
+            *guard = None;
+            return Err(e).context("cursor-agent session/prompt");
+        }
+    };
 
     let outcome: Result<Option<String>> = if stream_flag {
         stream_sse(socket, &mut stream, &response_model, input_tokens)
@@ -700,6 +705,13 @@ where
         }
     };
     cancel_session_on_error(session, &outcome).await;
+    // Evict on any non-disconnect failure (an unhealthy child would 502 every
+    // future request on this slot); a client disconnect leaves it usable.
+    if let Err(e) = &outcome
+        && !is_client_disconnect(e)
+    {
+        *guard = None;
+    }
     outcome
 }
 
@@ -720,11 +732,43 @@ pub(crate) fn is_client_disconnect(err: &anyhow::Error) -> bool {
     })
 }
 
+/// True for a malformed request body (JSON that didn't parse) — map to 400 so
+/// SDKs fail fast instead of retry-looping on a 5xx.
+fn is_bad_request(err: &anyhow::Error) -> bool {
+    err.chain()
+        .any(|cause| cause.downcast_ref::<serde_json::Error>().is_some())
+}
+
 /// Resolves the status code logged for a failed turn. Broken pipes get 499
 /// so logs distinguish client-initiated disconnects (expected, harmless) from
-/// real upstream failures (502).
+/// malformed requests (400) and real upstream failures (502).
 pub(crate) fn status_for_handler_error(err: &anyhow::Error) -> u16 {
-    if is_client_disconnect(err) { 499 } else { 502 }
+    if is_client_disconnect(err) {
+        499
+    } else if is_bad_request(err) {
+        400
+    } else {
+        502
+    }
+}
+
+/// Normalized ACP `stopReason`. Each protocol adapter maps this onto its own
+/// finish-reason vocab so a truncated / refused turn isn't reported as clean.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AcpStop {
+    EndTurn,
+    MaxTokens,
+    Refusal,
+}
+
+/// Normalize a `session/prompt` result's `stopReason`; unknown/absent (and
+/// `cancelled`/`end_turn`) fold to [`AcpStop::EndTurn`].
+pub(crate) fn acp_stop_from_result(result: &Value) -> AcpStop {
+    match result.get("stopReason").and_then(Value::as_str) {
+        Some("max_tokens") | Some("max_turn_requests") => AcpStop::MaxTokens,
+        Some("refusal") => AcpStop::Refusal,
+        _ => AcpStop::EndTurn,
+    }
 }
 
 pub(crate) struct AggregatedTurn {

@@ -43,22 +43,39 @@ pub fn is_legacy_cursor_login_secret(secret: &str) -> bool {
 /// toggle (Shift+Tab) instead — see [`cursor_permission_decision`].
 pub const CURSOR_ALLOW_TOOLS_ENV: &str = "AIVO_CURSOR_ALLOW_TOOLS";
 
-/// An explicit `AIVO_CURSOR_ALLOW_TOOLS` override, or `None` when unset/blank so
-/// the caller falls back to the live auto-approve toggle.
+/// Explicit `AIVO_CURSOR_ALLOW_TOOLS` override, else `None` (fall back to the
+/// live toggle). Both directions match EXPLICITLY — an unrecognized value is
+/// NOT treated as allow (that would fail open on a security setting); it's
+/// ignored with a one-time warning.
 fn cursor_allow_tools_env_override() -> Option<PermissionDecision> {
+    const DENY: &[&str] = &[
+        "0", "false", "no", "off", "reject", "deny", "never", "disable", "none",
+    ];
+    const ALLOW: &[&str] = &["1", "true", "yes", "on", "allow", "always"];
     let raw = std::env::var(CURSOR_ALLOW_TOOLS_ENV).ok()?;
     let v = raw.trim();
     if v.is_empty() {
         return None;
     }
-    if v == "0"
-        || v.eq_ignore_ascii_case("false")
-        || v.eq_ignore_ascii_case("no")
-        || v.eq_ignore_ascii_case("reject")
-    {
+    if DENY.iter().any(|d| v.eq_ignore_ascii_case(d)) {
         Some(PermissionDecision::Reject)
-    } else {
+    } else if ALLOW.iter().any(|a| v.eq_ignore_ascii_case(a)) {
         Some(PermissionDecision::Allow)
+    } else {
+        warn_unrecognized_allow_tools_once(v);
+        None
+    }
+}
+
+/// Warn once when `AIVO_CURSOR_ALLOW_TOOLS` carries an unrecognized value.
+fn warn_unrecognized_allow_tools_once(value: &str) {
+    static WARNED: AtomicBool = AtomicBool::new(false);
+    if !WARNED.swap(true, Ordering::Relaxed) {
+        eprintln!(
+            "aivo: ignoring unrecognized {CURSOR_ALLOW_TOOLS_ENV}={value:?} \
+             (expected 1/true/yes/allow or 0/false/no/reject); \
+             using the interactive tool-approval toggle instead."
+        );
     }
 }
 
@@ -188,6 +205,14 @@ fn cursor_agent_command_bare() -> Command {
 /// when the key is a shadow account; otherwise falls back to a bare spawn
 /// (used by raw `--key sk-…` API-key keys).
 pub fn cursor_agent_command_for_key(key: &ApiKey) -> Result<Command> {
+    // Refuse pre-shadow keys at the single open chokepoint: a legacy key has
+    // no shadow/auth env, so cursor-agent would run against the real ~/.cursor.
+    if is_legacy_cursor_login_secret(key.key.as_str()) {
+        anyhow::bail!(
+            "This cursor key predates per-account isolation. Run `aivo keys rm {0}` then `aivo keys add cursor` to recreate it as an isolated account.",
+            key.id
+        );
+    }
     let mut cmd = cursor_agent_command_bare();
     apply_shadow_env_to_command(&mut cmd, key)?;
     apply_color_env_to_command(&mut cmd);
@@ -1166,14 +1191,17 @@ impl CursorAcpSession {
     /// cursor-agent rejects them with JSON-RPC `-32602`, notably `"auto"`.
     /// Short-circuits matching ids so router requests don't trigger a
     /// `session/set_model` round trip on every call.
-    pub async fn set_model(&mut self, requested: &str) -> Result<()> {
+    /// Switch the live session's model. `Ok(false)` when `requested` matched no
+    /// catalog entry (e.g. `"auto"`, which cursor lists but rejects in
+    /// `session/set_model`) — a no-op callers must surface, else the UI lies.
+    pub async fn set_model(&mut self, requested: &str) -> Result<bool> {
         let Some(model_id) =
             pick_model_id_from_models(&self.models, Some(requested), self.model_pick_preference)
         else {
-            return Ok(());
+            return Ok(false);
         };
         if self.model_id.as_deref() == Some(model_id.as_str()) {
-            return Ok(());
+            return Ok(true);
         }
         self.client
             .request(
@@ -1183,7 +1211,7 @@ impl CursorAcpSession {
             .await
             .context("cursor-agent session/set_model failed")?;
         self.model_id = Some(model_id);
-        Ok(())
+        Ok(true)
     }
 
     /// Send a `session/prompt` and return a stream of session updates.
@@ -1224,13 +1252,17 @@ pub async fn run_cursor_acp_turn<F>(
 where
     F: FnMut(CursorChunk<'_>) -> Result<()>,
 {
+    // One-shot (`aivo code -p`) is non-interactive: default cursor's tools to
+    // conversation-only (always-off toggle) so `-p` is fail-closed like the
+    // native agent. `AIVO_CURSOR_ALLOW_TOOLS=1` still opts in (checked first).
+    let one_shot_tools_off = Arc::new(AtomicBool::new(false));
     let session = CursorAcpSession::open_with_options(
         key,
         requested_model,
         workspace_cwd,
         None,
         ModelPickPreference::PreferNoThinking,
-        None,
+        Some(one_shot_tools_off),
         None,
     )
     .await?;

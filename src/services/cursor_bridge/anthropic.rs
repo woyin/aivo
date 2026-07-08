@@ -584,6 +584,10 @@ pub(super) async fn stream_bridged_turn(
     let mut aggregated = String::new();
     let mut parked = false;
     let mut turn_errored = false;
+    let mut error_message = String::new();
+    // Write failure => client hung up; stop draining cursor (else it burns
+    // tokens / parks a permit for a resume that never comes).
+    let mut client_gone = false;
     // Same rationale as the Responses twin: cursor goes silent both before
     // the first chunk AND between text bursts while it runs internal
     // tools, sometimes 20+ s with only `tool_call_update` (no title → no
@@ -596,6 +600,16 @@ pub(super) async fn stream_bridged_turn(
     heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     heartbeat.tick().await; // consume the zero-delay first tick
 
+    // Flag a disconnect on write failure. Can't `break 'outer` from the macro
+    // (label hygiene), so the loop checks `client_gone` after the `select!`.
+    macro_rules! send {
+        ($e:expr) => {{
+            if $e.await.is_err() {
+                client_gone = true;
+            }
+        }};
+    }
+
     'outer: loop {
         tokio::select! {
             biased;
@@ -606,19 +620,21 @@ pub(super) async fn stream_bridged_turn(
                     Some(BridgeEvent::ToolCall { tool_use_id, name, arguments }) => {
                         // Close any open text/thinking block before opening
                         // the tool_use one — Anthropic blocks don't nest.
-                        let _ = block_state.close(socket).await;
+                        send!(block_state.close(socket));
                         let idx = block_state.allocate_index();
-                        let _ = write_sse_chunk(
+                        send!(write_sse_chunk(
                             socket,
                             &anthropic_content_block_start_tool_use(idx, &tool_use_id, &name),
-                        )
-                        .await;
-                        let _ = write_sse_chunk(
+                        ));
+                        send!(write_sse_chunk(
                             socket,
                             &anthropic_input_json_delta(idx, &arguments),
-                        )
-                        .await;
-                        let _ = write_sse_chunk(socket, &anthropic_content_block_stop(idx)).await;
+                        ));
+                        send!(write_sse_chunk(socket, &anthropic_content_block_stop(idx)));
+                        // Don't park if the write failed — the client is gone.
+                        if client_gone {
+                            break 'outer;
+                        }
                         stop_reason = "tool_use";
                         parked = true;
                         break 'outer;
@@ -635,43 +651,35 @@ pub(super) async fn stream_bridged_turn(
                         if let Some(text) = extract_agent_text(&value) {
                             aggregated.push_str(text);
                             output_tokens = output_tokens.saturating_add(estimate_tokens(text));
-                            let _ = block_state
-                                .ensure_kind(socket, AnthropicBlockKind::Text)
-                                .await;
-                            let _ = write_sse_chunk(
+                            send!(block_state.ensure_kind(socket, AnthropicBlockKind::Text));
+                            send!(write_sse_chunk(
                                 socket,
                                 &anthropic_text_delta(block_state.index(), text),
-                            )
-                            .await;
+                            ));
                             last_visible_at = std::time::Instant::now();
                         } else if let Some(thought) = extract_agent_thought(&value) {
-                            let _ = block_state
-                                .ensure_kind(socket, AnthropicBlockKind::Thinking)
-                                .await;
-                            let _ = write_sse_chunk(
+                            send!(block_state.ensure_kind(socket, AnthropicBlockKind::Thinking));
+                            send!(write_sse_chunk(
                                 socket,
                                 &anthropic_thinking_delta(block_state.index(), thought),
-                            )
-                            .await;
+                            ));
                             last_visible_at = std::time::Instant::now();
                         } else if let Some(marker) = extract_tool_call_marker(&value) {
-                            let _ = block_state
-                                .ensure_kind(socket, AnthropicBlockKind::Thinking)
-                                .await;
-                            let _ = write_sse_chunk(
+                            send!(block_state.ensure_kind(socket, AnthropicBlockKind::Thinking));
+                            send!(write_sse_chunk(
                                 socket,
                                 &anthropic_thinking_delta(block_state.index(), &marker),
-                            )
-                            .await;
+                            ));
                             last_visible_at = std::time::Instant::now();
                         }
                     }
                     Some(PromptEvent::Done(result)) => {
-                        if result.is_err() {
-                            // Anthropic's stop_reason enum is closed-set;
-                            // emit a spec-valid `end_turn` and surface the
-                            // upstream error via cancellation+logging.
-                            turn_errored = true;
+                        match result {
+                            Ok(v) => stop_reason = anthropic_stop_reason(acp_stop_from_result(&v)),
+                            Err(e) => {
+                                turn_errored = true;
+                                error_message = e.to_string();
+                            }
                         }
                         break 'outer;
                     }
@@ -692,66 +700,76 @@ pub(super) async fn stream_bridged_turn(
                     // model so reasoning/thinking panels are unreliable.
                     aggregated.push('.');
                     output_tokens = output_tokens.saturating_add(estimate_tokens("."));
-                    let _ = write_sse_chunk(
+                    send!(write_sse_chunk(
                         socket,
                         &anthropic_text_delta(block_state.index(), "."),
-                    )
-                    .await;
+                    ));
                     last_visible_at = std::time::Instant::now();
                 } else {
                     // No text block yet — keep the dot in a thinking block.
-                    let _ = block_state
-                        .ensure_kind(socket, AnthropicBlockKind::Thinking)
-                        .await;
+                    send!(block_state.ensure_kind(socket, AnthropicBlockKind::Thinking));
                     let delta = if output_tokens == 0 { "Waking cursor session" } else { "." };
                     output_tokens = output_tokens.saturating_add(estimate_tokens(delta));
-                    let _ = write_sse_chunk(
+                    send!(write_sse_chunk(
                         socket,
                         &anthropic_thinking_delta(block_state.index(), delta),
-                    )
-                    .await;
+                    ));
                     last_visible_at = std::time::Instant::now();
                 }
             }
         }
+        if client_gone {
+            break 'outer;
+        }
     }
 
-    if turn_errored && !parked {
+    // Disconnect or error => stop cursor; only a parked tool turn is kept.
+    if (client_gone || turn_errored) && !parked {
         // Tell cursor-agent's session/prompt to stop so its child doesn't
         // keep generating output we'll never deliver. Best-effort: a dead
         // session simply errors here and is dropped below.
         let _ = acp.cancel().await;
     }
 
-    let _ = block_state.close(socket).await;
-    let _ = write_sse_chunk(
-        socket,
-        &sse_named_event(
-            "message_delta",
-            &json!({
-                "type": "message_delta",
-                "delta": {"stop_reason": stop_reason, "stop_sequence": null},
-                "usage": {
-                    "input_tokens": input_tokens,
-                    "output_tokens": output_tokens,
-                    "cache_creation_input_tokens": 0,
-                    "cache_read_input_tokens": 0,
-                },
-            }),
-        ),
-    )
-    .await;
-    let _ = write_sse_chunk(
-        socket,
-        &sse_named_event("message_stop", &json!({"type": "message_stop"})),
-    )
-    .await;
-    let _ = write_chunk_terminator(socket).await;
+    if client_gone {
+        // Dead socket — skip close frames, go to teardown.
+    } else if turn_errored {
+        // Signal failure with an `error` event, not a clean `message_stop`.
+        let _ = block_state.close(socket).await;
+        let _ = write_sse_chunk(socket, &anthropic_error_event(&error_message)).await;
+        let _ = write_chunk_terminator(socket).await;
+    } else {
+        let _ = block_state.close(socket).await;
+        let _ = write_sse_chunk(
+            socket,
+            &sse_named_event(
+                "message_delta",
+                &json!({
+                    "type": "message_delta",
+                    "delta": {"stop_reason": stop_reason, "stop_sequence": null},
+                    "usage": {
+                        "input_tokens": input_tokens,
+                        "output_tokens": output_tokens,
+                        "cache_creation_input_tokens": 0,
+                        "cache_read_input_tokens": 0,
+                    },
+                }),
+            ),
+        )
+        .await;
+        let _ = write_sse_chunk(
+            socket,
+            &sse_named_event("message_stop", &json!({"type": "message_stop"})),
+        )
+        .await;
+        let _ = write_chunk_terminator(socket).await;
+    }
 
     {
         let mut guard = bridge_session.lock().await;
         guard.detach_event_sink();
-        if parked {
+        // Don't preserve a parked-but-disconnected turn — the resume never comes.
+        if parked && !client_gone {
             // Preserve the ACP session for the resumption turn that will
             // arrive on a follow-up `/v1/messages` carrying the matching
             // `tool_result`.
@@ -764,7 +782,7 @@ pub(super) async fn stream_bridged_turn(
             drop(stream);
         }
     }
-    if !parked {
+    if !parked || client_gone {
         state.mcp_bridge.drop_session(bridge_id).await;
     }
 
@@ -808,6 +826,26 @@ pub(super) fn anthropic_input_json_delta(index: u32, arguments: &Value) -> Strin
                 "type": "input_json_delta",
                 "partial_json": arguments.to_string(),
             },
+        }),
+    )
+}
+
+/// Map an ACP stop reason onto Anthropic's closed `stop_reason` set.
+pub(super) fn anthropic_stop_reason(stop: AcpStop) -> &'static str {
+    match stop {
+        AcpStop::MaxTokens => "max_tokens",
+        AcpStop::Refusal => "refusal",
+        AcpStop::EndTurn => "end_turn",
+    }
+}
+
+/// A mid-stream Anthropic `error` SSE event for a failed turn.
+pub(super) fn anthropic_error_event(message: &str) -> String {
+    sse_named_event(
+        "error",
+        &json!({
+            "type": "error",
+            "error": {"type": "api_error", "message": message},
         }),
     )
 }
@@ -1055,6 +1093,7 @@ pub(super) async fn stream_anthropic_sse(
     let mut stop_reason = "end_turn";
     let mut output_tokens: u64 = 0;
     let mut aggregated = String::new();
+    let mut error_message: Option<String> = None;
     while let Some(event) = stream.next().await {
         match event {
             PromptEvent::Update(value) => {
@@ -1094,8 +1133,9 @@ pub(super) async fn stream_anthropic_sse(
                 // pure protocol overhead and intentionally dropped.
             }
             PromptEvent::Done(result) => {
-                if result.is_err() {
-                    stop_reason = "error";
+                match result {
+                    Ok(v) => stop_reason = anthropic_stop_reason(acp_stop_from_result(&v)),
+                    Err(e) => error_message = Some(e.to_string()),
                 }
                 break;
             }
@@ -1103,6 +1143,12 @@ pub(super) async fn stream_anthropic_sse(
     }
 
     block_state.close(socket).await?;
+    // Emit a spec `error` event, not a bogus `stop_reason: "error"`.
+    if let Some(message) = error_message {
+        write_sse_chunk(socket, &anthropic_error_event(&message)).await?;
+        write_chunk_terminator(socket).await?;
+        return Ok(aggregated);
+    }
     write_sse_chunk(
         socket,
         &sse_named_event(

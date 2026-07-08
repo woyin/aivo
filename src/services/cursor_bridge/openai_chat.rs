@@ -420,6 +420,18 @@ pub(super) async fn stream_bridged_openai_chat_turn(
     let mut aggregated = String::new();
     let mut parked = false;
     let mut turn_errored = false;
+    let mut error_message = String::new();
+    // Write failure => client hung up; stop draining cursor.
+    let mut client_gone = false;
+
+    // Flag a disconnect on write failure; loop checks it after the `select!`.
+    macro_rules! send {
+        ($e:expr) => {{
+            if $e.await.is_err() {
+                client_gone = true;
+            }
+        }};
+    }
 
     'outer: loop {
         tokio::select! {
@@ -442,7 +454,7 @@ pub(super) async fn stream_bridged_openai_chat_turn(
                             }),
                             None,
                         );
-                        let _ = write_sse_chunk(socket, &open_chunk).await;
+                        send!(write_sse_chunk(socket, &open_chunk));
                         let args_chunk = openai_chunk_frame(
                             &chat_id,
                             created,
@@ -455,7 +467,11 @@ pub(super) async fn stream_bridged_openai_chat_turn(
                             }),
                             None,
                         );
-                        let _ = write_sse_chunk(socket, &args_chunk).await;
+                        send!(write_sse_chunk(socket, &args_chunk));
+                        // Only park if the client actually received the call.
+                        if client_gone {
+                            break 'outer;
+                        }
                         finish_reason = "tool_calls".to_string();
                         parked = true;
                         break 'outer;
@@ -475,17 +491,33 @@ pub(super) async fn stream_bridged_openai_chat_turn(
                                 json!({"content": text}),
                                 None,
                             );
-                            let _ = write_sse_chunk(socket, &chunk).await;
+                            send!(write_sse_chunk(socket, &chunk));
+                        } else if let Some(reasoning) = extract_agent_thought(&value) {
+                            // Surface thinking as `reasoning_content` deltas.
+                            let chunk = openai_chunk_frame(
+                                &chat_id,
+                                created,
+                                response_model,
+                                json!({"reasoning_content": reasoning}),
+                                None,
+                            );
+                            send!(write_sse_chunk(socket, &chunk));
                         } else {
-                            let _ = write_sse_chunk(socket, SSE_KEEPALIVE).await;
+                            send!(write_sse_chunk(socket, SSE_KEEPALIVE));
                         }
                     }
                     Some(PromptEvent::Done(result)) => {
-                        if result.is_err() {
-                            // OpenAI finish_reason is documented as
-                            // stop|length|tool_calls|content_filter; emit
-                            // `stop` and signal the error via cancellation.
-                            turn_errored = true;
+                        match result {
+                            Ok(v) => {
+                                if finish_reason != "tool_calls" {
+                                    finish_reason =
+                                        openai_finish_reason(acp_stop_from_result(&v)).to_string();
+                                }
+                            }
+                            Err(e) => {
+                                turn_errored = true;
+                                error_message = e.to_string();
+                            }
                         }
                         break 'outer;
                     }
@@ -493,43 +525,55 @@ pub(super) async fn stream_bridged_openai_chat_turn(
                 }
             }
         }
+        if client_gone {
+            break 'outer;
+        }
     }
 
-    if turn_errored && !parked {
+    // Disconnect or error => stop cursor; only a parked tool turn is kept.
+    if (client_gone || turn_errored) && !parked {
         let _ = acp.cancel().await;
     }
 
-    let final_chunk = openai_chunk_frame(
-        &chat_id,
-        created,
-        response_model,
-        json!({}),
-        Some(finish_reason.as_str()),
-    );
-    let _ = write_sse_chunk(socket, &final_chunk).await;
-    let output_tokens = estimate_tokens(&aggregated);
-    let usage_chunk = openai_usage_chunk(
-        &chat_id,
-        created,
-        response_model,
-        input_tokens,
-        output_tokens,
-    );
-    let _ = write_sse_chunk(socket, &usage_chunk).await;
-    let _ = write_sse_chunk(socket, "data: [DONE]\n\n").await;
-    let _ = write_chunk_terminator(socket).await;
+    if client_gone {
+        // Dead socket — skip close frames, go to teardown.
+    } else if turn_errored {
+        // Signal failure with an `error` object, not a clean finish + `[DONE]`.
+        let _ = write_sse_chunk(socket, &openai_error_chunk(&error_message)).await;
+        let _ = write_chunk_terminator(socket).await;
+    } else {
+        let final_chunk = openai_chunk_frame(
+            &chat_id,
+            created,
+            response_model,
+            json!({}),
+            Some(finish_reason.as_str()),
+        );
+        let _ = write_sse_chunk(socket, &final_chunk).await;
+        let output_tokens = estimate_tokens(&aggregated);
+        let usage_chunk = openai_usage_chunk(
+            &chat_id,
+            created,
+            response_model,
+            input_tokens,
+            output_tokens,
+        );
+        let _ = write_sse_chunk(socket, &usage_chunk).await;
+        let _ = write_sse_chunk(socket, "data: [DONE]\n\n").await;
+        let _ = write_chunk_terminator(socket).await;
+    }
 
     {
         let mut guard = bridge_session.lock().await;
         guard.detach_event_sink();
-        if parked {
+        if parked && !client_gone {
             guard.return_active(acp, stream);
         } else {
             drop(acp);
             drop(stream);
         }
     }
-    if !parked {
+    if !parked || client_gone {
         state.mcp_bridge.drop_session(bridge_id).await;
     }
 
@@ -562,6 +606,7 @@ pub(super) async fn stream_openai_chat_sse(
 
     let mut finish_reason = "stop".to_string();
     let mut aggregated = String::new();
+    let mut error_message: Option<String> = None;
     while let Some(event) = stream.next().await {
         match event {
             PromptEvent::Update(value) => {
@@ -575,26 +620,39 @@ pub(super) async fn stream_openai_chat_sse(
                         None,
                     );
                     write_sse_chunk(socket, &chunk).await?;
+                } else if let Some(reasoning) = extract_agent_thought(&value) {
+                    let chunk = openai_chunk_frame(
+                        &chat_id,
+                        created,
+                        model,
+                        json!({"reasoning_content": reasoning}),
+                        None,
+                    );
+                    write_sse_chunk(socket, &chunk).await?;
                 } else {
-                    // Non-text updates (tool_call_update, plan, thought, …)
-                    // get a keepalive comment line. cursor-agent can spend
-                    // 10+ s on internal work; OpenAI-SDK clients (pi 6.26
-                    // observed dropping after ~9 s of silence) treat the
-                    // stream as stalled and reconnect. Comment lines are
-                    // ignored per the SSE spec but reset client idle timers.
+                    // Keepalive: cursor can go silent 10+ s on internal work
+                    // and pi drops the stream after ~9 s. Comment lines reset
+                    // client idle timers without appearing in output.
                     write_sse_chunk(socket, SSE_KEEPALIVE).await?;
                 }
             }
             PromptEvent::Done(result) => {
                 match result {
-                    Ok(_) => {}
-                    Err(err) => {
-                        finish_reason = format!("error:{}", err.code);
+                    Ok(v) => {
+                        finish_reason = openai_finish_reason(acp_stop_from_result(&v)).to_string()
                     }
+                    Err(err) => error_message = Some(err.to_string()),
                 }
                 break;
             }
         }
+    }
+
+    // Emit an `error` object, not a bogus `finish_reason: "error:<code>"`.
+    if let Some(message) = error_message {
+        write_sse_chunk(socket, &openai_error_chunk(&message)).await?;
+        write_chunk_terminator(socket).await?;
+        return Ok(aggregated);
     }
 
     let final_chunk = openai_chunk_frame(
@@ -616,6 +674,23 @@ pub(super) async fn stream_openai_chat_sse(
     write_sse_chunk(socket, "data: [DONE]\n\n").await?;
     write_chunk_terminator(socket).await?;
     Ok(aggregated)
+}
+
+/// Map a normalized ACP stop reason onto OpenAI's `finish_reason` set.
+pub(super) fn openai_finish_reason(stop: AcpStop) -> &'static str {
+    match stop {
+        AcpStop::MaxTokens => "length",
+        AcpStop::Refusal => "content_filter",
+        AcpStop::EndTurn => "stop",
+    }
+}
+
+/// A terminal OpenAI streaming `error` frame for a failed turn.
+pub(super) fn openai_error_chunk(message: &str) -> String {
+    let payload = json!({
+        "error": {"message": message, "type": "server_error", "code": null},
+    });
+    format!("data: {payload}\n\n")
 }
 
 pub(super) fn openai_usage_chunk(

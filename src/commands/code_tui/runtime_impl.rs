@@ -962,6 +962,64 @@ impl CodeTuiApp {
         }));
     }
 
+    /// Permission-prompt hook: surface cursor's tool requests on aivo's own
+    /// permission card (reusing the agent's AgentPermission channel; "always"
+    /// flips auto-approve on). Shared by the live-turn open and the prewarm.
+    fn cursor_permission_prompt(&self) -> cursor_acp::CursorPermissionPrompt {
+        let tx = self.tx.clone();
+        std::sync::Arc::new(move |req: cursor_acp::CursorPermissionRequest| {
+            let tx = tx.clone();
+            Box::pin(async move {
+                let (reply, rx) = tokio::sync::oneshot::channel();
+                if tx
+                    .send(RuntimeEvent::AgentPermission {
+                        tool: req.tool,
+                        preview: Some(req.preview),
+                        reply,
+                    })
+                    .is_err()
+                {
+                    return Decision::Deny;
+                }
+                rx.await.unwrap_or(Decision::Deny)
+            })
+        })
+    }
+
+    /// The dir cursor-agent runs its tools in: the real launch dir, else the
+    /// sandbox (tests).
+    fn cursor_workspace_cwd(&self) -> String {
+        if self.real_cwd.is_empty() {
+            self.cwd.clone()
+        } else {
+            self.real_cwd.clone()
+        }
+    }
+
+    /// Start opening the cursor ACP session in the background so its connect
+    /// overlaps the user typing. The first turn consumes this in-flight open
+    /// (see [`Self::spawn_cursor_turn`]) rather than starting its own, so
+    /// exactly one session is created — no duplicate cursor-agent, no adoption
+    /// race. No-op unless it's a cursor key with no session/prewarm yet.
+    pub(super) fn prewarm_cursor_session(&mut self) {
+        if !self.key.is_cursor_acp()
+            || self.cursor_acp_session.is_some()
+            || self.cursor_prewarm.is_some()
+        {
+            return;
+        }
+        let key = self.key.clone();
+        let requested_model = (!self.raw_model.is_empty()).then(|| self.raw_model.clone());
+        let cwd = self.cursor_workspace_cwd();
+        let auto_approve = self.auto_approve_flag.clone();
+        let permission_prompt = self.cursor_permission_prompt();
+        self.cursor_prewarm = Some(tokio::spawn(async move {
+            open_cursor_session(key, requested_model, cwd, auto_approve, permission_prompt)
+                .await
+                .map_err(|e| e.to_string())
+        }));
+    }
+
     fn spawn_cursor_turn(&mut self, input: String, attachments: Vec<MessageAttachment>) {
         // Existing session: clone handles cheaply and skip the open step.
         let existing = self.cursor_acp_session.as_ref().map(|session| {
@@ -974,41 +1032,13 @@ impl CodeTuiApp {
         });
         let key = self.key.clone();
         let requested_model = (!self.raw_model.is_empty()).then(|| self.raw_model.clone());
-        // cursor-agent runs as a real coding agent in the actual launch dir (like
-        // the in-process agent path), so it can read/edit the user's project.
-        // Falls back to the sandbox only when the real dir is unknown (tests).
-        let cwd = if self.real_cwd.is_empty() {
-            self.cwd.clone()
-        } else {
-            self.real_cwd.clone()
-        };
+        let cwd = self.cursor_workspace_cwd();
         let tx = self.tx.clone();
         let format = self.format.clone();
         let cursor_auto_approve = self.auto_approve_flag.clone();
-        // When auto-approve is off, surface cursor's out-of-process tool
-        // requests on aivo's own permission card (allow / always / deny) instead
-        // of a blanket reject. Reuses the same AgentPermission channel as the
-        // in-process agent; "always" flips auto-approve on for the session.
-        let permission_prompt: cursor_acp::CursorPermissionPrompt = {
-            let tx = self.tx.clone();
-            std::sync::Arc::new(move |req: cursor_acp::CursorPermissionRequest| {
-                let tx = tx.clone();
-                Box::pin(async move {
-                    let (reply, rx) = tokio::sync::oneshot::channel();
-                    if tx
-                        .send(RuntimeEvent::AgentPermission {
-                            tool: req.tool,
-                            preview: Some(req.preview),
-                            reply,
-                        })
-                        .is_err()
-                    {
-                        return Decision::Deny;
-                    }
-                    rx.await.unwrap_or(Decision::Deny)
-                })
-            })
-        };
+        let permission_prompt = self.cursor_permission_prompt();
+        // Consume the startup prewarm so we reuse its open, not a second one.
+        let prewarm = self.cursor_prewarm.take();
 
         // Open + prompt happen inside the spawned task so the TUI event loop
         // keeps polling input. The Node.js startup + 3 RPC roundtrips on a
@@ -1017,23 +1047,35 @@ impl CodeTuiApp {
             let (client, session_id, model_id, capabilities) = match existing {
                 Some(handles) => handles,
                 None => {
-                    // cursor-agent acts as a full agent here, running its
-                    // Read/Edit/execute tools against the real workspace — but
-                    // gated by the live Shift+Tab auto-approve toggle (OFF =>
-                    // conversation-only) so the displayed safety state is honest.
-                    // AIVO_CURSOR_ALLOW_TOOLS still hard-overrides either way.
-                    match CursorAcpSession::open_with_options(
-                        &key,
-                        requested_model.as_deref(),
-                        &cwd,
-                        None,
-                        cursor_acp::ModelPickPreference::PreferNoThinking,
-                        Some(cursor_auto_approve),
-                        Some(permission_prompt),
-                    )
-                    .await
-                    {
-                        Ok(session) => {
+                    // Reuse the prewarm (awaiting it costs only the remaining
+                    // connect time); a panicked one falls through to cold-open.
+                    let prewarmed = match prewarm {
+                        Some(handle) => match handle.await {
+                            Ok(res) => Some(res.map_err(|e| anyhow::anyhow!(e))),
+                            Err(_) => None,
+                        },
+                        None => None,
+                    };
+                    let opened = match prewarmed {
+                        Some(r) => r,
+                        None => {
+                            open_cursor_session(
+                                key,
+                                requested_model.clone(),
+                                cwd,
+                                cursor_auto_approve,
+                                permission_prompt,
+                            )
+                            .await
+                        }
+                    };
+                    match opened {
+                        Ok(mut session) => {
+                            // Re-apply the current model — the prewarm may have
+                            // opened on one the user has since changed.
+                            if let Some(m) = &requested_model {
+                                let _ = session.set_model(m).await;
+                            }
                             let handles = (
                                 session.client_handle(),
                                 session.session_id().to_string(),
@@ -2649,6 +2691,27 @@ impl crate::agent::engine::AgentUi for ChatAgentUi {
                 .unwrap_or(crate::agent::review::ReviewDecision::Reject)
         })
     }
+}
+
+/// Open a cursor ACP session with the TUI's standard options. Shared by
+/// `spawn_cursor_turn`'s cold-open and `prewarm_cursor_session`.
+async fn open_cursor_session(
+    key: ApiKey,
+    requested_model: Option<String>,
+    cwd: String,
+    auto_approve: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    permission_prompt: cursor_acp::CursorPermissionPrompt,
+) -> Result<CursorAcpSession> {
+    CursorAcpSession::open_with_options(
+        &key,
+        requested_model.as_deref(),
+        &cwd,
+        None,
+        cursor_acp::ModelPickPreference::PreferNoThinking,
+        Some(auto_approve),
+        Some(permission_prompt),
+    )
+    .await
 }
 
 async fn drive_cursor_turn(

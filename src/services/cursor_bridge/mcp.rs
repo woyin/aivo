@@ -383,12 +383,10 @@ impl McpBridge {
     }
 
     /// Name-based variant of [`Self::resume_with_tool_result`] for protocols
-    /// that don't echo back the synthetic tool_use_id we allocated (notably
-    /// Gemini's older `functionResponse` shape, which carries only `name`).
-    /// Scans all currently-parked calls for one whose tool name matches and
-    /// fulfills the first match. Since cursor-agent serializes tool calls
-    /// per session, only one parked call per session exists at a time, so
-    /// the match is unambiguous in practice.
+    /// that don't echo the synthetic tool_use_id (Gemini's `functionResponse`
+    /// carries only `name`). Only delivers on a GLOBALLY unique match: two
+    /// conversations parked on the same tool name would otherwise cross-deliver
+    /// and corrupt both, so an ambiguous match (0 or >1) returns `None`.
     pub async fn resume_with_tool_result_by_name(
         &self,
         tool_name: &str,
@@ -397,20 +395,18 @@ impl McpBridge {
     ) -> Option<Arc<Mutex<BridgeSession>>> {
         let sessions: Vec<Arc<Mutex<BridgeSession>>> =
             self.state.sessions.lock().await.values().cloned().collect();
-        for session in sessions {
-            let matching_id = {
-                let guard = session.lock().await;
-                guard
-                    .parked
-                    .as_ref()
-                    .filter(|p| p.tool_name == tool_name)
-                    .map(|p| p.tool_use_id.clone())
-            };
-            if let Some(id) = matching_id {
-                return self.resume_with_tool_result(&id, content, is_error).await;
+        let mut matches: Vec<String> = Vec::new();
+        for session in &sessions {
+            let guard = session.lock().await;
+            if let Some(p) = guard.parked.as_ref().filter(|p| p.tool_name == tool_name) {
+                matches.push(p.tool_use_id.clone());
             }
         }
-        None
+        if matches.len() != 1 {
+            return None;
+        }
+        self.resume_with_tool_result(&matches[0], content, is_error)
+            .await
     }
 }
 
@@ -589,6 +585,16 @@ async fn handle(request: String, state: Arc<BridgeState>, mut socket: TcpStream)
 
 const MCP_LOG_URL_BASE: &str = "mcp-bridge://localhost";
 
+/// Mask the session id in a `/sess/<id>/…` path before logging it: the id is
+/// the MCP server's only access secret (no bearer), so a log reader could
+/// otherwise POST `tools/call` into a live turn.
+fn redact_session_path(path: &str) -> String {
+    match parse_session_path(path) {
+        Some(id) => path.replacen(&id, "<redacted>", 1),
+        None => path.to_string(),
+    }
+}
+
 async fn log_mcp_inbound(method: &str, path: &str, body: &str) -> Option<String> {
     let logger = http_debug::global()?;
     let id = format!(
@@ -604,7 +610,7 @@ async fn log_mcp_inbound(method: &str, path: &str, body: &str) -> Option<String>
             id: id.clone(),
             phase: Phase::Request,
             method: method.to_string(),
-            url: format!("{MCP_LOG_URL_BASE}{path}"),
+            url: format!("{MCP_LOG_URL_BASE}{}", redact_session_path(path)),
             status: None,
             duration_ms: None,
             request_headers: std::collections::BTreeMap::new(),
@@ -638,7 +644,7 @@ async fn log_mcp_outbound(
             id,
             phase: Phase::Response,
             method: method.to_string(),
-            url: format!("{MCP_LOG_URL_BASE}{path}"),
+            url: format!("{MCP_LOG_URL_BASE}{}", redact_session_path(path)),
             status: Some(status),
             duration_ms: Some(duration.as_millis() as u64),
             request_headers: std::collections::BTreeMap::new(),

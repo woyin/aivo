@@ -1348,6 +1348,9 @@ impl CodeTuiApp {
 
     pub(super) async fn run(&mut self) -> Result<()> {
         let mut terminal = setup_terminal(chat_mouse_enabled())?;
+        // Open the cursor session now (no-op for other keys) so its connect
+        // overlaps the user typing their first message.
+        self.prewarm_cursor_session();
         // Repaint only on change; an idle chat draws nothing.
         let mut needs_redraw = true;
         let run_result = loop {

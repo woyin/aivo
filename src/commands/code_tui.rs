@@ -239,6 +239,7 @@ impl CodeTuiApp {
             pending_ctrl_x: false,
             pending_external_edit: false,
             cursor_acp_session: None,
+            cursor_prewarm: None,
             pending_agent_messages: None,
             goal_mode: None,
             goal_guard_stop: None,

@@ -1845,3 +1845,78 @@ fn request_authorized_accepts_bearer_or_x_api_key() {
     assert!(!auth(&req("Authorization: Bearer nope"), "tok123"));
     assert!(!auth(&req("Host: x"), "tok123"));
 }
+
+// === Regression: mid-stream error signaling + stopReason mapping ===
+
+#[test]
+fn acp_stop_from_result_normalizes_stop_reasons() {
+    assert_eq!(
+        acp_stop_from_result(&json!({"stopReason": "max_tokens"})),
+        AcpStop::MaxTokens
+    );
+    assert_eq!(
+        acp_stop_from_result(&json!({"stopReason": "max_turn_requests"})),
+        AcpStop::MaxTokens
+    );
+    assert_eq!(
+        acp_stop_from_result(&json!({"stopReason": "refusal"})),
+        AcpStop::Refusal
+    );
+    // end_turn, cancelled, unknown, and absent all fold to EndTurn.
+    for v in [
+        json!({"stopReason": "end_turn"}),
+        json!({"stopReason": "cancelled"}),
+        json!({"stopReason": "something_new"}),
+        json!({}),
+    ] {
+        assert_eq!(acp_stop_from_result(&v), AcpStop::EndTurn);
+    }
+}
+
+#[test]
+fn protocol_finish_reasons_map_each_stop_kind() {
+    // Anthropic uses its closed enum; OpenAI + Gemini use their own vocab.
+    assert_eq!(anthropic_stop_reason(AcpStop::MaxTokens), "max_tokens");
+    assert_eq!(anthropic_stop_reason(AcpStop::Refusal), "refusal");
+    assert_eq!(anthropic_stop_reason(AcpStop::EndTurn), "end_turn");
+    assert_eq!(openai_finish_reason(AcpStop::MaxTokens), "length");
+    assert_eq!(openai_finish_reason(AcpStop::Refusal), "content_filter");
+    assert_eq!(openai_finish_reason(AcpStop::EndTurn), "stop");
+    assert_eq!(gemini_finish_reason(AcpStop::MaxTokens), "MAX_TOKENS");
+    assert_eq!(gemini_finish_reason(AcpStop::Refusal), "SAFETY");
+    assert_eq!(gemini_finish_reason(AcpStop::EndTurn), "STOP");
+}
+
+#[test]
+fn error_frames_carry_a_client_visible_error_signal() {
+    // Anthropic: a spec `error` event, not a bogus stop_reason.
+    let anth = anthropic_error_event("boom");
+    assert!(anth.contains("event: error"));
+    assert!(anth.contains("\"type\":\"error\""));
+    assert!(anth.contains("boom"));
+
+    // OpenAI chat: a terminal `error` object (not finish_reason: "error:..").
+    let oai = openai_error_chunk("boom");
+    assert!(oai.starts_with("data: "));
+    assert!(oai.contains("\"error\""));
+    assert!(oai.contains("boom"));
+
+    // Gemini: an `error` object with a numeric code.
+    let gem = gemini_error_frame("boom");
+    assert!(gem.contains("\"error\""));
+    assert!(gem.contains("\"code\":500"));
+    assert!(gem.contains("boom"));
+}
+
+#[test]
+fn malformed_request_body_maps_to_400_not_502() {
+    // A JSON parse failure is the client's fault — 400 so SDKs fail fast
+    // instead of retry-looping on a 5xx.
+    let parse_err = serde_json::from_str::<serde_json::Value>("{not json").unwrap_err();
+    let err = anyhow::Error::new(parse_err).context("parse request body");
+    assert_eq!(status_for_handler_error(&err), 400);
+
+    // An upstream failure with no serde error in the chain stays 502.
+    let upstream = anyhow::anyhow!("cursor-agent session/prompt failed");
+    assert_eq!(status_for_handler_error(&upstream), 502);
+}

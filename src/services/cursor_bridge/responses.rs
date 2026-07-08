@@ -310,11 +310,50 @@ async fn write_responses_heartbeat_delta(
     .await
 }
 
-/// Mid-stream failure path used after [`emit_responses_opening_events`] has
-/// committed us to a 200/SSE response. Surfaces the error inside the
-/// reasoning panel and emits a terminating `response.completed` with
-/// `status: failed` so codex marks the turn as errored instead of waiting
-/// forever.
+/// Emit a terminal `response.failed` event and close the stream. codex
+/// dispatches on the event `type`, so a `response.completed` with
+/// `status: "failed"` is still treated as success — a failure must use
+/// `response.failed`.
+async fn emit_response_failed(
+    socket: &mut TcpStream,
+    resp_id: &str,
+    model: &str,
+    created: i64,
+    output: Value,
+    tokens: (u64, u64),
+    error_message: &str,
+) {
+    let (input_tokens, output_tokens) = tokens;
+    let _ = write_sse_chunk(
+        socket,
+        &sse_named_event(
+            "response.failed",
+            &json!({
+                "type": "response.failed",
+                "response": {
+                    "id": resp_id,
+                    "object": "response",
+                    "model": model,
+                    "created_at": created,
+                    "status": "failed",
+                    "output": output,
+                    "usage": {
+                        "input_tokens": input_tokens,
+                        "output_tokens": output_tokens,
+                        "total_tokens": input_tokens.saturating_add(output_tokens),
+                    },
+                    "error": {"code": "server_error", "message": error_message},
+                },
+            }),
+        ),
+    )
+    .await;
+    let _ = write_chunk_terminator(socket).await;
+}
+
+/// Mid-stream failure path once [`emit_responses_opening_events`] has
+/// committed a 200/SSE response: surface the error in the reasoning panel and
+/// emit a terminating `response.failed`.
 async fn emit_responses_failure(
     socket: &mut TcpStream,
     open: BridgedResponsesOpen,
@@ -359,31 +398,16 @@ async fn emit_responses_failure(
         &reasoning_text,
     )
     .await;
-    let _ = write_sse_chunk(
+    emit_response_failed(
         socket,
-        &sse_named_event(
-            "response.completed",
-            &json!({
-                "type": "response.completed",
-                "response": {
-                    "id": resp_id,
-                    "object": "response",
-                    "model": response_model,
-                    "created_at": created,
-                    "status": "failed",
-                    "output": [reasoning_item_done(&reasoning_id, &reasoning_text)],
-                    "usage": {
-                        "input_tokens": input_tokens,
-                        "output_tokens": 0,
-                        "total_tokens": input_tokens,
-                    },
-                    "error": {"message": error_message},
-                },
-            }),
-        ),
+        &resp_id,
+        response_model,
+        created,
+        json!([reasoning_item_done(&reasoning_id, &reasoning_text)]),
+        (input_tokens, 0),
+        error_message,
     )
     .await;
-    let _ = write_chunk_terminator(socket).await;
 }
 
 pub(super) async fn run_responses_bridged(
@@ -667,7 +691,10 @@ pub(super) async fn stream_bridged_responses_turn(
     let mut output_items: Vec<Value> = Vec::new();
     let mut function_call_item: Option<Value> = None;
     let mut errored = false;
+    let mut error_message = String::new();
     let mut parked = false;
+    // Write failure => client hung up; stop draining cursor.
+    let mut client_gone = false;
     // Cursor goes silent in two distinct windows: (1) between `session/prompt`
     // and its first `agent_*` chunk (10+ s on cold prewarm), and (2)
     // between text bursts while it runs internal tools — 24+ s gaps with
@@ -683,6 +710,16 @@ pub(super) async fn stream_bridged_responses_turn(
     heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     heartbeat.tick().await; // consume the zero-delay first tick
 
+    // Flag a disconnect on write failure. Can't `break 'outer` from the macro
+    // (label hygiene), so the loop checks `client_gone` after the `select!`.
+    macro_rules! send {
+        ($e:expr) => {{
+            if $e.await.is_err() {
+                client_gone = true;
+            }
+        }};
+    }
+
     'outer: loop {
         tokio::select! {
             biased;
@@ -692,16 +729,16 @@ pub(super) async fn stream_bridged_responses_turn(
                         // Close reasoning + any open message block before
                         // opening the function_call output item.
                         if !reasoning_closed {
-                            let _ = emit_responses_reasoning_close(
+                            send!(emit_responses_reasoning_close(
                                 socket, &resp_id, &reasoning_id, reasoning_index, &reasoning_text,
-                            ).await;
+                            ));
                             output_items.push(reasoning_item_done(&reasoning_id, &reasoning_text));
                             reasoning_closed = true;
                         }
                         if let Some((msg_id, msg_text, msg_idx)) = current_message.take() {
-                            let _ = emit_responses_message_close(
+                            send!(emit_responses_message_close(
                                 socket, &resp_id, &msg_id, msg_idx, &msg_text,
-                            ).await;
+                            ));
                             output_items.push(message_item_done(&msg_id, &msg_text));
                         }
                         // No `next_output_index += 1` here — we break out
@@ -709,7 +746,7 @@ pub(super) async fn stream_bridged_responses_turn(
                         // item closes.
                         let output_index = next_output_index;
                         let args_json = arguments.to_string();
-                        let _ = write_sse_chunk(
+                        send!(write_sse_chunk(
                             socket,
                             &sse_named_event(
                                 "response.output_item.added",
@@ -727,9 +764,8 @@ pub(super) async fn stream_bridged_responses_turn(
                                     },
                                 }),
                             ),
-                        )
-                        .await;
-                        let _ = write_sse_chunk(
+                        ));
+                        send!(write_sse_chunk(
                             socket,
                             &sse_named_event(
                                 "response.function_call_arguments.delta",
@@ -741,9 +777,8 @@ pub(super) async fn stream_bridged_responses_turn(
                                     "delta": args_json,
                                 }),
                             ),
-                        )
-                        .await;
-                        let _ = write_sse_chunk(
+                        ));
+                        send!(write_sse_chunk(
                             socket,
                             &sse_named_event(
                                 "response.function_call_arguments.done",
@@ -755,8 +790,7 @@ pub(super) async fn stream_bridged_responses_turn(
                                     "arguments": args_json,
                                 }),
                             ),
-                        )
-                        .await;
+                        ));
                         let final_item = json!({
                             "id": tool_use_id,
                             "type": "function_call",
@@ -765,7 +799,7 @@ pub(super) async fn stream_bridged_responses_turn(
                             "name": name,
                             "arguments": args_json,
                         });
-                        let _ = write_sse_chunk(
+                        send!(write_sse_chunk(
                             socket,
                             &sse_named_event(
                                 "response.output_item.done",
@@ -776,8 +810,11 @@ pub(super) async fn stream_bridged_responses_turn(
                                     "item": final_item.clone(),
                                 }),
                             ),
-                        )
-                        .await;
+                        ));
+                        // Don't park if the write failed — the client is gone.
+                        if client_gone {
+                            break 'outer;
+                        }
                         function_call_item = Some(final_item);
                         parked = true;
                         break 'outer;
@@ -794,9 +831,9 @@ pub(super) async fn stream_bridged_responses_turn(
                                 let id = new_anthropic_message_id();
                                 let idx = next_output_index;
                                 next_output_index += 1;
-                                let _ = emit_responses_message_open(
+                                send!(emit_responses_message_open(
                                     socket, &resp_id, &id, idx,
-                                ).await;
+                                ));
                                 current_message = Some((id, String::new(), idx));
                             }
                             let Some(entry) = current_message.as_mut() else {
@@ -805,7 +842,7 @@ pub(super) async fn stream_bridged_responses_turn(
                             let msg_id_str = entry.0.clone();
                             let msg_idx = entry.2;
                             entry.1.push_str(text);
-                            let _ = write_sse_chunk(
+                            send!(write_sse_chunk(
                                 socket,
                                 &sse_named_event(
                                     "response.output_text.delta",
@@ -818,8 +855,7 @@ pub(super) async fn stream_bridged_responses_turn(
                                         "delta": text,
                                     }),
                                 ),
-                            )
-                            .await;
+                            ));
                             last_visible_at = std::time::Instant::now();
                         } else if let Some(reasoning) = extract_agent_thought(&value)
                             .map(str::to_string)
@@ -831,7 +867,7 @@ pub(super) async fn stream_bridged_responses_turn(
                             // ids so deltas route correctly.
                             if !reasoning_closed {
                                 reasoning_text.push_str(&reasoning);
-                                let _ = write_sse_chunk(
+                                send!(write_sse_chunk(
                                     socket,
                                     &sse_named_event(
                                         "response.reasoning_summary_text.delta",
@@ -844,8 +880,7 @@ pub(super) async fn stream_bridged_responses_turn(
                                             "delta": reasoning,
                                         }),
                                     ),
-                                )
-                                .await;
+                                ));
                                 last_visible_at = std::time::Instant::now();
                             }
                         } else {
@@ -853,12 +888,16 @@ pub(super) async fn stream_bridged_responses_turn(
                             // surface (plans, available_commands, etc.) so
                             // OpenAI SDK clients don't time out. The
                             // heartbeat branch below adds the visible tick.
-                            let _ = write_sse_chunk(socket, SSE_KEEPALIVE).await;
+                            send!(write_sse_chunk(socket, SSE_KEEPALIVE));
                         }
                     }
                     Some(PromptEvent::Done(result)) => {
-                        if result.is_err() {
-                            errored = true;
+                        match result {
+                            Ok(_) => {}
+                            Err(e) => {
+                                errored = true;
+                                error_message = e.to_string();
+                            }
                         }
                         break 'outer;
                     }
@@ -886,7 +925,7 @@ pub(super) async fn stream_bridged_responses_turn(
                         "."
                     };
                     reasoning_text.push_str(delta);
-                    let _ = write_sse_chunk(
+                    send!(write_sse_chunk(
                         socket,
                         &sse_named_event(
                             "response.reasoning_summary_text.delta",
@@ -899,16 +938,36 @@ pub(super) async fn stream_bridged_responses_turn(
                                 "delta": delta,
                             }),
                         ),
-                    )
-                    .await;
+                    ));
                     last_visible_at = std::time::Instant::now();
                 }
             }
         }
+        if client_gone {
+            break 'outer;
+        }
     }
 
-    if errored && !parked {
+    // Disconnect or error => stop cursor; only a parked tool turn is kept.
+    if (client_gone || errored) && !parked {
         let _ = acp.cancel().await;
+    }
+
+    if client_gone {
+        // Dead socket — skip close frames, go to teardown.
+        let partial = current_message.map(|(_, t, _)| t).unwrap_or_default();
+        {
+            let mut guard = bridge_session.lock().await;
+            guard.detach_event_sink();
+            drop(acp);
+            drop(stream);
+        }
+        state.mcp_bridge.drop_session(bridge_id).await;
+        return Ok(if partial.is_empty() {
+            None
+        } else {
+            Some(partial)
+        });
     }
 
     // Close the pre-opened reasoning item (always, even if empty — codex
@@ -945,31 +1004,43 @@ pub(super) async fn stream_bridged_responses_turn(
                 .map(estimate_tokens)
         })
         .sum();
-    let final_status = if errored { "failed" } else { "completed" };
-    let _ = write_sse_chunk(
-        socket,
-        &sse_named_event(
-            "response.completed",
-            &json!({
-                "type": "response.completed",
-                "response": {
-                    "id": resp_id,
-                    "object": "response",
-                    "model": response_model,
-                    "created_at": created,
-                    "status": final_status,
-                    "output": output_items,
-                    "usage": {
-                        "input_tokens": input_tokens,
-                        "output_tokens": output_tokens,
-                        "total_tokens": input_tokens.saturating_add(output_tokens),
+    if errored {
+        emit_response_failed(
+            socket,
+            &resp_id,
+            response_model,
+            created,
+            json!(output_items),
+            (input_tokens, output_tokens),
+            &error_message,
+        )
+        .await;
+    } else {
+        let _ = write_sse_chunk(
+            socket,
+            &sse_named_event(
+                "response.completed",
+                &json!({
+                    "type": "response.completed",
+                    "response": {
+                        "id": resp_id,
+                        "object": "response",
+                        "model": response_model,
+                        "created_at": created,
+                        "status": "completed",
+                        "output": output_items,
+                        "usage": {
+                            "input_tokens": input_tokens,
+                            "output_tokens": output_tokens,
+                            "total_tokens": input_tokens.saturating_add(output_tokens),
+                        },
                     },
-                },
-            }),
-        ),
-    )
-    .await;
-    let _ = write_chunk_terminator(socket).await;
+                }),
+            ),
+        )
+        .await;
+        let _ = write_chunk_terminator(socket).await;
+    }
 
     {
         let mut guard = bridge_session.lock().await;
@@ -1282,6 +1353,7 @@ pub(super) async fn stream_responses_sse(
 
     let mut full_text = String::new();
     let mut errored = false;
+    let mut error_message = String::new();
     while let Some(event) = stream.next().await {
         match event {
             PromptEvent::Update(value) => {
@@ -1309,8 +1381,9 @@ pub(super) async fn stream_responses_sse(
                 }
             }
             PromptEvent::Done(result) => {
-                if result.is_err() {
+                if let Err(e) = result {
                     errored = true;
+                    error_message = e.to_string();
                 }
                 break;
             }
@@ -1366,7 +1439,26 @@ pub(super) async fn stream_responses_sse(
         ),
     )
     .await?;
-    let final_status = if errored { "failed" } else { "completed" };
+    let message_item = json!({
+        "id": msg_id,
+        "type": "message",
+        "status": "completed",
+        "role": "assistant",
+        "content": [{"type": "output_text", "text": full_text, "annotations": []}],
+    });
+    if errored {
+        emit_response_failed(
+            socket,
+            &resp_id,
+            model,
+            created,
+            json!([message_item]),
+            (input_tokens, estimate_tokens(&full_text)),
+            &error_message,
+        )
+        .await;
+        return Ok(full_text);
+    }
     write_sse_chunk(
         socket,
         &sse_named_event(
@@ -1378,14 +1470,8 @@ pub(super) async fn stream_responses_sse(
                     "object": "response",
                     "model": model,
                     "created_at": created,
-                    "status": final_status,
-                    "output": [{
-                        "id": msg_id,
-                        "type": "message",
-                        "status": "completed",
-                        "role": "assistant",
-                        "content": [{"type": "output_text", "text": full_text, "annotations": []}],
-                    }],
+                    "status": "completed",
+                    "output": [message_item],
                     "usage": {
                         "input_tokens": input_tokens,
                         "output_tokens": estimate_tokens(&full_text),

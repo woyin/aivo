@@ -1325,6 +1325,16 @@ async fn test_ctrl_x_chord_cancelled_by_other_key() {
     assert!(!app.pending_external_edit);
 }
 
+#[tokio::test]
+async fn prewarm_cursor_session_noops_for_non_cursor_key() {
+    // Non-cursor key => prewarm must not spawn cursor-agent or arm the handle.
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    assert!(!app.key.is_cursor_acp());
+    app.prewarm_cursor_session();
+    assert!(app.cursor_prewarm.is_none());
+}
+
 fn make_test_app(
     tx: tokio::sync::mpsc::UnboundedSender<RuntimeEvent>,
     rx: tokio::sync::mpsc::UnboundedReceiver<RuntimeEvent>,
@@ -1449,6 +1459,7 @@ fn make_test_app(
         pending_ctrl_x: false,
         pending_external_edit: false,
         cursor_acp_session: None,
+        cursor_prewarm: None,
         pending_agent_messages: None,
         goal_mode: None,
         goal_guard_stop: None,

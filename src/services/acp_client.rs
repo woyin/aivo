@@ -4,11 +4,11 @@
 
 use anyhow::{Context, Result, anyhow};
 use serde_json::{Value, json};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::process::Stdio;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, Command};
 use tokio::sync::{Mutex, mpsc, oneshot};
@@ -34,6 +34,19 @@ impl std::error::Error for JsonRpcError {}
 type PendingMap = Arc<Mutex<HashMap<u64, oneshot::Sender<Result<Value, JsonRpcError>>>>>;
 type SessionMap = Arc<Mutex<HashMap<String, mpsc::UnboundedSender<PromptEvent>>>>;
 type Writer = Arc<Mutex<ChildStdin>>;
+/// Bounded ring of the child's recent stderr lines: drained so the pipe never
+/// fills (a full stderr pipe blocks cursor-agent), kept for hang/crash errors.
+type StderrTail = Arc<std::sync::Mutex<VecDeque<String>>>;
+
+/// Timeout for a one-shot ACP `request` (initialize / session/new / set_model)
+/// so a wedged cursor-agent doesn't hang the caller forever. The streaming
+/// `session/prompt` path ([`AcpClient::start_prompt`]) is exempt — a real turn
+/// can run for minutes.
+const ACP_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Cap on retained stderr lines and per-line length for [`StderrTail`].
+const STDERR_TAIL_LINES: usize = 40;
+const STDERR_TAIL_LINE_CAP: usize = 512;
 /// Per-client map from outbound-request id → send instant. Read by the reader
 /// task when an inbound response arrives to compute the round-trip
 /// `duration_ms` for the debug log. Scoped per `AcpClient` because each child
@@ -84,8 +97,10 @@ pub struct AcpClient {
     pending: PendingMap,
     session_handlers: SessionMap,
     request_timings: RequestTimings,
+    stderr_tail: StderrTail,
     child: Mutex<Option<Child>>,
     _reader: JoinHandle<()>,
+    _stderr_drain: JoinHandle<()>,
 }
 
 impl AcpClient {
@@ -117,11 +132,16 @@ impl AcpClient {
             .stdout
             .take()
             .ok_or_else(|| anyhow!("ACP child has no stdout"))?;
+        let stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| anyhow!("ACP child has no stderr"))?;
 
         let pending: PendingMap = Arc::new(Mutex::new(HashMap::new()));
         let sessions: SessionMap = Arc::new(Mutex::new(HashMap::new()));
         let writer: Writer = Arc::new(Mutex::new(stdin));
         let request_timings: RequestTimings = Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let stderr_tail: StderrTail = Arc::new(std::sync::Mutex::new(VecDeque::new()));
 
         let reader = spawn_reader(
             BufReader::new(stdout),
@@ -131,6 +151,7 @@ impl AcpClient {
             request_timings.clone(),
             permission_fn,
         );
+        let stderr_drain = spawn_stderr_drain(BufReader::new(stderr), stderr_tail.clone());
 
         Ok(Self {
             writer,
@@ -138,9 +159,30 @@ impl AcpClient {
             pending,
             session_handlers: sessions,
             request_timings,
+            stderr_tail,
             child: Mutex::new(Some(child)),
             _reader: reader,
+            _stderr_drain: stderr_drain,
         })
+    }
+
+    /// The child's recent stderr lines, joined newest-last for a crash error.
+    pub fn recent_stderr(&self) -> String {
+        self.stderr_tail
+            .lock()
+            .map(|q| q.iter().cloned().collect::<Vec<_>>().join("\n"))
+            .unwrap_or_default()
+    }
+
+    /// Append the child's stderr tail to `msg` so a transport error carries
+    /// the agent's own diagnostics.
+    fn with_stderr_context(&self, msg: String) -> anyhow::Error {
+        let tail = self.recent_stderr();
+        if tail.is_empty() {
+            anyhow!(msg)
+        } else {
+            anyhow!("{msg}\ncursor-agent stderr:\n{tail}")
+        }
     }
 
     pub async fn request(&self, method: &str, params: Value) -> Result<Value> {
@@ -159,14 +201,24 @@ impl AcpClient {
                 });
             })?;
 
-        match rx.await {
-            Ok(Ok(v)) => Ok(v),
-            Ok(Err(rpc_err)) => {
+        match tokio::time::timeout(ACP_REQUEST_TIMEOUT, rx).await {
+            Ok(Ok(Ok(v))) => Ok(v),
+            Ok(Ok(Err(rpc_err))) => {
                 Err(anyhow!(rpc_err).context(format!("ACP method `{method}` failed")))
             }
-            Err(_) => Err(anyhow!(
+            Ok(Err(_)) => Err(self.with_stderr_context(format!(
                 "ACP child closed connection before `{method}` returned"
-            )),
+            ))),
+            Err(_elapsed) => {
+                // Wedged child: reclaim the pending slot, surface a timeout.
+                let pending = self.pending.clone();
+                tokio::spawn(async move {
+                    pending.lock().await.remove(&id);
+                });
+                Err(self.with_stderr_context(format!(
+                    "ACP method `{method}` timed out after {ACP_REQUEST_TIMEOUT:?}"
+                )))
+            }
         }
     }
 
@@ -215,7 +267,16 @@ impl AcpClient {
                 }),
             };
             let _ = tx.send(PromptEvent::Done(result));
-            sessions.lock().await.remove(&session_id);
+            // Only clear the handler if it's still the one this prompt
+            // registered: a cancelled-then-restarted turn reuses the session
+            // id, and evicting the newer prompt's sender would drop its updates.
+            let mut guard = sessions.lock().await;
+            if guard
+                .get(&session_id)
+                .is_some_and(|current| current.same_channel(&tx))
+            {
+                guard.remove(&session_id);
+            }
         });
 
         Ok(PromptStream { rx })
@@ -227,6 +288,39 @@ impl AcpClient {
             let _ = child.wait().await;
         }
     }
+}
+
+/// Drain the child's stderr into a bounded tail. An unread stderr pipe fills
+/// (~64 KB) and blocks cursor-agent's next `write()`, freezing it mid-turn.
+fn spawn_stderr_drain(
+    mut stderr: BufReader<tokio::process::ChildStderr>,
+    tail: StderrTail,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut line = String::new();
+        loop {
+            line.clear();
+            match stderr.read_line(&mut line).await {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {}
+            }
+            let trimmed = line.trim_end();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let mut entry = trimmed.to_string();
+            if entry.len() > STDERR_TAIL_LINE_CAP {
+                entry.truncate(STDERR_TAIL_LINE_CAP);
+                entry.push('…');
+            }
+            if let Ok(mut q) = tail.lock() {
+                if q.len() == STDERR_TAIL_LINES {
+                    q.pop_front();
+                }
+                q.push_back(entry);
+            }
+        }
+    })
 }
 
 fn spawn_reader(
@@ -300,13 +394,18 @@ async fn dispatch_inbound(
     writer: &Writer,
     permission_fn: &PermissionFn,
 ) {
-    let id = value.get("id").and_then(value_to_u64);
+    // Keep the id as a raw `Value`: server-initiated requests may carry a
+    // string/negative id (JSON-RPC-legal) that must be echoed verbatim —
+    // dropping it would leave `session/request_permission` unanswered.
+    let raw_id = value.get("id").cloned();
     let method = value.get("method").and_then(Value::as_str);
 
-    match (id, method) {
+    match (raw_id, method) {
         (Some(id), None) => {
-            // Response to one of our requests.
-            if let Some(tx) = pending.lock().await.remove(&id) {
+            // Response to one of our requests (our ids are always u64).
+            if let Some(id) = value_to_u64(&id)
+                && let Some(tx) = pending.lock().await.remove(&id)
+            {
                 let _ = tx.send(parse_result_or_error(&value));
             }
         }
@@ -321,9 +420,8 @@ async fn dispatch_inbound(
             let _ = write_frame(writer, &resp, None).await;
         }
         (Some(id), Some(method)) => {
-            // Other server-initiated requests (fs/*, terminal/*) aren't
-            // implemented yet — reject with the JSON-RPC method-not-found
-            // code so the agent has a defined error to handle.
+            // Unimplemented server-initiated requests (fs/*, terminal/*):
+            // reject with method-not-found, echoing the id verbatim.
             let resp = json!({
                 "jsonrpc": "2.0",
                 "id": id,
@@ -348,7 +446,7 @@ async fn dispatch_inbound(
 /// the agent already offered (matched by `kind`) so the agent can map the
 /// reply to one of its own UI options; if no compatible option is offered we
 /// fall back to `cancelled`.
-fn build_permission_response(id: u64, params: &Value, decision: PermissionDecision) -> Value {
+fn build_permission_response(id: Value, params: &Value, decision: PermissionDecision) -> Value {
     let preferred_kind = match decision {
         PermissionDecision::Allow => "allow_once",
         PermissionDecision::Reject => "reject_once",
@@ -838,7 +936,7 @@ read line; printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"ok":true}}'"#,
             ],
             "toolCall": {"kind": "execute"},
         });
-        let resp = build_permission_response(42, &params, PermissionDecision::Reject);
+        let resp = build_permission_response(json!(42), &params, PermissionDecision::Reject);
         assert_eq!(resp["id"], 42);
         assert_eq!(resp["result"]["outcome"]["outcome"], "selected");
         assert_eq!(resp["result"]["outcome"]["optionId"], "reject-once");
@@ -852,8 +950,19 @@ read line; printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"ok":true}}'"#,
                 {"kind": "reject_once", "name": "Reject", "optionId": "reject-once"},
             ],
         });
-        let resp = build_permission_response(1, &params, PermissionDecision::Allow);
+        let resp = build_permission_response(json!(1), &params, PermissionDecision::Allow);
         assert_eq!(resp["result"]["outcome"]["optionId"], "allow-once");
+    }
+
+    #[test]
+    fn permission_response_echoes_non_u64_id_verbatim() {
+        // A string-id server request must be answered with that exact id.
+        let params = json!({"options": [
+            {"kind": "reject_once", "optionId": "reject-once"},
+        ]});
+        let resp = build_permission_response(json!("req-7"), &params, PermissionDecision::Reject);
+        assert_eq!(resp["id"], json!("req-7"));
+        assert_eq!(resp["result"]["outcome"]["optionId"], "reject-once");
     }
 
     #[test]
@@ -863,7 +972,7 @@ read line; printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"ok":true}}'"#,
         let params = json!({"options": [
             {"kind": "weird_custom", "optionId": "x"},
         ]});
-        let resp = build_permission_response(1, &params, PermissionDecision::Reject);
+        let resp = build_permission_response(json!(1), &params, PermissionDecision::Reject);
         assert_eq!(resp["result"]["outcome"]["outcome"], "cancelled");
         assert!(resp["result"]["outcome"].get("optionId").is_none());
     }

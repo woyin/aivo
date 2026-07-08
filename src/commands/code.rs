@@ -771,9 +771,16 @@ impl CodeCommand {
                     let mapped = match chunk {
                         CursorChunk::Content(t) => ChatResponseChunk::Content(t.to_string()),
                         CursorChunk::Reasoning(t) => ChatResponseChunk::Reasoning(t.to_string()),
-                        // Tool steps are progress, not the answer — omit from
-                        // one-shot output (which scripts may parse).
-                        CursorChunk::ToolCall { .. } | CursorChunk::ToolUpdate { .. } => {
+                        // Tool steps go to stderr (not stdout, which scripts
+                        // parse) so the user sees cursor touched the workspace.
+                        CursorChunk::ToolCall { name, .. } => {
+                            eprintln!("· cursor tool: {name}");
+                            return Ok(());
+                        }
+                        CursorChunk::ToolUpdate { failed, .. } => {
+                            if failed {
+                                eprintln!("· cursor tool: failed");
+                            }
                             return Ok(());
                         }
                     };

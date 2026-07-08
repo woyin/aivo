@@ -2178,6 +2178,14 @@ pub(super) struct CodeTuiApp {
     /// Live `cursor-agent acp` connection scoped to the current chat session.
     /// `None` outside of cursor keys and before the first turn.
     pub(super) cursor_acp_session: Option<crate::services::cursor_acp::CursorAcpSession>,
+    /// Background open of the cursor ACP session, started at TUI startup so
+    /// the connect overlaps the user typing. The first turn `take`s and awaits
+    /// this instead of opening its own — exactly one session is ever created.
+    pub(super) cursor_prewarm: Option<
+        tokio::task::JoinHandle<
+            std::result::Result<crate::services::cursor_acp::CursorAcpSession, String>,
+        >,
+    >,
     /// A resumed session's durable agent transcript (raw OpenAI messages with
     /// tool_calls + results), awaiting the next engine build to be restored
     /// verbatim (exact tool history). Consumed (`take`) on build; `None` otherwise.

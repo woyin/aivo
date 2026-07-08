@@ -428,11 +428,22 @@ pub(super) async fn stream_bridged_gemini_turn(
     let mut output_tokens: u64 = 0;
     let mut finish_reason = "STOP";
     let mut parked = false;
+    let mut error_message: Option<String> = None;
+    // Write failure => client hung up; stop draining cursor.
+    let mut client_gone = false;
     // Captured tool-call data for the final frame. We emit it together
     // with finishReason in a single candidate frame so strict gemini-cli
     // parsers (which key dispatch off "functionCall part AND finishReason
     // in the same chunk") see them atomically.
     let mut parked_call: Option<(String, String, Value)> = None;
+
+    macro_rules! send {
+        ($e:expr) => {{
+            if $e.await.is_err() {
+                client_gone = true;
+            }
+        }};
+    }
 
     'outer: loop {
         tokio::select! {
@@ -455,14 +466,15 @@ pub(super) async fn stream_bridged_gemini_turn(
                             aggregated.push_str(text);
                             output_tokens = output_tokens.saturating_add(estimate_tokens(text));
                             let frame = gemini_stream_text_frame(response_model, text);
-                            let _ = write_sse_chunk(socket, &frame).await;
+                            send!(write_sse_chunk(socket, &frame));
                         } else {
-                            let _ = write_sse_chunk(socket, SSE_KEEPALIVE).await;
+                            send!(write_sse_chunk(socket, SSE_KEEPALIVE));
                         }
                     }
                     Some(PromptEvent::Done(result)) => {
-                        if result.is_err() {
-                            finish_reason = "OTHER";
+                        match result {
+                            Ok(v) => finish_reason = gemini_finish_reason(acp_stop_from_result(&v)),
+                            Err(e) => error_message = Some(e.to_string()),
                         }
                         break 'outer;
                     }
@@ -470,46 +482,61 @@ pub(super) async fn stream_bridged_gemini_turn(
                 }
             }
         }
+        if client_gone {
+            break 'outer;
+        }
     }
 
-    if finish_reason == "OTHER" && !parked {
+    // Disconnect or error => stop cursor; only a parked tool turn is kept.
+    if (client_gone || error_message.is_some()) && !parked {
         let _ = acp.cancel().await;
     }
 
-    let total_tokens = input_tokens.saturating_add(output_tokens);
-    let final_frame = match parked_call.as_ref() {
-        Some((tool_use_id, name, arguments)) => gemini_stream_function_call_final_frame(
-            response_model,
-            tool_use_id,
-            name,
-            arguments,
-            finish_reason,
-            input_tokens,
-            output_tokens,
-            total_tokens,
-        ),
-        None => gemini_stream_final_frame(
-            response_model,
-            finish_reason,
-            input_tokens,
-            output_tokens,
-            total_tokens,
-        ),
-    };
-    let _ = write_sse_chunk(socket, &final_frame).await;
-    let _ = write_chunk_terminator(socket).await;
+    if client_gone {
+        // Dead socket — skip the final frame, go to teardown.
+    } else if let Some(message) = &error_message {
+        // Signal failure with an `error` object, not `finishReason: STOP`.
+        let _ = write_sse_chunk(socket, &gemini_error_frame(message)).await;
+        let _ = write_chunk_terminator(socket).await;
+    } else {
+        let total_tokens = input_tokens.saturating_add(output_tokens);
+        let final_frame = match parked_call.as_ref() {
+            Some((tool_use_id, name, arguments)) => gemini_stream_function_call_final_frame(
+                response_model,
+                tool_use_id,
+                name,
+                arguments,
+                finish_reason,
+                input_tokens,
+                output_tokens,
+                total_tokens,
+            ),
+            None => gemini_stream_final_frame(
+                response_model,
+                finish_reason,
+                input_tokens,
+                output_tokens,
+                total_tokens,
+            ),
+        };
+        // A parked turn whose final frame didn't reach the client is dead.
+        if write_sse_chunk(socket, &final_frame).await.is_err() {
+            client_gone = true;
+        }
+        let _ = write_chunk_terminator(socket).await;
+    }
 
     {
         let mut guard = bridge_session.lock().await;
         guard.detach_event_sink();
-        if parked {
+        if parked && !client_gone {
             guard.return_active(acp, stream);
         } else {
             drop(acp);
             drop(stream);
         }
     }
-    if !parked {
+    if !parked || client_gone {
         state.mcp_bridge.drop_session(bridge_id).await;
     }
 
@@ -518,6 +545,23 @@ pub(super) async fn stream_bridged_gemini_turn(
     } else {
         Some(aggregated)
     })
+}
+
+/// Map a normalized ACP stop reason onto Gemini's `finishReason` set.
+pub(super) fn gemini_finish_reason(stop: AcpStop) -> &'static str {
+    match stop {
+        AcpStop::MaxTokens => "MAX_TOKENS",
+        AcpStop::Refusal => "SAFETY",
+        AcpStop::EndTurn => "STOP",
+    }
+}
+
+/// A terminal Gemini `error` frame for a mid-stream upstream failure.
+pub(super) fn gemini_error_frame(message: &str) -> String {
+    let payload = json!({
+        "error": {"code": 500, "message": message, "status": "INTERNAL"},
+    });
+    format!("data: {payload}\n\n")
 }
 
 /// One-shot Gemini stream frame carrying the `functionCall` part and the
@@ -738,6 +782,7 @@ pub(super) async fn stream_gemini_sse(
     let mut aggregated = String::new();
     let mut output_tokens: u64 = 0;
     let mut finish_reason = "STOP";
+    let mut error_message: Option<String> = None;
     while let Some(event) = stream.next().await {
         match event {
             PromptEvent::Update(value) => {
@@ -754,12 +799,18 @@ pub(super) async fn stream_gemini_sse(
                 }
             }
             PromptEvent::Done(result) => {
-                if result.is_err() {
-                    finish_reason = "OTHER";
+                match result {
+                    Ok(v) => finish_reason = gemini_finish_reason(acp_stop_from_result(&v)),
+                    Err(e) => error_message = Some(e.to_string()),
                 }
                 break;
             }
         }
+    }
+    if let Some(message) = error_message {
+        write_sse_chunk(socket, &gemini_error_frame(&message)).await?;
+        write_chunk_terminator(socket).await?;
+        return Ok(aggregated);
     }
     let total_tokens = input_tokens.saturating_add(output_tokens);
     let final_frame = gemini_stream_final_frame(

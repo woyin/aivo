@@ -187,8 +187,13 @@ impl CodeTuiApp {
 
     /// `/model <name>`: apply the named model verbatim, no catalog lookup.
     pub(super) async fn set_model_direct(&mut self, name: String) -> Result<()> {
-        self.apply_model(name.clone()).await?;
-        let msg = if self.sending {
+        let applied = self.apply_model(name.clone()).await?;
+        let msg = if !applied {
+            // Live cursor session rejected the name (e.g. "auto") and kept its own.
+            format!(
+                "cursor kept its current model — \"{name}\" isn't selectable on the live session"
+            )
+        } else if self.sending {
             format!("Now using {name} — applies from the next turn")
         } else {
             format!("Now using {name}")
@@ -197,7 +202,9 @@ impl CodeTuiApp {
         Ok(())
     }
 
-    pub(super) async fn apply_model(&mut self, raw_model: String) -> Result<()> {
+    /// Apply a model. Returns `false` only when a live cursor session rejected
+    /// the name and kept its own (the picker's `"auto"`) — callers surface it.
+    pub(super) async fn apply_model(&mut self, raw_model: String) -> Result<bool> {
         self.persist_model_selection(&raw_model).await?;
 
         self.raw_model = raw_model.clone();
@@ -213,19 +220,26 @@ impl CodeTuiApp {
         // If we have a live cursor ACP session, switch its model in place so
         // the conversation context is preserved. Drop the session on failure
         // so the next turn opens a fresh one with the new model.
-        let drop_session = if let Some(session) = self.cursor_acp_session.as_mut() {
-            session.set_model(&raw_model).await.is_err()
+        let switch = if let Some(session) = self.cursor_acp_session.as_mut() {
+            Some(session.set_model(&raw_model).await)
         } else {
-            false
+            None
         };
-        if drop_session {
-            self.cursor_acp_session = None;
-        }
+        let applied = match switch {
+            // Errored — drop so the next turn reopens on the new model.
+            Some(Err(_)) => {
+                self.cursor_acp_session = None;
+                true
+            }
+            // No catalog match (e.g. "auto"): session kept its model — report it.
+            Some(Ok(false)) => false,
+            Some(Ok(true)) | None => true,
+        };
 
         if !self.history.is_empty() {
             self.persist_history().await?;
         }
-        Ok(())
+        Ok(applied)
     }
 
     /// Back the agent's `switch_model` tool: resolve `requested` against the catalog and
