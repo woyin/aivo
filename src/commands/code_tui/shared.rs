@@ -2377,4 +2377,7 @@ pub(super) struct CodeTuiApp {
     pub(super) account_login: Option<AccountLoginCard>,
     /// `/logout` awaiting its y/n confirm; the account display name.
     pub(super) pending_logout: Option<String>,
+    /// A `/key` provider switch (resets the chat) awaiting its y/n confirm; the
+    /// decrypted target key. Same-provider swaps skip this and apply directly.
+    pub(super) pending_key_switch: Option<ApiKey>,
 }

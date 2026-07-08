@@ -954,6 +954,8 @@ impl CodeTuiApp {
             self.render_mcp_consent_card(frame, composer_area, outer);
         } else if self.pending_logout.is_some() {
             self.render_logout_confirm_card(frame, composer_area, outer);
+        } else if self.pending_key_switch.is_some() {
+            self.render_key_switch_confirm_card(frame, composer_area, outer);
         } else if self.agent_permission.is_some() {
             self.render_permission_card(frame, composer_area, outer);
         } else if self.agent_ask.is_some() {
@@ -1185,6 +1187,46 @@ impl CodeTuiApp {
             composer_area,
             frame_area,
             "sign out of aivo",
+            WARNING,
+            lines,
+        );
+    }
+
+    /// `/key` provider-switch confirm card.
+    fn render_key_switch_confirm_card(
+        &self,
+        frame: &mut Frame<'_>,
+        composer_area: Rect,
+        frame_area: Rect,
+    ) {
+        let Some(target) = self.pending_key_switch.as_ref() else {
+            return;
+        };
+        let lines = vec![
+            Line::from(vec![
+                Span::styled("Switch to ", Style::default().fg(TEXT)),
+                Span::styled(
+                    target.display_name().to_string(),
+                    Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled("?", Style::default().fg(TEXT)),
+            ]),
+            Line::from(Span::styled(
+                "It's a different provider, so this starts a new chat.",
+                Style::default().fg(MUTED),
+            )),
+            Line::from(Span::styled(
+                "The current chat is saved — /resume brings it back.",
+                Style::default().fg(MUTED),
+            )),
+            Line::from(""),
+            account_keys_line(&[("y", ASSISTANT, "new chat"), ("n", ERROR, "keep current")]),
+        ];
+        render_account_card(
+            frame,
+            composer_area,
+            frame_area,
+            "switch key",
             WARNING,
             lines,
         );

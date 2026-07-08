@@ -77,6 +77,11 @@ impl CodeTuiApp {
             return Ok(false);
         }
 
+        if self.pending_key_switch.is_some() {
+            self.handle_key_switch_confirm_key(key).await?;
+            return Ok(false);
+        }
+
         // A pending tool-permission card owns the decision keys (y/a/n), but only
         // while the composer is empty. If the user is mid-composing a queued
         // message those keystrokes belong to that message — letting them decide

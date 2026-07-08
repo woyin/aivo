@@ -1518,6 +1518,7 @@ fn make_test_app(
         account_task: None,
         account_login: None,
         pending_logout: None,
+        pending_key_switch: None,
     }
 }
 
@@ -13272,6 +13273,220 @@ async fn test_complete_key_switch_updates_last_selection() {
     assert_eq!(sel.key_id, key_b_id, "switched-to key must be selected");
     assert_eq!(sel.model.as_deref(), Some("model-b"));
     assert_eq!(sel.tool, "codex", "launchable tool must be preserved");
+}
+
+#[tokio::test]
+async fn test_complete_key_switch_same_provider_preserves_chat() {
+    // Same base_url = credential swap → chat survives.
+    let temp_dir = TempDir::new().unwrap();
+    let store = SessionStore::with_path(temp_dir.path().join("config.json"));
+    let key_a = store
+        .add_key_with_protocol("personal", "https://same.example.com", None, "sk-a")
+        .await
+        .unwrap();
+    let key_b_id = store
+        .add_key_with_protocol("work", "https://same.example.com", None, "sk-b")
+        .await
+        .unwrap();
+    let key_a_full = store.get_key_by_id(&key_a).await.unwrap().unwrap();
+    let key_b_full = store.get_key_by_id(&key_b_id).await.unwrap().unwrap();
+
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.session_store = store.clone();
+    app.key = key_a_full;
+    app.session_id = "keep-me".to_string();
+    seed_two_exchanges(&mut app);
+
+    app.complete_key_switch(key_b_full, "model-b".to_string())
+        .await
+        .unwrap();
+
+    assert_eq!(app.key.id, key_b_id, "switched to the new key");
+    assert_eq!(
+        app.session_id, "keep-me",
+        "same-provider switch keeps the session"
+    );
+    assert_eq!(app.history.len(), 4, "conversation is preserved");
+}
+
+#[tokio::test]
+async fn test_complete_key_switch_different_provider_resets_chat() {
+    // Different base_url = different wire format → fresh session.
+    let temp_dir = TempDir::new().unwrap();
+    let store = SessionStore::with_path(temp_dir.path().join("config.json"));
+    let key_a = store
+        .add_key_with_protocol("a", "https://a.example.com", None, "sk-a")
+        .await
+        .unwrap();
+    let key_b_id = store
+        .add_key_with_protocol("b", "https://b.example.com", None, "sk-b")
+        .await
+        .unwrap();
+    let key_a_full = store.get_key_by_id(&key_a).await.unwrap().unwrap();
+    let key_b_full = store.get_key_by_id(&key_b_id).await.unwrap().unwrap();
+
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.session_store = store.clone();
+    app.key = key_a_full;
+    app.session_id = "old-session".to_string();
+    seed_two_exchanges(&mut app);
+
+    app.complete_key_switch(key_b_full, "model-b".to_string())
+        .await
+        .unwrap();
+
+    assert_eq!(app.key.id, key_b_id, "switched to the new key");
+    assert!(
+        app.history.is_empty(),
+        "different-provider switch resets the chat"
+    );
+    assert_ne!(
+        app.session_id, "old-session",
+        "a fresh session id is minted"
+    );
+}
+
+#[tokio::test]
+async fn test_begin_key_switch_confirms_before_provider_reset() {
+    // Different provider + live chat → arm the y/n card, don't switch yet.
+    let temp_dir = TempDir::new().unwrap();
+    let store = SessionStore::with_path(temp_dir.path().join("config.json"));
+    let key_a = store
+        .add_key_with_protocol("a", "https://a.example.com", None, "sk-a")
+        .await
+        .unwrap();
+    let key_b_id = store
+        .add_key_with_protocol("b", "https://b.example.com", None, "sk-b")
+        .await
+        .unwrap();
+    let key_a_full = store.get_key_by_id(&key_a).await.unwrap().unwrap();
+    let key_b_full = store.get_key_by_id(&key_b_id).await.unwrap().unwrap();
+
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.session_store = store.clone();
+    app.key = key_a_full;
+    app.session_id = "old-session".to_string();
+    seed_two_exchanges(&mut app);
+
+    app.begin_key_switch(key_b_full).await.unwrap();
+
+    assert!(
+        app.pending_key_switch.is_some(),
+        "the switch is armed, not applied"
+    );
+    assert_eq!(
+        app.key.id, key_a,
+        "still on the original key until confirmed"
+    );
+    assert_eq!(app.history.len(), 4, "conversation untouched while armed");
+}
+
+#[tokio::test]
+async fn test_key_switch_confirm_yes_resets_chat() {
+    let temp_dir = TempDir::new().unwrap();
+    let store = SessionStore::with_path(temp_dir.path().join("config.json"));
+    let key_a = store
+        .add_key_with_protocol("a", "https://a.example.com", None, "sk-a")
+        .await
+        .unwrap();
+    let key_b_id = store
+        .add_key_with_protocol("b", "https://b.example.com", None, "sk-b")
+        .await
+        .unwrap();
+    store.set_code_model(&key_b_id, "model-b").await.unwrap();
+    let key_a_full = store.get_key_by_id(&key_a).await.unwrap().unwrap();
+    let key_b_full = store.get_key_by_id(&key_b_id).await.unwrap().unwrap();
+
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.session_store = store.clone();
+    app.key = key_a_full;
+    app.session_id = "old-session".to_string();
+    seed_two_exchanges(&mut app);
+
+    app.begin_key_switch(key_b_full).await.unwrap();
+    app.handle_key_switch_confirm_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE))
+        .await
+        .unwrap();
+
+    assert!(app.pending_key_switch.is_none(), "card cleared");
+    assert_eq!(app.key.id, key_b_id, "confirm applies the switch");
+    assert!(app.history.is_empty(), "confirm resets the chat");
+    assert_ne!(app.session_id, "old-session", "fresh session id");
+}
+
+#[tokio::test]
+async fn test_key_switch_confirm_no_keeps_chat() {
+    let temp_dir = TempDir::new().unwrap();
+    let store = SessionStore::with_path(temp_dir.path().join("config.json"));
+    let key_a = store
+        .add_key_with_protocol("a", "https://a.example.com", None, "sk-a")
+        .await
+        .unwrap();
+    let key_b_id = store
+        .add_key_with_protocol("b", "https://b.example.com", None, "sk-b")
+        .await
+        .unwrap();
+    let key_a_full = store.get_key_by_id(&key_a).await.unwrap().unwrap();
+    let key_b_full = store.get_key_by_id(&key_b_id).await.unwrap().unwrap();
+
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.session_store = store.clone();
+    app.key = key_a_full;
+    app.session_id = "old-session".to_string();
+    seed_two_exchanges(&mut app);
+
+    app.begin_key_switch(key_b_full).await.unwrap();
+    app.handle_key_switch_confirm_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE))
+        .await
+        .unwrap();
+
+    assert!(
+        app.pending_key_switch.is_none(),
+        "declining clears the card"
+    );
+    assert_eq!(app.key.id, key_a, "declining keeps the current key");
+    assert_eq!(app.history.len(), 4, "declining preserves the conversation");
+    assert_eq!(app.session_id, "old-session", "same session id");
+}
+
+#[tokio::test]
+async fn test_begin_key_switch_same_provider_skips_confirm() {
+    // Same provider = credential swap: apply straight through, no card.
+    let temp_dir = TempDir::new().unwrap();
+    let store = SessionStore::with_path(temp_dir.path().join("config.json"));
+    let key_a = store
+        .add_key_with_protocol("personal", "https://same.example.com", None, "sk-a")
+        .await
+        .unwrap();
+    let key_b_id = store
+        .add_key_with_protocol("work", "https://same.example.com", None, "sk-b")
+        .await
+        .unwrap();
+    store.set_code_model(&key_b_id, "model-b").await.unwrap();
+    let key_a_full = store.get_key_by_id(&key_a).await.unwrap().unwrap();
+    let key_b_full = store.get_key_by_id(&key_b_id).await.unwrap().unwrap();
+
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.session_store = store.clone();
+    app.key = key_a_full;
+    app.session_id = "keep-me".to_string();
+    seed_two_exchanges(&mut app);
+
+    app.begin_key_switch(key_b_full).await.unwrap();
+
+    assert!(
+        app.pending_key_switch.is_none(),
+        "same-provider switch needs no confirm"
+    );
+    assert_eq!(app.key.id, key_b_id, "applied directly");
+    assert_eq!(app.session_id, "keep-me", "chat preserved");
+    assert_eq!(app.history.len(), 4);
 }
 
 #[tokio::test]

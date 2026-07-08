@@ -294,6 +294,10 @@ is preserved."
         key: ApiKey,
         raw_model: String,
     ) -> Result<()> {
+        // Same provider = credential/model swap → keep the chat like `/model`; a
+        // different provider changes the wire format, so replaying it is unsafe → reset.
+        let same_provider = same_wire_provider(&self.key.base_url, &key.base_url);
+
         self.key = key;
         self.raw_model = raw_model.clone();
         self.model = CodeCommand::transform_model_for_provider(&self.key.base_url, &raw_model);
@@ -302,7 +306,22 @@ is preserved."
         self.persist_model_selection(&raw_model).await?;
         self.refresh_context_window().await;
 
-        self.start_new_chat();
+        if same_provider && !self.history.is_empty() {
+            // Carry the transcript across the rebuild; drop the cursor session (auth changed).
+            self.format = seeded_chat_format(&self.key, &raw_model);
+            self.reset_engine_preserving_conversation();
+            self.cursor_acp_session = None;
+            self.persist_history().await?;
+            self.notice = Some((
+                MUTED,
+                format!(
+                    "Switched key to {} — chat preserved",
+                    self.key.display_name()
+                ),
+            ));
+        } else {
+            self.start_new_chat();
+        }
         Ok(())
     }
 
@@ -321,6 +340,17 @@ is preserved."
 
     pub(super) async fn begin_key_switch(&mut self, mut key: ApiKey) -> Result<()> {
         SessionStore::decrypt_key_secret(&mut key)?;
+        // A different provider resets the chat → confirm first; same-provider preserves it.
+        if !self.history.is_empty() && !same_wire_provider(&self.key.base_url, &key.base_url) {
+            self.overlay = Overlay::None;
+            self.pending_key_switch = Some(key);
+            return Ok(());
+        }
+        self.proceed_key_switch(key).await
+    }
+
+    /// Apply the switch: use the key's saved model, else open the model picker.
+    pub(super) async fn proceed_key_switch(&mut self, key: ApiKey) -> Result<()> {
         if let Some(raw_model) = self.session_store.get_code_model(&key.id).await? {
             self.complete_key_switch(key, raw_model).await?;
         } else {
@@ -328,6 +358,23 @@ is preserved."
             self.open_model_picker(None, ModelSelectionTarget::KeySwitch(key), false);
         }
         Ok(())
+    }
+
+    /// `/key` provider-switch confirm card: y/Enter proceeds, n/Esc cancels.
+    pub(super) async fn handle_key_switch_confirm_key(&mut self, key: KeyEvent) -> Result<()> {
+        let allow = matches!(key.code, KeyCode::Char('y' | 'Y') | KeyCode::Enter);
+        let deny = matches!(key.code, KeyCode::Char('n' | 'N') | KeyCode::Esc);
+        if !allow && !deny {
+            return Ok(());
+        }
+        let Some(target) = self.pending_key_switch.take() else {
+            return Ok(());
+        };
+        if deny {
+            self.show_toast("Key switch cancelled");
+            return Ok(());
+        }
+        self.proceed_key_switch(target).await
     }
 
     pub(super) async fn open_key_picker(&mut self, query: Option<String>) -> Result<()> {
@@ -2797,6 +2844,13 @@ pub(super) fn resolve_model_request(
             ))
         }
     }
+}
+
+/// Two base URLs resolve to the same provider (same wire protocol). The starter
+/// sentinel resolves to its real URL first; other sentinels compare literally.
+pub(super) fn same_wire_provider(a: &str, b: &str) -> bool {
+    use crate::services::provider_profile::resolve_starter_base_url;
+    resolve_starter_base_url(a) == resolve_starter_base_url(b)
 }
 
 /// Fetch model metadata for the picker, falling back to cached IDs on error.
