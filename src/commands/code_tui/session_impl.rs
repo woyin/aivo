@@ -185,6 +185,18 @@ impl CodeTuiApp {
         }
     }
 
+    /// `/model <name>`: apply the named model verbatim, no catalog lookup.
+    pub(super) async fn set_model_direct(&mut self, name: String) -> Result<()> {
+        self.apply_model(name.clone()).await?;
+        let msg = if self.sending {
+            format!("Now using {name} — applies from the next turn")
+        } else {
+            format!("Now using {name}")
+        };
+        self.notice = Some((MUTED, msg));
+        Ok(())
+    }
+
     pub(super) async fn apply_model(&mut self, raw_model: String) -> Result<()> {
         self.persist_model_selection(&raw_model).await?;
 

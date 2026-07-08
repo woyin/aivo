@@ -1116,8 +1116,16 @@ impl CodeTuiApp {
                 Ok(false)
             }
             SlashCommand::Model(query) => {
-                let auto_accept_exact = query.is_some();
-                self.open_model_picker(query, ModelSelectionTarget::CurrentChat, auto_accept_exact);
+                // A named `/model <name>` sets the model directly — no picker, so
+                // it works on providers with no `/v1/models` listing. Bare
+                // `/model` opens the picker.
+                match query
+                    .map(|q| q.trim().to_string())
+                    .filter(|q| !q.is_empty())
+                {
+                    Some(name) => self.set_model_direct(name).await?,
+                    None => self.open_model_picker(None, ModelSelectionTarget::CurrentChat, false),
+                }
                 Ok(false)
             }
             SlashCommand::Key(query) => {

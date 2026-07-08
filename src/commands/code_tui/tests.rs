@@ -11614,6 +11614,21 @@ async fn test_open_model_picker_keeps_inflight_turn() {
     assert!(matches!(app.overlay, Overlay::Picker(_)));
 }
 
+/// `/model <name>` applies the name directly, opening no picker.
+#[tokio::test]
+async fn test_model_command_applies_name_directly() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+
+    app.set_model_direct("my-model".to_string()).await.unwrap();
+
+    assert_eq!(app.raw_model, "my-model");
+    assert!(matches!(app.overlay, Overlay::None));
+    let (color, msg) = app.notice.as_ref().expect("a confirmation notice");
+    assert_eq!(*color, MUTED);
+    assert!(msg.contains("my-model"), "notice names the model: {msg}");
+}
+
 #[tokio::test]
 async fn test_cancel_keeps_user_turn_for_in_process_agent_turn() {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
