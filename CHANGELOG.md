@@ -1,5 +1,12 @@
 # Changelog
 
+## v0.38.1
+
+A small follow-up to v0.38.0. The `aivo code` footer settles into a single, stable status row with its context fill aligned to the `/context` total, and `aivo update` now elevates itself with sudo when the install directory is root-owned.
+
+- feat(update): auto-elevate with sudo on a root-owned install dir (81f9dc0)
+- fix(code): pin the footer to a single status row and align its context fill with `/context` (ae99045, f050f7e)
+
 ## v0.38.0
 
 A big upgrade to the `aivo code` agent. Subagents now leave durable artifacts, the `/goal` autonomous loop gains verification and safer stops, `/context` becomes a full context-window breakdown, and you can inject repo and context files with `-c`. The TUI also picks up `/login`, `/logout`, and `/usage` account commands, a collapsed one-row footer, and a full-autonomy auto-approve mode.
