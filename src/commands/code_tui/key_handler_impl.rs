@@ -22,6 +22,8 @@ enum OverlayKeyAction {
     ToggleConfigSetting(usize),
 }
 
+const GOAL_STOP_CONFIRM_NOTICE: &str = "Press Esc again to stop goal mode";
+
 impl CodeTuiApp {
     pub(super) async fn handle_key(&mut self, key: KeyEvent) -> Result<bool> {
         // Ctrl+X Ctrl+E chord: Ctrl+E completes it; any other key cancels and runs normally.
@@ -45,6 +47,14 @@ impl CodeTuiApp {
         if self.exit_confirm_pending {
             self.exit_confirm_pending = false;
             self.notice = None;
+        }
+
+        // Any non-Esc key disarms the goal-stop confirm — the second Esc must be consecutive.
+        if self.goal_stop_confirm_pending && !matches!(key.code, KeyCode::Esc) {
+            self.goal_stop_confirm_pending = false;
+            if matches!(&self.notice, Some((_, msg)) if msg.as_str() == GOAL_STOP_CONFIRM_NOTICE) {
+                self.notice = None;
+            }
         }
 
         if matches!(key.code, KeyCode::Esc) && self.transcript_selection.is_some() {
@@ -1221,7 +1231,15 @@ impl CodeTuiApp {
                 true
             }
             KeyCode::Esc if self.sending => {
-                self.interrupt_inflight_request().await?;
+                // In /goal mode one Esc only arms a confirm so a stray Esc can't
+                // tear down the loop; a second consecutive Esc interrupts + stops it.
+                if self.goal_mode.is_some() && !self.goal_stop_confirm_pending {
+                    self.goal_stop_confirm_pending = true;
+                    self.notice = Some((WARNING, GOAL_STOP_CONFIRM_NOTICE.to_string()));
+                } else {
+                    self.goal_stop_confirm_pending = false;
+                    self.interrupt_inflight_request().await?;
+                }
                 true
             }
             KeyCode::PageUp => {

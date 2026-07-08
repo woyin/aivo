@@ -1443,6 +1443,7 @@ fn make_test_app(
         picker_hitbox: None,
         overlay_detail_area: None,
         exit_confirm_pending: false,
+        goal_stop_confirm_pending: false,
         pending_ctrl_x: false,
         pending_external_edit: false,
         cursor_acp_session: None,
@@ -8279,6 +8280,67 @@ async fn test_goal_stops_on_errored_turn() {
     assert_eq!(style, ERROR);
     assert!(msg.contains("insufficient credits"), "error kept: {msg}");
     assert!(msg.contains("goal mode stopped"), "stop noted: {msg}");
+}
+
+/// In `/goal` mode a single Esc only arms a confirm — the loop keeps running;
+/// a second consecutive Esc interrupts and stops it.
+#[tokio::test]
+async fn test_goal_esc_requires_confirmation_to_stop() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+
+    app.goal_mode = Some(GoalState {
+        objective: "x".to_string(),
+        iteration: 3,
+        max: 20,
+    });
+    app.sending = true;
+
+    app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+        .await
+        .unwrap();
+    assert!(app.goal_stop_confirm_pending, "first Esc arms the confirm");
+    assert!(app.goal_mode.is_some(), "loop still armed after one Esc");
+    assert!(app.sending, "turn not interrupted by one Esc");
+    assert!(app.notice.is_some());
+
+    app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+        .await
+        .unwrap();
+    assert!(!app.goal_stop_confirm_pending);
+    assert!(app.goal_mode.is_none(), "second Esc stops the loop");
+    assert!(!app.sending, "second Esc interrupts the turn");
+}
+
+/// A non-Esc key between the two Esc presses disarms the confirm, so the loop
+/// keeps running and the next Esc re-arms rather than stopping.
+#[tokio::test]
+async fn test_goal_esc_confirm_resets_on_other_key() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+
+    app.goal_mode = Some(GoalState {
+        objective: "x".to_string(),
+        iteration: 3,
+        max: 20,
+    });
+    app.sending = true;
+
+    app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+        .await
+        .unwrap();
+    assert!(app.goal_stop_confirm_pending);
+
+    app.handle_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE))
+        .await
+        .unwrap();
+    assert!(
+        !app.goal_stop_confirm_pending,
+        "other key disarms the confirm"
+    );
+    assert!(app.notice.is_none(), "confirm notice cleared");
+    assert!(app.goal_mode.is_some(), "loop untouched");
+    assert!(app.sending);
 }
 
 /// The goal turn's marker ends the loop even when a queued user message already

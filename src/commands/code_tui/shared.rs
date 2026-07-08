@@ -2146,6 +2146,8 @@ pub(super) struct CodeTuiApp {
     /// the key/mouse "split active" signal — a draw always precedes input.
     pub(super) overlay_detail_area: Option<Rect>,
     pub(super) exit_confirm_pending: bool,
+    /// Armed by one Esc during a `/goal` turn; a second consecutive Esc stops the loop.
+    pub(super) goal_stop_confirm_pending: bool,
     /// Ctrl+X pressed; the next key completes (Ctrl+E → external editor) or cancels the chord.
     pub(super) pending_ctrl_x: bool,
     /// Chord fired: the event loop opens the draft in $VISUAL/$EDITOR before the next repaint.
