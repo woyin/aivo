@@ -491,6 +491,13 @@ impl CodeSessionStore {
             .map(|s| s.created_at.clone())
             .filter(|c| !c.is_empty())
             .unwrap_or_else(|| now.clone());
+        // Preserve the origin cwd (set once, at creation) so resuming from another
+        // dir can't re-home the session out of `/resume` + `-c`.
+        let cwd = existing
+            .as_ref()
+            .map(|s| s.cwd.clone())
+            .filter(|c| !c.is_empty())
+            .unwrap_or_else(|| cwd.to_string());
         // Preserve any durable agent-engine transcript across this (text-only) save
         // so a per-turn or heartbeat persist can't wipe it; `save_agent_messages`
         // refreshes it after a turn (when the engine is lockable).
@@ -1171,6 +1178,56 @@ mod tests {
         assert_eq!(updated.created_at, original_created);
         // updated_at should be different (or at least not earlier)
         assert!(updated.updated_at >= original_created);
+    }
+
+    #[tokio::test]
+    async fn save_session_preserves_origin_cwd_across_resume() {
+        let temp_dir = TempDir::new().unwrap();
+        let (store, key_id) = setup_store_with_key(&temp_dir).await;
+
+        store
+            .save_code_session_with_id(
+                &key_id,
+                "http://localhost",
+                "/tmp/origin",
+                "sess1",
+                "gpt-4o",
+                None,
+                &sample_messages(),
+                "title",
+                "preview",
+                SessionTokens::default(),
+            )
+            .await
+            .unwrap();
+
+        // Resume from a different dir must not re-home the session.
+        store
+            .save_code_session_with_id(
+                &key_id,
+                "http://localhost",
+                "/tmp/elsewhere",
+                "sess1",
+                "gpt-4o",
+                None,
+                &sample_messages(),
+                "title2",
+                "preview2",
+                SessionTokens::default(),
+            )
+            .await
+            .unwrap();
+
+        let file = store.get_code_session("sess1").await.unwrap().unwrap();
+        assert_eq!(file.cwd, "/tmp/origin");
+        let entry = store
+            .all_chat_sessions()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|e| e.session_id == "sess1")
+            .unwrap();
+        assert_eq!(entry.cwd, "/tmp/origin");
     }
 
     #[tokio::test]

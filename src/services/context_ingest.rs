@@ -1714,6 +1714,29 @@ async fn extract_code_thread(
     })
 }
 
+/// Code sessions matching a session-id prefix, cwd-agnostic — the global
+/// fallback for an explicit `--context=<id>` (parity with `/resume <id>`).
+pub async fn code_threads_by_id_global(
+    store: &SessionStore,
+    id_prefix: &str,
+    permissive: bool,
+) -> Vec<Thread> {
+    let mut entries = match store.all_chat_sessions().await {
+        Ok(e) => e,
+        Err(_) => return Vec::new(),
+    };
+    entries.retain(|e| e.session_id.starts_with(id_prefix));
+    entries.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+
+    let mut out = Vec::new();
+    for entry in entries {
+        if let Some(thread) = extract_code_thread(store, &entry, permissive).await {
+            out.push(thread);
+        }
+    }
+    out
+}
+
 // ---------------------------------------------------------------------------
 // Filesystem walking — newest-first
 // ---------------------------------------------------------------------------
@@ -2207,6 +2230,44 @@ mod tests {
         assert!(t.topic.contains("webhook retry queue"));
         assert!(t.last_response.contains("exponential backoff"));
         assert_eq!(t.cwd.as_deref(), Some(cwd.as_str()));
+    }
+
+    #[tokio::test]
+    async fn code_threads_by_id_global_ignores_cwd() {
+        let config_dir = TempDir::new().unwrap();
+        let store = SessionStore::with_path(config_dir.path().join("config.json"));
+
+        save_code_session(
+            &store,
+            "/project/one",
+            "aaaa1111-one",
+            &[
+                stored_msg("user", "first"),
+                stored_msg("assistant", "ok one"),
+            ],
+        )
+        .await;
+        save_code_session(
+            &store,
+            "/project/two",
+            "bbbb2222-two",
+            &[
+                stored_msg("user", "second"),
+                stored_msg("assistant", "ok two"),
+            ],
+        )
+        .await;
+
+        // A prefix from a foreign dir resolves — the `--context=<id>` fallback.
+        let hits = code_threads_by_id_global(&store, "bbbb2222", true).await;
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].session_id, "bbbb2222-two");
+
+        assert!(
+            code_threads_by_id_global(&store, "cccc3333", true)
+                .await
+                .is_empty()
+        );
     }
 
     #[tokio::test]

@@ -9,7 +9,9 @@ use crate::commands::models::resolve_model_placeholder;
 use crate::commands::{print_launch_preview, trim_to_one_line};
 use crate::errors::ExitCode;
 use crate::services::ai_launcher::{AILauncher, AIToolType, LaunchOptions};
-use crate::services::context_ingest::{IngestOptions, ingest_project_with_code};
+use crate::services::context_ingest::{
+    IngestOptions, code_threads_by_id_global, ingest_project_with_code,
+};
 use crate::services::context_render::{RenderedContext, render_single_session};
 use crate::services::environment_injector::{ClaudeModelOverrides, ClaudeSlotFlags};
 use crate::services::http_utils;
@@ -702,7 +704,23 @@ pub(crate) async fn resolve_context_thread(
     match select_thread(&threads, selector) {
         SelectOutcome::Picked(t) => ContextResolution::Selected(t.clone()),
         SelectOutcome::Cancelled => ContextResolution::Cancelled,
-        SelectOutcome::Err(msg) => ContextResolution::Unavailable(msg),
+        SelectOutcome::Err(msg) => {
+            // An explicit id missing here may name a session filed under another
+            // dir — retry globally before giving up (parity with `/resume <id>`).
+            let id = selector.trim();
+            if id.is_empty() {
+                return ContextResolution::Unavailable(msg);
+            }
+            let global = code_threads_by_id_global(store, id, true).await;
+            match select_thread(&global, id) {
+                SelectOutcome::Picked(t) => ContextResolution::Selected(t.clone()),
+                SelectOutcome::Cancelled => ContextResolution::Cancelled,
+                // No global hit → keep the in-project message; an ambiguous
+                // global prefix surfaces its own.
+                SelectOutcome::Err(_) if global.is_empty() => ContextResolution::Unavailable(msg),
+                SelectOutcome::Err(global_msg) => ContextResolution::Unavailable(global_msg),
+            }
+        }
     }
 }
 
@@ -792,7 +810,7 @@ fn select_thread<'a>(threads: &'a [Thread], selector: &str) -> SelectOutcome<'a>
         .collect();
     match matches.len() {
         0 => SelectOutcome::Err(format!(
-            "No session matches id prefix '{}' in this project. Run `aivo logs` to see available ids (sessions from other directories don't count).",
+            "No session matches id prefix '{}'. Run `aivo logs` to see available ids.",
             selector
         )),
         1 => SelectOutcome::Picked(matches[0]),
