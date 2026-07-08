@@ -1,5 +1,6 @@
 //! UpdateCommand handler for CLI self-update functionality.
 use std::env;
+#[cfg(not(windows))]
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::process::Command;
