@@ -9,7 +9,6 @@ use crate::agent::protocol::ToolSpec;
 use crate::agent::sandbox;
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -177,21 +176,16 @@ check_job {{\"id\": \"…\", \"kill\": true}} before starting another."
             .try_clone()
             .map_err(|e| format!("clone job log handle: {e}"))?;
 
-        // Build a std Command (process_group lives on std CommandExt), then convert to
-        // tokio — `From` preserves args/env/stdio/process_group.
+        // Skips `interactive_block_reason`: servers/watchers are the point, and with
+        // stdin null a stray prompt hits EOF and exits rather than hanging.
         let inv = sandbox::wrap_shell(command, cwd);
         let mut cmd = std::process::Command::new(&inv.program);
-        cmd.args(&inv.args)
-            .current_dir(cwd)
-            .env("GIT_TERMINAL_PROMPT", "0")
-            .stdin(Stdio::null())
-            .stdout(log_file) // shared file description → offset-safe interleave
+        cmd.args(&inv.args).current_dir(cwd);
+        sandbox::harden_headless(&mut cmd);
+        cmd.stdout(log_file) // shared file description → offset-safe interleave
             .stderr(log_err);
         #[cfg(unix)]
-        {
-            cmd.process_group(0); // leader pgid == pid → tree-kill via -pgid
-            cmd.env("GIT_EDITOR", "true").env("PAGER", "cat");
-        }
+        cmd.process_group(0); // leader pgid == pid → tree-kill via -pgid
         let mut cmd = tokio::process::Command::from(cmd);
         cmd.kill_on_drop(false); // detached BY DESIGN — kill/kill_all is the one cleanup path
         let child = cmd
@@ -236,7 +230,15 @@ unsandboxed escalation.",
         out.push_str("\n--- log tail ---\n");
         let tail = read_tail(&job.log_path);
         if tail.trim().is_empty() {
-            out.push_str("(no output yet)");
+            // Empty doesn't mean stuck: stdout can be block-buffered with the
+            // startup line still unflushed, so say so rather than imply failure.
+            out.push_str(match job.status {
+                JobStatus::Running => {
+                    "(no output captured yet — the program may be buffering stdout; a server \
+can be up before its startup line flushes. Probe it directly, e.g. curl the port, to confirm.)"
+                }
+                _ => "(no output)",
+            });
         } else {
             out.push_str(&tail);
         }
@@ -280,19 +282,11 @@ unsandboxed escalation.",
             return Ok(format!("killed job {id} ({command})."));
         };
         let job = &mut inner.jobs[idx];
-        reap(job);
-        // Keep a clean self-exit's code; a signal death (incl. our TERM/KILL) or unreaped job is a kill.
-        if !matches!(job.status, JobStatus::Exited(Some(_))) {
-            job.ended_at.get_or_insert_with(Instant::now);
-            job.status = JobStatus::Killed;
-        }
+        finalize_killed(job);
         let ran = fmt_dur(job.runtime());
         Ok(match &job.status {
             JobStatus::Exited(Some(c)) => {
                 format!("job {id} ({command}) stopped — exited with code {c} after {ran}.")
-            }
-            JobStatus::Exited(None) => {
-                format!("job {id} ({command}) stopped — exited (signal) after {ran}.")
             }
             _ => format!("killed job {id} ({command}) after {ran}."),
         })
@@ -300,22 +294,23 @@ unsandboxed escalation.",
 
     /// TERM every running group, ONE shared (polled) grace, KILL survivors; returns how many were running.
     pub async fn kill_all(&self) -> usize {
-        let count = {
+        // Capture the ids WE signal — only those may be relabeled `Killed`; a job that
+        // signal-died before this call keeps its own `Exited(None)`.
+        let signaled: Vec<String> = {
             let mut inner = self.inner.lock().unwrap();
             inner.reap_all();
-            let running: Vec<usize> = inner
+            let running: Vec<String> = inner
                 .jobs
                 .iter()
-                .enumerate()
-                .filter(|(_, j)| matches!(j.status, JobStatus::Running))
-                .map(|(i, _)| i)
+                .filter(|j| matches!(j.status, JobStatus::Running))
+                .map(|j| j.id.clone())
                 .collect();
-            for &i in &running {
-                first_kill_signal(&inner.jobs[i]);
+            for job in inner.jobs.iter().filter(|j| running.contains(&j.id)) {
+                first_kill_signal(job);
             }
-            running.len()
+            running
         };
-        if count == 0 {
+        if signaled.is_empty() {
             return 0;
         }
 
@@ -334,49 +329,43 @@ unsandboxed escalation.",
 
         let mut inner = self.inner.lock().unwrap();
         for job in &mut inner.jobs {
-            reap(job);
-            if !matches!(job.status, JobStatus::Exited(Some(_))) {
-                job.ended_at.get_or_insert_with(Instant::now);
-                job.status = JobStatus::Killed;
+            if signaled.contains(&job.id) {
+                finalize_killed(job);
             }
         }
-        count
+        signaled.len()
     }
 
     /// Poll job `id` up to `budget` (reaping under the lock); `true` once terminal/gone.
     async fn wait_for_exit(&self, id: &str, budget: Duration) -> bool {
-        let start = Instant::now();
-        loop {
-            {
-                let mut inner = self.inner.lock().unwrap();
-                match inner.jobs.iter_mut().find(|j| j.id == id) {
-                    Some(job) => {
-                        reap(job);
-                        if !matches!(job.status, JobStatus::Running) {
-                            return true;
-                        }
-                    }
-                    None => return true,
+        self.poll_until(budget, |inner| {
+            match inner.jobs.iter_mut().find(|j| j.id == id) {
+                Some(job) => {
+                    reap(job);
+                    !matches!(job.status, JobStatus::Running)
                 }
+                None => true,
             }
-            let elapsed = start.elapsed();
-            if elapsed >= budget {
-                return false;
-            }
-            tokio::time::sleep(KILL_POLL.min(budget - elapsed)).await;
-        }
+        })
+        .await
     }
 
     /// Poll all jobs up to `budget`; `true` once none are running.
     async fn wait_all_exited(&self, budget: Duration) -> bool {
+        self.poll_until(budget, |inner| {
+            inner.reap_all();
+            inner.running_count() == 0
+        })
+        .await
+    }
+
+    /// Re-lock + `done` each poll tick until it's true or `budget` runs out; the sleep
+    /// clamp keeps the final tick from overshooting the budget.
+    async fn poll_until(&self, budget: Duration, mut done: impl FnMut(&mut Inner) -> bool) -> bool {
         let start = Instant::now();
         loop {
-            {
-                let mut inner = self.inner.lock().unwrap();
-                inner.reap_all();
-                if inner.running_count() == 0 {
-                    return true;
-                }
+            if done(&mut self.inner.lock().unwrap()) {
+                return true;
             }
             let elapsed = start.elapsed();
             if elapsed >= budget {
@@ -426,6 +415,16 @@ fn reap(job: &mut Job) {
     }
 }
 
+/// Only call on jobs WE signaled: a clean self-exit keeps its code, anything
+/// else (our signal or a still-unreaped job) is recorded as `Killed`.
+fn finalize_killed(job: &mut Job) {
+    reap(job);
+    if !matches!(job.status, JobStatus::Exited(Some(_))) {
+        job.ended_at.get_or_insert_with(Instant::now);
+        job.status = JobStatus::Killed;
+    }
+}
+
 fn first_kill_signal(job: &Job) {
     #[cfg(unix)]
     signal_group(job.pgid, libc::SIGTERM);
@@ -458,8 +457,8 @@ fn signal_group(pgid: i32, sig: i32) {
 fn taskkill_tree(pid: u32) -> bool {
     std::process::Command::new("taskkill")
         .args(["/T", "/F", "/PID", &pid.to_string()])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
         .status()
         .is_ok()
 }
@@ -655,10 +654,16 @@ mod tests {
     async fn jobs_prune_bounds_finished() {
         let dir = tmp();
         let jobs = table(&dir);
-        // Spawn well past the finished cap; each exits immediately.
+        // Spawn well past the finished cap; each exits immediately. Wait for each to
+        // be reaped before the next spawn — a fixed sleep flakes under suite load.
         for _ in 0..(MAX_FINISHED_JOBS + 4) {
             jobs.spawn("exit 0", &dir).unwrap();
-            tokio::time::sleep(Duration::from_millis(5)).await;
+            for _ in 0..200 {
+                if jobs.running_count() == 0 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
         }
         // The oldest finished job has been pruned; a recent id is still queryable.
         assert!(jobs.check("j1").is_err(), "oldest finished job pruned");
@@ -708,7 +713,38 @@ mod tests {
     #[test]
     fn jobs_logs_root_falls_back_to_temp() {
         let jobs = JobTable::new(None);
+        assert!(
+            jobs.logs_root().starts_with(std::env::temp_dir()),
+            "None must resolve under temp_dir: {}",
+            jobs.logs_root().display()
+        );
         assert_eq!(jobs.running_count(), 0);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn jobs_check_reads_output_while_running() {
+        let dir = tmp();
+        let jobs = table(&dir);
+        jobs.spawn("echo ready; sleep 30", &dir).unwrap();
+        let check = wait_for(&jobs, "j1", "ready").await;
+        assert!(check.contains("running"), "still running: {check}");
+        assert!(check.contains("ready"), "live output visible: {check}");
+        jobs.kill("j1").await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn jobs_empty_tail_mentions_buffering_while_running() {
+        let dir = tmp();
+        let jobs = table(&dir);
+        jobs.spawn("sleep 30", &dir).unwrap();
+        let check = jobs.check("j1").unwrap();
+        assert!(
+            check.contains("buffering stdout"),
+            "buffering hint missing: {check}"
+        );
+        jobs.kill("j1").await.unwrap();
     }
 
     #[cfg(unix)]

@@ -2262,19 +2262,14 @@ async fn run_bash_inner(args: &Value, cwd: &Path, confined: bool) -> BashOutcome
     } else {
         crate::agent::sandbox::bare_shell(command)
     };
-    let mut builder = tokio::process::Command::new(&spawn.program);
-    builder
-        .args(&spawn.args)
-        .current_dir(cwd)
-        // Make common headless git hangs fail fast instead of blocking on a prompt.
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true);
-    // Unix-only: `true`/`cat` aren't launchable as editor/pager on Windows.
-    #[cfg(unix)]
-    builder.env("GIT_EDITOR", "true").env("PAGER", "cat");
+    // Std builder first so the anti-hang hardening is shared with background jobs
+    // (one drift-proof site); the tokio conversion preserves args/env/stdio.
+    let mut builder = std::process::Command::new(&spawn.program);
+    builder.args(&spawn.args).current_dir(cwd);
+    crate::agent::sandbox::harden_headless(&mut builder);
+    builder.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut builder = tokio::process::Command::from(builder);
+    builder.kill_on_drop(true);
     let child = match builder.spawn() {
         Ok(c) => c,
         Err(e) => return early(Err(format!("spawn shell: {e}"))),

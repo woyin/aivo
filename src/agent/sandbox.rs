@@ -56,6 +56,16 @@ pub struct ShellInvocation {
     pub args: Vec<String>,
 }
 
+/// Anti-hang hardening shared by every agent shell spawn: stdin closed,
+/// prompt-capable tools forced non-interactive. Grow it here, not per call site.
+pub(crate) fn harden_headless(cmd: &mut std::process::Command) {
+    cmd.env("GIT_TERMINAL_PROMPT", "0")
+        .stdin(std::process::Stdio::null());
+    // Unix-only: `true`/`cat` aren't launchable as editor/pager on Windows.
+    #[cfg(unix)]
+    cmd.env("GIT_EDITOR", "true").env("PAGER", "cat");
+}
+
 /// Whether a write-confining sandbox is active for this process. Used by
 /// `run_bash` to add a hint when a command likely failed because the sandbox
 /// blocked a write.

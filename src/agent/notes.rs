@@ -69,24 +69,27 @@ pub fn parse_note(args: &Value) -> Result<Note, String> {
 }
 
 /// Deterministic merge: same id → update in place; same normalized text → refresh
-/// recency; else append (capped oldest-first).
+/// recency; else append (capped oldest-first). Ids are the model's handles, so
+/// text collisions only dedup id-less notes.
 pub fn merge_note(notes: &mut Vec<Note>, new: Note, cap: usize) -> MergeOutcome {
     if let Some(id) = &new.id
         && let Some(pos) = notes.iter().position(|n| n.id.as_deref() == Some(id))
     {
         notes[pos].text = new.text;
-        // Drop any OTHER note the update now duplicates, so the no-near-duplicates invariant holds.
+        // Drop an id-LESS note the update now duplicates; a distinctly-id'd one stays.
         let id = id.clone();
         let norm = normalized(&notes[pos].text);
-        notes.retain(|n| n.id.as_deref() == Some(&id) || normalized(&n.text) != norm);
+        notes.retain(|n| n.id.is_some() || normalized(&n.text) != norm);
         return MergeOutcome::Updated(id);
     }
-    if let Some(pos) = notes
-        .iter()
-        .position(|n| normalized(&n.text) == normalized(&new.text))
-    {
+    let new_norm = normalized(&new.text);
+    if let Some(pos) = notes.iter().position(|n| {
+        // A duplicate text refreshes only when the ids can't conflict (same-id was
+        // handled above, so both-Some here means two distinct handles → keep both).
+        normalized(&n.text) == new_norm && (n.id.is_none() || new.id.is_none())
+    }) {
         let mut existing = notes.remove(pos);
-        existing.id = existing.id.or(new.id); // adopt a new id if the old had none
+        existing.id = existing.id.or(new.id); // adopt the incoming id if the old had none
         notes.push(existing);
         return MergeOutcome::Refreshed;
     }
@@ -180,6 +183,52 @@ mod tests {
         assert_eq!(notes.len(), 1, "the duplicate note is dropped");
         assert_eq!(notes[0].id.as_deref(), Some("auth"));
         assert_eq!(notes[0].text, "use JWT");
+    }
+
+    #[test]
+    fn merge_by_id_preserves_distinctly_id_note_on_text_collision() {
+        let mut notes = vec![
+            Note {
+                id: Some("db".into()),
+                text: "use postgres".into(),
+            },
+            Note {
+                id: Some("auth".into()),
+                text: "use sessions".into(),
+            },
+        ];
+        // Updating "auth" to text matching the "db" note must NOT delete "db" — ids are handles.
+        let out = merge_note(
+            &mut notes,
+            Note {
+                id: Some("auth".into()),
+                text: "use postgres".into(),
+            },
+            50,
+        );
+        assert!(matches!(out, MergeOutcome::Updated(id) if id == "auth"));
+        assert_eq!(notes.len(), 2, "the distinctly-id'd note survives");
+        assert_eq!(notes[0].id.as_deref(), Some("db"));
+        assert_eq!(notes[0].text, "use postgres");
+    }
+
+    #[test]
+    fn merge_distinct_ids_same_text_stay_separate() {
+        let mut notes = vec![Note {
+            id: Some("db".into()),
+            text: "use postgres".into(),
+        }];
+        // A NEW id with colliding text is appended, not folded into the other handle.
+        let out = merge_note(
+            &mut notes,
+            Note {
+                id: Some("infra".into()),
+                text: "use postgres".into(),
+            },
+            50,
+        );
+        assert!(matches!(out, MergeOutcome::Added(2)));
+        assert_eq!(notes[1].id.as_deref(), Some("infra"));
     }
 
     #[test]

@@ -48,12 +48,12 @@ fn signals_goal_complete(text: &str) -> bool {
 
 /// `AIVO_AGENT_SELF_CORRECT=1` — post-edit verification in interactive turns (parity with one-shot).
 fn env_self_correct() -> bool {
-    std::env::var("AIVO_AGENT_SELF_CORRECT").is_ok_and(|v| !v.is_empty() && v != "0")
+    crate::services::system_env::env_flag("AIVO_AGENT_SELF_CORRECT").unwrap_or(false)
 }
 
 /// Goal mode verifies at declared-done by default; `AIVO_GOAL_VERIFY=0` opts out.
 fn goal_verify_enabled() -> bool {
-    std::env::var("AIVO_GOAL_VERIFY").map_or(true, |v| v != "0")
+    crate::services::system_env::env_flag("AIVO_GOAL_VERIFY").unwrap_or(true)
 }
 
 /// Build the message a `/<skill> [args]` invocation sends to the model. If the
@@ -1717,12 +1717,26 @@ impl CodeTuiApp {
             ));
             return Ok(());
         }
-        // A guard-stopped turn steers the next one away from the dead end.
+        // An early-stopped turn steers the next one instead of blindly continuing.
         let continuation = match self.goal_guard_stop.take() {
-            Some(stop) => format!(
-                "[Previous turn stopped early: {stop}. Do NOT retry the same approach — pick a \
-different one, and record the dead end with take_note.]\n\n{GOAL_CONTINUE}"
-            ),
+            Some(stop) => {
+                use crate::agent::engine::TurnStop;
+                let steer = match stop {
+                    TurnStop::NoProgress => {
+                        "it repeated the same action without progress. Do NOT retry the same \
+approach — pick a different one, and record the dead end with take_note"
+                    }
+                    TurnStop::ToolFailureLoop => {
+                        "a tool call kept failing the same way. Do NOT retry the same call — \
+fix the input or pick another route, and record the dead end with take_note"
+                    }
+                    TurnStop::StepLimit => {
+                        "it ran out of steps mid-work. Break the remaining work into smaller \
+pieces and keep going"
+                    }
+                };
+                format!("[Previous turn stopped early: {steer}.]\n\n{GOAL_CONTINUE}")
+            }
             None => GOAL_CONTINUE.to_string(),
         };
         // Machine text: record nothing (↑/↓ recall) and stash the composer so the
@@ -2465,6 +2479,10 @@ impl crate::agent::engine::AgentUi for ChatAgentUi {
         self.tx
             .send(RuntimeEvent::AgentError(text.to_string()))
             .ok();
+    }
+
+    fn turn_stopped(&mut self, stop: crate::agent::engine::TurnStop) {
+        self.tx.send(RuntimeEvent::AgentTurnStop(stop)).ok();
     }
 
     fn footer(

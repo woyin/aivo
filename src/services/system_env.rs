@@ -64,6 +64,20 @@ pub fn username() -> Option<String> {
     }
 }
 
+/// Parse an on/off env flag; `None` means unset/empty (caller's default applies).
+/// The one truthiness rule — hand-rolled per-site checks used to drift.
+pub fn env_flag(var: &str) -> Option<bool> {
+    let v = std::env::var(var).ok()?;
+    let v = v.trim();
+    if v.is_empty() {
+        return None;
+    }
+    Some(!matches!(
+        v.to_ascii_lowercase().as_str(),
+        "0" | "false" | "no" | "off"
+    ))
+}
+
 /// Returns true if a process with `pid` is still alive on this system. Used
 /// to prune stale registry entries and detect orphaned helper processes.
 pub fn is_pid_alive(pid: u32) -> bool {

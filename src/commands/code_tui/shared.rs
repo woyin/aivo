@@ -223,7 +223,7 @@ pub(super) const SLASH_COMMANDS: &[SlashCommandSpec] = &[
     SlashCommandSpec {
         name: "goal",
         help_label: "/goal <objective>",
-        description: "work autonomously toward a goal, verifying tests each step, until done",
+        description: "work autonomously toward a goal until done (project tests run after edits, when detected)",
         takes_argument: true,
     },
     SlashCommandSpec {
@@ -1774,6 +1774,8 @@ pub(super) enum RuntimeEvent {
     AgentPlan(serde_json::Value),
     /// Engine status line (compaction, step limit, …) — shown as a notice.
     AgentNotice(String),
+    /// The engine ended the turn early (guard stop / step limit) — typed, for /goal steering.
+    AgentTurnStop(crate::agent::engine::TurnStop),
     /// A mutating tool needs approval. The event loop shows a permission card
     /// and replies with the decision; the engine task awaits `reply`.
     AgentPermission {
@@ -2164,7 +2166,7 @@ pub(super) struct CodeTuiApp {
     /// interrupt, `/new`, resume, or a key/model switch.
     pub(super) goal_mode: Option<GoalState>,
     /// Last turn's engine guard-stop, consumed by the `/goal` continuation to steer past a dead end.
-    pub(super) goal_guard_stop: Option<String>,
+    pub(super) goal_guard_stop: Option<crate::agent::engine::TurnStop>,
     /// Plan mode is on: read-only, persists across turns/interrupts until the plan
     /// is approved or `/plan stop`.
     pub(super) plan_mode: bool,
@@ -2288,8 +2290,10 @@ pub(super) struct CodeTuiApp {
     pub(super) local_command: Option<LocalCommandRun>,
     /// App-owned background-job table; never rebuilt (jobs survive `/new`/switches), killed at exit.
     pub(super) jobs: crate::agent::jobs::SharedJobs,
-    /// Running-job count, refreshed once per event-loop tick (which reaps); render reads this field.
+    /// Running-job count; refreshed (and reaped) on a ~250ms throttle; render reads this field.
     pub(super) jobs_running: usize,
+    /// Last job-table poll — bounds the reap sweep to ~4Hz (the input-repaint tick is ~1ms).
+    pub(super) last_jobs_poll: std::time::Instant,
     /// FULL output of each finished `!cmd`, keyed by the history index of its
     /// `local_command` entry — the source an expanded block renders from (the
     /// transcript and on-disk session keep only a bounded preview). In-memory only,

@@ -108,6 +108,11 @@ pub(crate) async fn run_one_shot_agent(
     // Background-job table (temp logs — one-shots have no session dir); killed at run end.
     let jobs = crate::agent::jobs::JobTable::new(None);
     engine.set_jobs(jobs.clone());
+    // Durable sub-agent reports, same temp-dir arrangement: without this, a long
+    // headless run's delegated work gets stubbed away by in-run compaction.
+    engine.set_artifacts_dir(
+        std::env::temp_dir().join(format!("aivo-artifacts-{}", std::process::id())),
+    );
     // Opt-in LSP diagnostics-after-edit (AIVO_AGENT_LSP=1).
     engine.maybe_enable_lsp(Path::new(&cwd));
 

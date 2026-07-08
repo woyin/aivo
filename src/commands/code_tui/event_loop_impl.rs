@@ -129,14 +129,10 @@ impl CodeTuiApp {
             RuntimeEvent::AgentNotice(text) => {
                 // A connection-retry notice means we're recovering, not thinking.
                 self.retrying = text.contains("retrying");
-                // Guard-stops are MUTED, not errors — remember one for the /goal continuation.
-                if text == crate::agent::engine::STOP_NO_PROGRESS
-                    || text == crate::agent::engine::STOP_TOOL_FAILURE
-                {
-                    self.goal_guard_stop = Some(text.clone());
-                }
                 self.notice = Some((MUTED, text));
             }
+            // Typed early-stop (guard stop / step limit) — remembered for /goal steering.
+            RuntimeEvent::AgentTurnStop(stop) => self.goal_guard_stop = Some(stop),
             RuntimeEvent::AgentError(text) => self.notice = Some((ERROR, text)),
             RuntimeEvent::AgentPermission {
                 tool,
@@ -1391,11 +1387,15 @@ impl CodeTuiApp {
 
             self.tick_status_throttle();
 
-            // Refresh the cached job count once per tick (this reaps), so render just reads a field.
-            let jobs_running = self.jobs.running_count();
-            if jobs_running != self.jobs_running {
-                self.jobs_running = jobs_running;
-                needs_redraw = true;
+            // Refresh the cached job count (this reaps) at most every 250ms — a badge
+            // needs no tick-rate waitpid sweeps, and the input-repaint tick runs at ~1ms.
+            if self.last_jobs_poll.elapsed() >= Duration::from_millis(250) {
+                self.last_jobs_poll = std::time::Instant::now();
+                let jobs_running = self.jobs.running_count();
+                if jobs_running != self.jobs_running {
+                    self.jobs_running = jobs_running;
+                    needs_redraw = true;
+                }
             }
 
             // Rotate the welcome tip on its interval (cheap at the idle cadence).

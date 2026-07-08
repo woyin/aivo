@@ -1487,6 +1487,7 @@ fn make_test_app(
         pending_mcp_consent: None,
         local_command: None,
         jobs: crate::agent::jobs::JobTable::new(None),
+        last_jobs_poll: std::time::Instant::now(),
         jobs_running: 0,
         local_outputs: std::collections::HashMap::new(),
         expanded_output: std::collections::HashSet::new(),
@@ -8435,7 +8436,7 @@ async fn test_goal_guard_stop_enriches_continuation() {
         iteration: 1,
         max: 20,
     });
-    app.goal_guard_stop = Some(crate::agent::engine::STOP_NO_PROGRESS.to_string());
+    app.goal_guard_stop = Some(crate::agent::engine::TurnStop::NoProgress);
     app.history.push(ChatMessage {
         model: None,
         role: "assistant".to_string(),
@@ -8464,6 +8465,37 @@ async fn test_goal_guard_stop_enriches_continuation() {
     );
 }
 
+/// A step-limit stop — which the old text-match silently ignored — also steers the
+/// continuation, telling the model to break the work into smaller pieces.
+#[tokio::test]
+async fn test_goal_step_limit_steers_continuation() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.key.base_url = "claude-oauth".to_string();
+    app.goal_mode = Some(GoalState {
+        objective: "x".to_string(),
+        iteration: 1,
+        max: 20,
+    });
+    app.goal_guard_stop = Some(crate::agent::engine::TurnStop::StepLimit);
+    app.history.push(ChatMessage {
+        model: None,
+        role: "assistant".to_string(),
+        content: "still working".to_string(),
+        reasoning_content: None,
+        attachments: vec![],
+    });
+
+    app.maybe_continue_goal().await.unwrap();
+
+    let last = app.history.last().unwrap();
+    assert!(
+        last.content.contains("ran out of steps"),
+        "step-limit gets its own steering: {}",
+        last.content
+    );
+}
+
 /// Starting a fresh `/goal` clears any stale guard-stop from a prior loop.
 #[tokio::test]
 async fn test_goal_guard_stop_cleared_on_new_goal() {
@@ -8485,7 +8517,7 @@ async fn test_goal_guard_stop_cleared_on_new_goal() {
             },
         }],
     });
-    app.goal_guard_stop = Some(crate::agent::engine::STOP_TOOL_FAILURE.to_string());
+    app.goal_guard_stop = Some(crate::agent::engine::TurnStop::ToolFailureLoop);
 
     app.run_goal_command(Some("do the thing".to_string())).await;
 

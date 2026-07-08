@@ -80,6 +80,17 @@ impl CodeSessionStore {
         self.sessions_dir().join("artifacts").join(session_id)
     }
 
+    /// The one place session deletion happens, so artifacts can't orphan. Artifacts
+    /// are best-effort; the file result is returned (already-gone counts as success).
+    async fn delete_session_files(&self, session_id: &str) -> std::io::Result<()> {
+        let file = match tokio::fs::remove_file(self.session_file_path(session_id)).await {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
+            _ => Ok(()),
+        };
+        let _ = tokio::fs::remove_dir_all(self.session_artifacts_dir(session_id)).await;
+        file
+    }
+
     fn index_path(&self) -> PathBuf {
         self.sessions_dir().join("index.json")
     }
@@ -270,9 +281,7 @@ impl CodeSessionStore {
 
         // Delete session files (and any durable artifacts alongside them).
         for session_id in &to_delete {
-            let path = self.session_file_path(session_id);
-            let _ = tokio::fs::remove_file(&path).await;
-            let _ = tokio::fs::remove_dir_all(self.session_artifacts_dir(session_id)).await;
+            let _ = self.delete_session_files(session_id).await;
         }
 
         // Prune index
@@ -632,13 +641,10 @@ impl CodeSessionStore {
 
         let path = self.session_file_path(session_id);
         let existed = path.exists();
-        if existed {
-            tokio::fs::remove_file(&path)
-                .await
-                .with_context(|| format!("Failed to delete session file: {:?}", path))?;
-        }
-        // Best-effort: drop the session's durable artifacts (never fail the delete).
-        let _ = tokio::fs::remove_dir_all(self.session_artifacts_dir(session_id)).await;
+        // Hard-fail on the file (user-facing delete must not silently no-op).
+        self.delete_session_files(session_id)
+            .await
+            .with_context(|| format!("Failed to delete session file: {:?}", path))?;
 
         let mut index = self.load_index().await.unwrap_or_default();
         let before = index.entries.len();
@@ -661,8 +667,7 @@ impl CodeSessionStore {
             .map(|e| e.session_id.clone())
             .collect();
         for session_id in &to_delete {
-            let _ = tokio::fs::remove_file(self.session_file_path(session_id)).await;
-            let _ = tokio::fs::remove_dir_all(self.session_artifacts_dir(session_id)).await;
+            let _ = self.delete_session_files(session_id).await;
         }
         index.entries.retain(|e| e.key_id != key_id);
         if !to_delete.is_empty() {
@@ -904,8 +909,44 @@ mod tests {
         assert!(!art.exists(), "artifacts dir should be pruned on delete");
     }
 
+    /// Cap eviction is the one deletion path with no user in the loop.
     #[tokio::test]
-    async fn prune_removes_artifacts_dir() {
+    async fn eviction_removes_artifacts_dir() {
+        let temp_dir = TempDir::new().unwrap();
+        let (store, key_id) = setup_store_with_key(&temp_dir).await;
+        // 21 sessions in ONE (key, cwd) scope → the oldest is evicted at cap 20.
+        for i in 0..21 {
+            let sid = format!("sess{i:02}");
+            let art = store.session_artifacts_dir(&sid);
+            std::fs::create_dir_all(&art).unwrap();
+            std::fs::write(art.join("sub-001-x.md"), "report").unwrap();
+            store
+                .save_code_session_with_id(
+                    &key_id,
+                    "http://localhost",
+                    "/tmp/test",
+                    &sid,
+                    "gpt-4o",
+                    None,
+                    &sample_messages(),
+                    "hello",
+                    "hello",
+                    SessionTokens::default(),
+                )
+                .await
+                .unwrap();
+        }
+        let artifacts_root = store.session_artifacts_dir("x");
+        let artifacts_root = artifacts_root.parent().unwrap();
+        let remaining = std::fs::read_dir(artifacts_root).unwrap().count();
+        assert_eq!(
+            remaining, 20,
+            "the evicted session's artifacts dir is removed with it"
+        );
+    }
+
+    #[tokio::test]
+    async fn key_removal_removes_artifacts_dir() {
         let temp_dir = TempDir::new().unwrap();
         let (store, key_id) = setup_store_with_key(&temp_dir).await;
         store

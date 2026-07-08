@@ -275,6 +275,7 @@ impl CodeTuiApp {
             local_command: None,
             jobs,
             jobs_running: 0,
+            last_jobs_poll: std::time::Instant::now(),
             local_outputs: std::collections::HashMap::new(),
             expanded_output: std::collections::HashSet::new(),
             expanded_thinking: std::collections::HashSet::new(),

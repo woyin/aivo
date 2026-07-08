@@ -58,7 +58,7 @@ Fix the cause and continue — don't stop until they pass:";
 /// Prefix of the artifact-pointer line; compaction preserves it so the parent can
 /// `read_file` a cleared sub-agent report back.
 pub(crate) const ARTIFACT_POINTER_PREFIX: &str = "[full report saved: ";
-/// Guard-stop notices the `/goal` loop matches on to steer past a dead end.
+/// Guard-stop notice text (display only — drivers get the typed [`TurnStop`]).
 pub(crate) const STOP_NO_PROGRESS: &str =
     "stopping: the model repeated the same action with no progress";
 pub(crate) const STOP_TOOL_FAILURE: &str = "stopping: a tool call kept failing the same way";
@@ -69,6 +69,15 @@ it's done or you're truly blocked (then say exactly what's blocking you).";
 /// Compaction window assumed when the model's real one is unknown (0); without it
 /// such models never compact and resend the whole transcript. A real window wins.
 pub(crate) const DEFAULT_CONTEXT_WINDOW: usize = 128_000;
+
+/// Why a turn ended early, surfaced via [`AgentUi::turn_stopped`]. Typed so a
+/// driver like the `/goal` loop must handle each variant in a `match`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TurnStop {
+    NoProgress,
+    ToolFailureLoop,
+    StepLimit,
+}
 
 /// Cap on force-compact-and-retry attempts per step after an input-overflow rejection.
 const MAX_FORCED_COMPACTIONS: usize = 3;
@@ -120,6 +129,9 @@ pub trait AgentUi: Send {
     fn tool_start(&mut self, name: &str, args: &Value);
     fn tool_result(&mut self, name: &str, result: &Result<String, String>);
     fn notify(&mut self, text: &str);
+    /// The turn ended early for `stop` (also announced via `notify` for display).
+    /// Default no-op.
+    fn turn_stopped(&mut self, _stop: TurnStop) {}
     /// Like [`notify`](Self::notify) but for a genuine error (error hue). Default delegates to `notify`.
     fn notify_error(&mut self, text: &str) {
         self.notify(text);
@@ -360,6 +372,9 @@ pub struct AgentEngine {
     /// Opt-in (`AIVO_AGENT_SELF_CORRECT`): when the agent declares done, run the
     /// project's validator and, on failure, feed it back so it fixes the cause.
     self_correct: bool,
+    /// Gates self-correct so investigate-only turns don't re-run the whole suite.
+    /// Starts true: the tree state is unknown until a first green run baselines it.
+    dirty_since_verify: bool,
     /// Interactive chat only (off for headless/sub-agents): see [`CONFIRM_BEFORE_BUILD`].
     confirm_before_build: bool,
     /// First-party branding (aivo-starter): present as aivo, not the upstream model.
@@ -474,6 +489,7 @@ impl AgentEngine {
             plan_mode_stash: Vec::new(),
             require_completion: false,
             self_correct: false,
+            dirty_since_verify: true,
             confirm_before_build: false,
             first_party: false,
             session_controls: false,
@@ -522,7 +538,7 @@ impl AgentEngine {
     /// Enable LSP diagnostics-after-edit rooted at `cwd` when `AIVO_AGENT_LSP` is set —
     /// after a successful edit, the language server's native errors are fed back.
     pub fn maybe_enable_lsp(&mut self, cwd: &Path) {
-        if std::env::var("AIVO_AGENT_LSP").is_ok_and(|v| v != "0" && !v.is_empty()) {
+        if crate::services::system_env::env_flag("AIVO_AGENT_LSP").unwrap_or(false) {
             let mgr = crate::agent::lsp::LspManager::new(cwd);
             mgr.warm(); // start indexing now so the first edit's check isn't cold
             self.lsp = Some(mgr);
@@ -1338,6 +1354,7 @@ questions.",
                 // A declared-done turn isn't accepted while the validator fails — feed
                 // the failure back (bounded) so the model fixes the cause.
                 if let Some(v) = &validator
+                    && self.dirty_since_verify
                     && selfcorrect_attempts < MAX_SELFCORRECT_ATTEMPTS
                 {
                     match verify::run(v.clone(), ctx.cwd).await {
@@ -1350,7 +1367,10 @@ questions.",
                             );
                             continue;
                         }
-                        Ok(()) => ui.notify(&format!("verified: {} passed", v.label)),
+                        Ok(()) => {
+                            self.dirty_since_verify = false;
+                            ui.notify(&format!("verified: {} passed", v.label));
+                        }
                     }
                 }
                 converged = true; // answered without calling tools
@@ -1387,6 +1407,7 @@ questions.",
 
             if repeats + 1 >= REPEAT_LIMIT || page_repeats + 1 >= REPEAT_LIMIT {
                 ui.notify(STOP_NO_PROGRESS);
+                ui.turn_stopped(TurnStop::NoProgress);
                 converged = true;
                 break;
             }
@@ -1395,6 +1416,7 @@ questions.",
             match failure_guard.observe(&failures) {
                 guards::FailureAction::Stop => {
                     ui.notify(STOP_TOOL_FAILURE);
+                    ui.turn_stopped(TurnStop::ToolFailureLoop);
                     converged = true;
                     break;
                 }
@@ -1415,6 +1437,7 @@ questions.",
 
         if !converged {
             ui.notify(&format!("reached the step limit ({})", self.max_steps));
+            ui.turn_stopped(TurnStop::StepLimit);
         }
         ui.footer(
             None,
@@ -1875,6 +1898,10 @@ command in the foreground (drop `background`)."
             }
             if result.is_ok() {
                 self.record_touched_file(n, &call.arguments);
+                // A successful mutation (or delegated work) invalidates the last green verify.
+                if tools::is_mutating(n) || n == "subagent" {
+                    self.dirty_since_verify = true;
+                }
             }
             let raw = match result {
                 Ok(c) => c,
@@ -4953,6 +4980,36 @@ mod tests {
         );
     }
 
+    /// The first done-turn always verifies (green baseline); a later clean turn skips it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn selfcorrect_skips_verify_when_clean_since_green() {
+        let dir = tmp();
+        // Passing suite that logs each invocation.
+        std::fs::write(dir.join("run_tests.sh"), "echo run >> runs.log; exit 0\n").unwrap();
+
+        let write = tool_call_sse("write_file", json!({"path": "f", "content": "x"}));
+        // Turn 1: edit + done → verify runs (green baseline).
+        let port = spawn_sse_sequence(vec![
+            write,
+            FINAL_TEXT_SSE.to_string(),
+            // Turn 2: read + done → clean since green → verify skipped.
+            tool_call_sse("read_file", json!({"path": "f"})),
+            FINAL_TEXT_SSE.to_string(),
+        ]);
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let base = format!("http://127.0.0.1:{port}");
+        let mut engine = AgentEngine::new(&dir.display().to_string(), "m", "", &[], &[], 0, 0);
+        engine.set_self_correct(true);
+        let mut ui = CapturingUi::default();
+        let ctx = turn_ctx(&client, &base, &dir);
+        run_session(&mut engine, &ctx, Some("edit then check".into()), &mut ui).await;
+        run_session(&mut engine, &ctx, Some("just look around".into()), &mut ui).await;
+
+        let runs = std::fs::read_to_string(dir.join("runs.log")).unwrap_or_default();
+        assert_eq!(runs.lines().count(), 1, "suite ran once, not per turn");
+    }
+
     // --- background jobs (Phase 4) ---
 
     #[test]
@@ -5110,6 +5167,41 @@ mod tests {
             "check_job should have run and reported the job"
         );
         let _ = table.kill_all().await;
+    }
+
+    /// Deliberate: it only signals a process the agent itself started and touches
+    /// no files (see `is_read_only`), so it stays prompt-free even in plan mode.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn check_job_kill_unprompted_in_plan_mode() {
+        let dir = tmp();
+        let table = jobs::JobTable::new(Some(dir.join("jobs")));
+        table.spawn("sleep 30", &dir).unwrap();
+        let call = tool_call_sse("check_job", json!({"id": "j1", "kill": true}));
+        let port = spawn_sse_sequence(vec![call, FINAL_TEXT_SSE.to_string()]);
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let base = format!("http://127.0.0.1:{port}");
+        let mut engine = AgentEngine::new(&dir.display().to_string(), "m", "", &[], &[], 0, 0);
+        engine.set_jobs(table.clone());
+        engine.set_plan_mode(true);
+        let mut ui = CapturingUi::default();
+        run_session(
+            &mut engine,
+            &turn_ctx(&client, &base, &dir),
+            Some("stop it".into()),
+            &mut ui,
+        )
+        .await;
+        assert_eq!(ui.asks, 0, "kill of an agent-started job is prompt-free");
+        assert!(
+            engine.messages.iter().any(|m| {
+                m.get("content")
+                    .and_then(|c| c.as_str())
+                    .is_some_and(|s| s.contains("killed job j1"))
+            }),
+            "the kill should have run and reported"
+        );
+        assert_eq!(table.running_count(), 0, "the job is really gone");
     }
 
     /// A background `run_bash` in plan mode still hits the plan-bash confirmation.
