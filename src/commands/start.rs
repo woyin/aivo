@@ -461,6 +461,7 @@ impl StartCommand {
                 model,
                 None,
                 None,
+                None,
                 Vec::new(),
                 args.refresh,
                 key_override,

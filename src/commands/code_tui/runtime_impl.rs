@@ -647,6 +647,9 @@ impl CodeTuiApp {
             if crate::services::provider_profile::is_aivo_starter_base(&self.key.base_url) {
                 engine.set_first_party();
             }
+            if let Some(ctx) = self.injected_context.as_deref() {
+                engine.append_system_context(ctx);
+            }
             // Enable `/rewind` tree-checkpointing (top-level chat only — sub-engines
             // never call this, so they don't pay the git cost).
             engine.enable_rewind_checkpoints(&real_cwd);
@@ -1182,6 +1185,10 @@ impl CodeTuiApp {
             }
             SlashCommand::Compact { fast } => {
                 self.run_compact_command(fast).await;
+                Ok(false)
+            }
+            SlashCommand::Context => {
+                self.open_context_overlay();
                 Ok(false)
             }
             SlashCommand::Share(arg) => {

@@ -661,9 +661,10 @@ pub struct RunArgs {
     #[arg(long)]
     pub relogin: bool,
 
-    /// Inject cross-CLI context for this launch. Bare flag opens an
-    /// interactive picker; `--context=<session-id>` picks a specific session
-    /// (prefix match; see `aivo logs --by native` for available ids).
+    /// Inject context from one past session in this project — a native AI
+    /// CLI's or aivo code's own. Bare flag opens an interactive picker;
+    /// `--context=<session-id>` picks a specific session (prefix match; see
+    /// `aivo logs` for available ids).
     #[arg(short = 'c', long, value_name = "SESSION_ID", num_args = 0..=1, default_missing_value = "")]
     pub context: Option<String>,
 
@@ -1016,6 +1017,13 @@ pub struct CodeArgs {
         value_parser = ["text", "stream-json"]
     )]
     pub output_format: Option<String>,
+
+    /// Inject context from one past session in this project — a native AI
+    /// CLI's (claude, codex, gemini, opencode, pi) or a previous aivo code
+    /// session. Bare flag opens an interactive picker; `--context=<session-id>`
+    /// picks a specific session (prefix match; see `aivo logs` for ids).
+    #[arg(short = 'c', long, value_name = "SESSION_ID", num_args = 0..=1, default_missing_value = "")]
+    pub context: Option<String>,
 
     /// Attach a file or image to the next message (repeatable)
     #[arg(long = "attach", value_name = "PATH", value_parser = non_empty())]

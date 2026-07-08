@@ -408,6 +408,7 @@ impl CodeCommand {
         model: Option<String>,
         one_shot: Option<String>,
         initial_prompt: Option<String>,
+        context_selector: Option<String>,
         attachments: Vec<String>,
         refresh: bool,
         key_override: Option<ApiKey>,
@@ -427,6 +428,7 @@ impl CodeCommand {
                 model,
                 one_shot,
                 initial_prompt,
+                context_selector,
                 attachments,
                 refresh,
                 key_override,
@@ -457,6 +459,7 @@ impl CodeCommand {
         model_flag: Option<String>,
         one_shot: Option<String>,
         initial_prompt: Option<String>,
+        context_selector: Option<String>,
         attachments: Vec<String>,
         refresh: bool,
         key_override: Option<ApiKey>,
@@ -654,6 +657,28 @@ impl CodeCommand {
             None
         };
 
+        // `-c` that finds nothing to inject is a hard failure, not a silent
+        // context-less launch; a cancelled picker launches plain.
+        let mut injected_context: Option<String> = None;
+        let mut injected_context_summary: Option<String> = None;
+        if let Some(selector) = context_selector {
+            use crate::commands::run::ContextResolution;
+            match crate::commands::run::resolve_context_thread(&self.session_store, &selector).await
+            {
+                ContextResolution::Selected(thread) => {
+                    let rendered = crate::services::context_render::render_for_aivo_code(&thread);
+                    let summary =
+                        crate::commands::run::context_injection_summary(&rendered, &thread);
+                    // Echoed to stderr (one-shot paths); the summary rides into the TUI.
+                    crate::commands::run::announce_context_injection(&rendered, &thread);
+                    injected_context = Some(rendered.text);
+                    injected_context_summary = Some(summary);
+                }
+                ContextResolution::Cancelled => {}
+                ContextResolution::Unavailable(msg) => anyhow::bail!(msg),
+            }
+        }
+
         if let Some(input) = one_shot {
             let one_shot_input = if input.is_empty() {
                 sanitize_one_shot_message(read_one_shot_message_from_stdin()?)?
@@ -681,6 +706,7 @@ impl CodeCommand {
                     &key,
                     &raw_model,
                     one_shot_input,
+                    injected_context,
                     max_context,
                     code_agent_oneshot::OutputFormat::parse(output_format.as_deref()),
                     code_agent_oneshot::OneShotAgentLimits {
@@ -691,6 +717,12 @@ impl CodeCommand {
                 )
                 .await;
             }
+
+            // Plain `-p` has no system-prompt hook; prepend the context block.
+            let one_shot_input = match injected_context.as_deref() {
+                Some(ctx) => format!("{ctx}\n\n{one_shot_input}"),
+                None => one_shot_input,
+            };
 
             let one_shot_attachments = materialize_attachments(&pending_attachments).await?;
             let history = vec![ChatMessage {
@@ -908,6 +940,8 @@ impl CodeCommand {
             startup_notice,
             initial_resume: resume,
             initial_prompt,
+            injected_context,
+            injected_context_summary,
             max_context,
             share,
             auto_approve,
@@ -977,6 +1011,10 @@ impl CodeCommand {
             "Resume a saved session (bare/last/id)",
         );
         print_opt("--share", "Share this session live (needs `aivo login`)");
+        print_opt(
+            "-c, --context[=<id>]",
+            "Inject one past AI CLI session as context",
+        );
         print_opt("--attach <path>", "Attach a file or image to the message");
         print_opt("--json", "Raw provider JSON (with -p)");
         print_opt(
@@ -2828,6 +2866,7 @@ mod tests {
             .execute(
                 None,
                 Some("hi".to_string()),
+                None,
                 None,
                 Vec::new(),
                 false,

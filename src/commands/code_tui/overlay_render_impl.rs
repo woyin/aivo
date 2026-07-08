@@ -453,6 +453,59 @@ impl CodeTuiApp {
         render_detail_lines(frame, inner, lines, scroll, "Esc close")
     }
 
+    /// `/context` overlay: read-only scrollable view of the injected block —
+    /// summary header over the wrapped body.
+    pub(super) fn render_context_overlay(
+        &self,
+        frame: &mut Frame<'_>,
+        area: Rect,
+        scroll: u16,
+    ) -> u16 {
+        frame.render_widget(Clear, area);
+        let shell = Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(FAINT))
+            .title(Span::styled(
+                "Injected context",
+                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+            ));
+        frame.render_widget(shell, area);
+
+        let inner = area.inner(ratatui::layout::Margin {
+            vertical: 1,
+            horizontal: 2,
+        });
+        let width = usize::from(inner.width).max(1);
+
+        let mut lines: Vec<Line> = Vec::new();
+        if let Some(summary) = &self.injected_context_summary {
+            lines.push(Line::from(Span::styled(
+                summary.clone(),
+                Style::default().fg(MUTED),
+            )));
+        }
+        lines.push(Line::from(Span::styled(
+            "Background awareness only — the model won't reference this unless it's relevant.",
+            Style::default().fg(FAINT),
+        )));
+        lines.push(Line::from(""));
+
+        // Preserve blank lines; word-wrap the rest.
+        let text = self.injected_context.as_deref().unwrap_or("");
+        for raw in text.split('\n') {
+            if raw.trim().is_empty() {
+                lines.push(Line::from(""));
+                continue;
+            }
+            for wrapped in wrap_chars(raw, width) {
+                lines.push(Line::from(Span::styled(wrapped, Style::default().fg(TEXT))));
+            }
+        }
+
+        render_detail_lines(frame, inner, lines, scroll, "Esc close")
+    }
+
     /// `/skills` overlay: a checkbox toggle list of the discovered skills. Split
     /// shows the highlighted skill's full text in the right pane; narrow keeps
     /// the Tab drill-in. Chrome shared with `/mcp`.
@@ -1905,7 +1958,7 @@ const HELP_COMMAND_GROUPS: &[(&str, &[&str])] = &[
         ],
     ),
     ("Model & key", &["model", "key"]),
-    ("Context", &["attach", "detach", "compact"]),
+    ("Context", &["attach", "detach", "compact", "context"]),
     ("Skills & tools", &["skills", "create-skill", "mcp"]),
     ("Autonomous", &["plan", "goal"]),
     // Shown only on the aivo provider (hidden by `slash_command_visible`).

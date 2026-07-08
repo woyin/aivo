@@ -84,7 +84,18 @@ impl CodeTuiApp {
     async fn new(params: CodeTuiParams) -> Result<Self> {
         let (tx, rx) = mpsc::unbounded_channel();
         // No "Ready" filler — the welcome chip + tip cover the empty state.
-        let startup_notice = params.startup_notice.map(|message| (MUTED, message));
+        // The `-c` summary rides in as the startup notice (the pre-TUI stderr
+        // line is wiped by the alt-screen); combine with any attachment notice.
+        let startup_message = match (
+            params.injected_context_summary.clone(),
+            params.startup_notice,
+        ) {
+            (Some(ctx), Some(attach)) => Some(format!("{ctx} · {attach}")),
+            (Some(ctx), None) => Some(ctx),
+            (None, Some(attach)) => Some(attach),
+            (None, None) => None,
+        };
+        let startup_notice = startup_message.map(|message| (MUTED, message));
 
         let initial_format = seeded_chat_format(&params.key, &params.raw_model);
         // Remembered across sessions (the user picked "remember last choice");
@@ -181,6 +192,8 @@ impl CodeTuiApp {
             session_tokens: crate::services::session_store::SessionTokens::default(),
             context_window: 0,
             context_window_override: params.max_context,
+            injected_context: params.injected_context,
+            injected_context_summary: params.injected_context_summary,
             context_is_estimate: true,
             follow_output: true,
             transcript_revision: 0,

@@ -776,7 +776,9 @@ impl CodeTuiApp {
                 picker.selected = 0;
                 true
             }
-            Overlay::Help { .. } | Overlay::Config(_) | Overlay::None => false,
+            Overlay::Help { .. } | Overlay::Context { .. } | Overlay::Config(_) | Overlay::None => {
+                false
+            }
         }
     }
 
@@ -788,6 +790,15 @@ impl CodeTuiApp {
                 if matches!(key.code, KeyCode::Esc | KeyCode::Enter | KeyCode::F(1)) {
                     self.overlay = Overlay::None;
                 } else if let Overlay::Help { scroll } = &mut self.overlay {
+                    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+                    apply_detail_scroll(scroll, key, ctrl);
+                }
+                OverlayKeyAction::Handled
+            }
+            Overlay::Context { .. } => {
+                if matches!(key.code, KeyCode::Esc | KeyCode::Enter) {
+                    self.overlay = Overlay::None;
+                } else if let Overlay::Context { scroll } = &mut self.overlay {
                     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
                     apply_detail_scroll(scroll, key, ctrl);
                 }

@@ -9,7 +9,7 @@ use crate::commands::models::resolve_model_placeholder;
 use crate::commands::{print_launch_preview, trim_to_one_line};
 use crate::errors::ExitCode;
 use crate::services::ai_launcher::{AILauncher, AIToolType, LaunchOptions};
-use crate::services::context_ingest::{IngestOptions, ingest_project};
+use crate::services::context_ingest::{IngestOptions, ingest_project_with_code};
 use crate::services::context_render::{RenderedContext, render_single_session};
 use crate::services::environment_injector::{ClaudeModelOverrides, ClaudeSlotFlags};
 use crate::services::http_utils;
@@ -389,7 +389,7 @@ impl RunCommand {
                 );
                 args
             } else {
-                maybe_inject_context(ai_tool, args, &selector).await
+                maybe_inject_context(&self.session_store, ai_tool, args, &selector).await
             }
         } else {
             args
@@ -640,9 +640,101 @@ fn warn_slot_flags_ignored(tool: AIToolType, slots: &ClaudeSlotFlags) {
     }
 }
 
+/// Outcome of resolving a `--context` selector. `aivo run` skips injection on
+/// Cancelled/Unavailable; `aivo code -c` launches on a cancel but bails on
+/// `Unavailable` (its `String` is a ready-to-print reason).
+pub(crate) enum ContextResolution {
+    Selected(Thread),
+    Cancelled,
+    Unavailable(String),
+}
+
+/// Resolve a `--context` selector into one past session: empty → interactive
+/// picker; else session-id prefix match. The scan runs under a spinner. Shared
+/// with `aivo code -c`.
+pub(crate) async fn resolve_context_thread(
+    store: &SessionStore,
+    selector: &str,
+) -> ContextResolution {
+    let Some(cwd) = system_env::current_dir() else {
+        return ContextResolution::Unavailable("Could not determine the current directory.".into());
+    };
+    let opts = if selector.trim().is_empty() {
+        IngestOptions::default()
+    } else {
+        // Explicit id: skip the substance filter — `aivo logs` lists
+        // short-first-prompt sessions the user may name here.
+        IngestOptions {
+            include_short_first_user: true,
+            ..IngestOptions::unlimited()
+        }
+    };
+
+    // Spinner covers the scan only — stop it before the picker.
+    let (spinning, spinner_handle) = style::start_spinner(Some(" Loading context…"));
+    let mut threads = match ingest_project_with_code(store, &cwd, opts).await {
+        Ok(t) => t,
+        Err(e) => {
+            style::stop_spinner(&spinning);
+            let _ = spinner_handle.await;
+            return ContextResolution::Unavailable(format!("Could not load context: {e}"));
+        }
+    };
+    // The substance filter keeps the picker's working set high-signal, but a
+    // project whose only sessions are short ("hello") would show an empty
+    // picker right after `aivo logs` listed them. Retry permissive rather
+    // than claim there's no context.
+    if threads.is_empty() && selector.trim().is_empty() {
+        threads = ingest_project_with_code(
+            store,
+            &cwd,
+            IngestOptions {
+                include_short_first_user: true,
+                ..IngestOptions::default()
+            },
+        )
+        .await
+        .unwrap_or_default();
+    }
+    style::stop_spinner(&spinning);
+    let _ = spinner_handle.await;
+
+    match select_thread(&threads, selector) {
+        SelectOutcome::Picked(t) => ContextResolution::Selected(t.clone()),
+        SelectOutcome::Cancelled => ContextResolution::Cancelled,
+        SelectOutcome::Err(msg) => ContextResolution::Unavailable(msg),
+    }
+}
+
+/// One-line summary of what got injected, for stderr and the TUI startup notice.
+pub(crate) fn context_injection_summary(rendered: &RenderedContext, thread: &Thread) -> String {
+    let sid_prefix = &thread.session_id[..thread.session_id.len().min(8)];
+    format!(
+        "injected ~{} tokens from {} session {} ({})",
+        rendered.tokens,
+        thread.cli,
+        sid_prefix,
+        format_time_ago_short_dt(thread.updated_at),
+    )
+}
+
+/// Print the injection summary to stderr (non-TUI paths).
+pub(crate) fn announce_context_injection(rendered: &RenderedContext, thread: &Thread) {
+    eprintln!(
+        "  {} {}",
+        style::arrow_symbol(),
+        context_injection_summary(rendered, thread),
+    );
+}
+
 /// Loads context from exactly one past session and injects it into the CLI
 /// args. `selector`: empty → most-recent; otherwise prefix-match on session_id.
-async fn maybe_inject_context(tool: AIToolType, args: Vec<String>, selector: &str) -> Vec<String> {
+async fn maybe_inject_context(
+    store: &SessionStore,
+    tool: AIToolType,
+    args: Vec<String>,
+    selector: &str,
+) -> Vec<String> {
     // Every tool has *some* injection path:
     //   claude, pi  → `--append-system-prompt <text>` (clean, hidden from user)
     //   codex       → prepended to [PROMPT] positional
@@ -650,53 +742,23 @@ async fn maybe_inject_context(tool: AIToolType, args: Vec<String>, selector: &st
     //   opencode    → `--prompt <text>` (TUI launch flag)
     // The non-claude paths are visible to the user as part of the first
     // message; we wrap with a "context only — wait for me" preamble.
-
-    let cwd = match system_env::current_dir() {
-        Some(p) => p,
-        None => return args,
-    };
-
-    // Default options pick the recent set for the picker. When the user
-    // supplied a specific session id, scan everything — they may be reaching
-    // for an older session shown by `aivo context -a`.
-    let opts = if selector.trim().is_empty() {
-        IngestOptions::default()
-    } else {
-        IngestOptions::unlimited()
-    };
-    let threads = match ingest_project(&cwd, opts).await {
-        Ok(t) => t,
-        Err(e) => {
-            eprintln!("  {} Skipping context injection: {}", style::yellow("!"), e);
-            return args;
-        }
-    };
-
-    let selected = match select_thread(&threads, selector) {
-        SelectOutcome::Picked(t) => t,
-        SelectOutcome::Cancelled => {
+    let selected = match resolve_context_thread(store, selector).await {
+        ContextResolution::Selected(thread) => thread,
+        ContextResolution::Cancelled => {
             eprintln!(
                 "  {} context picker cancelled; launching without injection",
                 style::dim("›")
             );
             return args;
         }
-        SelectOutcome::Err(msg) => {
+        ContextResolution::Unavailable(msg) => {
             eprintln!("  {} {}", style::yellow("!"), msg);
             return args;
         }
     };
 
-    let rendered = render_single_session(tool, selected);
-    let sid_prefix = &selected.session_id[..selected.session_id.len().min(8)];
-    eprintln!(
-        "  {} injecting {} tokens from {} session {} ({})",
-        style::arrow_symbol(),
-        rendered.tokens,
-        selected.cli,
-        sid_prefix,
-        format_time_ago_short_dt(selected.updated_at),
-    );
+    let rendered = render_single_session(tool, &selected);
+    announce_context_injection(&rendered, &selected);
 
     match tool {
         // Both claude and pi accept the same `--append-system-prompt <text>` flag.
@@ -730,7 +792,7 @@ fn select_thread<'a>(threads: &'a [Thread], selector: &str) -> SelectOutcome<'a>
         .collect();
     match matches.len() {
         0 => SelectOutcome::Err(format!(
-            "No session matches id prefix '{}'. Run `aivo logs --by native` to see available ids.",
+            "No session matches id prefix '{}' in this project. Run `aivo logs` to see available ids (sessions from other directories don't count).",
             selector
         )),
         1 => SelectOutcome::Picked(matches[0]),
@@ -817,6 +879,9 @@ fn inject_via_flag(rendered: &RenderedContext, mut args: Vec<String>, flag: &str
             args[idx + 1] = format!("{}\n\n{}", rendered.text, existing);
             return args;
         }
+        // Trailing bare flag: supply context as its value.
+        args.push(format!("{}{}", CONTEXT_PREAMBLE, rendered.text));
+        return args;
     }
     let prefix = format!("{flag}=");
     if let Some(idx) = args.iter().position(|a| a.starts_with(&prefix)) {
@@ -841,6 +906,18 @@ fn inject_codex(rendered: &RenderedContext, mut args: Vec<String>) -> Vec<String
     let last_positional = args.iter().rposition(|a| !a.starts_with('-'));
 
     match last_positional {
+        // A non-dash token after a valueless `--flag` may be that flag's value,
+        // not the prompt (`--sandbox read-only`); skip rather than corrupt it.
+        Some(idx) if idx > 0 && args[idx - 1].starts_with('-') && !args[idx - 1].contains('=') => {
+            eprintln!(
+                "  {} skipping context injection: {:?} may be the value of {:?} rather than the prompt; use `{}=<value>` to disambiguate",
+                style::yellow("!"),
+                args[idx],
+                args[idx - 1],
+                args[idx - 1],
+            );
+            args
+        }
         Some(idx) => {
             let prompt = std::mem::take(&mut args[idx]);
             args[idx] = format!("{}\n\n{}", rendered.text, prompt);
@@ -927,6 +1004,43 @@ mod tests {
         // Context is appended as a new positional at the end.
         assert_eq!(out.len(), 2);
         assert!(out[1].contains("aivo context"));
+        assert!(out[1].ends_with("CTX"));
+    }
+
+    #[test]
+    fn inject_codex_skips_when_trailing_token_may_be_flag_value() {
+        let rendered = RenderedContext {
+            text: "CTX".into(),
+            tokens: 1,
+        };
+        let args = vec!["--sandbox".to_string(), "read-only".to_string()];
+        let out = inject_codex(&rendered, args.clone());
+        assert_eq!(out, args);
+    }
+
+    #[test]
+    fn inject_codex_equals_form_disambiguates() {
+        let rendered = RenderedContext {
+            text: "CTX".into(),
+            tokens: 1,
+        };
+        let out = inject_codex(
+            &rendered,
+            vec!["--sandbox=read-only".to_string(), "fix the bug".to_string()],
+        );
+        assert_eq!(out[0], "--sandbox=read-only");
+        assert_eq!(out[1], "CTX\n\nfix the bug");
+    }
+
+    #[test]
+    fn inject_via_flag_trailing_bare_flag_gets_context_as_value() {
+        let rendered = RenderedContext {
+            text: "CTX".into(),
+            tokens: 1,
+        };
+        let out = inject_via_flag(&rendered, vec!["-i".to_string()], "-i");
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0], "-i");
         assert!(out[1].ends_with("CTX"));
     }
 

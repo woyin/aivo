@@ -826,6 +826,22 @@ questions.",
         self.subagents = subagents.to_vec();
     }
 
+    /// Append a `--context` block to the system prompt. Re-applied per build
+    /// since `export_conversation` omits the system message.
+    pub fn append_system_context(&mut self, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+        if let Some(sys) = self.messages.first_mut() {
+            let cur = sys
+                .get("content")
+                .and_then(|c| c.as_str())
+                .unwrap_or("")
+                .to_string();
+            sys["content"] = json!(format!("{cur}\n\n{text}"));
+        }
+    }
+
     /// Apply a named agent profile: fold its instructions into the system prompt
     /// and, if it authored a `tools` scope, restrict the offered tools to that
     /// allow-list (any unlisted tool, incl. MCP, is dropped; an empty resolution
@@ -2871,6 +2887,29 @@ mod tests {
             .filter_map(|t| t["function"]["name"].as_str())
             .collect();
         assert!(!tool_names.contains(&"skill"));
+    }
+
+    #[test]
+    fn append_system_context_lands_in_system_prompt_only() {
+        let mut engine = AgentEngine::new("/tmp", "m", "", &[], &[], 0, 0);
+        engine.append_system_context("# aivo context\n\nprior session facts");
+
+        let sys = &engine.outgoing_messages()[0];
+        assert_eq!(role(sys), "system");
+        assert!(
+            sys["content"]
+                .as_str()
+                .unwrap()
+                .ends_with("# aivo context\n\nprior session facts")
+        );
+        assert!(engine.export_conversation().is_empty());
+
+        engine.append_system_context("");
+        let unchanged = engine.outgoing_messages()[0]["content"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(unchanged.ends_with("prior session facts"));
     }
 
     #[test]

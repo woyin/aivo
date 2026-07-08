@@ -1,13 +1,12 @@
 use super::*;
 use std::collections::HashMap;
 
-/// Every resumable chat session, newest first, across ALL keys and working
-/// dirs. Not cwd-scoped: `aivo code` runs in an ephemeral per-pid sandbox, so a
-/// cwd filter would hide every prior session — `/resume` is a global history
-/// browser (searchable in the picker). Sessions whose key was removed are
-/// dropped (no key to load them with).
+/// Resumable chat sessions, newest first. `Some(dir)` scopes to that cwd (the
+/// `/resume` picker); `None` returns all (explicit-id lookups). Sessions whose
+/// key was removed are dropped.
 pub(super) async fn load_resume_snapshots(
     session_store: &SessionStore,
+    cwd_filter: Option<&str>,
 ) -> Result<Vec<SessionPreview>> {
     let by_id: HashMap<String, ApiKey> = session_store
         .get_keys()
@@ -20,6 +19,7 @@ pub(super) async fn load_resume_snapshots(
         .all_chat_sessions()
         .await?
         .into_iter()
+        .filter(|entry| cwd_filter.is_none_or(|dir| entry.cwd == dir))
         .filter_map(|entry| {
             let key = by_id.get(&entry.key_id)?;
             Some(SessionPreview::from_index_entry(entry, key))

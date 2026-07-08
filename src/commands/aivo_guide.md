@@ -145,6 +145,7 @@ aivo code "<text>"            # TUI with the text sent as the first message
 -r, --refresh                 refresh the model list (skip cache)
 --resume [last|id]            resume a saved session
 --share                       share this session live (needs `aivo login`)
+-c, --context[=<id>]          inject one past AI CLI session as context (bare = picker)
 --attach <path>               attach a file or image
 --json                        raw provider JSON (with -p)
 --max-context <size>          override the context window (e.g. 200k)

@@ -251,6 +251,12 @@ pub(super) const SLASH_COMMANDS: &[SlashCommandSpec] = &[
         takes_argument: true,
     },
     SlashCommandSpec {
+        name: "context",
+        help_label: "/context",
+        description: "show the context injected with -c/--context",
+        takes_argument: false,
+    },
+    SlashCommandSpec {
         name: "effort",
         help_label: "/effort [level]",
         description: "set reasoning effort (bare opens a picker)",
@@ -358,6 +364,10 @@ pub(crate) struct CodeTuiParams {
     pub initial_resume: Option<String>,
     /// Positional `aivo code "<text>"`: auto-sent as the first message.
     pub initial_prompt: Option<String>,
+    /// `--context` block, appended to the system prompt per build. Session-only.
+    pub injected_context: Option<String>,
+    /// One-line `-c` injection summary for the startup notice + `/context` header.
+    pub injected_context_summary: Option<String>,
     /// `--max-context <SIZE>` manual context-window override (tokens). Session-only.
     pub max_context: Option<u64>,
     /// `--share`: start live sharing at launch (device-link verified beforehand).
@@ -1020,6 +1030,10 @@ pub(super) enum Overlay {
     McpPaste(McpPasteOverlay),
     /// `/config` — a small fixed list of chat preferences, toggleable.
     Config(ConfigOverlay),
+    /// `/context` — read-only scrollable view of the injected `-c` block.
+    Context {
+        scroll: u16,
+    },
     Picker(Box<PickerState>),
 }
 
@@ -1663,6 +1677,8 @@ pub(super) enum SlashCommand {
     Compact {
         fast: bool,
     },
+    /// `/context` — read-only viewer of the injected `-c` block.
+    Context,
     /// Share this chat: bare/`start` opens a viewer URL (re-shown if already
     /// live); `stop` ends it.
     Share(Option<String>),
@@ -2065,6 +2081,10 @@ pub(super) struct CodeTuiApp {
     /// `--max-context` manual override (tokens); wins over the resolved window in
     /// `refresh_context_window` and the engine build. Session-only.
     pub(super) context_window_override: Option<u64>,
+    /// `--context` block, re-appended to the system prompt per engine build.
+    pub(super) injected_context: Option<String>,
+    /// One-line `injected_context` summary, shown as the `/context` header.
+    pub(super) injected_context_summary: Option<String>,
     /// `context_tokens` is a chars/4 estimate of the visible transcript, not a
     /// provider-measured count (cursor ACP and agents-without-usage). The footer
     /// marks these with `~` since the model's real context is larger.

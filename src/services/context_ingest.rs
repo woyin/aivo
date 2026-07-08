@@ -2,9 +2,10 @@
 //! threads. **No persistent storage** — each call reads the authoritative
 //! sources fresh and returns an in-memory thread list.
 //!
-//! Scope: only tools launchable via `aivo run` are sources, because
-//! `--context` injects into those tools. Aivo's own chat is excluded
-//! deliberately — its sessions belong to a different workflow.
+//! Scope: the native CLIs (`aivo run` tools), plus — via
+//! `ingest_project_with_code`, the `--context` injection path — aivo's own
+//! code sessions. `ingest_project` stays native-only for the share resolver,
+//! which looks up the native session a run launched.
 //!
 //! Sources:
 //! - Claude Code: `~/.claude/projects/<encoded-cwd>/*.jsonl` (matched by
@@ -29,6 +30,7 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 
 use crate::services::device_fingerprint::hex_sha256;
 use crate::services::project_id::{DEFAULT_THREAD_MAX_AGE_DAYS, Thread};
+use crate::services::session_store::{SessionIndexEntry, SessionStore};
 use crate::services::system_env;
 
 /// Minimum character count for a turn to count as substantive.
@@ -105,7 +107,8 @@ impl Default for IngestOptions {
 }
 
 impl IngestOptions {
-    /// Bypass both caps — used by `aivo context --all` / `-a`.
+    /// Bypass both caps — used when `--context=<id>` names a session that may
+    /// be older than the capped walk reaches.
     pub fn unlimited() -> Self {
         Self {
             max_age_days: None,
@@ -131,10 +134,29 @@ fn effective_cutoff(opts: &IngestOptions) -> Option<DateTime<Utc>> {
     }
 }
 
-/// Read all supported sources for the given project root, merge + dedup +
-/// age-filter, and return threads newest-first. Nothing is persisted.
+/// Read the native-CLI sources for the given project root, merge + age-filter,
+/// and return threads newest-first. Nothing is persisted.
 pub async fn ingest_project(project_root: &Path, opts: IngestOptions) -> Result<Vec<Thread>> {
-    // Compute the canonical project root once and pass it down — five
+    ingest_project_inner(None, project_root, opts).await
+}
+
+/// `ingest_project` plus aivo's own code sessions (from `store`'s session
+/// index) as a sixth source. This is the `--context` injection path: `aivo
+/// logs` lists `[code]` sessions, so injection must be able to find them too.
+pub async fn ingest_project_with_code(
+    store: &SessionStore,
+    project_root: &Path,
+    opts: IngestOptions,
+) -> Result<Vec<Thread>> {
+    ingest_project_inner(Some(store), project_root, opts).await
+}
+
+async fn ingest_project_inner(
+    store: Option<&SessionStore>,
+    project_root: &Path,
+    opts: IngestOptions,
+) -> Result<Vec<Thread>> {
+    // Compute the canonical project root once and pass it down — six
     // separate `canonicalize` syscalls would otherwise hit the same path.
     let canonical_root =
         std::fs::canonicalize(project_root).unwrap_or_else(|_| project_root.to_path_buf());
@@ -143,21 +165,29 @@ pub async fn ingest_project(project_root: &Path, opts: IngestOptions) -> Result<
     let permissive = opts.include_short_first_user;
 
     // Independent I/O — fan out across sources concurrently.
-    let (claude, codex, gemini, pi, opencode) = tokio::join!(
+    let (claude, codex, gemini, pi, opencode, code) = tokio::join!(
         ingest_claude(&canonical_root, cap, permissive),
         ingest_codex(&canonical_str, cap, permissive),
         ingest_gemini(&canonical_str, cap, permissive),
         ingest_pi(&canonical_str, cap, permissive),
         ingest_opencode(canonical_str.clone(), cap, permissive),
+        async {
+            match store {
+                Some(s) => ingest_code(s, &canonical_str, cap, permissive).await,
+                None => Vec::new(),
+            }
+        },
     );
 
-    let mut threads: Vec<Thread> =
-        Vec::with_capacity(claude.len() + codex.len() + gemini.len() + pi.len() + opencode.len());
+    let mut threads: Vec<Thread> = Vec::with_capacity(
+        claude.len() + codex.len() + gemini.len() + pi.len() + opencode.len() + code.len(),
+    );
     threads.extend(claude);
     threads.extend(codex);
     threads.extend(gemini);
     threads.extend(pi);
     threads.extend(opencode);
+    threads.extend(code);
 
     // Optional age filter (replaces the old `gc` command — evaluated lazily).
     if let Some(cutoff) = effective_cutoff(&opts) {
@@ -1604,6 +1634,87 @@ fn opencode_list_stubs(db_path: &Path, project_root: &str) -> Vec<Thread> {
 }
 
 // ---------------------------------------------------------------------------
+// aivo code: session-store index (`~/.config/aivo/sessions`)
+// ---------------------------------------------------------------------------
+
+/// Aivo's own code sessions as a source. The TUI persists the real launch
+/// dir as `cwd`, so per-project matching works; plain `-p` one-shots save
+/// under the chat sandbox dir and never match a project root.
+async fn ingest_code(
+    store: &SessionStore,
+    canonical_root: &str,
+    cap: Option<usize>,
+    permissive: bool,
+) -> Vec<Thread> {
+    let mut entries = match store.all_chat_sessions().await {
+        Ok(e) => e,
+        Err(_) => return Vec::new(),
+    };
+    entries.retain(|e| paths_match(&e.cwd, canonical_root));
+    // Index order isn't guaranteed; `updated_at` is RFC3339 (UTC), so the
+    // lexicographic sort is chronological.
+    entries.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+
+    let mut out = Vec::new();
+    for entry in entries {
+        if let Some(n) = cap
+            && out.len() >= n
+        {
+            break;
+        }
+        if let Some(thread) = extract_code_thread(store, &entry, permissive).await {
+            out.push(thread);
+        }
+    }
+    out
+}
+
+/// Same bracket extraction as the native sources, over the stored display
+/// messages. `strip_aivo_context` matters here too: a `-p` one-shot seeded
+/// with `--context` stores the injected block at the head of its first user
+/// message.
+async fn extract_code_thread(
+    store: &SessionStore,
+    entry: &SessionIndexEntry,
+    permissive: bool,
+) -> Option<Thread> {
+    let state = store.get_code_session(&entry.session_id).await.ok()??;
+
+    let mut first_user: Option<String> = None;
+    let mut last_assistant: Option<String> = None;
+    for msg in &state.messages {
+        match msg.role.as_str() {
+            "user" if first_user.is_none() => {
+                first_user = pick_first_user_turn(&msg.content, permissive);
+            }
+            "assistant" => {
+                if let Some(t) = sanitize_turn(&msg.content) {
+                    last_assistant = Some(t);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let updated_at = DateTime::parse_from_rfc3339(&entry.updated_at)
+        .map(|dt| dt.with_timezone(&Utc))
+        .unwrap_or_else(|_| Utc::now());
+
+    Some(Thread {
+        cli: "code".into(),
+        session_id: entry.session_id.clone(),
+        source_path: store
+            .session_file_path(&entry.session_id)
+            .to_string_lossy()
+            .to_string(),
+        topic: first_user?,
+        last_response: last_assistant.unwrap_or_default(),
+        updated_at,
+        cwd: Some(entry.cwd.clone()),
+    })
+}
+
+// ---------------------------------------------------------------------------
 // Filesystem walking — newest-first
 // ---------------------------------------------------------------------------
 
@@ -2009,6 +2120,125 @@ pub(crate) fn paths_match(a: &str, b: &str) -> bool {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    fn stored_msg(role: &str, content: &str) -> crate::services::session_store::StoredChatMessage {
+        crate::services::session_store::StoredChatMessage {
+            role: role.to_string(),
+            content: content.to_string(),
+            reasoning_content: None,
+            id: None,
+            timestamp: None,
+            attachments: None,
+            model: None,
+        }
+    }
+
+    async fn save_code_session(
+        store: &SessionStore,
+        cwd: &str,
+        session_id: &str,
+        messages: &[crate::services::session_store::StoredChatMessage],
+    ) {
+        store
+            .save_code_session_with_id(
+                "key1",
+                "https://api.example.com",
+                cwd,
+                session_id,
+                "test-model",
+                None,
+                messages,
+                "title",
+                "preview",
+                crate::services::session_store::SessionTokens::default(),
+            )
+            .await
+            .expect("save code session");
+    }
+
+    #[tokio::test]
+    async fn ingest_code_returns_project_sessions_only() {
+        let config_dir = TempDir::new().unwrap();
+        let store = SessionStore::with_path(config_dir.path().join("config.json"));
+        let project = TempDir::new().unwrap();
+        let cwd = std::fs::canonicalize(project.path())
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+
+        save_code_session(
+            &store,
+            &cwd,
+            "sess-in-project",
+            &[
+                stored_msg(
+                    "user",
+                    "please wire the payments webhook retry queue with backoff",
+                ),
+                stored_msg(
+                    "assistant",
+                    "added exponential backoff with a dead-letter queue after five attempts",
+                ),
+            ],
+        )
+        .await;
+        save_code_session(
+            &store,
+            "/somewhere/else",
+            "sess-elsewhere",
+            &[
+                stored_msg(
+                    "user",
+                    "a completely unrelated task in a different project dir",
+                ),
+                stored_msg(
+                    "assistant",
+                    "done — that other project's task is finished now",
+                ),
+            ],
+        )
+        .await;
+
+        let threads = ingest_code(&store, &cwd, None, false).await;
+        assert_eq!(threads.len(), 1);
+        let t = &threads[0];
+        assert_eq!(t.cli, "code");
+        assert_eq!(t.session_id, "sess-in-project");
+        assert!(t.topic.contains("webhook retry queue"));
+        assert!(t.last_response.contains("exponential backoff"));
+        assert_eq!(t.cwd.as_deref(), Some(cwd.as_str()));
+    }
+
+    #[tokio::test]
+    async fn ingest_code_drops_context_seeded_one_shots() {
+        // A `-p` one-shot launched with `--context` stores the injected block
+        // at the head of its first user message; re-ingesting it must not
+        // produce context-in-context recursion.
+        let config_dir = TempDir::new().unwrap();
+        let store = SessionStore::with_path(config_dir.path().join("config.json"));
+        let project = TempDir::new().unwrap();
+        let cwd = std::fs::canonicalize(project.path())
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+
+        save_code_session(
+            &store,
+            &cwd,
+            "sess-seeded",
+            &[
+                stored_msg(
+                    "user",
+                    "# aivo context\n\nCross-tool context from one past session.\n\nfix the login bug",
+                ),
+                stored_msg("assistant", "the login bug is fixed — the token refresh now retries"),
+            ],
+        )
+        .await;
+
+        let threads = ingest_code(&store, &cwd, None, true).await;
+        assert!(threads.is_empty());
+    }
 
     #[test]
     fn encode_claude_dir_uses_hyphens() {

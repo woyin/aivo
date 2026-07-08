@@ -342,20 +342,20 @@ is preserved."
     }
 
     pub(super) async fn open_resume_picker(&mut self, query: Option<String>) -> Result<()> {
-        let mut sessions = load_resume_snapshots(&self.session_store).await?;
+        // Scoped to the launch dir; an empty real_cwd can't scope → all.
+        let scope_cwd = (!self.real_cwd.is_empty()).then(|| self.real_cwd.clone());
+        let mut sessions = load_resume_snapshots(&self.session_store, scope_cwd.as_deref()).await?;
         if !self.history.is_empty()
             && !sessions
                 .iter()
                 .any(|session| session.session_id == self.session_id)
         {
             self.persist_history().await?;
-            sessions = load_resume_snapshots(&self.session_store).await?;
+            sessions = load_resume_snapshots(&self.session_store, scope_cwd.as_deref()).await?;
         }
 
-        // `--resume last` / `/resume last`: jump to the most recent session with
-        // no picker. In-session the current chat was just persisted above and now
-        // sorts newest, so skip it to land on the previous one; from a fresh
-        // launch the newest IS the chat you just left.
+        // `--resume last`: jump to the most recent session in this dir. In-session
+        // the current chat was just persisted and sorts newest, so skip it.
         if query.as_deref() == Some("last") {
             let pick = if self.history.is_empty() {
                 sessions.first()
@@ -366,15 +366,37 @@ is preserved."
             };
             match pick {
                 Some(snapshot) => self.begin_resume_load(snapshot.clone()),
-                None => self.notice = Some((MUTED, "No saved session to resume".to_string())),
+                None => {
+                    self.notice = Some((MUTED, "No saved session in this directory".to_string()))
+                }
             }
             return Ok(());
         }
 
-        if let Some(query) = &query
-            && let Some(snapshot) = sessions.iter().find(|session| session.session_id == *query)
-        {
-            self.begin_resume_load(snapshot.clone());
+        // Explicit id: jump if in this dir, else global fallback — a named
+        // session should resolve regardless of where it ran.
+        if let Some(query) = &query {
+            if let Some(snapshot) = sessions.iter().find(|session| session.session_id == *query) {
+                self.begin_resume_load(snapshot.clone());
+                return Ok(());
+            }
+            if scope_cwd.is_some()
+                && let Some(snapshot) = load_resume_snapshots(&self.session_store, None)
+                    .await?
+                    .into_iter()
+                    .find(|session| session.session_id == *query)
+            {
+                self.begin_resume_load(snapshot);
+                return Ok(());
+            }
+        }
+
+        // Empty scoped list → notice, not an unfilterable empty picker.
+        if sessions.is_empty() {
+            self.notice = Some((
+                MUTED,
+                "No saved sessions in this directory to resume".to_string(),
+            ));
             return Ok(());
         }
 
@@ -398,6 +420,19 @@ is preserved."
 
     pub(super) fn open_help_overlay(&mut self) {
         self.overlay = Overlay::Help { scroll: 0 };
+    }
+
+    /// `/context`: view the injected `-c` block, or a notice when none was.
+    pub(super) fn open_context_overlay(&mut self) {
+        if self.injected_context.is_none() {
+            self.notice = Some((
+                MUTED,
+                "No context injected — launch with `aivo code -c` to add prior-session context"
+                    .to_string(),
+            ));
+            return;
+        }
+        self.overlay = Overlay::Context { scroll: 0 };
     }
 
     /// `/config`: a small toggle list of chat preferences, seeded from the live

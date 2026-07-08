@@ -877,6 +877,14 @@ impl CodeTuiApp {
                     *scroll = clamped;
                 }
             }
+            Overlay::Context { scroll } => {
+                let area = centered_rect(72, 88, body);
+                self.screen_region = Some(overlay_content_rect(area));
+                let clamped = self.render_context_overlay(frame, area, scroll);
+                if let Overlay::Context { scroll } = &mut self.overlay {
+                    *scroll = clamped;
+                }
+            }
             Overlay::Skills(skills) => {
                 let (area, split) = split_overlay_area(body, 84, 80, 64, 80);
                 self.screen_region = Some(overlay_content_rect(area));

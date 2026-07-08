@@ -55,6 +55,7 @@ pub(crate) async fn run_one_shot_agent(
     key: &ApiKey,
     model: &str,
     prompt: String,
+    injected_context: Option<String>,
     context_window_override: Option<u64>,
     format: OutputFormat,
     limits: OneShotAgentLimits,
@@ -100,6 +101,9 @@ pub(crate) async fn run_one_shot_agent(
     }
     if crate::services::provider_profile::is_aivo_starter_base(&key.base_url) {
         engine.set_first_party();
+    }
+    if let Some(ctx) = injected_context.as_deref() {
+        engine.append_system_context(ctx);
     }
     let subagents = crate::agent::subagents::discover_subagents(session_store.config_dir());
     engine.set_subagents(&subagents);

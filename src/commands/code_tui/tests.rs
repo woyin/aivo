@@ -1402,6 +1402,8 @@ fn make_test_app(
         session_tokens: crate::services::session_store::SessionTokens::default(),
         context_window: 0,
         context_window_override: None,
+        injected_context: None,
+        injected_context_summary: None,
         context_is_estimate: true,
         follow_output: true,
         transcript_revision: 0,
@@ -6652,6 +6654,52 @@ fn test_parse_slash_compact() {
         parse_slash_command("compact now").unwrap(),
         SlashCommand::Compact { fast: false }
     );
+}
+
+#[test]
+fn test_parse_slash_context() {
+    assert_eq!(
+        parse_slash_command("context").unwrap(),
+        SlashCommand::Context
+    );
+}
+
+/// `/context` opens the viewer only when a `-c` block was injected; otherwise it
+/// leaves a notice explaining how to add one.
+#[tokio::test]
+async fn test_context_overlay_requires_injection() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+
+    // Nothing injected: a notice, no overlay.
+    app.open_context_overlay();
+    assert!(matches!(app.overlay, Overlay::None));
+    assert!(
+        app.notice
+            .as_ref()
+            .is_some_and(|(_, msg)| msg.contains("No context injected")),
+        "notice: {:?}",
+        app.notice
+    );
+
+    // With an injected block, the viewer opens.
+    app.injected_context = Some("# aivo context\n\n**Topic:** prior work".to_string());
+    app.injected_context_summary = Some("injected ~9 tokens from claude session abc (2m)".into());
+    app.open_context_overlay();
+    assert!(matches!(app.overlay, Overlay::Context { scroll: 0 }));
+
+    // It renders the summary header and the injected body, and Esc closes it.
+    let (screen, _) = render_full_screen(&mut app, 90, 30);
+    assert!(screen.contains("Injected context"), "title:\n{screen}");
+    assert!(
+        screen.contains("injected ~9 tokens from claude session abc"),
+        "summary header:\n{screen}"
+    );
+    assert!(screen.contains("Topic:"), "body:\n{screen}");
+    app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+        .await
+        .unwrap();
+    assert!(matches!(app.overlay, Overlay::None));
 }
 
 #[tokio::test]
@@ -12460,6 +12508,81 @@ async fn test_open_resume_picker_saves_current_unsaved_session() {
     assert_eq!(saved.session_id, "fresh-session");
 }
 
+/// The `/resume` picker only lists the launch dir's sessions, but an explicit
+/// id from another dir still resolves via the global fallback.
+#[tokio::test]
+async fn test_open_resume_picker_scopes_to_cwd_but_id_is_global() {
+    let temp_dir = TempDir::new().unwrap();
+    let store = SessionStore::with_path(temp_dir.path().join("config.json"));
+    let key_id = store
+        .add_key_with_protocol("prod", "https://api.example.com", None, "sk-test")
+        .await
+        .unwrap();
+    let key = store.get_key_by_id(&key_id).await.unwrap().unwrap();
+
+    for (sid, cwd) in [
+        ("here-sess", "/home/me/here"),
+        ("elsewhere-sess", "/home/me/elsewhere"),
+    ] {
+        store
+            .save_code_session_with_id(
+                &key_id,
+                &key.base_url,
+                cwd,
+                sid,
+                "claude",
+                None,
+                &[crate::services::session_store::StoredChatMessage {
+                    model: None,
+                    role: "user".into(),
+                    content: "hi".into(),
+                    reasoning_content: None,
+                    id: None,
+                    timestamp: None,
+                    attachments: None,
+                }],
+                sid,
+                sid,
+                crate::services::session_store::SessionTokens::default(),
+            )
+            .await
+            .unwrap();
+    }
+
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.session_store = store.clone();
+    app.key = key;
+    app.real_cwd = "/home/me/here".to_string();
+
+    // Bare picker: only the launch dir's session is listed.
+    app.open_resume_picker(None).await.unwrap();
+    let Overlay::Picker(picker) = &app.overlay else {
+        panic!("expected session picker");
+    };
+    let listed: Vec<&str> = picker
+        .items
+        .iter()
+        .filter_map(|item| match &item.value {
+            PickerValue::Session(session) => Some(session.session_id.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(listed, vec!["here-sess"], "got {listed:?}");
+
+    // Explicit id from another dir resolves via the global fallback.
+    app.overlay = Overlay::None;
+    app.open_resume_picker(Some("elsewhere-sess".to_string()))
+        .await
+        .unwrap();
+    assert!(
+        app.loading_resume
+            .as_ref()
+            .is_some_and(|l| l.preview.session_id == "elsewhere-sess"),
+        "explicit cross-dir id should begin a resume load"
+    );
+}
+
 #[tokio::test]
 async fn test_delete_picker_selection_removes_saved_chat() {
     let temp_dir = TempDir::new().unwrap();
@@ -12786,10 +12909,10 @@ async fn test_resume_does_not_overwrite_persisted_default_model() {
 }
 
 #[tokio::test]
-async fn test_resume_lists_sessions_regardless_of_cwd() {
-    // Sessions persist under the stable launch dir (for logs), but /resume is
-    // global — it must surface sessions saved under ANY cwd, including the dead
-    // per-pid sandbox dirs older sessions live in.
+async fn test_resume_snapshots_scope_by_cwd() {
+    // Sessions persist under their real launch dir. `/resume` is directory-
+    // scoped: `Some(dir)` returns only that dir's sessions, while `None` (the
+    // explicit-id fallback) returns every session across all dirs.
     let temp_dir = TempDir::new().unwrap();
     let store = SessionStore::with_path(temp_dir.path().join("config.json"));
     let key_id = store
@@ -12842,11 +12965,25 @@ async fn test_resume_lists_sessions_regardless_of_cwd() {
     assert_eq!(app.persist_cwd(), "/home/me/project"); // logs key on real dir
     app.persist_history().await.unwrap();
 
-    // /resume shows BOTH, newest first — no cwd filter.
-    let sessions = load_resume_snapshots(&store).await.unwrap();
-    let ids: Vec<&str> = sessions.iter().map(|s| s.session_id.as_str()).collect();
-    assert!(ids.contains(&"real-cwd-sess"), "got {ids:?}");
-    assert!(ids.contains(&"sandbox-sess"), "got {ids:?}");
+    // Unscoped (explicit-id fallback): both, newest first.
+    let all = load_resume_snapshots(&store, None).await.unwrap();
+    let all_ids: Vec<&str> = all.iter().map(|s| s.session_id.as_str()).collect();
+    assert!(all_ids.contains(&"real-cwd-sess"), "got {all_ids:?}");
+    assert!(all_ids.contains(&"sandbox-sess"), "got {all_ids:?}");
+
+    // Scoped to the launch dir: only that dir's session.
+    let scoped = load_resume_snapshots(&store, Some("/home/me/project"))
+        .await
+        .unwrap();
+    let scoped_ids: Vec<&str> = scoped.iter().map(|s| s.session_id.as_str()).collect();
+    assert_eq!(scoped_ids, vec!["real-cwd-sess"], "got {scoped_ids:?}");
+
+    // Scoped to the old sandbox dir: only the sandbox session.
+    let sandbox = load_resume_snapshots(&store, Some("/tmp/aivo-chat-old"))
+        .await
+        .unwrap();
+    let sandbox_ids: Vec<&str> = sandbox.iter().map(|s| s.session_id.as_str()).collect();
+    assert_eq!(sandbox_ids, vec!["sandbox-sess"], "got {sandbox_ids:?}");
 }
 
 /// `session_tokens` (the running per-session total folded from each turn) is

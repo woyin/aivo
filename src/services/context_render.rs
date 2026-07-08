@@ -35,6 +35,14 @@ pub fn render_single_session(tool: AIToolType, thread: &Thread) -> RenderedConte
     RenderedContext { text, tokens }
 }
 
+/// Render one past session for `aivo code -c` as compact markdown, appended
+/// to the system prompt rather than shown as a user message.
+pub fn render_for_aivo_code(thread: &Thread) -> RenderedContext {
+    let text = format_markdown_single(thread);
+    let tokens = estimate_tokens(&text);
+    RenderedContext { text, tokens }
+}
+
 fn format_claude_single(t: &Thread) -> String {
     let mut s = String::from(
         "<aivo_context>\nCross-tool context from one past session. Use as background awareness; the user is continuing prior work, not expecting you to reference this explicitly.\n",
@@ -133,6 +141,19 @@ mod tests {
         let r = render_single_session(AIToolType::Claude, &t);
         assert!(!r.text.contains("<script>"));
         assert!(r.text.contains("&lt;script&gt;"));
+    }
+
+    #[test]
+    fn aivo_code_render_uses_markdown() {
+        let t = thread(
+            "codex",
+            "wiring the payments webhook retry queue",
+            "added exponential backoff",
+        );
+        let r = render_for_aivo_code(&t);
+        assert!(r.text.contains("# aivo context"));
+        assert!(r.text.contains("**Topic:**"));
+        assert!(r.tokens > 0);
     }
 
     #[test]

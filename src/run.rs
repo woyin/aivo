@@ -374,6 +374,7 @@ pub async fn run() -> ! {
                     model,
                     one_shot,
                     initial_prompt,
+                    code_args.context,
                     code_args.attachments,
                     code_args.refresh,
                     key_override,
@@ -531,6 +532,13 @@ pub async fn run() -> ! {
                     process::exit(ExitCode::UserError.code());
                 }
 
+                // The start flow has no injection hook; warn rather than drop `-c` silently.
+                if context_selector.is_some() {
+                    eprintln!(
+                        "  {} --context is ignored here; use `aivo code -c` or `aivo <tool> -c`",
+                        style::yellow("!")
+                    );
+                }
                 let command = StartCommand::new(session_store, ai_launcher, models_cache);
                 command
                     .execute(StartFlowArgs {
