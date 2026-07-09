@@ -48,6 +48,8 @@ struct Job {
     pgid: i32,
     pid: u32,
     status: JobStatus,
+    /// The model has seen this job finish — gates `drain_finished_notices`.
+    notified: bool,
 }
 
 impl Job {
@@ -205,12 +207,14 @@ check_job {{\"id\": \"…\", \"kill\": true}} before starting another."
             pgid: pid as i32,
             pid,
             status: JobStatus::Running,
+            notified: false,
         });
 
         Ok(format!(
             "started background job {id} (pid {pid}): {command}\n\
 log: {}\n\
-Poll it with check_job {{\"id\": \"{id}\"}}; stop it with check_job {{\"id\": \"{id}\", \"kill\": true}}.\n\
+Poll it with check_job {{\"id\": \"{id}\"}}; stop it with check_job {{\"id\": \"{id}\", \"kill\": true}}. \
+You'll also get a notice at a later step when it finishes — no need to busy-poll.\n\
 Note: file writes are sandbox-confined to the workspace like any run_bash; if the log shows \
 \"Operation not permitted\"/\"Permission denied\", re-run in the foreground to be offered the \
 unsandboxed escalation.",
@@ -222,9 +226,13 @@ unsandboxed escalation.",
     pub fn check(&self, id: &str) -> Result<String, String> {
         let mut inner = self.inner.lock().unwrap();
         inner.reap_all();
-        let Some(job) = inner.jobs.iter().find(|j| j.id == id) else {
+        let Some(job) = inner.jobs.iter_mut().find(|j| j.id == id) else {
             return Err(inner.unknown_id_error(id));
         };
+        if !matches!(job.status, JobStatus::Running) {
+            job.notified = true; // the model just observed the finish
+        }
+        let job = &*job;
         let mut out = status_line(job);
         out.push_str(&format!("\nlog: {}", job.log_path.display()));
         out.push_str("\n--- log tail ---\n");
@@ -245,6 +253,22 @@ can be up before its startup line flushes. Probe it directly, e.g. curl the port
         Ok(out)
     }
 
+    /// Finished jobs the model hasn't seen yet, marked seen as taken — the engine
+    /// folds these in at step boundaries so the model needn't busy-poll `check_job`.
+    pub fn drain_finished_notices(&self) -> Vec<String> {
+        let mut inner = self.inner.lock().unwrap();
+        inner.reap_all();
+        inner
+            .jobs
+            .iter_mut()
+            .filter(|j| !matches!(j.status, JobStatus::Running) && !j.notified)
+            .map(|j| {
+                j.notified = true;
+                format!("{} (log: {})", status_line(j), j.log_path.display())
+            })
+            .collect()
+    }
+
     /// Tree-kill job `id` (TERM → grace → KILL), returning as soon as it dies;
     /// idempotent on a finished job. A job that exits on its own during the grace
     /// keeps its real `Exited(code)` — only a forced/unreaped job is marked `Killed`.
@@ -256,6 +280,7 @@ can be up before its startup line flushes. Probe it directly, e.g. curl the port
                 return Err(inner.unknown_id_error(id));
             };
             if !matches!(inner.jobs[idx].status, JobStatus::Running) {
+                inner.jobs[idx].notified = true; // the model just observed the finish
                 return Ok(format!(
                     "job {id} already finished ({}).",
                     status_word(&inner.jobs[idx].status)
@@ -283,6 +308,7 @@ can be up before its startup line flushes. Probe it directly, e.g. curl the port
         };
         let job = &mut inner.jobs[idx];
         finalize_killed(job);
+        job.notified = true; // finish observed via the kill's own result
         let ran = fmt_dur(job.runtime());
         Ok(match &job.status {
             JobStatus::Exited(Some(c)) => {
@@ -764,6 +790,58 @@ mod tests {
         assert!(
             check.contains("line5000"),
             "tail should keep the END: {check}"
+        );
+    }
+
+    #[cfg(unix)]
+    async fn wait_reaped(jobs: &SharedJobs) {
+        for _ in 0..100 {
+            if jobs.running_count() == 0 {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn drain_finished_notices_reports_each_finish_once() {
+        let dir = tmp();
+        let jobs = table(&dir);
+        jobs.spawn("echo done-quickly", &dir).unwrap();
+        wait_reaped(&jobs).await;
+        let notices = jobs.drain_finished_notices();
+        assert_eq!(notices.len(), 1, "{notices:?}");
+        assert!(
+            notices[0].contains("job j1") && notices[0].contains("exited"),
+            "{notices:?}"
+        );
+        assert!(
+            notices[0].contains("j1.log"),
+            "log path missing: {notices:?}"
+        );
+        assert!(
+            jobs.drain_finished_notices().is_empty(),
+            "a drained finish must not re-announce"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn checked_or_killed_jobs_are_not_re_announced() {
+        let dir = tmp();
+        let jobs = table(&dir);
+        jobs.spawn("true", &dir).unwrap();
+        wait_for(&jobs, "j1", "exited").await; // check() observes the finish
+        assert!(
+            jobs.drain_finished_notices().is_empty(),
+            "check_job already told the model"
+        );
+        jobs.spawn("sleep 30", &dir).unwrap();
+        jobs.kill("j2").await.unwrap();
+        assert!(
+            jobs.drain_finished_notices().is_empty(),
+            "the kill's own result already told the model"
         );
     }
 

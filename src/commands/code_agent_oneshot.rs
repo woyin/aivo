@@ -5,9 +5,13 @@
 //!
 //! Output is `--output-format`-selected ([`OutputFormat`]):
 //! - `text` (default): answer → stdout, tool/step activity → stderr (human prose).
+//! - `json`: activity → stderr, one final secret-redacted result document on stdout.
 //! - `stream-json`: one secret-redacted JSON event per line on stdout for
 //!   editors/automation — each carries `{schemaVersion, type, runId}` plus type-specific
 //!   fields (see the `stream_event` call sites for the per-type payloads).
+//!
+//! Completed runs persist a session (display messages + exact engine transcript), so
+//! `--resume last|<id>` continues one headlessly and the TUI's `/resume` can pick it up.
 
 use std::io::Write;
 use std::path::Path;
@@ -60,6 +64,7 @@ pub(crate) async fn run_one_shot_agent(
     format: OutputFormat,
     limits: OneShotAgentLimits,
     auto_approve: bool,
+    resume: Option<String>,
 ) -> anyhow::Result<ExitCode> {
     // Real launch dir (like the TUI's real_cwd), not chat's sandbox.
     let cwd = std::env::current_dir()
@@ -95,9 +100,15 @@ pub(crate) async fn run_one_shot_agent(
     ));
     // Unattended run: don't accept an answer that admits it isn't done — nudge to continue.
     engine.set_require_completion();
-    // Opt-in: run the project's validator on a declared-done turn and self-correct failures.
-    if env_or("AIVO_AGENT_SELF_CORRECT", 0u8) != 0 {
-        engine.set_self_correct(true);
+    // Self-verify: default on but mutation-gated (investigate-only stays fast);
+    // explicit `=1` also verifies the unknown starting baseline; `=0` opts out.
+    match crate::services::system_env::env_flag("AIVO_AGENT_SELF_CORRECT") {
+        Some(true) => engine.set_self_correct(true),
+        None => {
+            engine.set_self_correct(true);
+            engine.set_verified_baseline();
+        }
+        Some(false) => {}
     }
     if crate::services::provider_profile::is_aivo_starter_base(&key.base_url) {
         engine.set_first_party();
@@ -117,8 +128,37 @@ pub(crate) async fn run_one_shot_agent(
     engine.set_artifacts_dir(
         std::env::temp_dir().join(format!("aivo-artifacts-{}", std::process::id())),
     );
-    // Opt-in LSP diagnostics-after-edit (AIVO_AGENT_LSP=1).
+    // LSP diagnostics-after-edit (default on; AIVO_AGENT_LSP=0 opts out).
     engine.maybe_enable_lsp(Path::new(&cwd));
+    // User lifecycle hooks (~/.config/aivo/hooks.json).
+    engine.set_hooks(std::sync::Arc::new(
+        crate::agent::hooks::HookSet::load_default(),
+    ));
+
+    // Resume: best fidelity first (exact engine log, else display text). The session
+    // id is fixed up front so machine consumers see it from run_start on.
+    let resumed = match resume.as_deref() {
+        Some(sel) => Some(resolve_resume_session(session_store, sel, &cwd, &key.id).await?),
+        None => None,
+    };
+    if let Some(state) = &resumed {
+        match &state.engine_messages {
+            Some(msgs) if !msgs.is_empty() => engine.restore_conversation(msgs.clone()),
+            _ => {
+                let seed: Vec<serde_json::Value> = state
+                    .messages
+                    .iter()
+                    .filter(|m| m.role == "user" || m.role == "assistant")
+                    .map(|m| serde_json::json!({"role": m.role, "content": m.content}))
+                    .collect();
+                engine.restore_conversation(seed);
+            }
+        }
+    }
+    let session_id = resumed
+        .as_ref()
+        .map(|s| s.session_id.clone())
+        .unwrap_or_else(crate::commands::code::new_code_session_id);
 
     // Eval/CI hook: AIVO_AGENT_FAKE_SSE=<script> swaps the provider for a scripted
     // loopback model, so the real loop + real tool execution run deterministically.
@@ -161,7 +201,7 @@ pub(crate) async fn run_one_shot_agent(
         auto_approve: None,
         review_edits: None,
     };
-    let mut ui = HeadlessAgentUi::new(format);
+    let mut ui = HeadlessAgentUi::new(format, session_id.clone());
     ui.run_start(model, &cwd);
     let prompt_for_log = prompt.clone();
     let started = std::time::Instant::now();
@@ -187,9 +227,28 @@ pub(crate) async fn run_one_shot_agent(
     // event is followed by run_end, never left dangling).
     ui.run_end(i64::from(exit.code()));
 
-    // No session written — one-shots aren't resumable by design; just log the turn.
+    // Persist the session so `--resume` can continue it; an interrupted run saves
+    // nothing (its announced sessionId simply never materializes).
     if completed {
         let usage = engine.take_turn_usage();
+        persist_oneshot_session(
+            session_store,
+            key,
+            model,
+            &cwd,
+            &session_id,
+            resumed.map(|s| s.messages).unwrap_or_default(),
+            &prompt_for_log,
+            &ui.answer,
+            &usage,
+        )
+        .await;
+        let _ = session_store
+            .save_agent_messages(&session_id, &engine.export_conversation())
+            .await;
+        if format == OutputFormat::Text {
+            eprintln!("[session {session_id} — continue with --resume {session_id}]");
+        }
         log_oneshot_turn(
             session_store,
             key,
@@ -250,6 +309,104 @@ fn parse_upstream_status(msg: &str) -> Option<u16> {
         .ok()
 }
 
+/// `last` = cwd+key-scoped (matching the TUI); an explicit id resolves globally —
+/// a named session is user intent regardless of where it ran. Unknown → hard error.
+async fn resolve_resume_session(
+    session_store: &SessionStore,
+    selector: &str,
+    cwd: &str,
+    key_id: &str,
+) -> anyhow::Result<crate::services::session_store::CodeSessionState> {
+    let id = if selector == "last" {
+        session_store
+            .list_chat_sessions(key_id, "", cwd)
+            .await?
+            .first()
+            .map(|e| e.session_id.clone())
+            .ok_or_else(|| anyhow::anyhow!("no saved session in this directory to resume"))?
+    } else {
+        selector.to_string()
+    };
+    session_store
+        .get_code_session(&id)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("no saved session '{id}' — see `aivo code` → /resume"))
+}
+
+/// Best-effort — a failed save must not fail the run whose answer already printed.
+#[allow(clippy::too_many_arguments)]
+async fn persist_oneshot_session(
+    session_store: &SessionStore,
+    key: &ApiKey,
+    model: &str,
+    cwd: &str,
+    session_id: &str,
+    mut messages: Vec<crate::services::session_store::StoredChatMessage>,
+    prompt: &str,
+    answer: &str,
+    usage: &crate::services::session_store::SessionTokens,
+) {
+    use crate::services::session_store::StoredChatMessage;
+    let now = chrono::Utc::now().to_rfc3339();
+    messages.push(StoredChatMessage {
+        role: "user".to_string(),
+        content: prompt.to_string(),
+        reasoning_content: None,
+        id: None,
+        timestamp: Some(now.clone()),
+        attachments: None,
+        model: None,
+    });
+    messages.push(StoredChatMessage {
+        role: "assistant".to_string(),
+        content: answer.to_string(),
+        reasoning_content: None,
+        id: None,
+        timestamp: Some(now),
+        attachments: None,
+        model: Some(model.to_string()),
+    });
+    let title: String = messages
+        .iter()
+        .find(|m| m.role == "user")
+        .map(|m| {
+            m.content
+                .lines()
+                .next()
+                .unwrap_or("")
+                .chars()
+                .take(120)
+                .collect()
+        })
+        .unwrap_or_default();
+    let preview: String = answer
+        .lines()
+        .find(|l| !l.trim().is_empty())
+        .unwrap_or("")
+        .chars()
+        .take(160)
+        .collect();
+    let mut tokens = session_store.chat_session_tokens(session_id).await;
+    tokens.prompt_tokens += usage.prompt_tokens;
+    tokens.completion_tokens += usage.completion_tokens;
+    tokens.cache_read_tokens += usage.cache_read_tokens;
+    tokens.cache_write_tokens += usage.cache_write_tokens;
+    let _ = session_store
+        .save_code_session_with_id(
+            &key.id,
+            &key.base_url,
+            cwd,
+            session_id,
+            model,
+            Some(model),
+            &messages,
+            &title,
+            &preview,
+            tokens,
+        )
+        .await;
+}
+
 /// Log a completed headless turn (`chat_turn`) so `-e` shows in `aivo logs`. Best-effort.
 #[allow(clippy::too_many_arguments)]
 async fn log_oneshot_turn(
@@ -295,11 +452,13 @@ async fn log_oneshot_turn(
 }
 
 /// Headless output format for `-e`. `Text` = human prose (answer → stdout, activity
-/// → stderr). `StreamJson` = one schema-versioned JSON event per line on stdout,
+/// → stderr). `Json` = activity → stderr, one final result document on stdout.
+/// `StreamJson` = one schema-versioned JSON event per line on stdout,
 /// secret-redacted — a stable protocol for editors/automation driving the agent.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum OutputFormat {
     Text,
+    Json,
     StreamJson,
 }
 
@@ -308,6 +467,7 @@ impl OutputFormat {
     pub(crate) fn parse(s: Option<&str>) -> Self {
         match s {
             Some("stream-json") => Self::StreamJson,
+            Some("json") => Self::Json,
             _ => Self::Text,
         }
     }
@@ -361,6 +521,10 @@ fn redact_args(args: &Value) -> Value {
 struct HeadlessAgentUi {
     format: OutputFormat,
     run_id: String,
+    /// Persisted-session id, fixed up front so machine consumers can `--resume` it.
+    session_id: String,
+    model: String,
+    cwd: String,
     seg: String,
     wrote_answer: bool,
     /// Full answer text (flushed segments), kept for the `aivo logs` row and the
@@ -368,17 +532,23 @@ struct HeadlessAgentUi {
     answer: String,
     /// The last terminal error the engine reported, for exit-code classification.
     last_error: Option<String>,
+    /// Footer stats, kept for the single-document `json` result.
+    stats: (usize, u64, u64),
 }
 
 impl HeadlessAgentUi {
-    fn new(format: OutputFormat) -> Self {
+    fn new(format: OutputFormat, session_id: String) -> Self {
         Self {
             format,
             run_id: new_run_id(),
+            session_id,
+            model: String::new(),
+            cwd: String::new(),
             seg: String::new(),
             wrote_answer: false,
             answer: String::new(),
             last_error: None,
+            stats: (0, 0, 0),
         }
     }
 
@@ -388,17 +558,44 @@ impl HeadlessAgentUi {
         let _ = std::io::stdout().flush();
     }
 
-    /// First line of the stream: the run's identity. No-op in text mode.
-    fn run_start(&self, model: &str, cwd: &str) {
+    /// First line of the stream: the run's identity. No-op in text/json mode.
+    fn run_start(&mut self, model: &str, cwd: &str) {
+        self.model = model.to_string();
+        self.cwd = cwd.to_string();
         if self.format == OutputFormat::StreamJson {
-            self.emit("run_start", json!({ "model": model, "cwd": cwd }));
+            self.emit(
+                "run_start",
+                json!({ "model": model, "cwd": cwd, "sessionId": self.session_id }),
+            );
         }
     }
 
-    /// Terminal line of the stream, always emitted (even after an error). No-op in text mode.
+    /// Terminal output: stream-json emits `run_end` (always, even after an error, so a
+    /// machine consumer sees a terminal event); `json` prints its single result document.
     fn run_end(&self, exit_code: i64) {
-        if self.format == OutputFormat::StreamJson {
-            self.emit("run_end", json!({ "exit": exit_code }));
+        match self.format {
+            OutputFormat::StreamJson => self.emit("run_end", json!({ "exit": exit_code })),
+            OutputFormat::Json => {
+                let (steps, tokens, elapsed_secs) = self.stats;
+                let doc = stream_event(
+                    &self.run_id,
+                    "result",
+                    json!({
+                        "sessionId": self.session_id,
+                        "model": self.model,
+                        "cwd": self.cwd,
+                        "exit": exit_code,
+                        "answer": redact(&self.answer),
+                        "error": self.last_error.as_deref().map(redact),
+                        "steps": steps,
+                        "tokens": tokens,
+                        "elapsedSecs": elapsed_secs,
+                    }),
+                );
+                println!("{doc}");
+                let _ = std::io::stdout().flush();
+            }
+            OutputFormat::Text => {}
         }
     }
 
@@ -411,6 +608,8 @@ impl HeadlessAgentUi {
                 print!("{}", self.seg);
                 let _ = std::io::stdout().flush();
             }
+            // Json: stdout is reserved for the final result document.
+            OutputFormat::Json => {}
             OutputFormat::StreamJson => {
                 self.emit("text", json!({ "text": redact(&self.seg) }));
             }
@@ -434,7 +633,9 @@ impl AgentUi for HeadlessAgentUi {
     fn tool_start(&mut self, name: &str, args: &Value) {
         self.flush_seg();
         match self.format {
-            OutputFormat::Text => eprintln!("⏺ {name} {}", one_line(&args.to_string())),
+            OutputFormat::Text | OutputFormat::Json => {
+                eprintln!("⏺ {name} {}", one_line(&args.to_string()));
+            }
             OutputFormat::StreamJson => {
                 self.emit(
                     "tool_call",
@@ -445,7 +646,7 @@ impl AgentUi for HeadlessAgentUi {
     }
     fn tool_result(&mut self, name: &str, result: &Result<String, String>) {
         match self.format {
-            OutputFormat::Text => match result {
+            OutputFormat::Text | OutputFormat::Json => match result {
                 Ok(s) => eprintln!("  ⎿ {}", one_line(s)),
                 Err(e) => eprintln!("  ✗ {}", one_line(e)),
             },
@@ -460,14 +661,14 @@ impl AgentUi for HeadlessAgentUi {
     }
     fn notify(&mut self, text: &str) {
         match self.format {
-            OutputFormat::Text => eprintln!("{text}"),
+            OutputFormat::Text | OutputFormat::Json => eprintln!("{text}"),
             OutputFormat::StreamJson => self.emit("notice", json!({ "text": redact(text) })),
         }
     }
     fn notify_error(&mut self, text: &str) {
         self.last_error = Some(text.to_string());
         match self.format {
-            OutputFormat::Text => eprintln!("{text}"),
+            OutputFormat::Text | OutputFormat::Json => eprintln!("{text}"),
             OutputFormat::StreamJson => self.emit("error", json!({ "text": redact(text) })),
         }
     }
@@ -480,6 +681,7 @@ impl AgentUi for HeadlessAgentUi {
         elapsed_secs: u64,
     ) {
         self.flush_seg();
+        self.stats = (steps, tokens, elapsed_secs);
         match self.format {
             OutputFormat::Text => {
                 if self.wrote_answer {
@@ -487,12 +689,18 @@ impl AgentUi for HeadlessAgentUi {
                 }
                 eprintln!("[{steps} step(s) · {tokens} tok · {elapsed_secs}s]");
             }
+            OutputFormat::Json => {
+                eprintln!("[{steps} step(s) · {tokens} tok · {elapsed_secs}s]");
+            }
             OutputFormat::StreamJson => {
                 self.emit(
                     "usage",
                     json!({ "steps": steps, "tokens": tokens, "elapsedSecs": elapsed_secs }),
                 );
-                self.emit("final", json!({ "text": redact(&self.answer) }));
+                self.emit(
+                    "final",
+                    json!({ "text": redact(&self.answer), "sessionId": self.session_id }),
+                );
             }
         }
     }
@@ -564,6 +772,10 @@ mod tests {
         assert!(matches!(
             OutputFormat::parse(Some("text")),
             OutputFormat::Text
+        ));
+        assert!(matches!(
+            OutputFormat::parse(Some("json")),
+            OutputFormat::Json
         ));
         assert!(matches!(OutputFormat::parse(None), OutputFormat::Text));
     }

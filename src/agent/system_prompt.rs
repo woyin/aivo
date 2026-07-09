@@ -1,27 +1,122 @@
 //! System-prompt assembly for the agent engine: the base coding-agent prompt
 //! (identity, action bias and its safety counterweights, verify-before-done,
 //! plan/notes/subagent guidance, host-shell/OS environment), plus discovery of
-//! project convention files (AGENTS.md/CLAUDE.md/…) that the prompt points to lazily.
+//! project convention files (AGENTS.md/CLAUDE.md/…) — global, ancestor, and cwd —
+//! whose contents are inlined verbatim when small, pointed to lazily when not.
 
-use std::path::Path;
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
 
 use crate::agent::skills::{self, Skill};
 
-/// Names of project-convention / AI-guide files present in `cwd`. The agent reads
-/// them on demand rather than injecting their contents into every turn.
+/// Convention-file names recognized in `cwd` itself.
+const GUIDE_NAMES: &[&str] = &[
+    "AGENTS.md",
+    "CLAUDE.md",
+    "GEMINI.md",
+    ".cursorrules",
+    ".github/copilot-instructions.md",
+];
+/// Ancestors/global carry only the hierarchical-merge conventions; `.cursorrules`-style
+/// files are cwd-rooted by their own ecosystems.
+const ANCESTOR_GUIDE_NAMES: &[&str] = &["AGENTS.md", "CLAUDE.md"];
+/// Inline-verbatim byte caps (per file / all files); over → read-on-demand pointer,
+/// so one huge guide can't crowd the window.
+const GUIDE_INLINE_MAX: usize = 24 * 1024;
+const GUIDES_INLINE_TOTAL_MAX: usize = 48 * 1024;
+/// Upward-walk backstop against pathological directory depths.
+const GUIDE_WALK_CAP: usize = 32;
+
+/// Convention files that apply to `cwd`, most-specific LAST (later wins on conflict):
+/// global `~/.config/aivo/AGENTS.md`, ancestors from the git root down, then `cwd`'s
+/// own (bare names; others absolute). Symlinked duplicates collapse to one entry.
 pub fn discover_project_guides(cwd: &Path) -> Vec<String> {
-    const NAMES: &[&str] = &[
-        "AGENTS.md",
-        "CLAUDE.md",
-        "GEMINI.md",
-        ".cursorrules",
-        ".github/copilot-instructions.md",
-    ];
-    NAMES
-        .iter()
-        .filter(|name| cwd.join(name).is_file())
-        .map(|name| name.to_string())
-        .collect()
+    let global = crate::services::system_env::home_dir().map(|h| h.join(".config/aivo"));
+    discover_project_guides_at(cwd, global.as_deref())
+}
+
+/// [`discover_project_guides`] with the global config dir injectable for tests.
+pub fn discover_project_guides_at(cwd: &Path, global_dir: Option<&Path>) -> Vec<String> {
+    let mut labels = Vec::new();
+    let mut seen: HashSet<PathBuf> = HashSet::new();
+    let mut push = |path: PathBuf, label: String, seen: &mut HashSet<PathBuf>| {
+        if !path.is_file() {
+            return;
+        }
+        let canon = std::fs::canonicalize(&path).unwrap_or(path);
+        if seen.insert(canon) {
+            labels.push(label);
+        }
+    };
+    if let Some(dir) = global_dir {
+        let p = dir.join("AGENTS.md");
+        push(p.clone(), p.display().to_string(), &mut seen);
+    }
+    for dir in guide_ancestors(cwd) {
+        for name in ANCESTOR_GUIDE_NAMES {
+            let p = dir.join(name);
+            push(p.clone(), p.display().to_string(), &mut seen);
+        }
+    }
+    for name in GUIDE_NAMES {
+        push(cwd.join(name), (*name).to_string(), &mut seen);
+    }
+    labels
+}
+
+/// Ancestors from the git root down to `cwd`'s parent (deeper = higher precedence).
+/// Empty outside a git work tree — an unbounded upward walk would surprise (e.g.
+/// pick up a stray `~/AGENTS.md` for any dir under home).
+fn guide_ancestors(cwd: &Path) -> Vec<PathBuf> {
+    let cwd = std::fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
+    let mut chain = Vec::new();
+    let mut dir = cwd.as_path();
+    for _ in 0..GUIDE_WALK_CAP {
+        let Some(parent) = dir.parent() else {
+            return Vec::new(); // hit filesystem root without a .git boundary
+        };
+        // `.git` may be a dir or a worktree/submodule pointer file.
+        if dir.join(".git").exists() {
+            if dir == cwd {
+                return Vec::new(); // cwd IS the git root: no ancestors apply
+            }
+            chain.push(dir.to_path_buf()); // the git root itself carries guides too
+            chain.reverse();
+            return chain;
+        }
+        if dir != cwd {
+            chain.push(dir.to_path_buf());
+        }
+        dir = parent;
+    }
+    Vec::new()
+}
+
+/// Split guides into (label, contents) to inline vs labels to point to lazily —
+/// missing, unreadable, empty, or over-cap files keep the pointer treatment.
+fn partition_guides(cwd: &str, guides: &[String]) -> (Vec<(String, String)>, Vec<String>) {
+    let mut inlined = Vec::new();
+    let mut pointers = Vec::new();
+    let mut total = 0usize;
+    for label in guides {
+        let path = {
+            let p = Path::new(label);
+            if p.is_absolute() {
+                p.to_path_buf()
+            } else {
+                Path::new(cwd).join(p)
+            }
+        };
+        match std::fs::read_to_string(&path) {
+            Ok(c) if c.trim().is_empty() => {}
+            Ok(c) if c.len() <= GUIDE_INLINE_MAX && total + c.len() <= GUIDES_INLINE_TOTAL_MAX => {
+                total += c.len();
+                inlined.push((label.clone(), c.trim().to_string()));
+            }
+            _ => pointers.push(label.clone()),
+        }
+    }
+    (inlined, pointers)
 }
 
 pub(crate) fn system_prompt(cwd: &str, date: &str, guides: &[String], skills: &[Skill]) -> String {
@@ -116,14 +211,29 @@ so write every command in {shell} syntax — don't assume a different OS's shell
 the `curl` alias) and chain with `;` (not `&&`). Paths use `\\`.",
         );
     }
-    if !guides.is_empty() {
+    let (inlined, pointers) = partition_guides(cwd, guides);
+    if !inlined.is_empty() {
+        p.push_str(
+            "\n\nThis project's convention file(s) follow. When you act on this project — create \
+or edit ANY file, or run a project workflow (a build, release, commit/tag, or a skill/slash-command \
+that operates on this repo) — you must follow them: they may dictate file headers, style, git and \
+release process, or workflow, and a workflow's own steps do not override them. Where two conflict, \
+the later (more specific) one wins.",
+        );
+        for (label, content) in &inlined {
+            p.push_str(&format!(
+                "\n\n<conventions from=\"{label}\">\n{content}\n</conventions>"
+            ));
+        }
+    }
+    if !pointers.is_empty() {
         p.push_str(&format!(
             "\n\nThis project has convention file(s): {}. Read the relevant one(s) BEFORE you act \
 on this project — before creating or editing ANY file, and before running a project workflow (a \
 build, release, commit/tag, or a skill/slash-command that operates on this repo). They may \
 dictate file headers, style, git and release process, or workflow, and you must follow them — a \
 workflow's own steps do not override them. (Skip them for questions, chat, or read-only exploration.)",
-            guides.join(", ")
+            pointers.join(", ")
         ));
     }
     p.push_str(&skills::skills_prompt_section(
@@ -157,7 +267,78 @@ mod tests {
         let dir = tmp();
         std::fs::write(dir.join("AGENTS.md"), "rules").unwrap();
         std::fs::write(dir.join("README.md"), "not a guide").unwrap();
-        assert_eq!(discover_project_guides(&dir), vec!["AGENTS.md".to_string()]);
+        assert_eq!(
+            discover_project_guides_at(&dir, None),
+            vec!["AGENTS.md".to_string()]
+        );
+    }
+
+    #[test]
+    fn discover_orders_global_then_ancestors_then_cwd() {
+        let dir = tmp();
+        let global = dir.join("global");
+        let root = dir.join("repo");
+        let sub = root.join("crates/app");
+        std::fs::create_dir_all(&global).unwrap();
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(global.join("AGENTS.md"), "global rules").unwrap();
+        std::fs::write(root.join("AGENTS.md"), "root rules").unwrap();
+        std::fs::write(sub.join("CLAUDE.md"), "leaf rules").unwrap();
+        let got = discover_project_guides_at(&sub, Some(&global));
+        assert_eq!(got.len(), 3, "{got:?}");
+        // Most-specific last: global abs path, git-root abs path, bare cwd name.
+        assert!(got[0].ends_with("global/AGENTS.md") && Path::new(&got[0]).is_absolute());
+        assert!(got[1].ends_with("repo/AGENTS.md") && Path::new(&got[1]).is_absolute());
+        assert_eq!(got[2], "CLAUDE.md");
+    }
+
+    #[test]
+    fn discover_without_git_root_skips_ancestors() {
+        // No .git boundary → an upward walk would surprise; only cwd files apply.
+        let dir = tmp();
+        let sub = dir.join("a/b");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(dir.join("AGENTS.md"), "outer").unwrap();
+        assert!(discover_project_guides_at(&sub, None).is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn discover_collapses_symlinked_duplicates() {
+        let dir = tmp();
+        std::fs::write(dir.join("CLAUDE.md"), "rules").unwrap();
+        std::os::unix::fs::symlink(dir.join("CLAUDE.md"), dir.join("AGENTS.md")).unwrap();
+        assert_eq!(
+            discover_project_guides_at(&dir, None),
+            vec!["AGENTS.md".to_string()]
+        );
+    }
+
+    #[test]
+    fn system_prompt_inlines_small_guides_verbatim() {
+        let dir = tmp();
+        std::fs::write(dir.join("AGENTS.md"), "Always use tabs, never spaces.").unwrap();
+        let guides = discover_project_guides_at(&dir, None);
+        let p = system_prompt(dir.to_str().unwrap(), "", &guides, &[]);
+        assert!(p.contains("<conventions from=\"AGENTS.md\">"));
+        assert!(p.contains("Always use tabs, never spaces."));
+        assert!(p.contains("the later (more specific) one wins"));
+        // Inlined → no read-on-demand pointer paragraph.
+        assert!(!p.contains("Read the relevant one(s) BEFORE"));
+    }
+
+    #[test]
+    fn system_prompt_keeps_pointer_for_oversized_guides() {
+        let dir = tmp();
+        std::fs::write(dir.join("AGENTS.md"), "x".repeat(GUIDE_INLINE_MAX + 1)).unwrap();
+        std::fs::write(dir.join("CLAUDE.md"), "small rule").unwrap();
+        let guides = discover_project_guides_at(&dir, None);
+        let p = system_prompt(dir.to_str().unwrap(), "", &guides, &[]);
+        // Small file inlined; the oversized one stays a lazy pointer.
+        assert!(p.contains("<conventions from=\"CLAUDE.md\">"));
+        assert!(p.contains("This project has convention file(s): AGENTS.md."));
+        assert!(p.contains("Read the relevant one(s) BEFORE"));
     }
 
     #[test]

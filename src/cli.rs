@@ -1009,15 +1009,16 @@ pub struct CodeArgs {
     #[arg(long, requires = "prompt")]
     pub json: bool,
 
-    /// Machine-readable output for `-e`/`--exec`: `text` (default, human prose) or
-    /// `stream-json` (one schema-versioned JSON event per line on stdout —
-    /// run_start, text, tool_call, tool_result, usage, final, run_end).
+    /// Machine-readable output for `-e`/`--exec`: `text` (default, human prose),
+    /// `json` (one final result document on stdout), or `stream-json` (one
+    /// schema-versioned JSON event per line on stdout — run_start, text, tool_call,
+    /// tool_result, usage, final, run_end).
     /// Secret-redacted; for editors and automation driving the agent.
     #[arg(
         long = "output-format",
         value_name = "FORMAT",
         requires = "exec",
-        value_parser = ["text", "stream-json"]
+        value_parser = ["text", "json", "stream-json"]
     )]
     pub output_format: Option<String>,
 

@@ -143,11 +143,13 @@ aivo code "<text>"            # TUI with the text sent as the first message
 --max-steps <N>               max -e agent steps (0 disables)
 --max-output-tokens <N>       max -e output tokens (0 disables)
 -r, --refresh                 refresh the model list (skip cache)
---resume [last|id]            resume a saved session
+--resume [last|id]            resume a saved session (TUI and -e; -e runs persist too)
 --share                       share this session live (needs `aivo login`)
 -c, --context[=<id>]          inject one past AI CLI session as context (bare = picker)
 --attach <path>               attach a file or image
 --json                        raw provider JSON (with -p)
+--output-format <fmt>         -e output: text (default), json (one final result
+                              document), or stream-json (one event per line)
 --max-context <size>          override the context window (e.g. 200k)
 --dry-run                     show the resolved key/model/endpoint, don't connect
 --auto-approve                start in auto-approve mode: everything runs without
@@ -161,7 +163,13 @@ aivo -p "Summarize this repo"                # bare string → one-shot plain re
 git diff | aivo -p "Write a commit message"  # piped stdin appended as context
 aivo code -e "make the failing test pass"    # one-shot agent run
 aivo code -e "fix lint" --max-steps 50       # override headless agent limits
+aivo code -e "audit deps" --output-format json | jq .answer   # scriptable result
+aivo code -e "now fix what you found" --resume last           # continue that run
 ```
+
+Headless runs verify by default: when the agent edited files and declares done, the project's
+validator (`run_tests.sh`, `make test`, `npm test`, `cargo test`, …) runs and failures are fed
+back for a fix. `AIVO_AGENT_SELF_CORRECT=0` opts out.
 
 ### Inside the code TUI
 
@@ -220,6 +228,32 @@ aivo code mcp import [tool] [name]  # copy servers from claude/cursor/gemini/cop
 ```
 
 Per-tool toggles within a connected server live in the TUI (`/mcp`, `Ctrl+T`).
+
+### Hooks — `~/.config/aivo/hooks.json`
+
+User-authored shell commands the agent runs at lifecycle points (config shape mirrors Claude
+Code's `hooks` block; user-scope only — repo-provided hook commands would be code execution
+on open). Each hook receives a JSON payload on stdin; exit `0` passes, exit `2` blocks with
+stderr as the reason; other failures and timeouts are ignored (fail-open — the built-in
+permission tiers remain the security floor).
+
+- `PreToolUse` — before a tool call; exit 2 vetoes it (`matcher`: `*` or `run_bash|write_file`)
+- `PostToolUse` — after a tool call; stdout (or exit-2 stderr) is folded into the tool result
+- `Stop` — when the agent declares done; exit 2 sends stderr back as guidance and continues
+
+```json
+{
+  "hooks": {
+    "PreToolUse": [
+      { "matcher": "run_bash",
+        "hooks": [{ "command": "my-guard.sh", "timeout": 10 }] }
+    ],
+    "Stop": [
+      { "hooks": [{ "command": "check-todos.sh" }] }
+    ]
+  }
+}
+```
 
 ## Local models — `hf:` and `aivo hf`
 
@@ -343,6 +377,9 @@ aivo update --sync-model-data  # refresh model metadata from models.dev
 - `AIVO_LLAMA_MMPROJ=off` — skip the auto-detected vision projector
 - `AIVO_LLAMA_DRAFT=off` — skip the auto-detected speculative-decoding draft model
 - `AIVO_LLAMA_NGL=<n>` — GPU layers to offload (`AIVO_GPU=cpu` disables GPU)
+- `AIVO_AGENT_LSP=0` — disable LSP diagnostics-after-edit in the code agent (default on)
+- `AIVO_AGENT_SELF_CORRECT` — post-edit verification: default on for `-e` (`0` disables);
+  `1` also enables it in interactive turns
 - `AIVO_NO_UPDATE_NOTICE=1` (or `CI`) — suppress the update-available notice
 - `NO_PROXY=127.0.0.1,localhost` — set when an `http_proxy` is configured, so `aivo serve` /
   local llama endpoints aren't proxied

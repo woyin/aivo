@@ -55,6 +55,10 @@ const MAX_COMPLETION_NUDGES: usize = 2;
 const MAX_SELFCORRECT_ATTEMPTS: usize = 3;
 const VERIFY_FAILED_PREFIX: &str = "The project's checks are failing, so the task isn't done. \
 Fix the cause and continue — don't stop until they pass:";
+/// Cap on Stop-hook refusals per turn, so a hook that always exits 2 can't loop the run.
+const MAX_STOP_HOOK_CONTINUES: usize = 3;
+const STOP_HOOK_PREFIX: &str = "A user-configured Stop hook reviewed your answer and asked you \
+to continue. Address the following, then finish:";
 /// Prefix of the artifact-pointer line; compaction preserves it so the parent can
 /// `read_file` a cleared sub-agent report back.
 pub(crate) const ARTIFACT_POINTER_PREFIX: &str = "[full report saved: ";
@@ -374,11 +378,11 @@ pub struct AgentEngine {
     /// Unattended `-e` only: reject a text turn that admits it isn't done (or trails
     /// off mid-step) and nudge to continue, rather than accept it as the final answer.
     require_completion: bool,
-    /// Opt-in (`AIVO_AGENT_SELF_CORRECT`): when the agent declares done, run the
-    /// project's validator and, on failure, feed it back so it fixes the cause.
+    /// Run the project's validator at declared-done and feed failures back. Default
+    /// on for headless `-e` (`AIVO_AGENT_SELF_CORRECT=0` opts out), opt-in (`=1`) interactive.
     self_correct: bool,
     /// Gates self-correct so investigate-only turns don't re-run the whole suite.
-    /// Starts true: the tree state is unknown until a first green run baselines it.
+    /// Starts true (tree state unknown); [`Self::set_verified_baseline`] clears it.
     dirty_since_verify: bool,
     /// Interactive chat only (off for headless/sub-agents): see [`CONFIRM_BEFORE_BUILD`].
     confirm_before_build: bool,
@@ -391,10 +395,12 @@ pub struct AgentEngine {
     /// File-staleness guard: baselines of files read this session, so a mutating tool
     /// can be refused when its target changed on disk since the model last read it.
     file_tracker: crate::agent::file_tracker::FileTracker,
-    /// Opt-in LSP diagnostics-after-edit (`AIVO_AGENT_LSP=1`); `None` = disabled.
+    /// LSP diagnostics-after-edit (default on, `AIVO_AGENT_LSP=0` opts out); `None` = disabled.
     lsp: Option<crate::agent::lsp::LspManager>,
     /// App-owned background-job table; `None` → `check_job` unadvertised.
     jobs: Option<crate::agent::jobs::SharedJobs>,
+    /// User lifecycle hooks; `None` = none configured. Shared with sub-engines.
+    hooks: Option<std::sync::Arc<crate::agent::hooks::HookSet>>,
     /// chars/4 tokens of the `-c` block folded into the system prompt, so
     /// `context_report` can split it back out.
     injected_context_tokens: usize,
@@ -550,7 +556,15 @@ impl AgentEngine {
             file_tracker: crate::agent::file_tracker::FileTracker::default(),
             lsp: None,
             jobs: None,
+            hooks: None,
             injected_context_tokens: 0,
+        }
+    }
+
+    /// Wire the user's lifecycle hooks (see [`crate::agent::hooks`]).
+    pub fn set_hooks(&mut self, hooks: std::sync::Arc<crate::agent::hooks::HookSet>) {
+        if !hooks.is_empty() {
+            self.hooks = Some(hooks);
         }
     }
 
@@ -589,10 +603,10 @@ impl AgentEngine {
         }
     }
 
-    /// Enable LSP diagnostics-after-edit rooted at `cwd` when `AIVO_AGENT_LSP` is set —
-    /// after a successful edit, the language server's native errors are fed back.
+    /// Enable LSP diagnostics-after-edit rooted at `cwd` (default on; `AIVO_AGENT_LSP=0`
+    /// opts out) — after a successful edit, the language server's native errors are fed back.
     pub fn maybe_enable_lsp(&mut self, cwd: &Path) {
-        if crate::services::system_env::env_flag("AIVO_AGENT_LSP").unwrap_or(false) {
+        if crate::services::system_env::env_flag("AIVO_AGENT_LSP").unwrap_or(true) {
             let mgr = crate::agent::lsp::LspManager::new(cwd);
             mgr.warm(); // start indexing now so the first edit's check isn't cold
             self.lsp = Some(mgr);
@@ -728,6 +742,12 @@ questions.",
     /// Takes a bool so goal mode can toggle it per turn on a reused engine.
     pub fn set_self_correct(&mut self, on: bool) {
         self.self_correct = on;
+    }
+
+    /// Treat the current tree as verified — only a mutation re-arms self-verify, so
+    /// the default-on headless path doesn't pay a suite run for investigate-only work.
+    pub fn set_verified_baseline(&mut self) {
+        self.dirty_since_verify = false;
     }
 
     /// Set the `reasoning_effort` level (`/effort`). Only meaningful for reasoning models.
@@ -1280,6 +1300,7 @@ questions.",
         let mut page_repeats = 0usize;
         // Same-signature tool-failure streaks: hint the schema, then hard-stop a loop.
         let mut failure_guard = guards::FailureGuard::default();
+        let mut stop_hook_continues = 0usize;
         let mut converged = false;
 
         for _ in 0..self.max_steps {
@@ -1477,6 +1498,18 @@ questions.",
                         }
                     }
                 }
+                // A Stop hook may refuse the stop; the turn continues with its guidance.
+                if stop_hook_continues < MAX_STOP_HOOK_CONTINUES
+                    && let Some(hooks) = self.hooks.clone()
+                    && let Some(guidance) = hooks
+                        .stop_guidance(message.content.as_deref().unwrap_or(""), ctx.cwd)
+                        .await
+                {
+                    stop_hook_continues += 1;
+                    ui.notify("a Stop hook asked the agent to continue");
+                    self.push_text_turn("user", format!("{STOP_HOOK_PREFIX}\n{guidance}"));
+                    continue;
+                }
                 converged = true; // answered without calling tools
                 // Finalize a started plan on real convergence so it can't linger as
                 // "0/N done". Gated on `started` — an all-pending plan (planned then converged) is left alone.
@@ -1538,6 +1571,7 @@ questions.",
                 guards::FailureAction::None => {}
             }
 
+            self.inject_job_notices();
             self.inject_steering(ui);
         }
 
@@ -1579,6 +1613,27 @@ questions.",
 working. Factor it in before continuing — it may change what to do next.",
             steering.join("\n\n")
         );
+        self.fold_into_last_tool_result(block);
+    }
+
+    /// Surface jobs that finished since the last step, so the model needn't busy-poll.
+    fn inject_job_notices(&mut self) {
+        let Some(jobs) = &self.jobs else { return };
+        let notices = jobs.drain_finished_notices();
+        if notices.is_empty() {
+            return;
+        }
+        let block = format!(
+            "<background_jobs>\n{}\n</background_jobs>\nThese background job(s) finished while \
+you were working. If the outcome matters to the task, inspect the log; otherwise continue.",
+            notices.join("\n")
+        );
+        self.fold_into_last_tool_result(block);
+    }
+
+    /// Append `block` to the last tool result, or push a user turn when there is
+    /// none — a fresh user turn straight after tool results 400s the Anthropic bridge.
+    fn fold_into_last_tool_result(&mut self, block: String) {
         if let Some(last) = self.messages.last_mut()
             && last.get("role").and_then(Value::as_str) == Some("tool")
             && let Some(c) = last.get("content").and_then(Value::as_str)
@@ -1646,6 +1701,14 @@ working. Factor it in before continuing — it may change what to do next.",
 `exit_plan_mode` with your plan."
                         .to_string(),
                 ));
+                continue;
+            }
+            // PreToolUse veto runs before the permission tiers — a veto never
+            // prompts; an allow still goes through them.
+            if let Some(hooks) = self.hooks.clone()
+                && let Some(reason) = hooks.pre_tool_use_deny(n, &call.arguments, ctx.cwd).await
+            {
+                outcomes[i] = Some(Err(format!("blocked by PreToolUse hook: {reason}")));
                 continue;
             }
             // Confirm only genuinely risky actions: destructive command, out-of-cwd
@@ -2014,6 +2077,28 @@ command in the foreground (drop `background`)."
             }
         }
 
+        // PostToolUse feedback folds into each call's result (like the LSP fold above).
+        if let Some(hooks) = self.hooks.clone().filter(|h| h.has_post()) {
+            for (i, call) in tool_calls.iter().enumerate() {
+                let Some(result) = outcomes[i].as_ref() else {
+                    continue;
+                };
+                let n = subagents::normalize_tool_name(&call.name).unwrap_or(&call.name);
+                let Some(extra) = hooks
+                    .post_tool_use(n, &call.arguments, result, ctx.cwd)
+                    .await
+                else {
+                    continue;
+                };
+                let block = format!("\n\n[PostToolUse hook]\n{extra}");
+                match outcomes[i].as_mut() {
+                    Some(Ok(msg)) => msg.push_str(&block),
+                    Some(Err(msg)) => msg.push_str(&block),
+                    None => {}
+                }
+            }
+        }
+
         // Emit results and append tool messages in call order (call↔result pairing intact).
         for (i, call) in tool_calls.iter().enumerate() {
             let n = subagents::normalize_tool_name(&call.name).unwrap_or(&call.name);
@@ -2257,6 +2342,10 @@ Re-run the full command without write confinement?",
         }
         // Honor the parent's hosted-web-search opt-in/out in delegated work.
         sub.set_web_search_enabled(self.use_web_search_enabled);
+        // A guard hook covers delegated work too.
+        if let Some(hooks) = &self.hooks {
+            sub.set_hooks(hooks.clone());
+        }
         // Carry the parent's reasoning effort — but only if it's valid for the sub's model (may differ), else keep the sub's default.
         if let Some(effort) = &self.reasoning_effort
             && crate::services::model_metadata::snapshot_limits(model)
@@ -5274,6 +5363,40 @@ mod tests {
         assert_eq!(runs.lines().count(), 1, "suite ran once, not per turn");
     }
 
+    /// Under a verified baseline (the default-on headless arrangement), an
+    /// investigate-only run converges without paying for a suite run; a mutating run
+    /// still verifies at declared-done.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn selfcorrect_verified_baseline_skips_investigate_only_runs() {
+        let dir = tmp();
+        std::fs::write(dir.join("run_tests.sh"), "echo run >> runs.log; exit 0\n").unwrap();
+
+        let port = spawn_sse_sequence(vec![
+            // Turn 1: read + done → clean baseline → no suite run.
+            tool_call_sse("read_file", json!({"path": "run_tests.sh"})),
+            FINAL_TEXT_SSE.to_string(),
+            // Turn 2: write + done → dirty → suite runs.
+            tool_call_sse("write_file", json!({"path": "f", "content": "x"})),
+            FINAL_TEXT_SSE.to_string(),
+        ]);
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let base = format!("http://127.0.0.1:{port}");
+        let mut engine = AgentEngine::new(&dir.display().to_string(), "m", "", &[], &[], 0, 0);
+        engine.set_self_correct(true);
+        engine.set_verified_baseline();
+        let mut ui = CapturingUi::default();
+        let ctx = turn_ctx(&client, &base, &dir);
+        run_session(&mut engine, &ctx, Some("just look around".into()), &mut ui).await;
+        assert!(
+            !dir.join("runs.log").exists(),
+            "investigate-only run must not trigger the suite"
+        );
+        run_session(&mut engine, &ctx, Some("now edit".into()), &mut ui).await;
+        let runs = std::fs::read_to_string(dir.join("runs.log")).unwrap_or_default();
+        assert_eq!(runs.lines().count(), 1, "mutation re-arms verification");
+    }
+
     // --- background jobs (Phase 4) ---
 
     #[test]
@@ -5326,6 +5449,169 @@ mod tests {
                     .is_some_and(|s| s.contains("started background job j1"))
             }),
             "expected a job-started tool result"
+        );
+    }
+
+    /// A background job that finished is surfaced at the next step boundary, folded
+    /// into the last tool result (bridge-safe), so the model needn't busy-poll.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn finished_background_job_notice_is_injected_at_step_boundary() {
+        let dir = tmp();
+        let jobs = jobs::JobTable::new(Some(dir.join("jobs")));
+        jobs.spawn("echo bye", &dir).unwrap();
+        // Already reaped-finished before the turn: the first boundary drains it.
+        for _ in 0..100 {
+            if jobs.running_count() == 0 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        let call = tool_call_sse("list_dir", json!({"path": "."}));
+        let port = spawn_sse_sequence(vec![call, FINAL_TEXT_SSE.to_string()]);
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let base = format!("http://127.0.0.1:{port}");
+        let mut engine = AgentEngine::new(&dir.display().to_string(), "m", "", &[], &[], 0, 0);
+        engine.set_jobs(jobs);
+        let mut ui = CapturingUi::default();
+        run_session(
+            &mut engine,
+            &turn_ctx(&client, &base, &dir),
+            Some("look around".into()),
+            &mut ui,
+        )
+        .await;
+        let folded = engine.messages.iter().any(|m| {
+            m.get("role").and_then(Value::as_str) == Some("tool")
+                && m.get("content")
+                    .and_then(Value::as_str)
+                    .is_some_and(|s| s.contains("<background_jobs>") && s.contains("job j1"))
+        });
+        assert!(
+            folded,
+            "expected the finish notice folded into a tool result: {:?}",
+            engine.messages
+        );
+    }
+
+    // --- user lifecycle hooks ---
+
+    fn hookset(
+        dir: &std::path::Path,
+        json_str: &str,
+    ) -> std::sync::Arc<crate::agent::hooks::HookSet> {
+        let path = dir.join("hooks.json");
+        std::fs::write(&path, json_str).unwrap();
+        std::sync::Arc::new(crate::agent::hooks::HookSet::load_from(&path))
+    }
+
+    /// A PreToolUse veto (exit 2) blocks the call before it runs; the stderr reason
+    /// reaches the model as the tool error.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pre_tool_use_hook_veto_blocks_the_call() {
+        let dir = tmp();
+        let call = tool_call_sse("write_file", json!({"path": "f", "content": "x"}));
+        let port = spawn_sse_sequence(vec![call, FINAL_TEXT_SSE.to_string()]);
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let base = format!("http://127.0.0.1:{port}");
+        let mut engine = AgentEngine::new(&dir.display().to_string(), "m", "", &[], &[], 0, 0);
+        engine.set_hooks(hookset(
+            &dir,
+            r#"{"hooks":{"PreToolUse":[{"matcher":"write_file","hooks":[
+                {"command":"echo writes are frozen >&2; exit 2"}]}]}}"#,
+        ));
+        let mut ui = CapturingUi::default();
+        run_session(
+            &mut engine,
+            &turn_ctx(&client, &base, &dir),
+            Some("write it".into()),
+            &mut ui,
+        )
+        .await;
+        assert!(!dir.join("f").exists(), "vetoed call must not run");
+        assert!(
+            engine.messages.iter().any(|m| {
+                m.get("content")
+                    .and_then(Value::as_str)
+                    .is_some_and(|s| s.contains("blocked by PreToolUse hook: writes are frozen"))
+            }),
+            "the veto reason must reach the model"
+        );
+    }
+
+    /// PostToolUse stdout is folded into the tool result (same pattern as LSP diagnostics).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn post_tool_use_hook_feedback_lands_in_the_tool_result() {
+        let dir = tmp();
+        let call = tool_call_sse("write_file", json!({"path": "f", "content": "x"}));
+        let port = spawn_sse_sequence(vec![call, FINAL_TEXT_SSE.to_string()]);
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let base = format!("http://127.0.0.1:{port}");
+        let mut engine = AgentEngine::new(&dir.display().to_string(), "m", "", &[], &[], 0, 0);
+        engine.set_hooks(hookset(
+            &dir,
+            r#"{"hooks":{"PostToolUse":[{"matcher":"write_file","hooks":[
+                {"command":"echo formatting applied"}]}]}}"#,
+        ));
+        let mut ui = CapturingUi::default();
+        run_session(
+            &mut engine,
+            &turn_ctx(&client, &base, &dir),
+            Some("write it".into()),
+            &mut ui,
+        )
+        .await;
+        assert!(dir.join("f").exists(), "allowed call runs");
+        let folded = engine.messages.iter().any(|m| {
+            m.get("role").and_then(Value::as_str) == Some("tool")
+                && m.get("content").and_then(Value::as_str).is_some_and(|s| {
+                    s.contains("[PostToolUse hook]") && s.contains("formatting applied")
+                })
+        });
+        assert!(folded, "hook stdout must land in the tool result");
+    }
+
+    /// A Stop-hook refusal (exit 2) feeds guidance back and the turn continues;
+    /// once the hook allows, the turn converges normally.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stop_hook_refusal_continues_the_turn_with_guidance() {
+        let dir = tmp();
+        let port = spawn_sse_sequence(vec![
+            FINAL_TEXT_SSE.to_string(), // 1st done attempt → hook refuses
+            FINAL_TEXT_SSE.to_string(), // 2nd done attempt → hook allows
+        ]);
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let base = format!("http://127.0.0.1:{port}");
+        let mut engine = AgentEngine::new(&dir.display().to_string(), "m", "", &[], &[], 0, 0);
+        // Refuse once (flag file marks the first refusal), then allow.
+        engine.set_hooks(hookset(
+            &dir,
+            r#"{"hooks":{"Stop":[{"hooks":[
+                {"command":"[ -f stop-flag ] || { touch stop-flag; echo also run the linter >&2; exit 2; }"}]}]}}"#,
+        ));
+        let mut ui = CapturingUi::default();
+        run_session(
+            &mut engine,
+            &turn_ctx(&client, &base, &dir),
+            Some("do the thing".into()),
+            &mut ui,
+        )
+        .await;
+        let guided = engine.messages.iter().any(|m| {
+            m.get("content")
+                .and_then(Value::as_str)
+                .is_some_and(|s| s.contains("also run the linter"))
+        });
+        assert!(guided, "the refusal guidance must be fed back");
+        assert!(
+            ui.notices
+                .iter()
+                .any(|n| n.contains("Stop hook asked the agent to continue")),
+            "expected a stop-hook notice: {:?}",
+            ui.notices
         );
     }
 

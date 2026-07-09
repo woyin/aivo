@@ -1,4 +1,4 @@
-//! Opt-in (`AIVO_AGENT_LSP=1`) LSP diagnostics-after-edit. After the agent edits a
+//! LSP diagnostics-after-edit (default on, `AIVO_AGENT_LSP=0` opts out). After the agent edits a
 //! file, ask a language server for its *native* diagnostics — the syntax /
 //! name-resolution / semantic errors the server computes itself — and fold the errors
 //! back into the tool result so the model fixes them in the same turn.

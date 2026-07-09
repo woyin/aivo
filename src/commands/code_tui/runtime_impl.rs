@@ -46,7 +46,8 @@ fn signals_goal_complete(text: &str) -> bool {
     })
 }
 
-/// `AIVO_AGENT_SELF_CORRECT=1` — post-edit verification in interactive turns (parity with one-shot).
+/// `AIVO_AGENT_SELF_CORRECT=1` — post-edit verification in interactive turns. Opt-in
+/// here (headless defaults on): a full-suite run stalls a watched turn.
 fn env_self_correct() -> bool {
     crate::services::system_env::env_flag("AIVO_AGENT_SELF_CORRECT").unwrap_or(false)
 }
@@ -709,8 +710,12 @@ impl CodeTuiApp {
             // Durable sub-agent reports under this session's artifacts dir (survive compaction).
             engine.set_artifacts_dir(self.session_store.session_artifacts_dir(&self.session_id));
             engine.set_jobs(self.jobs.clone());
-            // Opt-in LSP diagnostics-after-edit (AIVO_AGENT_LSP=1).
+            // LSP diagnostics-after-edit (default on; AIVO_AGENT_LSP=0 opts out).
             engine.maybe_enable_lsp(std::path::Path::new(&real_cwd));
+            // User lifecycle hooks (~/.config/aivo/hooks.json).
+            engine.set_hooks(std::sync::Arc::new(
+                crate::agent::hooks::HookSet::load_default(),
+            ));
             // Carry prior conversation in, best fidelity first: a resumed session's
             // durable transcript, else the outgoing engine's messages on a model
             // switch (both verbatim), else the lossy text seed of display history.

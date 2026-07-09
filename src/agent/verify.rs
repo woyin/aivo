@@ -1,7 +1,7 @@
-//! Post-edit self-verification (opt-in, `AIVO_AGENT_SELF_CORRECT=1`). Detects the
-//! project's validator command, runs it when the agent claims it's done, and — on
-//! failure — hands a short summary back so the model fixes the cause in the same run,
-//! instead of a `-e` run confidently finishing with the build/tests red.
+//! Post-edit self-verification: detect the project's validator, run it at declared-done,
+//! feed failures back so the run can't finish red. Default on for headless `-e`
+//! (`AIVO_AGENT_SELF_CORRECT=0` opts out); opt-in (`=1`) for interactive turns, where a
+//! surprise full-suite run would stall a watched turn.
 //!
 //! Detection is best-effort and conservative: a recognized validator or nothing. Only
 //! the agent's declared-done moment triggers a run, so it isn't run after every edit.

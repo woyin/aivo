@@ -714,6 +714,7 @@ impl CodeCommand {
                         max_output_tokens,
                     },
                     auto_approve,
+                    resume,
                 )
                 .await;
             }
@@ -1015,7 +1016,7 @@ impl CodeCommand {
         print_opt("-r, --refresh", "Refresh the model list (skip cache)");
         print_opt(
             "--resume [last|id]",
-            "Resume a saved session (bare/last/id)",
+            "Resume a saved session (bare/last/id; works with -e)",
         );
         print_opt("--share", "Share this session live (needs `aivo login`)");
         print_opt(
@@ -1026,7 +1027,7 @@ impl CodeCommand {
         print_opt("--json", "Raw provider JSON (with -p)");
         print_opt(
             "--output-format <fmt>",
-            "-e output: text (default) or stream-json",
+            "-e output: text (default), json, or stream-json",
         );
         print_opt(
             "--max-context <size>",
@@ -1501,7 +1502,7 @@ fn to_stored_messages(history: &[ChatMessage]) -> Vec<StoredChatMessage> {
         .collect()
 }
 
-fn new_code_session_id() -> String {
+pub(crate) fn new_code_session_id() -> String {
     use rand::Rng;
     let bytes: [u8; 16] = rand::thread_rng().r#gen();
     format!(
