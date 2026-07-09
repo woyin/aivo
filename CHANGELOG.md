@@ -1,5 +1,20 @@
 # Changelog
 
+## v0.38.2
+
+This release deepens the `aivo code` cursor backend.
+Cursor's interactive tools now surface natively in the TUI — todo lists and plans render as cards — and `/plan` drives cursor's own plan mode, raising an approval card when it drafts a plan.
+The ACP bridge is hardened and the cursor session prewarms so first messages connect without the cold-start stall.
+
+- feat(cursor): reach cursor plan mode via `/plan`, enabling the create_plan approval card (ad2b7fa)
+- feat(cursor): implement the ACP ask_question, update_todos, and create_plan client methods (67b89cc)
+- feat(code): re-prewarm the cursor session on `/new` (821ba0a)
+- feat(code): add `/quit` and `/unwind` slash aliases (65460dc)
+- feat(code): preserve chat on a same-provider `/key` switch, confirm otherwise (27adbac)
+- fix(cursor): harden the ACP bridge and prewarm the TUI session (18e66e5)
+- fix(code): reconcile the footer context fill with the `/context` total (f85e65b)
+- chore(plugin): free media names from reserved alias names (a11a9a4)
+
 ## v0.38.1
 
 A small follow-up to v0.38.0. The `aivo code` footer settles into a single, stable status row with its context fill aligned to the `/context` total, and `aivo update` now elevates itself with sudo when the install directory is root-owned.
