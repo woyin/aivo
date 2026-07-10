@@ -2086,6 +2086,9 @@ pub(super) struct CodeTuiApp {
     /// `aivo stats --since` can attribute windowed chat usage. Reset on `/new`,
     /// re-seeded from the stored entry on resume.
     pub(super) session_tokens: crate::services::session_store::SessionTokens,
+    /// Estimated session spend in USD (snapshot pricing × each turn's measured
+    /// usage); 0 when the model has no known pricing. Reset on `/new`.
+    pub(super) session_cost_usd: f64,
     /// Active model's context window (tokens), 0 = unknown. Cached on model/key
     /// change for the footer utilization stat; see `refresh_context_window`.
     pub(super) context_window: u64,

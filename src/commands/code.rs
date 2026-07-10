@@ -421,6 +421,7 @@ impl CodeCommand {
         output_format: Option<String>,
         max_steps: Option<u32>,
         max_output_tokens: Option<u64>,
+        max_cost: Option<f64>,
         auto_approve: bool,
     ) -> ExitCode {
         match self
@@ -441,6 +442,7 @@ impl CodeCommand {
                 output_format,
                 max_steps,
                 max_output_tokens,
+                max_cost,
                 auto_approve,
             )
             .await
@@ -472,6 +474,7 @@ impl CodeCommand {
         output_format: Option<String>,
         max_steps: Option<u32>,
         max_output_tokens: Option<u64>,
+        max_cost: Option<f64>,
         auto_approve: bool,
     ) -> Result<ExitCode> {
         if (max_steps.is_some() || max_output_tokens.is_some()) && !agent_mode {
@@ -712,6 +715,7 @@ impl CodeCommand {
                     code_agent_oneshot::OneShotAgentLimits {
                         max_steps,
                         max_output_tokens,
+                        max_cost,
                     },
                     auto_approve,
                     resume,
@@ -1012,6 +1016,11 @@ impl CodeCommand {
         print_opt(
             "--max-output-tokens <N>",
             "Max -e output tokens (0 disables)",
+        );
+        print_opt("--max-cost <usd>", "Max estimated -e spend in USD");
+        print_opt(
+            "--add-dir <dir>",
+            "Extra writable workspace root (repeatable)",
         );
         print_opt("-r, --refresh", "Refresh the model list (skip cache)");
         print_opt(
@@ -2887,6 +2896,7 @@ mod tests {
                 false,
                 None,
                 Some(1),
+                None,
                 None,
                 false,
             )

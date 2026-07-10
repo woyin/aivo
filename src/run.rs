@@ -304,6 +304,19 @@ pub async fn run() -> ! {
 
         Commands::Code(mut code_args) => {
             maybe_init_http_debug(&code_args.debug).await;
+            // Roots must exist (a typo'd root would silently allow nothing).
+            if !code_args.add_dir.is_empty() {
+                let mut roots = Vec::new();
+                for dir in &code_args.add_dir {
+                    let path = crate::services::system_env::expand_tilde(dir);
+                    if !path.is_dir() {
+                        eprintln!("{} --add-dir {dir}: not a directory", style::red("Error:"));
+                        process::exit(ExitCode::UserError.code());
+                    }
+                    roots.push(path);
+                }
+                crate::agent::sandbox::set_extra_write_roots(roots);
+            }
             let key_explicit = code_args.key.is_some();
             let initial_prompt = match take_code_initial_prompt(&mut code_args) {
                 Ok(prompt) => prompt,
@@ -392,6 +405,7 @@ pub async fn run() -> ! {
                     code_args.output_format,
                     code_args.max_steps,
                     code_args.max_output_tokens,
+                    code_args.max_cost,
                     code_args.auto_approve,
                 )
                 .await

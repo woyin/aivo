@@ -699,11 +699,12 @@ impl CodeTuiApp {
             });
             // Share the live thinking toggle so the engine requests reasoning (on
             // reasoning-capable models) only while thinking is on.
-            // Offer any named specialist sub-agents authored under
-            // `~/.config/aivo/agents`. The model delegates to them via the
-            // `subagent` tool's `agent` field.
-            let subagents =
-                crate::agent::subagents::discover_subagents(self.session_store.config_dir());
+            // Named specialist sub-agents (project `.aivo/agents`/`.claude/agents`,
+            // then `~/.config/aivo/agents`); the model delegates via `agent`.
+            let subagents = crate::agent::subagents::discover_subagents(
+                std::path::Path::new(&real_cwd),
+                self.session_store.config_dir(),
+            );
             engine.set_subagents(&subagents);
             // Persistent grant store so "always allow"s survive across sessions.
             engine.set_grants_path(self.session_store.config_dir());
@@ -2325,6 +2326,7 @@ pieces and keep going"
         self.context_tokens = 0;
         // Fresh session → fresh token tally (the index entry starts at zero).
         self.session_tokens = crate::services::session_store::SessionTokens::default();
+        self.session_cost_usd = 0.0;
         self.context_is_estimate = true;
         self.follow_output = true;
         self.plan_mode = false;

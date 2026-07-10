@@ -211,6 +211,18 @@ so write every command in {shell} syntax — don't assume a different OS's shell
 the `curl` alias) and chain with `;` (not `&&`). Paths use `\\`.",
         );
     }
+    let extra_roots = crate::agent::sandbox::extra_write_roots();
+    if !extra_roots.is_empty() {
+        let list: Vec<String> = extra_roots
+            .iter()
+            .map(|r| format!("`{}`", r.display()))
+            .collect();
+        p.push_str(&format!(
+            "\n\nAdditional writable workspace root(s) (via --add-dir): {}. Treat them as part \
+of the workspace — reference files there by absolute path.",
+            list.join(", ")
+        ));
+    }
     let (inlined, pointers) = partition_guides(cwd, guides);
     if !inlined.is_empty() {
         p.push_str(

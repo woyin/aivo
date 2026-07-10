@@ -1005,6 +1005,16 @@ pub struct CodeArgs {
     #[arg(long = "max-output-tokens", value_name = "N")]
     pub max_output_tokens: Option<u64>,
 
+    /// Maximum estimated spend in USD for -e/--exec; stops the run when the
+    /// estimate reaches it (needs a model with known pricing)
+    #[arg(long = "max-cost", value_name = "USD", requires = "exec")]
+    pub max_cost: Option<f64>,
+
+    /// Additional writable workspace root (repeatable). Writes there run without
+    /// the out-of-workspace confirmation and inside the sandbox confinement.
+    #[arg(long = "add-dir", value_name = "DIR")]
+    pub add_dir: Vec<String>,
+
     /// Print the upstream provider's raw JSON response (requires -p; useful for scripting)
     #[arg(long, requires = "prompt")]
     pub json: bool,

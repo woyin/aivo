@@ -1410,6 +1410,7 @@ fn make_test_app(
         live_usage: None,
         context_tokens: 0,
         session_tokens: crate::services::session_store::SessionTokens::default(),
+        session_cost_usd: 0.0,
         context_window: 0,
         context_window_override: None,
         injected_context: None,

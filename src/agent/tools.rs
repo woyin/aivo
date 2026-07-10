@@ -500,9 +500,18 @@ fn git_subcommand_is_readonly(tokens: &[&str]) -> bool {
 /// canonicalizing the workspace root and the target's closest existing ancestor
 /// (the file itself may not exist yet) before comparing.
 fn path_escapes_cwd(path: &str, cwd: &Path) -> bool {
-    let root = canonicalize_existing_ancestor(cwd);
+    // `--add-dir` roots are part of the workspace too.
+    path_escapes_roots(path, cwd, crate::agent::sandbox::extra_write_roots())
+}
+
+fn path_escapes_roots(path: &str, cwd: &Path, extra: &[PathBuf]) -> bool {
     let target = canonicalize_existing_ancestor(&resolve(cwd, path));
-    !target.starts_with(&root)
+    if target.starts_with(canonicalize_existing_ancestor(cwd)) {
+        return false;
+    }
+    !extra
+        .iter()
+        .any(|root| target.starts_with(canonicalize_existing_ancestor(root)))
 }
 
 /// Resolve `path` as far as the filesystem allows: canonicalize the longest
@@ -2894,6 +2903,29 @@ fn collapse_whitespace(s: &str) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn add_dir_roots_count_as_workspace_for_writes() {
+        let cwd = std::env::temp_dir().join(format!("aivo-adddir-cwd-{}", std::process::id()));
+        let extra = std::env::temp_dir().join(format!("aivo-adddir-extra-{}", std::process::id()));
+        std::fs::create_dir_all(&cwd).unwrap();
+        std::fs::create_dir_all(&extra).unwrap();
+        let target = extra.join("f.txt").display().to_string();
+        // Outside cwd with no extra roots → escapes (confirm-worthy)…
+        assert!(path_escapes_roots(&target, &cwd, &[]));
+        // …but inside a registered `--add-dir` root → part of the workspace.
+        assert!(!path_escapes_roots(
+            &target,
+            &cwd,
+            std::slice::from_ref(&extra)
+        ));
+        // A path outside BOTH still escapes.
+        assert!(path_escapes_roots(
+            "/etc/hosts",
+            &cwd,
+            std::slice::from_ref(&extra)
+        ));
+    }
 
     fn tmp() -> PathBuf {
         use std::sync::atomic::{AtomicU64, Ordering};

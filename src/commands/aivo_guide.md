@@ -142,6 +142,10 @@ aivo code "<text>"            # TUI with the text sent as the first message
 -e, --exec   [prompt]         one prompt, run the full agent (tools), exit
 --max-steps <N>               max -e agent steps (0 disables)
 --max-output-tokens <N>       max -e output tokens (0 disables)
+--max-cost <USD>              max estimated -e spend (needs known model pricing)
+--add-dir <dir>               extra writable workspace root (repeatable) — writes
+                              there skip the out-of-workspace confirm and stay
+                              inside the sandbox confinement
 -r, --refresh                 refresh the model list (skip cache)
 --resume [last|id]            resume a saved session (TUI and -e; -e runs persist too)
 --share                       share this session live (needs `aivo login`)

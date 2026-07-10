@@ -27,10 +27,32 @@
 //! Default-on where supported; opt out everywhere with `AIVO_AGENT_NO_SANDBOX=1`.
 
 use std::path::Path;
-#[cfg(target_os = "linux")]
 use std::path::PathBuf;
+use std::sync::OnceLock;
 #[cfg(target_os = "linux")]
 use std::sync::atomic::{AtomicBool, Ordering};
+
+/// Extra writable roots from `--add-dir`, set once at CLI startup. Process-wide
+/// because confinement is process-level anyway (seatbelt profile / Landlock argv).
+static EXTRA_WRITE_ROOTS: OnceLock<Vec<PathBuf>> = OnceLock::new();
+
+/// Register `--add-dir` roots (first caller wins; callers validate existence).
+pub fn set_extra_write_roots(dirs: Vec<PathBuf>) {
+    let _ = EXTRA_WRITE_ROOTS.set(dirs);
+}
+
+pub fn extra_write_roots() -> &'static [PathBuf] {
+    EXTRA_WRITE_ROOTS.get().map(Vec::as_slice).unwrap_or(&[])
+}
+
+/// A user-facing note when this platform can't confine writes (no
+/// seatbelt/Landlock equivalent); `None` where a sandbox backend exists.
+pub fn confinement_notice() -> Option<&'static str> {
+    cfg!(windows).then_some(
+        "Windows: shell writes are not sandbox-confined — the destructive-command \
+confirm is the only write guard",
+    )
+}
 
 /// Set by `run::run` in the real CLI binary to signal that this process
 /// dispatches the hidden `__agent-sandbox` subcommand, so `wrap_shell` may
@@ -138,18 +160,24 @@ pub fn wrap_shell(command: &str, cwd: &Path) -> ShellInvocation {
 /// without touching the global relaunch flag (which concurrent tests share).
 #[cfg(target_os = "linux")]
 fn landlock_relaunch(exe: String, cwd: &Path, command: &str) -> ShellInvocation {
-    ShellInvocation {
-        program: exe,
-        args: vec![
-            "__agent-sandbox".to_string(),
-            "--workspace".to_string(),
-            cwd.to_string_lossy().into_owned(),
-            "--".to_string(),
-            "sh".to_string(),
-            "-c".to_string(),
-            command.to_string(),
-        ],
+    // First `--workspace` = cwd; any extra ones are `--add-dir` roots (the child
+    // is a fresh process, so the roots must ride the argv).
+    let mut args = vec![
+        "__agent-sandbox".to_string(),
+        "--workspace".to_string(),
+        cwd.to_string_lossy().into_owned(),
+    ];
+    for root in extra_write_roots() {
+        args.push("--workspace".to_string());
+        args.push(root.to_string_lossy().into_owned());
     }
+    args.extend([
+        "--".to_string(),
+        "sh".to_string(),
+        "-c".to_string(),
+        command.to_string(),
+    ]);
+    ShellInvocation { program: exe, args }
 }
 
 /// The plain shell invocation with no sandbox wrapper. Used by `wrap_shell` when
@@ -217,6 +245,12 @@ fn macos_profile(cwd: &Path) -> String {
     writable.push(cwd.to_string_lossy().into_owned());
     if let Ok(canon) = cwd.canonicalize() {
         writable.push(canon.to_string_lossy().into_owned());
+    }
+    for root in extra_write_roots() {
+        writable.push(root.to_string_lossy().into_owned());
+        if let Ok(canon) = root.canonicalize() {
+            writable.push(canon.to_string_lossy().into_owned());
+        }
     }
     if let Some(tmp) = std::env::var_os("TMPDIR") {
         writable.push(tmp.to_string_lossy().into_owned());
@@ -333,7 +367,7 @@ fn landlock_supported() -> bool {
 /// `false` (caller degrades to running unconfined). Only WRITE accesses are
 /// handled, so reads and exec stay open; network is never restricted.
 #[cfg(target_os = "linux")]
-fn apply_landlock(cwd: &Path) -> bool {
+fn apply_landlock(workspaces: &[String]) -> bool {
     use landlock::{
         ABI, AccessFs, CompatLevel, Compatible, PathBeneath, PathFd, Ruleset, RulesetAttr,
         RulesetCreatedAttr, RulesetStatus,
@@ -348,7 +382,12 @@ fn apply_landlock(cwd: &Path) -> bool {
         Ok(c) => c,
         Err(_) => return false,
     };
-    for path in linux_writable_paths(cwd) {
+    // First workspace = cwd (carries the standard writable set); the rest are
+    // `--add-dir` roots.
+    let cwd = workspaces.first().map(String::as_str).unwrap_or(".");
+    let mut paths = linux_writable_paths(Path::new(cwd));
+    paths.extend(workspaces.iter().skip(1).map(PathBuf::from));
+    for path in paths {
         let Ok(fd) = PathFd::new(&path) else {
             continue; // skip a path that vanished between the exists() check and now
         };
@@ -367,14 +406,16 @@ fn apply_landlock(cwd: &Path) -> bool {
 /// after `--`. Factored out for unit testing (the entry point below diverges).
 /// `raw_args` is the full process argv (`[exe, "__agent-sandbox", …]`).
 #[cfg(target_os = "linux")]
-fn parse_sandbox_child_args(raw_args: &[String]) -> (Option<String>, Vec<String>) {
-    let mut workspace = None;
+fn parse_sandbox_child_args(raw_args: &[String]) -> (Vec<String>, Vec<String>) {
+    let mut workspaces = Vec::new();
     let mut rest = Vec::new();
     let mut i = 2; // skip exe + subcommand
     while i < raw_args.len() {
         match raw_args[i].as_str() {
             "--workspace" => {
-                workspace = raw_args.get(i + 1).cloned();
+                if let Some(w) = raw_args.get(i + 1) {
+                    workspaces.push(w.clone());
+                }
                 i += 2;
             }
             "--" => {
@@ -384,7 +425,7 @@ fn parse_sandbox_child_args(raw_args: &[String]) -> (Option<String>, Vec<String>
             _ => i += 1,
         }
     }
-    (workspace, rest)
+    (workspaces, rest)
 }
 
 /// Entry point for the hidden `aivo __agent-sandbox` re-exec (dispatched in
@@ -394,14 +435,17 @@ fn parse_sandbox_child_args(raw_args: &[String]) -> (Option<String>, Vec<String>
 /// returns.
 #[cfg(target_os = "linux")]
 pub fn run_sandbox_child(raw_args: &[String]) -> ! {
-    let (workspace, rest) = parse_sandbox_child_args(raw_args);
+    let (workspaces, rest) = parse_sandbox_child_args(raw_args);
     if rest.is_empty() {
         eprintln!("aivo: __agent-sandbox: no command after `--`");
         std::process::exit(127);
     }
-    let cwd = workspace.unwrap_or_else(|| ".".to_string());
+    let cwd = workspaces
+        .first()
+        .cloned()
+        .unwrap_or_else(|| ".".to_string());
     // Best-effort confinement; if Landlock is unavailable we still run the shell.
-    let _ = apply_landlock(Path::new(&cwd));
+    let _ = apply_landlock(&workspaces);
     let status = std::process::Command::new(&rest[0])
         .args(&rest[1..])
         .current_dir(&cwd)
@@ -488,7 +532,7 @@ mod linux_tests {
         .map(|s| s.to_string())
         .collect();
         let (ws, rest) = parse_sandbox_child_args(&raw);
-        assert_eq!(ws.as_deref(), Some("/x"));
+        assert_eq!(ws, vec!["/x"]);
         assert_eq!(rest, vec!["sh", "-c", "echo hi"]);
     }
 

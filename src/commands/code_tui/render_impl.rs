@@ -2697,11 +2697,21 @@ impl CodeTuiApp {
             format!("{approx}{pct}%")
         };
         let label = format!(
-            "{approx}{} / {} · {pct_label}",
+            "{approx}{} / {} · {pct_label}{}",
             format_token_count_value(used),
             format_token_count_value(self.context_window),
+            self.session_cost_label(),
         );
         (label, context_fill_color(pct))
+    }
+
+    /// ` · ~$X.XX` session-spend suffix; empty below half a cent or without pricing.
+    /// Always `~`: snapshot list prices × parsed usage is an estimate, not a bill.
+    pub(super) fn session_cost_label(&self) -> String {
+        if self.session_cost_usd < 0.005 {
+            return String::new();
+        }
+        format!(" · ~${:.2}", self.session_cost_usd)
     }
 
     pub(super) fn composer_height(&self, width: u16) -> u16 {

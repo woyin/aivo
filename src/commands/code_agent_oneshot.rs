@@ -50,6 +50,7 @@ fn cli_env_or<T: Copy + std::str::FromStr>(cli: Option<T>, var: &str, default: T
 pub(crate) struct OneShotAgentLimits {
     pub(crate) max_steps: Option<u32>,
     pub(crate) max_output_tokens: Option<u64>,
+    pub(crate) max_cost: Option<f64>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -98,6 +99,12 @@ pub(crate) async fn run_one_shot_agent(
         "AIVO_AGENT_MAX_OUTPUT_TOKENS",
         DEFAULT_MAX_OUTPUT_TOKENS,
     ));
+    // A spend budget needs known pricing — fail closed rather than run uncapped.
+    if let Some(usd) = limits.max_cost.filter(|c| *c > 0.0) {
+        let pricing = crate::services::model_metadata::model_pricing(model)
+            .ok_or_else(|| anyhow::anyhow!("--max-cost: no pricing known for model '{model}'"))?;
+        engine.set_cost_budget(usd, pricing);
+    }
     // Unattended run: don't accept an answer that admits it isn't done — nudge to continue.
     engine.set_require_completion();
     // Self-verify: default on but mutation-gated (investigate-only stays fast);
@@ -116,7 +123,8 @@ pub(crate) async fn run_one_shot_agent(
     if let Some(ctx) = injected_context.as_deref() {
         engine.append_system_context(ctx);
     }
-    let subagents = crate::agent::subagents::discover_subagents(session_store.config_dir());
+    let subagents =
+        crate::agent::subagents::discover_subagents(Path::new(&cwd), session_store.config_dir());
     engine.set_subagents(&subagents);
     // Persistent grant store: remembered "always allow"s survive across runs.
     engine.set_grants_path(session_store.config_dir());
@@ -203,6 +211,9 @@ pub(crate) async fn run_one_shot_agent(
     };
     let mut ui = HeadlessAgentUi::new(format, session_id.clone());
     ui.run_start(model, &cwd);
+    if let Some(warn) = crate::agent::sandbox::confinement_notice() {
+        ui.notify(warn);
+    }
     let prompt_for_log = prompt.clone();
     let started = std::time::Instant::now();
     let completed = tokio::select! {

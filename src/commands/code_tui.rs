@@ -95,6 +95,12 @@ impl CodeTuiApp {
             (None, Some(attach)) => Some(attach),
             (None, None) => None,
         };
+        // Platforms without write confinement (Windows) say so up front.
+        let startup_message = match (startup_message, crate::agent::sandbox::confinement_notice()) {
+            (Some(m), Some(warn)) => Some(format!("{m} · {warn}")),
+            (None, Some(warn)) => Some(warn.to_string()),
+            (m, None) => m,
+        };
         let startup_notice = startup_message.map(|message| (MUTED, message));
 
         let initial_format = seeded_chat_format(&params.key, &params.raw_model);
@@ -190,6 +196,7 @@ impl CodeTuiApp {
             live_usage: None,
             context_tokens: 0,
             session_tokens: crate::services::session_store::SessionTokens::default(),
+            session_cost_usd: 0.0,
             context_window: 0,
             context_window_override: params.max_context,
             injected_context: params.injected_context,

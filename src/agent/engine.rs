@@ -401,6 +401,9 @@ pub struct AgentEngine {
     jobs: Option<crate::agent::jobs::SharedJobs>,
     /// User lifecycle hooks; `None` = none configured. Shared with sub-engines.
     hooks: Option<std::sync::Arc<crate::agent::hooks::HookSet>>,
+    /// `--max-cost`: stop the turn at this estimated spend (USD; 0 = off).
+    max_cost_usd: f64,
+    cost_pricing: Option<crate::services::model_metadata::Pricing>,
     /// chars/4 tokens of the `-c` block folded into the system prompt, so
     /// `context_report` can split it back out.
     injected_context_tokens: usize,
@@ -557,8 +560,16 @@ impl AgentEngine {
             lsp: None,
             jobs: None,
             hooks: None,
+            max_cost_usd: 0.0,
+            cost_pricing: None,
             injected_context_tokens: 0,
         }
+    }
+
+    /// Cap the turn's estimated spend (USD; 0 = no cap). Headless `--max-cost`.
+    pub fn set_cost_budget(&mut self, usd: f64, pricing: crate::services::model_metadata::Pricing) {
+        self.max_cost_usd = usd;
+        self.cost_pricing = Some(pricing);
     }
 
     /// Wire the user's lifecycle hooks (see [`crate::agent::hooks`]).
@@ -1419,6 +1430,21 @@ questions.",
                 ui.notify(&format!(
                     "stopping: reached the per-turn output-token budget ({})",
                     self.max_output_tokens
+                ));
+                converged = true;
+                break;
+            }
+            // Same for the USD budget (`--max-cost`): estimated spend from measured usage.
+            if self.max_cost_usd > 0.0
+                && let Some(cost) = self
+                    .cost_pricing
+                    .as_ref()
+                    .and_then(|p| p.cost_usd(&self.turn_usage))
+                && cost >= self.max_cost_usd
+            {
+                ui.notify(&format!(
+                    "stopping: reached the cost budget (~${cost:.2} of ${:.2})",
+                    self.max_cost_usd
                 ));
                 converged = true;
                 break;
@@ -2326,8 +2352,26 @@ Re-run the full command without write confinement?",
             .or_else(|| profile.and_then(|p| p.model.as_deref()))
             .unwrap_or(&self.model);
 
+        // Isolation: explicit arg wins, else the profile's flag; unavailable falls
+        // back to the shared workspace with a note.
+        let isolate = args.get("isolation").and_then(|v| v.as_str()) == Some("worktree")
+            || profile.is_some_and(|p| p.isolation_worktree);
+        let mut worktree: Option<PathBuf> = None;
+        let mut isolation_note: Option<String> = None;
+        if isolate {
+            match subagents::create_worktree(ctx.cwd) {
+                Ok(wt) => worktree = Some(wt),
+                Err(why) => {
+                    isolation_note = Some(format!(
+                        "\n\n[worktree isolation] unavailable ({why}); ran in the shared workspace."
+                    ));
+                }
+            }
+        }
+        let sub_cwd: PathBuf = worktree.clone().unwrap_or_else(|| ctx.cwd.to_path_buf());
+
         let mut sub = AgentEngine::new(
-            &ctx.cwd.display().to_string(),
+            &sub_cwd.display().to_string(),
             model,
             &self.date,
             &self.guides,
@@ -2383,9 +2427,25 @@ Re-run the full command without write confinement?",
             agent_name,
             ..Default::default()
         };
+        // The sub's ctx roots tool execution + sandbox confinement at its own cwd.
+        let sub_ctx = TurnCtx {
+            client: ctx.client,
+            serve_base: ctx.serve_base,
+            auth: ctx.auth,
+            cwd: &sub_cwd,
+            yes: ctx.yes,
+            auto_approve_all: ctx.auto_approve_all,
+            auto_approve: ctx.auto_approve,
+            review_edits: ctx.review_edits,
+        };
         // Box the recursive future (run_turn → subagent → run_turn) so it isn't infinitely-sized.
-        Box::pin(sub.run_turn(ctx, &mut ui, task.to_string())).await;
+        Box::pin(sub.run_turn(&sub_ctx, &mut ui, task.to_string())).await;
         let mut msg = ui.result_message();
+        if let Some(wt) = &worktree {
+            msg.push_str(&subagents::finalize_worktree(ctx.cwd, wt));
+        } else if let Some(note) = isolation_note {
+            msg.push_str(&note);
+        }
         // Gate on the STORED length (not the bare answer) so the tail can't push it over
         // the clear threshold and get cleared without a pointer.
         if let Some(dir) = &self.artifacts_dir
@@ -2468,14 +2528,16 @@ fn slug_for_artifact(task: &str) -> String {
 fn subagent_tool_spec(subagents: &[Subagent]) -> ToolSpec {
     let mut properties = json!({
         "task": {"type": "string", "description": "A complete, standalone instruction for the sub-agent."},
-        "model": {"type": "string", "description": "Optional model id to run the sub-agent on (default: the agent's configured model, else same as you)."}
+        "model": {"type": "string", "description": "Optional model id to run the sub-agent on (default: the agent's configured model, else same as you)."},
+        "isolation": {"type": "string", "enum": ["worktree"], "description": "Optional: run the sub-agent in a disposable git worktree — an isolated snapshot of the last commit (uncommitted changes not included). Its edits stay there and the result tells you how to review/apply them. Use when a delegate will edit files, especially several delegates in parallel."}
     });
     let mut description = "Delegate a self-contained subtask to a fresh sub-agent that has the same \
 file/shell tools and runs its own loop, then hands back its result. Use it to keep your own context \
 focused (offload a big investigation), or pass `model` to delegate hard work to a stronger model. The \
 sub-agent does not see this conversation, so make `task` complete and standalone; it cannot spawn \
 further sub-agents. Call `subagent` several times in one turn to run independent investigations in \
-parallel — they execute concurrently and each result comes back separately."
+parallel — they execute concurrently and each result comes back separately; give parallel delegates \
+that edit files `isolation: \"worktree\"` so they can't clobber each other."
         .to_string();
     if !subagents.is_empty() {
         let names: Vec<&str> = subagents.iter().map(|s| s.name.as_str()).collect();
@@ -4974,6 +5036,112 @@ mod tests {
         assert_eq!(ui2.answer(), "plain answer");
     }
 
+    /// `isolation: "worktree"`: the sub-agent's writes land in a disposable worktree,
+    /// the parent tree stays untouched, and the result says where the changes are.
+    #[tokio::test]
+    async fn subagent_worktree_isolation_keeps_parent_tree_clean() {
+        let dir = tmp();
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&dir)
+                .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?} failed");
+        };
+        git(&["init", "-q"]);
+        std::fs::write(dir.join("a.txt"), "one").unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-qm", "init"]);
+
+        let parent_call = tool_call_sse(
+            "subagent",
+            json!({"task": "add b.txt", "isolation": "worktree"}),
+        );
+        let sub_write = tool_call_sse("write_file", json!({"path": "b.txt", "content": "two"}));
+        let port = spawn_sse_sequence(vec![
+            parent_call,
+            sub_write,
+            FINAL_TEXT_SSE.to_string(), // sub declares done
+            FINAL_TEXT_SSE.to_string(), // parent declares done
+        ]);
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let base = format!("http://127.0.0.1:{port}");
+        let mut engine = AgentEngine::new(&dir.display().to_string(), "m", "", &[], &[], 0, 0);
+        let mut ui = CapturingUi::default();
+        run_session(
+            &mut engine,
+            &turn_ctx(&client, &base, &dir),
+            Some("delegate the edit".into()),
+            &mut ui,
+        )
+        .await;
+
+        assert!(
+            !dir.join("b.txt").exists(),
+            "parent tree must stay untouched"
+        );
+        let report = engine
+            .messages
+            .iter()
+            .filter_map(|m| m.get("content").and_then(Value::as_str))
+            .find(|s| s.contains("[worktree isolation]"))
+            .expect("result must carry the worktree note")
+            .to_string();
+        assert!(report.contains("1 path(s) changed"), "{report}");
+        // The reported worktree really holds the edit; clean it up.
+        let wt = report
+            .split("worktree at ")
+            .nth(1)
+            .and_then(|s| s.split(' ').next())
+            .map(PathBuf::from)
+            .expect("note names the worktree path");
+        assert!(wt.join("b.txt").is_file(), "edit landed in the worktree");
+        let _ = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&dir)
+            .args(["worktree", "remove", "--force"])
+            .arg(&wt)
+            .output();
+    }
+
+    /// Isolation requested outside a git repo falls back to the shared workspace
+    /// with a note, rather than failing the delegation.
+    #[tokio::test]
+    async fn subagent_worktree_isolation_falls_back_outside_git() {
+        let dir = tmp();
+        let parent_call = tool_call_sse(
+            "subagent",
+            json!({"task": "look around", "isolation": "worktree"}),
+        );
+        let port = spawn_sse_sequence(vec![
+            parent_call,
+            FINAL_TEXT_SSE.to_string(),
+            FINAL_TEXT_SSE.to_string(),
+        ]);
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let base = format!("http://127.0.0.1:{port}");
+        let mut engine = AgentEngine::new(&dir.display().to_string(), "m", "", &[], &[], 0, 0);
+        let mut ui = CapturingUi::default();
+        run_session(
+            &mut engine,
+            &turn_ctx(&client, &base, &dir),
+            Some("delegate".into()),
+            &mut ui,
+        )
+        .await;
+        assert!(
+            engine.messages.iter().any(|m| {
+                m.get("content")
+                    .and_then(Value::as_str)
+                    .is_some_and(|s| s.contains("[worktree isolation] unavailable"))
+            }),
+            "fallback must be reported"
+        );
+    }
+
     /// A sub-agent's token usage folds into the parent turn's total (the sub's LLM calls aren't parent steps).
     #[tokio::test]
     async fn subagent_tokens_fold_into_parent_total() {
@@ -7090,6 +7258,7 @@ mod tests {
             model: model.map(str::to_string),
             tools: tools.map(|t| t.into_iter().map(str::to_string).collect()),
             body: format!("You are {name}. Follow the {name} playbook."),
+            isolation_worktree: false,
             source: PathBuf::new(),
         }
     }

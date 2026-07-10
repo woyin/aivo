@@ -749,6 +749,11 @@ impl CodeTuiApp {
         // entry (and thus `aivo stats --since`) carries actual chat tokens.
         if let Some(session) = self.agent_engine.as_ref() {
             let turn = session.engine.lock().await.take_turn_usage();
+            if let Some(cost) = crate::services::model_metadata::model_pricing(&self.model)
+                .and_then(|p| p.cost_usd(&turn))
+            {
+                self.session_cost_usd += cost;
+            }
             self.session_tokens = self.session_tokens.merge(turn);
         }
         // If the tool set changed mid-turn, drop the engine now so the next turn
@@ -1112,14 +1117,18 @@ impl CodeTuiApp {
             .await?;
         // Fold the same split into the session's running total so the chat index
         // entry feeds `aivo stats --since` (the non-agent / cursor path).
-        self.session_tokens =
-            self.session_tokens
-                .merge(crate::services::session_store::SessionTokens {
-                    prompt_tokens: usage.prompt_tokens,
-                    completion_tokens: usage.completion_tokens,
-                    cache_read_tokens: usage.cache_read_input_tokens,
-                    cache_write_tokens: usage.cache_creation_input_tokens,
-                });
+        let split = crate::services::session_store::SessionTokens {
+            prompt_tokens: usage.prompt_tokens,
+            completion_tokens: usage.completion_tokens,
+            cache_read_tokens: usage.cache_read_input_tokens,
+            cache_write_tokens: usage.cache_creation_input_tokens,
+        };
+        if let Some(cost) = crate::services::model_metadata::model_pricing(&self.model)
+            .and_then(|p| p.cost_usd(&split))
+        {
+            self.session_cost_usd += cost;
+        }
+        self.session_tokens = self.session_tokens.merge(split);
         self.context_tokens = if turn.usage.is_some() {
             usage.total_tokens()
         } else {

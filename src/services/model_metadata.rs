@@ -12,7 +12,7 @@ use serde::Deserialize;
 use super::model_names::strip_context_suffix;
 use super::models_cache::{ModelsCache, full_catalog_key};
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ModelLimits {
     pub context: Option<u64>,
     pub output: Option<u64>,
@@ -27,6 +27,46 @@ pub struct ModelLimits {
     /// Supported reasoning-effort values as published (may include levels
     /// like `xhigh`/`max` — consumers filter to what their tool accepts).
     pub reasoning_efforts: Vec<String>,
+    /// USD-per-1M-token prices, when models.dev lists them.
+    pub pricing: Option<Pricing>,
+}
+
+/// USD per 1M tokens. `cache_read`/`cache_write` fall back to `input` when unlisted.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct Pricing {
+    pub input: Option<f64>,
+    pub output: Option<f64>,
+    pub cache_read: Option<f64>,
+    pub cache_write: Option<f64>,
+}
+
+impl Pricing {
+    /// Estimated USD for a usage split; `None` without both input and output prices.
+    /// OpenAI-style counts (cache ⊂ prompt) are exact; Anthropic-style (cache
+    /// disjoint) slightly underestimates — callers present it as an estimate.
+    pub fn cost_usd(&self, t: &crate::services::session_store::SessionTokens) -> Option<f64> {
+        let (input, output) = (self.input?, self.output?);
+        let per = 1e-6;
+        let base_in = t.prompt_tokens.saturating_sub(t.cache_read_tokens) as f64;
+        Some(
+            base_in * input * per
+                + t.cache_read_tokens as f64 * self.cache_read.unwrap_or(input) * per
+                + t.cache_write_tokens as f64 * self.cache_write.unwrap_or(input) * per
+                + t.completion_tokens as f64 * output * per,
+        )
+    }
+
+    fn known_fields(&self) -> usize {
+        [self.input, self.output, self.cache_read, self.cache_write]
+            .iter()
+            .filter(|v| v.is_some())
+            .count()
+    }
+}
+
+/// Prices for `model` from the embedded snapshot (same folded lookup as limits).
+pub fn model_pricing(model: &str) -> Option<Pricing> {
+    snapshot_limits(model)?.pricing
 }
 
 /// Cascade result: per-field merge of live cache over snapshot. `caps` are
@@ -41,9 +81,9 @@ pub struct ResolvedLimits {
     pub reasoning_efforts: Vec<String>,
 }
 
-/// Row: `[context, output, flags, efforts]` — see `sync_model_limits.py` and
-/// `model_data_sync.rs`, which writes the override in this same shape.
-type LimitRow = (Option<u64>, Option<u64>, String, String);
+/// `[context, output, flags, efforts]` + optional `[in, out, cache_read, cache_write]`
+/// USD-per-1M prices — see `sync_model_limits.py` (`model_data_sync.rs` writes 4-slot).
+type LimitRow = Vec<serde_json::Value>;
 
 #[derive(Deserialize)]
 struct SnapshotFile {
@@ -94,37 +134,84 @@ fn overlay_override(
     over: std::collections::BTreeMap<String, LimitRow>,
 ) -> HashMap<String, ModelLimits> {
     let mut map = fold_rows(base);
-    map.extend(fold_rows(over)); // override wins per folded id
+    // Override wins per folded id; a price-less override row (the 4-slot shape
+    // `model_data_sync` writes) keeps the embedded pricing rather than erasing it.
+    for (k, mut limits) in fold_rows(over) {
+        if let Some(prev) = map.get(&k) {
+            merge_pricing(&mut limits, prev.pricing);
+        }
+        map.insert(k, limits);
+    }
     map
 }
 
 fn fold_rows(rows: std::collections::BTreeMap<String, LimitRow>) -> HashMap<String, ModelLimits> {
     let mut map: HashMap<String, ModelLimits> = HashMap::with_capacity(rows.len());
-    for (id, (context, output, flags, efforts)) in rows {
-        let limits = ModelLimits {
-            context,
-            output,
-            tool_call: flags.contains('t'),
-            reasoning: flags.contains('r'),
-            attachment: flags.contains('a'),
-            image_input: flags.contains('i'),
-            temperature: !flags.contains('f'),
-            deprecated: flags.contains('d'),
-            reasoning_efforts: efforts
-                .split(',')
-                .filter(|s| !s.is_empty())
-                .map(str::to_string)
-                .collect(),
+    for (id, row) in rows {
+        let Some(limits) = parse_row(&row) else {
+            continue;
         };
         let key = fold(&id);
-        match map.get(&key) {
-            Some(prev) if prev.context.unwrap_or(0) >= limits.context.unwrap_or(0) => {}
-            _ => {
+        match map.get_mut(&key) {
+            Some(prev) if prev.context.unwrap_or(0) >= limits.context.unwrap_or(0) => {
+                // The loser may know prices the winner lacks — a zero-priced
+                // ':free' pool must not shadow the vendor's list price.
+                merge_pricing(prev, limits.pricing);
+            }
+            Some(prev) => {
+                let keep = prev.pricing;
+                *prev = limits;
+                merge_pricing(prev, keep);
+            }
+            None => {
                 map.insert(key, limits);
             }
         }
     }
     map
+}
+
+/// Fill `limits.pricing` from `other` when absent or less complete.
+fn merge_pricing(limits: &mut ModelLimits, other: Option<Pricing>) {
+    let Some(other) = other else { return };
+    match &limits.pricing {
+        Some(own) if own.known_fields() >= other.known_fields() => {}
+        _ => limits.pricing = Some(other),
+    }
+}
+
+/// Parse one snapshot row; `None` on a malformed row (skipped, never panics).
+fn parse_row(row: &[serde_json::Value]) -> Option<ModelLimits> {
+    if row.len() < 4 {
+        return None;
+    }
+    let context = row[0].as_u64();
+    let output = row[1].as_u64();
+    let flags = row[2].as_str()?;
+    let efforts = row[3].as_str()?;
+    let price = |i: usize| row.get(i).and_then(serde_json::Value::as_f64);
+    let pricing = Pricing {
+        input: price(4),
+        output: price(5),
+        cache_read: price(6),
+        cache_write: price(7),
+    };
+    Some(ModelLimits {
+        context,
+        output,
+        tool_call: flags.contains('t'),
+        reasoning: flags.contains('r'),
+        attachment: flags.contains('a'),
+        image_input: flags.contains('i'),
+        temperature: !flags.contains('f'),
+        deprecated: flags.contains('d'),
+        reasoning_efforts: efforts
+            .split(',')
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .collect(),
+        pricing: (pricing.known_fields() > 0).then_some(pricing),
+    })
 }
 
 /// Path of the user-refreshed snapshot, beside `config.json`. Written by
@@ -211,6 +298,7 @@ fn hf_local_caps(image_input: bool) -> ModelLimits {
         temperature: true,
         deprecated: false,
         reasoning_efforts: Vec::new(),
+        pricing: None,
     }
 }
 
@@ -330,6 +418,15 @@ pub fn parse_context_size(s: &str) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn row(ctx: Option<u64>, out: Option<u64>, flags: String) -> LimitRow {
+        vec![
+            serde_json::json!(ctx),
+            serde_json::json!(out),
+            serde_json::json!(flags),
+            serde_json::json!(""),
+        ]
+    }
     use crate::services::models_cache::ModelMetadata;
     use tempfile::TempDir;
 
@@ -515,27 +612,65 @@ mod tests {
     }
 
     #[test]
+    fn pricing_parses_and_survives_fold_collisions() {
+        use std::collections::BTreeMap;
+        let mut rows: BTreeMap<String, LimitRow> = BTreeMap::new();
+        // Dash spelling (sorts first, same context) has no pricing; the dot
+        // spelling carries the vendor's. The folded row must keep the prices.
+        rows.insert(
+            "bar-2-0".into(),
+            row(Some(100_000), Some(8_000), "t".into()),
+        );
+        rows.insert(
+            "bar-2.0".into(),
+            vec![
+                serde_json::json!(100_000),
+                serde_json::json!(8_000),
+                serde_json::json!("t"),
+                serde_json::json!(""),
+                serde_json::json!(5.0),
+                serde_json::json!(25.0),
+                serde_json::json!(0.5),
+                serde_json::json!(6.25),
+            ],
+        );
+        let folded = fold_rows(rows);
+        let pricing = folded["bar-2-0"]
+            .pricing
+            .expect("pricing merged across fold");
+        assert_eq!(pricing.input, Some(5.0));
+        assert_eq!(pricing.cache_write, Some(6.25));
+
+        let tokens = crate::services::session_store::SessionTokens {
+            prompt_tokens: 1_000_000, // includes the 500k cache reads (OpenAI-style)
+            completion_tokens: 100_000,
+            cache_read_tokens: 500_000,
+            cache_write_tokens: 200_000,
+        };
+        let cost = pricing.cost_usd(&tokens).unwrap();
+        assert!((cost - 6.5).abs() < 1e-9, "got {cost}");
+        // No input/output price → no estimate.
+        assert!(Pricing::default().cost_usd(&tokens).is_none());
+    }
+
+    #[test]
+    fn embedded_snapshot_carries_vendor_pricing() {
+        let p = model_pricing("claude-opus-4-8").expect("opus is priced");
+        assert_eq!(p.input, Some(5.0));
+        assert_eq!(p.output, Some(25.0));
+        assert!(model_pricing("definitely-not-a-model").is_none());
+    }
+
+    #[test]
     fn override_rows_win_over_embedded_floor() {
         use std::collections::BTreeMap;
         let mut base: BTreeMap<String, LimitRow> = BTreeMap::new();
-        base.insert(
-            "model-a".into(),
-            (Some(100), Some(10), "t".into(), String::new()),
-        );
-        base.insert(
-            "model-b".into(),
-            (Some(200), None, String::new(), String::new()),
-        );
+        base.insert("model-a".into(), row(Some(100), Some(10), "t".into()));
+        base.insert("model-b".into(), row(Some(200), None, String::new()));
         let mut over: BTreeMap<String, LimitRow> = BTreeMap::new();
         // model-a refreshed to a *smaller* context — fresh data still wins.
-        over.insert(
-            "model-a".into(),
-            (Some(50), Some(5), "tr".into(), String::new()),
-        );
-        over.insert(
-            "model-c".into(),
-            (Some(300), None, String::new(), String::new()),
-        );
+        over.insert("model-a".into(), row(Some(50), Some(5), "tr".into()));
+        over.insert("model-c".into(), row(Some(300), None, String::new()));
         let folded = overlay_override(base, over);
         assert_eq!(folded["model-a"].context, Some(50));
         assert!(folded["model-a"].reasoning);
@@ -554,12 +689,12 @@ mod tests {
         let mut base: BTreeMap<String, LimitRow> = BTreeMap::new();
         base.insert(
             "claude-sonnet-4.6".into(),
-            (Some(1_000_000), Some(64_000), "t".into(), String::new()),
+            row(Some(1_000_000), Some(64_000), "t".into()),
         );
         let mut over: BTreeMap<String, LimitRow> = BTreeMap::new();
         over.insert(
             "claude-sonnet-4-6".into(),
-            (Some(800_000), Some(32_000), "tr".into(), String::new()),
+            row(Some(800_000), Some(32_000), "tr".into()),
         );
         let folded = overlay_override(base, over);
         assert_eq!(folded.len(), 1, "dot and dash fold to one id");
@@ -572,14 +707,8 @@ mod tests {
     fn fold_collapses_dot_and_dash_keeping_larger_context() {
         use std::collections::BTreeMap;
         let mut rows: BTreeMap<String, LimitRow> = BTreeMap::new();
-        rows.insert(
-            "foo-1.5".into(),
-            (Some(128_000), None, "t".into(), String::new()),
-        );
-        rows.insert(
-            "foo-1-5".into(),
-            (Some(200_000), None, "t".into(), String::new()),
-        );
+        rows.insert("foo-1.5".into(), row(Some(128_000), None, "t".into()));
+        rows.insert("foo-1-5".into(), row(Some(200_000), None, "t".into()));
         let folded = fold_rows(rows);
         // Both fold to `foo-1-5`; the larger context wins regardless of order.
         assert_eq!(folded.len(), 1);
