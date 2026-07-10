@@ -175,7 +175,7 @@ impl ShareCommand {
         println!(
             "{}",
             style::dim(
-                "Share an AI session (claude, codex, gemini, pi, opencode, chat) via a tunneled, ephemeral viewer URL. Closing the process invalidates the link."
+                "Share an AI session (claude, codex, gemini, pi, opencode, code) via a tunneled, ephemeral viewer URL. Closing the process invalidates the link."
             )
         );
         println!();

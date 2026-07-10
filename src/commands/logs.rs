@@ -286,7 +286,7 @@ impl LogsCommand {
     async fn prune_orphans(&self, args: &LogsArgs) -> Result<ExitCode> {
         let orphan_ids = compute_orphan_code_ids(&self.session_store).await;
         if orphan_ids.is_empty() {
-            println!("{} No orphan chat events found.", style::green("✓"));
+            println!("{} No orphan code events found.", style::green("✓"));
             return Ok(ExitCode::Success);
         }
         let mut ids: Vec<String> = orphan_ids.into_iter().collect();
@@ -315,7 +315,7 @@ impl LogsCommand {
             .delete_code_events_by_session_ids(&ids)
             .await?;
         println!(
-            "{} Deleted {} chat event(s) from logs.db.",
+            "{} Deleted {} code event(s) from logs.db.",
             style::green("✓"),
             style::bold(deleted.to_string()),
         );
@@ -617,7 +617,7 @@ fn print_help_prune() {
     println!(
         "{}",
         style::dim(
-            "Delete logs.db chat events whose session file is gone (prompts unless --force). Native session files are not touched."
+            "Delete logs.db code events whose session file is gone (prompts unless --force). Native session files are not touched."
         )
     );
     println!();

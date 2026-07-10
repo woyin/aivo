@@ -399,7 +399,7 @@ pub(super) async fn run_chat_tui(params: CodeTuiParams) -> Result<()> {
     {
         println!(
             "{}  {}",
-            crate::style::dim("Resume this chat:"),
+            crate::style::dim("Resume:"),
             crate::style::cyan(format!("aivo code --resume {id}")),
         );
     }

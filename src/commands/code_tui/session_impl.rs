@@ -315,7 +315,7 @@ is preserved."
             self.notice = Some((
                 MUTED,
                 format!(
-                    "Switched key to {} — chat preserved",
+                    "Switched key to {} — session preserved",
                     self.key.display_name()
                 ),
             ));

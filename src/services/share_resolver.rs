@@ -161,7 +161,7 @@ pub async fn resolve_session(session_id: &str, ctx: &ResolverContext) -> Result<
                     .await?
                     .ok_or_else(|| {
                         anyhow!(
-                            "chat session '{}' was deleted (logs.db still has its events but the session file is gone). Run `aivo logs prune` to remove orphan chat events.",
+                            "code session '{}' was deleted (logs.db still has its events but the session file is gone). Run `aivo logs prune` to remove orphan code events.",
                             chat_id
                         )
                     })?;
@@ -247,7 +247,7 @@ pub async fn resolve_session(session_id: &str, ctx: &ResolverContext) -> Result<
                 .session_store
                 .get_code_session(&hit.full_id)
                 .await?
-                .ok_or_else(|| anyhow!("chat session '{}' vanished during resolve", hit.full_id))?;
+                .ok_or_else(|| anyhow!("code session '{}' vanished during resolve", hit.full_id))?;
             extract_chat_full(&state, p_root)?
         }
         "claude" => {
@@ -772,13 +772,13 @@ async fn export_native_plugin_transcript(
 async fn infer_chat_session_id(entry: &LogEntry, ctx: &ResolverContext) -> Result<String> {
     let cwd = entry.cwd.as_deref().ok_or_else(|| {
         anyhow!(
-            "chat event '{}' has no session_id linkage and no cwd to infer one",
+            "code event '{}' has no session_id linkage and no cwd to infer one",
             entry.id
         )
     })?;
     let ts = parse_log_timestamp(&entry.ts_utc).ok_or_else(|| {
         anyhow!(
-            "chat event '{}' has no session_id linkage and an unparseable ts_utc",
+            "code event '{}' has no session_id linkage and an unparseable ts_utc",
             entry.id
         )
     })?;
@@ -787,7 +787,7 @@ async fn infer_chat_session_id(entry: &LogEntry, ctx: &ResolverContext) -> Resul
         .await?
         .ok_or_else(|| {
             anyhow!(
-                "chat event '{}' has no session_id linkage, and no chat session in {} matched within 60s of the event",
+                "code event '{}' has no session_id linkage, and no code session in {} matched within 60s of the event",
                 entry.id,
                 cwd
             )
@@ -978,7 +978,7 @@ mod tests {
         let err = resolve_session(&event_id, &ctx).await.unwrap_err();
         let msg = err.to_string();
         assert!(
-            msg.contains("no chat session in /tmp/no-sessions-here"),
+            msg.contains("no code session in /tmp/no-sessions-here"),
             "unexpected error: {msg}"
         );
     }

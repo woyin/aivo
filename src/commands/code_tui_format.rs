@@ -257,10 +257,10 @@ pub(super) fn format_session_time(updated_at: &str) -> String {
 
 pub(super) fn format_session_match_count(filtered: usize, total: usize) -> String {
     if total == 0 {
-        return "0 chats".to_string();
+        return "0 sessions".to_string();
     }
     if filtered == total {
-        return format!("{total} chats");
+        return format!("{total} sessions");
     }
     format!("{filtered}/{total}")
 }
@@ -602,8 +602,8 @@ mod tests {
 
     #[test]
     fn test_format_session_match_count() {
-        assert_eq!(format_session_match_count(0, 0), "0 chats");
-        assert_eq!(format_session_match_count(4, 4), "4 chats");
+        assert_eq!(format_session_match_count(0, 0), "0 sessions");
+        assert_eq!(format_session_match_count(4, 4), "4 sessions");
         assert_eq!(format_session_match_count(2, 5), "2/5");
     }
 

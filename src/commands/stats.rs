@@ -708,7 +708,7 @@ impl StatsCommand {
         };
         print_opt(
             "--by <NAME>",
-            "Filter to one tool or plugin (e.g. claude, chat)",
+            "Filter to one tool or plugin (e.g. claude, code)",
         );
         print_opt("-n, --numbers", "Exact numbers instead of human-readable");
         print_opt("-r, --refresh", "Bypass cache and re-read all data files");

@@ -3227,7 +3227,7 @@ fn print_help_use() {
     println!(
         "{}",
         style::dim(
-            "Activate an API key as the default for run/chat/serve (bare opens the picker)."
+            "Activate an API key as the default for run/code/serve (bare opens the picker)."
         )
     );
     println!();

@@ -251,7 +251,7 @@ impl CodeTuiApp {
         frame.render_widget(
             Paragraph::new(search_input_line(
                 &picker.query,
-                "filter chats, keys, models",
+                "filter sessions, keys, models",
             )),
             chunks[0],
         );
@@ -2077,7 +2077,7 @@ fn footer_hints(hints: &[(&str, &str)]) -> Line<'static> {
 /// group by the renderer, so a newly added command never silently vanishes.
 const HELP_COMMAND_GROUPS: &[(&str, &[&str])] = &[
     (
-        "Chat",
+        "Session",
         &[
             "new", "resume", "rewind", "copy", "config", "effort", "share", "help", "exit",
         ],

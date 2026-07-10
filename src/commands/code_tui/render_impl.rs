@@ -1212,15 +1212,18 @@ impl CodeTuiApp {
                 Span::styled("?", Style::default().fg(TEXT)),
             ]),
             Line::from(Span::styled(
-                "It's a different provider, so this starts a new chat.",
+                "It's a different provider, so this starts a new session.",
                 Style::default().fg(MUTED),
             )),
             Line::from(Span::styled(
-                "The current chat is saved — /resume brings it back.",
+                "The current session is saved — /resume brings it back.",
                 Style::default().fg(MUTED),
             )),
             Line::from(""),
-            account_keys_line(&[("y", ASSISTANT, "new chat"), ("n", ERROR, "keep current")]),
+            account_keys_line(&[
+                ("y", ASSISTANT, "new session"),
+                ("n", ERROR, "keep current"),
+            ]),
         ];
         render_account_card(
             frame,

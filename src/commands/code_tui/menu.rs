@@ -295,7 +295,7 @@ pub(super) fn picker_kind_noun(kind: &PickerKind) -> &'static str {
     match kind {
         PickerKind::Key => "keys",
         PickerKind::Model { .. } => "models",
-        PickerKind::Session => "chats",
+        PickerKind::Session => "sessions",
         PickerKind::Rewind => "turns",
         PickerKind::Effort => "levels",
     }
@@ -305,7 +305,7 @@ pub(super) fn picker_search_placeholder(kind: &PickerKind) -> &'static str {
     match kind {
         PickerKind::Key => "filter key name or endpoint",
         PickerKind::Model { .. } => "filter model names",
-        PickerKind::Session => "filter saved chats",
+        PickerKind::Session => "filter saved sessions",
         PickerKind::Rewind => "filter turns",
         PickerKind::Effort => "filter levels",
     }
@@ -472,7 +472,7 @@ pub(super) fn render_session_picker_rows(
     let filtered = picker.filtered_items();
     if filtered.is_empty() || max_rows == 0 {
         let msg = if picker.items.is_empty() {
-            "No saved chats yet"
+            "No saved sessions yet"
         } else {
             "No matches"
         };

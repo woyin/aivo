@@ -254,7 +254,7 @@ async fn test_help_overlay_groups_lists_every_command_and_scrolls() {
     let (top, _) = render_full_screen(&mut app, 90, 70);
     assert!(top.contains("Slash commands"), "missing header:\n{top}");
     for group in [
-        "Chat",
+        "Session",
         "Model & key",
         "Context",
         "Skills & tools",
