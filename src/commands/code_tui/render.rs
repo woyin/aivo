@@ -942,9 +942,9 @@ pub(super) fn render_tool_call(
         }
     }
     lines.push(line_with_plain(spans));
-    // For edit tools, show a compact diff of what changed so the user can review
-    // the agent's edit without opening the file (no-op for tools without a
-    // textual old/new, e.g. cursor edits or write_file).
+    // For edit/write tools, show a compact diff of what changed so the user can
+    // review the agent's edit without opening the file (no-op for tools without
+    // a textual old/new, e.g. cursor edits).
     render_edit_diff(lines, name, args, line_starts);
     // Cursor stores its result on the call entry (the in-process agent emits a
     // separate `tool_result` line instead) — surface it as a compact `⎿` line,
@@ -1689,12 +1689,26 @@ pub(super) struct EditDiff {
 }
 
 /// The pairs an edit tool applies, in render order (one per `edit_file`, per
-/// `multi_edit` step, per `apply_patch` hunk) — so `line_starts` aligns by index.
+/// `multi_edit` step, per `apply_patch` hunk, whole content for `write_file`) —
+/// so `line_starts` aligns by index. `write_file` shows as all-additions; the
+/// pre-write review card uses [`review_edit_diffs`] for a real diff.
 pub(super) fn edit_diffs(name: &str, args: &serde_json::Value) -> Vec<EditDiff> {
     let pick = |v: &serde_json::Value, k: &str| {
         v.get(k).and_then(|x| x.as_str()).unwrap_or("").to_string()
     };
     match name {
+        "write_file" => {
+            let new = pick(args, "content");
+            if new.is_empty() {
+                vec![]
+            } else {
+                vec![EditDiff {
+                    path: pick(args, "path"),
+                    old: String::new(),
+                    new,
+                }]
+            }
+        }
         "edit_file" => {
             let (old, new) = (pick(args, "old_string"), pick(args, "new_string"));
             if old.is_empty() && new.is_empty() {
@@ -3303,6 +3317,42 @@ mod render_tests {
             texts.iter().any(|t| t.contains("    if len(hours) > 12 {")),
             "expanded indent missing: {texts:?}"
         );
+    }
+
+    #[test]
+    fn write_file_renders_content_as_additions() {
+        let args = serde_json::json!({
+            "path": "src/new.rs",
+            "content": "fn main() {\n    println!(\"hi\");\n}\n",
+        });
+        let mut lines = Vec::new();
+        render_edit_diff(&mut lines, "write_file", &args, &[Some(1)]);
+        let texts: Vec<String> = lines
+            .iter()
+            .map(|l| {
+                l.line
+                    .spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect();
+        assert!(
+            texts.iter().any(|t| t.contains("fn main() {")),
+            "written content missing from diff: {texts:?}"
+        );
+        assert!(
+            texts.iter().any(|t| t.contains("println!(\"hi\");")),
+            "written content missing from diff: {texts:?}"
+        );
+    }
+
+    #[test]
+    fn write_file_empty_content_renders_nothing() {
+        let args = serde_json::json!({ "path": "src/empty.rs", "content": "" });
+        let mut lines = Vec::new();
+        render_edit_diff(&mut lines, "write_file", &args, &[None]);
+        assert!(lines.is_empty(), "empty write should emit no diff rows");
     }
 
     #[test]
