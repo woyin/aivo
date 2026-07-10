@@ -27,6 +27,10 @@ pub struct AssistantMessage {
     pub tool_calls: Vec<ToolCall>,
     #[serde(default)]
     pub usage: Option<Value>,
+    /// `content` is a kept partial from a mid-stream drop (see
+    /// `serve_client::complete`). Never on the wire — a sent message can't be partial.
+    #[serde(skip)]
+    pub truncated: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

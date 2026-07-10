@@ -329,6 +329,9 @@ impl CodeTuiApp {
         self.subagent_rows.clear();
         self.turn_output_tokens = 0;
         self.retrying = false;
+        // Fresh stall clock — a stale stamp would flag a "stall" at turn start.
+        self.last_stream_activity = Some(Instant::now());
+        self.wait_tick = None;
         self.pending_submit = Some(PendingSubmission {
             content: input.clone(),
             attachments: attachments.clone(),
@@ -2419,9 +2422,7 @@ pieces and keep going"
         self.agent_ask = None;
         self.agent_review = None;
         self.agent_plan_approval = None;
-        self.queued_messages.clear();
-        self.clear_steering_queue();
-        self.queued_commands.clear();
+        let discarded = self.discard_queued_input();
         if was_sending && let Some(session) = self.cursor_acp_session.as_ref() {
             // Fire-and-forget session/cancel so the agent stops generating
             // even though our task already dropped the prompt stream.
@@ -2467,7 +2468,7 @@ pieces and keep going"
         self.pending_finish = None;
         self.pending_reasoning.clear();
         self.follow_output = true;
-        self.notice = Some((MUTED, "Request cancelled".to_string()));
+        self.notice = Some((MUTED, with_discarded("Request cancelled", discarded)));
     }
 
     pub(super) async fn interrupt_inflight_request(&mut self) -> Result<()> {
@@ -2514,9 +2515,7 @@ pieces and keep going"
         self.agent_ask = None;
         self.agent_review = None;
         self.agent_plan_approval = None;
-        self.queued_messages.clear();
-        self.clear_steering_queue();
-        self.queued_commands.clear();
+        let discarded = self.discard_queued_input();
 
         let partial = std::mem::take(&mut self.pending_response);
         // Keep the reasoning shown for this partial reply (the user saw it); the
@@ -2542,14 +2541,32 @@ pieces and keep going"
         self.persist_history().await?;
         self.notice = Some((
             MUTED,
-            if goal_was_active {
-                "Response interrupted — goal mode stopped"
-            } else {
-                "Response interrupted"
-            }
-            .to_string(),
+            with_discarded(
+                if goal_was_active {
+                    "Response interrupted — goal mode stopped"
+                } else {
+                    "Response interrupted"
+                },
+                discarded,
+            ),
         ));
         Ok(())
+    }
+
+    /// Drop unconsumed mid-turn input, returning the count so the interrupt
+    /// notice can say so instead of losing it silently.
+    pub(super) fn discard_queued_input(&mut self) -> usize {
+        let count = self.queued_messages.len()
+            + self.queued_commands.len()
+            + self
+                .steering_queue
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .len();
+        self.queued_messages.clear();
+        self.clear_steering_queue();
+        self.queued_commands.clear();
+        count
     }
 
     pub(super) fn record_draft_history(&mut self, input: &str) {
@@ -2772,6 +2789,36 @@ fn compute_line_starts(
         .collect()
 }
 
+/// Interrupt notice + how many queued messages it threw away.
+fn with_discarded(base: &str, discarded: usize) -> String {
+    match discarded {
+        0 => base.to_string(),
+        1 => format!("{base} — 1 queued message discarded"),
+        n => format!("{base} — {n} queued messages discarded"),
+    }
+}
+
+/// A `write_file`'s pre-write snapshot for the transcript diff card, captured
+/// before the write applies (by commit time the old content is gone). `None`
+/// (missing/non-UTF8/oversized) keeps the all-additions card; the byte cap also
+/// bounds what the session file persists per write.
+fn capture_pre_write(
+    cwd: &std::path::Path,
+    name: &str,
+    args: &serde_json::Value,
+) -> Option<String> {
+    const MAX_BYTES: u64 = 256 * 1024;
+    if name != "write_file" {
+        return None;
+    }
+    let path = args.get("path").and_then(|v| v.as_str())?;
+    let abs = crate::agent::tools::resolve(cwd, path);
+    if std::fs::metadata(&abs).ok()?.len() > MAX_BYTES {
+        return None;
+    }
+    std::fs::read_to_string(abs).ok()
+}
+
 /// Bridges the in-process `AgentEngine` to the chat TUI: engine callbacks become
 /// `RuntimeEvent`s the event loop renders, and a permission request round-trips
 /// through the loop's permission card via a oneshot.
@@ -2917,12 +2964,14 @@ impl crate::agent::engine::AgentUi for ChatAgentUi {
         // Runs on the engine thread before the edit applies, so the probe sees
         // the pre-edit file.
         let line_starts = compute_line_starts(&self.cwd, name, args);
+        let old_content = capture_pre_write(&self.cwd, name, args);
         self.tx
             .send(RuntimeEvent::AgentToolCall {
                 id: None,
                 name: name.to_string(),
                 args: args.clone(),
                 line_starts,
+                old_content,
             })
             .ok();
     }
@@ -3295,6 +3344,7 @@ async fn drive_cursor_turn(
                 args,
                 // Cursor edits carry no file offset to number.
                 line_starts: vec![],
+                old_content: None,
             },
             CursorChunk::ToolUpdate {
                 id,

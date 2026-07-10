@@ -109,17 +109,21 @@ pub async fn complete(
     // splits a char, so we decode only complete lines.
     let mut buf: Vec<u8> = Vec::new();
     let mut done = false;
+    let mut truncated = false;
     let mut stream = resp.bytes_stream();
 
     while let Some(chunk) = stream.next().await {
         let bytes = match chunk {
             Ok(b) => b,
             // A mid-stream drop AFTER a text-only partial reply: keep what
-            // already streamed (the user saw it) instead of discarding it as an
-            // error — matching the plain-chat sender. But if a tool call was
+            // already streamed (the user saw it), flagged as truncated —
+            // matching the plain-chat sender. But if a tool call was
             // mid-assembly its arguments may be truncated, so bail rather than
             // risk executing a malformed call.
-            Err(_) if !content.is_empty() && tools.is_empty() => break,
+            Err(_) if !content.is_empty() && tools.is_empty() => {
+                truncated = true;
+                break;
+            }
             Err(e) => return Err(ServeError::transport(format!("stream error: {e}"))),
         };
         buf.extend_from_slice(&bytes);
@@ -195,6 +199,7 @@ pub async fn complete(
         content: (!content.is_empty()).then_some(content),
         tool_calls,
         usage,
+        truncated,
     })
 }
 
@@ -363,6 +368,7 @@ data: [DONE]\n\n";
 
         assert_eq!(seen, "Hello");
         assert_eq!(msg.content.as_deref(), Some("Hello"));
+        assert!(!msg.truncated);
         assert_eq!(msg.tool_calls.len(), 1);
         assert_eq!(msg.tool_calls[0].name, "read_file");
         assert_eq!(msg.tool_calls[0].id, "call_1");
@@ -585,5 +591,9 @@ data: [DONE]\n\n";
         assert_eq!(msg.content.as_deref(), Some("partial"));
         assert_eq!(seen, "partial");
         assert!(msg.tool_calls.is_empty());
+        assert!(
+            msg.truncated,
+            "a kept partial must be flagged so it can't pass for a complete answer"
+        );
     }
 }

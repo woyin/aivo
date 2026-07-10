@@ -66,7 +66,7 @@ pub(super) const WELCOME_TIPS: &[&str] = &[
     "/model switches models without losing the thread",
     "/config toggles thinking and tool auto-approve",
     "/copy grabs a past reply to your clipboard",
-    "Ctrl+O pages through long shell output",
+    "Ctrl+O expands the last collapsed output — clicking ▸ works too",
     "type while the agent works to queue your next message",
     "/new starts a fresh session, keeping your keys",
 ];
@@ -1761,6 +1761,9 @@ pub(super) enum RuntimeEvent {
         /// Pre-edit start line of each diff pair (aligned with `edit_diffs`), so
         /// the card can number rows; empty for non-edit and cursor calls.
         line_starts: Vec<Option<usize>>,
+        /// A `write_file`'s bounded pre-write snapshot (see `capture_pre_write`)
+        /// for a real diff card; `None` for every other tool.
+        old_content: Option<String>,
     },
     /// Enriches an earlier `AgentToolCall` (matched by `id`) in place: the
     /// resolved target (real path/pattern) and/or a compact result. Cursor only —
@@ -2101,9 +2104,15 @@ pub(super) struct CodeTuiApp {
     /// Context fill before a manual `/compact` (LLM) turn, so the finish path reports
     /// the freed delta and skips the duration marker. `None` outside a compact.
     pub(super) compact_before: Option<u64>,
-    /// Current tool step, present-tense (`running grep`), + when it started.
-    /// Feeds the inline status label.
-    pub(super) last_tool_action: Option<(String, Instant)>,
+    /// Current tool step, present-tense (`running grep`), when it started, and
+    /// its timeout budget in seconds (`run_bash` only). Feeds the status label.
+    pub(super) last_tool_action: Option<(String, Instant, Option<u64>)>,
+    /// Last frame tick seen while a decision card was up — `tick_decision_wait`
+    /// pushes the step + turn clocks forward so human decision time never reads
+    /// as tool runtime or inflates `✶ Done in …`.
+    pub(super) wait_tick: Option<Instant>,
+    /// When the turn last produced any runtime event, for the stall label.
+    pub(super) last_stream_activity: Option<Instant>,
     /// Live rows under the spinner for a parallel sub-agent batch (slot-indexed);
     /// cleared on batch finish / turn end.
     pub(super) subagent_rows: Vec<SubagentRow>,
@@ -2412,6 +2421,9 @@ pub(super) struct CodeTuiApp {
     /// Wall time (ms) a finished turn took, by the history index of its last entry;
     /// drives the `✶ Done in …` marker. In-memory only, cleared with `expanded_thinking`.
     pub(super) turn_durations: std::collections::HashMap<usize, u64>,
+    /// Completion note appended to the `✶ Done in …` marker (this turn's tokens
+    /// and estimated cost), keyed and cleared like `turn_durations`.
+    pub(super) turn_notes: std::collections::HashMap<usize, String>,
     /// When the current segment's reasoning started streaming (first reasoning
     /// chunk), for the live `▸ thought for Ns` timer. `None` between segments.
     pub(super) reasoning_started_at: Option<Instant>,

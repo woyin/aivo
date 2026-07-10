@@ -23,6 +23,7 @@ use crate::agent::protocol::{
 use crate::agent::request::{assistant_to_openai, role, tool_to_openai};
 use crate::agent::retry::{
     error_is_retryable, is_context_overflow_error, resolve_max_steps, retry_delay,
+    retryable_error_label, terminal_error_notice,
 };
 use crate::agent::secrets_guard;
 use crate::agent::skills::{self, Skill};
@@ -1375,6 +1376,7 @@ questions.",
             // Auto-retry transient failures with backoff — only when nothing streamed yet (re-streaming double-renders).
             let mut retries = 0usize;
             let mut forced_compactions = 0usize;
+            let mut terminal_error = false;
             let message = loop {
                 let mut streamed = false;
                 let result = serve_client::complete(
@@ -1396,10 +1398,18 @@ questions.",
                     Ok(m) => break m,
                     Err(e) if retries < MAX_RETRIES && !streamed && error_is_retryable(&e) => {
                         retries += 1;
+                        // Show the wait so a Retry-After pause doesn't read as a frozen UI.
+                        let delay = retry_delay(retries, e.retry_after);
+                        let wait = if delay.as_secs() >= 2 {
+                            format!(" in {}s", delay.as_secs())
+                        } else {
+                            String::new()
+                        };
                         ui.notify(&format!(
-                            "connection issue — retrying ({retries}/{MAX_RETRIES})…"
+                            "{} — retrying{wait} ({retries}/{MAX_RETRIES})…",
+                            retryable_error_label(&e)
                         ));
-                        tokio::time::sleep(retry_delay(retries, e.retry_after)).await;
+                        tokio::time::sleep(delay).await;
                     }
                     // Over the input limit despite our budget check: calibrate from the
                     // rejection, force-fit, retry — else the 400 is terminal and re-sends every turn.
@@ -1416,15 +1426,29 @@ questions.",
                         ui.notify("context over the model's limit — compacting and retrying…");
                     }
                     Err(e) => {
-                        ui.notify_error(&format!("LLM error: {e}"));
+                        ui.notify_error(&terminal_error_notice(&e));
+                        terminal_error = true;
                         break AssistantMessage {
-                            content: Some(format!("[error: {e}]")),
+                            content: None,
                             tool_calls: vec![],
                             usage: None,
+                            truncated: false,
                         };
                     }
                 }
             };
+            // End the turn without recording — an "[error: …]" assistant turn
+            // would replay the failure to the model every later step and on resume.
+            if terminal_error {
+                converged = true;
+                break;
+            }
+            if message.truncated {
+                // The kept partial must not pass for a complete answer.
+                ui.notify_error(
+                    "the connection dropped mid-reply — the answer above may be incomplete",
+                );
+            }
             steps += 1;
             let step_tokens = usage_tokens(&message.usage);
             tokens += step_tokens;
@@ -1477,8 +1501,9 @@ questions.",
             let no_output = message.tool_calls.is_empty()
                 && message.content.as_deref().is_none_or(str::is_empty);
             if no_output {
-                // Silent convergence reads as success ("Done" with no answer); say so.
-                ui.notify("the model returned an empty response — no answer produced");
+                // No answer = a failed turn: the error channel persists it, skips
+                // the `✶ Done` marker, and fails a headless run closed.
+                ui.notify_error("the model returned an empty response — no answer produced");
                 converged = true;
                 break;
             }
@@ -1503,6 +1528,7 @@ questions.",
                     content: Some(recorded),
                     tool_calls: Vec::new(),
                     usage: message.usage.clone(),
+                    truncated: false,
                 };
                 self.messages.push(assistant_to_openai(&recorded_msg));
                 self.push_text_turn("user", LEAKED_TOOL_CALL_NUDGE.to_string());
@@ -3063,6 +3089,8 @@ mod tests {
         tools: Vec<String>,
         text: String,
         notices: Vec<String>,
+        /// `notify_error` notices, separate so tests can assert the channel.
+        errors: Vec<String>,
         plans: Vec<usize>,
         /// Statuses from the most recent `plan_updated` (to assert finalization).
         last_plan: Vec<PlanStatus>,
@@ -3104,6 +3132,9 @@ mod tests {
         fn tool_result(&mut self, _: &str, _: &Result<String, String>) {}
         fn notify(&mut self, t: &str) {
             self.notices.push(t.to_string());
+        }
+        fn notify_error(&mut self, t: &str) {
+            self.errors.push(t.to_string());
         }
         fn footer(&mut self, _: Option<&str>, _: usize, tokens: u64, _: u64, _: u64) {
             self.footer_tokens = tokens;
@@ -4658,6 +4689,14 @@ mod tests {
                 .messages
                 .iter()
                 .any(|m| role(m) == "user" && content_str(m) == "hi")
+        );
+        // No answer must ride the ERROR channel (persisted entry, no `✶ Done`,
+        // headless fails closed).
+        assert!(
+            ui.errors.iter().any(|e| e.contains("empty response")),
+            "empty response must use notify_error: {:?} / {:?}",
+            ui.errors,
+            ui.notices
         );
     }
 

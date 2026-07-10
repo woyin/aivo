@@ -274,6 +274,7 @@ impl CodeTuiApp {
                     } else {
                         let (result, failed) = decode_tool_outcome(&message.content);
                         let line_starts = decode_line_starts(&message.content);
+                        let old_content = decode_old_content(&message.content);
                         render_tool_call(
                             &mut block,
                             &name,
@@ -282,6 +283,7 @@ impl CodeTuiApp {
                             failed,
                             cwd,
                             &line_starts,
+                            old_content.as_deref(),
                         );
                     }
                 }
@@ -301,6 +303,7 @@ impl CodeTuiApp {
                         cwd,
                         tool.as_deref(),
                         label.as_deref(),
+                        self.expanded_output.contains(&idx),
                     );
                 }
                 "local_command" => {
@@ -316,19 +319,28 @@ impl CodeTuiApp {
                     render_local_command(&mut block, &message.content, view);
                 }
                 "plan" => render_plan(&mut block, &message.content),
+                "error" => render_error_message(&mut block, &message.content),
                 other => render_system_message(&mut block, other, &message.content, text_width),
             }
             let bar = role_bar_color(message.role.as_str());
             push_block(&mut lines, &mut bars, block, Some(bar));
             // The `✶ Done in …` marker for a turn stamped on its last entry (which
             // may sit inside a coalesced block, so scan the block's index range).
-            if let Some(&ms) = (idx..idx + advance).find_map(|i| self.turn_durations.get(&i)) {
+            if let Some((i, &ms)) =
+                (idx..idx + advance).find_map(|i| self.turn_durations.get(&i).map(|ms| (i, ms)))
+            {
                 push_styled_line(&mut lines, String::new(), Style::default());
                 bars.push(None);
+                // Trailing per-turn tokens/cost note, when the finish recorded one.
+                let note = self
+                    .turn_notes
+                    .get(&i)
+                    .map(|n| format!(" · {n}"))
+                    .unwrap_or_default();
                 push_styled_line(
                     &mut lines,
                     format!(
-                        "✶ Done in {}",
+                        "✶ Done in {}{note}",
                         format_request_elapsed(std::time::Duration::from_millis(ms))
                     ),
                     Style::default().fg(MUTED).add_modifier(Modifier::ITALIC),
@@ -485,6 +497,7 @@ impl CodeTuiApp {
                 self.frame_tick,
                 self.reduce_motion,
                 progress.started.elapsed(),
+                None,
                 &progress.status_text(),
                 "",
             );
@@ -502,9 +515,9 @@ impl CodeTuiApp {
             Some((label, _)) => label.clone(),
             None => self.desired_status(),
         };
-        // This turn's generated tokens (measured, else a ~chars/4 estimate); 0 is
-        // omitted. A `!cmd` run has no round, so it keeps the interrupt hint.
+        // Tokens (measured, else ~chars/4; 0 omitted) · queued count · esc hint.
         let tail = if self.sending {
+            let mut parts: Vec<String> = Vec::new();
             let (used, is_estimate) = if self.turn_output_tokens > 0 {
                 (self.turn_output_tokens, false)
             } else {
@@ -513,26 +526,35 @@ impl CodeTuiApp {
                     + self.pending_reasoning.len();
                 (streamed as u64 / 4, true)
             };
-            if used == 0 {
-                String::new()
-            } else {
+            if used > 0 {
                 let approx = if is_estimate { "~" } else { "" };
-                format!("{approx}{} tokens", format_token_count_value(used))
+                parts.push(format!("{approx}{} tokens", format_token_count_value(used)));
             }
+            let queued = self.queued_input_count();
+            if queued > 0 {
+                parts.push(format!("{queued} queued"));
+            }
+            parts.push("esc to interrupt".to_string());
+            parts.join(" · ")
         } else {
             "esc to interrupt".to_string()
         };
         // A named tool step is timed by its own runtime, not the whole turn's —
         // else a fast read reads "20m" when a sibling subagent dominates the turn.
-        let elapsed = if self.current_action_label().is_some() {
+        let (elapsed, deadline) = if self.current_action_label().is_some() {
             self.last_tool_action
                 .as_ref()
-                .map(|(_, since)| since.elapsed())
+                .map(|(_, since, budget)| {
+                    (since.elapsed(), budget.map(std::time::Duration::from_secs))
+                })
                 .unwrap_or_default()
         } else {
-            started_at
-                .map(|started_at| started_at.elapsed())
-                .unwrap_or_default()
+            (
+                started_at
+                    .map(|started_at| started_at.elapsed())
+                    .unwrap_or_default(),
+                None,
+            )
         };
         let mut block = Vec::new();
         render_pending_status(
@@ -540,17 +562,42 @@ impl CodeTuiApp {
             self.frame_tick,
             self.reduce_motion,
             elapsed,
+            deadline,
             &activity,
             &tail,
         );
         block.into_iter().next()
     }
 
-    /// The status label right now, pre-throttle: a tool step names itself, else
-    /// streaming reads "Working" and pre-output compute reads "Thinking".
+    /// Input typed mid-turn still waiting to run: steering + follow-ups + commands.
+    pub(super) fn queued_input_count(&self) -> usize {
+        let steering = self
+            .steering_queue
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len();
+        steering + self.queued_messages.len() + self.queued_commands.len()
+    }
+
+    /// The status label right now, pre-throttle: a decision card names the wait,
+    /// a tool step names itself, else "Working"/"Thinking" (or a stall's "waiting").
     pub(super) fn desired_status(&self) -> String {
         if !self.sending {
             return "running command".to_string();
+        }
+        // Blocked on the user — "running rm -rf build (38s)" would imply the
+        // command is already executing.
+        if self.agent_permission.is_some() {
+            return "waiting for your approval".to_string();
+        }
+        if self.agent_ask.is_some() {
+            return "waiting for your answer".to_string();
+        }
+        if self.agent_review.is_some() {
+            return "waiting for your review".to_string();
+        }
+        if self.agent_plan_approval.is_some() {
+            return "waiting for plan approval".to_string();
         }
         // A parallel sub-agent batch owns the headline while its rows are live.
         if !self.subagent_rows.is_empty() {
@@ -567,7 +614,14 @@ impl CodeTuiApp {
         if let Some(action) = self.current_action_label() {
             return action;
         }
-        // Streaming output or recovering from a retry → "Working", else "Thinking".
+        // Streaming/retrying → "Working", else "Thinking" — unless silent long
+        // enough to look like a stall.
+        const STALL_AFTER: std::time::Duration = std::time::Duration::from_secs(10);
+        if let Some(last) = self.last_stream_activity
+            && last.elapsed() >= STALL_AFTER
+        {
+            return "waiting".to_string();
+        }
         if self.retrying || !self.pending_response.is_empty() || !self.incoming_buffer.is_empty() {
             return "Working".to_string();
         }
@@ -2669,7 +2723,7 @@ impl CodeTuiApp {
         }
         self.last_tool_action
             .as_ref()
-            .map(|(label, _)| label.clone())
+            .map(|(label, _, _)| label.clone())
     }
 
     /// Tokens to show in the footer fill right now, and whether the figure is a

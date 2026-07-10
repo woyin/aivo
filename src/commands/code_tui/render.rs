@@ -245,7 +245,19 @@ pub(super) fn role_bar_color(role: &str) -> Color {
         "assistant" => ACCENT,
         "local_command" => SHELL,
         "tool_call" | "tool_result" | "plan" => TOOL,
+        "error" => ERROR,
         _ => MUTED,
+    }
+}
+
+/// A turn-level error persisted into the transcript: `✗ message` in the error hue.
+pub(super) fn render_error_message(lines: &mut Vec<StyledLine>, content: &str) {
+    for (i, line) in content.lines().enumerate() {
+        let prefix = if i == 0 { "✗ " } else { "  " };
+        lines.push(line_with_plain(vec![Span::styled(
+            format!("{prefix}{line}"),
+            Style::default().fg(ERROR),
+        )]));
     }
 }
 
@@ -779,11 +791,16 @@ pub(super) fn render_pending_status(
     frame_tick: usize,
     reduce_motion: bool,
     elapsed: Duration,
+    deadline: Option<Duration>,
     activity: &str,
     tail: &str,
 ) {
     let spinner = spinner_frame_indexed(frame_tick, reduce_motion);
-    let elapsed = format_request_elapsed(elapsed);
+    let mut elapsed = format_request_elapsed(elapsed);
+    // A step with a timeout budget shows the deadline it will be killed at.
+    if let Some(deadline) = deadline {
+        elapsed = format!("{elapsed} / {}", format_request_elapsed(deadline));
+    }
     // Empty tail → just the clock.
     let text = if tail.is_empty() {
         format!("{spinner} {activity} ({elapsed})")
@@ -904,6 +921,7 @@ pub(super) fn render_system_message(
 /// bridge stores these as `tool_call` entries whose `content` is JSON
 /// `{"name", "args"}` (chat history is a display log; the engine owns the real
 /// LLM context).
+#[allow(clippy::too_many_arguments)]
 pub(super) fn render_tool_call(
     lines: &mut Vec<StyledLine>,
     name: &str,
@@ -912,6 +930,7 @@ pub(super) fn render_tool_call(
     failed: bool,
     cwd: &str,
     line_starts: &[Option<usize>],
+    old_content: Option<&str>,
 ) {
     let name = canonical_tool_name(name);
     let summary = tool_arg_summary(name, args, cwd);
@@ -945,7 +964,7 @@ pub(super) fn render_tool_call(
     // For edit/write tools, show a compact diff of what changed so the user can
     // review the agent's edit without opening the file (no-op for tools without
     // a textual old/new, e.g. cursor edits).
-    render_edit_diff(lines, name, args, line_starts);
+    render_edit_diff(lines, name, args, line_starts, old_content);
     // Cursor stores its result on the call entry (the in-process agent emits a
     // separate `tool_result` line instead) — surface it as a compact `⎿` line,
     // in the error hue when the tool failed.
@@ -985,6 +1004,16 @@ pub(super) fn decode_line_starts(content: &str) -> Vec<Option<usize>> {
         .and_then(|v| v.get("line_starts").and_then(|x| x.as_array()).cloned())
         .map(|arr| arr.iter().map(|x| x.as_u64().map(|n| n as usize)).collect())
         .unwrap_or_default()
+}
+
+/// The pre-write snapshot a `write_file` `tool_call` entry carries; absent
+/// (new/non-UTF8/oversized/older entries) → all-additions fallback.
+pub(super) fn decode_old_content(content: &str) -> Option<String> {
+    serde_json::from_str::<serde_json::Value>(content)
+        .ok()?
+        .get("old_content")?
+        .as_str()
+        .map(str::to_string)
 }
 
 /// Decode a `tool_call` history entry's JSON `{name, args}` payload.
@@ -1294,13 +1323,16 @@ pub(super) const OUTPUT_COLLAPSED_PREFIX: &str = "▸ +";
 /// Leading marker of an expanded `!cmd` output (`▾ collapse`).
 pub(super) const OUTPUT_EXPANDED_PREFIX: &str = "▾ collapse";
 
-/// Whether a rendered transcript row is a clickable `!cmd` output expander — the
-/// folded `▸ +N more lines` or the expanded `▾ collapse` toggle. The click handler
-/// maps it back to its `local_command` block; ordinary output rows are indented
-/// with their own text, so they don't match these arrow-led markers.
+/// Whether a rendered transcript row is a clickable output expander: folded
+/// `▸ +N…`, expanded `⎿ ▾ N lines` summary, or trailing `▾ collapse`.
 pub(super) fn is_output_expander(row: &str) -> bool {
     let row = row.trim_start();
-    row.starts_with(OUTPUT_COLLAPSED_PREFIX) || row.starts_with(OUTPUT_EXPANDED_PREFIX)
+    let row = row.strip_prefix("⎿ ").unwrap_or(row);
+    row.starts_with(OUTPUT_COLLAPSED_PREFIX)
+        || row.starts_with(OUTPUT_EXPANDED_PREFIX)
+        || row
+            .strip_prefix("▾ ")
+            .is_some_and(|r| r.starts_with(|c: char| c.is_ascii_digit()))
 }
 
 /// The true output line count a `local_command` entry carries (its persisted
@@ -1492,22 +1524,103 @@ pub(super) fn render_local_command(
     }
 }
 
+/// The `[exit N]` tail a nonzero-exit `run_bash` result carries — scan the last
+/// few lines, since a sandbox note or spill pointer can follow it.
+pub(super) fn bash_exit_code(result: &str) -> Option<i32> {
+    result.lines().rev().take(4).find_map(|l| {
+        l.trim()
+            .strip_prefix("[exit ")
+            .and_then(|r| r.strip_suffix(']'))
+            .and_then(|n| n.parse().ok())
+    })
+}
+
 /// Render an agent tool result as a compact `⎿ summary` line under its call.
+/// A multi-line summary doubles as the fold toggle (`▸ +N lines`); a nonzero
+/// `run_bash` exit reads in the error hue so a broken build can't pass for green.
 pub(super) fn render_tool_result(
     lines: &mut Vec<StyledLine>,
     result: &str,
     cwd: &str,
     tool: Option<&str>,
     label: Option<&str>,
+    expanded: bool,
 ) {
-    // A failure arrives as a single-line `error: …` (see `ChatAgentUi`); show it
-    // in the error hue. Multi-line output containing "error:" stays neutral.
-    let failed = result.lines().count() <= 1 && result.trim_start().starts_with("error:");
+    let tool = tool.map(canonical_tool_name);
+    let count = result.lines().count();
+    let exit = (tool == Some("run_bash"))
+        .then(|| bash_exit_code(result))
+        .flatten()
+        .filter(|&c| c != 0);
+    // Multi-line "error:" text stays neutral — only a single-line `error: …`
+    // (see `ChatAgentUi`) or a nonzero exit is a real failure.
+    let failed = exit.is_some() || (count <= 1 && result.trim_start().starts_with("error:"));
     let summary_color = if failed { ERROR } else { FAINT };
     let mut spans = vec![Span::styled(
         "  ⎿ ".to_string(),
         Style::default().fg(summary_color),
     )];
+    if count > 1 {
+        // The summary line is the fold toggle in both states.
+        let unit = count_unit(tool, count);
+        let summary = if expanded {
+            format!("▾ {count} {unit}")
+        } else {
+            format!("{OUTPUT_COLLAPSED_PREFIX}{count} {unit}")
+        };
+        spans.push(Span::styled(
+            summary,
+            Style::default().fg(if failed { ERROR } else { MUTED }),
+        ));
+        if let Some(code) = exit {
+            spans.push(Span::styled(
+                format!(" · exited {code}"),
+                Style::default().fg(ERROR),
+            ));
+        }
+        if let Some(label) = label.filter(|l| !l.is_empty()) {
+            spans.push(Span::styled(
+                format!(" · {}", truncate_chars(label, 40)),
+                Style::default().fg(MUTED),
+            ));
+        }
+        // A search's or subagent's first line is the payoff — preview it.
+        if matches!(tool, Some("grep" | "glob" | "subagent")) {
+            let first = result
+                .lines()
+                .map(str::trim)
+                .find(|l| !l.is_empty())
+                .unwrap_or("");
+            spans.push(Span::styled(
+                format!(" · {}", truncate_chars(&strip_ansi_and_controls(first), 48)),
+                Style::default().fg(summary_color),
+            ));
+        }
+        lines.push(line_with_plain(spans));
+        if expanded {
+            for line in result.lines().take(MAX_EXPANDED_OUTPUT_LINES) {
+                let is_exit_line = line.trim().starts_with("[exit ");
+                lines.push(line_with_plain(vec![Span::styled(
+                    format!("    {}", strip_ansi_and_controls(line)),
+                    Style::default().fg(if is_exit_line { ERROR } else { FAINT }),
+                )]));
+            }
+            if count > MAX_EXPANDED_OUTPUT_LINES {
+                lines.push(line_with_plain(vec![Span::styled(
+                    format!("    … (+{} more lines)", count - MAX_EXPANDED_OUTPUT_LINES),
+                    Style::default().fg(FAINT),
+                )]));
+            }
+            // A long block also folds from its far end.
+            if count > MAX_OUTPUT_LINES {
+                lines.push(line_with_plain(vec![Span::styled(
+                    format!("  {OUTPUT_EXPANDED_PREFIX}"),
+                    Style::default().fg(MUTED),
+                )]));
+            }
+        }
+        return;
+    }
     if let Some(label) = label.filter(|l| !l.is_empty()) {
         spans.push(Span::styled(
             format!("{} · ", truncate_chars(label, 40)),
@@ -1515,7 +1628,7 @@ pub(super) fn render_tool_result(
         ));
     }
     spans.push(Span::styled(
-        tool_result_summary(result, cwd, tool),
+        tool_result_summary(result, cwd),
         Style::default().fg(summary_color),
     ));
     lines.push(line_with_plain(spans));
@@ -1690,8 +1803,9 @@ pub(super) struct EditDiff {
 
 /// The pairs an edit tool applies, in render order (one per `edit_file`, per
 /// `multi_edit` step, per `apply_patch` hunk, whole content for `write_file`) —
-/// so `line_starts` aligns by index. `write_file` shows as all-additions; the
-/// pre-write review card uses [`review_edit_diffs`] for a real diff.
+/// so `line_starts` aligns by index. `write_file` defaults to all-additions;
+/// the review card ([`review_edit_diffs`]) and the transcript card (via the
+/// `old_content` snapshot in [`render_edit_diff`]) upgrade it to a real diff.
 pub(super) fn edit_diffs(name: &str, args: &serde_json::Value) -> Vec<EditDiff> {
     let pick = |v: &serde_json::Value, k: &str| {
         v.get(k).and_then(|x| x.as_str()).unwrap_or("").to_string()
@@ -2032,22 +2146,33 @@ fn render_change_row(
     line_with_plain(spans)
 }
 
+/// One cap for every edit tool's diff card — the same change shouldn't truncate
+/// differently depending on which tool the model picked.
+const MAX_DIFF_LINES: usize = 22;
+
 /// The compact diff card under an edit tool call: removed lines red, added green,
 /// changed tokens brightened, unchanged lines dim context. Capped so a big rewrite
 /// can't flood the transcript; nothing for tools with no textual diff.
+/// `old_content` upgrades a `write_file` card to a real diff.
 fn render_edit_diff(
     lines: &mut Vec<StyledLine>,
     name: &str,
     args: &serde_json::Value,
     line_starts: &[Option<usize>],
+    old_content: Option<&str>,
 ) {
     if name == "apply_patch" {
         render_patch_diff(lines, args, line_starts);
         return;
     }
-    const MAX_DIFF_LINES: usize = 14;
     const CONTEXT: usize = 3;
-    let diffs = edit_diffs(name, args);
+    let mut diffs = edit_diffs(name, args);
+    if name == "write_file"
+        && let Some(old) = old_content
+        && let [diff] = diffs.as_mut_slice()
+    {
+        diff.old = old.to_string();
+    }
     if diffs.is_empty() {
         return;
     }
@@ -2089,7 +2214,7 @@ fn render_patch_diff(
     args: &serde_json::Value,
     line_starts: &[Option<usize>],
 ) {
-    const MAX_LINES: usize = 22;
+    const MAX_LINES: usize = MAX_DIFF_LINES;
     const CONTEXT: usize = 3;
     let diffs = edit_diffs("apply_patch", args);
     if diffs.is_empty() {
@@ -2662,43 +2787,17 @@ pub(super) fn render_output_line(raw: &str) -> String {
     line.into_iter().collect()
 }
 
-fn tool_result_summary(s: &str, cwd: &str, tool: Option<&str>) -> String {
-    let tool = tool.map(canonical_tool_name);
-    // Multi-line output (read_file's numbered lines, dir listings, command
-    // output) collapses to a clean count — the `→ verb(args)` line above already
-    // says what ran, so a peek at the noisy first line (line numbers, etc.) adds
-    // nothing. Single-line results are the meaningful outcome ("wrote x", "+1 −1").
-    let count = s.lines().count();
-    // A subagent's result is its written report; a bare line count ("243 lines")
-    // says nothing about what it found and can't be told apart from a sibling's.
-    // Preview the first non-empty line (with a `+N more` tail) so each subagent's
-    // outcome is legible at a glance.
-    if tool == Some("subagent") {
-        let first = s
-            .lines()
-            .map(str::trim)
-            .find(|l| !l.is_empty())
-            .unwrap_or("");
-        let preview = truncate_chars(&strip_ansi_and_controls(first), 56);
-        let extra = count.saturating_sub(1);
-        return if extra > 0 {
-            format!("{preview} (+{extra} more)")
-        } else {
-            preview
-        };
-    }
-    if count > 1 {
-        format!("{count} {}", count_unit(tool, count))
+/// A single-line result is the meaningful outcome ("wrote x", "+1 −1") — show it
+/// cwd-stripped and sanitized. Multi-line results fold in [`render_tool_result`].
+fn tool_result_summary(s: &str, cwd: &str) -> String {
+    let cwd = cwd.trim_end_matches(['/', '\\']);
+    let clean = strip_ansi_and_controls(s.trim());
+    let stripped = if cwd.is_empty() {
+        clean
     } else {
-        let cwd = cwd.trim_end_matches(['/', '\\']);
-        let clean = strip_ansi_and_controls(s.trim());
-        let stripped = if cwd.is_empty() {
-            clean
-        } else {
-            clean.replace(&format!("{cwd}/"), "")
-        };
-        truncate_chars(&stripped, 60)
-    }
+        clean.replace(&format!("{cwd}/"), "")
+    };
+    truncate_chars(&stripped, 60)
 }
 
 /// Unit for a tool's multi-line result count. File listers/searchers count
@@ -3297,7 +3396,7 @@ mod render_tests {
             "new_string": "\tif len(hours) > 12 {\n\t\tstep = 4\n\t}",
         });
         let mut lines = Vec::new();
-        render_edit_diff(&mut lines, "edit_file", &args, &[None]);
+        render_edit_diff(&mut lines, "edit_file", &args, &[None], None);
         assert!(!lines.is_empty());
         let texts: Vec<String> = lines
             .iter()
@@ -3326,7 +3425,7 @@ mod render_tests {
             "content": "fn main() {\n    println!(\"hi\");\n}\n",
         });
         let mut lines = Vec::new();
-        render_edit_diff(&mut lines, "write_file", &args, &[Some(1)]);
+        render_edit_diff(&mut lines, "write_file", &args, &[Some(1)], None);
         let texts: Vec<String> = lines
             .iter()
             .map(|l| {
@@ -3351,7 +3450,7 @@ mod render_tests {
     fn write_file_empty_content_renders_nothing() {
         let args = serde_json::json!({ "path": "src/empty.rs", "content": "" });
         let mut lines = Vec::new();
-        render_edit_diff(&mut lines, "write_file", &args, &[None]);
+        render_edit_diff(&mut lines, "write_file", &args, &[None], None);
         assert!(lines.is_empty(), "empty write should emit no diff rows");
     }
 
@@ -3484,7 +3583,7 @@ mod render_tests {
     #[test]
     fn single_line_summary_is_sanitized() {
         // A single-line colored result renders with no escape bytes leaking in.
-        let out = tool_result_summary("\x1b[31mfatal: bad ref\x1b[0m", "", None);
+        let out = tool_result_summary("\x1b[31mfatal: bad ref\x1b[0m", "");
         assert_eq!(out, "fatal: bad ref");
         assert!(!out.contains('\x1b'));
     }

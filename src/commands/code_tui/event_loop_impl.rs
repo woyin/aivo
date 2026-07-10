@@ -9,6 +9,10 @@ impl CodeTuiApp {
             self.handle_runtime_event(event).await?;
             handled = true;
         }
+        if handled {
+            // Any runtime event is proof of life for the stall detector.
+            self.last_stream_activity = Some(Instant::now());
+        }
         Ok(handled)
     }
 
@@ -66,7 +70,8 @@ impl CodeTuiApp {
                 name,
                 args,
                 line_starts,
-            } => self.apply_agent_tool_call(id, name, args, line_starts),
+                old_content,
+            } => self.apply_agent_tool_call(id, name, args, line_starts, old_content),
             RuntimeEvent::AgentSubActivity {
                 agent,
                 tool,
@@ -150,7 +155,7 @@ impl CodeTuiApp {
             }
             // Typed early-stop (guard stop / step limit) — remembered for /goal steering.
             RuntimeEvent::AgentTurnStop(stop) => self.goal_guard_stop = Some(stop),
-            RuntimeEvent::AgentError(text) => self.notice = Some((ERROR, text)),
+            RuntimeEvent::AgentError(text) => self.apply_agent_error(text),
             RuntimeEvent::AgentPermission {
                 tool,
                 preview,
@@ -472,6 +477,7 @@ impl CodeTuiApp {
         name: String,
         args: serde_json::Value,
         line_starts: Vec<Option<usize>>,
+        old_content: Option<String>,
     ) {
         self.clear_sandbox_escalation_notice();
         self.flush_pending_assistant();
@@ -481,9 +487,17 @@ impl CodeTuiApp {
         } else {
             self.real_cwd.clone()
         };
+        // Timeout budget for the status clock (mirrors the engine's resolution).
+        let deadline = (name == "run_bash").then(|| {
+            args.get("timeout")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(120)
+                .min(600)
+        });
         self.last_tool_action = Some((
             super::render::tool_action_label(&name, &args, &cwd),
             Instant::now(),
+            deadline,
         ));
         let mut obj = serde_json::Map::new();
         obj.insert("name".to_string(), serde_json::Value::String(name.clone()));
@@ -494,6 +508,10 @@ impl CodeTuiApp {
         // Carry the pre-edit line numbers so the diff card can number rows.
         if !line_starts.is_empty() {
             obj.insert("line_starts".to_string(), serde_json::json!(line_starts));
+        }
+        // Carry a write_file's pre-write snapshot so the card shows a real diff.
+        if let Some(old) = old_content.filter(|o| !o.is_empty()) {
+            obj.insert("old_content".to_string(), serde_json::Value::String(old));
         }
         let content = serde_json::to_string(&serde_json::Value::Object(obj)).unwrap_or(name);
         self.history.push(ChatMessage {
@@ -535,7 +553,7 @@ impl CodeTuiApp {
         } else {
             format!("↳ {who}: {inner}")
         };
-        self.last_tool_action = Some((label, Instant::now()));
+        self.last_tool_action = Some((label, Instant::now(), None));
     }
 
     /// Unnamed delegates get numbered so every row stays distinguishable.
@@ -726,6 +744,21 @@ impl CodeTuiApp {
         }
     }
 
+    /// A turn-level agent error: the transient notice, plus a durable `error`
+    /// transcript entry — else a failed turn reads as a prompt with no reply
+    /// after scrolling or resume. Display-only; `agent_seed_turns` skips it.
+    pub(super) fn apply_agent_error(&mut self, text: String) {
+        self.flush_pending_assistant();
+        self.notice = Some((ERROR, text.clone()));
+        self.history.push(ChatMessage {
+            model: None,
+            role: "error".to_string(),
+            content: text,
+            reasoning_content: None,
+            attachments: vec![],
+        });
+    }
+
     pub(super) fn apply_agent_tool_result(&mut self, content: String) {
         self.history.push(ChatMessage {
             model: None,
@@ -785,6 +818,8 @@ impl CodeTuiApp {
         self.flush_pending_assistant();
         // A `/compact` turn has no assistant reply: report freed context, not a marker.
         let compact_before = self.compact_before.take();
+        // Marker index, so the per-turn usage below can note tokens/cost on it.
+        let mut done_idx = None;
         if let Some(before) = compact_before {
             let freed = before.saturating_sub(context_tokens) as usize;
             self.notice = Some(freed_notice(freed, "summarized older turns"));
@@ -801,6 +836,7 @@ impl CodeTuiApp {
                     && let Some(idx) = self.history.iter().rposition(|m| m.role != "plan")
                 {
                     self.turn_durations.insert(idx, elapsed.as_millis() as u64);
+                    done_idx = Some(idx);
                 }
             }
         }
@@ -838,10 +874,24 @@ impl CodeTuiApp {
         // entry (and thus `aivo stats --since`) carries actual chat tokens.
         if let Some(session) = self.agent_engine.as_ref() {
             let turn = session.engine.lock().await.take_turn_usage();
-            if let Some(cost) = crate::services::model_metadata::model_pricing(&self.model)
-                .and_then(|p| p.cost_usd(&turn))
-            {
+            let cost = crate::services::model_metadata::model_pricing(&self.model)
+                .and_then(|p| p.cost_usd(&turn));
+            if let Some(cost) = cost {
                 self.session_cost_usd += cost;
+            }
+            // The spinner's live token count vanishes at turn end — keep the
+            // final figure on the `✶ Done` line.
+            if let Some(idx) = done_idx
+                && turn.completion_tokens > 0
+            {
+                let mut note = format!(
+                    "{} tokens",
+                    format_token_count_value(turn.completion_tokens)
+                );
+                if let Some(cost) = cost.filter(|c| *c >= 0.005) {
+                    note.push_str(&format!(" · ~${cost:.2}"));
+                }
+                self.turn_notes.insert(idx, note);
             }
             self.session_tokens = self.session_tokens.merge(turn);
         }
@@ -1504,6 +1554,7 @@ impl CodeTuiApp {
                 Err(err) => break Err(err),
             }
 
+            self.tick_decision_wait();
             self.tick_status_throttle();
 
             // Refresh the cached job count (this reaps) at most every 250ms — a badge
@@ -2312,20 +2363,71 @@ impl CodeTuiApp {
             .collect()
     }
 
-    /// History indices of `local_command` entries that render an output expander, in
-    /// display order — i.e. runs whose output exceeds `MAX_OUTPUT_LINES` (shorter
-    /// runs show in full with no marker). The Nth expander row maps to the Nth entry
-    /// (folded and expanded blocks alike render exactly one marker). A still-running
-    /// command's preview is absent: it has no history index and a plain, non-clickable
-    /// marker.
+    /// History index behind each expander marker row, in display order. Must
+    /// repeat an index exactly as many times as the render emits markers for
+    /// it — one per block, two for a long expanded tool result.
     fn expandable_output_indices(&self) -> Vec<usize> {
         self.history
             .iter()
             .enumerate()
-            .filter(|(_, m)| m.role == "local_command")
-            .filter(|(_, m)| local_command_total_lines(&m.content) > MAX_OUTPUT_LINES)
-            .map(|(i, _)| i)
+            .flat_map(|(i, m)| {
+                let markers = match m.role.as_str() {
+                    "local_command" => {
+                        usize::from(local_command_total_lines(&m.content) > MAX_OUTPUT_LINES)
+                    }
+                    "tool_result" => {
+                        let count = m.content.lines().count();
+                        if count <= 1 {
+                            0
+                        } else if self.expanded_output.contains(&i) && count > MAX_OUTPUT_LINES {
+                            2
+                        } else {
+                            1
+                        }
+                    }
+                    _ => 0,
+                };
+                std::iter::repeat_n(i, markers)
+            })
             .collect()
+    }
+
+    /// While a decision card is up, push the step + turn clocks forward by each
+    /// waiting interval — decision time must not read as tool runtime or
+    /// inflate `✶ Done in …`. Called per frame beside `tick_status_throttle`.
+    pub(super) fn tick_decision_wait(&mut self) {
+        let waiting = self.sending
+            && (self.agent_permission.is_some()
+                || self.agent_ask.is_some()
+                || self.agent_review.is_some()
+                || self.agent_plan_approval.is_some());
+        if !waiting {
+            self.wait_tick = None;
+            return;
+        }
+        let now = Instant::now();
+        let Some(dt) = self.wait_tick.replace(now).map(|prev| now - prev) else {
+            return;
+        };
+        if let Some((_, since, _)) = &mut self.last_tool_action {
+            *since += dt;
+        }
+        if let Some(started) = &mut self.request_started_at {
+            *started += dt;
+        }
+    }
+
+    /// Toggle the most recent expandable output block (Ctrl+O) — the keyboard
+    /// path to the `▸ +N lines` click. Returns false when there is none.
+    pub(super) fn toggle_latest_output(&mut self) -> bool {
+        let Some(&idx) = self.expandable_output_indices().last() else {
+            return false;
+        };
+        if !self.expanded_output.insert(idx) {
+            self.expanded_output.remove(&idx);
+        }
+        self.transcript_revision = self.transcript_revision.wrapping_add(1);
+        true
     }
 
     /// If transcript `row` is a `▸ +N more lines` / `▾ collapse` output marker, toggle

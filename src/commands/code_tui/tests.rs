@@ -197,6 +197,7 @@ async fn test_streamed_steps_keep_scroll_when_user_scrolled_up() {
         "read_file".to_string(),
         serde_json::json!({"path": "x"}),
         vec![],
+        None,
     );
     assert!(
         !app.follow_output,
@@ -1403,6 +1404,8 @@ fn make_test_app(
         request_started_at: None,
         compact_before: None,
         last_tool_action: None,
+        wait_tick: None,
+        last_stream_activity: None,
         subagent_rows: Vec::new(),
         status_display: None,
         turn_output_tokens: 0,
@@ -1512,6 +1515,7 @@ fn make_test_app(
         agent_turn_indices: std::collections::HashSet::new(),
         reasoning_durations: std::collections::HashMap::new(),
         turn_durations: std::collections::HashMap::new(),
+        turn_notes: std::collections::HashMap::new(),
         reasoning_started_at: None,
         reasoning_elapsed_ms: None,
         installing_skill: None,
@@ -2595,6 +2599,7 @@ fn test_current_action_label_reflects_phase() {
         "run_bash".to_string(),
         serde_json::json!({"command": "ls"}),
         vec![],
+        None,
     );
     assert_eq!(app.current_action_label().as_deref(), Some("running ls"));
     // Streamed tokens arriving → the step is over, heartbeat only.
@@ -2650,6 +2655,7 @@ fn test_current_action_shows_inline_on_status_line() {
         "grep".to_string(),
         serde_json::json!({"pattern": "parse_expr"}),
         vec![],
+        None,
     );
     // The action replaces "Thinking" on the SAME single status line (no extra
     // line), so the layout never shifts as steps come and go.
@@ -2675,6 +2681,7 @@ fn test_subagent_activity_drives_status_line() {
         "subagent".to_string(),
         serde_json::json!({"agent": "code-reviewer", "task": "review mcp.rs"}),
         vec![],
+        None,
     );
     app.apply_subagent_activity(
         "code-reviewer".to_string(),
@@ -2709,6 +2716,7 @@ fn test_parallel_subagent_rows_render_under_status_line() {
         "subagent".to_string(),
         serde_json::json!({"label": "audit auth flow", "task": "…"}),
         vec![],
+        None,
     );
     app.apply_subagent_begin(vec!["audit auth flow".to_string(), String::new()]);
     // The unnamed delegate is numbered so its row stays distinguishable.
@@ -2843,6 +2851,7 @@ fn test_in_flight_tool_card_hidden_until_result() {
         "run_bash".to_string(),
         serde_json::json!({"command": "lsof -ti:3000"}),
         vec![],
+        None,
     );
     // In flight: only the status names it — the `→ run_bash(…)` card is held back
     // so the same action isn't shown twice (the dup the user reported).
@@ -2870,12 +2879,13 @@ fn test_status_tail_shows_turn_output_tokens() {
     let mut app = make_test_app(tx, rx);
     app.sending = true;
     app.pending_response = "x".repeat(4_000); // ~1k tokens streamed
-    // Before any measured turn output: a live ~-flagged estimate, never esc.
+    // A live ~-flagged estimate, alongside the always-present interrupt hint —
+    // stopping a runaway turn must be discoverable mid-turn.
     let plain = app.build_transcript().plain_lines.join("\n");
     assert!(plain.contains("tokens"), "estimate shown: {plain:?}");
     assert!(
-        !plain.contains("esc to interrupt"),
-        "no esc hint in status: {plain:?}"
+        plain.contains("esc to interrupt"),
+        "esc hint in the agent-turn status: {plain:?}"
     );
     // The engine reports the turn's cumulative generated tokens → exact (no ~),
     // distinct from the prompt-dominated context total (which stays in the footer).
@@ -2883,6 +2893,141 @@ fn test_status_tail_shows_turn_output_tokens() {
     let plain = app.build_transcript().plain_lines.join("\n");
     assert!(plain.contains("512 tokens"), "turn output shown: {plain:?}");
     assert!(!plain.contains("~512"), "measured, not estimate: {plain:?}");
+}
+
+#[test]
+fn test_status_tail_counts_queued_input() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.sending = true;
+    app.queued_messages.push("follow-up one".to_string());
+    app.queued_messages.push("follow-up two".to_string());
+    let plain = app.build_transcript().plain_lines.join("\n");
+    assert!(plain.contains("2 queued"), "queued chip missing: {plain:?}");
+}
+
+#[test]
+fn test_desired_status_names_decision_waits_and_stalls() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.sending = true;
+    // A permission card means blocked on the user — the status must not read as
+    // the (possibly destructive) command already executing.
+    let (reply, _rx) = tokio::sync::oneshot::channel();
+    app.agent_permission = Some(PendingPermission {
+        tool: "run_bash".to_string(),
+        preview: Some("rm -rf build".to_string()),
+        reply,
+    });
+    assert_eq!(app.desired_status(), "waiting for your approval");
+    app.agent_permission = None;
+
+    // A silent stream reads as a stall, not an ever-ticking "Thinking".
+    app.last_stream_activity =
+        std::time::Instant::now().checked_sub(std::time::Duration::from_secs(15));
+    assert_eq!(app.desired_status(), "waiting");
+    app.last_stream_activity = Some(std::time::Instant::now());
+    assert_eq!(app.desired_status(), "Thinking");
+}
+
+#[test]
+fn test_decision_wait_freezes_step_and_turn_clocks() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.sending = true;
+    let t0 = std::time::Instant::now();
+    app.last_tool_action = Some(("running rm -rf build".to_string(), t0, None));
+    app.request_started_at = Some(t0);
+    let (reply, _rx) = tokio::sync::oneshot::channel();
+    app.agent_permission = Some(PendingPermission {
+        tool: "run_bash".to_string(),
+        preview: None,
+        reply,
+    });
+    // Two ticks a real interval apart: the waiting span must be pushed out of
+    // both clocks, so their effective elapsed stays near zero.
+    app.tick_decision_wait();
+    std::thread::sleep(std::time::Duration::from_millis(30));
+    app.tick_decision_wait();
+    let (_, since, _) = app.last_tool_action.as_ref().unwrap();
+    assert!(
+        since.elapsed() < std::time::Duration::from_millis(15),
+        "tool clock ran during the wait: {:?}",
+        since.elapsed()
+    );
+    assert!(
+        app.request_started_at.unwrap().elapsed() < std::time::Duration::from_millis(15),
+        "turn clock ran during the wait"
+    );
+    // Card resolved → clocks run again from here.
+    app.agent_permission = None;
+    app.tick_decision_wait();
+    assert!(app.wait_tick.is_none());
+}
+
+#[test]
+fn test_discard_queued_input_counts_and_clears() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.queued_messages.push("a".to_string());
+    app.queued_messages.push("b".to_string());
+    app.steering_queue.lock().unwrap().push("steer".to_string());
+    assert_eq!(app.discard_queued_input(), 3);
+    assert!(app.queued_messages.is_empty());
+    assert!(app.steering_queue.lock().unwrap().is_empty());
+    assert_eq!(app.discard_queued_input(), 0);
+}
+
+#[test]
+fn test_bash_status_clock_shows_timeout_budget() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.sending = true;
+    app.apply_agent_tool_call(
+        None,
+        "run_bash".to_string(),
+        serde_json::json!({"command": "cargo test", "timeout": 300}),
+        vec![],
+        None,
+    );
+    let (_, _, budget) = app.last_tool_action.as_ref().unwrap();
+    assert_eq!(*budget, Some(300));
+    let plain = app.build_transcript().plain_lines.join("\n");
+    assert!(
+        plain.contains(" / "),
+        "deadline missing from clock: {plain:?}"
+    );
+    // Non-bash steps carry no budget.
+    app.apply_agent_tool_call(
+        None,
+        "read_file".to_string(),
+        serde_json::json!({"path": "x.rs"}),
+        vec![],
+        None,
+    );
+    assert_eq!(app.last_tool_action.as_ref().unwrap().2, None);
+}
+
+#[test]
+fn test_done_marker_appends_turn_note() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.history.push(ChatMessage {
+        model: None,
+        role: "assistant".to_string(),
+        content: "done".to_string(),
+        reasoning_content: None,
+        attachments: vec![],
+    });
+    let idx = app.history.len() - 1;
+    app.turn_durations.insert(idx, 42_000);
+    app.turn_notes
+        .insert(idx, "3.1k tokens · ~$0.02".to_string());
+    let plain = app.build_transcript().plain_lines.join("\n");
+    assert!(
+        plain.contains("✶ Done in 42s · 3.1k tokens · ~$0.02"),
+        "{plain}"
+    );
 }
 
 #[tokio::test]
@@ -2901,6 +3046,31 @@ async fn test_agent_error_notice_uses_error_color() {
         .unwrap();
     app.handle_runtime_events().await.unwrap();
     assert_eq!(app.notice, Some((MUTED, "compacting context…".to_string())));
+}
+
+#[tokio::test]
+async fn test_agent_error_persists_in_transcript() {
+    // Beyond the transient notice, the error must land as a durable transcript entry.
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.tx
+        .send(RuntimeEvent::AgentError(
+            "the provider rejected this API key (upstream 401: bad key)".to_string(),
+        ))
+        .unwrap();
+    app.handle_runtime_events().await.unwrap();
+    let last = app.history.last().expect("error entry committed");
+    assert_eq!(last.role, "error");
+    let plain = app.build_transcript().plain_lines.join("\n");
+    assert!(
+        plain.contains("✗ the provider rejected this API key"),
+        "{plain}"
+    );
+    // Never seeded back to the model on an engine rebuild.
+    assert!(
+        super::runtime_impl::agent_seed_turns(&app.history).is_empty(),
+        "error entries must stay display-only"
+    );
 }
 
 #[tokio::test]
@@ -2957,6 +3127,7 @@ async fn test_sandbox_escalation_notice_clears_on_next_output() {
             name: "read_file".to_string(),
             args: serde_json::json!({"path": "x"}),
             line_starts: vec![],
+            old_content: None,
         })
         .unwrap();
     app.handle_runtime_events().await.unwrap();
@@ -2990,6 +3161,7 @@ async fn test_sandbox_escalation_notice_clears_on_next_output() {
             name: "read_file".to_string(),
             args: serde_json::json!({"path": "y"}),
             line_starts: vec![],
+            old_content: None,
         })
         .unwrap();
     app.handle_runtime_events().await.unwrap();
@@ -3087,6 +3259,7 @@ fn test_status_label_throttled_to_min_duration() {
         "grep".to_string(),
         serde_json::json!({"pattern": "foo"}),
         vec![],
+        None,
     );
     app.tick_status_throttle();
     assert_eq!(
@@ -4692,6 +4865,7 @@ fn test_agent_events_build_display_history() {
         "read_file".to_string(),
         serde_json::json!({"path": "a.rs"}),
         vec![],
+        None,
     );
     assert!(app.pending_response.is_empty());
     assert_eq!(app.history.len(), 2);
@@ -4711,6 +4885,7 @@ fn test_agent_events_build_display_history() {
         "edit_file".to_string(),
         serde_json::json!({"path": "a.rs"}),
         vec![],
+        None,
     );
     assert_eq!(app.history.len(), 4);
     assert_eq!(app.history[3].role, "tool_call");
@@ -4728,6 +4903,7 @@ fn test_native_tool_paths_render_relative_to_cwd() {
         "read_file".to_string(),
         serde_json::json!({"path": "/Users/alice/proj/src/ui/views/panel.rs"}),
         vec![],
+        None,
     );
     app.apply_agent_tool_result("128 lines".to_string());
     let plain = app.build_transcript().plain_lines.join("\n");
@@ -4745,7 +4921,7 @@ fn test_native_tool_paths_render_relative_to_cwd() {
         None,
         "read_file".to_string(),
         serde_json::json!({"path": "/Users/alice/proj/src/module/feature/component/section/detail/view/inner/widget.rs"}),
-    vec![]);
+    vec![], None);
     let plain = app.build_transcript().plain_lines.join("\n");
     assert!(plain.contains("…/"), "expected left-truncation: {plain}");
     assert!(plain.contains("widget.rs"), "basename lost: {plain}");
@@ -4769,6 +4945,7 @@ fn test_tool_result_count_units_by_tool() {
             tool.to_string(),
             serde_json::json!({"path": "x"}),
             vec![],
+            None,
         );
         app.apply_agent_tool_result(output.to_string());
         let plain = app.build_transcript().plain_lines.join("\n");
@@ -4792,6 +4969,7 @@ fn test_batched_tool_results_resolve_unit_and_target_by_position() {
             "grep".to_string(),
             serde_json::json!({"pattern": pat}),
             vec![],
+            None,
         );
     }
     app.apply_agent_tool_result("1: x\n2: y".to_string()); // 2 matches
@@ -4827,6 +5005,7 @@ fn test_adjacent_search_tools_merge_into_one_group() {
             tool.to_string(),
             serde_json::json!({"pattern": pat}),
             vec![],
+            None,
         );
     }
     app.apply_agent_tool_result("a.rs\nb.rs\nc.rs".to_string()); // glob -> 3 files
@@ -4854,6 +5033,7 @@ fn test_run_bash_label_strips_redundant_cd_prefix() {
         "run_bash".to_string(),
         serde_json::json!({"command": "cd /Users/alice/project/work/aivo && git show f391ffd"}),
         vec![],
+        None,
     );
     let plain = app.build_transcript().plain_lines.join("\n");
     assert!(plain.contains("run_bash(git show f391ffd)"), "{plain}");
@@ -4875,19 +5055,21 @@ fn test_detached_results_in_batch_carry_their_target() {
         "read_file".to_string(),
         serde_json::json!({"path": "src/gemini_router.rs"}),
         vec![],
+        None,
     );
     app.apply_agent_tool_call(
         None,
         "grep".to_string(),
         serde_json::json!({"pattern": "400|sanitize"}),
         vec![],
+        None,
     );
     app.apply_agent_tool_result("a\nb\nc".to_string()); // read -> 3 lines
     app.apply_agent_tool_result("1:x\n2:y".to_string()); // grep -> 2 matches
 
     let plain = app.build_transcript().plain_lines.join("\n");
-    assert!(plain.contains("gemini_router.rs · 3 lines"), "{plain}");
-    assert!(plain.contains("400|sanitize · 2 matches"), "{plain}");
+    assert!(plain.contains("▸ +3 lines · gemini_router.rs"), "{plain}");
+    assert!(plain.contains("▸ +2 matches · 400|sanitize"), "{plain}");
 }
 
 #[test]
@@ -4901,6 +5083,7 @@ fn test_failed_tool_result_renders_in_error_hue() {
         "",
         Some("run_bash"),
         None,
+        false,
     );
     assert!(
         lines[0]
@@ -4919,9 +5102,214 @@ fn test_failed_tool_result_renders_in_error_hue() {
 
     // A normal multi-line result stays neutral even when a line says "error:".
     let mut ok = Vec::new();
-    render_tool_result(&mut ok, "error: x\nmore\nlines", "", Some("grep"), None);
+    render_tool_result(
+        &mut ok,
+        "error: x\nmore\nlines",
+        "",
+        Some("grep"),
+        None,
+        false,
+    );
     assert!(ok[0].line.spans.iter().any(|s| s.style.fg == Some(FAINT)));
     assert!(ok[0].line.spans.iter().all(|s| s.style.fg != Some(ERROR)));
+}
+
+#[test]
+fn test_failed_bash_result_shows_exit_code_in_error_hue() {
+    // Nonzero exit arrives as Ok(output + "[exit N]") — the summary must still read red.
+    let mut lines = Vec::new();
+    render_tool_result(
+        &mut lines,
+        "compiling…\nerror[E0308]: mismatched types\n[exit 101]",
+        "",
+        Some("run_bash"),
+        None,
+        false,
+    );
+    assert!(lines[0].plain.contains("exited 101"), "{}", lines[0].plain);
+    assert!(
+        lines[0]
+            .line
+            .spans
+            .iter()
+            .any(|s| s.style.fg == Some(ERROR)),
+        "failed bash summary should carry the error hue"
+    );
+
+    // The `[exit N]` tail is found past the spill pointer, and a clean run
+    // stays neutral.
+    assert_eq!(
+        bash_exit_code("x\ny\n[exit 2]\n[full output: /tmp/f]"),
+        Some(2)
+    );
+    assert_eq!(bash_exit_code("all good\n[done]"), None);
+    let mut ok = Vec::new();
+    render_tool_result(&mut ok, "a\nb\nc", "", Some("run_bash"), None, false);
+    assert!(
+        ok[0].line.spans.iter().all(|s| s.style.fg != Some(ERROR)),
+        "clean bash output must not read as a failure"
+    );
+}
+
+#[test]
+fn test_tool_result_expands_inline_via_keyboard_toggle() {
+    // A multi-line agent tool result folds behind its `▸ +N lines` summary;
+    // Ctrl+O (toggle_latest_output) reveals the lines in place and folds back.
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.apply_agent_tool_call(
+        None,
+        "run_bash".to_string(),
+        serde_json::json!({"command": "cargo test"}),
+        vec![],
+        None,
+    );
+    app.apply_agent_tool_result("test a ... ok\ntest b ... FAILED\n[exit 1]".to_string());
+
+    let plain = app.build_transcript().plain_lines.join("\n");
+    assert!(plain.contains("▸ +3 lines"), "{plain}");
+    assert!(plain.contains("exited 1"), "{plain}");
+    assert!(
+        !plain.contains("test b ... FAILED"),
+        "folded result must hide its lines: {plain}"
+    );
+
+    assert!(app.toggle_latest_output());
+    let plain = app.build_transcript().plain_lines.join("\n");
+    assert!(
+        plain.contains("test b ... FAILED"),
+        "expanded result must show its lines: {plain}"
+    );
+    // The summary stays the (sole) toggle for a short block — no trailing collapse.
+    assert!(plain.contains("▾ 3 lines"), "{plain}");
+    assert!(!plain.contains(OUTPUT_EXPANDED_PREFIX), "{plain}");
+
+    assert!(app.toggle_latest_output());
+    let plain = app.build_transcript().plain_lines.join("\n");
+    assert!(!plain.contains("test b ... FAILED"), "{plain}");
+}
+
+#[test]
+fn expanded_tool_result_refolds_from_its_summary_row() {
+    // Regression: expanding flipped the summary to a dead "▾ N lines" row, so a
+    // long read_file could only fold from the far end of the block.
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.apply_agent_tool_call(
+        None,
+        "read_file".to_string(),
+        serde_json::json!({"path": "big.rs"}),
+        vec![],
+        None,
+    );
+    let content: String = (1..=100).map(|i| format!("{i}: line\n")).collect();
+    app.apply_agent_tool_result(content.trim_end().to_string());
+    let idx = app.history.len() - 1;
+
+    let refresh = |app: &mut CodeTuiApp| -> Vec<String> {
+        let body = app.build_transcript_history_body(80);
+        let wrapped = wrap_transcript(&body.lines, &body.bar_colors, 80);
+        app.transcript_hitbox = Some(TranscriptHitbox {
+            area: Rect::new(0, 0, 80, 40),
+            first_row: 0,
+            rows: wrapped.rows.clone(),
+        });
+        wrapped.rows
+    };
+
+    let rows = refresh(&mut app);
+    let marker = rows.iter().position(|r| is_output_expander(r)).unwrap();
+    assert!(app.toggle_output_at_row(marker));
+    assert!(app.expanded_output.contains(&idx));
+
+    // A long expanded block renders two toggles, both mapping to this entry.
+    let rows = refresh(&mut app);
+    let markers: Vec<usize> = rows
+        .iter()
+        .enumerate()
+        .filter(|(_, r)| is_output_expander(r))
+        .map(|(i, _)| i)
+        .collect();
+    assert_eq!(markers.len(), 2, "rows:\n{}", rows.join("\n"));
+    assert!(
+        rows[markers[0]].contains("▾ 100 lines"),
+        "{}",
+        rows[markers[0]]
+    );
+    assert!(rows[markers[1]].contains(OUTPUT_EXPANDED_PREFIX));
+
+    assert!(app.toggle_output_at_row(markers[0]));
+    assert!(!app.expanded_output.contains(&idx));
+
+    refresh(&mut app);
+    let rows = refresh(&mut app);
+    let marker = rows.iter().position(|r| is_output_expander(r)).unwrap();
+    assert!(app.toggle_output_at_row(marker));
+    let rows = refresh(&mut app);
+    let bottom = rows.iter().rposition(|r| is_output_expander(r)).unwrap();
+    assert!(app.toggle_output_at_row(bottom));
+    assert!(!app.expanded_output.contains(&idx));
+}
+
+#[test]
+fn tool_result_expander_click_maps_across_mixed_blocks() {
+    // A `!cmd` fold and a tool-result fold interleave; clicking the second
+    // marker row must toggle the tool result, not the shell block.
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    let full: String = (1..=250).map(|i| format!("L{i:04}\n")).collect();
+    app.record_local_output("seq 250".to_string(), full, String::new(), 0, false, false);
+    app.apply_agent_tool_call(
+        None,
+        "read_file".to_string(),
+        serde_json::json!({"path": "x.rs"}),
+        vec![],
+        None,
+    );
+    app.apply_agent_tool_result("alpha\nbeta".to_string());
+    let result_idx = app.history.len() - 1;
+
+    let body = app.build_transcript_history_body(80);
+    let wrapped = wrap_transcript(&body.lines, &body.bar_colors, 80);
+    app.transcript_hitbox = Some(TranscriptHitbox {
+        area: Rect::new(0, 0, 80, 40),
+        first_row: 0,
+        rows: wrapped.rows.clone(),
+    });
+    let marker_rows: Vec<usize> = wrapped
+        .rows
+        .iter()
+        .enumerate()
+        .filter(|(_, r)| is_output_expander(r))
+        .map(|(i, _)| i)
+        .collect();
+    assert_eq!(marker_rows.len(), 2, "rows:\n{}", wrapped.rows.join("\n"));
+
+    assert!(app.toggle_output_at_row(marker_rows[1]));
+    assert!(app.expanded_output.contains(&result_idx));
+    let plain = app.build_transcript().plain_lines.join("\n");
+    assert!(plain.contains("beta"), "{plain}");
+}
+
+#[test]
+fn write_file_snapshot_rides_tool_call_entry() {
+    // The tool_start snapshot turns the write_file card into a real diff.
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.apply_agent_tool_call(
+        None,
+        "write_file".to_string(),
+        serde_json::json!({"path": "a.rs", "content": "fn keep() {}\nfn renamed() {}\n"}),
+        vec![Some(1)],
+        Some("fn keep() {}\nfn original() {}\n".to_string()),
+    );
+    let plain = app.build_transcript().plain_lines.join("\n");
+    assert!(plain.contains("original"), "old side missing: {plain}");
+    assert!(plain.contains("renamed"), "new side missing: {plain}");
+    assert!(
+        plain.contains(" - ") && plain.contains(" + "),
+        "expected real del/ins rows, not all-additions: {plain}"
+    );
 }
 
 #[test]
@@ -4933,6 +5321,7 @@ fn test_run_bash_label_drops_redirection_noise() {
         "run_bash".to_string(),
         serde_json::json!({"command": "which aivo 2>/dev/null && aivo --help 2>&1"}),
         vec![],
+        None,
     );
     let plain = app.build_transcript().plain_lines.join("\n");
     assert!(plain.contains("which aivo && aivo --help"), "{plain}");
@@ -4971,12 +5360,14 @@ fn test_subagents_render_individually_not_coalesced() {
         "subagent".to_string(),
         serde_json::json!({"task": "Review the chat API endpoint for gaps"}),
         vec![],
+        None,
     );
     app.apply_agent_tool_call(
         None,
         "subagent".to_string(),
         serde_json::json!({"agent": "reviewer", "task": "Audit the auth flow"}),
         vec![],
+        None,
     );
     app.apply_agent_tool_result("## Findings\nfirst\nsecond".to_string());
 
@@ -4999,15 +5390,11 @@ fn test_subagents_render_individually_not_coalesced() {
         plain.contains("→ Audit the auth flow"),
         "second delegated task missing: {plain}"
     );
-    // The result previews the report's first line + a `+N more` tail — not a bare
-    // "3 lines" count that says nothing about what the subagent found.
+    // The result previews the report's first line after the fold toggle — not a
+    // bare count alone that says nothing about what the subagent found.
     assert!(
-        plain.contains("## Findings (+2 more)"),
+        plain.contains("▸ +3 lines · ## Findings"),
         "subagent result preview missing: {plain}"
-    );
-    assert!(
-        !plain.contains("3 lines"),
-        "bare line count leaked for subagent: {plain}"
     );
 }
 
@@ -5021,6 +5408,7 @@ fn test_delegating_spinner_label_drops_subagent_word() {
         "subagent".to_string(),
         serde_json::json!({"task": "Audit the auth flow"}),
         vec![],
+        None,
     );
     let activity = app.current_action_label().unwrap_or_default();
     assert_eq!(
@@ -5045,6 +5433,7 @@ fn test_cursor_tool_update_enriches_call_in_place() {
         "read_file".to_string(),
         serde_json::json!({"path": "Read File"}),
         vec![],
+        None,
     );
     let rev_before = app.transcript_revision;
     let plain = app.build_transcript().plain_lines.join("\n");
@@ -5099,6 +5488,7 @@ async fn test_cursor_turn_ending_on_tool_does_not_duplicate_prose() {
         "edit_file".to_string(),
         serde_json::json!({"path": "a.rs"}),
         vec![],
+        None,
     );
     app.apply_agent_tool_result("done".to_string());
     assert!(app.pending_response.is_empty());
@@ -5233,7 +5623,7 @@ fn test_build_transcript_renders_tool_steps() {
         "missing tool-call line in:\n{plain}"
     );
     assert!(
-        plain.contains("⎿ 3 lines"),
+        plain.contains("⎿ ▸ +3 lines"),
         "missing tool-result line in:\n{plain}"
     );
     assert!(
@@ -5251,7 +5641,7 @@ fn test_build_transcript_renders_tool_steps() {
     let result_idx = transcript
         .plain_lines
         .iter()
-        .position(|l| l.contains("⎿ 3 lines"))
+        .position(|l| l.contains("⎿ ▸ +3 lines"))
         .unwrap();
     assert_eq!(result_idx, call_idx + 1, "result should hug its call");
     assert_eq!(transcript.bar_colors[call_idx], Some(TOOL));

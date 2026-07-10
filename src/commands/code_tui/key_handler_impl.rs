@@ -40,7 +40,16 @@ impl CodeTuiApp {
                 return Ok(true);
             }
             self.exit_confirm_pending = true;
-            self.notice = Some((WARNING, "Press Ctrl+C again to exit".to_string()));
+            // Mid-turn, a reflexive Ctrl+C usually means "stop the agent" — point
+            // at esc before the second press tears down the TUI.
+            self.notice = Some((
+                WARNING,
+                if self.sending {
+                    "esc stops the agent's turn — Ctrl+C again exits aivo".to_string()
+                } else {
+                    "Press Ctrl+C again to exit".to_string()
+                },
+            ));
             return Ok(false);
         }
 
@@ -1268,6 +1277,13 @@ impl CodeTuiApp {
             }
             KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.scroll_up();
+                true
+            }
+            // Keyboard path to the `▸ +N lines` fold toggle.
+            KeyCode::Char('o') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                if !self.toggle_latest_output() {
+                    self.notice = Some((MUTED, "no collapsed output to expand".to_string()));
+                }
                 true
             }
             // Ctrl+D is left for the composer's delete-forward (emacs `delete-char`);
