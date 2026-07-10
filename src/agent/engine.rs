@@ -286,9 +286,9 @@ impl TurnCtx<'_> {
 #[derive(Clone)]
 pub(crate) struct Checkpoint {
     pub(crate) msg_index: usize,
-    prompt: String,
-    tree: Option<String>,
-    changed: Option<Vec<std::path::PathBuf>>,
+    pub(crate) prompt: String,
+    pub(crate) tree: Option<String>,
+    pub(crate) changed: Option<Vec<std::path::PathBuf>>,
 }
 
 /// Result of a [`AgentEngine::rewind_to`] — counts for the notice.

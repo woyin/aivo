@@ -492,3 +492,351 @@ pub(crate) fn find_cut(messages: &[Value], keep_recent_tokens: usize) -> usize {
     }
     cut
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::agent::engine::{ARTIFACT_POINTER_PREFIX, Checkpoint};
+    use crate::agent::protocol::Decision;
+    use futures::future::BoxFuture;
+    use serde_json::Value;
+
+    fn engine() -> AgentEngine {
+        AgentEngine::new("/tmp", "m", "", &[], &[], 0, 0)
+    }
+
+    struct NoopUi;
+    impl AgentUi for NoopUi {
+        fn assistant_text(&mut self, _: &str) {}
+        fn tool_start(&mut self, _: &str, _: &Value) {}
+        fn tool_result(&mut self, _: &str, _: &Result<String, String>) {}
+        fn notify(&mut self, _: &str) {}
+        fn footer(&mut self, _: Option<&str>, _: usize, _: u64, _: u64, _: u64) {}
+        fn ask_permission<'a>(
+            &'a mut self,
+            _: &'a str,
+            _: Option<&'a str>,
+        ) -> BoxFuture<'a, Decision> {
+            Box::pin(async { Decision::Deny })
+        }
+    }
+
+    fn turn_ctx<'a>(client: &'a reqwest::Client, cwd: &'a std::path::Path) -> TurnCtx<'a> {
+        TurnCtx {
+            client,
+            serve_base: "",
+            auth: None,
+            cwd,
+            yes: true,
+            auto_approve_all: false,
+            auto_approve: None,
+            review_edits: None,
+        }
+    }
+
+    #[test]
+    fn recalibrate_from_overflow_falls_back_to_a_nudge() {
+        let mut e = engine();
+        e.recalibrate_from_overflow("context length exceeded");
+        assert!(
+            (e.token_calibration - 1.2).abs() < 1e-9,
+            "unparseable rejection nudges ×1.2, got {}",
+            e.token_calibration
+        );
+        for _ in 0..20 {
+            e.recalibrate_from_overflow("context length exceeded");
+        }
+        assert_eq!(
+            e.token_calibration, MAX_CALIBRATION,
+            "repeated nudges clamp at the ceiling"
+        );
+    }
+
+    #[test]
+    fn recalibrate_from_overflow_ignores_ratio_below_min_sample() {
+        let mut e = engine();
+        e.messages = vec![json!({"role":"system","content":"sys"})];
+        assert!(estimate_tokens(&e.messages) < CALIBRATION_MIN_SAMPLE);
+        e.recalibrate_from_overflow(
+            "token count of 290000 exceeds the maximum allowed input length of 262112 tokens",
+        );
+        assert!(
+            (e.token_calibration - 1.2).abs() < 1e-9,
+            "tiny estimate must nudge, not calibrate from the cited count, got {}",
+            e.token_calibration
+        );
+    }
+
+    #[test]
+    fn update_calibration_ignores_zero_measured_total() {
+        let mut e = engine();
+        e.update_calibration(100_000, 0);
+        assert_eq!(e.token_calibration, 1.0, "a zero measurement is no signal");
+    }
+
+    /// The cheap path in `maybe_compact` trusts savings and skips `enforce_budget`;
+    /// an overestimate would leave the next request over the window.
+    #[test]
+    fn stale_savings_do_not_overestimate_actual_reclaim() {
+        let mut e = engine();
+        let pointer = format!("{ARTIFACT_POINTER_PREFIX}/tmp/r.md — re-read it]");
+        let escaped = format!("line \"quoted\"\n{}\n{pointer}", "y".repeat(6_000));
+        e.messages = vec![
+            json!({"role":"system","content":"sys"}),
+            json!({"role":"user","content":"q1"}),
+            json!({"role":"assistant","content":"","tool_calls":[
+                {"id":"a","type":"function","function":{"name":"read_file","arguments":"{}"}}]}),
+            json!({"role":"tool","tool_call_id":"a","content": "s".repeat(8_000)}),
+            json!({"role":"assistant","content":"","tool_calls":[
+                {"id":"b","type":"function","function":{"name":"grep","arguments":"{}"}}]}),
+            json!({"role":"tool","tool_call_id":"b","content": escaped}),
+            json!({"role":"user","content":"q2"}),
+            json!({"role":"assistant","content":"done"}),
+        ];
+        let cut = find_cut(&e.messages, 0);
+        assert_eq!(cut, 6, "both tool results are old");
+        let savings = e.stale_tool_result_savings(cut);
+        assert!(savings > 0);
+        let before = estimate_tokens(&e.messages);
+        e.clear_stale_tool_results(cut);
+        let reclaimed = before - estimate_tokens(&e.messages);
+        assert!(
+            savings <= reclaimed + 2,
+            "savings {savings} overestimates actual reclaim {reclaimed}"
+        );
+    }
+
+    #[test]
+    fn clear_stale_tool_results_is_idempotent() {
+        let mut e = engine();
+        let pointer = format!("{ARTIFACT_POINTER_PREFIX}/tmp/r.md — re-read it]");
+        e.messages = vec![
+            json!({"role":"system","content":"sys"}),
+            json!({"role":"user","content":"q1"}),
+            json!({"role":"assistant","content":"","tool_calls":[
+                {"id":"a","type":"function","function":{"name":"read_file","arguments":"{}"}}]}),
+            json!({"role":"tool","tool_call_id":"a","content": format!("{}\n{pointer}", "x".repeat(5_000))}),
+            json!({"role":"user","content":"q2"}),
+        ];
+        e.clear_stale_tool_results(4);
+        let once = e.messages.clone();
+        assert!(
+            once[3]["content"].as_str().unwrap().contains(&pointer),
+            "pointer survives the first clear"
+        );
+        e.clear_stale_tool_results(4);
+        assert_eq!(e.messages, once, "second clear must be a no-op");
+    }
+
+    #[test]
+    fn mechanical_summary_preserves_running_summary() {
+        let mut e = engine();
+        assert!(e.mechanical_summary().contains("omitted"));
+        e.last_summary = Some("KEYFACT: db is postgres".to_string());
+        let s = e.mechanical_summary();
+        assert!(s.contains("KEYFACT: db is postgres"), "{s}");
+        assert!(s.contains("summarization unavailable"), "{s}");
+    }
+
+    #[test]
+    fn force_fit_fold_carries_running_summary_forward() {
+        let mut e = engine();
+        e.context_window = 20_000; // budget = 20_000 − COMPACT_RESERVE = 4_000
+        e.last_summary = Some("KEYFACT: db is postgres".to_string());
+        e.messages = vec![
+            json!({"role":"system","content":"sys"}),
+            json!({"role":"user","content":"original task"}),
+            json!({"role":"assistant","content": "reasoning ".repeat(4_000)}),
+            json!({"role":"user","content":"continue"}),
+        ];
+        e.force_fit_budget();
+        assert!(estimate_tokens(&e.messages) <= e.compaction_budget_estimate());
+        let last = e.messages.last().unwrap();
+        assert_eq!(role(last), "user");
+        let content = last["content"].as_str().unwrap();
+        assert!(
+            content.contains("KEYFACT: db is postgres"),
+            "running summary lost in recovery: {content}"
+        );
+        assert!(content.contains("continue"), "latest turn kept: {content}");
+    }
+
+    #[test]
+    fn apply_compaction_nonuser_cut_splices_standalone_summary() {
+        let mut e = engine();
+        e.messages = vec![
+            json!({"role":"system","content":"sys"}),
+            json!({"role":"user","content":"u1"}),
+            json!({"role":"assistant","content":"a1"}),
+            json!({"role":"assistant","content":"a2"}),
+        ];
+        for i in [1usize, 3] {
+            e.checkpoints.push(Checkpoint {
+                msg_index: i,
+                prompt: format!("cp{i}"),
+                tree: None,
+                changed: None,
+            });
+        }
+        e.apply_compaction(3, "early work");
+
+        let roles: Vec<&str> = e.messages.iter().map(role).collect();
+        assert_eq!(roles, vec!["system", "user", "assistant"]);
+        let summary = e.messages[1]["content"].as_str().unwrap();
+        assert!(
+            summary.starts_with("[Summary of earlier conversation]")
+                && summary.contains("early work"),
+            "{summary}"
+        );
+        assert_eq!(e.messages[2]["content"], "a2", "kept turn intact");
+        // splice nets −(cut−2): survivor 3 → 2; folded cp dropped
+        assert_eq!(
+            e.checkpoints
+                .iter()
+                .map(|c| c.msg_index)
+                .collect::<Vec<_>>(),
+            vec![2]
+        );
+    }
+
+    #[test]
+    fn find_cut_honors_keep_recent_and_no_user_boundary() {
+        let m = |role: &str, content: String| json!({"role": role, "content": content});
+        let messages = vec![
+            m("system", "sys".into()),
+            m("user", "u1".into()),
+            m("assistant", "a".repeat(4_000)),
+            m("user", "u2".into()),
+            m("assistant", "a2".into()),
+        ];
+        assert_eq!(find_cut(&messages, 0), 3, "keep=0 cuts at the last user");
+        assert_eq!(
+            find_cut(&messages, 10_000),
+            1,
+            "a large keep window walks back to an earlier user boundary"
+        );
+        let no_user = vec![
+            m("system", "sys".into()),
+            m("assistant", "a1".into()),
+            m("tool", "t1".into()),
+        ];
+        assert_eq!(find_cut(&no_user, 0), no_user.len());
+    }
+
+    #[test]
+    fn render_pinned_block_trims_notes_then_bails_at_plan_only() {
+        let mut e = engine();
+        e.plan =
+            plan::parse_plan(&json!({"plan":[{"step":"keep me","status":"pending"}]})).unwrap();
+        e.notes = (0..400)
+            .map(|i| Note {
+                id: None,
+                text: format!("note-{i} {}", "n".repeat(30)),
+            })
+            .collect();
+        let block = e.render_pinned_block();
+        assert!(estimate_str_tokens(&block) <= PINNED_MAX_TOKENS);
+        assert!(block.contains("keep me"), "plan kept whole");
+        assert!(!block.contains("note-0 "), "oldest note trimmed");
+        assert!(block.contains("note-399 "), "newest note kept");
+
+        let giant_plan: Vec<Value> = (0..300)
+            .map(|i| json!({"step": format!("step-{i} {}", "p".repeat(40)), "status": "pending"}))
+            .collect();
+        e.plan = plan::parse_plan(&json!({ "plan": giant_plan })).unwrap();
+        e.notes = Vec::new();
+        let block = e.render_pinned_block();
+        assert!(
+            estimate_str_tokens(&block) > PINNED_MAX_TOKENS,
+            "a plan alone can exceed the cap"
+        );
+        assert!(
+            block.contains("step-0 ") && block.contains("step-299 "),
+            "over-cap plan still returned whole, not looped on"
+        );
+    }
+
+    #[test]
+    fn compose_pinned_omits_empty_sections() {
+        assert_eq!(compose_pinned("", &[], &[]), "");
+        let files_only = compose_pinned("", &[], &["src/a.rs".to_string()]);
+        assert!(files_only.starts_with("## Files touched"), "{files_only}");
+        assert!(!files_only.contains("## Pinned Plan") && !files_only.contains("## Notes"));
+    }
+
+    #[tokio::test]
+    async fn maybe_compact_under_budget_is_a_noop() {
+        let mut e = engine();
+        e.context_window = 100_000;
+        e.messages = vec![
+            json!({"role":"system","content":"sys"}),
+            json!({"role":"user","content":"hi"}),
+            json!({"role":"assistant","content":"yo"}),
+        ];
+        let snapshot = e.messages.clone();
+        let client = reqwest::Client::new();
+        let ctx = turn_ctx(&client, std::path::Path::new("."));
+        let tokens = e.maybe_compact(&ctx, &mut NoopUi).await;
+        assert_eq!(tokens, 0);
+        assert_eq!(
+            e.messages, snapshot,
+            "under-budget compaction must not touch history"
+        );
+    }
+
+    #[tokio::test]
+    async fn summarize_range_noop_when_cut_at_most_one() {
+        let mut e = engine();
+        e.messages = vec![
+            json!({"role":"system","content":"sys"}),
+            json!({"role":"user","content":"hi"}),
+        ];
+        let snapshot = e.messages.clone();
+        let client = reqwest::Client::new();
+        let ctx = turn_ctx(&client, std::path::Path::new("."));
+        for cut in [0, 1] {
+            let tokens = e.summarize_range(&ctx, &mut NoopUi, cut).await;
+            assert_eq!(tokens, 0);
+            assert_eq!(e.messages, snapshot);
+        }
+    }
+
+    #[test]
+    fn enforce_budget_drop_rebases_checkpoints() {
+        let mut e = engine();
+        let pad = "x".repeat(400);
+        e.messages = vec![
+            json!({"role":"system","content":"sys"}),
+            json!({"role":"user","content":format!("u1 {pad}")}),
+            json!({"role":"assistant","content":format!("a1 {pad}")}),
+            json!({"role":"user","content":"u2 keep"}),
+            json!({"role":"assistant","content":"a2 keep"}),
+        ];
+        for i in [1usize, 3] {
+            e.checkpoints.push(Checkpoint {
+                msg_index: i,
+                prompt: format!("cp{i}"),
+                tree: None,
+                changed: None,
+            });
+        }
+        e.enforce_budget(100);
+        assert!(estimate_tokens(&e.messages) <= 100);
+        assert!(
+            e.messages[1]["content"]
+                .as_str()
+                .unwrap()
+                .contains("u2 keep")
+        );
+        let cps: Vec<(usize, &str)> = e
+            .checkpoints
+            .iter()
+            .map(|c| (c.msg_index, c.prompt.as_str()))
+            .collect();
+        assert_eq!(
+            cps,
+            vec![(1, "cp3")],
+            "dropped-turn cp gone; survivor rebased"
+        );
+    }
+}
