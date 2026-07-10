@@ -1733,6 +1733,15 @@ is preserved."
             ));
             return Ok(());
         }
+        if scope == crate::agent::mcp::ServerScope::Pack {
+            self.notice = Some((
+                WARNING,
+                format!(
+                    "`{name}` is provided by an installed pack — remove it with `aivo code packs rm`"
+                ),
+            ));
+            return Ok(());
+        }
         match crate::agent::mcp::remove_user_server(name).await {
             Ok(true) => {
                 // Clear any leftover disabled flag so a re-add isn't stuck off.

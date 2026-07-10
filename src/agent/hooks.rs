@@ -114,12 +114,22 @@ impl HookSet {
         !self.post_tool_use.is_empty()
     }
 
+    /// Guard-only copy for delegated runs: Pre/PostToolUse apply, Stop hooks dropped
+    /// (they gate the user answer, not each delegate — cf. CC's SubagentStop).
+    pub fn without_stop(&self) -> HookSet {
+        HookSet {
+            pre_tool_use: self.pre_tool_use.clone(),
+            post_tool_use: self.post_tool_use.clone(),
+            stop: Vec::new(),
+        }
+    }
+
     /// First veto (exit 2) wins; `None` = allowed (permission tiers still apply).
     pub async fn pre_tool_use_deny(&self, tool: &str, args: &Value, cwd: &Path) -> Option<String> {
         let payload = json!({
             "event": "PreToolUse",
             "tool": tool,
-            "args": args,
+            "args": capped_args(args),
             "cwd": cwd.display().to_string(),
         });
         for rule in matching(&self.pre_tool_use, tool) {
@@ -147,7 +157,7 @@ impl HookSet {
         let payload = json!({
             "event": "PostToolUse",
             "tool": tool,
-            "args": args,
+            "args": capped_args(args),
             "ok": ok,
             "output": cap(output, PAYLOAD_FIELD_CAP),
             "cwd": cwd.display().to_string(),
@@ -186,8 +196,26 @@ impl HookSet {
 fn matching<'a>(rules: &'a [HookRule], tool: &'a str) -> impl Iterator<Item = &'a HookRule> {
     rules.iter().filter(move |r| {
         let m = r.matcher.trim();
-        m.is_empty() || m == "*" || m.split('|').any(|t| t.trim() == tool)
+        // Entries match by aivo's tool name OR CC's vocabulary mapped onto it, so a
+        // ported CC hooks.json fires. `*`/`.*`/empty = all tools.
+        m.is_empty()
+            || m == "*"
+            || m == ".*"
+            || m.split('|').any(|t| {
+                let t = t.trim();
+                t == tool || crate::agent::subagents::normalize_tool_name(t) == Some(tool)
+            })
     })
+}
+
+/// Bound `args` so a multi-MB tool call can't balloon the stdin write; the hook
+/// still sees the tool + a truncation marker.
+fn capped_args(args: &Value) -> Value {
+    let s = args.to_string();
+    if s.len() <= PAYLOAD_FIELD_CAP {
+        return args.clone();
+    }
+    json!({ "_truncated": true, "preview": cap(&s, PAYLOAD_FIELD_CAP) })
 }
 
 fn cap(s: &str, max: usize) -> &str {
@@ -217,13 +245,23 @@ async fn run_hook(cmd: &HookCmd, payload: &Value, cwd: &Path) -> HookVerdict {
     let Ok(mut child) = command.spawn() else {
         return HookVerdict::Pass(None);
     };
-    if let Some(mut stdin) = child.stdin.take() {
-        use tokio::io::AsyncWriteExt;
-        let _ = stdin.write_all(payload.to_string().as_bytes()).await;
-        // Dropped here → EOF, so a hook reading stdin to end can't deadlock.
-    }
+    // Write stdin concurrently with draining stdout/stderr, both under the timeout:
+    // writing the whole payload first deadlocks a hook that fills its stdout pipe
+    // before reading stdin. Dropping the handle sends EOF.
+    let mut stdin = child.stdin.take();
+    let payload_bytes = payload.to_string().into_bytes();
+    let feed = async move {
+        if let Some(mut s) = stdin.take() {
+            use tokio::io::AsyncWriteExt;
+            let _ = s.write_all(&payload_bytes).await;
+        }
+    };
     let timeout = Duration::from_secs(cmd.timeout.unwrap_or(DEFAULT_TIMEOUT_SECS).max(1));
-    let out = match tokio::time::timeout(timeout, child.wait_with_output()).await {
+    let run = async {
+        let (_, out) = tokio::join!(feed, child.wait_with_output());
+        out
+    };
+    let out = match tokio::time::timeout(timeout, run).await {
         Ok(Ok(out)) => out,
         _ => return HookVerdict::Pass(None),
     };
@@ -299,6 +337,46 @@ mod tests {
         assert_eq!(matching(&rules, "run_bash").count(), 2);
         assert_eq!(matching(&rules, "edit_file").count(), 2);
         assert_eq!(matching(&rules, "read_file").count(), 1); // only "*"
+    }
+
+    #[test]
+    fn matcher_maps_claude_code_vocabulary_and_regex_all() {
+        let rules = vec![
+            HookRule {
+                matcher: "Write|Edit".into(),
+                hooks: vec![],
+            },
+            HookRule {
+                matcher: ".*".into(),
+                hooks: vec![],
+            },
+            HookRule {
+                matcher: "Bash".into(),
+                hooks: vec![],
+            },
+        ];
+        assert_eq!(matching(&rules, "write_file").count(), 2);
+        assert_eq!(matching(&rules, "edit_file").count(), 2);
+        assert_eq!(matching(&rules, "run_bash").count(), 2);
+        assert_eq!(matching(&rules, "read_file").count(), 1);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn large_payload_hook_ignoring_stdin_does_not_deadlock() {
+        // Hook fills its stdout pipe and never reads the oversized stdin: must fail
+        // open under the timeout, not hang.
+        let hooks = set(r#"{"hooks":{"PreToolUse":[{"matcher":"*","hooks":[
+                {"command":"yes X | head -c 200000; exit 0", "timeout": 5}]}]}}"#);
+        let cwd = tmp();
+        let big = "x".repeat(300_000);
+        let verdict = tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            hooks.pre_tool_use_deny("write_file", &json!({ "content": big }), &cwd),
+        )
+        .await
+        .expect("hook must not deadlock the turn");
+        assert!(verdict.is_none(), "exit 0 = allowed");
     }
 
     #[cfg(unix)]

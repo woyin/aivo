@@ -66,11 +66,28 @@ pub(crate) async fn run_one_shot_agent(
     limits: OneShotAgentLimits,
     auto_approve: bool,
     resume: Option<String>,
+    model_explicit: bool,
 ) -> anyhow::Result<ExitCode> {
     // Real launch dir (like the TUI's real_cwd), not chat's sandbox.
     let cwd = std::env::current_dir()
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_else(|_| ".".to_string());
+
+    // Resolve resume before building the engine: a resumed session's model wins
+    // over the key default (like the TUI's /resume) unless `--model` was explicit.
+    let resumed = match resume.as_deref() {
+        Some(sel) => Some(resolve_resume_session(session_store, sel, &cwd, &key.id).await?),
+        None => None,
+    };
+    let resumed_model = resumed
+        .as_ref()
+        .map(|s| s.model.clone())
+        .filter(|m| !m.is_empty());
+    let effective_model = match resumed_model {
+        Some(m) if !model_explicit => m,
+        _ => model.to_string(),
+    };
+    let model: &str = &effective_model;
 
     let context_window = match context_window_override {
         Some(w) => w,
@@ -99,10 +116,13 @@ pub(crate) async fn run_one_shot_agent(
         "AIVO_AGENT_MAX_OUTPUT_TOKENS",
         DEFAULT_MAX_OUTPUT_TOKENS,
     ));
-    // A spend budget needs known pricing — fail closed rather than run uncapped.
+    // A cost estimate needs both input and output prices; fail closed otherwise.
     if let Some(usd) = limits.max_cost.filter(|c| *c > 0.0) {
         let pricing = crate::services::model_metadata::model_pricing(model)
-            .ok_or_else(|| anyhow::anyhow!("--max-cost: no pricing known for model '{model}'"))?;
+            .filter(|p| p.input.is_some() && p.output.is_some())
+            .ok_or_else(|| {
+                anyhow::anyhow!("--max-cost: no input/output pricing known for model '{model}'")
+            })?;
         engine.set_cost_budget(usd, pricing);
     }
     // Unattended run: don't accept an answer that admits it isn't done — nudge to continue.
@@ -143,12 +163,8 @@ pub(crate) async fn run_one_shot_agent(
         crate::agent::hooks::HookSet::load_default(),
     ));
 
-    // Resume: best fidelity first (exact engine log, else display text). The session
-    // id is fixed up front so machine consumers see it from run_start on.
-    let resumed = match resume.as_deref() {
-        Some(sel) => Some(resolve_resume_session(session_store, sel, &cwd, &key.id).await?),
-        None => None,
-    };
+    // Resume: best fidelity first (exact engine log, else display text). The
+    // session was resolved up front (for model restore); replay it into the engine.
     if let Some(state) = &resumed {
         match &state.engine_messages {
             Some(msgs) if !msgs.is_empty() => engine.restore_conversation(msgs.clone()),
@@ -328,7 +344,8 @@ async fn resolve_resume_session(
     cwd: &str,
     key_id: &str,
 ) -> anyhow::Result<crate::services::session_store::CodeSessionState> {
-    let id = if selector == "last" {
+    // Bare `--resume` parses to "" — headless has no picker, so it means `last`.
+    let id = if selector.is_empty() || selector == "last" {
         session_store
             .list_chat_sessions(key_id, "", cwd)
             .await?

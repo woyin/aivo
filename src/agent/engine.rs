@@ -2356,11 +2356,17 @@ Re-run the full command without write confinement?",
         // back to the shared workspace with a note.
         let isolate = args.get("isolation").and_then(|v| v.as_str()) == Some("worktree")
             || profile.is_some_and(|p| p.isolation_worktree);
-        let mut worktree: Option<PathBuf> = None;
+        let mut guard: Option<subagents::WorktreeGuard> = None;
+        let mut sub_cwd: PathBuf = ctx.cwd.to_path_buf();
         let mut isolation_note: Option<String> = None;
         if isolate {
             match subagents::create_worktree(ctx.cwd) {
-                Ok(wt) => worktree = Some(wt),
+                Ok(wt) => {
+                    // Keep the delegate at the parent's subdir vantage point; guard
+                    // prunes the worktree if this future is dropped before finalize.
+                    sub_cwd = subagents::worktree_cwd(ctx.cwd, &wt);
+                    guard = Some(subagents::WorktreeGuard::new(ctx.cwd, &wt));
+                }
                 Err(why) => {
                     isolation_note = Some(format!(
                         "\n\n[worktree isolation] unavailable ({why}); ran in the shared workspace."
@@ -2368,7 +2374,6 @@ Re-run the full command without write confinement?",
                 }
             }
         }
-        let sub_cwd: PathBuf = worktree.clone().unwrap_or_else(|| ctx.cwd.to_path_buf());
 
         let mut sub = AgentEngine::new(
             &sub_cwd.display().to_string(),
@@ -2386,9 +2391,10 @@ Re-run the full command without write confinement?",
         }
         // Honor the parent's hosted-web-search opt-in/out in delegated work.
         sub.set_web_search_enabled(self.use_web_search_enabled);
-        // A guard hook covers delegated work too.
+        // Pre/PostToolUse guards cover delegated work; Stop hooks don't (they gate
+        // the user-facing answer, not each delegate).
         if let Some(hooks) = &self.hooks {
-            sub.set_hooks(hooks.clone());
+            sub.set_hooks(std::sync::Arc::new(hooks.without_stop()));
         }
         // Carry the parent's reasoning effort — but only if it's valid for the sub's model (may differ), else keep the sub's default.
         if let Some(effort) = &self.reasoning_effort
@@ -2441,8 +2447,8 @@ Re-run the full command without write confinement?",
         // Box the recursive future (run_turn → subagent → run_turn) so it isn't infinitely-sized.
         Box::pin(sub.run_turn(&sub_ctx, &mut ui, task.to_string())).await;
         let mut msg = ui.result_message();
-        if let Some(wt) = &worktree {
-            msg.push_str(&subagents::finalize_worktree(ctx.cwd, wt));
+        if let Some(g) = guard {
+            msg.push_str(&g.finalize());
         } else if let Some(note) = isolation_note {
             msg.push_str(&note);
         }
@@ -7259,6 +7265,7 @@ mod tests {
             tools: tools.map(|t| t.into_iter().map(str::to_string).collect()),
             body: format!("You are {name}. Follow the {name} playbook."),
             isolation_worktree: false,
+            repo_local: false,
             source: PathBuf::new(),
         }
     }

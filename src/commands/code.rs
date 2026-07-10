@@ -719,6 +719,7 @@ impl CodeCommand {
                     },
                     auto_approve,
                     resume,
+                    model_flag.is_some(),
                 )
                 .await;
             }

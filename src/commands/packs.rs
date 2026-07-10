@@ -45,7 +45,7 @@ hooks, and MCP servers installed as one unit (Claude Code plugin layout)."
         println!();
         println!("{}", style::bold("Subcommands:"));
         let row = |a: &str, b: &str| {
-            println!("  {}  {}", style::cyan(format!("{:<20}", a)), style::dim(b));
+            println!("  {}  {}", style::cyan(format!("{:<26}", a)), style::dim(b));
         };
         row("list", "Show installed packs and what each ships (default)");
         row(
@@ -117,18 +117,20 @@ or .mcp.json found"
     println!("Pack {} from {}:", style::cyan(&name), style::dim(source));
     print!("{}", describe(&contents));
     if !yes {
-        // The consent moment: hooks + stdio servers execute code once installed.
-        if !std::io::IsTerminal::is_terminal(&std::io::stdin()) {
+        // Consent is for code-executing components; a skills/agents-only pack
+        // installs unattended off a TTY (matches the `-y` contract).
+        if std::io::IsTerminal::is_terminal(&std::io::stdin()) {
+            eprint!("Install? [y/N] ");
+            let mut line = String::new();
+            std::io::stdin().read_line(&mut line)?;
+            if !matches!(line.trim(), "y" | "Y" | "yes") {
+                println!("Cancelled.");
+                return Ok(ExitCode::Success);
+            }
+        } else if contents.executes_code() {
             return Err(anyhow!(
-                "not a terminal — re-run with -y to accept the contents above"
+                "not a terminal — re-run with -y to accept the hooks/MCP servers above"
             ));
-        }
-        eprint!("Install? [y/N] ");
-        let mut line = String::new();
-        std::io::stdin().read_line(&mut line)?;
-        if !matches!(line.trim(), "y" | "Y" | "yes") {
-            println!("Cancelled.");
-            return Ok(ExitCode::Success);
         }
     }
     let dest = packs::install_tree(root, &name, staged).map_err(|e| anyhow!(e))?;

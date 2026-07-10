@@ -224,6 +224,43 @@ pub fn shell_label() -> &'static str {
 #[cfg(target_os = "macos")]
 const SANDBOX_EXEC: &str = "/usr/bin/sandbox-exec";
 
+/// Extra writable roots when `cwd` is a LINKED worktree: its `.git` is a file into
+/// the parent repo's `.git/worktrees/<name>`, and git writes land there + the shared
+/// object store, both outside `cwd` — so `git add`/`commit` inside an isolated
+/// worktree would hit EPERM. A normal repo's `.git` dir is under `cwd` → empty.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn git_metadata_roots(cwd: &Path) -> Vec<PathBuf> {
+    let mut dir = Some(cwd);
+    for _ in 0..64 {
+        let Some(d) = dir else { break };
+        let dotgit = d.join(".git");
+        let Ok(meta) = std::fs::symlink_metadata(&dotgit) else {
+            dir = d.parent();
+            continue;
+        };
+        if !meta.is_file() {
+            return Vec::new(); // real `.git` dir = repo boundary, nothing extra
+        }
+        // Grant the pointed-to worktree gitdir and its `.git` common dir.
+        let Some(gitdir) = std::fs::read_to_string(&dotgit).ok().and_then(|t| {
+            t.lines().find_map(|l| {
+                l.trim()
+                    .strip_prefix("gitdir:")
+                    .map(|p| PathBuf::from(p.trim()))
+            })
+        }) else {
+            return Vec::new();
+        };
+        let common = gitdir
+            .ancestors()
+            .find(|a| a.file_name().is_some_and(|n| n == ".git"))
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| gitdir.clone());
+        return vec![gitdir, common];
+    }
+    Vec::new()
+}
+
 /// A seatbelt (SBPL) profile: allow everything, then deny all file writes, then
 /// re-allow writes to the workspace, temp dirs, dev-tool caches, and package
 /// prefixes. Last matching rule wins, so the re-allow list carves holes in the
@@ -245,6 +282,13 @@ fn macos_profile(cwd: &Path) -> String {
     writable.push(cwd.to_string_lossy().into_owned());
     if let Ok(canon) = cwd.canonicalize() {
         writable.push(canon.to_string_lossy().into_owned());
+    }
+    // A linked worktree's git metadata lives under the parent repo (see helper).
+    for root in git_metadata_roots(cwd) {
+        writable.push(root.to_string_lossy().into_owned());
+        if let Ok(canon) = root.canonicalize() {
+            writable.push(canon.to_string_lossy().into_owned());
+        }
     }
     for root in extra_write_roots() {
         writable.push(root.to_string_lossy().into_owned());
@@ -313,6 +357,8 @@ fn linux_writable_paths(cwd: &Path) -> Vec<PathBuf> {
     if let Ok(canon) = cwd.canonicalize() {
         candidates.push(canon);
     }
+    // A linked worktree's git metadata lives under the parent repo (see helper).
+    candidates.extend(git_metadata_roots(cwd));
     if let Some(tmp) = std::env::var_os("TMPDIR") {
         candidates.push(PathBuf::from(tmp));
     }

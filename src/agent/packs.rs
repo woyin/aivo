@@ -87,17 +87,17 @@ fn load_pack(dir: &Path) -> Pack {
     }
 }
 
-/// The manifest's `name` (`.claude-plugin/plugin.json`), if any.
+/// The manifest's `name` field, if present and non-empty. `None` (not the dir
+/// name) when absent, so the caller falls back to the source-derived name rather
+/// than the temp staging dir.
 pub fn manifest_name(dir: &Path) -> Option<String> {
-    let pack = load_pack(dir);
-    (pack.name
-        != dir
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_default()
-        || dir.join(".claude-plugin/plugin.json").is_file())
-    .then_some(pack.name)
-    .filter(|n| !n.is_empty())
+    let text = std::fs::read_to_string(dir.join(".claude-plugin/plugin.json")).ok()?;
+    let manifest: serde_json::Value = serde_json::from_str(&text).ok()?;
+    manifest
+        .get("name")
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+        .filter(|n| !n.is_empty())
 }
 
 /// Existing `skills/` dirs across installed packs, for skill discovery.
@@ -186,6 +186,11 @@ pub fn install_tree(root: &Path, name: &str, src: &Path) -> Result<PathBuf, Stri
 }
 
 pub fn remove(root: &Path, name: &str) -> Result<(), String> {
+    // Validate before joining — a `../` name would escape the root into an
+    // arbitrary `remove_dir_all` (install validates the same way).
+    if !crate::agent::subagents::is_valid_name(name) {
+        return Err(format!("`{name}` isn't a valid pack name ([A-Za-z0-9_-])"));
+    }
     let dir = root.join(name);
     if !dir.is_dir() {
         let known: Vec<String> = installed_packs_at(root)
@@ -288,5 +293,34 @@ mod tests {
         assert_eq!(packs.len(), 1);
         assert_eq!(packs[0].name, "bare");
         assert!(packs[0].description.is_none());
+    }
+
+    #[test]
+    fn remove_rejects_path_traversal_name() {
+        let root = tmp().join("packs");
+        std::fs::create_dir_all(&root).unwrap();
+        let victim = root.parent().unwrap().join("victim");
+        std::fs::create_dir_all(&victim).unwrap();
+        assert!(remove(&root, "../victim").is_err());
+        assert!(
+            victim.is_dir(),
+            "traversal name must not delete outside the packs root"
+        );
+    }
+
+    #[test]
+    fn manifest_name_needs_an_actual_name_field() {
+        let dir = tmp();
+        // Manifest present but no `name` → None.
+        write(
+            dir.join(".claude-plugin/plugin.json"),
+            r#"{"version":"1.0.0"}"#,
+        );
+        assert_eq!(manifest_name(&dir), None);
+        write(
+            dir.join(".claude-plugin/plugin.json"),
+            r#"{"name":"toolkit"}"#,
+        );
+        assert_eq!(manifest_name(&dir).as_deref(), Some("toolkit"));
     }
 }

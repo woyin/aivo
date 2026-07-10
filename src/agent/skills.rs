@@ -124,6 +124,8 @@ pub fn skill_scope(dir: &Path, cwd: &Path) -> SkillScope {
         // Claude Code's library is discovered and usable, but belongs to Claude
         // Code, not aivo — never deletable via the `/skills` overlay.
         protected.push(home.join(".claude").join("skills"));
+        // Pack skills are managed as a unit via `aivo code packs`, not /skills.
+        protected.push(home.join(".config").join("aivo").join("packs"));
     }
     if protected.iter().any(|root| dir.starts_with(root)) {
         SkillScope::Project
@@ -1518,6 +1520,10 @@ mod tests {
         if let Some(home) = crate::services::system_env::home_dir() {
             assert_eq!(
                 skill_scope(&home.join(".claude/skills/repo-study"), cwd),
+                SkillScope::Project
+            );
+            assert_eq!(
+                skill_scope(&home.join(".config/aivo/packs/toolkit/skills/review"), cwd),
                 SkillScope::Project
             );
         }
