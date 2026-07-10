@@ -270,7 +270,8 @@ impl CodeTuiApp {
         }
         let (kind, entries) = if let Some(query) = self.active_command_query() {
             (MenuKind::Commands, self.matching_command_entries(query))
-        } else if let Some(query) = self.active_attach_query() {
+        } else {
+            let query = self.active_attach_query()?;
             (
                 MenuKind::AttachPath,
                 // Suggest from the real launch dir (where relative paths actually
@@ -280,8 +281,6 @@ impl CodeTuiApp {
                     .map(ComposerMenuEntry::Path)
                     .collect::<Vec<_>>(),
             )
-        } else {
-            return None;
         };
         let selected = if entries.is_empty() {
             None

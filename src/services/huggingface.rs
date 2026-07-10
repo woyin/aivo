@@ -537,7 +537,7 @@ async fn install_from_release(target: &ReleaseTarget, dest_dir: &Path) -> Result
 
     let tmp_dir = std::env::temp_dir();
     let _ = std::fs::create_dir_all(&tmp_dir);
-    let archive_path = tmp_dir.join(format!("aivo-{}-{}", std::process::id(), &asset_name));
+    let archive_path = tmp_dir.join(format!("aivo-{}-{}", std::process::id(), asset_name));
 
     let download_result = download_release_archive(&asset_url, &archive_path, asset_size).await;
     if let Err(e) = download_result {

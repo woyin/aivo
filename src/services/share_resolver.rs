@@ -133,7 +133,7 @@ pub async fn resolve_session(session_id: &str, ctx: &ResolverContext) -> Result<
     if logs_hits.len() > 1 {
         let summary = logs_hits
             .iter()
-            .map(|e| format!("{} [{}]", &e.id, e.source))
+            .map(|e| format!("{} [{}]", e.id, e.source))
             .collect::<Vec<_>>()
             .join(", ");
         return Err(anyhow!(

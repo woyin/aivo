@@ -963,7 +963,7 @@ async fn pick_ambiguous_log_hit(
     if !interactive {
         let summary = hits
             .iter()
-            .map(|e| format!("{} [{}]", &e.id, e.source))
+            .map(|e| format!("{} [{}]", e.id, e.source))
             .collect::<Vec<_>>()
             .join(", ");
         anyhow::bail!(

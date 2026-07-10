@@ -344,7 +344,7 @@ impl StatsCommand {
         } else {
             &[]
         };
-        let window = cutoff.and_then(|c| args.since.as_deref().map(|raw| (raw, c)));
+        let window = args.since.as_deref().zip(cutoff);
 
         if args.json {
             return print_json(&build_overview_json(
@@ -541,7 +541,7 @@ impl StatsCommand {
             }
         }
 
-        let window = cutoff.and_then(|c| args.since.as_deref().map(|raw| (raw, c)));
+        let window = args.since.as_deref().zip(cutoff);
 
         if args.json {
             return print_json(&build_tool_view_json(
@@ -608,7 +608,7 @@ impl StatsCommand {
                 models,
             };
             if args.json {
-                let window = cutoff.and_then(|c| args.since.as_deref().map(|raw| (raw, c)));
+                let window = args.since.as_deref().zip(cutoff);
                 return print_json(&build_tool_view_json(
                     tool,
                     &view,
@@ -969,7 +969,7 @@ fn render_plugin_report(
         models,
     };
     let source = report.source.as_deref().unwrap_or("plugin");
-    let window = cutoff.and_then(|c| args.since.as_deref().map(|raw| (raw, c)));
+    let window = args.since.as_deref().zip(cutoff);
     if args.json {
         return print_json(&build_tool_view_json(
             tool,
