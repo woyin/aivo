@@ -117,11 +117,21 @@ pub(super) fn build_footer_text(
         .filter(|b| !b.is_empty())
         .map(|b| format!(" ({b})"))
         .unwrap_or_default();
+    // Local HF model: key name `hf:owner/repo` already ends in the model, so drop
+    // the duplicate and lead with the ref.
+    let is_redundant_hf = host
+        .strip_prefix("hf:")
+        .is_some_and(|repo| repo.rsplit('/').next() == Some(model));
+    let lead = if is_redundant_hf {
+        host.clone()
+    } else {
+        format!("{model} · {host}")
+    };
     let candidates = [
-        format!("{model} · {host} · {cwd_full}{branch_suffix}"),
-        format!("{model} · {host} · {cwd_base}{branch_suffix}"),
-        format!("{model} · {host} · {cwd_base}"),
-        format!("{model} · {host}"),
+        format!("{lead} · {cwd_full}{branch_suffix}"),
+        format!("{lead} · {cwd_base}{branch_suffix}"),
+        format!("{lead} · {cwd_base}"),
+        lead.clone(),
         model.to_string(),
     ];
 
@@ -409,6 +419,47 @@ mod tests {
                 6
             ),
             "gpt-4o"
+        );
+    }
+
+    #[test]
+    fn test_build_footer_text_collapses_redundant_hf_ref() {
+        // A local HF model's key name (`hf:owner/repo`) has the model as its
+        // basename — the footer collapses the duplicated model into the ref.
+        assert_eq!(
+            build_footer_text(
+                "Qwen2.5-0.5B-Instruct-GGUF",
+                "http://127.0.0.1:8080/v1",
+                "hf:Qwen/Qwen2.5-0.5B-Instruct-GGUF",
+                "/tmp/project",
+                Some("main"),
+                80,
+            ),
+            "hf:Qwen/Qwen2.5-0.5B-Instruct-GGUF · /tmp/project (main)"
+        );
+        // Tiniest width degrades to the bare model name, not the long ref.
+        assert_eq!(
+            build_footer_text(
+                "Qwen2.5-0.5B-Instruct-GGUF",
+                "http://127.0.0.1:8080/v1",
+                "hf:Qwen/Qwen2.5-0.5B-Instruct-GGUF",
+                "/tmp/project",
+                Some("main"),
+                26,
+            ),
+            "Qwen2.5-0.5B-Instruct-GGUF"
+        );
+        // A non-matching basename is not treated as redundant (both kept).
+        assert_eq!(
+            build_footer_text(
+                "some-model",
+                "http://127.0.0.1:8080/v1",
+                "hf:Qwen/Qwen2.5-0.5B-Instruct-GGUF",
+                "/tmp/project",
+                None,
+                80,
+            ),
+            "some-model · hf:Qwen/Qwen2.5-0.5B-Instruct-GGUF · /tmp/project"
         );
     }
 
