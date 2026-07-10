@@ -548,7 +548,12 @@ is preserved."
                 ));
             }
         }
-        engine.seed_history(super::runtime_impl::agent_seed_turns(&self.history));
+        // A resumed transcript (pending until the first send) beats the lossy display seed.
+        if let Some(conversation) = self.pending_agent_messages.clone() {
+            engine.restore_conversation(conversation);
+        } else {
+            engine.seed_history(super::runtime_impl::agent_seed_turns(&self.history));
+        }
         engine.context_report()
     }
 

@@ -12969,6 +12969,54 @@ async fn test_resume_resets_agent_engine() {
     );
 }
 
+/// The idle footer after `/resume` must estimate from the stashed durable
+/// transcript, not the lossy display seed (~10x too small on tool-heavy sessions).
+#[tokio::test]
+async fn test_resume_footer_estimate_uses_durable_transcript() {
+    let temp_dir = TempDir::new().unwrap();
+    let store = SessionStore::with_path(temp_dir.path().join("config.json"));
+    let key_id = store
+        .add_key_with_protocol("prod", "https://api.example.com", None, "sk-test")
+        .await
+        .unwrap();
+    let key = store.get_key_by_id(&key_id).await.unwrap().unwrap();
+
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.session_store = store;
+    app.key = key.clone();
+    app.model = "claude".to_string();
+
+    let fat = "x".repeat(200_000);
+    let session = LoadedSession {
+        key_id: key.id.clone(),
+        session_id: "resumed".to_string(),
+        raw_model: "claude".to_string(),
+        messages: vec![ChatMessage {
+            model: None,
+            role: "user".to_string(),
+            content: "earlier turn".to_string(),
+            reasoning_content: None,
+            attachments: vec![],
+        }],
+        engine_messages: Some(vec![
+            serde_json::json!({"role": "user", "content": "earlier turn"}),
+            serde_json::json!({"role": "tool", "tool_call_id": "t1", "content": fat}),
+        ]),
+    };
+    app.apply_loaded_session(session).await.unwrap();
+
+    assert!(
+        app.context_is_estimate,
+        "post-resume fill is an estimate until measured"
+    );
+    assert!(
+        app.context_tokens >= 50_000,
+        "estimate must reflect the ~50k-token transcript, got {}",
+        app.context_tokens
+    );
+}
+
 #[tokio::test]
 async fn test_resume_does_not_overwrite_persisted_default_model() {
     let temp_dir = TempDir::new().unwrap();
