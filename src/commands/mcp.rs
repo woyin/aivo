@@ -115,6 +115,7 @@ async fn list_action() -> Result<ExitCode> {
         let scope = match s.scope {
             mcp::ServerScope::User => "user   ",
             mcp::ServerScope::Project => "project",
+            mcp::ServerScope::Pack => "pack   ",
         };
         // Prefix match on the advertised (sanitized) form; display-only.
         let prefix = mcp::qualified_name(&s.name, "");
@@ -199,6 +200,12 @@ async fn cat_action(args: McpNameArgs) -> Result<ExitCode> {
                 .to_string(),
         ),
         mcp::ServerScope::Project => ("project", cwd.join(".mcp.json").display().to_string()),
+        mcp::ServerScope::Pack => (
+            "pack",
+            pack_mcp_path(&name)
+                .map(|p| p.display().to_string())
+                .unwrap_or_default(),
+        ),
     };
     println!("Name:       {}", style::cyan(&name));
     println!(
@@ -238,6 +245,7 @@ fn raw_server_config(
     let path = match scope {
         mcp::ServerScope::User => mcp::user_config_path()?,
         mcp::ServerScope::Project => cwd.join(".mcp.json"),
+        mcp::ServerScope::Pack => pack_mcp_path(name)?,
     };
     let text = std::fs::read_to_string(path).ok()?;
     serde_json::from_str::<serde_json::Value>(&text)
@@ -245,6 +253,20 @@ fn raw_server_config(
         .get("mcpServers")?
         .get(name)
         .cloned()
+}
+
+/// The `.mcp.json` of the installed pack that defines server `name`.
+fn pack_mcp_path(name: &str) -> Option<std::path::PathBuf> {
+    crate::agent::packs::mcp_dirs()
+        .into_iter()
+        .map(|d| d.join(".mcp.json"))
+        .find(|p| {
+            std::fs::read_to_string(p)
+                .ok()
+                .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
+                .and_then(|v| v.get("mcpServers")?.get(name).cloned())
+                .is_some()
+        })
 }
 
 /// Split a leading or trailing `-p`/`--project` off the add spec. Only the

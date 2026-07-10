@@ -233,6 +233,22 @@ aivo code mcp import [tool] [name]  # copy servers from claude/cursor/gemini/cop
 
 Per-tool toggles within a connected server live in the TUI (`/mcp`, `Ctrl+T`).
 
+### Extension packs — `aivo code packs`
+
+One installable unit bundling skills, sub-agent profiles, hooks, and MCP servers — the
+Claude Code plugin layout (`.claude-plugin/plugin.json` + `skills/` + `agents/` +
+`hooks/hooks.json` + `.mcp.json`), so existing Claude Code plugins install unchanged.
+Installed under `~/.config/aivo/packs/<name>`; components join normal discovery at the
+lowest precedence (project and user files shadow them). Installing is the consent
+moment: `add` lists everything the pack ships — hooks and stdio MCP servers execute
+code — and asks before copying (`-y` skips; required off a TTY).
+
+```bash
+aivo code packs                     # list installed packs and what each ships
+aivo code packs add github:o/pack   # or a github.com (tree) URL, or a local path
+aivo code packs rm <name>           # remove the pack and everything it shipped
+```
+
 ### Hooks — `~/.config/aivo/hooks.json`
 
 User-authored shell commands the agent runs at lifecycle points (config shape mirrors Claude

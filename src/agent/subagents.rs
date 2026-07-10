@@ -51,13 +51,21 @@ impl Subagent {
     }
 }
 
-/// Project dirs first (a repo can ship/shadow profiles), then user-global.
+/// Project dirs first (a repo can ship/shadow profiles), then user-global, then
+/// installed packs (lowest precedence).
 pub fn discover_subagents(cwd: &Path, config_dir: &Path) -> Vec<Subagent> {
-    discover_from_roots(&[
+    let mut roots = vec![
         cwd.join(".aivo").join("agents"),
         cwd.join(".claude").join("agents"),
         config_dir.join("agents"),
-    ])
+    ];
+    roots.extend(crate::agent::packs::agents_roots());
+    discover_from_roots(&roots)
+}
+
+/// Valid profile names under one dir (for pack scanning/consent display).
+pub fn profile_names(root: &Path) -> Vec<String> {
+    read_root(root).into_iter().map(|s| s.name).collect()
 }
 
 /// Collect sub-agents from `roots` in order, first name winning on collision.

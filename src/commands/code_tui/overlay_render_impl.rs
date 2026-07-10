@@ -1584,6 +1584,7 @@ impl CodeTuiApp {
         let scope = match row.scope {
             ServerScope::User => "user",
             ServerScope::Project => "project · .mcp.json",
+            ServerScope::Pack => "pack (managed by `aivo code packs`)",
         };
         let mut lines = vec![Line::from(vec![
             Span::styled(

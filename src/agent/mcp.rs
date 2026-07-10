@@ -159,11 +159,13 @@ struct McpServer {
 
 /// Which config file a server is defined in. The `/mcp` overlay only adds/removes
 /// `User` servers (the aivo-global `~/.config/aivo/mcp.json`); a `Project` server
-/// from a repo's `.mcp.json` is shown and toggleable but edited via that file.
+/// from a repo's `.mcp.json` is shown and toggleable but edited via that file, and
+/// a `Pack` server is managed by removing/reinstalling its pack.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ServerScope {
     User,
     Project,
+    Pack,
 }
 
 /// A configured MCP server as it appears in the `/mcp` overlay before (or
@@ -245,6 +247,12 @@ fn configured_servers_from(user_path: Option<&Path>, cwd: &Path) -> Vec<Configur
             );
         }
     };
+    // Same precedence as `load_configs`: packs < user < project.
+    if user_path.is_some() {
+        for dir in crate::agent::packs::mcp_dirs() {
+            insert(read_file_servers(&dir.join(".mcp.json")), ServerScope::Pack);
+        }
+    }
     if let Some(path) = user_path {
         insert(read_file_servers(path), ServerScope::User);
     }
@@ -1029,6 +1037,13 @@ fn load_configs(
     let mut configs = HashMap::new();
     let mut errors = Vec::new();
     let mut files: Vec<(PathBuf, String)> = Vec::new();
+    // Packs first = lowest precedence; gated on user_path so `None` (tests) stays isolated.
+    if user_path.is_some() {
+        for dir in crate::agent::packs::mcp_dirs() {
+            let label = format!("pack {}", dir.file_name().unwrap_or_default().display());
+            files.push((dir.join(".mcp.json"), label));
+        }
+    }
     if let Some(path) = user_path {
         files.push((path.to_path_buf(), "~/.config/aivo/mcp.json".to_string()));
     }

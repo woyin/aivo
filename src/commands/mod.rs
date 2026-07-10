@@ -96,6 +96,7 @@ pub mod login;
 pub mod logs;
 pub mod mcp;
 pub mod models;
+pub mod packs;
 pub mod plugins;
 pub mod run;
 pub mod serve;

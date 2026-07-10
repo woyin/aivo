@@ -53,6 +53,8 @@ pub fn discover_skills(cwd: &Path) -> Vec<Skill> {
         roots.push(home.join(".config").join("aivo").join("skills"));
         roots.push(home.join(".claude").join("skills"));
     }
+    // Installed packs' skills come last (project and user shadow them).
+    roots.extend(crate::agent::packs::skills_roots());
     discover_from_roots(&roots)
 }
 
@@ -552,12 +554,12 @@ pub async fn install_or_stage_into(
 
 /// A resolved source tree on disk: `root` is where to scan; `cleanup` is a temp
 /// dir to delete afterward (None for a local path the user owns).
-struct SourceTree {
-    root: PathBuf,
-    cleanup: Option<PathBuf>,
+pub(crate) struct SourceTree {
+    pub(crate) root: PathBuf,
+    pub(crate) cleanup: Option<PathBuf>,
 }
 
-async fn fetch_source_tree(
+pub(crate) async fn fetch_source_tree(
     source: &str,
     progress: Option<&std::sync::atomic::AtomicU64>,
 ) -> Result<SourceTree, String> {
@@ -825,7 +827,7 @@ fn skill_folder_name(name: &str) -> String {
 
 /// Recursive copy of a skill folder, skipping VCS / build junk so a skill that
 /// lives at a repo root doesn't drag `.git`/`node_modules` along.
-fn copy_dir_all(src: &Path, dst: &Path) -> std::io::Result<()> {
+pub(crate) fn copy_dir_all(src: &Path, dst: &Path) -> std::io::Result<()> {
     // Never follow a symlinked source dir — `read_dir` would walk the link
     // target. Nested links are skipped per-entry below; this guards the top level.
     if std::fs::symlink_metadata(src)?.file_type().is_symlink() {

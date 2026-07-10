@@ -239,6 +239,7 @@ pub async fn run() -> ! {
             Commands::Plugins(_) => PluginsCommand::print_help(),
             Commands::Mcp(_) => crate::commands::mcp::McpCommand::print_help(),
             Commands::Skills(_) => crate::commands::skills::SkillsCommand::print_help(),
+            Commands::Packs(_) => crate::commands::packs::PacksCommand::print_help(),
             Commands::Share(_) => ShareCommand::print_help(),
             Commands::Guide => commands::guide::print_guide(),
         }
@@ -328,7 +329,7 @@ pub async fn run() -> ! {
                     eprintln!(
                         "  {}",
                         style::dim(
-                            "Expected a subcommand (mcp, skills), a model ref (`hf:<owner>/<repo>` or `https://huggingface.co/...`), or text to open the TUI with."
+                            "Expected a subcommand (mcp, skills, packs), a model ref (`hf:<owner>/<repo>` or `https://huggingface.co/...`), or text to open the TUI with."
                         ),
                     );
                     eprintln!(
@@ -901,6 +902,11 @@ pub async fn run() -> ! {
         Commands::Skills(skills_args) => {
             let command = crate::commands::skills::SkillsCommand::new();
             command.execute(skills_args).await
+        }
+
+        Commands::Packs(packs_args) => {
+            let command = crate::commands::packs::PacksCommand::new();
+            command.execute(packs_args).await
         }
 
         Commands::Share(share_args) => {

@@ -47,7 +47,7 @@ pub(crate) fn rewrite_cli_args(
 
     // `aivo code <mcp|skills> …` → the hidden clap command named "code mcp"/"code skills".
     if raw_args[1] == "code"
-        && let Some(sub @ ("mcp" | "skills")) = raw_args.get(2).map(String::as_str)
+        && let Some(sub @ ("mcp" | "skills" | "packs")) = raw_args.get(2).map(String::as_str)
     {
         let mut rewritten = vec![raw_args[0].clone(), format!("code {sub}")];
         rewritten.extend_from_slice(&raw_args[3..]);

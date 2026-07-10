@@ -990,6 +990,11 @@ impl CodeCommand {
         );
         println!(
             "  {}{}",
+            style::cyan(format!("{:<26}", "packs")),
+            style::dim("Manage extension packs (aivo code packs --help)")
+        );
+        println!(
+            "  {}{}",
             style::cyan(format!("{:<26}", "skills")),
             style::dim("Manage agent skills (aivo code skills --help)")
         );
