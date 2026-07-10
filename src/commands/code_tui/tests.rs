@@ -2437,7 +2437,7 @@ fn test_footer_status_label_shows_window_on_pristine_session() {
     app.context_window = 1_000_000;
     app.context_tokens = 0; // no turn yet → no fill to gauge
 
-    // The welcome screen shows the window size, not an empty `0 / 1M · 0%` meter.
+    // The welcome screen shows the window size, not an empty `0 / 1M` meter.
     let (label, color) = app.footer_status_label();
     assert_eq!(label, "1M context");
     assert_eq!(color, MUTED);
@@ -2445,7 +2445,7 @@ fn test_footer_status_label_shows_window_on_pristine_session() {
     // The first tokens flip it to the live gauge.
     app.context_tokens = 50_000;
     app.context_is_estimate = false;
-    assert_eq!(app.footer_status_label().0, "50k / 1M · 5%");
+    assert_eq!(app.footer_status_label().0, "50k / 1M");
 }
 
 #[test]
@@ -2456,9 +2456,9 @@ fn test_footer_status_label_shows_context_utilization() {
     app.context_tokens = 10_000;
     app.context_is_estimate = false; // a provider-measured fill
 
-    // used / window · pct%, quiet until it nears the limit.
+    // used / window, quiet until it nears the limit.
     let (label, color) = app.footer_status_label();
-    assert_eq!(label, "10k / 200k · 5%");
+    assert_eq!(label, "10k / 200k");
     assert_eq!(color, MUTED);
 
     // Warms toward the window limit (compaction territory).
@@ -2473,7 +2473,7 @@ fn test_footer_status_label_shows_context_utilization() {
         completion_tokens: 0,
         ..Default::default()
     });
-    assert_eq!(app.footer_status_label().0, "40k / 200k · 20%");
+    assert_eq!(app.footer_status_label().0, "40k / 200k");
 }
 
 #[test]
@@ -2487,7 +2487,7 @@ fn test_footer_status_label_marks_estimates() {
     // understates the model's real context, so flag it with `~`.
     app.context_is_estimate = true;
     app.last_usage = None;
-    assert_eq!(app.footer_status_label().0, "~10k / 200k · ~5%");
+    assert_eq!(app.footer_status_label().0, "~10k / 200k");
 
     // A provider-measured last-turn total is exact even if the estimate flag
     // lingers from a prior turn — no tilde.
@@ -2496,7 +2496,7 @@ fn test_footer_status_label_marks_estimates() {
         completion_tokens: 0,
         ..Default::default()
     });
-    assert_eq!(app.footer_status_label().0, "40k / 200k · 20%");
+    assert_eq!(app.footer_status_label().0, "40k / 200k");
 }
 
 #[test]
@@ -2539,7 +2539,7 @@ fn test_footer_status_label_updates_live_during_turn() {
     // baseline (no drop at turn start) and grows it as text streams in, flagged `~`.
     app.sending = true;
     app.pending_response = "x".repeat(4_000); // ~1k tokens streamed so far
-    assert_eq!(app.footer_status_label().0, "~41k / 200k · ~20%");
+    assert_eq!(app.footer_status_label().0, "~41k / 200k");
 
     // Provider-measured usage arrives mid-stream (Anthropic message_start/_delta):
     // the live figure replaces the estimate immediately, no `~`.
@@ -2548,7 +2548,7 @@ fn test_footer_status_label_updates_live_during_turn() {
         completion_tokens: 2_000,
         ..Default::default()
     });
-    assert_eq!(app.footer_status_label().0, "52k / 200k · 26%");
+    assert_eq!(app.footer_status_label().0, "52k / 200k");
 
     // Turn ends: the fold into last_usage keeps the measured total on the footer.
     app.sending = false;
@@ -2558,7 +2558,7 @@ fn test_footer_status_label_updates_live_during_turn() {
         completion_tokens: 2_500,
         ..Default::default()
     });
-    assert_eq!(app.footer_status_label().0, "52.5k / 200k · 26%");
+    assert_eq!(app.footer_status_label().0, "52.5k / 200k");
 }
 
 #[test]
@@ -2572,13 +2572,13 @@ fn test_agent_context_drives_footer_live() {
     // counts the real request the engine sends, not just the visible transcript.
     // Flagged `~` since it is a chars/4 estimate.
     app.apply_agent_context(50_000, false);
-    assert_eq!(app.footer_status_label().0, "~50k / 200k · ~25%");
+    assert_eq!(app.footer_status_label().0, "~50k / 200k");
 
     // The step's measured total arrives → exact figure, no `~`, and streamed text
     // is not re-added on top (it is already in the measured completion).
     app.pending_response = "x".repeat(8_000); // would add ~2k if double-counted
     app.apply_agent_context(60_000, true);
-    assert_eq!(app.footer_status_label().0, "60k / 200k · 30%");
+    assert_eq!(app.footer_status_label().0, "60k / 200k");
 }
 
 #[test]

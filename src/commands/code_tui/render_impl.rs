@@ -2676,28 +2676,22 @@ impl CodeTuiApp {
             };
             return (format_token_count(used, usage), MUTED);
         }
-        // Fresh session: show the window size, not an empty `0 / 1M · 0%` meter.
+        // Fresh session: show the window size, not an empty `0 / 1M` meter.
         if used == 0 {
             return (
                 format!("{} context", format_token_count_value(self.context_window)),
                 MUTED,
             );
         }
+        // Percent isn't shown (the used/window pair already implies it) but still
+        // drives the meter color.
         let pct = (used.saturating_mul(100) / self.context_window).min(100);
         // Mark estimate-only figures (cursor ACP / agents without reported usage):
         // aivo's tracked transcript is a fraction of the model's real context, so
         // the number understates the true fill — `~` flags it as approximate.
         let approx = if is_estimate && used > 0 { "~" } else { "" };
-        // A non-zero fill that rounds down to 0% reads as `<1%` rather than a flat
-        // `0%` (common for cursor, whose real context we can't measure and only
-        // estimate from the transcript).
-        let pct_label = if pct == 0 && used > 0 {
-            "<1%".to_string()
-        } else {
-            format!("{approx}{pct}%")
-        };
         let label = format!(
-            "{approx}{} / {} · {pct_label}{}",
+            "{approx}{} / {}{}",
             format_token_count_value(used),
             format_token_count_value(self.context_window),
             self.session_cost_label(),
