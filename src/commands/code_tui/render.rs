@@ -414,14 +414,14 @@ pub(super) fn push_block(
     lines.extend(block);
 }
 
-/// The two-row half-block "aivo code" wordmark, 31 columns wide.
+/// The two-row half-block "aivo code" wordmark, 30 columns wide.
 pub(super) const BRAND_WORDMARK: [&str; 2] = [
-    "▄▀█ █ █░█ █▀█   █▀▀ █▀█ █▀▄ █▀█",
-    "█▀█ █ ▀▄▀ █▄█   █▄▄ █▄█ █▄▀ █▄▄",
+    "▄▀█ █ █░█ █▀█  █▀▀ █▀█ █▀▄ █▀█",
+    "█▀█ █ ▀▄▀ █▄█  █▄▄ █▄█ █▄▀ █▄▄",
 ];
 /// Narrow "aivo" fallback for columns too slim for the full mark.
 pub(super) const BRAND_WORDMARK_NARROW: [&str; 2] = ["▄▀█ █ █░█ █▀█", "█▀█ █ ▀▄▀ █▄█"];
-pub(super) const BRAND_WORDMARK_WIDTH: u16 = 31;
+pub(super) const BRAND_WORDMARK_WIDTH: u16 = 30;
 pub(super) const BRAND_WORDMARK_NARROW_WIDTH: u16 = 13;
 
 fn brand_wordmark_for(width: u16) -> (&'static [&'static str; 2], u16) {

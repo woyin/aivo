@@ -3341,8 +3341,8 @@ fn test_transcript_intro_is_brand_only() {
     assert_eq!(
         app.transcript_intro_lines(80),
         vec![
-            "▄▀█ █ █░█ █▀█   █▀▀ █▀█ █▀▄ █▀█".to_string(),
-            format!("█▀█ █ ▀▄▀ █▄█   █▄▄ █▄█ █▄▀ █▄▄{version}"),
+            "▄▀█ █ █░█ █▀█  █▀▀ █▀█ █▀▄ █▀█".to_string(),
+            format!("█▀█ █ ▀▄▀ █▄█  █▄▄ █▄█ █▄▀ █▄▄{version}"),
         ]
     );
 }
@@ -3359,8 +3359,8 @@ fn test_transcript_intro_narrow_falls_back_to_aivo() {
     );
     // Exactly the mark width keeps the full mark (version needs more room).
     assert_eq!(
-        app.transcript_intro_lines(31)[0],
-        "▄▀█ █ █░█ █▀█   █▀▀ █▀█ █▀▄ █▀█"
+        app.transcript_intro_lines(30)[0],
+        "▄▀█ █ █░█ █▀█  █▀▀ █▀█ █▀▄ █▀█"
     );
     let version = format!("v{}", crate::version::VERSION);
     assert!(
