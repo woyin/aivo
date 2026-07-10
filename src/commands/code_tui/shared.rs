@@ -54,7 +54,7 @@ pub(super) const EMPTY_STATE_BOTTOM_GAP: u16 = 0;
 /// Rotating welcome-banner hints. Keep each terse; name a real affordance.
 pub(super) const WELCOME_TIPS: &[&str] = &[
     "start a line with ! to run a shell command",
-    "Shift+Tab cycles mode: default → auto → plan → review",
+    "Shift+Tab cycles mode: normal → auto → plan → review",
     "/rewind undoes the agent's file edits",
     "/goal <task> keeps working on its own until it's done",
     "Ctrl+R reopens a past session",

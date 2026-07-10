@@ -611,23 +611,21 @@ impl CodeTuiApp {
         if self.plan_mode {
             self.leave_plan_mode(false).await;
             self.set_review_quiet(true);
-            self.show_toast("Review mode — every edit shows a diff to approve");
+            self.show_toast("Review mode — approve each edit");
         } else if self.agent_review_edits {
             self.set_review_quiet(false);
-            self.show_toast("Normal mode — risky and remote-mutating actions ask first");
+            self.show_toast("Normal mode — risky actions ask first");
         } else if self.agent_auto_approve {
             self.set_auto_quiet(false);
             if !self.sending && self.enter_plan_mode().await {
-                self.show_toast("Plan mode — read-only until you approve a plan");
+                self.show_toast("Plan mode — read-only until you approve");
             } else {
                 self.set_review_quiet(true);
-                self.show_toast("Review mode — every edit shows a diff to approve");
+                self.show_toast("Review mode — approve each edit");
             }
         } else {
             self.set_auto_quiet(true);
-            self.show_toast(
-                "Auto-approve mode — everything runs without asking (catastrophic still confirms)",
-            );
+            self.show_toast("Auto-approve mode — tools run without asking");
         }
     }
 
@@ -652,9 +650,9 @@ impl CodeTuiApp {
     pub(super) fn set_auto_approve(&mut self, on: bool) {
         self.set_auto_quiet(on);
         self.show_toast(if on {
-            "Auto-approve mode — everything runs without asking (catastrophic still confirms)"
+            "Auto-approve mode — tools run without asking"
         } else {
-            "Normal mode — risky and remote-mutating actions ask first"
+            "Normal mode — risky actions ask first"
         });
     }
 
@@ -662,7 +660,7 @@ impl CodeTuiApp {
     pub(super) fn set_review_edits(&mut self, on: bool) {
         self.set_review_quiet(on);
         self.show_toast(if on {
-            "Review mode — the agent shows edits for approval before writing"
+            "Review mode — approve each edit"
         } else {
             "Review edits off — in-cwd edits apply without a review card"
         });
