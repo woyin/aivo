@@ -502,12 +502,16 @@ impl CodeTuiApp {
             ));
         }
         segs.push((format!("Tools · {}", report.tool_count), report.tools, TOOL));
-        if report.mcp_tool_count > 0 {
-            segs.push((
-                format!("MCP tools · {}", report.mcp_tool_count),
-                report.mcp_tools,
-                USER,
-            ));
+        if report.mcp_tool_count > 0 || report.mcp_deferred_count > 0 {
+            let label = if report.mcp_deferred_count > 0 {
+                format!(
+                    "MCP tools · {} (+{} deferred)",
+                    report.mcp_tool_count, report.mcp_deferred_count
+                )
+            } else {
+                format!("MCP tools · {}", report.mcp_tool_count)
+            };
+            segs.push((label, report.mcp_tools, USER));
         }
         segs.push((
             format!("Messages · {}", report.message_count),

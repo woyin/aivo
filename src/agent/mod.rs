@@ -34,5 +34,6 @@ pub mod subagents;
 pub mod system_prompt;
 pub mod tokens;
 pub mod tool_repair;
+pub mod tool_search;
 pub mod tools;
 pub mod verify;

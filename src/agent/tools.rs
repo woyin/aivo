@@ -303,6 +303,8 @@ pub fn is_read_only(name: &str) -> bool {
             | "ask_user"
             // Job control on a process the agent itself started; never touches files.
             | "check_job"
+            // Loads deferred MCP schemas — engine state only, never the workspace.
+            | "search_tools"
     )
 }
 
@@ -1480,6 +1482,95 @@ pub(crate) fn resolve(cwd: &Path, p: &str) -> PathBuf {
     }
 }
 
+/// Effective `read_file` range (offset/limit aliases + defaults) — shared with
+/// `read_dedupe_key` so the dedupe identity can't drift from the read.
+pub(crate) fn read_file_range(args: &Value) -> (u64, u64) {
+    let offset = arg_u64(args, "offset")
+        .or_else(|| arg_u64(args, "start_line"))
+        .unwrap_or(1)
+        .max(1);
+    let limit = arg_u64(args, "limit")
+        .or_else(|| arg_u64(args, "end_line").map(|end| end.saturating_sub(offset - 1)))
+        .unwrap_or(DEFAULT_READ_LIMIT as u64);
+    (offset, limit)
+}
+
+/// Effective `grep` context lines (clamped). Shared with `read_dedupe_key`.
+fn grep_context(args: &Value) -> u64 {
+    arg_u64(args, "context").unwrap_or(0).min(100)
+}
+
+/// Effective `web_fetch` char cap (default + ceiling). Shared with `read_dedupe_key`.
+fn web_fetch_max_chars(args: &Value) -> usize {
+    arg_u64(args, "max_chars")
+        .map(|n| n as usize)
+        .unwrap_or(MAX_OUTPUT)
+        .min(WEB_FETCH_CHAR_CEIL)
+}
+
+/// Repeat-supersedable tools; checked before paying to parse a call's arguments.
+pub(crate) fn is_dedupe_eligible(name: &str) -> bool {
+    matches!(
+        name,
+        "read_file" | "list_dir" | "glob" | "grep" | "web_fetch"
+    )
+}
+
+/// Canonical identity of a repeatable read-only call (`None` = ineligible).
+/// Paths resolve against `cwd` and args normalize through the tools' own
+/// helpers, so two calls share a key iff the tool would return the same content.
+pub(crate) fn read_dedupe_key(name: &str, args: &Value, cwd: &Path) -> Option<String> {
+    let path_of = |default: Option<&str>| -> Option<String> {
+        let p = arg_str_opt(args, "path").or(default)?;
+        Some(
+            lexical_normalize(&resolve(cwd, p))
+                .to_string_lossy()
+                .into_owned(),
+        )
+    };
+    match name {
+        "read_file" => {
+            let path = path_of(None)?;
+            let (offset, limit) = read_file_range(args);
+            Some(format!("read_file\u{0}{path}\u{0}{offset}\u{0}{limit}"))
+        }
+        "list_dir" => Some(format!("list_dir\u{0}{}", path_of(Some("."))?)),
+        "glob" => {
+            let pattern = arg_str_opt(args, "pattern")?;
+            Some(format!("glob\u{0}{}\u{0}{pattern}", path_of(Some("."))?))
+        }
+        "grep" => {
+            let pattern = arg_str_opt(args, "pattern")?;
+            Some(format!(
+                "grep\u{0}{}\u{0}{pattern}\u{0}{}",
+                path_of(Some("."))?,
+                grep_context(args)
+            ))
+        }
+        "web_fetch" => {
+            let url = arg_str_opt(args, "url")?;
+            Some(format!(
+                "web_fetch\u{0}{url}\u{0}{}",
+                web_fetch_max_chars(args)
+            ))
+        }
+        _ => None,
+    }
+}
+
+/// Truncate to ≤ `max` bytes on a UTF-8 boundary; returns whether anything was cut.
+fn truncate_on_char_boundary(s: &mut String, max: usize) -> bool {
+    if s.len() <= max {
+        return false;
+    }
+    let mut end = max;
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    s.truncate(end);
+    true
+}
+
 /// Cap keeping the HEAD — for file reads / listings, where the start matters.
 fn cap_head(s: String) -> String {
     let total_lines = s.lines().count();
@@ -1493,14 +1584,7 @@ fn cap_head(s: String) -> String {
     } else {
         s
     };
-    if out.len() > MAX_OUTPUT {
-        let mut end = MAX_OUTPUT;
-        while !out.is_char_boundary(end) {
-            end -= 1;
-        }
-        out.truncate(end);
-        truncated = true;
-    }
+    truncated |= truncate_on_char_boundary(&mut out, MAX_OUTPUT);
     if truncated {
         let kept_lines = out.lines().count();
         let kept_bytes = out.len();
@@ -1587,13 +1671,8 @@ fn read_file(args: &Value, cwd: &Path) -> Result<String, String> {
     let lines: Vec<&str> = content.lines().collect();
     let total = lines.len();
     // Accept `start_line`/`end_line` as aliases — ignoring them re-paged line 1 forever.
-    let offset = arg_u64(args, "offset")
-        .or_else(|| arg_u64(args, "start_line"))
-        .unwrap_or(1)
-        .max(1) as usize;
-    let limit = arg_u64(args, "limit")
-        .or_else(|| arg_u64(args, "end_line").map(|end| end.saturating_sub(offset as u64 - 1)))
-        .unwrap_or(DEFAULT_READ_LIMIT as u64) as usize;
+    let (offset, limit) = read_file_range(args);
+    let (offset, limit) = (offset as usize, limit as usize);
     let start = offset - 1;
     let mut out = String::new();
     for (i, line) in lines.iter().skip(start).take(limit).enumerate() {
@@ -1726,7 +1805,7 @@ async fn grep(args: &Value, cwd: &Path) -> Result<String, String> {
     let pattern = arg_str(args, "pattern")?;
     let path = arg_str_opt(args, "path").unwrap_or(".");
     // Context lines per match (grep -C), clamped so it can't dump whole files.
-    let context = arg_u64(args, "context").unwrap_or(0).min(100) as usize;
+    let context = grep_context(args) as usize;
     // All three tiers (rg → grep -rn → pure-Rust walk) must search the SAME file
     // set, or results would vary by which tool is installed. The pure-Rust walk
     // defines the contract: skip only `IGNORED_DIRS`, do NOT honor `.gitignore`.
@@ -1943,8 +2022,14 @@ fn apply_one_edit(
         } else {
             (old, new)
         };
+    // The constant head must fill failure_signature's 80-char window, so
+    // per-attempt hint text can't split one flailing-edit streak into many.
     match content.matches(old).count() {
-        0 => Err(format!("old_string not found in {path}")),
+        0 => Err(format!(
+            "old_string not found in {path} — the given text does not appear verbatim in the \
+file's current contents{}",
+            no_match_hint(content, old)
+        )),
         n if n > 1 && !replace_all => Err(format!(
             "old_string matches {n} times in {path}; make it unique or set replace_all"
         )),
@@ -1963,6 +2048,142 @@ fn apply_one_edit(
 /// CRLF file): collapse existing CRLF to LF first so no `\r\r\n` is produced.
 fn to_crlf(s: &str) -> String {
     s.replace("\r\n", "\n").replace('\n', "\r\n")
+}
+
+/// Max lines / bytes of file text echoed back in a no-match hint.
+const HINT_SNIPPET_LINES: usize = 8;
+const HINT_SNIPPET_BYTES: usize = 700;
+/// Past this many file lines the collapse+window scan is skipped (cost cap).
+const HINT_SCAN_MAX_LINES: usize = 5_000;
+
+/// Diagnose a failed exact match with the file's exact text at the closest
+/// region, so the model can re-anchor instead of retrying blind.
+fn no_match_hint(content: &str, old: &str) -> String {
+    // Most common miss: `old_string` pasted with read_file's `NNN\t` prefixes.
+    if let Some(stripped) = strip_line_number_prefixes(old)
+        && content.contains(&stripped)
+    {
+        return ". old_string includes read_file's line-number prefixes — resend the exact \
+text without them"
+            .to_string();
+    }
+    let lines: Vec<&str> = content.lines().collect();
+    if lines.len() > HINT_SCAN_MAX_LINES {
+        return ". The file may have changed since you read it — re-read the region and copy \
+the exact text"
+            .to_string();
+    }
+    let norm: Vec<String> = lines.iter().map(|l| collapse_ws(l)).collect();
+    let mut old_norm: Vec<String> = old.lines().map(collapse_ws).collect();
+    // Blank boundary lines collapse to "" and would match ANY line — drop them.
+    while old_norm.first().is_some_and(|l| l.is_empty()) {
+        old_norm.remove(0);
+    }
+    while old_norm.last().is_some_and(|l| l.is_empty()) {
+        old_norm.pop();
+    }
+    if old_norm.is_empty() || lines.is_empty() {
+        return String::new();
+    }
+    // Whitespace-insensitive window scan, gated on one distinctive line — a
+    // brace-only window matches all over a file and would name the wrong block.
+    let distinctive = old_norm.iter().any(|l| l.len() >= 4);
+    let starts: Vec<usize> = if distinctive {
+        (0..lines.len().saturating_sub(old_norm.len() - 1))
+            .filter(|&s| window_matches_ws(&norm, &old_norm, s))
+            .collect()
+    } else {
+        Vec::new()
+    };
+    if let Some(&s) = starts.first() {
+        let n = old_norm.len();
+        let many = if starts.len() > 1 {
+            format!(" ({} such regions; the first is shown)", starts.len())
+        } else {
+            String::new()
+        };
+        return format!(
+            ". Lines {}\u{2013}{} differ only in whitespace/indentation{many}; the file's exact \
+text is:\n{}\nRetry with old_string copied exactly from that",
+            s + 1,
+            s + n,
+            hint_snippet(&lines, s, n)
+        );
+    }
+    // Anchor on old_string's most distinctive line to point at the closest region.
+    let anchor = old_norm
+        .iter()
+        .enumerate()
+        .filter(|(_, l)| l.len() >= 12)
+        .max_by_key(|(_, l)| l.len());
+    if let Some((old_idx, anchor)) = anchor
+        && let Some(hit) = norm.iter().position(|l| l == anchor)
+    {
+        // Keep the anchor inside the capped snippet.
+        let s = hit
+            .saturating_sub(old_idx)
+            .max(hit.saturating_sub(HINT_SNIPPET_LINES - 1));
+        return format!(
+            ". Closest match is near line {}:\n{}\nCopy old_string exactly from the file's \
+current text",
+            hit + 1,
+            hint_snippet(&lines, s, old_norm.len())
+        );
+    }
+    ". No similar text found — the file may have changed since you read it; re-read it and retry"
+        .to_string()
+}
+
+/// Whitespace-collapsed form of a line: trimmed, inner runs squeezed to one space.
+fn collapse_ws(s: &str) -> String {
+    s.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Does `old_norm` match the collapsed file lines at `start`? First/last lines
+/// match as suffix/prefix so an `old_string` cut mid-line still anchors.
+fn window_matches_ws(norm: &[String], old_norm: &[String], start: usize) -> bool {
+    let n = old_norm.len();
+    if n == 1 {
+        return !old_norm[0].is_empty() && norm[start].contains(old_norm[0].as_str());
+    }
+    norm[start].ends_with(old_norm[0].as_str())
+        && norm[start + n - 1].starts_with(old_norm[n - 1].as_str())
+        && (1..n - 1).all(|k| norm[start + k] == old_norm[k])
+}
+
+/// Verbatim file lines `[start, start+len)` for a hint, capped so the error stays small.
+fn hint_snippet(lines: &[&str], start: usize, len: usize) -> String {
+    let end = (start + len).min(lines.len());
+    let shown = (end - start).min(HINT_SNIPPET_LINES);
+    let mut out = lines[start..start + shown].join("\n");
+    let mut capped = shown < end - start;
+    capped |= truncate_on_char_boundary(&mut out, HINT_SNIPPET_BYTES);
+    if capped {
+        out.push_str("\n… (snippet truncated)");
+    }
+    out
+}
+
+/// Strip `read_file`-style `NNN\t` prefixes when every non-blank line has one.
+/// Tab-only: a `NNN:` form would misfire on numeric-key literals (`200: "OK",`).
+fn strip_line_number_prefixes(s: &str) -> Option<String> {
+    let mut out = Vec::new();
+    let mut stripped = false;
+    for line in s.lines() {
+        if line.trim().is_empty() {
+            out.push(line.to_string());
+            continue;
+        }
+        let t = line.trim_start();
+        let digits = t.chars().take_while(|c| c.is_ascii_digit()).count();
+        if digits == 0 {
+            return None;
+        }
+        let rest = t[digits..].strip_prefix('\t')?;
+        out.push(rest.to_string());
+        stripped = true;
+    }
+    stripped.then(|| out.join("\n"))
 }
 
 /// Write `content` to `full` atomically: stage it in a sibling temp file, then
@@ -2494,10 +2715,7 @@ pub(crate) fn wrap_untrusted(source: &str, body: &str) -> String {
 
 async fn web_fetch(args: &Value) -> Result<String, String> {
     let url = arg_str(args, "url")?;
-    let max_chars = arg_u64(args, "max_chars")
-        .map(|n| n as usize)
-        .unwrap_or(MAX_OUTPUT)
-        .min(WEB_FETCH_CHAR_CEIL);
+    let max_chars = web_fetch_max_chars(args);
     let allow_local = web_fetch_allow_local();
     // Follow redirects manually (Policy::none) so every hop — the initial URL and
     // each 30x target — is re-validated against the SSRF blocklist below. The
@@ -4334,6 +4552,195 @@ mod tests {
         assert!(
             !raw.contains("beta\nGAMMA"),
             "introduced a lone LF: {raw:?}"
+        );
+    }
+
+    #[test]
+    fn edit_no_match_flags_leaked_line_number_prefixes() {
+        let content = "fn main() {\n    let x = 1;\n}\n";
+        let old = "    12\tfn main() {\n    13\t    let x = 1;";
+        let err = apply_one_edit(content, old, "X", false, "f.rs").unwrap_err();
+        assert!(err.contains("line-number prefixes"), "got: {err}");
+    }
+
+    #[test]
+    fn edit_no_match_points_at_whitespace_mismatch_with_exact_text() {
+        let content = "impl Foo {\n    fn bar(&self) -> u32 {\n        self.n\n    }\n}\n";
+        let old = "impl Foo {\n\tfn bar(&self) -> u32 {\n\t\tself.n\n\t}\n}";
+        let err = apply_one_edit(content, old, "X", false, "f.rs").unwrap_err();
+        assert!(err.contains("whitespace"), "got: {err}");
+        assert!(
+            err.contains("    fn bar(&self) -> u32 {"),
+            "snippet must carry the file's exact text: {err}"
+        );
+        assert!(err.contains("Lines 1\u{2013}5"), "got: {err}");
+    }
+
+    #[test]
+    fn edit_no_match_anchors_on_the_closest_distinctive_line() {
+        let content = "a\nb\nfn compute_total_price(cart: &Cart) -> f64 {\n    cart.sum()\n}\n";
+        let old = "fn compute_total_price(cart: &Cart) -> f64 {\n    cart.total\n}";
+        let err = apply_one_edit(content, old, "X", false, "f.rs").unwrap_err();
+        assert!(err.contains("near line 3"), "got: {err}");
+        assert!(
+            err.contains("cart.sum()"),
+            "snippet must show the actual body: {err}"
+        );
+    }
+
+    /// Different wrong old_strings must share one failure signature (streak guard).
+    #[test]
+    fn edit_no_match_error_head_is_stable_across_attempts() {
+        let content = "impl Foo {\n    fn bar(&self) -> u32 {\n        self.n\n    }\n}\n";
+        let e1 = apply_one_edit(
+            content,
+            "impl Foo {\n\tfn bar(&self) -> u32 {",
+            "X",
+            false,
+            "f.rs",
+        )
+        .unwrap_err();
+        let e2 = apply_one_edit(
+            content,
+            "totally unrelated missing text",
+            "X",
+            false,
+            "f.rs",
+        )
+        .unwrap_err();
+        assert_ne!(e1, e2, "hints differ per attempt");
+        assert_eq!(
+            crate::agent::guards::failure_signature("edit_file", &e1),
+            crate::agent::guards::failure_signature("edit_file", &e2),
+            "the signature head must stay constant per path"
+        );
+    }
+
+    /// Numeric-key literals must not read as leaked line numbers (tab-only rule).
+    #[test]
+    fn edit_no_match_does_not_flag_numeric_key_literals_as_prefixes() {
+        let content = "codes = {\n    \"OK\",\n    \"Not Found\",\n}\n";
+        let old = "200: \"OK\",\n404: \"Not Found\",";
+        let err = apply_one_edit(content, old, "X", false, "f.rs").unwrap_err();
+        assert!(
+            !err.contains("line-number prefixes"),
+            "colon-form numeric keys misclassified: {err}"
+        );
+    }
+
+    /// Blank boundary lines must not anchor the window scan.
+    #[test]
+    fn edit_no_match_ignores_blank_boundary_lines_in_window_scan() {
+        let content = "alpha\nbeta\ngamma\n";
+        let old = "\n\tbeta\n";
+        let err = apply_one_edit(content, old, "X", false, "f.rs").unwrap_err();
+        assert!(
+            err.contains("Lines 2\u{2013}2") || err.contains("beta"),
+            "hint should anchor on the real line: {err}"
+        );
+        assert!(
+            !err.contains("Lines 1\u{2013}"),
+            "must not anchor on a blank-line pseudo-match at the top: {err}"
+        );
+    }
+
+    /// A deep anchor must still appear inside the capped snippet.
+    #[test]
+    fn edit_no_match_anchor_stays_inside_the_capped_snippet() {
+        let mut content: String = (1..=19).map(|i| format!("x{i}\n")).collect();
+        content.push_str("let the_special_marker = compute_value();\n");
+        let old: String = (1..=9).map(|i| format!("aaa{i}\n")).collect::<String>()
+            + "let the_special_marker = compute_value();";
+        let err = apply_one_edit(&content, &old, "X", false, "f.rs").unwrap_err();
+        assert!(err.contains("near line 20"), "got: {err}");
+        assert!(
+            err.contains("the_special_marker"),
+            "the named line must be inside the snippet: {err}"
+        );
+    }
+
+    /// Brace-only old_strings must not produce a (wrong-block) whitespace hint.
+    #[test]
+    fn edit_no_match_skips_window_scan_for_brace_only_old_strings() {
+        let err = apply_one_edit(
+            "}\n{\nlet unique_a = 1;\n}\n{\n",
+            "\t}\n\t{",
+            "X\nY",
+            false,
+            "f.rs",
+        )
+        .unwrap_err();
+        assert!(
+            !err.contains("differ only in whitespace"),
+            "brace-only window must not be trusted: {err}"
+        );
+        assert!(err.contains("re-read"), "got: {err}");
+    }
+
+    #[test]
+    fn edit_no_match_suggests_reread_when_nothing_is_similar() {
+        let err = apply_one_edit(
+            "alpha beta\n",
+            "zzz qqq totally different line here",
+            "X",
+            false,
+            "f.rs",
+        )
+        .unwrap_err();
+        assert!(err.contains("re-read"), "got: {err}");
+    }
+
+    #[test]
+    fn read_dedupe_key_normalizes_paths_aliases_and_defaults() {
+        let cwd = Path::new("/w");
+        let a = read_dedupe_key("read_file", &json!({"path":"src/x.rs"}), cwd);
+        let b = read_dedupe_key("read_file", &json!({"path":"./src/x.rs","offset":1}), cwd);
+        let c = read_dedupe_key(
+            "read_file",
+            &json!({"path":"/w/src/x.rs","start_line":1}),
+            cwd,
+        );
+        assert!(a.is_some());
+        assert_eq!(a, b, "relative/`./`-prefixed + default offset collide");
+        assert_eq!(a, c, "absolute path + start_line alias collide");
+        let paged = read_dedupe_key("read_file", &json!({"path":"src/x.rs","offset":100}), cwd);
+        assert_ne!(a, paged, "a different page is a different read");
+        assert_eq!(
+            read_dedupe_key("run_bash", &json!({"command":"ls"}), cwd),
+            None,
+            "non-repeatable tools are ineligible"
+        );
+        assert_eq!(
+            read_dedupe_key("grep", &json!({"pattern":"foo"}), cwd),
+            read_dedupe_key(
+                "grep",
+                &json!({"pattern":"foo","path":".","context":0}),
+                cwd
+            ),
+            "grep defaults normalize"
+        );
+        assert_eq!(
+            read_dedupe_key("grep", &json!({"pattern":"foo","context":150}), cwd),
+            read_dedupe_key("grep", &json!({"pattern":"foo","context":100}), cwd),
+            "grep context mirrors the tool's clamp"
+        );
+        assert_eq!(
+            read_dedupe_key("web_fetch", &json!({"url":"https://e.co/d"}), cwd),
+            read_dedupe_key(
+                "web_fetch",
+                &json!({"url":"https://e.co/d","max_chars":30_000}),
+                cwd
+            ),
+            "web_fetch default max_chars mirrors the tool's MAX_OUTPUT"
+        );
+        assert_ne!(
+            read_dedupe_key("web_fetch", &json!({"url":"https://e.co/d"}), cwd),
+            read_dedupe_key(
+                "web_fetch",
+                &json!({"url":"https://e.co/d","max_chars":0}),
+                cwd
+            ),
+            "an explicit tiny cap is a different fetch — must not collide with a full one"
         );
     }
 

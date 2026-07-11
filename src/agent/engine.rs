@@ -30,7 +30,7 @@ use crate::agent::skills::{self, Skill};
 use crate::agent::subagents::{self, Subagent};
 use crate::agent::system_prompt::system_prompt;
 use crate::agent::tokens::{content_to_parts, estimate_str_tokens, estimate_tokens, usage_tokens};
-use crate::agent::{serve_client, tool_repair, tools, verify};
+use crate::agent::{serve_client, tool_repair, tool_search, tools, verify};
 use crate::services::serve_router::extract_usage_from_value;
 use crate::services::session_store::SessionTokens;
 
@@ -353,6 +353,12 @@ pub struct AgentEngine {
     guides: Vec<String>,
     /// Extra tools beyond the built-ins (MCP servers), if any are configured.
     external: Option<std::sync::Arc<dyn ExternalTools>>,
+    /// External specs deferred behind `search_tools`; loading moves a spec
+    /// from here into `tools_openai`. See [`tool_search`].
+    pub(crate) deferred_tools: Vec<Value>,
+    /// Deferral threshold (estimate tokens); `None` = always inline. Read from
+    /// the env once at construction so tests can override the field.
+    pub(crate) mcp_defer_tokens: Option<usize>,
     /// Body of the last compaction summary (no prefix). Fed back to the summarizer
     /// next compaction so facts carry forward instead of being re-compressed lossily.
     pub(crate) last_summary: Option<String>,
@@ -450,6 +456,8 @@ pub struct ContextReport {
     pub tool_count: usize,
     pub mcp_tools: u64,
     pub mcp_tool_count: usize,
+    /// External tools deferred behind `search_tools` (schemas not in context).
+    pub mcp_deferred_count: usize,
     /// Transcript: every message after the system prompt.
     pub messages: u64,
     pub message_count: usize,
@@ -561,6 +569,8 @@ impl AgentEngine {
             date: date.to_string(),
             guides: guides.to_vec(),
             external: None,
+            deferred_tools: Vec::new(),
+            mcp_defer_tokens: tool_search::defer_threshold(),
             last_summary: None,
             plan: Vec::new(),
             touched_files: Vec::new(),
@@ -905,11 +915,73 @@ questions.",
         (cost > 0.0).then_some(cost)
     }
 
-    /// Attach an external tool source (MCP): advertise its schemas alongside the
-    /// built-ins and route its calls to it. Call once, after construction.
+    /// Attach an external tool source (MCP). Call once, after construction. Past
+    /// the deferral threshold the schemas defer behind `search_tools` instead of
+    /// permanently occupying the window; calls still route by name.
     pub fn set_external_tools(&mut self, ext: std::sync::Arc<dyn ExternalTools>) {
-        self.tools_openai.extend(ext.specs());
+        let specs = ext.specs();
+        self.deferred_tools.clear();
+        if self
+            .mcp_defer_tokens
+            .is_some_and(|t| tool_search::should_defer_at(&specs, t))
+        {
+            self.deferred_tools = specs;
+        } else {
+            self.tools_openai.extend(specs);
+        }
+        self.refresh_search_tools();
         self.external = Some(ext);
+    }
+
+    /// Rebuild the `search_tools` advertisement: present iff anything is deferred.
+    fn refresh_search_tools(&mut self) {
+        self.tools_openai
+            .retain(|t| t["function"]["name"].as_str() != Some("search_tools"));
+        if !self.deferred_tools.is_empty() {
+            self.tools_openai
+                .push(tool_to_openai(tool_search::search_tools_spec(
+                    &self.deferred_tools,
+                )));
+        }
+    }
+
+    /// Move the deferred specs at `idxs` into the live tool list and refresh
+    /// `search_tools`; returns the loaded specs in deferred order.
+    fn load_deferred_tools(&mut self, idxs: &[usize]) -> Vec<Value> {
+        let want: std::collections::HashSet<usize> = idxs.iter().copied().collect();
+        if want.is_empty() {
+            return Vec::new();
+        }
+        let mut loaded = Vec::with_capacity(want.len());
+        let mut kept = Vec::with_capacity(self.deferred_tools.len());
+        for (i, t) in std::mem::take(&mut self.deferred_tools)
+            .into_iter()
+            .enumerate()
+        {
+            if want.contains(&i) {
+                loaded.push(t);
+            } else {
+                kept.push(t);
+            }
+        }
+        self.deferred_tools = kept;
+        if !loaded.is_empty() {
+            self.tools_openai.extend(loaded.iter().cloned());
+            self.refresh_search_tools();
+        }
+        loaded
+    }
+
+    /// A direct call to a still-deferred tool works (routing is name-based) —
+    /// promote its schema so later steps see it as a first-class tool.
+    fn promote_deferred_tool(&mut self, name: &str) {
+        if let Some(i) = self
+            .deferred_tools
+            .iter()
+            .position(|t| t["function"]["name"].as_str() == Some(name))
+        {
+            self.load_deferred_tools(&[i]);
+        }
     }
 
     /// Fill in the compaction context window if unknown (0) at construction (a
@@ -1002,6 +1074,9 @@ questions.",
                     || allowed.contains(&name)
                     || (is_editor && editor_allowed)
             });
+            // `resolved_tools` normalizes to built-ins, so the retain just dropped
+            // `search_tools`; clear the now-unreachable deferred set too.
+            self.deferred_tools.clear();
         }
     }
 
@@ -1225,13 +1300,21 @@ questions.",
         let sys_full = estimate_tokens(&self.messages[..self.messages.len().min(1)]);
         let injected = self.injected_context_tokens.min(sys_full);
 
-        let mcp_specs = self
-            .external
-            .as_ref()
-            .map(|e| e.specs())
-            .unwrap_or_default();
-        let mcp_tok = estimate_tokens(&mcp_specs);
-        let mcp_tool_count = mcp_specs.len();
+        // Count the external specs actually advertised (deferred ones cost nothing).
+        let is_external = |t: &Value| {
+            self.external
+                .as_ref()
+                .is_some_and(|e| t["function"]["name"].as_str().is_some_and(|n| e.handles(n)))
+        };
+        let (mcp_tok, mcp_tool_count) = self.tools_openai.iter().filter(|t| is_external(t)).fold(
+            (0usize, 0usize),
+            |(tok, n), t| {
+                (
+                    tok + crate::agent::tokens::estimate_message_tokens(t),
+                    n + 1,
+                )
+            },
+        );
         let tools_full = estimate_tokens(&self.tools_openai);
         let transcript = &self.messages[self.messages.len().min(1)..];
 
@@ -1243,6 +1326,7 @@ questions.",
             tool_count: self.tools_openai.len().saturating_sub(mcp_tool_count),
             mcp_tools: calib(mcp_tok),
             mcp_tool_count,
+            mcp_deferred_count: self.deferred_tools.len(),
             messages: calib(estimate_tokens(transcript)),
             message_count: transcript.len(),
             calibration: cal,
@@ -2186,8 +2270,29 @@ planning is off) — continue with the task."
                         Err(e) => Err(e),
                     }
                 }
+            } else if n == "search_tools" {
+                // Deferred-MCP discovery: load matching schemas (engine state → ordered pass).
+                match call.arguments.get("query").and_then(|v| v.as_str()) {
+                    Some(q) if !q.trim().is_empty() => {
+                        let max = call
+                            .arguments
+                            .get("max_results")
+                            .and_then(|v| v.as_u64())
+                            .map(|v| v as usize)
+                            .unwrap_or(tool_search::SEARCH_DEFAULT_RESULTS)
+                            .clamp(1, tool_search::SEARCH_MAX_RESULTS);
+                        let hits = tool_search::rank(&self.deferred_tools, q.trim(), max);
+                        let loaded = self.load_deferred_tools(&hits);
+                        Ok(tool_search::format_loaded(
+                            &loaded,
+                            self.deferred_tools.len(),
+                        ))
+                    }
+                    _ => Err("missing required string argument `query`".to_string()),
+                }
             } else if let Some(ext) = self.external.clone().filter(|e| e.handles(&call.name)) {
                 // External tool — keyed on its raw advertised name (`mcp__*`), never normalized (matches the shadow check).
+                self.promote_deferred_tool(&call.name);
                 ext.call(&call.name, &call.arguments).await
             } else if n == "run_bash" && jobs::wants_background(&call.arguments) {
                 // Detached job — no escalation flow (a spawn returns before a sandbox block shows).
@@ -2293,6 +2398,7 @@ command in the foreground (drop `background`)."
         }
 
         // Emit results and append tool messages in call order (call↔result pairing intact).
+        let mut repeated_reads: Vec<(String, String)> = Vec::new();
         for (i, call) in tool_calls.iter().enumerate() {
             let n = subagents::normalize_tool_name(&call.name).unwrap_or(&call.name);
             let result = outcomes[i]
@@ -2307,6 +2413,9 @@ command in the foreground (drop `background`)."
                 // A successful mutation (or delegated work) invalidates the last green verify.
                 if tools::is_mutating(n) || n == "subagent" {
                     self.dirty_since_verify = true;
+                }
+                if let Some(k) = tools::read_dedupe_key(n, &call.arguments, ctx.cwd) {
+                    repeated_reads.push((k, call.id.clone()));
                 }
             }
             let raw = match result {
@@ -2329,6 +2438,8 @@ command in the foreground (drop `background`)."
                 "content": content,
             }));
         }
+        // Older copies of any read this batch repeated verbatim are now dead weight.
+        self.supersede_duplicate_reads(ctx.cwd, &repeated_reads);
 
         (extra_tokens, failures)
     }
@@ -5202,6 +5313,150 @@ mod tests {
                 .any(|m| role(m) == "tool" && content_str(m) == "pong"),
             "external tool result not routed back"
         );
+    }
+
+    /// 80 filler tools + one distinctive `alpha_sync` (~16k est tokens — defers).
+    struct BigExt;
+    impl crate::agent::engine::ExternalTools for BigExt {
+        fn specs(&self) -> Vec<Value> {
+            let mut specs: Vec<Value> = (0..80)
+                .map(|i| {
+                    json!({
+                        "type": "function",
+                        "function": {
+                            "name": format!("mcp__demo__filler_{i}"),
+                            "description": "filler tool with a long schema description ".repeat(20),
+                            "parameters": {"type": "object"}
+                        }
+                    })
+                })
+                .collect();
+            specs.push(json!({
+                "type": "function",
+                "function": {
+                    "name": "mcp__demo__alpha_sync",
+                    "description": "Synchronize alpha records upstream",
+                    "parameters": {"type": "object"}
+                }
+            }));
+            specs
+        }
+        fn handles(&self, name: &str) -> bool {
+            name.starts_with("mcp__demo__")
+        }
+        fn call<'a>(
+            &'a self,
+            name: &'a str,
+            _args: &'a Value,
+        ) -> BoxFuture<'a, Result<String, String>> {
+            Box::pin(async move { Ok(format!("ran {name}")) })
+        }
+    }
+
+    /// Defer → search loads the match → the loaded tool routes to its source.
+    #[tokio::test]
+    async fn bulky_external_tools_defer_and_load_via_search() {
+        let dir = tmp();
+        let search = tool_call_sse("search_tools", json!({"query": "alpha sync"}));
+        let call = tool_call_sse("mcp__demo__alpha_sync", json!({}));
+        let port = spawn_sse_sequence(vec![search, call, FINAL_TEXT_SSE.to_string()]);
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let base = format!("http://127.0.0.1:{port}");
+        let mut engine = AgentEngine::new(&dir.display().to_string(), "m", "", &[], &[], 0, 0);
+        // Pin the threshold so an exported AIVO_AGENT_MCP_DEFER_TOKENS can't flip the test.
+        engine.mcp_defer_tokens = Some(8_000);
+        engine.set_external_tools(std::sync::Arc::new(BigExt));
+
+        let names = tool_names(&engine);
+        assert!(
+            names.iter().any(|n| n == "search_tools"),
+            "meta-tool advertised"
+        );
+        assert!(
+            !names.iter().any(|n| n.starts_with("mcp__")),
+            "no external schema inlined while deferred"
+        );
+        assert_eq!(engine.deferred_tools.len(), 81);
+        let report = engine.context_report();
+        assert_eq!(report.mcp_tool_count, 0, "deferred specs cost no context");
+        assert_eq!(report.mcp_tools, 0);
+        assert_eq!(report.mcp_deferred_count, 81);
+
+        let mut ui = CapturingUi::default();
+        run_session(
+            &mut engine,
+            &turn_ctx(&client, &base, &dir),
+            Some("sync the alpha records".into()),
+            &mut ui,
+        )
+        .await;
+
+        assert!(
+            tool_names(&engine)
+                .iter()
+                .any(|n| n == "mcp__demo__alpha_sync"),
+            "search must load the matching schema"
+        );
+        assert_eq!(engine.deferred_tools.len(), 80);
+        assert!(
+            engine.messages.iter().any(|m| role(m) == "tool"
+                && content_str(m).contains("Loaded 1 tool(s)")
+                && content_str(m).contains("mcp__demo__alpha_sync")),
+            "search result names what loaded"
+        );
+        assert!(
+            engine
+                .messages
+                .iter()
+                .any(|m| role(m) == "tool" && content_str(m) == "ran mcp__demo__alpha_sync"),
+            "loaded tool routed to the external source"
+        );
+        let report = engine.context_report();
+        assert_eq!(report.mcp_tool_count, 1, "loaded spec now counted");
+        assert!(report.mcp_tools > 0);
+        assert_eq!(report.mcp_deferred_count, 80);
+    }
+
+    /// A direct call to a still-deferred tool executes and promotes its schema.
+    #[tokio::test]
+    async fn direct_call_to_deferred_tool_routes_and_promotes() {
+        let dir = tmp();
+        let call = tool_call_sse("mcp__demo__filler_3", json!({}));
+        let port = spawn_sse_sequence(vec![call, FINAL_TEXT_SSE.to_string()]);
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let base = format!("http://127.0.0.1:{port}");
+        let mut engine = AgentEngine::new(&dir.display().to_string(), "m", "", &[], &[], 0, 0);
+        engine.mcp_defer_tokens = Some(8_000);
+        engine.set_external_tools(std::sync::Arc::new(BigExt));
+        assert!(
+            !tool_names(&engine)
+                .iter()
+                .any(|n| n == "mcp__demo__filler_3")
+        );
+
+        let mut ui = CapturingUi::default();
+        run_session(
+            &mut engine,
+            &turn_ctx(&client, &base, &dir),
+            Some("run filler 3".into()),
+            &mut ui,
+        )
+        .await;
+
+        assert!(
+            engine
+                .messages
+                .iter()
+                .any(|m| role(m) == "tool" && content_str(m) == "ran mcp__demo__filler_3"),
+            "deferred tool must still execute when called directly"
+        );
+        assert!(
+            tool_names(&engine)
+                .iter()
+                .any(|n| n == "mcp__demo__filler_3"),
+            "direct call promotes the schema"
+        );
+        assert_eq!(engine.deferred_tools.len(), 80);
     }
 
     /// The model calls `take_note`; the engine stores it (no prompt, no `tools::execute`), echoes a confirmation, retains it for pinning.
