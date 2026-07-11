@@ -17,6 +17,7 @@ pub mod jobs;
 pub mod lsp;
 pub mod mcp;
 pub mod mcp_import;
+pub mod memory;
 pub mod notes;
 pub mod packs;
 pub mod plan;

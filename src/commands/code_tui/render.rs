@@ -817,6 +817,16 @@ pub(super) fn render_pending_status(
 /// Row-name cap — short enough that the delegate's action stays visible.
 const SUBAGENT_ROW_NAME_MAX_COLS: usize = 28;
 
+/// One live tail row, truncated so a long line can't re-wrap taller each frame.
+pub(super) fn tool_tail_row_text(line: &str) -> String {
+    const TOOL_TAIL_MAX_COLS: usize = 96;
+    let line = line.replace('\t', "  ");
+    format!(
+        "    {}",
+        truncate_label(line.trim_end(), TOOL_TAIL_MAX_COLS)
+    )
+}
+
 /// One live row for a parallel delegate: `↳ name — action · step N (12s)`,
 /// flipping to `✓ name — done (32s · 8 step(s) · 1.2k tokens)`.
 pub(super) fn subagent_row_text(row: &super::shared::SubagentRow) -> String {

@@ -2056,21 +2056,32 @@ pub struct BashOutcome {
     pub sandbox_blocked: bool,
 }
 
+/// Live `run_bash` output chunks for the UI; never changes the final result.
+pub type BashProgress = tokio::sync::mpsc::UnboundedSender<String>;
+
 /// Run a shell command with file writes confined to the workspace sandbox.
 async fn run_bash(args: &Value, cwd: &Path) -> Result<String, String> {
-    run_bash_confined(args, cwd).await.result
+    run_bash_confined(args, cwd, None).await.result
 }
 
 /// Like [`run_bash`], but also reports whether the sandbox blocked a write so
 /// the engine can offer to escalate (see [`run_bash_unconfined`]).
-pub async fn run_bash_confined(args: &Value, cwd: &Path) -> BashOutcome {
-    run_bash_inner(args, cwd, true).await
+pub async fn run_bash_confined(
+    args: &Value,
+    cwd: &Path,
+    progress: Option<BashProgress>,
+) -> BashOutcome {
+    run_bash_inner(args, cwd, true, progress).await
 }
 
 /// Run a shell command WITHOUT the workspace sandbox. Reserved for the
 /// user-approved escalation of a command the sandbox blocked.
-pub async fn run_bash_unconfined(args: &Value, cwd: &Path) -> Result<String, String> {
-    run_bash_inner(args, cwd, false).await.result
+pub async fn run_bash_unconfined(
+    args: &Value,
+    cwd: &Path,
+    progress: Option<BashProgress>,
+) -> Result<String, String> {
+    run_bash_inner(args, cwd, false, progress).await.result
 }
 
 fn is_shell_operator(tok: &str) -> bool {
@@ -2294,7 +2305,49 @@ impl Drop for GroupKillGuard {
     }
 }
 
-async fn run_bash_inner(args: &Value, cwd: &Path, confined: bool) -> BashOutcome {
+/// Read a child pipe to EOF, forwarding complete-UTF-8 chunks to `progress`
+/// (a split code point carries over rather than rendering as �).
+async fn drain_pipe<R: tokio::io::AsyncRead + Unpin>(
+    reader: Option<R>,
+    progress: Option<&BashProgress>,
+) -> Vec<u8> {
+    let mut collected = Vec::new();
+    let Some(mut reader) = reader else {
+        return collected;
+    };
+    use tokio::io::AsyncReadExt;
+    let mut chunk = [0u8; 8192];
+    let mut sent = 0; // bytes of `collected` already forwarded
+    loop {
+        match reader.read(&mut chunk).await {
+            Ok(0) | Err(_) => break,
+            Ok(n) => {
+                collected.extend_from_slice(&chunk[..n]);
+                let Some(tx) = progress else { continue };
+                let pending = &collected[sent..];
+                let valid = match std::str::from_utf8(pending) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        let (valid, _) = pending.split_at(e.valid_up_to());
+                        std::str::from_utf8(valid).unwrap_or("")
+                    }
+                };
+                if !valid.is_empty() {
+                    let _ = tx.send(valid.to_string());
+                    sent += valid.len();
+                }
+            }
+        }
+    }
+    collected
+}
+
+async fn run_bash_inner(
+    args: &Value,
+    cwd: &Path,
+    confined: bool,
+    progress: Option<BashProgress>,
+) -> BashOutcome {
     let early = |result| BashOutcome {
         result,
         sandbox_blocked: false,
@@ -2334,7 +2387,7 @@ async fn run_bash_inner(args: &Value, cwd: &Path, confined: bool) -> BashOutcome
     }
     let mut builder = tokio::process::Command::from(builder);
     builder.kill_on_drop(true);
-    let child = match builder.spawn() {
+    let mut child = match builder.spawn() {
         Ok(c) => c,
         Err(e) => return early(Err(format!("spawn shell: {e}"))),
     };
@@ -2344,10 +2397,21 @@ async fn run_bash_inner(args: &Value, cwd: &Path, confined: bool) -> BashOutcome
     let mut tree_kill = GroupKillGuard::new(child.id());
     #[cfg(windows)]
     let pid = child.id();
-    let output =
-        match tokio::time::timeout(Duration::from_secs(timeout), child.wait_with_output()).await {
-            Ok(Ok(o)) => o,
-            Ok(Err(e)) => return early(Err(format!("run command: {e}"))),
+    // Drain pipes concurrently with the wait — no deadlock on a full pipe.
+    let stdout_pipe = child.stdout.take();
+    let stderr_pipe = child.stderr.take();
+    let run = async {
+        let (out_bytes, err_bytes, status) = tokio::join!(
+            drain_pipe(stdout_pipe, progress.as_ref()),
+            drain_pipe(stderr_pipe, progress.as_ref()),
+            child.wait(),
+        );
+        (status, out_bytes, err_bytes)
+    };
+    let (status, out_bytes, err_bytes) =
+        match tokio::time::timeout(Duration::from_secs(timeout), run).await {
+            Ok((Ok(status), out_bytes, err_bytes)) => (status, out_bytes, err_bytes),
+            Ok((Err(e), ..)) => return early(Err(format!("run command: {e}"))),
             Err(_) => {
                 #[cfg(windows)]
                 if let Some(pid) = pid {
@@ -2368,8 +2432,8 @@ async fn run_bash_inner(args: &Value, cwd: &Path, confined: bool) -> BashOutcome
     #[cfg(unix)]
     tree_kill.disarm();
     let mut out = String::new();
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&out_bytes);
+    let stderr = String::from_utf8_lossy(&err_bytes);
     if !stdout.trim().is_empty() {
         out.push_str(&stdout);
     }
@@ -2379,7 +2443,7 @@ async fn run_bash_inner(args: &Value, cwd: &Path, confined: bool) -> BashOutcome
         }
         out.push_str(&stderr);
     }
-    let code = output.status.code().unwrap_or(-1);
+    let code = status.code().unwrap_or(-1);
     let mut sandbox_blocked = false;
     if code != 0 {
         out.push_str(&format!("\n[exit {code}]"));
@@ -3349,6 +3413,24 @@ mod tests {
         assert!(bad.contains("[exit 3]"));
     }
 
+    /// The first chunk arrives before the command completes; result unchanged.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn run_bash_streams_progress_before_completion() {
+        let dir = tmp();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let args = json!({"command":"echo first; sleep 2; echo second"});
+        let fut = run_bash_confined(&args, &dir, Some(tx));
+        let mut fut = std::pin::pin!(fut);
+        let first = tokio::select! {
+            _ = &mut fut => panic!("command finished before any chunk streamed"),
+            chunk = rx.recv() => chunk.expect("a live chunk"),
+        };
+        assert!(first.contains("first"));
+        let out = fut.await.result.unwrap();
+        assert!(out.contains("first") && out.contains("second"));
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn run_bash_spills_full_output_past_the_cap() {
@@ -3421,7 +3503,7 @@ mod tests {
         let cmd = json!({ "command": format!("echo hi > '{}'", outside.display()) });
 
         // Confined: blocked, flagged, file absent, hint present.
-        let confined = run_bash_confined(&cmd, &dir).await;
+        let confined = run_bash_confined(&cmd, &dir, None).await;
         assert!(
             confined.sandbox_blocked,
             "out-of-workspace write was not flagged as blocked"
@@ -3430,7 +3512,7 @@ mod tests {
         assert!(confined.result.unwrap().contains("write-sandbox"));
 
         // Unconfined: same command, write lands, no sandbox hint.
-        let out = run_bash_unconfined(&cmd, &dir).await.unwrap();
+        let out = run_bash_unconfined(&cmd, &dir, None).await.unwrap();
         let existed = outside.exists();
         let _ = std::fs::remove_file(&outside);
         assert!(existed, "unconfined write was still blocked");
@@ -3455,7 +3537,7 @@ mod tests {
     async fn run_bash_runs_in_its_own_process_group() {
         let dir = tmp();
         // Unconfined: macOS seatbelt denies `ps`; the spawn builder is shared.
-        let out = run_bash_unconfined(&json!({"command":"ps -o pgid= -p $$"}), &dir)
+        let out = run_bash_unconfined(&json!({"command":"ps -o pgid= -p $$"}), &dir, None)
             .await
             .unwrap();
         let child_pgid: i32 = out

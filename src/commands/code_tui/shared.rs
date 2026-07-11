@@ -238,6 +238,12 @@ pub(super) const SLASH_COMMANDS: &[SlashCommandSpec] = &[
         takes_argument: true,
     },
     SlashCommandSpec {
+        name: "review",
+        help_label: "/review [ref|scope]",
+        description: "review the working diff (or vs a base ref) — line-by-line findings",
+        takes_argument: true,
+    },
+    SlashCommandSpec {
         name: "rewind",
         help_label: "/rewind",
         description: "rewind to an earlier turn (reverts file edits)",
@@ -259,6 +265,12 @@ pub(super) const SLASH_COMMANDS: &[SlashCommandSpec] = &[
         name: "context",
         help_label: "/context",
         description: "break down what's filling the context window this session",
+        takes_argument: false,
+    },
+    SlashCommandSpec {
+        name: "memory",
+        help_label: "/memory",
+        description: "show this project's persistent memory (facts saved via `remember`)",
         takes_argument: false,
     },
     SlashCommandSpec {
@@ -1659,6 +1671,10 @@ pub(super) enum SlashCommand {
     /// implementation plan; `go` executes it in a fresh context; bare shows
     /// status, `stop` discards the pending plan.
     Plan(Option<String>),
+    /// Read-only review turn: working diff (bare), or vs a ref / scope.
+    Review(Option<String>),
+    /// Show this project's persistent memory (`remember` facts).
+    Memory,
     /// Reasoning effort: bare opens a picker of the model's levels, `<level>`
     /// sets it directly.
     Effort(Option<String>),
@@ -1773,6 +1789,10 @@ pub(super) enum RuntimeEvent {
         args: Option<serde_json::Value>,
         result: Option<String>,
         failed: bool,
+    },
+    /// Live `run_bash` output chunk — feeds the streaming tail, not the transcript.
+    AgentToolOutput {
+        chunk: String,
     },
     /// The agent engine's tool returned — render the `⎿ result` step.
     AgentToolResult {
@@ -2116,6 +2136,10 @@ pub(super) struct CodeTuiApp {
     /// Live rows under the spinner for a parallel sub-agent batch (slot-indexed);
     /// cleared on batch finish / turn end.
     pub(super) subagent_rows: Vec<SubagentRow>,
+    /// Streaming tail of the in-flight `run_bash`; cleared when the tool returns.
+    pub(super) tool_output_tail: std::collections::VecDeque<String>,
+    /// Unterminated last line of the stream (rendered too, for progress output).
+    pub(super) tool_output_partial: String,
     /// The status label on screen + when first shown; throttled by
     /// `tick_status_throttle` so it switches at most once per `STATUS_MIN_DURATION`.
     pub(super) status_display: Option<(String, Instant)>,

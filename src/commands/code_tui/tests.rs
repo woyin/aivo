@@ -770,10 +770,14 @@ fn test_visible_command_menu_filters_and_hides_escaped_slash() {
     app.cursor = 3;
     app.sync_command_menu_state();
     let menu = app.visible_command_menu().unwrap();
-    assert_eq!(menu.entries.len(), 1);
+    assert_eq!(menu.entries.len(), 2); // "mo" → model + memory
     assert!(matches!(
         menu.entries[0],
         ComposerMenuEntry::Command(command) if command.name == "model"
+    ));
+    assert!(matches!(
+        menu.entries[1],
+        ComposerMenuEntry::Command(command) if command.name == "memory"
     ));
     assert_eq!(menu.selected, Some(0));
 
@@ -1407,6 +1411,8 @@ fn make_test_app(
         wait_tick: None,
         last_stream_activity: None,
         subagent_rows: Vec::new(),
+        tool_output_tail: std::collections::VecDeque::new(),
+        tool_output_partial: String::new(),
         status_display: None,
         turn_output_tokens: 0,
         retrying: false,
@@ -9024,10 +9030,12 @@ async fn test_goal_continuation_preserves_composer_draft() {
     assert_eq!(app.cursor, 4, "cursor survives the dispatch");
     let last = app.history.last().unwrap();
     assert_eq!(last.role, "user");
+    assert_eq!(last.content, "/goal — continue");
+    let sent = app.pending_submit.as_ref().unwrap();
     assert!(
-        last.content.starts_with("Continue toward the goal"),
+        sent.content.starts_with("Continue toward the goal"),
         "the continuation still went out: {}",
-        last.content
+        sent.content
     );
     assert!(app.goal_mode.is_none(), "plain-chat route disarms the loop");
     assert!(app.notice.as_ref().unwrap().1.contains("plain chat"));
@@ -9058,15 +9066,20 @@ async fn test_goal_guard_stop_enriches_continuation() {
 
     let last = app.history.last().unwrap();
     assert_eq!(last.role, "user");
+    assert_eq!(
+        last.content, "/goal — continue",
+        "compact transcript marker"
+    );
+    let sent = app.pending_submit.as_ref().unwrap();
     assert!(
-        last.content.starts_with("[Previous turn stopped early:"),
+        sent.content.starts_with("[Previous turn stopped early:"),
         "guard-stop should enrich the continuation: {}",
-        last.content
+        sent.content
     );
     assert!(
-        last.content.contains("Continue toward the goal"),
+        sent.content.contains("Continue toward the goal"),
         "the base continuation still rides along: {}",
-        last.content
+        sent.content
     );
     assert!(
         app.goal_guard_stop.is_none(),
@@ -9097,11 +9110,11 @@ async fn test_goal_step_limit_steers_continuation() {
 
     app.maybe_continue_goal().await.unwrap();
 
-    let last = app.history.last().unwrap();
+    let sent = app.pending_submit.as_ref().unwrap();
     assert!(
-        last.content.contains("ran out of steps"),
+        sent.content.contains("ran out of steps"),
         "step-limit gets its own steering: {}",
-        last.content
+        sent.content
     );
 }
 

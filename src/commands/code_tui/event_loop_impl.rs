@@ -100,6 +100,7 @@ impl CodeTuiApp {
                 result,
                 failed,
             } => self.apply_agent_tool_update(id, args, result, failed),
+            RuntimeEvent::AgentToolOutput { chunk } => self.push_tool_output(&chunk),
             RuntimeEvent::AgentToolResult { content } => self.apply_agent_tool_result(content),
             RuntimeEvent::AgentSteered(text) => self.apply_agent_steered(text),
             RuntimeEvent::AgentDiscardSegment => self.discard_streamed_segment(),
@@ -481,6 +482,7 @@ impl CodeTuiApp {
     ) {
         self.clear_sandbox_escalation_notice();
         self.flush_pending_assistant();
+        self.clear_tool_output();
         // Stamp the status-line action label for the in-flight step.
         let cwd = if self.real_cwd.is_empty() {
             self.cwd.clone()
@@ -760,6 +762,7 @@ impl CodeTuiApp {
     }
 
     pub(super) fn apply_agent_tool_result(&mut self, content: String) {
+        self.clear_tool_output();
         self.history.push(ChatMessage {
             model: None,
             role: "tool_result".to_string(),
@@ -769,6 +772,37 @@ impl CodeTuiApp {
         });
         // Same as the tool-call append: leave `follow_output` alone so a user
         // reading scrolled-up output isn't snapped to the bottom each step.
+    }
+
+    /// Fold a live output chunk into the tail; a bare \r (progress redraw)
+    /// counts as a line break.
+    pub(super) fn push_tool_output(&mut self, chunk: &str) {
+        const TAIL_LINES: usize = 5;
+        const PARTIAL_CAP: usize = 512;
+        self.tool_output_partial.push_str(chunk);
+        while let Some(pos) = self.tool_output_partial.find(['\n', '\r']) {
+            let rest = self.tool_output_partial.split_off(pos + 1);
+            let line = std::mem::replace(&mut self.tool_output_partial, rest);
+            let line = line.trim_end_matches(['\n', '\r']);
+            if !line.trim().is_empty() {
+                if self.tool_output_tail.len() >= TAIL_LINES {
+                    self.tool_output_tail.pop_front();
+                }
+                self.tool_output_tail.push_back(line.to_string());
+            }
+        }
+        if self.tool_output_partial.len() > PARTIAL_CAP {
+            let mut cut = PARTIAL_CAP;
+            while !self.tool_output_partial.is_char_boundary(cut) {
+                cut -= 1;
+            }
+            self.tool_output_partial.truncate(cut);
+        }
+    }
+
+    pub(super) fn clear_tool_output(&mut self) {
+        self.tool_output_tail.clear();
+        self.tool_output_partial.clear();
     }
 
     /// Commit a consumed interjection at its injection point (events arrive in
@@ -855,6 +889,7 @@ impl CodeTuiApp {
         self.clear_retry_notice();
         self.sending = false;
         self.subagent_rows.clear();
+        self.clear_tool_output();
         self.request_started_at = None;
         self.response_task = None;
         self.pending_submit = None;
@@ -1117,6 +1152,7 @@ impl CodeTuiApp {
         // Reset the turn, fail-closed like an interrupt.
         self.sending = false;
         self.subagent_rows.clear();
+        self.clear_tool_output();
         self.request_started_at = None;
         self.pending_submit = None;
         // A dead compact turn must not mark the NEXT turn as a compact.
@@ -1149,6 +1185,7 @@ impl CodeTuiApp {
     ) -> Result<()> {
         self.sending = false;
         self.subagent_rows.clear();
+        self.clear_tool_output();
         self.request_started_at = None;
         self.response_task = None;
         // The turn's format belongs to the model that ran it — don't clobber a

@@ -17,6 +17,28 @@ going. Use `take_note` for key decisions and dead-ends so they survive context c
 const GOAL_CONTINUE: &str = "Continue toward the goal. If the objective is now fully met, reply \
 with exactly `GOAL COMPLETE` and nothing else; otherwise do the next step.";
 
+/// The `/review` directive: a read-only, line-by-line review of a diff.
+const REVIEW_PREAMBLE: &str = "[Code review] Review the changes below as a senior engineer \
+would before a merge. This is READ-ONLY: do not modify, create, or delete any file.\n\
+\n\
+1. Establish the diff. With no target given, review the working diff: `git status --short` \
+plus `git diff HEAD` (staged + unstaged). If the working tree is clean, review the last \
+commit (`git show HEAD`). If a target is given and names a git ref, review \
+`git diff <target>...HEAD` (plus the working diff); if it names a path or topic, restrict \
+the review to that scope.\n\
+2. For every changed hunk, read enough surrounding code to judge it in context — follow \
+callers and callees a change could break. Never judge from the diff alone.\n\
+3. Report only findings that matter: correctness bugs, edge cases, races, security issues, \
+API misuse, behavior changes callers don't expect, dead or duplicated logic, missing tests \
+for risky changes. Skip style nits a formatter or linter would catch.\n\
+4. Present the review as:\n\
+   - One finding per bullet: `file:line — [P0|P1|P2] summary`, then 1-3 sentences of why \
+it's wrong (with a concrete failure scenario) and a suggested fix. P0 = must fix before \
+merge, P1 = should fix, P2 = polish. Order by severity.\n\
+   - A closing verdict paragraph: overall quality, whether it's safe to merge, and what \
+you checked but found sound.\n\
+   - If there are no findings, say so explicitly and list what you verified.";
+
 /// The `/plan go` message — the plan is already in engine history, so only the
 /// go-ahead + guidance is sent.
 pub(super) fn plan_go_message(guidance: &str) -> String {
@@ -280,6 +302,17 @@ impl CodeTuiApp {
         input: String,
         record: Option<String>,
     ) -> Result<()> {
+        self.dispatch_user_message_shown(input, record, None).await
+    }
+
+    /// Like [`dispatch_user_message`], but the transcript shows `display`
+    /// (e.g. `/review main`) while the model receives the full `input`.
+    pub(super) async fn dispatch_user_message_shown(
+        &mut self,
+        input: String,
+        record: Option<String>,
+        display: Option<String>,
+    ) -> Result<()> {
         // A known text-only model would 400 on image bytes; refuse here instead,
         // keeping the draft + attachment so the user can switch models and resend.
         if self.model_image_input == Some(false)
@@ -343,7 +376,7 @@ impl CodeTuiApp {
         self.history.push(ChatMessage {
             model: None,
             role: "user".to_string(),
-            content: input.clone(),
+            content: display.unwrap_or_else(|| input.clone()),
             reasoning_content: None,
             attachments: attachments.clone(),
         });
@@ -1414,6 +1447,14 @@ impl CodeTuiApp {
                 self.run_plan_command(arg).await;
                 Ok(false)
             }
+            SlashCommand::Review(arg) => {
+                self.run_review_command(arg).await;
+                Ok(false)
+            }
+            SlashCommand::Memory => {
+                self.run_memory_command();
+                Ok(false)
+            }
             SlashCommand::Effort(arg) => {
                 self.run_effort_command(arg).await;
                 Ok(false)
@@ -1855,10 +1896,86 @@ impl CodeTuiApp {
         self.draft_history_stash = None;
     }
 
-    /// `/goal`: autonomous goal mode. `<objective>` starts it (submits the first
-    /// turn with goal framing); bare shows status/usage; `stop`/`off`/`cancel`
-    /// ends it. Only for the native agent path. The loop itself is driven by
-    /// `maybe_continue_goal`, called after each agent turn finishes.
+    /// `/memory`: audit surface for `remember` — the saved facts as a card,
+    /// with the file path for hand edits. Local, no model call.
+    pub(super) fn run_memory_command(&mut self) {
+        let cwd = if self.real_cwd.is_empty() {
+            self.cwd.clone()
+        } else {
+            self.real_cwd.clone()
+        };
+        let path = crate::agent::memory::project_memory_path(std::path::Path::new(&cwd));
+        let entries = crate::agent::memory::load_entries(&path);
+        if entries.is_empty() {
+            self.notice = Some((
+                MUTED,
+                "No project memory yet — the agent saves durable facts here with its `remember` tool"
+                    .to_string(),
+            ));
+            return;
+        }
+        let mut content = format!(
+            "{} fact(s) injected into every session in this project:\n\n",
+            entries.len()
+        );
+        for e in &entries {
+            content.push_str(&format!("- {e}\n"));
+        }
+        content.push_str(&format!("\nEdit or delete lines: `{}`", path.display()));
+        self.history.push(ChatMessage {
+            model: None,
+            role: "memory".to_string(),
+            content,
+            reasoning_content: None,
+            attachments: vec![],
+        });
+        self.transcript_revision = self.transcript_revision.wrapping_add(1);
+    }
+
+    /// `/review [ref|scope]`: one agent turn under the review directive — no
+    /// mode state, the directive travels in the message.
+    pub(super) async fn run_review_command(&mut self, arg: Option<String>) {
+        if self.sending {
+            self.queue_command(SlashCommand::Review(arg), "/review");
+            return;
+        }
+        if self.plan_mode {
+            self.notice = Some((
+                ERROR,
+                "Plan mode is active — approve the plan or /plan stop before /review".to_string(),
+            ));
+            return;
+        }
+        if !self.agent_capable() {
+            self.notice = Some((
+                ERROR,
+                "/review needs the native agent (an API key or Copilot — not OAuth or cursor)"
+                    .to_string(),
+            ));
+            return;
+        }
+        let target = arg.as_deref().map(str::trim).unwrap_or("");
+        let (prompt, typed) = if target.is_empty() {
+            (
+                format!("{REVIEW_PREAMBLE}\n\nReview target: the current working diff."),
+                "/review".to_string(),
+            )
+        } else {
+            (
+                format!("{REVIEW_PREAMBLE}\n\nReview target: `{target}`"),
+                format!("/review {target}"),
+            )
+        };
+        if let Err(e) = self
+            .dispatch_user_message_shown(prompt, None, Some(typed))
+            .await
+        {
+            self.notice = Some((ERROR, e.to_string()));
+        }
+    }
+
+    /// `/goal`: autonomous goal mode. `<objective>` starts it; bare shows
+    /// status; `stop` ends it. The loop is driven by `maybe_continue_goal`.
     pub(super) async fn run_goal_command(&mut self, arg: Option<String>) {
         match arg.as_deref().map(str::trim) {
             None | Some("") => {
@@ -1917,11 +2034,11 @@ impl CodeTuiApp {
                 // Fresh objective: no stale guard-stop from a prior loop.
                 self.goal_guard_stop = None;
                 let first = format!("{GOAL_PREAMBLE}\n\nObjective: {objective}");
-                // The model receives the expanded preamble, but draft history must
-                // record only the typed `/goal <objective>` (done by `submit_draft`),
-                // not this machine text — so send with `record: None`. Mirrors how
-                // `send_skill_message` keeps the re-runnable `/name args` recallable.
-                if let Err(e) = self.dispatch_user_message(first, None).await {
+                let typed = format!("/goal {objective}");
+                if let Err(e) = self
+                    .dispatch_user_message_shown(first, None, Some(typed))
+                    .await
+                {
                     self.goal_mode = None;
                     self.notice = Some((ERROR, e.to_string()));
                     return;
@@ -2022,7 +2139,9 @@ pieces and keep going"
         let draft = std::mem::take(&mut self.draft);
         let cursor = self.cursor;
         let attachments = std::mem::take(&mut self.draft_attachments);
-        let sent = self.dispatch_user_message(continuation, None).await;
+        let sent = self
+            .dispatch_user_message_shown(continuation, None, Some("/goal — continue".to_string()))
+            .await;
         self.draft = draft;
         self.cursor = cursor;
         self.draft_attachments = attachments;
@@ -2349,6 +2468,7 @@ pieces and keep going"
         self.pending_reasoning.clear();
         self.pending_submit = None;
         self.sending = false;
+        self.clear_tool_output();
         self.request_started_at = None;
         self.session_id = new_code_session_id();
         // New session → re-root NEW jobs' logs (running jobs keep their absolute paths).
@@ -2977,6 +3097,14 @@ impl crate::agent::engine::AgentUi for ChatAgentUi {
                 args: args.clone(),
                 line_starts,
                 old_content,
+            })
+            .ok();
+    }
+
+    fn tool_output(&mut self, _name: &str, chunk: &str) {
+        self.tx
+            .send(RuntimeEvent::AgentToolOutput {
+                chunk: chunk.to_string(),
             })
             .ok();
     }

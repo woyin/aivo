@@ -2083,9 +2083,12 @@ const HELP_COMMAND_GROUPS: &[(&str, &[&str])] = &[
         ],
     ),
     ("Model & key", &["model", "key"]),
-    ("Context", &["attach", "detach", "compact", "context"]),
+    (
+        "Context",
+        &["attach", "detach", "compact", "context", "memory"],
+    ),
     ("Skills & tools", &["skills", "create-skill", "mcp"]),
-    ("Autonomous", &["plan", "goal"]),
+    ("Autonomous", &["plan", "goal", "review"]),
     // Shown only on the aivo provider (hidden by `slash_command_visible`).
     ("aivo account", &["login", "usage", "logout"]),
 ];

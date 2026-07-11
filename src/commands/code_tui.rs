@@ -193,6 +193,8 @@ impl CodeTuiApp {
             wait_tick: None,
             last_stream_activity: None,
             subagent_rows: Vec::new(),
+            tool_output_tail: std::collections::VecDeque::new(),
+            tool_output_partial: String::new(),
             status_display: None,
             turn_output_tokens: 0,
             retrying: false,

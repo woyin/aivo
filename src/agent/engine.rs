@@ -154,6 +154,9 @@ pub trait AgentUi: Send {
     /// The agent set/updated its plan via `update_plan`; rendered as a checklist card. Default no-op.
     fn plan_updated(&mut self, _items: &[PlanItem]) {}
     fn tool_start(&mut self, name: &str, args: &Value);
+    /// Live output chunk from an in-flight `run_bash` (local display only,
+    /// pre-redaction like `tool_result`). Default no-op.
+    fn tool_output(&mut self, _name: &str, _chunk: &str) {}
     fn tool_result(&mut self, name: &str, result: &Result<String, String>);
     fn notify(&mut self, text: &str);
     /// The turn ended early for `stop` (also announced via `notify` for display).
@@ -532,6 +535,7 @@ impl AgentEngine {
         }
         specs.push(plan::plan_tool_spec());
         specs.push(notes::note_tool_spec());
+        specs.push(crate::agent::memory::memory_tool_spec());
         specs.push(subagent_tool_spec(&[]));
         let mut tools_openai: Vec<Value> = specs.into_iter().map(tool_to_openai).collect();
         // Native-search providers get the server tool instead of the local one (mutually exclusive).
@@ -2117,6 +2121,27 @@ you were working. If the outcome matters to the task, inspect the log; otherwise
                     }),
                     Err(e) => Err(e),
                 }
+            } else if n == "remember" {
+                // Notify so a saved memory never lands silently (poison audit).
+                match crate::agent::memory::parse_fact(&call.arguments) {
+                    Ok(fact) => {
+                        let path = crate::agent::memory::project_memory_path(ctx.cwd);
+                        match crate::agent::memory::remember(&path, &fact) {
+                            Ok(crate::agent::memory::RememberOutcome::Added(count)) => {
+                                ui.notify(&format!("remembered: {fact}"));
+                                Ok(format!(
+                                    "Remembered ({count} saved) — this is injected into every \
+future session in this project. The user can audit or edit it via /memory."
+                                ))
+                            }
+                            Ok(crate::agent::memory::RememberOutcome::Refreshed) => {
+                                Ok("Already remembered (recency refreshed).".to_string())
+                            }
+                            Err(e) => Err(e),
+                        }
+                    }
+                    Err(e) => Err(e),
+                }
             } else if n == "switch_model" {
                 match call.arguments.get("model").and_then(|v| v.as_str()) {
                     Some(m) if !m.trim().is_empty() => ui.switch_chat_model(m.trim()).await,
@@ -2335,7 +2360,9 @@ Before calling `{tool}` again, make its arguments match this schema exactly:\n{s
         ui: &mut dyn AgentUi,
         args: &Value,
     ) -> Result<String, String> {
-        let outcome = tools::run_bash_confined(args, ctx.cwd).await;
+        let outcome =
+            Self::pump_bash_progress(ui, |tx| tools::run_bash_confined(args, ctx.cwd, Some(tx)))
+                .await;
         if !outcome.sandbox_blocked {
             return outcome.result;
         }
@@ -2369,7 +2396,29 @@ Re-run the full command without write confinement?",
             return outcome.result;
         }
         ui.notify(SANDBOX_ESCALATION_NOTICE);
-        tools::run_bash_unconfined(args, ctx.cwd).await
+        Self::pump_bash_progress(ui, |tx| tools::run_bash_unconfined(args, ctx.cwd, Some(tx))).await
+    }
+
+    /// Run a `run_bash` future, forwarding its live output chunks to the UI.
+    async fn pump_bash_progress<T, F, Fut>(ui: &mut dyn AgentUi, run: F) -> T
+    where
+        F: FnOnce(tools::BashProgress) -> Fut,
+        Fut: std::future::Future<Output = T>,
+    {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let fut = run(tx);
+        let mut fut = std::pin::pin!(fut);
+        let out = loop {
+            tokio::select! {
+                out = &mut fut => break out,
+                Some(chunk) = rx.recv() => ui.tool_output("run_bash", &chunk),
+            }
+        };
+        // Completion can race chunks still queued in the channel.
+        while let Ok(chunk) = rx.try_recv() {
+            ui.tool_output("run_bash", &chunk);
+        }
+        out
     }
 
     /// True when a `write_file` would overwrite an existing file the model hasn't

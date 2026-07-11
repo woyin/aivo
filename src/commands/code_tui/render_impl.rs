@@ -664,6 +664,10 @@ impl CodeTuiApp {
             lines.push(row);
             bars.push(None);
         }
+        for row in self.tool_output_tail_rows() {
+            lines.push(row);
+            bars.push(None);
+        }
     }
 
     /// Live parallel-batch rows, styled like the spinner they sit under. Empty
@@ -677,6 +681,28 @@ impl CodeTuiApp {
             .iter()
             .map(|row| line_plain(super::render::subagent_row_text(row), style))
             .collect()
+    }
+
+    /// Live `run_bash` tail rows under the spinner; empty when idle so an
+    /// interrupted turn can't leave ghost output.
+    fn tool_output_tail_rows(&self) -> Vec<StyledLine> {
+        if !self.sending {
+            return Vec::new();
+        }
+        let style = Style::default().fg(MUTED);
+        let mut rows: Vec<StyledLine> = self
+            .tool_output_tail
+            .iter()
+            .map(|line| line_plain(super::render::tool_tail_row_text(line), style))
+            .collect();
+        let partial = self.tool_output_partial.trim_end();
+        if !partial.trim().is_empty() {
+            rows.push(line_plain(
+                super::render::tool_tail_row_text(partial),
+                style,
+            ));
+        }
+        rows
     }
 
     /// A cheap O(1) fingerprint of everything the cached *history body* depends
@@ -902,6 +928,10 @@ impl CodeTuiApp {
             tail.push(spinner.clone());
             tail_bars.push(None);
             for row in self.subagent_status_rows() {
+                tail.push(row);
+                tail_bars.push(None);
+            }
+            for row in self.tool_output_tail_rows() {
                 tail.push(row);
                 tail_bars.push(None);
             }
