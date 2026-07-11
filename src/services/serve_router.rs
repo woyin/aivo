@@ -65,6 +65,7 @@ pub struct ServeRouterConfig {
     pub is_copilot: bool,
     pub is_openrouter: bool,
     pub is_starter: bool,
+    pub is_joycode: bool,
     pub cors: bool,
     pub timeout: u64,
     pub auth_token: Option<String>,
@@ -98,6 +99,7 @@ impl ServeRouterConfig {
             is_copilot: profile.serve_flags.is_copilot,
             is_openrouter: profile.serve_flags.is_openrouter,
             is_starter: profile.serve_flags.is_starter,
+            is_joycode: crate::services::joycode_oauth::is_joycode_key(&key.base_url),
             cors,
             timeout,
             auth_token,
@@ -310,6 +312,7 @@ impl ServeRouter {
                         is_copilot,
                         is_openrouter: profile.serve_flags.is_openrouter,
                         is_starter: profile.serve_flags.is_starter,
+                        is_joycode: crate::services::joycode_oauth::is_joycode_key(&fk.base_url),
                         cors: false,
                         timeout,
                         auth_token: None,
@@ -640,6 +643,11 @@ async fn run_accept_loop(listener: tokio::net::TcpListener, state: Arc<ServeStat
 }
 
 async fn handle_models(state: &ServeState) -> Result<RouterResponse> {
+    // JoyCode has a custom models endpoint.
+    if state.config.is_joycode {
+        let ctx = upstream_context(state);
+        return crate::services::joycode_router::send_joycode_models(&ctx).await;
+    }
     let models = fetch_models(&state.client, &state.key).await?;
     // Local cache instance: lazy one-time disk read, and this endpoint
     // already pays a network fetch per call.
@@ -1074,6 +1082,16 @@ async fn handle_chat_body(body: Value, state: &ServeState) -> Result<RouterRespo
         return Ok(result);
     }
 
+    // JoyCode uses a fixed OpenAI-compatible protocol with custom headers/signing.
+    if state.config.is_joycode {
+        let mut body = body;
+        let ctx = upstream_context(state);
+        return crate::services::joycode_router::send_joycode_chat(
+            &mut body, client_wants_stream, &ctx,
+        )
+        .await;
+    }
+
     // Skip fallback for openrouter — fixed protocol.
     if state.config.is_openrouter {
         let mut body = body;
@@ -1205,6 +1223,7 @@ fn upstream_context(state: &ServeState) -> UpstreamRequestContext {
         is_copilot: state.config.is_copilot,
         is_openrouter: state.config.is_openrouter,
         is_starter: state.config.is_starter,
+        is_joycode: state.config.is_joycode,
         copilot_tokens: state.copilot_tokens.clone(),
         accounting: state.usage_sink.is_some(),
     }
@@ -1510,6 +1529,7 @@ mod tests {
                 is_copilot: false,
                 is_openrouter: false,
                 is_starter: false,
+                is_joycode: false,
                 cors: false,
                 timeout: 300,
                 auth_token: None,
@@ -1656,6 +1676,7 @@ mod tests {
                 is_copilot: false,
                 is_openrouter: true,
                 is_starter: false,
+                is_joycode: false,
                 cors: false,
                 timeout: 300,
                 auth_token: None,
@@ -1835,6 +1856,7 @@ mod tests {
                 is_copilot: false,
                 is_openrouter: false,
                 is_starter: false,
+                is_joycode: false,
                 cors: false,
                 timeout: 300,
                 auth_token: None,
@@ -1870,6 +1892,7 @@ mod tests {
             is_copilot: false,
             is_openrouter: false,
             is_starter: false,
+                is_joycode: false,
             cors: false,
             timeout: 300,
             auth_token: None,
@@ -1904,6 +1927,7 @@ mod tests {
                 is_copilot: false,
                 is_openrouter: false,
                 is_starter: false,
+                is_joycode: false,
                 cors: false,
                 timeout: 300,
                 auth_token: None,

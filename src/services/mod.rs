@@ -53,6 +53,8 @@ pub mod huggingface;
 pub mod id_compact;
 pub mod key_compat;
 pub mod known_providers;
+pub mod joycode_oauth;
+pub mod joycode_router;
 pub mod last_selection;
 pub mod launch_args;
 pub mod launch_runtime;
