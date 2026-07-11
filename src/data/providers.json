@@ -278,10 +278,5 @@
     "id": "joycode",
     "name": "JoyCode (JD)",
     "base_url": "https://joycode-api.jd.com"
-  },
-  {
-    "id": "joycode-proxy",
-    "name": "JoyCode Proxy",
-    "base_url": "http://localhost:34891"
   }
 ]

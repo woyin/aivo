@@ -139,7 +139,7 @@ fn request_url(
 }
 
 /// JoyCode credentials extracted from the stored key.
-/// These are serialized as JSON in the `ApiKey.key` field when using JoyCode OAuth.
+/// Serialized as JSON in `ApiKey.key`.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct JoyCodeKeyData {
     pub pt_key: String,
