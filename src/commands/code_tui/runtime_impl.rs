@@ -39,6 +39,19 @@ merge, P1 = should fix, P2 = polish. Order by severity.\n\
 you checked but found sound.\n\
    - If there are no findings, say so explicitly and list what you verified.";
 
+/// Bare-`/plan` kick-off: interview for an objective. `ask_user` keeps the turn
+/// alive — a prose question would end it and be stamped as a drafted plan.
+pub(super) const PLAN_KICKOFF_MESSAGE: &str = "The user entered plan mode without saying what \
+to plan. Interview them for the objective before any planning:\n\
+1. Orient briefly (git status/log, project layout) — only as far as it yields concrete \
+suggestions.\n\
+2. Call `ask_user` asking what they want to build, fix, or change — offer candidates you \
+noticed as options; they can also type their own.\n\
+3. With the objective clear, investigate the code it touches and call `exit_plan_mode` with \
+the complete plan.\n\
+Never call `exit_plan_mode` before the user states an objective; if their answer is ambiguous, \
+ask one focused follow-up.";
+
 /// The `/plan go` message — the plan is already in engine history, so only the
 /// go-ahead + guidance is sent.
 pub(super) fn plan_go_message(guidance: &str) -> String {
@@ -2248,8 +2261,9 @@ pieces and keep going"
         self.plan_exit_pending = false;
     }
 
-    /// `/plan`: `[objective]` enters plan mode; `go [guidance]` approves a drafted
-    /// plan and executes it in the same session; `stop` leaves.
+    /// `/plan`: `[objective]` enters plan mode; bare also sends a kick-off turn
+    /// so the agent interviews for the objective; `go [guidance]` approves a
+    /// drafted plan and executes it in the same session; `stop` leaves.
     pub(super) async fn run_plan_command(&mut self, arg: Option<String>) {
         let arg = arg.as_deref().map(str::trim).unwrap_or("");
         // First word = action; the rest is `go`'s optional guidance.
@@ -2316,8 +2330,12 @@ pieces and keep going"
                 if self.plan_mode {
                     self.notice = Some((
                         MUTED,
-                        "Plan mode is on — approve the plan card (or /plan go), or /plan stop to leave"
-                            .to_string(),
+                        if self.pending_plan.is_some() {
+                            "Plan mode is on — approve the plan card (or /plan go), or /plan stop to leave"
+                        } else {
+                            "Plan mode is on — describe what to plan, or /plan stop to leave"
+                        }
+                        .to_string(),
                     ));
                     return;
                 }
@@ -2334,12 +2352,32 @@ pieces and keep going"
                     ));
                     return;
                 }
+                // Stash the composer so the kick-off can't swallow a draft or
+                // staged attachment; the transcript shows the compact `/plan`.
+                let draft = std::mem::take(&mut self.draft);
+                let cursor = self.cursor;
+                let attachments = std::mem::take(&mut self.draft_attachments);
+                let sent = self
+                    .dispatch_user_message_shown(
+                        PLAN_KICKOFF_MESSAGE.to_string(),
+                        None,
+                        Some("/plan".to_string()),
+                    )
+                    .await;
+                self.draft = draft;
+                self.cursor = cursor;
+                self.draft_attachments = attachments;
+                self.sync_command_menu_state();
+                if let Err(e) = sent {
+                    self.notice = Some((ERROR, e.to_string()));
+                    return;
+                }
                 self.notice = Some((
                     MUTED,
                     if goal_stopped {
                         "Goal mode stopped — plan mode is read-only until you approve the plan"
                     } else {
-                        "Plan mode — describe what to plan; read-only until you approve the plan"
+                        "Plan mode — read-only until you approve the plan"
                     }
                     .to_string(),
                 ));

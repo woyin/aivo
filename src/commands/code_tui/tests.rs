@@ -8472,8 +8472,8 @@ async fn test_plan_card_idx_shifts_on_removal() {
 
 /// Plan-mode state machine without the dispatch paths (which need a serve):
 /// a finished plan-mode turn drafts its reply as the pending plan while the
-/// MODE PERSISTS; `stop` leaves the mode; bare reports status / enters it;
-/// `go` with nothing pending just guides.
+/// MODE PERSISTS; `stop` leaves the mode; bare while on reports status (with
+/// vs without a draft); `go` with nothing pending just guides.
 #[tokio::test]
 async fn test_plan_capture_discard_and_status() {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
@@ -8486,9 +8486,19 @@ async fn test_plan_capture_discard_and_status() {
         attachments: vec![],
     };
 
+    // Bare `/plan` in the mode with nothing drafted points at the composer.
+    app.plan_mode = true;
+    app.run_plan_command(None).await;
+    assert!(
+        app.notice
+            .as_ref()
+            .unwrap()
+            .1
+            .contains("describe what to plan")
+    );
+
     // A finished plan-mode turn stashes the reply as the draft — and stays in
     // plan mode (persistent until approved or stopped).
-    app.plan_mode = true;
     app.history.push(assistant("1. do X\n2. do Y"));
     app.capture_plan_draft();
     assert!(app.plan_mode, "plan mode persists after a draft");
@@ -8500,9 +8510,15 @@ async fn test_plan_capture_discard_and_status() {
         app.history.iter().rposition(|m| m.role == "assistant")
     );
 
-    // Bare `/plan` while in plan mode reports status.
+    // Bare `/plan` with a drafted plan points at the approval card instead.
     app.run_plan_command(None).await;
-    assert!(app.notice.as_ref().unwrap().1.contains("Plan mode is on"));
+    assert!(
+        app.notice
+            .as_ref()
+            .unwrap()
+            .1
+            .contains("approve the plan card")
+    );
 
     // `/plan stop` leaves plan mode, discarding the draft and the card frame.
     app.run_plan_command(Some("stop".to_string())).await;
@@ -8534,19 +8550,18 @@ async fn test_plan_capture_discard_and_status() {
     assert!(!app.plan_mode);
 }
 
-/// Bare `/plan` enters plan mode without dispatching a turn; the approval-card
-/// verdicts pick the exit mode Claude Code-style: 1 = approve + auto-approve,
-/// 2 = approve + manual approval, 3 = keep planning.
+/// Approval-card verdicts, Claude Code-style: 1 = approve + auto-approve,
+/// 2 = approve + manual approval, 3 = keep planning. (Bare `/plan`'s kick-off
+/// dispatch is covered in `test_plan_bare_dispatches_kickoff`.)
 #[tokio::test]
 async fn test_plan_mode_enter_and_approval_verdicts() {
     use crate::agent::protocol::PlanDecision;
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let mut app = make_test_app(tx, rx);
 
-    // Bare `/plan` while off enters the mode (no engine yet — build-time entry).
-    app.run_plan_command(None).await;
+    // Enter the mode (no engine yet — build-time entry).
+    assert!(app.enter_plan_mode().await);
     assert!(app.plan_mode);
-    assert!(app.notice.as_ref().unwrap().1.contains("Plan mode"));
 
     // Approve & auto-approve: mode off, execution continues unattended.
     let (reply, mut rx1) = tokio::sync::oneshot::channel();
@@ -9517,10 +9532,27 @@ async fn test_plan_entry_stops_goal_mode() {
         iteration: 3,
         max: 20,
     });
+    // Image in history + unknown vision pins the kick-off to plain chat — an
+    // agent engine build would touch real config/git.
+    app.history.push(ChatMessage {
+        model: None,
+        role: "user".to_string(),
+        content: "look".to_string(),
+        reasoning_content: None,
+        attachments: vec![MessageAttachment {
+            name: "shot.png".to_string(),
+            mime_type: "image/png".to_string(),
+            storage: AttachmentStorage::Inline {
+                data: "iVBOR".to_string(),
+            },
+        }],
+    });
+    app.model_image_input = None;
     app.run_plan_command(None).await;
 
     assert!(app.plan_mode, "plan mode is on");
     assert!(app.goal_mode.is_none(), "plan entry ends the goal loop");
+    assert!(app.sending, "the kick-off turn went out");
     assert!(app.notice.as_ref().unwrap().1.contains("Goal mode stopped"));
 }
 
@@ -9751,6 +9783,54 @@ async fn test_plan_go_preserves_composer_draft() {
     assert!(app.sending, "the go message went out");
     assert_eq!(app.draft, "note to self", "draft survives the dispatch");
     assert_eq!(app.cursor, 4);
+}
+
+/// Bare `/plan` enters the mode AND dispatches the kick-off turn: the model
+/// gets the machine text, the transcript shows the compact `/plan`, and
+/// neither a composer draft nor ↑ recall picks it up.
+#[tokio::test]
+async fn test_plan_bare_dispatches_kickoff() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    // Image in history + unknown vision pins the kick-off to plain chat — an
+    // agent engine build would touch real config/git.
+    app.history.push(ChatMessage {
+        model: None,
+        role: "user".to_string(),
+        content: "look".to_string(),
+        reasoning_content: None,
+        attachments: vec![MessageAttachment {
+            name: "shot.png".to_string(),
+            mime_type: "image/png".to_string(),
+            storage: AttachmentStorage::Inline {
+                data: "iVBOR".to_string(),
+            },
+        }],
+    });
+    app.model_image_input = None;
+    app.draft = "note to self".to_string();
+    app.cursor = 4;
+
+    app.run_plan_command(None).await;
+
+    assert!(app.plan_mode, "bare /plan enters the mode");
+    assert!(app.sending, "the kick-off went out");
+    assert_eq!(
+        app.pending_submit.as_ref().unwrap().content,
+        super::runtime_impl::PLAN_KICKOFF_MESSAGE,
+        "the model receives the interview instructions"
+    );
+    assert_eq!(
+        app.history.last().unwrap().content,
+        "/plan",
+        "the transcript shows the compact command, not the machine text"
+    );
+    assert_eq!(app.draft, "note to self", "draft survives the dispatch");
+    assert_eq!(app.cursor, 4);
+    assert!(
+        app.draft_history.is_empty(),
+        "machine text never enters ↑ recall"
+    );
 }
 
 /// A non-UTF8 file under a text mime (unknown extension) is refused with a clear
