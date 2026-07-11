@@ -4960,6 +4960,65 @@ fn test_agent_events_build_display_history() {
 }
 
 #[test]
+fn test_folded_run_bash_result_keeps_streaming_tail_height() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+
+    // Short output stays whole under the summary — nothing vanishes.
+    app.apply_agent_tool_call(
+        None,
+        "run_bash".to_string(),
+        serde_json::json!({"command": "make"}),
+        vec![],
+        None,
+    );
+    app.apply_agent_tool_result("line one\nline two\nline three".to_string());
+    let plain = app.build_transcript().plain_lines.join("\n");
+    assert!(plain.contains("line one"), "{plain}");
+    assert!(plain.contains("line three"), "{plain}");
+
+    // Long output keeps only the last `STREAM_TAIL_LINES` — no collapse, no flood.
+    app.apply_agent_tool_call(
+        None,
+        "run_bash".to_string(),
+        serde_json::json!({"command": "curl"}),
+        vec![],
+        None,
+    );
+    let long = (1..=40)
+        .map(|n| format!("row {n}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    app.apply_agent_tool_result(long);
+    let plain = app.build_transcript().plain_lines.join("\n");
+    assert!(plain.contains("row 40"), "last line kept: {plain}");
+    assert!(plain.contains("row 37"), "tail window kept: {plain}");
+    assert!(
+        !plain.contains("row 36"),
+        "earlier lines fold away: {plain}"
+    );
+    assert!(
+        !plain.contains("row 20"),
+        "earlier lines fold away: {plain}"
+    );
+
+    // A non-run_bash tool has no tail, so it stays a summary line only.
+    app.apply_agent_tool_call(
+        None,
+        "read_file".to_string(),
+        serde_json::json!({"path": "a.rs"}),
+        vec![],
+        None,
+    );
+    app.apply_agent_tool_result("secret-alpha\nsecret-beta".to_string());
+    let plain = app.build_transcript().plain_lines.join("\n");
+    assert!(
+        !plain.contains("secret-alpha"),
+        "a non-run_bash result stays folded: {plain}"
+    );
+}
+
+#[test]
 fn test_native_tool_paths_render_relative_to_cwd() {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let mut app = make_test_app(tx, rx);
@@ -5221,8 +5280,8 @@ fn test_failed_bash_result_shows_exit_code_in_error_hue() {
 
 #[test]
 fn test_tool_result_expands_inline_via_keyboard_toggle() {
-    // A multi-line agent tool result folds behind its `▸ +N lines` summary;
-    // Ctrl+O (toggle_latest_output) reveals the lines in place and folds back.
+    // Folded run_bash keeps only the streamed tail; Ctrl+O (toggle_latest_output)
+    // reveals the full output in place and folds back.
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let mut app = make_test_app(tx, rx);
     app.apply_agent_tool_call(
@@ -5232,29 +5291,36 @@ fn test_tool_result_expands_inline_via_keyboard_toggle() {
         vec![],
         None,
     );
-    app.apply_agent_tool_result("test a ... ok\ntest b ... FAILED\n[exit 1]".to_string());
+    // Eight lines: folded keeps the tail, so the first lines only appear expanded.
+    app.apply_agent_tool_result(
+        "test 1 ... ok\ntest 2 ... ok\ntest 3 ... ok\ntest a ... ok\n\
+         test b ... FAILED\ntest c ... ok\ntest d ... ok\n[exit 1]"
+            .to_string(),
+    );
 
     let plain = app.build_transcript().plain_lines.join("\n");
-    assert!(plain.contains("▸ +3 lines"), "{plain}");
+    assert!(plain.contains("▸ +8 lines"), "{plain}");
     assert!(plain.contains("exited 1"), "{plain}");
+    // The streamed tail stays put, but earlier lines fold away.
+    assert!(plain.contains("[exit 1]"), "tail line kept: {plain}");
     assert!(
-        !plain.contains("test b ... FAILED"),
-        "folded result must hide its lines: {plain}"
+        !plain.contains("test 1 ... ok"),
+        "folded result hides its early lines: {plain}"
     );
 
     assert!(app.toggle_latest_output());
     let plain = app.build_transcript().plain_lines.join("\n");
     assert!(
-        plain.contains("test b ... FAILED"),
-        "expanded result must show its lines: {plain}"
+        plain.contains("test 1 ... ok"),
+        "expanded result must show all its lines: {plain}"
     );
     // The summary stays the (sole) toggle for a short block — no trailing collapse.
-    assert!(plain.contains("▾ 3 lines"), "{plain}");
+    assert!(plain.contains("▾ 8 lines"), "{plain}");
     assert!(!plain.contains(OUTPUT_EXPANDED_PREFIX), "{plain}");
 
     assert!(app.toggle_latest_output());
     let plain = app.build_transcript().plain_lines.join("\n");
-    assert!(!plain.contains("test b ... FAILED"), "{plain}");
+    assert!(!plain.contains("test 1 ... ok"), "{plain}");
 }
 
 #[test]

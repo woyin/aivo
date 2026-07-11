@@ -805,7 +805,7 @@ impl CodeTuiApp {
     /// Fold a live output chunk into the tail; a bare \r (progress redraw)
     /// counts as a line break.
     pub(super) fn push_tool_output(&mut self, chunk: &str) {
-        const TAIL_LINES: usize = 5;
+        const TAIL_LINES: usize = super::render::STREAM_TAIL_LINES;
         const PARTIAL_CAP: usize = 512;
         self.tool_output_partial.push_str(chunk);
         while let Some(pos) = self.tool_output_partial.find(['\n', '\r']) {

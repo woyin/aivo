@@ -1348,6 +1348,10 @@ pub(super) const MAX_OUTPUT_LINES: usize = 40;
 /// change — an unbounded 50k-line expand would re-freeze the UI each turn.
 pub(super) const MAX_EXPANDED_OUTPUT_LINES: usize = 2_000;
 
+/// Trailing lines a folded `run_bash` result keeps visible — its live streaming
+/// window (`push_tool_output`'s tail), so landing doesn't drop them and jump the view.
+pub(super) const STREAM_TAIL_LINES: usize = 4;
+
 /// How many output lines a finished `!cmd` persists into its `local_command` history
 /// entry (and the on-disk session) — a bounded preview that caps session size and is
 /// what an expanded block falls back to after a resume. The true count rides along as
@@ -1658,6 +1662,15 @@ pub(super) fn render_tool_result(
                 lines.push(line_with_plain(vec![Span::styled(
                     format!("  {OUTPUT_EXPANDED_PREFIX}"),
                     Style::default().fg(MUTED),
+                )]));
+            }
+        } else if tool == Some("run_bash") {
+            // Keep the streamed tail under the summary so landing doesn't jump the view.
+            for line in result.lines().skip(count.saturating_sub(STREAM_TAIL_LINES)) {
+                let is_exit_line = line.trim().starts_with("[exit ");
+                lines.push(line_with_plain(vec![Span::styled(
+                    format!("    {}", strip_ansi_and_controls(line)),
+                    Style::default().fg(if is_exit_line { ERROR } else { FAINT }),
                 )]));
             }
         }
