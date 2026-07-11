@@ -6208,6 +6208,7 @@ mod tests {
 
     // --- user lifecycle hooks ---
 
+    #[cfg(unix)] // every caller is a #[cfg(unix)] hook test; ungated it's dead code on Windows
     fn hookset(
         dir: &std::path::Path,
         json_str: &str,

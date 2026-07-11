@@ -672,7 +672,10 @@ fn bash_is_catastrophic(cmd: &str) -> bool {
                 .any(|t| t.strip_prefix("of=").is_some_and(is_raw_device_path)),
             "chmod" | "chown" | "chgrp" => {
                 has_short_or_long(tokens, &['r'], &["recursive"])
-                    && tokens.iter().skip(1).any(|t| *t == "/")
+                    && tokens
+                        .iter()
+                        .skip(1)
+                        .any(|t| strip_matching_quotes(t) == "/")
             }
             "shutdown" | "reboot" | "halt" | "poweroff" => true,
             "init" => matches!(tokens.get(1), Some(&"0") | Some(&"6")),
@@ -718,6 +721,7 @@ fn windows_seg_is_catastrophic(tokens: &[&str]) -> bool {
 /// A Windows drive/home/system root (`C:\`, `\`, `~`, `$env:`/`%…%`) whose
 /// recursive deletion is unrecoverable. A subpath is not matched.
 fn is_windows_root_target(arg: &str) -> bool {
+    let arg = strip_matching_quotes(arg);
     let trimmed = arg.trim_end_matches(['*', '\\', '/']);
     // "<letter>:" drive root.
     if let [letter, b':'] = trimmed.as_bytes()
@@ -794,11 +798,23 @@ fn effective_command<'a>(tokens: &'a [&'a str]) -> &'a [&'a str] {
 /// or the whole cwd (`.`), with or without a trailing `/` or `/*`. A workspace
 /// subpath (`./build`, `~/Documents`) is not matched. `arg` arrives lowercased.
 fn is_root_or_home_target(arg: &str) -> bool {
+    let arg = strip_matching_quotes(arg);
     let base = arg.strip_suffix("/*").unwrap_or(arg).trim_end_matches('/');
     if arg.starts_with('/') && base.is_empty() {
         return true; // "/", "//", "/*"
     }
     matches!(base, "~" | "$home" | "${home}" | ".")
+}
+
+/// Strip one layer of matching surrounding quotes (`"$HOME"` → `$HOME`).
+fn strip_matching_quotes(arg: &str) -> &str {
+    let bytes = arg.as_bytes();
+    match (bytes.first(), bytes.last()) {
+        (Some(b'"'), Some(b'"')) | (Some(b'\''), Some(b'\'')) if bytes.len() >= 2 => {
+            &arg[1..arg.len() - 1]
+        }
+        _ => arg,
+    }
 }
 
 /// A real `/dev/` block device (`/dev/sda`) vs. a harmless pseudo-device.
@@ -4118,6 +4134,20 @@ mod tests {
         assert!(bash_is_catastrophic("shutdown -h now"));
         assert!(bash_is_catastrophic("sudo reboot"));
         assert!(bash_is_catastrophic("init 0"));
+
+        // Quoted targets classify the same as bare ones.
+        assert!(bash_is_catastrophic("rm -rf \"$HOME\""));
+        assert!(bash_is_catastrophic("rm -rf '$HOME'"));
+        assert!(bash_is_catastrophic("rm -rf \"${HOME}\""));
+        assert!(bash_is_catastrophic("rm -rf \"~\""));
+        assert!(bash_is_catastrophic("rm -rf '~'"));
+        assert!(bash_is_catastrophic("rm -rf \".\""));
+        assert!(bash_is_catastrophic("rm -rf \"/\""));
+        assert!(bash_is_catastrophic("chmod -R 777 \"/\""));
+        assert!(bash_is_catastrophic("chown -R root '/'"));
+        assert!(!bash_is_catastrophic("rm -rf \"~/Documents\""));
+        assert!(!bash_is_catastrophic("rm -rf \"./build\""));
+        assert!(bash_is_catastrophic("ri -recurse \"~\"")); // PowerShell side
 
         // The whole point: workspace-local destruction stays WAIVABLE (must NOT
         // be in the floor, or `/goal` / `-y` runs break). These are still caught
