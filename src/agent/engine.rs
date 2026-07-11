@@ -70,6 +70,12 @@ pub(crate) const STOP_TOOL_FAILURE: &str = "stopping: a tool call kept failing t
 const COMPLETION_NUDGE: &str = "That may not be finished. If the task is genuinely complete, \
 briefly confirm what you did and verified, then stop. Otherwise keep going — don't stop until \
 it's done or you're truly blocked (then say exactly what's blocking you).";
+/// Cap on unstarted-plan nudges per turn.
+const MAX_PLAN_NUDGES: usize = 1;
+const PLAN_NUDGE: &str = "You set a plan this turn but haven't started any of its steps. \
+Execute the plan now, updating each step's status as you go. If the work is already done or \
+you can't proceed, call `update_plan` to reflect that (or say exactly what's blocking you), \
+then finish.";
 
 /// Compaction window assumed when the model's real one is unknown (0); without it
 /// such models never compact and resend the whole transcript. A real window wins.
@@ -1422,6 +1428,9 @@ questions.",
         let mut steps = 0usize;
         let mut leaked_nudges = 0usize;
         let mut completion_nudges = 0usize;
+        let mut plan_nudges = 0usize;
+        // Keeps a stale plan from an earlier turn from triggering the nudge.
+        let mut plan_set_this_turn = false;
         // Post-edit self-verification (opt-in): the project's validator, detected once.
         let validator = self.self_correct.then(|| verify::detect(ctx.cwd)).flatten();
         let mut selfcorrect_attempts = 0usize;
@@ -1665,6 +1674,19 @@ questions.",
                     self.push_text_turn("user", COMPLETION_NUDGE.to_string());
                     continue;
                 }
+                // A plan set this turn but never started isn't done — nudge once.
+                // Plan mode is exempt: proposing without executing is the point.
+                if !self.read_only
+                    && plan_set_this_turn
+                    && plan_nudges < MAX_PLAN_NUDGES
+                    && !self.plan.is_empty()
+                    && !plan::started(&self.plan)
+                {
+                    plan_nudges += 1;
+                    ui.notify("the plan hasn't been started — asking the model to continue");
+                    self.push_text_turn("user", PLAN_NUDGE.to_string());
+                    continue;
+                }
                 // A declared-done turn isn't accepted while the validator fails — feed
                 // the failure back (bounded) so the model fixes the cause.
                 if let Some(v) = &validator
@@ -1724,6 +1746,10 @@ questions.",
                 page_repeats = 0;
                 last_page = page;
             }
+
+            plan_set_this_turn |= message.tool_calls.iter().any(|c| {
+                subagents::normalize_tool_name(&c.name).unwrap_or(&c.name) == "update_plan"
+            });
 
             // Execute this batch (permission-gated); returns extra tokens accrued inside
             // it (sub-agent calls) plus each failed call's (tool, error) for the guard.
@@ -5207,10 +5233,10 @@ mod tests {
         );
     }
 
-    /// An all-pending plan means the model planned but converged WITHOUT executing;
-    /// the `started` gate must not fabricate completion.
+    /// An all-pending plan at convergence gets one nudge; if the model still
+    /// stops, the `started` gate must not fabricate completion.
     #[tokio::test]
-    async fn engine_leaves_unstarted_plan_alone_on_convergence() {
+    async fn engine_nudges_unstarted_plan_once_then_leaves_it_alone() {
         let dir = tmp();
         let plan = tool_call_sse(
             "update_plan",
@@ -5219,7 +5245,11 @@ mod tests {
                 {"step": "b", "status": "pending"}
             ]}),
         );
-        let port = spawn_sse_sequence(vec![plan, FINAL_TEXT_SSE.to_string()]);
+        let port = spawn_sse_sequence(vec![
+            plan,
+            FINAL_TEXT_SSE.to_string(),
+            FINAL_TEXT_SSE.to_string(),
+        ]);
         let client = reqwest::Client::builder().no_proxy().build().unwrap();
         let base = format!("http://127.0.0.1:{port}");
         let mut engine = AgentEngine::new(&dir.display().to_string(), "m", "", &[], &[], 0, 0);
@@ -5232,9 +5262,101 @@ mod tests {
         )
         .await;
 
+        let nudges = engine
+            .messages
+            .iter()
+            .filter(|m| {
+                role(m) == "user" && content_str(m).contains("haven't started any of its steps")
+            })
+            .count();
+        assert_eq!(nudges, 1, "unstarted plan gets exactly one nudge");
+        assert_no_consecutive_user(&engine.messages);
+        assert_eq!(engine.messages.last().unwrap()["content"], "done");
         // Only the model's event fired — no engine finalization.
         assert_eq!(ui.plans, vec![2]);
         assert_eq!(ui.last_plan, vec![PlanStatus::Pending, PlanStatus::Pending]);
+    }
+
+    /// Plan mode proposes without executing — no unstarted-plan nudge there.
+    #[tokio::test]
+    async fn plan_mode_skips_unstarted_plan_nudge() {
+        let dir = tmp();
+        let plan = tool_call_sse(
+            "update_plan",
+            json!({"plan": [
+                {"step": "a", "status": "pending"},
+                {"step": "b", "status": "pending"}
+            ]}),
+        );
+        let port = spawn_sse_sequence(vec![plan, FINAL_TEXT_SSE.to_string()]);
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let base = format!("http://127.0.0.1:{port}");
+        let mut engine = AgentEngine::new(&dir.display().to_string(), "m", "", &[], &[], 0, 0);
+        engine.set_plan_mode(true);
+        let mut ui = CapturingUi::default();
+        run_session(
+            &mut engine,
+            &turn_ctx(&client, &base, &dir),
+            Some("plan only".into()),
+            &mut ui,
+        )
+        .await;
+
+        assert!(
+            !engine
+                .messages
+                .iter()
+                .any(|m| content_str(m).contains("haven't started any of its steps")),
+            "plan mode must not nudge an unstarted plan"
+        );
+        assert_eq!(engine.messages.last().unwrap()["content"], "done");
+    }
+
+    /// A stale unstarted plan from an earlier turn must not nudge a later turn.
+    #[tokio::test]
+    async fn stale_plan_from_prior_turn_does_not_nudge() {
+        let dir = tmp();
+        let plan = tool_call_sse(
+            "update_plan",
+            json!({"plan": [
+                {"step": "a", "status": "pending"},
+                {"step": "b", "status": "pending"}
+            ]}),
+        );
+        // Turn 1: plan, nudged converge, stop. Turn 2: plain answer.
+        let port = spawn_sse_sequence(vec![
+            plan,
+            FINAL_TEXT_SSE.to_string(),
+            FINAL_TEXT_SSE.to_string(),
+            FINAL_TEXT_SSE.to_string(),
+        ]);
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let base = format!("http://127.0.0.1:{port}");
+        let mut engine = AgentEngine::new(&dir.display().to_string(), "m", "", &[], &[], 0, 0);
+        let mut ui = CapturingUi::default();
+        let ctx = turn_ctx(&client, &base, &dir);
+        run_session(&mut engine, &ctx, Some("plan only".into()), &mut ui).await;
+        let nudges_after_turn1 = engine
+            .messages
+            .iter()
+            .filter(|m| content_str(m).contains("haven't started any of its steps"))
+            .count();
+        run_session(
+            &mut engine,
+            &ctx,
+            Some("unrelated question".into()),
+            &mut ui,
+        )
+        .await;
+
+        let nudges = engine
+            .messages
+            .iter()
+            .filter(|m| content_str(m).contains("haven't started any of its steps"))
+            .count();
+        assert_eq!(nudges_after_turn1, 1);
+        assert_eq!(nudges, 1, "the stale plan must not nudge a later turn");
+        assert_eq!(engine.messages.last().unwrap()["content"], "done");
     }
 
     /// A `subagent` call spawns a fresh sub-engine; its text result feeds back as the parent's tool result and the parent converges.
