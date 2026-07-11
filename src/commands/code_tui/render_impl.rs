@@ -1854,9 +1854,27 @@ impl CodeTuiApp {
         let plan_lines = self.plan_panel_lines();
         let plan_panel_height =
             self.plan_panel_height(&plan_lines, area, composer_height, footer_height);
+        // Clamp queue focus each frame — the engine or a turn-end drain may
+        // have emptied the rows it selects since the last event.
+        let queue_rows = self.queued_rows();
+        match (&mut self.queue_focus, queue_rows.len()) {
+            (focus @ Some(_), 0) => *focus = None,
+            (Some(sel), n) => *sel = (*sel).min(n - 1),
+            (None, _) => {}
+        }
+        let queue_lines = self.queued_panel_lines(&queue_rows, area.width);
+        let queue_panel_height = self.queued_panel_height(
+            &queue_lines,
+            area,
+            composer_height,
+            footer_height,
+            plan_panel_height,
+        );
         let max_transcript_height = area
             .height
-            .saturating_sub(composer_height + footer_height + plan_panel_height)
+            .saturating_sub(
+                composer_height + footer_height + plan_panel_height + queue_panel_height,
+            )
             .max(1);
         let is_empty = self.is_transcript_empty();
         // Memoize the heavy history body build + wrap AND the volatile tail
@@ -1898,6 +1916,7 @@ impl CodeTuiApp {
         };
         let stack_height = transcript_height
             .saturating_add(plan_panel_height)
+            .saturating_add(queue_panel_height)
             .saturating_add(composer_height)
             .saturating_add(footer_height)
             .min(area.height.max(1));
@@ -1906,11 +1925,15 @@ impl CodeTuiApp {
             .direction(Direction::Vertical)
             .constraints([Constraint::Length(stack_height), Constraint::Min(0)])
             .split(area);
-        // transcript / [plan panel] / composer / footer — the plan row is present
-        // only when there's a plan, so the indices below shift accordingly.
+        // transcript / [plan panel] / [queue panel] / composer / footer — the
+        // plan and queue rows are present only when non-empty, so the indices
+        // below shift accordingly.
         let mut constraints = vec![Constraint::Length(transcript_height)];
         if plan_panel_height > 0 {
             constraints.push(Constraint::Length(plan_panel_height));
+        }
+        if queue_panel_height > 0 {
+            constraints.push(Constraint::Length(queue_panel_height));
         }
         constraints.push(Constraint::Length(composer_height));
         constraints.push(Constraint::Length(footer_height));
@@ -1922,6 +1945,13 @@ impl CodeTuiApp {
         let transcript_area = chunks[0];
         let mut chunk_idx = 1usize;
         let plan_panel_area = if plan_panel_height > 0 {
+            let a = chunks[chunk_idx];
+            chunk_idx += 1;
+            Some(a)
+        } else {
+            None
+        };
+        let queue_panel_area = if queue_panel_height > 0 {
             let a = chunks[chunk_idx];
             chunk_idx += 1;
             Some(a)
@@ -2023,6 +2053,10 @@ impl CodeTuiApp {
 
         if let Some(plan_panel_area) = plan_panel_area {
             self.render_plan_panel(frame, plan_panel_area, &plan_lines);
+        }
+
+        if let Some(queue_panel_area) = queue_panel_area {
+            self.render_queued_panel(frame, queue_panel_area, &queue_lines);
         }
 
         // A blank spacing row, then the divider rule, then the input. The blank
@@ -2254,6 +2288,89 @@ impl CodeTuiApp {
             .map(|i| (i + 1 - usize::from(body.height)) as u16)
             .unwrap_or(0);
         frame.render_widget(Paragraph::new(wrapped.text).scroll((scroll, 0)), body);
+    }
+
+    /// Queued-input panel lines: a blank spacer, one line per item (windowed
+    /// around the selection with `… +k` indicators), a hint line while focused.
+    fn queued_panel_lines(&self, rows: &[QueuedRow], width: u16) -> Vec<Line<'static>> {
+        if rows.is_empty() {
+            return Vec::new();
+        }
+        let selected = self.queue_focus;
+        let start = selected
+            .map(|sel| sel.saturating_sub(QUEUE_PANEL_MAX_ROWS - 1))
+            .unwrap_or(0)
+            .min(rows.len().saturating_sub(QUEUE_PANEL_MAX_ROWS));
+        let end = (start + QUEUE_PANEL_MAX_ROWS).min(rows.len());
+        let mut lines = vec![Line::default()];
+        if start > 0 {
+            lines.push(Line::from(Span::styled(
+                format!("  … +{start} earlier"),
+                Style::default().fg(FAINT),
+            )));
+        }
+        for (i, row) in rows.iter().enumerate().take(end).skip(start) {
+            let is_selected = selected == Some(i);
+            let marker = if is_selected { "▸ " } else { "  " };
+            let prefix = match row.segment {
+                QueueSegment::Steering => "» ",
+                QueueSegment::Command => "",
+                QueueSegment::Message => "· ",
+            };
+            let room = usize::from(width).saturating_sub(3 + prefix.chars().count());
+            let (marker_style, text_style) = if is_selected {
+                (Style::default().fg(ACCENT), Style::default().fg(TEXT))
+            } else {
+                (Style::default().fg(MUTED), Style::default().fg(MUTED))
+            };
+            lines.push(Line::from(vec![
+                Span::styled(marker.to_string(), marker_style),
+                Span::styled(
+                    format!("{prefix}{}", truncate_for_display_width(&row.display, room)),
+                    text_style,
+                ),
+            ]));
+        }
+        if end < rows.len() {
+            lines.push(Line::from(Span::styled(
+                format!("  … +{} more", rows.len() - end),
+                Style::default().fg(FAINT),
+            )));
+        }
+        if selected.is_some() {
+            lines.push(Line::from(Span::styled(
+                "  enter edit · ctrl+d remove · alt+↑↓ move · esc back",
+                Style::default().fg(FAINT),
+            )));
+        }
+        lines
+    }
+
+    /// Panel height, clamped so the transcript keeps a usable minimum.
+    fn queued_panel_height(
+        &self,
+        lines: &[Line<'static>],
+        area: Rect,
+        composer_height: u16,
+        footer_height: u16,
+        plan_panel_height: u16,
+    ) -> u16 {
+        if lines.is_empty() {
+            return 0;
+        }
+        let reserved = composer_height
+            .saturating_add(footer_height)
+            .saturating_add(plan_panel_height)
+            .saturating_add(PLAN_PANEL_MIN_TRANSCRIPT);
+        (lines.len() as u16).min(area.height.saturating_sub(reserved))
+    }
+
+    fn render_queued_panel(&self, frame: &mut Frame<'_>, area: Rect, lines: &[Line<'static>]) {
+        if area.height == 0 || lines.is_empty() {
+            return;
+        }
+        frame.render_widget(Clear, area);
+        frame.render_widget(Paragraph::new(Text::from(lines.to_vec())), area);
     }
 
     pub(super) fn empty_state_height(&self, width: u16) -> u16 {

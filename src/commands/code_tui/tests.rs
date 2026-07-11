@@ -1509,6 +1509,7 @@ fn make_test_app(
         queued_messages: Vec::new(),
         steering_queue: SteeringQueue::default(),
         queued_commands: Vec::new(),
+        queue_focus: None,
         project_mcp_consent: ProjectMcpConsent::default(),
         pending_mcp_consent: None,
         local_command: None,
@@ -14935,6 +14936,340 @@ async fn test_queued_commands_cleared_on_cancel() {
 
     app.cancel_inflight_request(CancelKind::Discard);
     assert!(app.queued_commands.is_empty());
+}
+
+#[tokio::test]
+async fn test_queue_focus_entered_by_up_on_empty_composer() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.sending = true;
+    app.queued_messages = vec!["first".to_string(), "second".to_string()];
+
+    app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE))
+        .await
+        .unwrap();
+    assert_eq!(app.queue_focus, Some(1), "newest row selected");
+
+    // A non-empty draft blocks entry.
+    app.queue_focus = None;
+    app.draft = "typing".to_string();
+    app.cursor = app.draft.len();
+    app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE))
+        .await
+        .unwrap();
+    assert_eq!(app.queue_focus, None);
+    assert_eq!(app.draft, "typing");
+}
+
+#[tokio::test]
+async fn test_queue_focus_selection_and_down_past_end_exits() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.sending = true;
+    app.queued_messages = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+
+    app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE))
+        .await
+        .unwrap();
+    assert_eq!(app.queue_focus, Some(2));
+    app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE))
+        .await
+        .unwrap();
+    assert_eq!(app.queue_focus, Some(1));
+    app.handle_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL))
+        .await
+        .unwrap();
+    assert_eq!(app.queue_focus, Some(0));
+    app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE))
+        .await
+        .unwrap();
+    assert_eq!(app.queue_focus, Some(0));
+
+    app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE))
+        .await
+        .unwrap();
+    assert_eq!(app.queue_focus, Some(1));
+    app.handle_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL))
+        .await
+        .unwrap();
+    assert_eq!(app.queue_focus, Some(2));
+    app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE))
+        .await
+        .unwrap();
+    assert_eq!(app.queue_focus, None, "↓ past the last row exits");
+}
+
+#[tokio::test]
+async fn test_queue_focus_enter_recalls_message_into_composer() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.sending = true;
+    app.queued_messages = vec!["fix login".to_string(), "run tests".to_string()];
+
+    app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE))
+        .await
+        .unwrap();
+    app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        .await
+        .unwrap();
+    assert_eq!(app.draft, "run tests");
+    assert_eq!(app.cursor, app.draft.len());
+    assert_eq!(app.queued_messages, vec!["fix login".to_string()]);
+    assert_eq!(app.queue_focus, None);
+}
+
+#[tokio::test]
+async fn test_queue_focus_recalls_steering_row() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.sending = true;
+    app.steering_queue
+        .lock()
+        .unwrap()
+        .push("steer it".to_string());
+
+    app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE))
+        .await
+        .unwrap();
+    app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        .await
+        .unwrap();
+    assert_eq!(app.draft, "steer it");
+    assert!(app.steering_queue.lock().unwrap().is_empty());
+}
+
+/// Ops on a steering row the engine drained mid-event fail gracefully.
+#[test]
+fn test_queue_row_ops_validate_after_steering_drain() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.steering_queue.lock().unwrap().push("steer".to_string());
+    let rows = app.queued_rows();
+    assert_eq!(rows.len(), 1);
+
+    // Simulate the engine draining the batch between snapshot and op.
+    app.steering_queue.lock().unwrap().clear();
+    assert!(!app.queue_row_remove(&rows[0]));
+    assert!(app.queue_row_recall(&rows[0]).is_none());
+    assert!(!app.queue_row_move(&rows[0], 1));
+}
+
+#[tokio::test]
+async fn test_queue_focus_delete_clamps_and_exits_when_empty() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.sending = true;
+    app.queued_messages = vec!["a".to_string(), "b".to_string()];
+
+    app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE))
+        .await
+        .unwrap();
+    assert_eq!(app.queue_focus, Some(1));
+    app.handle_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL))
+        .await
+        .unwrap();
+    assert_eq!(app.queued_messages, vec!["a".to_string()]);
+    assert_eq!(app.queue_focus, Some(0), "selection clamps to the survivor");
+    app.handle_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE))
+        .await
+        .unwrap();
+    assert!(app.queued_messages.is_empty());
+    assert_eq!(app.queue_focus, None, "focus exits with the last row");
+}
+
+/// Reorder stays within a segment — delivery semantics differ across them.
+#[tokio::test]
+async fn test_queue_focus_reorder_within_segment_not_across() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.sending = true;
+    app.steering_queue
+        .lock()
+        .unwrap()
+        .extend(["s1".to_string(), "s2".to_string()]);
+    app.queued_commands.push(SlashCommand::Rewind);
+    app.queued_messages = vec!["m1".to_string(), "m2".to_string()];
+    // Unified rows: [s1, s2, /rewind, m1, m2].
+
+    app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE))
+        .await
+        .unwrap();
+    assert_eq!(app.queue_focus, Some(4)); // m2
+    app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::ALT))
+        .await
+        .unwrap();
+    assert_eq!(
+        app.queued_messages,
+        vec!["m2".to_string(), "m1".to_string()]
+    );
+    assert_eq!(app.queue_focus, Some(3), "selection follows the moved row");
+
+    // No crossing into the command segment.
+    app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::ALT))
+        .await
+        .unwrap();
+    assert_eq!(
+        app.queued_messages,
+        vec!["m2".to_string(), "m1".to_string()]
+    );
+    assert_eq!(app.queued_commands, vec![SlashCommand::Rewind]);
+    assert_eq!(app.queue_focus, Some(3));
+
+    // Shift is the alias for terminals that don't deliver Alt+arrows.
+    app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::SHIFT))
+        .await
+        .unwrap();
+    assert_eq!(
+        app.queued_messages,
+        vec!["m1".to_string(), "m2".to_string()]
+    );
+    assert_eq!(app.queue_focus, Some(4));
+    app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::ALT))
+        .await
+        .unwrap();
+    assert_eq!(
+        app.queued_messages,
+        vec!["m1".to_string(), "m2".to_string()]
+    );
+    assert_eq!(app.queue_focus, Some(4));
+
+    app.queue_focus = Some(1); // s2
+    app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::ALT))
+        .await
+        .unwrap();
+    assert_eq!(
+        *app.steering_queue.lock().unwrap(),
+        vec!["s2".to_string(), "s1".to_string()]
+    );
+    assert_eq!(app.queue_focus, Some(0));
+    app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::ALT))
+        .await
+        .unwrap();
+    assert_eq!(
+        *app.steering_queue.lock().unwrap(),
+        vec!["s2".to_string(), "s1".to_string()]
+    );
+}
+
+#[tokio::test]
+async fn test_queue_focus_esc_exits_without_interrupting() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.sending = true;
+    app.queued_messages = vec!["a".to_string()];
+
+    app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE))
+        .await
+        .unwrap();
+    assert_eq!(app.queue_focus, Some(0));
+    app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+        .await
+        .unwrap();
+    assert_eq!(app.queue_focus, None);
+    assert!(app.sending, "Esc in focus mode must not interrupt the turn");
+    assert_eq!(app.queued_messages, vec!["a".to_string()]);
+}
+
+#[tokio::test]
+async fn test_queue_focus_typing_char_exits_and_inserts() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.sending = true;
+    app.queued_messages = vec!["a".to_string()];
+
+    app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE))
+        .await
+        .unwrap();
+    app.handle_key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE))
+        .await
+        .unwrap();
+    assert_eq!(app.queue_focus, None);
+    assert_eq!(app.draft, "h");
+    assert_eq!(app.queued_messages, vec!["a".to_string()]);
+}
+
+#[test]
+fn test_command_recall_text_round_trips() {
+    for cmd in [
+        SlashCommand::Compact { fast: false },
+        SlashCommand::Compact { fast: true },
+        SlashCommand::Rewind,
+        SlashCommand::Review(None),
+        SlashCommand::Review(Some("main".to_string())),
+        SlashCommand::Goal(Some("ship the fix".to_string())),
+        SlashCommand::Plan(Some("go".to_string())),
+    ] {
+        let text = queue_impl::command_recall_text(&cmd);
+        assert!(text.starts_with('/'), "{text}");
+        assert_eq!(parse_slash_command(&text[1..]).unwrap(), cmd, "{text}");
+    }
+    // Skills aren't in the static parser; they resolve by name at submit time.
+    assert_eq!(
+        queue_impl::command_recall_text(&SlashCommand::Skill {
+            name: "repo-study".to_string(),
+            argument: Some("this repo".to_string()),
+        }),
+        "/repo-study this repo"
+    );
+}
+
+#[test]
+fn test_queued_panel_rows_render_with_cap_and_more() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.sending = true;
+    app.steering_queue
+        .lock()
+        .unwrap()
+        .push("steer msg".to_string());
+    app.queued_commands.push(SlashCommand::Rewind);
+    app.queued_messages.push("plain msg".to_string());
+    let (screen, _rows) = render_full_screen(&mut app, 70, 20);
+    assert!(screen.contains("» steer msg"), "steering row:\n{screen}");
+    assert!(screen.contains("/rewind"), "command row:\n{screen}");
+    assert!(screen.contains("· plain msg"), "message row:\n{screen}");
+
+    // An expanded skill body renders as its compact /name form.
+    app.queued_messages.push(
+        "Use the \"my-skill\" skill. Follow these instructions:\n\nLong body.\n\nInput: hello"
+            .to_string(),
+    );
+    let (screen, _rows) = render_full_screen(&mut app, 70, 20);
+    assert!(screen.contains("/my-skill hello"), "{screen}");
+    assert!(!screen.contains("Follow these instructions"), "{screen}");
+
+    // Overflow: 7 messages cap at QUEUE_PANEL_MAX_ROWS + an indicator.
+    app.steering_queue.lock().unwrap().clear();
+    app.queued_commands.clear();
+    app.queued_messages = (1..=7).map(|i| format!("q{i}")).collect();
+    let (screen, _rows) = render_full_screen(&mut app, 70, 20);
+    assert!(
+        screen.contains("· q1") && screen.contains("· q5"),
+        "{screen}"
+    );
+    assert!(!screen.contains("· q6"), "{screen}");
+    assert!(screen.contains("… +2 more"), "{screen}");
+    assert!(
+        !screen.contains("enter edit"),
+        "no hint unfocused:\n{screen}"
+    );
+
+    // Focused on the newest row: the window follows the selection.
+    app.queue_focus = Some(6);
+    let (screen, _rows) = render_full_screen(&mut app, 70, 20);
+    assert!(screen.contains("▸ · q7"), "{screen}");
+    assert!(screen.contains("… +2 earlier"), "{screen}");
+    assert!(screen.contains("enter edit · ctrl+d remove"), "{screen}");
+}
+
+#[test]
+fn test_queue_focus_cleared_by_discard_queued_input() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.queued_messages = vec!["a".to_string()];
+    app.queue_focus = Some(0);
+    app.discard_queued_input();
+    assert_eq!(app.queue_focus, None);
 }
 
 /// `/mcp` Ctrl+D arms a two-press delete (removal edits the user mcp.json), the

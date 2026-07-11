@@ -47,6 +47,8 @@ pub(super) const DIFF_DEL_SIGN: Color = Color::Rgb(230, 120, 112);
 pub(super) const DIFF_ADD_HL_BG: Color = Color::Rgb(33, 84, 50);
 pub(super) const DIFF_DEL_HL_BG: Color = Color::Rgb(92, 38, 38);
 pub(super) const EMPTY_STATE_TOP_GAP: u16 = 1;
+/// Max visible rows in the queued-input panel.
+pub(super) const QUEUE_PANEL_MAX_ROWS: usize = 5;
 // No bottom padding: the composer already reserves its own blank spacing row
 // above the divider, so the welcome screen's last line keeps the same single
 // blank gap above the prompt as a live conversation does (not a doubled gap).
@@ -1730,6 +1732,26 @@ pub(super) enum DeferredFinish {
 /// Composer→engine steering handoff; `std::sync` mutex — never held across an await.
 pub(super) type SteeringQueue = std::sync::Arc<std::sync::Mutex<Vec<String>>>;
 
+/// Owning queue of a unified queue row; variants in delivery order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum QueueSegment {
+    Steering,
+    Command,
+    Message,
+}
+
+/// One row of the unified queued-input view, snapshotted per key event/frame;
+/// ops revalidate `offset`+`recall` against the owning queue before mutating.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct QueuedRow {
+    pub(super) segment: QueueSegment,
+    pub(super) offset: usize,
+    /// Single-line label; width truncation happens at render time.
+    pub(super) display: String,
+    /// Text a recall puts back into the composer.
+    pub(super) recall: String,
+}
+
 /// One delegate's live row in a parallel sub-agent batch.
 pub(super) struct SubagentRow {
     pub(super) name: String,
@@ -2409,6 +2431,9 @@ pub(super) struct CodeTuiApp {
     /// turn finishes, before any queued message. Cleared with `queued_messages` on
     /// interrupt/cancel.
     pub(super) queued_commands: Vec<SlashCommand>,
+    /// Selected row in the queued-input panel (`queued_rows` order); `None` =
+    /// composer focused. Entered by ↑ on an empty composer.
+    pub(super) queue_focus: Option<usize>,
     /// An in-flight `!cmd` local shell run streaming output into the transcript,
     /// or `None`. Separate from `sending` (model turns) so the two don't entangle.
     pub(super) local_command: Option<LocalCommandRun>,

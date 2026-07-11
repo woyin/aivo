@@ -67,6 +67,8 @@ mod input_impl;
 mod key_handler_impl;
 #[path = "code_tui/live_impl.rs"]
 mod live_impl;
+#[path = "code_tui/queue_impl.rs"]
+mod queue_impl;
 #[path = "code_tui/runtime_impl.rs"]
 mod runtime_impl;
 #[path = "code_tui/session_impl.rs"]
@@ -299,6 +301,7 @@ impl CodeTuiApp {
             queued_messages: Vec::new(),
             steering_queue: SteeringQueue::default(),
             queued_commands: Vec::new(),
+            queue_focus: None,
             project_mcp_consent: ProjectMcpConsent::default(),
             pending_mcp_consent: None,
             local_command: None,

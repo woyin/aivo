@@ -2144,6 +2144,16 @@ const HELP_KEYBINDINGS: &[(&str, &[(&str, &str)])] = &[
         ],
     ),
     (
+        "Queued messages",
+        &[
+            ("↑ (empty prompt)", "select a queued message"),
+            ("Enter", "recall it into the prompt to edit"),
+            ("Del/Ctrl+D", "remove it"),
+            ("Alt/Shift+↑/↓", "move it in the queue"),
+            ("Esc", "back to the prompt"),
+        ],
+    ),
+    (
         "Session",
         &[
             ("Ctrl+R", "resume a saved session"),
