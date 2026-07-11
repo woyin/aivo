@@ -33,7 +33,11 @@ const GUIDE_WALK_CAP: usize = 32;
 pub fn discover_project_guides(cwd: &Path) -> Vec<String> {
     let global = crate::services::paths::config_dir();
     let mut guides = discover_project_guides_at(cwd, Some(&global));
-    // `remember`-saved memory rides in as a guide (small guides inline verbatim).
+    // Memory rides in as guides: global first, project second (later wins).
+    let global_memory = crate::agent::memory::global_memory_path();
+    if global_memory.is_file() {
+        guides.push(global_memory.display().to_string());
+    }
     let memory = crate::agent::memory::project_memory_path(cwd);
     if memory.is_file() {
         guides.push(memory.display().to_string());

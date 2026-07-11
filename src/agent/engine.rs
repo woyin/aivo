@@ -544,6 +544,7 @@ impl AgentEngine {
         specs.push(plan::plan_tool_spec());
         specs.push(notes::note_tool_spec());
         specs.push(crate::agent::memory::memory_tool_spec());
+        specs.push(crate::agent::memory::memory_search_tool_spec());
         specs.push(subagent_tool_spec(&[]));
         let mut tools_openai: Vec<Value> = specs.into_iter().map(tool_to_openai).collect();
         // Native-search providers get the server tool instead of the local one (mutually exclusive).
@@ -2207,15 +2208,23 @@ you were working. If the outcome matters to the task, inspect the log; otherwise
                 }
             } else if n == "remember" {
                 // Notify so a saved memory never lands silently (poison audit).
-                match crate::agent::memory::parse_fact(&call.arguments) {
-                    Ok(fact) => {
-                        let path = crate::agent::memory::project_memory_path(ctx.cwd);
+                match crate::agent::memory::parse_remember(&call.arguments) {
+                    Ok((fact, scope)) => {
+                        let path = crate::agent::memory::path_for_scope(ctx.cwd, scope);
+                        let label = scope.label();
                         match crate::agent::memory::remember(&path, &fact) {
                             Ok(crate::agent::memory::RememberOutcome::Added(count)) => {
-                                ui.notify(&format!("remembered: {fact}"));
+                                // Global facts ride into every project — call that out.
+                                if scope == crate::agent::memory::MemoryScope::Global {
+                                    ui.notify(&format!(
+                                        "remembered (GLOBAL — injected into ALL projects): {fact}"
+                                    ));
+                                } else {
+                                    ui.notify(&format!("remembered ({label}): {fact}"));
+                                }
                                 Ok(format!(
-                                    "Remembered ({count} saved) — this is injected into every \
-future session in this project. The user can audit or edit it via /memory."
+                                    "Remembered ({count} saved, {label} scope) — this is injected \
+into every future session. The user can audit or edit it via /memory."
                                 ))
                             }
                             Ok(crate::agent::memory::RememberOutcome::Refreshed) => {
@@ -2224,6 +2233,11 @@ future session in this project. The user can audit or edit it via /memory."
                             Err(e) => Err(e),
                         }
                     }
+                    Err(e) => Err(e),
+                }
+            } else if n == "memory_search" {
+                match crate::agent::memory::parse_query(&call.arguments) {
+                    Ok(query) => Ok(crate::agent::memory::search_result_text(ctx.cwd, &query)),
                     Err(e) => Err(e),
                 }
             } else if n == "switch_model" {

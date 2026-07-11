@@ -1035,6 +1035,18 @@ impl CodeCommand {
             "--add-dir <dir>",
             "Extra writable workspace root (repeatable)",
         );
+        print_opt(
+            "--sandbox <profile>",
+            "Shell sandbox: off, workspace, read-only, strict",
+        );
+        print_opt(
+            "--best-of-n <N>",
+            "Run -e N ways in parallel, return the best (N ≤ 10; read-only sandbox)",
+        );
+        print_opt(
+            "--json-schema <schema>",
+            "Constrain the -e answer to a JSON Schema (inline or @file)",
+        );
         print_opt("-r, --refresh", "Refresh the model list (skip cache)");
         print_opt(
             "--resume [last|id]",

@@ -1906,22 +1906,43 @@ impl CodeTuiApp {
         };
         let path = crate::agent::memory::project_memory_path(std::path::Path::new(&cwd));
         let entries = crate::agent::memory::load_entries(&path);
-        if entries.is_empty() {
+        let global_path = crate::agent::memory::global_memory_path();
+        let global = crate::agent::memory::load_entries(&global_path);
+        if entries.is_empty() && global.is_empty() {
             self.notice = Some((
                 MUTED,
-                "No project memory yet — the agent saves durable facts here with its `remember` tool"
+                "No memory yet — the agent saves durable facts with its `remember` tool"
                     .to_string(),
             ));
             return;
         }
-        let mut content = format!(
-            "{} fact(s) injected into every session in this project:\n\n",
-            entries.len()
-        );
-        for e in &entries {
-            content.push_str(&format!("- {e}\n"));
+        let mut content = String::new();
+        if !entries.is_empty() {
+            content.push_str(&format!(
+                "{} project fact(s) injected into every session here:\n\n",
+                entries.len()
+            ));
+            for e in &entries {
+                content.push_str(&format!("- {e}\n"));
+            }
+            content.push_str(&format!("\nEdit or delete lines: `{}`\n", path.display()));
         }
-        content.push_str(&format!("\nEdit or delete lines: `{}`", path.display()));
+        if !global.is_empty() {
+            if !entries.is_empty() {
+                content.push('\n');
+            }
+            content.push_str(&format!(
+                "{} global fact(s) injected in every project:\n\n",
+                global.len()
+            ));
+            for e in &global {
+                content.push_str(&format!("- {e}\n"));
+            }
+            content.push_str(&format!(
+                "\nEdit or delete lines: `{}`",
+                global_path.display()
+            ));
+        }
         self.history.push(ChatMessage {
             model: None,
             role: "memory".to_string(),

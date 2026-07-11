@@ -1486,6 +1486,19 @@ impl CodeTuiApp {
         if !self.history.is_empty() {
             let _ = self.persist_history().await;
         }
+
+        // Searchable session topic for `memory_search` — user text only
+        // (shell commands can embed secrets).
+        if !self.real_cwd.is_empty()
+            && let Some(topic) = self.history.iter().find(|m| m.role == "user")
+        {
+            let date = chrono::Local::now().format("%Y-%m-%d").to_string();
+            crate::agent::memory::record_session_summary(
+                std::path::Path::new(&self.real_cwd),
+                &topic.content,
+                &date,
+            );
+        }
     }
 
     /// Debounced `/resume` preview loader: after the selection rests on an

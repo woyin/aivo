@@ -333,6 +333,41 @@ pub async fn run() -> ! {
                 }
                 crate::agent::sandbox::set_extra_write_roots(roots);
             }
+            if let Some(profile) = code_args
+                .sandbox
+                .as_deref()
+                .and_then(crate::agent::sandbox::SandboxProfile::parse)
+            {
+                crate::agent::sandbox::set_sandbox_profile(profile);
+            }
+            if let Some(n) = code_args.best_of_n {
+                crate::commands::code_agent_oneshot::set_best_of_n(n as usize);
+                // Candidates share the working tree; default to read-only so
+                // parallel runs can't race writes (--sandbox/env overrides).
+                if n >= 2 {
+                    crate::agent::sandbox::set_read_only_unless_configured();
+                }
+            }
+            if let Some(spec) = code_args.json_schema.take() {
+                // `@path` loads the schema from a file; otherwise it's inline JSON.
+                let schema = match spec.strip_prefix('@') {
+                    Some(path) => match std::fs::read_to_string(
+                        crate::services::system_env::expand_tilde(path),
+                    ) {
+                        Ok(s) => s,
+                        Err(e) => {
+                            eprintln!("{} --json-schema {path}: {e}", style::red("Error:"));
+                            process::exit(ExitCode::UserError.code());
+                        }
+                    },
+                    None => spec,
+                };
+                if serde_json::from_str::<serde_json::Value>(&schema).is_err() {
+                    eprintln!("{} --json-schema: not valid JSON", style::red("Error:"));
+                    process::exit(ExitCode::UserError.code());
+                }
+                crate::commands::code_agent_oneshot::set_json_schema(schema);
+            }
             let key_explicit = code_args.key.is_some();
             let initial_prompt = match take_code_initial_prompt(&mut code_args) {
                 Ok(prompt) => prompt,

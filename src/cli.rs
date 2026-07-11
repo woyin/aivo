@@ -1052,6 +1052,38 @@ pub struct CodeArgs {
     #[arg(long = "add-dir", value_name = "DIR")]
     pub add_dir: Vec<String>,
 
+    /// Shell sandbox profile (overrides AIVO_AGENT_SANDBOX): `off`, `workspace`
+    /// (default — confine shell writes to the workspace + caches), `read-only`
+    /// (no writes anywhere, no child network — also blocks the agent's own edit
+    /// tools), or `strict` (writes confined to the workspace + temp, no child
+    /// network). Child-network denial is macOS-only (Landlock can't gate network).
+    #[arg(
+        long = "sandbox",
+        value_name = "PROFILE",
+        value_parser = clap::builder::PossibleValuesParser::new(
+            crate::agent::sandbox::SandboxProfile::VALUES
+        )
+    )]
+    pub sandbox: Option<String>,
+
+    /// Run the task N ways in parallel (N ≤ 10) and return the best (LLM-judged).
+    /// Costs N× tokens; --max-cost applies per candidate. Candidates share the
+    /// working tree, so the sandbox defaults to read-only unless --sandbox is
+    /// given. Requires -e/--exec; 1 runs a single pass as usual.
+    #[arg(
+        long = "best-of-n",
+        value_name = "N",
+        requires = "exec",
+        value_parser = clap::value_parser!(u32).range(1..=10)
+    )]
+    pub best_of_n: Option<u32>,
+
+    /// Constrain the final answer to a JSON Schema (inline JSON, or `@path` to a
+    /// file). Instructs the agent to emit one conforming JSON value. Requires
+    /// -e/--exec; best paired with `--output-format json`.
+    #[arg(long = "json-schema", value_name = "SCHEMA", requires = "exec")]
+    pub json_schema: Option<String>,
+
     /// Print the upstream provider's raw JSON response (requires -p; useful for scripting)
     #[arg(long, requires = "prompt")]
     pub json: bool,

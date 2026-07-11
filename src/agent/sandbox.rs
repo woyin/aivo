@@ -45,6 +45,83 @@ pub fn extra_write_roots() -> &'static [PathBuf] {
     EXTRA_WRITE_ROOTS.get().map(Vec::as_slice).unwrap_or(&[])
 }
 
+/// Confinement level for the agent's shell (`run_bash` writes/network).
+/// Under `ReadOnly`, `tools::execute` also refuses the in-process edit tools.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum SandboxProfile {
+    /// No confinement (legacy `AIVO_AGENT_NO_SANDBOX=1`).
+    Off,
+    /// Shell writes confined to workspace + temp + dev caches (default).
+    #[default]
+    Workspace,
+    /// No writes anywhere (temp scratch only); child network blocked.
+    ReadOnly,
+    /// Writes confined to workspace + temp (no caches); child network blocked.
+    Strict,
+}
+
+impl SandboxProfile {
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "off" | "none" => Some(Self::Off),
+            "workspace" | "default" | "on" => Some(Self::Workspace),
+            "read-only" | "readonly" | "ro" => Some(Self::ReadOnly),
+            "strict" => Some(Self::Strict),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Workspace => "workspace",
+            Self::ReadOnly => "read-only",
+            Self::Strict => "strict",
+        }
+    }
+
+    /// The accepted `--sandbox` values, for CLI help/validation.
+    pub const VALUES: &'static [&'static str] = &["off", "workspace", "read-only", "strict"];
+
+    /// Child-network denial is macOS-only (Landlock can't gate network).
+    fn deny_network(self) -> bool {
+        matches!(self, Self::ReadOnly | Self::Strict)
+    }
+}
+
+static SANDBOX_PROFILE: OnceLock<SandboxProfile> = OnceLock::new();
+
+/// Register the `--sandbox` profile (first caller wins).
+pub fn set_sandbox_profile(profile: SandboxProfile) {
+    let _ = SANDBOX_PROFILE.set(profile);
+}
+
+/// Force read-only unless the user picked a profile via flag or env — used by
+/// `--best-of-n`, whose parallel candidates share the working tree and would
+/// otherwise race each other's writes (losers' edits are never rolled back).
+pub fn set_read_only_unless_configured() {
+    if std::env::var_os("AIVO_AGENT_SANDBOX").is_none() && !legacy_no_sandbox() {
+        let _ = SANDBOX_PROFILE.set(SandboxProfile::ReadOnly);
+    }
+}
+
+/// Resolution order: `--sandbox` flag > `AIVO_AGENT_SANDBOX` >
+/// legacy `AIVO_AGENT_NO_SANDBOX` (→ `Off`) > `Workspace`.
+pub fn current_profile() -> SandboxProfile {
+    if let Some(p) = SANDBOX_PROFILE.get() {
+        return *p;
+    }
+    if let Ok(v) = std::env::var("AIVO_AGENT_SANDBOX")
+        && let Some(p) = SandboxProfile::parse(&v)
+    {
+        return p;
+    }
+    if legacy_no_sandbox() {
+        return SandboxProfile::Off;
+    }
+    SandboxProfile::Workspace
+}
+
 /// A user-facing note when this platform can't confine writes (no
 /// seatbelt/Landlock equivalent); `None` where a sandbox backend exists.
 pub fn confinement_notice() -> Option<&'static str> {
@@ -109,8 +186,12 @@ pub fn active() -> bool {
     }
 }
 
-/// Opt out via `AIVO_AGENT_NO_SANDBOX` (any value other than empty/`0`).
 fn disabled() -> bool {
+    current_profile() == SandboxProfile::Off
+}
+
+/// Legacy `AIVO_AGENT_NO_SANDBOX` opt-out (any value other than empty/`0`).
+fn legacy_no_sandbox() -> bool {
     std::env::var("AIVO_AGENT_NO_SANDBOX")
         .map(|v| !v.is_empty() && v != "0")
         .unwrap_or(false)
@@ -125,7 +206,7 @@ pub fn wrap_shell(command: &str, cwd: &Path) -> ShellInvocation {
             program: SANDBOX_EXEC.to_string(),
             args: vec![
                 "-p".to_string(),
-                macos_profile(cwd),
+                macos_profile(cwd, current_profile()),
                 "sh".to_string(),
                 "-c".to_string(),
                 command.to_string(),
@@ -144,7 +225,12 @@ pub fn wrap_shell(command: &str, cwd: &Path) -> ShellInvocation {
         && RELAUNCH_ENABLED.load(Ordering::Relaxed)
         && let Ok(exe) = std::env::current_exe()
     {
-        return landlock_relaunch(exe.to_string_lossy().into_owned(), cwd, command);
+        return landlock_relaunch(
+            exe.to_string_lossy().into_owned(),
+            cwd,
+            command,
+            current_profile(),
+        );
     }
 
     // `cwd` is consulted only by the macOS/Linux sandbox backends above; on other
@@ -159,11 +245,18 @@ pub fn wrap_shell(command: &str, cwd: &Path) -> ShellInvocation {
 /// ruleset then `sh -c`'s the command. Split out so the wiring is unit-testable
 /// without touching the global relaunch flag (which concurrent tests share).
 #[cfg(target_os = "linux")]
-fn landlock_relaunch(exe: String, cwd: &Path, command: &str) -> ShellInvocation {
-    // First `--workspace` = cwd; any extra ones are `--add-dir` roots (the child
-    // is a fresh process, so the roots must ride the argv).
+fn landlock_relaunch(
+    exe: String,
+    cwd: &Path,
+    command: &str,
+    profile: SandboxProfile,
+) -> ShellInvocation {
+    // First `--workspace` = cwd, extras are `--add-dir` roots; roots + profile
+    // must ride the argv (the OnceLock isn't inherited across the re-exec).
     let mut args = vec![
         "__agent-sandbox".to_string(),
+        "--profile".to_string(),
+        profile.as_str().to_string(),
         "--workspace".to_string(),
         cwd.to_string_lossy().into_owned(),
     ];
@@ -261,45 +354,51 @@ fn git_metadata_roots(cwd: &Path) -> Vec<PathBuf> {
     Vec::new()
 }
 
-/// A seatbelt (SBPL) profile: allow everything, then deny all file writes, then
-/// re-allow writes to the workspace, temp dirs, dev-tool caches, and package
-/// prefixes. Last matching rule wins, so the re-allow list carves holes in the
-/// blanket write deny. Reads / exec / network stay open from `(allow default)`.
+/// A seatbelt (SBPL) profile: allow everything, optionally deny network, then
+/// deny all file writes and re-allow the profile's writable set (last matching
+/// rule wins). Reads / exec stay open from `(allow default)`.
 #[cfg(target_os = "macos")]
-fn macos_profile(cwd: &Path) -> String {
+fn macos_profile(cwd: &Path, profile: SandboxProfile) -> String {
+    // Temp scratch stays writable under every profile — many read-only tools
+    // still write to $TMPDIR / /dev/null.
     let mut writable: Vec<String> = vec![
         "/tmp".into(),
         "/private/tmp".into(),
         "/var/folders".into(),
         "/private/var/folders".into(),
         "/dev".into(),
-        // Package-manager prefixes so `brew`, etc. keep working.
-        "/usr/local".into(),
-        "/opt/homebrew".into(),
     ];
-    // The workspace and its real (symlink-resolved) path — seatbelt matches the
-    // resolved path of the target, so a symlinked cwd needs both forms.
-    writable.push(cwd.to_string_lossy().into_owned());
-    if let Ok(canon) = cwd.canonicalize() {
-        writable.push(canon.to_string_lossy().into_owned());
+    if profile == SandboxProfile::Workspace {
+        // Package-manager prefixes so `brew`, etc. keep working.
+        writable.push("/usr/local".into());
+        writable.push("/opt/homebrew".into());
     }
-    // A linked worktree's git metadata lives under the parent repo (see helper).
-    for root in git_metadata_roots(cwd) {
-        writable.push(root.to_string_lossy().into_owned());
-        if let Ok(canon) = root.canonicalize() {
+    // Seatbelt matches the resolved path, so a symlinked cwd needs both forms.
+    if profile != SandboxProfile::ReadOnly {
+        writable.push(cwd.to_string_lossy().into_owned());
+        if let Ok(canon) = cwd.canonicalize() {
             writable.push(canon.to_string_lossy().into_owned());
         }
-    }
-    for root in extra_write_roots() {
-        writable.push(root.to_string_lossy().into_owned());
-        if let Ok(canon) = root.canonicalize() {
-            writable.push(canon.to_string_lossy().into_owned());
+        // A linked worktree's git metadata lives under the parent repo (see helper).
+        for root in git_metadata_roots(cwd) {
+            writable.push(root.to_string_lossy().into_owned());
+            if let Ok(canon) = root.canonicalize() {
+                writable.push(canon.to_string_lossy().into_owned());
+            }
+        }
+        for root in extra_write_roots() {
+            writable.push(root.to_string_lossy().into_owned());
+            if let Ok(canon) = root.canonicalize() {
+                writable.push(canon.to_string_lossy().into_owned());
+            }
         }
     }
     if let Some(tmp) = std::env::var_os("TMPDIR") {
         writable.push(tmp.to_string_lossy().into_owned());
     }
-    if let Some(home) = crate::services::system_env::home_dir() {
+    if profile == SandboxProfile::Workspace
+        && let Some(home) = crate::services::system_env::home_dir()
+    {
         // Dev-tool caches, deliberately NOT `~/.config`: that holds aivo's own
         // encrypted key store (`~/.config/aivo`) and every app's config, which
         // the agent shouldn't be able to silently rewrite. A command that
@@ -318,17 +417,21 @@ fn macos_profile(cwd: &Path) -> String {
         }
     }
 
-    let mut profile =
-        String::from("(version 1)\n(allow default)\n(deny file-write*)\n(allow file-write*\n");
+    let mut profile_str = String::from("(version 1)\n(allow default)\n");
+    if profile.deny_network() {
+        // The agent's own LLM/web calls are in-process, unaffected by this.
+        profile_str.push_str("(deny network*)\n");
+    }
+    profile_str.push_str("(deny file-write*)\n(allow file-write*\n");
     for path in writable {
         let trimmed = path.trim_end_matches('/');
         if trimmed.is_empty() {
             continue;
         }
-        profile.push_str(&format!("    (subpath \"{}\")\n", sbpl_escape(trimmed)));
+        profile_str.push_str(&format!("    (subpath \"{}\")\n", sbpl_escape(trimmed)));
     }
-    profile.push_str(")\n");
-    profile
+    profile_str.push_str(")\n");
+    profile_str
 }
 
 /// Escape a path for an SBPL double-quoted string literal.
@@ -345,20 +448,24 @@ fn sbpl_escape(s: &str) -> String {
 /// filtered to entries that actually exist (Landlock errors on a rule for a
 /// missing path). Pure function — unit-testable without the kernel feature.
 #[cfg(target_os = "linux")]
-fn linux_writable_paths(cwd: &Path) -> Vec<PathBuf> {
+fn linux_writable_paths(cwd: &Path, profile: SandboxProfile) -> Vec<PathBuf> {
     let mut candidates: Vec<PathBuf> = vec![
         PathBuf::from("/tmp"),
         PathBuf::from("/var/tmp"),
         PathBuf::from("/dev"),
-        // Package-manager prefix.
-        PathBuf::from("/usr/local"),
     ];
-    candidates.push(cwd.to_path_buf());
-    if let Ok(canon) = cwd.canonicalize() {
-        candidates.push(canon);
+    if profile == SandboxProfile::Workspace {
+        // Package-manager prefix.
+        candidates.push(PathBuf::from("/usr/local"));
     }
-    // A linked worktree's git metadata lives under the parent repo (see helper).
-    candidates.extend(git_metadata_roots(cwd));
+    if profile != SandboxProfile::ReadOnly {
+        candidates.push(cwd.to_path_buf());
+        if let Ok(canon) = cwd.canonicalize() {
+            candidates.push(canon);
+        }
+        // A linked worktree's git metadata lives under the parent repo (see helper).
+        candidates.extend(git_metadata_roots(cwd));
+    }
     if let Some(tmp) = std::env::var_os("TMPDIR") {
         candidates.push(PathBuf::from(tmp));
     }
@@ -366,7 +473,9 @@ fn linux_writable_paths(cwd: &Path) -> Vec<PathBuf> {
     if let Some(run) = std::env::var_os("XDG_RUNTIME_DIR") {
         candidates.push(PathBuf::from(run));
     }
-    if let Some(home) = crate::services::system_env::home_dir() {
+    if profile == SandboxProfile::Workspace
+        && let Some(home) = crate::services::system_env::home_dir()
+    {
         // Dev-tool caches, deliberately NOT `~/.config`: that holds aivo's own
         // encrypted key store (`~/.config/aivo`) and every app's config, which
         // the agent shouldn't be able to silently rewrite. A command that
@@ -413,7 +522,7 @@ fn landlock_supported() -> bool {
 /// `false` (caller degrades to running unconfined). Only WRITE accesses are
 /// handled, so reads and exec stay open; network is never restricted.
 #[cfg(target_os = "linux")]
-fn apply_landlock(workspaces: &[String]) -> bool {
+fn apply_landlock(workspaces: &[String], profile: SandboxProfile) -> bool {
     use landlock::{
         ABI, AccessFs, CompatLevel, Compatible, PathBeneath, PathFd, Ruleset, RulesetAttr,
         RulesetCreatedAttr, RulesetStatus,
@@ -431,7 +540,7 @@ fn apply_landlock(workspaces: &[String]) -> bool {
     // First workspace = cwd (carries the standard writable set); the rest are
     // `--add-dir` roots.
     let cwd = workspaces.first().map(String::as_str).unwrap_or(".");
-    let mut paths = linux_writable_paths(Path::new(cwd));
+    let mut paths = linux_writable_paths(Path::new(cwd), profile);
     paths.extend(workspaces.iter().skip(1).map(PathBuf::from));
     for path in paths {
         let Ok(fd) = PathFd::new(&path) else {
@@ -452,12 +561,19 @@ fn apply_landlock(workspaces: &[String]) -> bool {
 /// after `--`. Factored out for unit testing (the entry point below diverges).
 /// `raw_args` is the full process argv (`[exe, "__agent-sandbox", …]`).
 #[cfg(target_os = "linux")]
-fn parse_sandbox_child_args(raw_args: &[String]) -> (Vec<String>, Vec<String>) {
+fn parse_sandbox_child_args(raw_args: &[String]) -> (SandboxProfile, Vec<String>, Vec<String>) {
+    let mut profile = SandboxProfile::Workspace;
     let mut workspaces = Vec::new();
     let mut rest = Vec::new();
     let mut i = 2; // skip exe + subcommand
     while i < raw_args.len() {
         match raw_args[i].as_str() {
+            "--profile" => {
+                if let Some(p) = raw_args.get(i + 1).and_then(|v| SandboxProfile::parse(v)) {
+                    profile = p;
+                }
+                i += 2;
+            }
             "--workspace" => {
                 if let Some(w) = raw_args.get(i + 1) {
                     workspaces.push(w.clone());
@@ -471,7 +587,7 @@ fn parse_sandbox_child_args(raw_args: &[String]) -> (Vec<String>, Vec<String>) {
             _ => i += 1,
         }
     }
-    (workspaces, rest)
+    (profile, workspaces, rest)
 }
 
 /// Entry point for the hidden `aivo __agent-sandbox` re-exec (dispatched in
@@ -481,7 +597,7 @@ fn parse_sandbox_child_args(raw_args: &[String]) -> (Vec<String>, Vec<String>) {
 /// returns.
 #[cfg(target_os = "linux")]
 pub fn run_sandbox_child(raw_args: &[String]) -> ! {
-    let (workspaces, rest) = parse_sandbox_child_args(raw_args);
+    let (profile, workspaces, rest) = parse_sandbox_child_args(raw_args);
     if rest.is_empty() {
         eprintln!("aivo: __agent-sandbox: no command after `--`");
         std::process::exit(127);
@@ -491,7 +607,7 @@ pub fn run_sandbox_child(raw_args: &[String]) -> ! {
         .cloned()
         .unwrap_or_else(|| ".".to_string());
     // Best-effort confinement; if Landlock is unavailable we still run the shell.
-    let _ = apply_landlock(&workspaces);
+    let _ = apply_landlock(&workspaces, profile);
     let status = std::process::Command::new(&rest[0])
         .args(&rest[1..])
         .current_dir(&cwd)
@@ -515,7 +631,7 @@ mod macos_tests {
 
     #[test]
     fn profile_confines_writes_to_workspace() {
-        let profile = macos_profile(Path::new("/Users/x/proj"));
+        let profile = macos_profile(Path::new("/Users/x/proj"), SandboxProfile::Workspace);
         assert!(profile.contains("(deny file-write*)"));
         assert!(profile.contains("(subpath \"/Users/x/proj\")"));
         // Temp is always writable (macOS $TMPDIR lives under /var/folders).
@@ -524,6 +640,32 @@ mod macos_tests {
         assert!(profile.contains("(allow default)"));
         assert!(!profile.contains("(deny file-read"));
         assert!(!profile.contains("(deny network"));
+        // Package prefixes writable under Workspace only.
+        assert!(profile.contains("/opt/homebrew"));
+    }
+
+    #[test]
+    fn read_only_profile_denies_workspace_writes_and_network() {
+        let profile = macos_profile(Path::new("/Users/x/proj"), SandboxProfile::ReadOnly);
+        // Workspace is NOT re-allowed for writing.
+        assert!(!profile.contains("(subpath \"/Users/x/proj\")"));
+        // Network is denied for the shell's children.
+        assert!(profile.contains("(deny network*)"));
+        // Temp scratch stays writable so read-only tools can still run.
+        assert!(profile.contains("/private/var/folders"));
+        // Reads still open.
+        assert!(profile.contains("(allow default)"));
+        assert!(!profile.contains("(deny file-read"));
+    }
+
+    #[test]
+    fn strict_profile_confines_to_workspace_but_denies_network_and_caches() {
+        let profile = macos_profile(Path::new("/Users/x/proj"), SandboxProfile::Strict);
+        // Workspace is writable (untrusted code still needs to build in-tree).
+        assert!(profile.contains("(subpath \"/Users/x/proj\")"));
+        // Network denied; package prefixes NOT writable.
+        assert!(profile.contains("(deny network*)"));
+        assert!(!profile.contains("/opt/homebrew"));
     }
 
     #[test]
@@ -554,12 +696,20 @@ mod linux_tests {
     #[test]
     fn writable_paths_include_present_workspace_and_temp_only() {
         // /tmp always exists; assert it's present and macOS-only paths aren't.
-        let paths = linux_writable_paths(Path::new("/tmp"));
+        let paths = linux_writable_paths(Path::new("/tmp"), SandboxProfile::Workspace);
         assert!(paths.iter().any(|p| p == Path::new("/tmp")));
         assert!(!paths.iter().any(|p| p.starts_with("/private")));
         assert!(!paths.iter().any(|p| p == Path::new("/opt/homebrew")));
         // Every returned path exists (the filter held).
         assert!(paths.iter().all(|p| p.exists()));
+    }
+
+    #[test]
+    fn read_only_profile_excludes_workspace_from_writable() {
+        // Workspace cwd must not become writable; temp scratch stays.
+        let paths = linux_writable_paths(Path::new("/usr"), SandboxProfile::ReadOnly);
+        assert!(!paths.iter().any(|p| p == Path::new("/usr")));
+        assert!(paths.iter().any(|p| p == Path::new("/tmp")));
     }
 
     #[test]
@@ -577,19 +727,52 @@ mod linux_tests {
         .iter()
         .map(|s| s.to_string())
         .collect();
-        let (ws, rest) = parse_sandbox_child_args(&raw);
+        let (profile, ws, rest) = parse_sandbox_child_args(&raw);
+        assert_eq!(profile, SandboxProfile::Workspace);
         assert_eq!(ws, vec!["/x"]);
         assert_eq!(rest, vec!["sh", "-c", "echo hi"]);
+    }
+
+    #[test]
+    fn parse_child_args_reads_profile() {
+        let raw: Vec<String> = [
+            "aivo",
+            "__agent-sandbox",
+            "--profile",
+            "strict",
+            "--workspace",
+            "/x",
+            "--",
+            "sh",
+            "-c",
+            "echo hi",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let (profile, ws, _) = parse_sandbox_child_args(&raw);
+        assert_eq!(profile, SandboxProfile::Strict);
+        assert_eq!(ws, vec!["/x"]);
     }
 
     #[test]
     fn landlock_relaunch_has_subcommand_shape() {
         // The relaunch invocation's shape, tested directly (no global flag, so it
         // can't race concurrent run_bash tests into relaunching the test binary).
-        let inv = landlock_relaunch("/usr/bin/aivo".to_string(), Path::new("/tmp"), "echo hi");
+        let inv = landlock_relaunch(
+            "/usr/bin/aivo".to_string(),
+            Path::new("/tmp"),
+            "echo hi",
+            SandboxProfile::Strict,
+        );
         assert_eq!(inv.program, "/usr/bin/aivo");
         assert_eq!(inv.args[0], "__agent-sandbox");
         assert!(inv.args.iter().any(|a| a == "--workspace"));
+        assert!(
+            inv.args
+                .windows(2)
+                .any(|w| w[0] == "--profile" && w[1] == "strict")
+        );
         assert!(inv.args.iter().any(|a| a == "--"));
         assert_eq!(inv.args.last().unwrap(), "echo hi");
     }
@@ -626,5 +809,40 @@ mod shell_tests {
             assert_eq!(shell_label(), "POSIX sh");
             assert_eq!(inv.args[0], "-c");
         }
+    }
+
+    #[test]
+    fn profile_parse_accepts_aliases_and_rejects_junk() {
+        assert_eq!(SandboxProfile::parse("off"), Some(SandboxProfile::Off));
+        assert_eq!(SandboxProfile::parse("none"), Some(SandboxProfile::Off));
+        assert_eq!(
+            SandboxProfile::parse(" Workspace "),
+            Some(SandboxProfile::Workspace)
+        );
+        assert_eq!(
+            SandboxProfile::parse("readonly"),
+            Some(SandboxProfile::ReadOnly)
+        );
+        assert_eq!(
+            SandboxProfile::parse("read-only"),
+            Some(SandboxProfile::ReadOnly)
+        );
+        assert_eq!(
+            SandboxProfile::parse("STRICT"),
+            Some(SandboxProfile::Strict)
+        );
+        assert_eq!(SandboxProfile::parse("bogus"), None);
+        // Round-trips through as_str for the canonical spellings.
+        for v in SandboxProfile::VALUES {
+            assert_eq!(SandboxProfile::parse(v).unwrap().as_str(), *v);
+        }
+    }
+
+    #[test]
+    fn only_confining_profiles_deny_network() {
+        assert!(SandboxProfile::ReadOnly.deny_network());
+        assert!(SandboxProfile::Strict.deny_network());
+        assert!(!SandboxProfile::Workspace.deny_network());
+        assert!(!SandboxProfile::Off.deny_network());
     }
 }

@@ -1443,6 +1443,17 @@ pub async fn execute(name: &str, args: &Value, cwd: &Path) -> Result<String, Str
         Some(n) => n,
         None => name,
     };
+    // The OS sandbox confines only the shell; refuse in-process edits here too.
+    if matches!(
+        name,
+        "write_file" | "edit_file" | "multi_edit" | "apply_patch"
+    ) && crate::agent::sandbox::current_profile()
+        == crate::agent::sandbox::SandboxProfile::ReadOnly
+    {
+        return Err(format!(
+            "{name}: refused — the read-only sandbox profile is active, so no files may be written."
+        ));
+    }
     match name {
         "read_file" => read_file(args, cwd),
         "list_dir" => list_dir(args, cwd),

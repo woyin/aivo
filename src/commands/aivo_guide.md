@@ -146,6 +146,15 @@ aivo code "<text>"            # TUI with the text sent as the first message
 --add-dir <dir>               extra writable workspace root (repeatable) — writes
                               there skip the out-of-workspace confirm and stay
                               inside the sandbox confinement
+--sandbox <profile>          shell sandbox: off, workspace (default), read-only
+                              (no writes/network — also blocks edit tools), strict
+                              (writes confined to workspace + temp, no child network)
+--best-of-n <N>              run -e N ways in parallel (N ≤ 10), return the
+                              LLM-judged best; costs N× tokens (--max-cost is
+                              per candidate) and the sandbox defaults to
+                              read-only — candidates share the working tree
+--json-schema <schema>       constrain the -e final answer to a JSON Schema
+                              (inline JSON or @path to a file)
 -r, --refresh                 refresh the model list (skip cache)
 --resume [last|id]            resume a saved session (TUI and -e; -e runs persist too)
 --share                       share this session live (needs `aivo login`)
