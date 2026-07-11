@@ -1736,6 +1736,11 @@ impl CodeTuiApp {
                 "Rewound (conversation only — file edits not reverted)".to_string()
             }
         };
+        // The measured fill described the truncated turns — re-estimate, or the
+        // footer and `/context` keep anchoring to the stale total.
+        self.context_tokens = self.estimated_context_used().await;
+        self.context_is_estimate = true;
+        self.last_usage = None;
         self.notice = Some((MUTED, notice));
         self.persist_history().await?;
         Ok(())

@@ -428,6 +428,10 @@ pub struct AgentEngine {
     /// chars/4 tokens of the `-c` block folded into the system prompt, so
     /// `context_report` can split it back out.
     injected_context_tokens: usize,
+    /// Provider-reported USD spend summed across the turn's steps (`usage.cost`).
+    turn_cost_usd: f64,
+    /// Upstream model echoed by responses — resolves aliases for pricing/stats.
+    billed_model: Option<String>,
 }
 
 /// Calibrated chars/4 breakdown of what fills the context window, for `/context`.
@@ -584,6 +588,8 @@ impl AgentEngine {
             max_cost_usd: 0.0,
             cost_pricing: None,
             injected_context_tokens: 0,
+            turn_cost_usd: 0.0,
+            billed_model: None,
         }
     }
 
@@ -882,6 +888,17 @@ questions.",
     /// the chat TUI folds it into the chat session index for `aivo stats`.
     pub fn take_turn_usage(&mut self) -> SessionTokens {
         std::mem::take(&mut self.turn_usage)
+    }
+
+    /// Upstream model echoed by this session's responses, when any step carried one.
+    pub fn billed_model(&self) -> Option<&str> {
+        self.billed_model.as_deref()
+    }
+
+    /// Drain the turn's provider-reported USD spend, when any step carried one.
+    pub fn take_turn_cost_usd(&mut self) -> Option<f64> {
+        let cost = std::mem::take(&mut self.turn_cost_usd);
+        (cost > 0.0).then_some(cost)
     }
 
     /// Attach an external tool source (MCP): advertise its schemas alongside the
@@ -1188,13 +1205,11 @@ questions.",
 
     /// Run one user turn to convergence: call the model, execute tool calls
     /// (permission-gated), repeat until it stops or a stop condition trips; footer.
-    /// chars/4 estimate of the next request's prompt (system + tools + conversation).
-    /// Seeds the live context-fill before real usage — the visible transcript omits
-    /// the system prompt and tool defs, which dominate an agent prompt.
+    /// Estimate of the next request's prompt (system + tools + conversation), on the
+    /// same [`estimate_tokens`] ruler as `context_report` so footer and `/context`
+    /// agree. Seeds the live context-fill before real usage.
     pub(crate) fn estimated_prompt_tokens(&self) -> u64 {
-        let msg_chars: usize = self.messages.iter().map(|m| m.to_string().len()).sum();
-        let tool_chars: usize = self.tools_openai.iter().map(|t| t.to_string().len()).sum();
-        ((msg_chars + tool_chars) / 4) as u64
+        (estimate_tokens(&self.messages) + estimate_tokens(&self.tools_openai)) as u64
     }
 
     /// Calibrated composition snapshot for the `/context` viewer.
@@ -1433,6 +1448,7 @@ questions.",
                             tool_calls: vec![],
                             usage: None,
                             truncated: false,
+                            model: None,
                         };
                     }
                 }
@@ -1450,6 +1466,9 @@ questions.",
                 );
             }
             steps += 1;
+            if let Some(m) = &message.model {
+                self.billed_model = Some(m.clone());
+            }
             let step_tokens = usage_tokens(&message.usage);
             tokens += step_tokens;
             if message.usage.is_some() {
@@ -1458,16 +1477,21 @@ questions.",
                 self.update_calibration(sent_estimate, step_tokens);
             }
             // Sum the real prompt/completion/cache split across steps (same parser as the serve, for a consistent index).
-            if let Some(u) = &message.usage
-                && let Some(split) = extract_usage_from_value(&json!({ "usage": u }))
-            {
-                self.turn_usage = self.turn_usage.merge(SessionTokens {
-                    prompt_tokens: split.prompt,
-                    completion_tokens: split.completion,
-                    cache_read_tokens: split.cache_read,
-                    cache_write_tokens: split.cache_creation,
-                });
-                ui.turn_tokens(self.turn_usage.completion_tokens);
+            if let Some(u) = &message.usage {
+                if let Some(split) = extract_usage_from_value(&json!({ "usage": u })) {
+                    self.turn_usage = self.turn_usage.merge(SessionTokens {
+                        prompt_tokens: split.prompt,
+                        completion_tokens: split.completion,
+                        cache_read_tokens: split.cache_read,
+                        cache_write_tokens: split.cache_creation,
+                    });
+                    ui.turn_tokens(self.turn_usage.completion_tokens);
+                }
+                if let Some(cost) = u.get("cost").and_then(|x| x.as_f64())
+                    && cost > 0.0
+                {
+                    self.turn_cost_usd += cost;
+                }
             }
 
             // Per-turn cost breaker for unattended runs (0 = no cap; TUI relies on esc).
@@ -1529,6 +1553,7 @@ questions.",
                     tool_calls: Vec::new(),
                     usage: message.usage.clone(),
                     truncated: false,
+                    model: None,
                 };
                 self.messages.push(assistant_to_openai(&recorded_msg));
                 self.push_text_turn("user", LEAKED_TOOL_CALL_NUDGE.to_string());
@@ -3045,7 +3070,12 @@ mod tests {
         let injected = format!("PRIOR SESSION CONTEXT: {}", "x".repeat(4_000));
         e.append_system_context(&injected);
         let with_ctx = e.context_report();
-        assert!(with_ctx.injected_context >= 900, "≈4k chars/4 ≈ 1k tokens");
+        let injected_est = estimate_str_tokens(&injected) as u64;
+        assert!(
+            with_ctx.injected_context.abs_diff(injected_est) <= 5,
+            "injected segment ≈ the block's estimate: {} vs {injected_est}",
+            with_ctx.injected_context
+        );
         assert!(
             with_ctx.system_prompt.abs_diff(base.system_prompt) <= 5,
             "base system prompt unchanged by the append: {} vs {}",
@@ -3082,6 +3112,15 @@ mod tests {
         assert!(r.messages.abs_diff(1_000) <= 1);
         r.rescale(0); // no-op, never blank the breakdown
         assert!(r.used() > 0);
+    }
+
+    #[test]
+    fn take_turn_cost_usd_drains_reported_spend() {
+        let mut e = AgentEngine::new("/tmp", "m", "", &[], &[], 0, 0);
+        assert_eq!(e.take_turn_cost_usd(), None);
+        e.turn_cost_usd = 0.0421;
+        assert_eq!(e.take_turn_cost_usd(), Some(0.0421));
+        assert_eq!(e.take_turn_cost_usd(), None, "drained with the turn");
     }
 
     #[derive(Default)]
@@ -6473,7 +6512,7 @@ mod tests {
     #[test]
     fn compact_now_local_clears_stale_tool_output() {
         let mut engine = AgentEngine::new("/tmp", "m", "", &[], &[], 0, 0);
-        let recent = "r".repeat(120_000); // ~30k tokens — fills the 20k keep window
+        let recent = "r".repeat(200_000); // ~25k tokens — fills the 20k keep window
         let stale = "s".repeat(8_000); // > TOOL_RESULT_CLEAR_MIN, older than the cut
         engine.messages = vec![
             json!({"role":"system","content":"sys"}),
@@ -7110,7 +7149,7 @@ mod tests {
     #[test]
     fn clear_stale_tool_results_clears_only_old_bulky_outputs() {
         let mut e = AgentEngine::new("/tmp", "m", "", &[], &[], 0, 0);
-        let big = "x".repeat(5000);
+        let big = "x".repeat(10_000); // ~1.25k tokens
         // [0 system, 1 user, 2 assistant(call), 3 tool BIG(old), 4 user, 5 tool BIG(recent), 6 asst]
         e.messages.push(json!({"role":"user","content":"go"}));
         e.messages.push(json!({"role":"assistant","tool_calls":[
@@ -7129,7 +7168,7 @@ mod tests {
         assert_eq!(e.messages[3]["tool_call_id"], "c1"); // pairing intact
         assert_eq!(
             e.messages[5]["content"].as_str().unwrap().len(),
-            5000,
+            10_000,
             "recent tool output untouched"
         );
         assert_eq!(e.stale_tool_result_savings(cut), 0, "idempotent");

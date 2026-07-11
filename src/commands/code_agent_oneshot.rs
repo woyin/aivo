@@ -414,11 +414,15 @@ async fn persist_oneshot_session(
         .chars()
         .take(160)
         .collect();
-    let mut tokens = session_store.chat_session_tokens(session_id).await;
+    let (mut tokens, _, stored_cost) = session_store.chat_session_billing(session_id).await;
     tokens.prompt_tokens += usage.prompt_tokens;
     tokens.completion_tokens += usage.completion_tokens;
     tokens.cache_read_tokens += usage.cache_read_tokens;
     tokens.cache_write_tokens += usage.cache_write_tokens;
+    let cost = stored_cost
+        + crate::services::model_metadata::model_pricing(model)
+            .and_then(|p| p.cost_usd(usage))
+            .unwrap_or(0.0);
     let _ = session_store
         .save_code_session_with_id(
             &key.id,
@@ -431,6 +435,7 @@ async fn persist_oneshot_session(
             &title,
             &preview,
             tokens,
+            cost,
         )
         .await;
 }

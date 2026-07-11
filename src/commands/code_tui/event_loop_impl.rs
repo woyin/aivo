@@ -809,6 +809,16 @@ impl CodeTuiApp {
         // Don't force-follow on a plan refresh; respect the user's scroll position.
     }
 
+    /// Pricing for the session's model, else the upstream-echoed `billed_model`
+    /// (an alias like `aivo/starter` has no snapshot row).
+    pub(super) fn session_pricing(&self) -> Option<crate::services::model_metadata::Pricing> {
+        crate::services::model_metadata::model_pricing(&self.model).or_else(|| {
+            self.billed_model
+                .as_deref()
+                .and_then(crate::services::model_metadata::model_pricing)
+        })
+    }
+
     async fn finish_agent_turn(
         &mut self,
         _steps: usize,
@@ -873,9 +883,20 @@ impl CodeTuiApp {
         // total BEFORE a possible MCP rebuild drops the engine, so the chat index
         // entry (and thus `aivo stats --since`) carries actual chat tokens.
         if let Some(session) = self.agent_engine.as_ref() {
-            let turn = session.engine.lock().await.take_turn_usage();
-            let cost = crate::services::model_metadata::model_pricing(&self.model)
-                .and_then(|p| p.cost_usd(&turn));
+            let (turn, reported_cost, billed) = {
+                let mut engine = session.engine.lock().await;
+                (
+                    engine.take_turn_usage(),
+                    engine.take_turn_cost_usd(),
+                    engine.billed_model().map(str::to_string),
+                )
+            };
+            if billed.is_some() {
+                self.billed_model = billed;
+            }
+            // Provider-reported spend beats list-price × usage when available.
+            let cost =
+                reported_cost.or_else(|| self.session_pricing().and_then(|p| p.cost_usd(&turn)));
             if let Some(cost) = cost {
                 self.session_cost_usd += cost;
             }
@@ -888,8 +909,8 @@ impl CodeTuiApp {
                     "{} tokens",
                     format_token_count_value(turn.completion_tokens)
                 );
-                if let Some(cost) = cost.filter(|c| *c >= 0.005) {
-                    note.push_str(&format!(" · ~${cost:.2}"));
+                if let Some(cost) = cost.filter(|c| *c > 0.0) {
+                    note.push_str(&format!(" · ~${}", format_usd(cost)));
                 }
                 self.turn_notes.insert(idx, note);
             }
@@ -1264,9 +1285,7 @@ impl CodeTuiApp {
             cache_read_tokens: usage.cache_read_input_tokens,
             cache_write_tokens: usage.cache_creation_input_tokens,
         };
-        if let Some(cost) = crate::services::model_metadata::model_pricing(&self.model)
-            .and_then(|p| p.cost_usd(&split))
-        {
+        if let Some(cost) = self.session_pricing().and_then(|p| p.cost_usd(&split)) {
             self.session_cost_usd += cost;
         }
         self.session_tokens = self.session_tokens.merge(split);

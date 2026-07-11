@@ -221,8 +221,8 @@ impl AgentEngine {
         (before, self.estimated_context_tokens())
     }
 
-    /// Tokens (chars/4) reclaimable by [`clear_stale_tool_results`]: for each OLD `tool`
-    /// message over the threshold, the bytes dropped (a retained pointer line is excluded).
+    /// Tokens reclaimable by [`clear_stale_tool_results`], on the [`estimate_tokens`]
+    /// ruler — the cheap compaction path trusts this figure without re-checking the budget.
     pub(crate) fn stale_tool_result_savings(&self, cut: usize) -> usize {
         self.messages
             .get(1..cut)
@@ -232,9 +232,9 @@ impl AgentEngine {
             .filter_map(|m| m.get("content").and_then(|c| c.as_str()))
             .filter(|s| s.len() > TOOL_RESULT_CLEAR_MIN)
             .map(|s| {
-                let retained =
-                    TOOL_RESULT_CLEARED.len() + artifact_pointer_line(s).map_or(0, |p| p.len() + 1);
-                s.len().saturating_sub(retained) / 4
+                let retained = estimate_str_tokens(TOOL_RESULT_CLEARED)
+                    + artifact_pointer_line(s).map_or(0, |p| estimate_str_tokens(p) + 1);
+                estimate_str_tokens(s).saturating_sub(retained)
             })
             .sum()
     }

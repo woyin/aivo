@@ -902,9 +902,14 @@ pub struct SessionIndexEntry {
     pub cache_read_tokens: u64,
     #[serde(default, skip_serializing_if = "is_zero")]
     pub cache_write_tokens: u64,
+    /// Cumulative estimated/reported spend, so resume doesn't lose the figure.
+    #[serde(default, skip_serializing_if = "is_zero_f64")]
+    pub cost_usd: f64,
 }
 
 /// Token usage for a single chat turn or accumulated across a session.
+/// `prompt_tokens` is the total input side — cache reads/writes are a subset of
+/// it (OpenAI-style); Anthropic's disjoint counts are normalized at ingestion.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct SessionTokens {
     pub prompt_tokens: u64,
@@ -930,10 +935,8 @@ impl SessionTokens {
     }
 
     pub fn total(&self) -> u64 {
-        self.prompt_tokens
-            .saturating_add(self.completion_tokens)
-            .saturating_add(self.cache_read_tokens)
-            .saturating_add(self.cache_write_tokens)
+        // Cache counts are ⊂ prompt_tokens — adding them would double count.
+        self.prompt_tokens.saturating_add(self.completion_tokens)
     }
 }
 
@@ -961,6 +964,10 @@ impl ChatTokenWindow {
 
 fn is_zero(value: &u64) -> bool {
     *value == 0
+}
+
+fn is_zero_f64(value: &f64) -> bool {
+    *value == 0.0
 }
 
 fn default_chat_session_id() -> String {
@@ -2156,6 +2163,14 @@ impl SessionStore {
         self.sessions.chat_session_tokens(session_id).await
     }
 
+    /// Index billing snapshot: cumulative tokens, upstream billed model, and spend.
+    pub async fn chat_session_billing(
+        &self,
+        session_id: &str,
+    ) -> (SessionTokens, Option<String>, f64) {
+        self.sessions.chat_session_billing(session_id).await
+    }
+
     pub async fn all_chat_sessions(&self) -> Result<Vec<SessionIndexEntry>> {
         self.sessions.all_chat_sessions().await
     }
@@ -2173,6 +2188,7 @@ impl SessionStore {
         title: &str,
         preview: &str,
         tokens: SessionTokens,
+        cost_usd: f64,
     ) -> Result<()> {
         self.sessions
             .save_code_session_with_id(
@@ -2186,6 +2202,7 @@ impl SessionStore {
                 title,
                 preview,
                 tokens,
+                cost_usd,
             )
             .await
     }
@@ -3117,6 +3134,7 @@ mod tests {
                 "hello",
                 "hello",
                 SessionTokens::default(),
+                0.0,
             )
             .await
             .unwrap();
@@ -3155,6 +3173,7 @@ mod tests {
                 "second",
                 "second",
                 SessionTokens::default(),
+                0.0,
             )
             .await
             .unwrap();

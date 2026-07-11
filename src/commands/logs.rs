@@ -2161,6 +2161,7 @@ mod tests {
             completion_tokens: 3057,
             cache_read_tokens: 0,
             cache_write_tokens: 0,
+            cost_usd: 0.0,
         }
     }
 

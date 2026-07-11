@@ -889,6 +889,7 @@ mod tests {
                 "title",
                 "preview",
                 SessionTokens::default(),
+                0.0,
             )
             .await
             .unwrap();
@@ -927,6 +928,7 @@ mod tests {
                 "title",
                 "preview",
                 SessionTokens::default(),
+                0.0,
             )
             .await
             .unwrap();

@@ -5,11 +5,10 @@
 use crate::services::ai_launcher::AIToolType;
 use crate::services::project_id::Thread;
 
-/// Rough token estimate: ~4 chars per token for English prose. Cheap and
-/// good enough for the single "injecting N tokens" status line we show.
+/// Same ruler as the agent engine's injected block, so the "injecting N tokens"
+/// summary matches `/context`.
 pub fn estimate_tokens(text: &str) -> usize {
-    let chars = text.chars().count();
-    chars.div_ceil(4)
+    crate::agent::tokens::estimate_str_tokens(text)
 }
 
 /// Output of a render: the rendered string plus a token estimate for the
@@ -159,7 +158,7 @@ mod tests {
     #[test]
     fn estimate_tokens_matches_rough_ratio() {
         assert_eq!(estimate_tokens("abcd"), 1);
-        assert_eq!(estimate_tokens("abcdefgh"), 2);
+        assert_eq!(estimate_tokens("the quick brown fox jumps"), 5);
         assert_eq!(estimate_tokens(""), 0);
     }
 

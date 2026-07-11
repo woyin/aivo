@@ -1589,6 +1589,43 @@ async fn test_rewind_truncates_history_and_restores_draft() {
     assert_eq!(app.cursor, app.draft.len());
 }
 
+/// A rewind invalidates the measured fill — footer and `/context` must drop
+/// back to a flagged estimate of the surviving turns.
+#[tokio::test]
+async fn test_rewind_reestimates_context_fill() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.session_id = "rewind-ctx".to_string();
+    seed_two_exchanges(&mut app);
+    app.context_tokens = 100_000;
+    app.context_is_estimate = false;
+    app.last_usage = Some(crate::commands::code_response_parser::TokenUsage {
+        prompt_tokens: 99_000,
+        completion_tokens: 1_000,
+        ..Default::default()
+    });
+
+    app.rewind_to_turn(2, None).await.unwrap();
+
+    assert!(app.context_is_estimate, "measured flag must not survive");
+    assert_eq!(app.last_usage, None);
+    assert!(
+        app.context_tokens < 100_000,
+        "fill must be re-estimated from the truncated history, got {}",
+        app.context_tokens
+    );
+}
+
+#[tokio::test]
+async fn test_session_pricing_falls_back_to_billed_model() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.model = "aivo/starter".to_string();
+    assert!(app.session_pricing().is_none(), "alias alone is unpriced");
+    app.billed_model = Some("claude-opus-4-8".to_string());
+    assert!(app.session_pricing().is_some(), "billed model resolves");
+}
+
 #[tokio::test]
 async fn test_rewind_to_first_turn_clears_history() {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
@@ -2442,7 +2479,7 @@ fn test_footer_status_label_shows_window_on_pristine_session() {
     app.context_window = 1_000_000;
     app.context_tokens = 0; // no turn yet → no fill to gauge
 
-    // The welcome screen shows the window size, not an empty `0 / 1M` meter.
+    // The welcome screen shows the window size, not an empty `0/1M` meter.
     let (label, color) = app.footer_status_label();
     assert_eq!(label, "1M context");
     assert_eq!(color, MUTED);
@@ -2450,7 +2487,7 @@ fn test_footer_status_label_shows_window_on_pristine_session() {
     // The first tokens flip it to the live gauge.
     app.context_tokens = 50_000;
     app.context_is_estimate = false;
-    assert_eq!(app.footer_status_label().0, "50k / 1M");
+    assert_eq!(app.footer_status_label().0, "50k/1M");
 }
 
 #[test]
@@ -2461,9 +2498,9 @@ fn test_footer_status_label_shows_context_utilization() {
     app.context_tokens = 10_000;
     app.context_is_estimate = false; // a provider-measured fill
 
-    // used / window, quiet until it nears the limit.
+    // used/window, quiet until it nears the limit.
     let (label, color) = app.footer_status_label();
-    assert_eq!(label, "10k / 200k");
+    assert_eq!(label, "10k/200k");
     assert_eq!(color, MUTED);
 
     // Warms toward the window limit (compaction territory).
@@ -2478,7 +2515,7 @@ fn test_footer_status_label_shows_context_utilization() {
         completion_tokens: 0,
         ..Default::default()
     });
-    assert_eq!(app.footer_status_label().0, "40k / 200k");
+    assert_eq!(app.footer_status_label().0, "40k/200k");
 }
 
 #[test]
@@ -2492,7 +2529,7 @@ fn test_footer_status_label_marks_estimates() {
     // understates the model's real context, so flag it with `~`.
     app.context_is_estimate = true;
     app.last_usage = None;
-    assert_eq!(app.footer_status_label().0, "~10k / 200k");
+    assert_eq!(app.footer_status_label().0, "~10k/200k");
 
     // A provider-measured last-turn total is exact even if the estimate flag
     // lingers from a prior turn — no tilde.
@@ -2501,7 +2538,7 @@ fn test_footer_status_label_marks_estimates() {
         completion_tokens: 0,
         ..Default::default()
     });
-    assert_eq!(app.footer_status_label().0, "40k / 200k");
+    assert_eq!(app.footer_status_label().0, "40k/200k");
 }
 
 #[test]
@@ -2544,7 +2581,7 @@ fn test_footer_status_label_updates_live_during_turn() {
     // baseline (no drop at turn start) and grows it as text streams in, flagged `~`.
     app.sending = true;
     app.pending_response = "x".repeat(4_000); // ~1k tokens streamed so far
-    assert_eq!(app.footer_status_label().0, "~41k / 200k");
+    assert_eq!(app.footer_status_label().0, "~41k/200k");
 
     // Provider-measured usage arrives mid-stream (Anthropic message_start/_delta):
     // the live figure replaces the estimate immediately, no `~`.
@@ -2553,7 +2590,7 @@ fn test_footer_status_label_updates_live_during_turn() {
         completion_tokens: 2_000,
         ..Default::default()
     });
-    assert_eq!(app.footer_status_label().0, "52k / 200k");
+    assert_eq!(app.footer_status_label().0, "52k/200k");
 
     // Turn ends: the fold into last_usage keeps the measured total on the footer.
     app.sending = false;
@@ -2563,7 +2600,7 @@ fn test_footer_status_label_updates_live_during_turn() {
         completion_tokens: 2_500,
         ..Default::default()
     });
-    assert_eq!(app.footer_status_label().0, "52.5k / 200k");
+    assert_eq!(app.footer_status_label().0, "52.5k/200k");
 }
 
 #[test]
@@ -2577,13 +2614,13 @@ fn test_agent_context_drives_footer_live() {
     // counts the real request the engine sends, not just the visible transcript.
     // Flagged `~` since it is a chars/4 estimate.
     app.apply_agent_context(50_000, false);
-    assert_eq!(app.footer_status_label().0, "~50k / 200k");
+    assert_eq!(app.footer_status_label().0, "~50k/200k");
 
     // The step's measured total arrives → exact figure, no `~`, and streamed text
     // is not re-added on top (it is already in the measured completion).
     app.pending_response = "x".repeat(8_000); // would add ~2k if double-counted
     app.apply_agent_context(60_000, true);
-    assert_eq!(app.footer_status_label().0, "60k / 200k");
+    assert_eq!(app.footer_status_label().0, "60k/200k");
 }
 
 #[test]
@@ -12919,6 +12956,7 @@ async fn test_resume_last_jumps_to_newest_from_fresh_launch() {
             "older",
             "older",
             crate::services::session_store::SessionTokens::default(),
+            0.0,
         )
         .await
         .unwrap();
@@ -12936,6 +12974,7 @@ async fn test_resume_last_jumps_to_newest_from_fresh_launch() {
             "newer",
             "newer",
             crate::services::session_store::SessionTokens::default(),
+            0.0,
         )
         .await
         .unwrap();
@@ -12985,6 +13024,7 @@ async fn test_resume_last_in_session_skips_current_chat() {
             "previous",
             "previous",
             crate::services::session_store::SessionTokens::default(),
+            0.0,
         )
         .await
         .unwrap();
@@ -13102,6 +13142,7 @@ async fn test_open_resume_picker_scopes_to_cwd_but_id_is_global() {
                 sid,
                 sid,
                 crate::services::session_store::SessionTokens::default(),
+                0.0,
             )
             .await
             .unwrap();
@@ -13180,6 +13221,7 @@ async fn test_delete_picker_selection_removes_saved_chat() {
             "hello",
             "hello · hi there",
             crate::services::session_store::SessionTokens::default(),
+            0.0,
         )
         .await
         .unwrap();
@@ -13253,6 +13295,7 @@ async fn test_ctrl_d_requires_confirmation_before_delete() {
             "hello",
             "hello",
             crate::services::session_store::SessionTokens::default(),
+            0.0,
         )
         .await
         .unwrap();
@@ -13452,10 +13495,59 @@ async fn test_resume_footer_estimate_uses_durable_transcript() {
         "post-resume fill is an estimate until measured"
     );
     assert!(
-        app.context_tokens >= 50_000,
-        "estimate must reflect the ~50k-token transcript, got {}",
+        app.context_tokens >= 20_000,
+        "estimate must reflect the ~25k-token transcript, got {}",
         app.context_tokens
     );
+}
+
+/// Resume restores the stored spend and billed model verbatim — an alias with no
+/// snapshot pricing must not zero the figure the session already accumulated.
+#[tokio::test]
+async fn test_resume_restores_session_cost_and_billed_model() {
+    let temp_dir = TempDir::new().unwrap();
+    let store = SessionStore::with_path(temp_dir.path().join("config.json"));
+    let key_id = store
+        .add_key_with_protocol("prod", "https://api.example.com", None, "sk-test")
+        .await
+        .unwrap();
+    let key = store.get_key_by_id(&key_id).await.unwrap().unwrap();
+    store
+        .save_code_session_with_id(
+            &key.id,
+            &key.base_url,
+            "/tmp/proj",
+            "cost-sess",
+            "aivo/starter",
+            Some("deepseek-v4-flash"),
+            &[],
+            "t",
+            "p",
+            SessionTokens {
+                prompt_tokens: 5,
+                completion_tokens: 176,
+                ..Default::default()
+            },
+            0.000_065,
+        )
+        .await
+        .unwrap();
+
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.session_store = store;
+    app.key = key;
+    let session = LoadedSession {
+        key_id,
+        session_id: "cost-sess".to_string(),
+        raw_model: "aivo/starter".to_string(),
+        messages: vec![],
+        engine_messages: None,
+    };
+    app.apply_loaded_session(session).await.unwrap();
+
+    assert_eq!(app.session_cost_usd, 0.000_065);
+    assert_eq!(app.billed_model.as_deref(), Some("deepseek-v4-flash"));
 }
 
 #[tokio::test]
@@ -13548,6 +13640,7 @@ async fn test_resume_snapshots_scope_by_cwd() {
             "older",
             "older",
             crate::services::session_store::SessionTokens::default(),
+            0.0,
         )
         .await
         .unwrap();

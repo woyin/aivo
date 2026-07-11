@@ -34,7 +34,8 @@ use super::code_tui_format::{
     build_footer_text, display_width, estimate_context_tokens, footer_host_label,
     format_picker_match_count, format_request_elapsed, format_session_group_label,
     format_session_match_count, format_session_time, format_time_ago_short, format_token_count,
-    format_token_count_value, git_branch_for, truncate_for_display_width, truncate_for_width,
+    format_token_count_value, format_usd, git_branch_for, truncate_for_display_width,
+    truncate_for_width,
 };
 use super::*;
 

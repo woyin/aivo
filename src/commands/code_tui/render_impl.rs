@@ -2785,7 +2785,7 @@ impl CodeTuiApp {
         // the number understates the true fill — `~` flags it as approximate.
         let approx = if is_estimate && used > 0 { "~" } else { "" };
         let label = format!(
-            "{approx}{} / {}{}",
+            "{approx}{}/{}{}",
             format_token_count_value(used),
             format_token_count_value(self.context_window),
             self.session_cost_label(),
@@ -2793,13 +2793,13 @@ impl CodeTuiApp {
         (label, context_fill_color(pct))
     }
 
-    /// ` · ~$X.XX` session-spend suffix; empty below half a cent or without pricing.
+    /// ` · ~$X.XX` session-spend suffix; empty only without any recorded spend.
     /// Always `~`: snapshot list prices × parsed usage is an estimate, not a bill.
     pub(super) fn session_cost_label(&self) -> String {
-        if self.session_cost_usd < 0.005 {
+        if self.session_cost_usd <= 0.0 {
             return String::new();
         }
-        format!(" · ~${:.2}", self.session_cost_usd)
+        format!(" · ~${}", format_usd(self.session_cost_usd))
     }
 
     pub(super) fn composer_height(&self, width: u16) -> u16 {

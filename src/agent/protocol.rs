@@ -31,6 +31,9 @@ pub struct AssistantMessage {
     /// `serve_client::complete`). Never on the wire — a sent message can't be partial.
     #[serde(skip)]
     pub truncated: bool,
+    /// Upstream model echoed by the response chunks; never on the wire.
+    #[serde(skip)]
+    pub model: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

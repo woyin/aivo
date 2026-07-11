@@ -103,6 +103,7 @@ pub async fn complete(
     let mut content = String::new();
     let mut tools: Vec<ToolAcc> = Vec::new();
     let mut usage: Option<Value> = None;
+    let mut model: Option<String> = None;
     // Accumulate raw BYTES, not lossily-decoded chunks: a multi-byte char (CJK,
     // emoji) can straddle a chunk boundary, and decoding each chunk separately
     // would turn each half into a replacement char. A `\n`-terminated line never
@@ -146,6 +147,12 @@ pub async fn complete(
                 && !u.is_null()
             {
                 usage = Some(u.clone());
+            }
+            if model.is_none()
+                && let Some(m) = v.get("model").and_then(|x| x.as_str())
+                && !m.is_empty()
+            {
+                model = Some(m.to_string());
             }
             let Some(delta) = v.pointer("/choices/0/delta") else {
                 continue;
@@ -200,6 +207,7 @@ pub async fn complete(
         tool_calls,
         usage,
         truncated,
+        model,
     })
 }
 
@@ -373,6 +381,24 @@ data: [DONE]\n\n";
         assert_eq!(msg.tool_calls[0].name, "read_file");
         assert_eq!(msg.tool_calls[0].id, "call_1");
         assert_eq!(msg.tool_calls[0].arguments["path"], "a.txt");
+    }
+
+    #[tokio::test]
+    async fn captures_upstream_model_from_chunks() {
+        let body = "data: {\"model\":\"deepseek-v4-flash\",\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n\
+data: [DONE]\n\n";
+        let port = spawn_sse(body);
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let msg = complete(
+            &client,
+            &format!("http://127.0.0.1:{port}"),
+            None,
+            &req(),
+            &mut |_| {},
+        )
+        .await
+        .unwrap();
+        assert_eq!(msg.model.as_deref(), Some("deepseek-v4-flash"));
     }
 
     #[test]

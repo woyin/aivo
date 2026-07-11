@@ -2362,6 +2362,7 @@ is preserved."
                 &title,
                 &preview,
                 self.session_tokens,
+                self.session_cost_usd,
             )
             .await?;
         // Durable resume: also persist the agent engine's exact conversation
@@ -2455,16 +2456,13 @@ is preserved."
                 .session_artifacts_dir(&self.session_id)
                 .join("jobs"),
         );
-        // Re-seed the running token total from the stored entry so further turns
-        // accumulate on top of it (the index save overwrites with the cumulative).
-        self.session_tokens = self
+        // Re-seed the running totals from the stored entry so further turns
+        // accumulate on top of them (the index save overwrites with the cumulative).
+        let (tokens, stored_billed, stored_cost) = self
             .session_store
-            .chat_session_tokens(&self.session_id)
+            .chat_session_billing(&self.session_id)
             .await;
-        // Re-estimated from the resumed totals (the `~` label tolerates price drift).
-        self.session_cost_usd = crate::services::model_metadata::model_pricing(&self.model)
-            .and_then(|p| p.cost_usd(&self.session_tokens))
-            .unwrap_or(0.0);
+        self.session_tokens = tokens;
         self.history = session.messages;
         // Resumed rows never map to live checkpoints (the store is session-scoped).
         self.agent_turn_indices.clear();
@@ -2492,7 +2490,16 @@ is preserved."
         self.raw_model = session.raw_model.clone();
         self.model =
             CodeCommand::transform_model_for_provider(&self.key.base_url, &session.raw_model);
-        self.billed_model = None;
+        self.billed_model = stored_billed;
+        // Stored spend survives resume verbatim (it may include provider-reported
+        // figures); legacy entries without one fall back to a list-price estimate.
+        self.session_cost_usd = if stored_cost > 0.0 {
+            stored_cost
+        } else {
+            self.session_pricing()
+                .and_then(|p| p.cost_usd(&self.session_tokens))
+                .unwrap_or(0.0)
+        };
         self.refresh_context_window().await;
         // After model/window are set, so the preview mirrors the resumed session.
         self.context_tokens = self.estimated_context_used().await;

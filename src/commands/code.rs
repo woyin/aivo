@@ -887,6 +887,12 @@ impl CodeCommand {
                         cache_read_tokens: usage.cache_read_input_tokens,
                         cache_write_tokens: usage.cache_creation_input_tokens,
                     };
+                    let cost = crate::services::model_metadata::model_pricing(&raw_model)
+                        .or_else(|| {
+                            billed_model.and_then(crate::services::model_metadata::model_pricing)
+                        })
+                        .and_then(|p| p.cost_usd(&session_tokens))
+                        .unwrap_or(0.0);
                     let _ = self
                         .session_store
                         .save_code_session_with_id(
@@ -900,6 +906,7 @@ impl CodeCommand {
                             &title,
                             &preview,
                             session_tokens,
+                            cost,
                         )
                         .await;
                     if json {
