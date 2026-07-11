@@ -1021,6 +1021,20 @@ impl CodeTuiApp {
                     }
                 }
             }
+            Overlay::Agents(agents) => {
+                let (area, split) = split_overlay_area(body, 84, 80, 64, 80);
+                self.screen_region = Some(overlay_content_rect(area));
+                let out = self.render_agents_overlay(frame, area, &agents, split);
+                self.overlay_detail_area = out.detail_area;
+                if let Overlay::Agents(s) = &mut self.overlay {
+                    if let Some(c) = out.detail_scroll {
+                        s.detail_scroll = c;
+                    }
+                    if split {
+                        s.viewing = None;
+                    }
+                }
+            }
             Overlay::SkillInstall(pick) => {
                 let (area, split) = split_overlay_area(body, 84, 80, 64, 80);
                 self.screen_region = Some(overlay_content_rect(area));

@@ -7,7 +7,7 @@ use crate::errors::ExitCode;
 use crate::services::SessionStore;
 use crate::services::ai_launcher::AIToolType;
 use crate::services::global_stats::{self, normalize_model_for_display};
-use crate::services::session_store::{ChatTokenWindow, UsageStats};
+use crate::services::session_store::{AgentUsage, ChatTokenWindow, UsageStats};
 use crate::style;
 
 /// By tool `tokens` column placeholder for launch-only tools.
@@ -346,6 +346,14 @@ impl StatsCommand {
         };
         let window = args.since.as_deref().zip(cutoff);
 
+        // Per-agent tallies have no timestamp, so they're lifetime-only — omit
+        // them from a `--since` view rather than mislabel lifetime data.
+        let agent_rows = if cutoff.is_none() {
+            aggregate_agent_usage(&stats, &key_ids)
+        } else {
+            Vec::new()
+        };
+
         if args.json {
             return print_json(&build_overview_json(
                 &tool_tokens,
@@ -355,6 +363,7 @@ impl StatsCommand {
                 (total_cache_read, total_cache_write),
                 total_sessions,
                 total_models,
+                &agent_rows,
                 args.search.as_deref(),
                 window,
                 omitted_sources,
@@ -441,6 +450,7 @@ impl StatsCommand {
             }
         }
 
+        render_agent_table(&agent_rows, fmt);
         render_model_table(&model_tokens, fmt, args);
         render_since_footer(args.since.as_deref(), omitted_sources);
 
@@ -778,6 +788,7 @@ fn build_overview_json(
     (total_cache_read, total_cache_write): (u64, u64),
     total_sessions: u64,
     total_models: u64,
+    agent_rows: &[(String, AgentUsage)],
     search: Option<&str>,
     window: Option<(&str, chrono::DateTime<chrono::Utc>)>,
     omitted_sources: &[&str],
@@ -840,6 +851,20 @@ fn build_overview_json(
         "by_model": by_model,
         "omitted_sources": omitted_sources,
     });
+    if !agent_rows.is_empty() {
+        payload["per_agent"] = agent_rows
+            .iter()
+            .map(|(name, u)| {
+                json!({
+                    "name": name,
+                    "runs": u.runs,
+                    "ok_runs": u.ok_runs,
+                    "steps": u.steps,
+                    "tokens": u.tokens,
+                })
+            })
+            .collect();
+    }
     if let Some((raw, cutoff)) = window {
         payload["window"] = json!({
             "since": raw,
@@ -1332,6 +1357,96 @@ fn print_launch_view(
     hints.push("-n numbers");
     hints.push("-s filter");
     println!("{}", style::dim(hints.join(" · ")));
+}
+
+/// Sum per-named-subagent tallies across the current keys, sorted by tokens then
+/// runs. Agent stats carry no timestamp, so this is lifetime-only (callers skip
+/// it under `--since`).
+fn aggregate_agent_usage(stats: &UsageStats, key_ids: &HashSet<&str>) -> Vec<(String, AgentUsage)> {
+    let mut agents: HashMap<String, AgentUsage> = HashMap::new();
+    for (key_id, entry) in &stats.key_usage {
+        if !key_ids.contains(key_id.as_str()) {
+            continue;
+        }
+        for (name, usage) in &entry.per_agent {
+            let acc = agents.entry(name.clone()).or_default();
+            acc.runs = acc.runs.saturating_add(usage.runs);
+            acc.ok_runs = acc.ok_runs.saturating_add(usage.ok_runs);
+            acc.steps = acc.steps.saturating_add(usage.steps);
+            acc.tokens = acc.tokens.saturating_add(usage.tokens);
+        }
+    }
+    let mut rows: Vec<(String, AgentUsage)> = agents.into_iter().collect();
+    rows.sort_by(|a, b| {
+        b.1.tokens
+            .cmp(&a.1.tokens)
+            .then_with(|| b.1.runs.cmp(&a.1.runs))
+            .then_with(|| a.0.cmp(&b.0))
+    });
+    rows
+}
+
+/// A run cell reads `ok/total` only when a run failed, else the bare total.
+fn agent_runs_cell(u: &AgentUsage, fmt: fn(u64) -> String) -> String {
+    if u.ok_runs == u.runs {
+        fmt(u.runs)
+    } else {
+        format!("{}/{}", fmt(u.ok_runs), fmt(u.runs))
+    }
+}
+
+/// `By agent` summary — mirrors the `By tool` table's alignment and colors.
+/// Empty rows (no named delegations, or a `--since` window) print nothing.
+fn render_agent_table(rows: &[(String, AgentUsage)], fmt: fn(u64) -> String) {
+    if rows.is_empty() {
+        return;
+    }
+    println!();
+
+    let name_w = rows
+        .iter()
+        .map(|(n, _)| n.len())
+        .max()
+        .unwrap_or(0)
+        .max("By agent".len());
+    let runs_w = rows
+        .iter()
+        .map(|(_, u)| agent_runs_cell(u, fmt).len())
+        .max()
+        .unwrap_or(0)
+        .max("runs".len());
+    let steps_w = rows
+        .iter()
+        .map(|(_, u)| fmt(u.steps).len())
+        .max()
+        .unwrap_or(0)
+        .max("steps".len());
+    let tok_w = rows
+        .iter()
+        .map(|(_, u)| fmt(u.tokens).len())
+        .max()
+        .unwrap_or(0)
+        .max("tokens".len());
+
+    println!(
+        "{} {} {} {}",
+        style::bold(format!("{:<name_w$}", "By agent")),
+        style::dim(format!("{:>runs_w$}", "runs")),
+        style::dim(format!("{:>steps_w$}", "steps")),
+        style::dim(format!("{:>tok_w$}", "tokens")),
+    );
+
+    for (name, u) in rows {
+        let pn = format!("{:<width$}", name, width = name_w);
+        let pr = colorize_unit(&format!(
+            "{:>width$}",
+            agent_runs_cell(u, fmt),
+            width = runs_w
+        ));
+        let pst = colorize_unit(&format!("{:>width$}", fmt(u.steps), width = steps_w));
+        let pt = colorize_unit(&format!("{:>width$}", fmt(u.tokens), width = tok_w));
+        println!("{} {} {} {}", style::cyan(&pn), pr, pst, pt);
+    }
 }
 
 fn render_model_table(
@@ -1913,6 +2028,131 @@ mod tests {
     }
 
     #[test]
+    fn aggregate_agent_usage_sums_across_keys_and_sorts_by_tokens() {
+        let mut stats = UsageStats::default();
+        let mut c1 = UsageCounter::default();
+        c1.per_agent.insert(
+            "code-reviewer".to_string(),
+            AgentUsage {
+                runs: 2,
+                ok_runs: 1,
+                steps: 8,
+                tokens: 500,
+            },
+        );
+        c1.per_agent.insert(
+            "explorer".to_string(),
+            AgentUsage {
+                runs: 1,
+                ok_runs: 1,
+                steps: 3,
+                tokens: 2000,
+            },
+        );
+        let mut c2 = UsageCounter::default();
+        c2.per_agent.insert(
+            "code-reviewer".to_string(),
+            AgentUsage {
+                runs: 1,
+                ok_runs: 1,
+                steps: 4,
+                tokens: 300,
+            },
+        );
+        stats.key_usage.insert("key1".to_string(), c1);
+        stats.key_usage.insert("key2".to_string(), c2);
+
+        let keys: HashSet<&str> = ["key1", "key2"].into_iter().collect();
+        let rows = aggregate_agent_usage(&stats, &keys);
+        // Sorted by tokens desc: explorer (2000) before code-reviewer (800).
+        assert_eq!(rows[0].0, "explorer");
+        assert_eq!(rows[1].0, "code-reviewer");
+        // code-reviewer folds both keys: runs 3, ok 2, steps 12, tokens 800.
+        let reviewer = &rows[1].1;
+        assert_eq!(reviewer.runs, 3);
+        assert_eq!(reviewer.ok_runs, 2);
+        assert_eq!(reviewer.steps, 12);
+        assert_eq!(reviewer.tokens, 800);
+
+        // A stale key (dropped from the store) is excluded from the tally.
+        let only_key2: HashSet<&str> = ["key2"].into_iter().collect();
+        let scoped = aggregate_agent_usage(&stats, &only_key2);
+        assert_eq!(scoped.len(), 1);
+        assert_eq!(scoped[0].1.tokens, 300);
+    }
+
+    #[test]
+    fn agent_runs_cell_shows_ok_over_total_only_on_failure() {
+        let clean = AgentUsage {
+            runs: 3,
+            ok_runs: 3,
+            steps: 0,
+            tokens: 0,
+        };
+        assert_eq!(agent_runs_cell(&clean, format_number), "3");
+        let mixed = AgentUsage {
+            runs: 5,
+            ok_runs: 3,
+            steps: 0,
+            tokens: 0,
+        };
+        assert_eq!(agent_runs_cell(&mixed, format_number), "3/5");
+    }
+
+    #[test]
+    fn build_overview_json_includes_per_agent_when_present() {
+        let tool_tokens = HashMap::new();
+        let model_tokens = HashMap::new();
+        let agent_rows = vec![(
+            "code-reviewer".to_string(),
+            AgentUsage {
+                runs: 4,
+                ok_runs: 3,
+                steps: 20,
+                tokens: 1500,
+            },
+        )];
+        let payload = build_overview_json(
+            &tool_tokens,
+            &HashSet::new(),
+            &model_tokens,
+            (0, 0),
+            (0, 0),
+            0,
+            0,
+            &agent_rows,
+            None,
+            None,
+            &[],
+        );
+        let per_agent = payload
+            .get("per_agent")
+            .and_then(|v| v.as_array())
+            .expect("per_agent array");
+        assert_eq!(per_agent[0]["name"], "code-reviewer");
+        assert_eq!(per_agent[0]["runs"], 4);
+        assert_eq!(per_agent[0]["ok_runs"], 3);
+        assert_eq!(per_agent[0]["steps"], 20);
+        assert_eq!(per_agent[0]["tokens"], 1500);
+
+        // No named delegations → the key is omitted entirely.
+        let bare = build_overview_json(
+            &tool_tokens,
+            &HashSet::new(),
+            &model_tokens,
+            (0, 0),
+            (0, 0),
+            0,
+            0,
+            &[],
+            None,
+            None,
+            &[],
+        );
+        assert!(bare.get("per_agent").is_none());
+    }
+
+    #[test]
     fn aggregate_tool_counts_folds_codex_app_into_codex() {
         // codex-app writes to the same ~/.codex/sessions as the codex CLI, so
         // its launches merge into `codex` instead of forming a separate
@@ -2228,6 +2468,7 @@ mod tests {
             (0, 0),
             0,
             0,
+            &[],
             None,
             Some(("7d", cutoff)),
             &["aivo-proxy"],
@@ -2254,6 +2495,7 @@ mod tests {
             (0, 0),
             0,
             0,
+            &[],
             None,
             None,
             &[],
@@ -2299,6 +2541,7 @@ mod tests {
             (0, 0),
             15,
             0,
+            &[],
             None,
             None,
             &[],
@@ -2669,6 +2912,7 @@ mod tests {
             (0, 0),
             0,
             1, // total_models pre-computed by show()
+            &[],
             None,
             Some(("1h", cutoff)),
             &[],
@@ -2700,6 +2944,7 @@ mod tests {
             (0, 0),
             0,
             0,
+            &[],
             None,
             None,
             &[],

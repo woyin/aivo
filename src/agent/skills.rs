@@ -65,11 +65,54 @@ pub fn discover_skills(cwd: &Path) -> Vec<Skill> {
 /// empty because there is nothing on disk.
 pub fn create_skill_builtin() -> Skill {
     const SRC: &str = include_str!("builtin_skills/create-skill.md");
-    let (front, body) = split_frontmatter(SRC);
+    builtin_skill_from(SRC, "create-skill")
+}
+
+/// Name of the create-agent builtin — used to dedup against discovered skills
+/// and to keep it out of sub-engines (which can't delegate, so can't test one).
+pub const CREATE_AGENT_SKILL_NAME: &str = "create-agent";
+
+/// The built-in **create-agent** instructions: the guided workflow for authoring
+/// a named specialist subagent (`~/.config/aivo/agents/<name>.md`). There is no
+/// slash command by design — the whole point is natural language ("make a
+/// code-reviewer subagent"). It's advertised to the model via [`engine_skills`],
+/// so the model reaches for it through the `skill` tool. It has no folder and
+/// never appears in `/skills`.
+pub fn create_agent_builtin() -> Skill {
+    const SRC: &str = include_str!("builtin_skills/create-agent.md");
+    builtin_skill_from(SRC, CREATE_AGENT_SKILL_NAME)
+}
+
+/// The skill list an engine advertises: discovered skills minus the
+/// `/skills`-disabled set, plus the create-agent builtin (skipped when an
+/// on-disk skill already claimed the name, so the tool enum never holds
+/// duplicates). The one assembler for every engine-construction site — the
+/// live send path, the `/context` preview, and headless one-shot.
+pub fn engine_skills(cwd: &Path, disabled: &std::collections::HashSet<String>) -> Vec<Skill> {
+    with_builtins(discover_skills(cwd), disabled)
+}
+
+/// [`engine_skills`] minus the discovery, for tests.
+fn with_builtins(
+    mut skills: Vec<Skill>,
+    disabled: &std::collections::HashSet<String>,
+) -> Vec<Skill> {
+    skills.retain(|s| !disabled.contains(&s.name));
+    if !skills.iter().any(|s| s.name == CREATE_AGENT_SKILL_NAME) {
+        skills.push(create_agent_builtin());
+    }
+    skills
+}
+
+/// Parse an embedded `SKILL.md` into a folderless [`Skill`] (name from
+/// frontmatter, falling back to `default_name`; description falls back to the
+/// first non-empty body line). Shared by the built-in create-* skills.
+fn builtin_skill_from(src: &str, default_name: &str) -> Skill {
+    let (front, body) = split_frontmatter(src);
     let name = front
         .as_ref()
         .and_then(|f| field(f, "name"))
-        .unwrap_or_else(|| "create-skill".to_string());
+        .unwrap_or_else(|| default_name.to_string());
     let description = front
         .as_ref()
         .and_then(|f| field(f, "description"))
@@ -1169,7 +1212,12 @@ pub fn load_skill_result(skills: &[Skill], name: &str) -> Result<String, String>
         Some(skill) => Ok(format!(
             "Skill: {}\nFolder: {}\n\n{}",
             skill.name,
-            skill.dir.display(),
+            // Folderless builtins have no dir; a blank path would read as a bug.
+            if skill.dir.as_os_str().is_empty() {
+                "(builtin)".to_string()
+            } else {
+                skill.dir.display().to_string()
+            },
             skill.instructions()
         )),
         None => {
@@ -1549,6 +1597,76 @@ mod tests {
         assert!(
             discover_from_roots(&[]).is_empty(),
             "no built-in is injected into discovery"
+        );
+    }
+
+    /// The embedded `create-agent` parses into a usable, folderless Skill whose
+    /// advert stays within the prompt cap. There is no slash command; it reaches
+    /// the model only via `engine_skills`, never via on-disk discovery.
+    #[test]
+    fn create_agent_builtin_parses_and_is_not_on_disk() {
+        let sc = create_agent_builtin();
+        assert_eq!(sc.name, "create-agent");
+        assert!(!sc.description.is_empty());
+        assert!(!sc.body.is_empty());
+        assert!(sc.dir.as_os_str().is_empty(), "no folder on disk");
+        assert!(advert_description(&sc.description).len() <= 161);
+        // Discovery over a real (populated) root surfaces only what's on disk —
+        // the builtin is added by `engine_skills`, not folded into discovery.
+        let root = tmp();
+        write_skill(
+            &root,
+            "misc",
+            "---\nname: misc\ndescription: x\n---\nbody\n",
+        );
+        let found = discover_from_roots(&[root]);
+        assert_eq!(
+            found.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(),
+            ["misc"],
+            "discovery must not inject the builtin"
+        );
+    }
+
+    /// `engine_skills` assembly: the builtin is appended exactly once, an on-disk
+    /// skill of the same name wins (no duplicate tool-enum values), and the
+    /// disabled filter applies to discovered skills but can't remove the builtin.
+    #[test]
+    fn engine_skills_dedups_builtin_and_filters_disabled() {
+        let mk = |name: &str| Skill {
+            name: name.to_string(),
+            description: format!("{name} desc"),
+            body: String::new(),
+            dir: PathBuf::from("/on/disk"),
+        };
+        let none = std::collections::HashSet::new();
+
+        // No discovered skills → just the builtin.
+        let out = with_builtins(Vec::new(), &none);
+        assert_eq!(
+            out.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(),
+            [CREATE_AGENT_SKILL_NAME]
+        );
+
+        // An on-disk create-agent shadows the builtin: name appears once.
+        let out = with_builtins(vec![mk(CREATE_AGENT_SKILL_NAME), mk("other")], &none);
+        assert_eq!(
+            out.iter()
+                .filter(|s| s.name == CREATE_AGENT_SKILL_NAME)
+                .count(),
+            1
+        );
+        assert!(!out[0].dir.as_os_str().is_empty(), "on-disk one wins");
+
+        // Disabled removes a discovered skill; the builtin is still advertised
+        // (it never appears in `/skills`, so it can't be disabled).
+        let disabled: std::collections::HashSet<String> =
+            ["other".to_string(), CREATE_AGENT_SKILL_NAME.to_string()]
+                .into_iter()
+                .collect();
+        let out = with_builtins(vec![mk("other")], &disabled);
+        assert_eq!(
+            out.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(),
+            [CREATE_AGENT_SKILL_NAME]
         );
     }
 

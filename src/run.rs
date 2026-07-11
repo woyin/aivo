@@ -255,6 +255,7 @@ pub async fn run() -> ! {
             Commands::Mcp(_) => crate::commands::mcp::McpCommand::print_help(),
             Commands::Skills(_) => crate::commands::skills::SkillsCommand::print_help(),
             Commands::Packs(_) => crate::commands::packs::PacksCommand::print_help(),
+            Commands::Agents(_) => crate::commands::agents::AgentsCommand::print_help(),
             Commands::Share(_) => ShareCommand::print_help(),
             Commands::Guide => commands::guide::print_guide(),
         }
@@ -957,6 +958,11 @@ pub async fn run() -> ! {
         Commands::Packs(packs_args) => {
             let command = crate::commands::packs::PacksCommand::new();
             command.execute(packs_args).await
+        }
+
+        Commands::Agents(agents_args) => {
+            let command = crate::commands::agents::AgentsCommand::new();
+            command.execute(agents_args).await
         }
 
         Commands::Share(share_args) => {

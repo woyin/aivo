@@ -175,6 +175,7 @@ pub(super) fn command_recall_text(command: &SlashCommand) -> String {
         SlashCommand::Copy(None) => "/copy".to_string(),
         SlashCommand::Copy(Some(n)) => format!("/copy {n}"),
         SlashCommand::Skills(arg) => with_arg("skills", arg),
+        SlashCommand::Agents(arg) => with_arg("agents", arg),
         SlashCommand::Mcp(arg) => with_arg("mcp", arg),
         SlashCommand::Goal(arg) => with_arg("goal", arg),
         SlashCommand::Plan(arg) => with_arg("plan", arg),

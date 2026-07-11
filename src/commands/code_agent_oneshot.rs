@@ -214,7 +214,14 @@ async fn run_agent_captured(
 
     let date = chrono::Local::now().format("%Y-%m-%d").to_string();
     let guides = discover_project_guides(Path::new(&cwd));
-    let skills = crate::agent::skills::discover_skills(Path::new(&cwd));
+    // Same assembler as the TUI: disabled skills respected, create-agent advertised.
+    let disabled: std::collections::HashSet<String> = session_store
+        .get_disabled_skills()
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .collect();
+    let skills = crate::agent::skills::engine_skills(Path::new(&cwd), &disabled);
     let max_steps = cli_env_or(limits.max_steps, "AIVO_AGENT_MAX_STEPS", DEFAULT_MAX_STEPS);
     let mut engine = AgentEngine::new(
         &cwd,
@@ -263,6 +270,9 @@ async fn run_agent_captured(
     let subagents =
         crate::agent::subagents::discover_subagents(Path::new(&cwd), session_store.config_dir());
     engine.set_subagents(&subagents);
+    // Delegations re-resolve profiles from disk — a profile the model authors
+    // during this run is delegatable in the same run (headless has no next turn).
+    engine.set_agents_dir(session_store.config_dir());
     // Persistent grant store: remembered "always allow"s survive across runs.
     engine.set_grants_path(session_store.config_dir());
     // Temp job/artifact dirs, keyed by pid + nonce so concurrent best-of-n

@@ -8,6 +8,7 @@ enum OverlayKeyAction {
     ToggleSkill(usize),
     AddSkill(String),
     RemoveSkill(usize),
+    RemoveAgent(usize),
     InstallStagedSkills(Vec<String>),
     CancelSkillInstall,
     ToggleMcpServer(usize),
@@ -693,6 +694,10 @@ impl CodeTuiApp {
                 self.remove_skill(index).await?;
                 Ok(Some(false))
             }
+            OverlayKeyAction::RemoveAgent(index) => {
+                self.remove_agent(index).await?;
+                Ok(Some(false))
+            }
             OverlayKeyAction::InstallStagedSkills(names) => {
                 self.install_staged_skills(names).await?;
                 Ok(Some(false))
@@ -770,6 +775,11 @@ impl CodeTuiApp {
                     state.query.push_str(clean);
                     state.refilter();
                 }
+                true
+            }
+            Overlay::Agents(state) => {
+                state.query.push_str(clean);
+                state.refilter();
                 true
             }
             Overlay::SkillInstall(state) => {
@@ -900,6 +910,56 @@ impl CodeTuiApp {
                         let confirmed = state.arm_or_confirm_delete();
                         if confirmed {
                             return OverlayKeyAction::RemoveSkill(state.selected);
+                        }
+                    }
+                    // Page keys scroll the split's right detail pane.
+                    KeyCode::PageUp | KeyCode::PageDown | KeyCode::Home | KeyCode::End if split => {
+                        apply_detail_scroll(&mut state.detail_scroll, key, ctrl);
+                    }
+                    KeyCode::Backspace => {
+                        state.query.pop();
+                        state.refilter();
+                    }
+                    KeyCode::Char(c) if !ctrl && c != ' ' => {
+                        state.query.push(c);
+                        state.refilter();
+                    }
+                    _ => {}
+                }
+                OverlayKeyAction::Handled
+            }
+            Overlay::Agents(state) => {
+                let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+                // Narrow-only drill-in: scroll the body; Esc/Enter/Tab back out.
+                if state.viewing.is_some() && !split {
+                    apply_detail_scroll(&mut state.detail_scroll, key, ctrl);
+                    if matches!(key.code, KeyCode::Esc | KeyCode::Enter | KeyCode::Tab) {
+                        state.viewing = None;
+                        state.detail_scroll = 0;
+                    }
+                    return OverlayKeyAction::Handled;
+                }
+                // List mode: plain keys type into the filter; no toggle/add —
+                // Enter/Tab view (narrow), Ctrl+D removes the file (two-press).
+                match key.code {
+                    KeyCode::Esc if state.pending_delete.is_some() => state.pending_delete = None,
+                    KeyCode::Esc if !state.query.is_empty() => {
+                        state.query.clear();
+                        state.refilter();
+                    }
+                    KeyCode::Esc => self.overlay = Overlay::None,
+                    KeyCode::Up => state.select_prev(),
+                    KeyCode::Char('p') if ctrl => state.select_prev(),
+                    KeyCode::Down => state.select_next(),
+                    KeyCode::Char('n') if ctrl => state.select_next(),
+                    KeyCode::Enter | KeyCode::Tab if state.has_selection() && !split => {
+                        state.pending_delete = None;
+                        state.viewing = Some(state.selected);
+                    }
+                    KeyCode::Char('d') if ctrl && state.has_selection() => {
+                        let confirmed = state.arm_or_confirm_delete();
+                        if confirmed {
+                            return OverlayKeyAction::RemoveAgent(state.selected);
                         }
                     }
                     // Page keys scroll the split's right detail pane.

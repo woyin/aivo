@@ -173,6 +173,7 @@ impl CodeTuiApp {
             cursor: 0,
             command_menu: CommandMenuState::default(),
             skill_commands: Vec::new(),
+            last_subagents: Vec::new(),
             mcp_configured_count,
             welcome_tip_index,
             welcome_tip_rotated_at: None,

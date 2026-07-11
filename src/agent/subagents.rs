@@ -16,7 +16,9 @@
 use crate::agent::skills::advert_description;
 use std::path::{Path, PathBuf};
 
-#[derive(Clone, Debug)]
+// PartialEq: the TUI compares full discovered profiles across turns to decide
+// whether the cached engine (which snapshots them at build) must be rebuilt.
+#[derive(Clone, Debug, PartialEq)]
 pub struct Subagent {
     pub name: String,
     pub description: String,
@@ -51,10 +53,29 @@ impl Subagent {
         }
         if out.is_empty() { None } else { Some(out) }
     }
+
+    /// Compiled into the binary (no file on disk) — not removable; shadow it by
+    /// creating a same-named profile in any discovered root.
+    pub fn is_builtin(&self) -> bool {
+        self.source.as_os_str().is_empty()
+    }
+}
+
+/// The built-in profiles compiled into the binary, matching the roster every
+/// major CLI ships: a read-only explorer and a docs expert on aivo itself.
+/// Lowest precedence — any same-named repo/user/pack file replaces them.
+pub fn builtin_subagents() -> Vec<Subagent> {
+    [
+        include_str!("builtin_agents/explorer.md"),
+        include_str!("builtin_agents/aivo-guide.md"),
+    ]
+    .iter()
+    .filter_map(|src| parse_subagent(src, String::new(), PathBuf::new()))
+    .collect()
 }
 
 /// Project dirs first (a repo can ship/shadow profiles), then user-global, then
-/// installed packs (lowest precedence).
+/// installed packs, then the compiled-in built-ins (lowest precedence).
 pub fn discover_subagents(cwd: &Path, config_dir: &Path) -> Vec<Subagent> {
     let project_roots = [
         cwd.join(".aivo").join("agents"),
@@ -66,6 +87,11 @@ pub fn discover_subagents(cwd: &Path, config_dir: &Path) -> Vec<Subagent> {
     let mut found = discover_from_roots(&roots);
     for sa in &mut found {
         sa.repo_local = project_roots.iter().any(|r| sa.source.starts_with(r));
+    }
+    for b in builtin_subagents() {
+        if !found.iter().any(|e| e.name == b.name) {
+            found.push(b);
+        }
     }
     found
 }
@@ -108,11 +134,17 @@ fn read_root(root: &Path) -> Vec<Subagent> {
 fn load_subagent(path: &Path) -> Option<Subagent> {
     let text = std::fs::read_to_string(path).ok()?;
     let stem = path.file_stem()?.to_string_lossy().into_owned();
-    let (front, body) = split_frontmatter(&text);
+    parse_subagent(&text, stem, path.to_path_buf())
+}
+
+/// Parse one profile from its markdown `text`. Also used for the embedded
+/// built-ins, whose `source` is the empty path (see [`Subagent::is_builtin`]).
+fn parse_subagent(text: &str, fallback_name: String, source: PathBuf) -> Option<Subagent> {
+    let (front, body) = split_frontmatter(text);
     let name = front
         .as_ref()
         .and_then(|f| field(f, "name"))
-        .unwrap_or(stem);
+        .unwrap_or(fallback_name);
     if !is_valid_name(&name) {
         return None;
     }
@@ -120,7 +152,11 @@ fn load_subagent(path: &Path) -> Option<Subagent> {
         .as_ref()
         .and_then(|f| field(f, "description"))
         .unwrap_or_else(|| first_non_empty_line(body));
-    let model = front.as_ref().and_then(|f| field(f, "model"));
+    // Claude Code's `model: inherit` means "the parent's model" — our None.
+    let model = front
+        .as_ref()
+        .and_then(|f| field(f, "model"))
+        .filter(|m| !m.eq_ignore_ascii_case("inherit"));
     let tools = front.as_ref().and_then(|f| field_list(f, "tools"));
     let isolation_worktree = front
         .as_ref()
@@ -134,7 +170,7 @@ fn load_subagent(path: &Path) -> Option<Subagent> {
         body: body.trim().to_string(),
         isolation_worktree,
         repo_local: false, // set by `discover_subagents` from the source root
-        source: path.to_path_buf(),
+        source,
     })
 }
 
@@ -205,7 +241,8 @@ pub fn subagents_prompt_section(subagents: &[Subagent]) -> String {
         "\n\nYou have specialist sub-agents — pre-configured roles you can delegate to. To use one, \
 call the `subagent` tool with its name in the `agent` field (plus a complete, standalone `task`). \
 Each runs its own loop with its own instructions and only the `task` you pass — it never sees this \
-conversation — and hands back a result. Omit `agent` for a generic sub-agent.",
+conversation — and hands back a result. Omit `agent` for a generic sub-agent. `@name` in a user \
+message names one of these profiles — treat it as an explicit request to delegate to that sub-agent.",
     );
     if !trusted.is_empty() {
         let list: String = trusted.iter().map(|s| advert(s, false)).collect();
@@ -555,11 +592,62 @@ mod tests {
         );
         let subs = discover_subagents(&cwd, &config);
         let names: Vec<&str> = subs.iter().map(|s| s.name.as_str()).collect();
-        assert_eq!(names, vec!["dup", "cc", "global"]);
+        // Discovered files first (precedence order), compiled-in built-ins last.
+        assert_eq!(names, vec!["dup", "cc", "global", "explorer", "aivo-guide"]);
         assert_eq!(subs[0].description, "from aivo", ".aivo shadows .claude");
         assert!(subs.iter().find(|s| s.name == "dup").unwrap().repo_local);
         assert!(subs.iter().find(|s| s.name == "cc").unwrap().repo_local);
         assert!(!subs.iter().find(|s| s.name == "global").unwrap().repo_local);
+    }
+
+    /// The compiled-in built-ins: parse cleanly, advertise within the prompt cap,
+    /// carry the intended tool scope, ride at the lowest precedence, and are
+    /// replaced (not duplicated) by a same-named discovered file.
+    #[test]
+    fn builtin_subagents_parse_and_are_shadowable() {
+        let builtins = builtin_subagents();
+        let names: Vec<&str> = builtins.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, vec!["explorer", "aivo-guide"]);
+        for b in &builtins {
+            assert!(b.is_builtin());
+            assert!(!b.repo_local);
+            assert!(!b.body.is_empty());
+            assert!(is_valid_name(&b.name));
+            assert!(
+                advert_description(&b.description).len() <= 161,
+                "{}",
+                b.name
+            );
+        }
+        // The explorer's read-only guarantee is tool-level, not just prose.
+        let explorer = &builtins[0];
+        assert_eq!(
+            explorer.resolved_tools().unwrap(),
+            vec!["read_file", "grep", "glob", "list_dir"]
+        );
+
+        // A user file named `explorer` shadows the built-in outright.
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().join("repo");
+        let config = dir.path().join("config");
+        let agents = config.join("agents");
+        std::fs::create_dir_all(&cwd).unwrap();
+        std::fs::create_dir_all(&agents).unwrap();
+        write(
+            &agents,
+            "explorer.md",
+            "---\nname: explorer\ndescription: my own\n---\nMine.\n",
+        );
+        let subs = discover_subagents(&cwd, &config);
+        let explorers: Vec<&Subagent> = subs.iter().filter(|s| s.name == "explorer").collect();
+        assert_eq!(explorers.len(), 1, "shadow replaces, never duplicates");
+        assert!(!explorers[0].is_builtin());
+        assert_eq!(explorers[0].body, "Mine.");
+        // The other built-in is still there.
+        assert!(
+            subs.iter()
+                .any(|s| s.name == "aivo-guide" && s.is_builtin())
+        );
     }
 
     #[test]

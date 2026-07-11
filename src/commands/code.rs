@@ -993,6 +993,11 @@ impl CodeCommand {
         println!("{}", style::bold("Subcommands:"));
         println!(
             "  {}{}",
+            style::cyan(format!("{:<26}", "agents")),
+            style::dim("Manage named sub-agents (aivo code agents --help)")
+        );
+        println!(
+            "  {}{}",
             style::cyan(format!("{:<26}", "mcp")),
             style::dim("Manage MCP servers (aivo code mcp --help)")
         );

@@ -104,6 +104,10 @@ pub enum Commands {
     #[command(name = "code packs", hide = true)]
     Packs(PacksArgs),
 
+    /// Manage the coding agent's named sub-agents (list, cat, rm)
+    #[command(name = "code agents", hide = true)]
+    Agents(AgentsArgs),
+
     /// Alias for `aivo logs share` — share a session via tunneled viewer URL.
     /// Both forms accept the same flags.
     Share(ShareArgs),
@@ -478,6 +482,36 @@ pub struct SkillsInstallArgs {
 #[derive(Args, Debug, Clone)]
 pub struct SkillsNameArgs {
     /// Skill name as shown by `aivo code skills list`
+    #[arg(value_name = "NAME", value_parser = non_empty())]
+    pub name: String,
+}
+
+/// Arguments for `aivo code agents` (pre-clap rewrite to the hidden top-level
+/// `code agents`). No subcommand → `list`. Creation is conversational — ask the
+/// agent inside `aivo code` to make one — so there is no `add` verb here.
+#[derive(Args, Debug, Clone)]
+pub struct AgentsArgs {
+    #[command(subcommand)]
+    pub command: Option<AgentsSubcommand>,
+}
+
+#[derive(Subcommand, Debug, Clone)]
+pub enum AgentsSubcommand {
+    /// List discovered sub-agents (repo + user + pack scope)
+    #[command(alias = "ls")]
+    List,
+
+    /// Show one sub-agent in full (scope, model, tools, instructions)
+    Cat(AgentsNameArgs),
+
+    /// Remove a repo- or user-scope sub-agent by name
+    #[command(name = "rm", alias = "remove")]
+    Remove(AgentsNameArgs),
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct AgentsNameArgs {
+    /// Sub-agent name as shown by `aivo code agents list`
     #[arg(value_name = "NAME", value_parser = non_empty())]
     pub name: String,
 }

@@ -704,6 +704,7 @@ pub(super) fn parse_slash_command(input: &str) -> Result<SlashCommand> {
             ),
         })),
         "skills" => Ok(SlashCommand::Skills(argument)),
+        "agents" => Ok(SlashCommand::Agents(argument)),
         "mcp" => Ok(SlashCommand::Mcp(argument)),
         "goal" => Ok(SlashCommand::Goal(argument)),
         "plan" => Ok(SlashCommand::Plan(argument)),

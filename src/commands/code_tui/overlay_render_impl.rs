@@ -1306,6 +1306,269 @@ impl CodeTuiApp {
     /// One-line detail for the selected `/skills` row: where the skill lives (home
     /// dir abbreviated to `~`) and, for a repo skill, a `project` tag — so the user
     /// knows where to edit it and that `d` won't delete it.
+    /// `/agents` overlay: the `/skills` chrome minus toggle/add — a filterable
+    /// list of discovered sub-agent profiles with a detail pane. Rows are always
+    /// "on" (profiles have no enabled state); Ctrl+D deletes repo/user files.
+    pub(super) fn render_agents_overlay(
+        &self,
+        frame: &mut Frame<'_>,
+        area: Rect,
+        state: &AgentsOverlay,
+        split: bool,
+    ) -> OverlayRenderOut {
+        // Narrow-only Tab/Enter drill-in; the split's right pane replaces it.
+        if !split && let Some(item) = state.viewing.and_then(|i| state.items.get(i)) {
+            let inner = overlay_shell(frame, area, "Agents", None);
+            if inner.height == 0 {
+                return OverlayRenderOut {
+                    detail_scroll: Some(state.detail_scroll),
+                    ..Default::default()
+                };
+            }
+            return OverlayRenderOut {
+                detail_scroll: Some(self.render_agent_detail(
+                    frame,
+                    inner,
+                    item,
+                    usize::from(inner.width).max(1),
+                    state.detail_scroll,
+                    "Esc back",
+                )),
+                ..Default::default()
+            };
+        }
+
+        let filtered = state.filtered_indices();
+        // The search line doubles as the delete-confirm prompt while armed.
+        let input_line = if let Some(name) = state
+            .pending_delete
+            .and_then(|i| state.items.get(i))
+            .map(|i| i.name.as_str())
+        {
+            Line::from(Span::styled(
+                format!("Delete \u{201c}{name}\u{201d}?  ^D confirm \u{b7} Esc cancel"),
+                Style::default().fg(WARNING).add_modifier(Modifier::BOLD),
+            ))
+        } else {
+            search_input_line(&state.query, "filter sub-agents")
+        };
+
+        let inner = overlay_shell(frame, area, "Agents", None);
+        if inner.height == 0 {
+            return OverlayRenderOut::default();
+        }
+        // Split: two panes over a full-width footer strip (hints don't fit the left pane).
+        let (list_pane, split_panes) = if split && inner.height > 1 {
+            let footer_rect = Rect {
+                y: inner.y + inner.height - 1,
+                height: 1,
+                ..inner
+            };
+            let body = Rect {
+                height: inner.height - 1,
+                ..inner
+            };
+            let (left, rule, right) = split_columns(body);
+            render_vertical_rule(frame, rule);
+            (left, Some((right, footer_rect)))
+        } else {
+            (inner, None)
+        };
+
+        let mut rows: Vec<Line> = Vec::new();
+        let mut selected_pos = 0usize;
+        let footer: Vec<(&str, &str)>;
+        if state.items.is_empty() {
+            // The body clips rather than wraps, so word-wrap the intro to the
+            // pane width — it must read intact down to ~40-col terminals.
+            let intro_width = usize::from(list_pane.width).saturating_sub(2).max(20);
+            for line in wrap_words("No sub-agents yet \u{2014} just ask:", intro_width) {
+                rows.push(Line::from(Span::styled(line, Style::default().fg(MUTED))));
+            }
+            for line in wrap_words(
+                "\u{201c}make me a code-reviewer subagent\u{201d}",
+                intro_width.saturating_sub(2),
+            ) {
+                rows.push(Line::from(Span::styled(
+                    format!("  {line}"),
+                    Style::default().fg(FAINT),
+                )));
+            }
+            for line in wrap_words("or drop a <name>.md profile in:", intro_width) {
+                rows.push(Line::from(Span::styled(line, Style::default().fg(MUTED))));
+            }
+            for path in ["~/.config/aivo/agents", ".aivo/agents", ".claude/agents"] {
+                rows.push(Line::from(Span::styled(
+                    format!("  {path}"),
+                    Style::default().fg(FAINT),
+                )));
+            }
+            footer = vec![("Esc", "close")];
+        } else if filtered.is_empty() {
+            rows.push(Line::from(Span::styled(
+                format!("No sub-agents match \u{201c}{}\u{201d}", state.query),
+                Style::default().fg(MUTED),
+            )));
+            footer = vec![("Esc", "close")];
+        } else {
+            let inner_width = usize::from(list_pane.width).saturating_sub(2).max(1);
+            for (pos, &i) in filtered.iter().enumerate() {
+                let item = &state.items[i];
+                let desc = truncate_for_display_width(
+                    &crate::agent::skills::advert_description(&item.description),
+                    toggle_detail_room(inner_width),
+                );
+                if i == state.selected {
+                    selected_pos = rows.len() + 1;
+                }
+                rows.extend(toggle_list_rows(
+                    true,
+                    &item.name,
+                    &desc,
+                    MUTED,
+                    i == state.selected,
+                    inner_width,
+                ));
+                if pos + 1 < filtered.len() {
+                    rows.push(Line::from(""));
+                }
+            }
+            footer = vec![
+                ("\u{2191}\u{2193}", "move"),
+                ("Tab", "view"),
+                ("^D", "remove"),
+            ];
+        }
+
+        let selected_item = state
+            .items
+            .get(state.selected)
+            .filter(|_| filtered.contains(&state.selected));
+        // One-line detail only in narrow \u{2014} the split's right pane carries the full version.
+        let detail = if split_panes.is_none() {
+            selected_item.map(|item| (self.agent_detail_text(item), MUTED))
+        } else {
+            None
+        };
+        let (body_footer, strip_footer): (Vec<_>, Vec<_>) = match split_panes {
+            Some(_) => (
+                Vec::new(),
+                footer
+                    .into_iter()
+                    .map(|hint| {
+                        if hint == ("Tab", "view") {
+                            ("PgDn", "scroll")
+                        } else {
+                            hint
+                        }
+                    })
+                    .collect(),
+            ),
+            None => (footer, Vec::new()),
+        };
+
+        render_toggle_list_body(
+            frame,
+            list_pane,
+            ToggleListView {
+                title: "Agents",
+                badge: None,
+                input_line,
+                rows,
+                selected_pos,
+                detail,
+                footer: body_footer,
+            },
+        );
+
+        let Some((right, footer_rect)) = split_panes else {
+            return OverlayRenderOut::default();
+        };
+        render_footer_hints(frame, footer_rect, &strip_footer);
+        let detail_scroll = match selected_item {
+            Some(item) => Some(self.render_agent_detail(
+                frame,
+                right,
+                item,
+                usize::from(right.width).max(1),
+                state.detail_scroll,
+                "",
+            )),
+            None => {
+                frame.render_widget(
+                    Paragraph::new(Span::styled(
+                        "no sub-agent selected",
+                        Style::default().fg(MUTED),
+                    )),
+                    right,
+                );
+                None
+            }
+        };
+        OverlayRenderOut {
+            detail_scroll,
+            detail_area: Some(right),
+            ..Default::default()
+        }
+    }
+
+    /// Detail pane for one sub-agent: profile meta (model/tools/isolation) as a
+    /// head line over the instructions body, through the shared doc layout.
+    #[allow(clippy::too_many_arguments)]
+    fn render_agent_detail(
+        &self,
+        frame: &mut Frame<'_>,
+        area: Rect,
+        item: &AgentRow,
+        width: usize,
+        scroll: u16,
+        esc_label: &str,
+    ) -> u16 {
+        let mut meta: Vec<String> = Vec::new();
+        if let Some(m) = &item.model {
+            meta.push(format!("model: {m}"));
+        }
+        if let Some(t) = &item.tools {
+            meta.push(format!("tools: {}", t.join(", ")));
+        }
+        if item.isolation_worktree {
+            meta.push("isolation: worktree".to_string());
+        }
+        let body = if meta.is_empty() {
+            item.body.clone()
+        } else {
+            format!("{}\n\n{}", meta.join("  \u{b7}  "), item.body)
+        };
+        self.render_skill_doc_detail(
+            frame,
+            area,
+            &item.name,
+            &format!("[{}]", item.scope),
+            &agent_source_text(&item.source),
+            &item.description,
+            &body,
+            width,
+            scroll,
+            esc_label,
+        )
+    }
+
+    /// Narrow-mode one-liner under the list: scope, source, and profile meta.
+    fn agent_detail_text(&self, item: &AgentRow) -> String {
+        let mut parts = vec![format!(
+            "{} \u{b7} {}",
+            item.scope,
+            agent_source_text(&item.source)
+        )];
+        if let Some(m) = &item.model {
+            parts.push(format!("model {m}"));
+        }
+        if item.tools.is_some() {
+            parts.push("scoped tools".to_string());
+        }
+        parts.join(" \u{b7} ")
+    }
+
     fn skill_detail_text(&self, item: &SkillToggle) -> String {
         use crate::agent::skills::SkillScope;
         let path = abbreviate_home_path(&item.dir);
@@ -2012,6 +2275,16 @@ fn toggle_list_rows(
     }
 }
 
+/// A sub-agent's displayable source: the abbreviated file path, or a marker
+/// for compiled-in built-ins (whose source path is empty).
+fn agent_source_text(source: &std::path::Path) -> String {
+    if source.as_os_str().is_empty() {
+        "built into aivo".to_string()
+    } else {
+        abbreviate_home_path(source)
+    }
+}
+
 /// The search input row: an accent `/` prompt then the live query (with a caret),
 /// or a muted italic placeholder when the query is empty.
 fn search_input_line(query: &str, placeholder: &str) -> Line<'static> {
@@ -2091,7 +2364,10 @@ const HELP_COMMAND_GROUPS: &[(&str, &[&str])] = &[
         "Context",
         &["attach", "detach", "compact", "context", "memory"],
     ),
-    ("Skills & tools", &["skills", "create-skill", "mcp"]),
+    (
+        "Skills & tools",
+        &["skills", "create-skill", "agents", "mcp"],
+    ),
     ("Autonomous", &["plan", "goal", "review"]),
     // Shown only on the aivo provider (hidden by `slash_command_visible`).
     ("aivo account", &["login", "usage", "logout"]),

@@ -354,6 +354,11 @@ pub struct AgentEngine {
     /// Named specialist sub-agents (top-level engine only). The `subagent` tool's
     /// `agent` field selects one; `run_subagent` applies its model/instructions/scope.
     subagents: Vec<Subagent>,
+    /// Config dir for re-discovering profiles at delegation time. When set,
+    /// `run_subagent` resolves `agent` fresh from disk — a profile authored or
+    /// edited this very turn delegates correctly; unset falls back to the
+    /// build-time `subagents` snapshot (tests, callers without a store).
+    agents_dir: Option<PathBuf>,
     /// Kept so `subagent` can build a sub-engine with the same identity (date + guides).
     date: String,
     guides: Vec<String>,
@@ -573,6 +578,7 @@ impl AgentEngine {
             grants: crate::agent::grant_store::GrantStore::default(),
             skills: skills.to_vec(),
             subagents: Vec::new(),
+            agents_dir: None,
             date: date.to_string(),
             guides: guides.to_vec(),
             external: None,
@@ -1032,6 +1038,23 @@ questions.",
             sys["content"] = json!(format!("{cur}{section}"));
         }
         self.subagents = subagents.to_vec();
+    }
+
+    /// Enable delegation-time profile re-discovery (see the `agents_dir` field).
+    pub fn set_agents_dir(&mut self, config_dir: &Path) {
+        self.agents_dir = Some(config_dir.to_path_buf());
+    }
+
+    /// The profile a delegation should run: fresh from disk when an agents dir is
+    /// configured (the snapshot goes stale the moment the model authors or edits
+    /// a profile mid-turn), else from the build-time snapshot.
+    fn resolve_profile(&self, cwd: &Path, name: &str) -> Option<Subagent> {
+        match &self.agents_dir {
+            Some(cfg) => subagents::discover_subagents(cwd, cfg)
+                .into_iter()
+                .find(|s| s.name == name),
+            None => self.subagents.iter().find(|s| s.name == name).cloned(),
+        }
     }
 
     /// Append a `--context` block to the system prompt. Re-applied per build
@@ -2700,21 +2723,24 @@ Re-run the full command without write confinement?",
         };
         let task =
             str_arg(&["task", "prompt"]).ok_or_else(|| "subagent: missing `task`".to_string())?;
-        // Named specialist if `agent` matches; unknown names fall back to generic (lenient, don't fail the turn).
-        let profile = str_arg(&["agent", "subagent_type"])
-            .and_then(|n| self.subagents.iter().find(|s| s.name == n));
+        // Named specialist if `agent` matches — resolved fresh from disk (see
+        // `resolve_profile`), so a profile authored this turn delegates correctly.
+        // Unknown names fall back to generic (lenient, don't fail the turn) but
+        // the result says so; a silent fallback would fake the specialist's test.
+        let requested_agent = str_arg(&["agent", "subagent_type"]);
+        let profile = requested_agent.and_then(|n| self.resolve_profile(ctx.cwd, n));
         // Model precedence: explicit `model` arg > profile's pinned model > parent's model.
         let model = args
             .get("model")
             .and_then(|v| v.as_str())
             .filter(|m| !m.is_empty())
-            .or_else(|| profile.and_then(|p| p.model.as_deref()))
+            .or_else(|| profile.as_ref().and_then(|p| p.model.as_deref()))
             .unwrap_or(&self.model);
 
         // Isolation: explicit arg wins, else the profile's flag; unavailable falls
         // back to the shared workspace with a note.
         let isolate = args.get("isolation").and_then(|v| v.as_str()) == Some("worktree")
-            || profile.is_some_and(|p| p.isolation_worktree);
+            || profile.as_ref().is_some_and(|p| p.isolation_worktree);
         let mut guard: Option<subagents::WorktreeGuard> = None;
         let mut sub_cwd: PathBuf = ctx.cwd.to_path_buf();
         let mut isolation_note: Option<String> = None;
@@ -2734,12 +2760,33 @@ Re-run the full command without write confinement?",
             }
         }
 
+        // Delegates keep the parent's skills except the create-agent builtin: a
+        // sub-engine can't delegate (tool dropped below), so it could author a
+        // profile but never test it — the workflow is top-level only. A profile
+        // whose tool scope excludes `skill` gets NO skills: `apply_profile` would
+        // strip the tool, and an advert the tool can't load is a prompt/toolset
+        // contradiction.
+        let scope_has_skill = profile
+            .as_ref()
+            .and_then(|p| p.resolved_tools())
+            .is_none_or(|allowed| allowed.contains(&"skill"));
+        let sub_skills: Vec<Skill> = if scope_has_skill {
+            self.skills
+                .iter()
+                .filter(|s| {
+                    !(s.name == skills::CREATE_AGENT_SKILL_NAME && s.dir.as_os_str().is_empty())
+                })
+                .cloned()
+                .collect()
+        } else {
+            Vec::new()
+        };
         let mut sub = AgentEngine::new(
             &sub_cwd.display().to_string(),
             model,
             &self.date,
             &self.guides,
-            &self.skills,
+            &sub_skills,
             self.context_window,
             SUBAGENT_MAX_STEPS,
         );
@@ -2771,7 +2818,7 @@ Re-run the full command without write confinement?",
             sub.set_jobs(jobs.clone());
         }
         // Fold in the specialist's role + scope. After MCP wiring so a `tools` allow-list applies to the full offered set.
-        if let Some(p) = profile {
+        if let Some(p) = &profile {
             sub.apply_profile(p);
         }
 
@@ -2804,6 +2851,27 @@ Re-run the full command without write confinement?",
             msg.push_str(&g.finalize());
         } else if let Some(note) = isolation_note {
             msg.push_str(&note);
+        }
+        if profile.is_none()
+            && let Some(name) = requested_agent
+        {
+            msg.push_str(&format!(
+                "\n\n[subagent] no profile named `{name}` — ran a generic sub-agent \
+instead. No such file in the agents dirs (project `.aivo/agents`/`.claude/agents`, \
+user config, packs); check the filename / `name:` frontmatter."
+            ));
+        }
+        // A failed run on a model aivo's catalog doesn't know is most often a bad
+        // profile `model:` — name the likely cause instead of a bare empty result.
+        if ui.answer().is_empty()
+            && model != self.model
+            && crate::services::model_metadata::snapshot_limits(model).is_none()
+        {
+            msg.push_str(&format!(
+                "\n\n[subagent] note: model `{model}` isn't in aivo's catalog — if the \
+run failed at the provider, fix the profile's `model:` (use a full model id) or omit \
+it to inherit yours."
+            ));
         }
         // Gate on the STORED length (not the bare answer) so the tail can't push it over
         // the clear threshold and get cleared without a pointer.
@@ -8434,6 +8502,42 @@ mod tests {
                 .get("agent")
                 .is_none()
         );
+    }
+
+    /// Delegation-time profile resolution: with an agents dir configured, a
+    /// profile written AFTER engine build (or edited since) resolves fresh from
+    /// disk; without one, the build-time snapshot answers.
+    #[test]
+    fn resolve_profile_prefers_disk_over_snapshot() {
+        let cwd = tempfile::tempdir().unwrap();
+        let cfg = tempfile::tempdir().unwrap();
+
+        // Snapshot-only engine: unknown dir → falls back to set_subagents.
+        let mut e = AgentEngine::new("/tmp", "m", "", &[], &[], 0, 0);
+        e.set_subagents(&[subagent("reviewer", None, None)]);
+        let p = e.resolve_profile(cwd.path(), "reviewer").unwrap();
+        assert!(p.body.contains("reviewer playbook"), "snapshot body");
+
+        // With an agents dir, a file authored after build wins over the snapshot…
+        e.set_agents_dir(cfg.path());
+        let dir = cwd.path().join(".aivo/agents");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("reviewer.md"),
+            "---\nname: reviewer\ndescription: fresh\n---\nFRESH BODY v2\n",
+        )
+        .unwrap();
+        let p = e.resolve_profile(cwd.path(), "reviewer").unwrap();
+        assert_eq!(p.body, "FRESH BODY v2", "disk beats snapshot");
+        // …and a brand-new name (created mid-turn) is delegatable immediately.
+        std::fs::write(
+            dir.join("tester.md"),
+            "---\nname: tester\ndescription: t\n---\nTEST BODY\n",
+        )
+        .unwrap();
+        assert!(e.resolve_profile(cwd.path(), "tester").is_some());
+        // Unknown names still miss (→ generic fallback with a note).
+        assert!(e.resolve_profile(cwd.path(), "ghost").is_none());
     }
 
     /// A profile's body folds into the system prompt; a `tools` allow-list restricts the built-ins (keeping `update_plan`).

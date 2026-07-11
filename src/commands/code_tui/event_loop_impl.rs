@@ -92,7 +92,11 @@ impl CodeTuiApp {
                 ok,
                 steps,
                 tokens,
-            } => self.apply_subagent_done(slot, ok, steps, tokens),
+            } => {
+                if let Some(agent) = self.apply_subagent_done(slot, ok, steps, tokens) {
+                    self.record_agent_run(agent, ok, steps, tokens);
+                }
+            }
             RuntimeEvent::AgentSubFinish => self.subagent_rows.clear(),
             RuntimeEvent::AgentToolUpdate {
                 id,
@@ -623,11 +627,35 @@ impl CodeTuiApp {
         ));
     }
 
-    pub(super) fn apply_subagent_done(&mut self, slot: usize, ok: bool, steps: usize, tokens: u64) {
-        let Some(row) = self.subagent_rows.get_mut(slot) else {
-            return;
-        };
+    /// Returns the profile name to attribute in lifetime stats when the finished
+    /// row names a discovered subagent; generic/labeled delegates return `None`
+    /// so they never pollute per-agent stats.
+    pub(super) fn apply_subagent_done(
+        &mut self,
+        slot: usize,
+        ok: bool,
+        steps: usize,
+        tokens: u64,
+    ) -> Option<String> {
+        let row = self.subagent_rows.get_mut(slot)?;
         row.done = Some((ok, steps, tokens, row.started.elapsed()));
+        let name = row.name.clone();
+        self.last_subagents
+            .iter()
+            .any(|s| s.name == name)
+            .then_some(name)
+    }
+
+    /// Persist one finished named delegation under the active key. Fire-and-forget:
+    /// a stats write must never block or fail the turn.
+    fn record_agent_run(&self, agent: String, ok: bool, steps: usize, tokens: u64) {
+        let session_store = self.session_store.clone();
+        let key_id = self.key.id.clone();
+        tokio::spawn(async move {
+            let _ = session_store
+                .record_agent_run(&key_id, &agent, ok, steps as u64, tokens)
+                .await;
+        });
     }
 
     /// Enrich the matching tool-call entry in place (cursor reports the resolved
@@ -2628,6 +2656,23 @@ impl CodeTuiApp {
                 Ok(Some(false))
             }
             (Overlay::Skills(_), _) => Ok(Some(false)),
+            (Overlay::Agents(_), MouseEventKind::ScrollUp | MouseEventKind::ScrollDown) => {
+                let up = matches!(mouse.kind, MouseEventKind::ScrollUp);
+                let over_detail = self
+                    .overlay_detail_area
+                    .is_some_and(|area| rect_contains(area, (mouse.column, mouse.row)));
+                if let Overlay::Agents(state) = &mut self.overlay {
+                    if state.viewing.is_some() || over_detail {
+                        state.detail_scroll = wheel_scroll(state.detail_scroll, up);
+                    } else if up {
+                        state.select_prev();
+                    } else {
+                        state.select_next();
+                    }
+                }
+                Ok(Some(false))
+            }
+            (Overlay::Agents(_), _) => Ok(Some(false)),
             (Overlay::SkillInstall(_), MouseEventKind::ScrollUp | MouseEventKind::ScrollDown) => {
                 let up = matches!(mouse.kind, MouseEventKind::ScrollUp);
                 let over_detail = self

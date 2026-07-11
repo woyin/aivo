@@ -683,12 +683,17 @@ impl CodeTuiApp {
             let guides = crate::agent::system_prompt::discover_project_guides(
                 std::path::Path::new(&real_cwd),
             );
-            let mut skills = crate::agent::skills::discover_skills(std::path::Path::new(&real_cwd));
-            // Drop skills the user turned off in `/skills`.
-            if let Ok(disabled) = self.session_store.get_disabled_skills().await {
-                let disabled: std::collections::HashSet<String> = disabled.into_iter().collect();
-                skills.retain(|s| !disabled.contains(&s.name));
-            }
+            // Discovered skills minus `/skills`-disabled, plus the create-agent
+            // builtin (natural-language subagent authoring via the `skill` tool).
+            let disabled: std::collections::HashSet<String> = self
+                .session_store
+                .get_disabled_skills()
+                .await
+                .unwrap_or_default()
+                .into_iter()
+                .collect();
+            let skills =
+                crate::agent::skills::engine_skills(std::path::Path::new(&real_cwd), &disabled);
             // A `--max-context` override wins; otherwise resolve from catalog/snapshot.
             let context_window = match self.context_window_override {
                 Some(w) => w,
@@ -743,6 +748,9 @@ impl CodeTuiApp {
                 self.session_store.config_dir(),
             );
             engine.set_subagents(&subagents);
+            // Delegations re-resolve profiles from disk, so one authored or edited
+            // mid-turn runs correctly even before the advert refreshes.
+            engine.set_agents_dir(self.session_store.config_dir());
             // Persistent grant store so "always allow"s survive across sessions.
             engine.set_grants_path(self.session_store.config_dir());
             // Durable sub-agent reports under this session's artifacts dir (survive compaction).
@@ -1435,6 +1443,10 @@ impl CodeTuiApp {
                 self.run_skills_command(arg).await?;
                 Ok(false)
             }
+            SlashCommand::Agents(arg) => {
+                self.run_agents_command(arg).await?;
+                Ok(false)
+            }
             SlashCommand::Mcp(arg) => {
                 self.run_mcp_command(arg).await?;
                 Ok(false)
@@ -1533,10 +1545,20 @@ impl CodeTuiApp {
         // model (and the `skill` tool's enum updates). The exact conversation is
         // preserved across the rebuild. Body-only edits don't change this list; the
         // `/name` path re-reads the body fresh regardless.
-        if next != self.skill_commands {
+        //
+        // Same for subagents, comparing FULL profiles: delegation re-resolves from
+        // disk (`set_agents_dir`), but the system-prompt advert and the `agent`
+        // enum are baked at build — any change (a new specialist, a retuned
+        // description) drops the engine so the next turn re-advertises.
+        let next_subagents = crate::agent::subagents::discover_subagents(
+            std::path::Path::new(&cwd),
+            self.session_store.config_dir(),
+        );
+        if next != self.skill_commands || next_subagents != self.last_subagents {
             self.reset_engine_preserving_conversation();
         }
         self.skill_commands = next;
+        self.last_subagents = next_subagents;
     }
 
     /// Drop the cached agent engine while keeping its exact transcript, so the next

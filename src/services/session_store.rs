@@ -420,6 +420,22 @@ impl ModelCounter {
     }
 }
 
+/// Per-named-subagent lifetime tally. Only delegations whose name matches a
+/// discovered profile are attributed here (generic/labeled delegates are
+/// excluded), so this never fills with ad-hoc task labels.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct AgentUsage {
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub runs: u64,
+    /// Runs that finished successfully (`runs - ok_runs` = failures).
+    #[serde(rename = "okRuns", default, skip_serializing_if = "is_zero")]
+    pub ok_runs: u64,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub steps: u64,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub tokens: u64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct UsageCounter {
     #[serde(rename = "promptTokens", default, skip_serializing_if = "is_zero")]
@@ -459,6 +475,14 @@ pub struct UsageCounter {
         skip_serializing_if = "HashMap::is_empty"
     )]
     pub per_tool_model_usage: HashMap<String, HashMap<String, ModelCounter>>,
+    /// Per-named-subagent run tallies (only populated in key_usage entries).
+    /// Forward-only — old stats files load with this empty.
+    #[serde(
+        rename = "perAgent",
+        default,
+        skip_serializing_if = "HashMap::is_empty"
+    )]
+    pub per_agent: HashMap<String, AgentUsage>,
     /// Legacy per-model total tokens. Read by the migration helper, never written
     /// after this version. Kept on the type for forward/backward compatibility
     /// with on-disk data recorded before the schema collapse.
@@ -722,6 +746,26 @@ impl UsageStats {
                 model_stats.total_tokens = model_stats.total_tokens.saturating_add(total);
             }
         }
+    }
+
+    /// Attribute one finished delegation to a named subagent profile. The caller
+    /// only records rows whose delegate name matches a discovered profile.
+    pub(crate) fn record_agent_run(
+        &mut self,
+        key_id: &str,
+        agent: &str,
+        ok: bool,
+        steps: u64,
+        tokens: u64,
+    ) {
+        let key_stats = self.key_usage.entry(key_id.to_string()).or_default();
+        let entry = key_stats.per_agent.entry(agent.to_string()).or_default();
+        entry.runs = entry.runs.saturating_add(1);
+        if ok {
+            entry.ok_runs = entry.ok_runs.saturating_add(1);
+        }
+        entry.steps = entry.steps.saturating_add(steps);
+        entry.tokens = entry.tokens.saturating_add(tokens);
     }
 }
 
@@ -2113,6 +2157,19 @@ impl SessionStore {
             .await
     }
 
+    pub async fn record_agent_run(
+        &self,
+        key_id: &str,
+        agent: &str,
+        ok: bool,
+        steps: u64,
+        tokens: u64,
+    ) -> Result<()> {
+        self.stats
+            .record_agent_run(key_id, agent, ok, steps, tokens)
+            .await
+    }
+
     // ── Chat sessions (delegated to CodeSessionStore) ─────────────────────
 
     #[allow(dead_code)]
@@ -2372,6 +2429,51 @@ mod tests {
         // Reading data with all zero fields produces a default-valued struct.
         let empty: ModelCounter = serde_json::from_str("{}").unwrap();
         assert_eq!(empty, ModelCounter::default());
+    }
+
+    #[test]
+    fn usage_counter_without_per_agent_loads_default() {
+        // A stats file recorded before per-agent tracking has no `perAgent` key;
+        // it must deserialize with an empty map (forward-compat).
+        let json = r#"{"promptTokens":300,"totalTokens":300}"#;
+        let counter: UsageCounter = serde_json::from_str(json).unwrap();
+        assert!(counter.per_agent.is_empty());
+        // Re-serializing an empty per_agent omits the field entirely.
+        let out = serde_json::to_string(&counter).unwrap();
+        assert!(!out.contains("perAgent"));
+    }
+
+    #[test]
+    fn agent_usage_serde_round_trip() {
+        let usage = AgentUsage {
+            runs: 5,
+            ok_runs: 4,
+            steps: 42,
+            tokens: 12_000,
+        };
+        let json = serde_json::to_string(&usage).unwrap();
+        assert!(json.contains("okRuns"));
+        let parsed: AgentUsage = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, usage);
+        // All-zero fields collapse to `{}` and read back as the default.
+        assert_eq!(serde_json::to_string(&AgentUsage::default()).unwrap(), "{}");
+        let empty: AgentUsage = serde_json::from_str("{}").unwrap();
+        assert_eq!(empty, AgentUsage::default());
+    }
+
+    #[test]
+    fn record_agent_run_accumulates_per_key() {
+        let mut stats = UsageStats::default();
+        stats.record_agent_run("k1", "code-reviewer", true, 6, 900);
+        stats.record_agent_run("k1", "code-reviewer", false, 3, 400);
+        stats.record_agent_run("k1", "explorer", true, 2, 100);
+        let agents = &stats.key_usage.get("k1").unwrap().per_agent;
+        let reviewer = agents.get("code-reviewer").unwrap();
+        assert_eq!(reviewer.runs, 2);
+        assert_eq!(reviewer.ok_runs, 1); // one run failed
+        assert_eq!(reviewer.steps, 9);
+        assert_eq!(reviewer.tokens, 1300);
+        assert_eq!(agents.get("explorer").unwrap().runs, 1);
     }
 
     #[test]

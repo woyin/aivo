@@ -1389,6 +1389,7 @@ fn make_test_app(
         cursor: 0,
         command_menu: CommandMenuState::default(),
         skill_commands: Vec::new(),
+        last_subagents: Vec::new(),
         mcp_configured_count: 0,
         welcome_tip_index: 0,
         welcome_tip_rotated_at: None,
@@ -2798,6 +2799,33 @@ fn test_parallel_subagent_rows_render_under_status_line() {
     // Batch end retires the rows and hands the headline back.
     app.subagent_rows.clear();
     assert_ne!(app.desired_status(), "running 2 sub-agents (1 done)");
+}
+
+#[test]
+fn subagent_done_attributes_only_discovered_profiles() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    let profile = |name: &str| crate::agent::subagents::Subagent {
+        name: name.to_string(),
+        description: String::new(),
+        model: None,
+        tools: None,
+        body: String::new(),
+        isolation_worktree: false,
+        repo_local: false,
+        source: std::path::PathBuf::new(),
+    };
+    app.last_subagents = vec![profile("code-reviewer")];
+    app.apply_subagent_begin(vec!["code-reviewer".to_string(), "sub-agent 2".to_string()]);
+    // A row named after a discovered profile is attributed to it.
+    assert_eq!(
+        app.apply_subagent_done(0, true, 6, 900),
+        Some("code-reviewer".to_string())
+    );
+    // A generic/labeled delegate is not (it would pollute per-agent stats).
+    assert_eq!(app.apply_subagent_done(1, true, 4, 200), None);
+    // An out-of-range slot is a defensive no-op.
+    assert_eq!(app.apply_subagent_done(9, true, 1, 1), None);
 }
 
 #[test]
@@ -5430,8 +5458,9 @@ fn test_subagents_render_individually_not_coalesced() {
         plain.contains("→ Review the chat API endpoint for gaps"),
         "first delegated task missing: {plain}"
     );
+    // A named delegation leads with the profile name so the row attributes it.
     assert!(
-        plain.contains("→ Audit the auth flow"),
+        plain.contains("→ reviewer — Audit the auth flow"),
         "second delegated task missing: {plain}"
     );
     // The result previews the report's first line after the fold toggle — not a
@@ -8715,6 +8744,166 @@ async fn test_create_skill_is_a_builtin_command() {
         screen.contains("/create-skill"),
         "transcript should show the compact command:\n{screen}"
     );
+}
+
+/// Creating a subagent is natural-language only, by design: there is NO
+/// `/create-agent` slash command (it would be redundant with the advertised
+/// skill and clutter the menu). The workflow is instead exposed to the model as
+/// a folderless built-in skill it reaches for on a request like "make a
+/// code-reviewer subagent".
+#[test]
+fn test_create_agent_has_no_slash_command() {
+    // Not registered as a typeable command — absent from the menu/help and unknown
+    // to the parser.
+    assert!(
+        !SLASH_COMMANDS.iter().any(|c| c.name == "create-agent"),
+        "create-agent must NOT be a slash command — it's natural-language only"
+    );
+    assert!(
+        parse_slash_command("create-agent").is_err(),
+        "typing /create-agent is an unknown command, not a builtin"
+    );
+
+    // The workflow still exists as a model-facing builtin skill (this is what the
+    // send path injects into the engine's skill list to advertise it).
+    let sc = crate::agent::skills::create_agent_builtin();
+    assert_eq!(sc.name, "create-agent");
+    assert!(!sc.body.is_empty());
+}
+
+/// `/agents`: registered as a typeable command; bare opens the overlay, `rm`
+/// on an unknown name reports instead of erroring, and anything else prints
+/// usage (there is no `add` — creation is conversational by design).
+#[tokio::test]
+async fn test_agents_command_opens_overlay_and_validates_args() {
+    assert!(SLASH_COMMANDS.iter().any(|c| c.name == "agents"));
+    assert!(matches!(
+        parse_slash_command("agents"),
+        Ok(SlashCommand::Agents(None))
+    ));
+
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.run_agents_command(None).await.unwrap();
+    assert!(matches!(app.overlay, Overlay::Agents(_)));
+
+    app.overlay = Overlay::None;
+    app.run_agents_command(Some("rm no-such-agent".to_string()))
+        .await
+        .unwrap();
+    assert!(matches!(app.overlay, Overlay::None));
+    let notice = app.notice.as_ref().expect("notice set").1.clone();
+    assert!(notice.contains("no-such-agent"), "{notice}");
+
+    app.run_agents_command(Some("add reviewer".to_string()))
+        .await
+        .unwrap();
+    let notice = app.notice.as_ref().expect("usage notice").1.clone();
+    assert!(notice.contains("Usage: /agents"), "{notice}");
+
+    // Built-ins can't be removed — the notice points at shadowing instead.
+    app.run_agents_command(Some("rm explorer".to_string()))
+        .await
+        .unwrap();
+    let notice = app.notice.as_ref().expect("builtin notice").1.clone();
+    assert!(notice.contains("built into aivo"), "{notice}");
+}
+
+/// The `/agents` empty state reads intact on a narrow terminal: the body clips
+/// rather than wraps, so every line must be pre-wrapped short enough (~40 cols)
+/// — the quoted example must survive whole, not as "make me a cod".
+#[test]
+fn test_agents_overlay_empty_state_fits_narrow_terminals() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.overlay = Overlay::Agents(AgentsOverlay::default());
+    let (top, _) = render_full_screen(&mut app, 46, 18);
+    // Keep only the modal interior (between the │ borders), then collapse
+    // whitespace: wrapping may split lines, but every WORD must survive whole.
+    let interior: String = top
+        .lines()
+        .filter_map(|row| {
+            let first = row.find('\u{2502}')?;
+            let last = row.rfind('\u{2502}')?;
+            (last > first).then(|| row[first + '\u{2502}'.len_utf8()..last].to_string())
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    let flat = interior.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(flat.contains("No sub-agents yet"), "{top}");
+    assert!(
+        flat.contains("\u{201c}make me a code-reviewer subagent\u{201d}"),
+        "quoted example clipped:\n{top}"
+    );
+    assert!(flat.contains("or drop a <name>.md profile in:"), "{top}");
+    assert!(flat.contains("~/.config/aivo/agents"), "{top}");
+}
+
+/// The `@` mention menu: word-boundary trigger (mid-message ok, emails no),
+/// prefix-first filtering over discovered profiles, and completion that inserts
+/// `@name ` at the token without submitting the draft.
+#[test]
+fn test_at_mention_menu_completes_subagent_names() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    let profile = |name: &str| crate::agent::subagents::Subagent {
+        name: name.to_string(),
+        description: format!("{name} does things. Extra sentence."),
+        model: None,
+        tools: None,
+        body: String::new(),
+        isolation_worktree: false,
+        repo_local: false,
+        source: std::path::PathBuf::new(),
+    };
+
+    // No discovered profiles → no menu, even on a bare `@`.
+    app.draft = "@".to_string();
+    app.cursor = 1;
+    assert!(app.active_mention_query().is_none());
+
+    app.last_subagents = vec![profile("code-reviewer"), profile("architect")];
+
+    // Mid-message mention at a word boundary; query is the partial after `@`.
+    app.draft = "use @co on the diff".to_string();
+    app.cursor = 7; // after "use @co"
+    let (at, query) = app.active_mention_query().expect("mention active");
+    assert_eq!((at, query.as_str()), (4, "co"));
+    let menu = app.visible_command_menu().expect("menu visible");
+    assert!(matches!(menu.kind, MenuKind::Mention));
+    assert_eq!(menu.entries.len(), 1);
+    assert_eq!(menu.entries[0].label(), "@code-reviewer");
+
+    // Tab completion replaces just the token and keeps composing (no submit).
+    assert!(app.insert_selected_command());
+    assert_eq!(app.draft, "use @code-reviewer  on the diff");
+    assert_eq!(app.cursor, "use @code-reviewer ".len());
+
+    // A bare `@` lists every profile.
+    app.draft = "@".to_string();
+    app.cursor = 1;
+    app.command_menu.reset();
+    let menu = app.visible_command_menu().expect("menu visible");
+    assert_eq!(menu.entries.len(), 2);
+
+    // No word boundary (email-style) → no menu; ditto once the token has a space.
+    app.draft = "mail me a@b".to_string();
+    app.cursor = app.draft.len();
+    assert!(app.active_mention_query().is_none());
+    app.draft = "@code-reviewer go".to_string();
+    app.cursor = app.draft.len();
+    assert!(app.active_mention_query().is_none());
+
+    // `/attach` path mode wins over mention parsing…
+    app.draft = "/attach @x".to_string();
+    app.cursor = app.draft.len();
+    assert!(app.active_mention_query().is_none());
+    // …but a mention inside an ordinary command ARGUMENT works (`/goal`, `/plan`
+    // steering a named agent is a legit composition).
+    app.draft = "/goal ship it with @arch".to_string();
+    app.cursor = app.draft.len();
+    let (_, query) = app.active_mention_query().expect("mention in command arg");
+    assert_eq!(query, "arch");
 }
 
 /// `/goal` status/stop and the start guards — none of which send a turn.

@@ -242,6 +242,19 @@ aivo code mcp import [tool] [name]  # copy servers from claude/cursor/gemini/cop
 
 Per-tool toggles within a connected server live in the TUI (`/mcp`, `Ctrl+T`).
 
+### Subagents — named specialists the agent delegates to
+
+A subagent is a `<name>.md` file (frontmatter + instructions) the main agent can hand a
+self-contained task to — a "code reviewer", "software architect", "test writer". Two ship
+built-in: `explorer` (read-only codebase exploration) and `aivo-guide` (answers questions about
+aivo itself); shadow either by creating a same-named file. The rest are discovered from the repo
+(`.aivo/agents`, `.claude/agents`), `~/.config/aivo/agents`, and installed packs; an existing
+Claude Code `.claude/agents` fleet is picked up as-is (`model: inherit` honored — prefer full
+model ids over `sonnet`-style shorthands, which pass through verbatim). Just **ask the agent
+to create one** ("make me a code-reviewer subagent") and it authors the file for you; it's
+delegatable immediately (profiles resolve fresh at delegation time). Scope its tools (`tools: [read_file, grep]`), give it its own
+`model:`, or run it in a throwaway worktree (`isolation: worktree`) — all optional frontmatter.
+
 ### Extension packs — `aivo code packs`
 
 One installable unit bundling skills, sub-agent profiles, hooks, and MCP servers — the

@@ -281,6 +281,38 @@ fn wrap_one_line(line: &str, width: usize) -> Vec<String> {
     wrapped
 }
 
+/// Greedy word wrap by display width, for prose that must stay readable on
+/// narrow terminals — words never split mid-word (an oversized single word
+/// falls back to the character wrap).
+pub(super) fn wrap_words(text: &str, width: usize) -> Vec<String> {
+    let width = width.max(1);
+    let mut lines: Vec<String> = Vec::new();
+    let mut current = String::new();
+    for word in text.split_whitespace() {
+        let sep = usize::from(!current.is_empty());
+        let current_width: usize = current.chars().map(char_cell_width).sum();
+        let word_width: usize = word.chars().map(char_cell_width).sum();
+        if !current.is_empty() && current_width + sep + word_width > width {
+            lines.push(std::mem::take(&mut current));
+        }
+        if !current.is_empty() {
+            current.push(' ');
+        }
+        current.push_str(word);
+    }
+    if !current.is_empty() {
+        lines.push(current);
+    }
+    lines
+        .into_iter()
+        .flat_map(|l| wrap_one_line(&l, width))
+        .collect()
+}
+
+fn char_cell_width(ch: char) -> usize {
+    UnicodeWidthChar::width(ch).unwrap_or(0).max(1)
+}
+
 pub(super) fn wrap_plain_lines(lines: &[String], width: u16) -> Vec<String> {
     let width = usize::from(width.max(1));
     let mut wrapped = Vec::new();
@@ -2567,11 +2599,13 @@ fn tool_arg_summary(name: &str, args: &serde_json::Value, cwd: &str) -> String {
         // "subagent" is jargon — the short `label`, else the task (preamble
         // stripped), renders as the label itself (see `render_tool_call`).
         // `description`/`prompt` are Claude Code's names for the same args.
+        // A named delegation (`agent`/`subagent_type`) leads with the profile
+        // name so the transcript attributes the work: `code-reviewer — <task>`.
         "subagent" => {
             let label = [pick("label"), pick("description")]
                 .into_iter()
                 .find(|s| !s.trim().is_empty());
-            match label {
+            let body = match label {
                 Some(l) => truncate_chars(l.trim(), 72),
                 None => {
                     let task = if pick("task").is_empty() {
@@ -2581,6 +2615,14 @@ fn tool_arg_summary(name: &str, args: &serde_json::Value, cwd: &str) -> String {
                     };
                     truncate_chars(&condense_subagent_task(task), 72)
                 }
+            };
+            match [pick("agent"), pick("subagent_type")]
+                .into_iter()
+                .find(|s| !s.trim().is_empty())
+            {
+                Some(agent) if !body.is_empty() => format!("{} — {}", agent.trim(), body),
+                Some(agent) => agent.trim().to_string(),
+                None => body,
             }
         }
         _ => String::new(),
@@ -3538,6 +3580,46 @@ mod render_tests {
                 ""
             ),
             "investigate the crash"
+        );
+    }
+
+    #[test]
+    fn tool_arg_summary_subagent_leads_with_named_agent() {
+        // A named delegation attributes the row to the profile: `agent — task`.
+        assert_eq!(
+            tool_arg_summary(
+                "subagent",
+                &serde_json::json!({"agent": "code-reviewer", "label": "audit auth flow"}),
+                ""
+            ),
+            "code-reviewer — audit auth flow"
+        );
+        // Claude Code's `subagent_type` is the same field; falls back to the task.
+        assert_eq!(
+            tool_arg_summary(
+                "Task",
+                &serde_json::json!({"subagent_type": "explorer", "prompt": "Please investigate the crash"}),
+                ""
+            ),
+            "explorer — investigate the crash"
+        );
+        // Named delegate with no label/task renders the bare agent name.
+        assert_eq!(
+            tool_arg_summary(
+                "subagent",
+                &serde_json::json!({"agent": "code-reviewer"}),
+                ""
+            ),
+            "code-reviewer"
+        );
+        // No agent → unchanged label-only behavior (generic delegate).
+        assert_eq!(
+            tool_arg_summary(
+                "subagent",
+                &serde_json::json!({"label": "audit auth flow"}),
+                ""
+            ),
+            "audit auth flow"
         );
     }
 

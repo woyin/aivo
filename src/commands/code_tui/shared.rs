@@ -63,6 +63,7 @@ pub(super) const WELCOME_TIPS: &[&str] = &[
     "/share creates a live web link to this session",
     "/effort changes how hard the model thinks",
     "/skills and /mcp manage the agent's extra tools",
+    "ask the agent to create a subagent for a task — a reviewer, an architect …",
     "/compact summarizes older turns to free up context",
     "/plan plans read-only — approve the plan and it builds",
     "/model switches models without losing the thread",
@@ -216,6 +217,12 @@ pub(super) const SLASH_COMMANDS: &[SlashCommandSpec] = &[
         takes_argument: true,
     },
     SlashCommandSpec {
+        name: "agents",
+        help_label: "/agents [rm <name>]",
+        description: "list or remove named sub-agents (ask in chat to create one)",
+        takes_argument: true,
+    },
+    SlashCommandSpec {
         name: "create-skill",
         help_label: "/create-skill [intent]",
         description: "create or improve an agent skill, guided",
@@ -324,6 +331,7 @@ pub(super) fn command_usage_hint(name: &str) -> Option<&'static str> {
         // Richer than a placeholder — teaches the subcommand grammar.
         "mcp" => Some("[add [-p] <command> [args…] | rm <name>]"),
         "skills" => Some("[add [-p] <name>|<github:owner/repo> | rm <name>]"),
+        "agents" => Some("[rm <name>]"),
         "create-skill" => Some("[what the skill should do]"),
         "goal" => Some("<objective> | stop"),
         "plan" => Some("[objective] | go [guidance] | stop"),
@@ -487,6 +495,79 @@ pub(super) struct SkillToggle {
     pub(super) scope: crate::agent::skills::SkillScope,
     /// Full SKILL.md instructions, read at open time (discovery leaves them empty).
     pub(super) body: String,
+}
+
+/// One row in the `/agents` overlay: a discovered sub-agent profile plus the
+/// display metadata the panes need (resolved at open time).
+#[derive(Clone, Debug)]
+pub(super) struct AgentRow {
+    pub(super) name: String,
+    pub(super) description: String,
+    /// "repo" | "user" | "pack" — where the file lives; packs aren't deletable here.
+    pub(super) scope: &'static str,
+    pub(super) source: std::path::PathBuf,
+    pub(super) model: Option<String>,
+    /// Resolved tool scope; `None` = unscoped (all tools).
+    pub(super) tools: Option<Vec<&'static str>>,
+    pub(super) isolation_worktree: bool,
+    pub(super) body: String,
+}
+
+/// The interactive `/agents` overlay: the `/skills` interaction grammar minus
+/// toggle/add — profiles have no enabled state, and creation is conversational
+/// (the create-agent workflow) rather than a form.
+#[derive(Clone, Debug, Default)]
+pub(super) struct AgentsOverlay {
+    pub(super) items: Vec<AgentRow>,
+    pub(super) selected: usize,
+    pub(super) query: String,
+    pub(super) pending_delete: Option<usize>,
+    pub(super) viewing: Option<usize>,
+    pub(super) detail_scroll: u16,
+}
+
+impl AgentsOverlay {
+    pub(super) fn filtered_indices(&self) -> Vec<usize> {
+        ranked_indices(
+            &self.query,
+            self.items
+                .iter()
+                .map(|it| (it.name.as_str(), it.description.as_str())),
+        )
+    }
+
+    pub(super) fn select_prev(&mut self) {
+        self.pending_delete = None;
+        self.detail_scroll = 0;
+        move_within(&self.filtered_indices(), &mut self.selected, -1);
+    }
+
+    pub(super) fn select_next(&mut self) {
+        self.pending_delete = None;
+        self.detail_scroll = 0;
+        move_within(&self.filtered_indices(), &mut self.selected, 1);
+    }
+
+    pub(super) fn refilter(&mut self) {
+        self.pending_delete = None;
+        self.detail_scroll = 0;
+        self.selected = self.filtered_indices().first().copied().unwrap_or(0);
+    }
+
+    pub(super) fn has_selection(&self) -> bool {
+        self.filtered_indices().contains(&self.selected)
+    }
+
+    /// First Ctrl+D arms the delete, a second on the same row confirms it.
+    pub(super) fn arm_or_confirm_delete(&mut self) -> bool {
+        if self.pending_delete == Some(self.selected) {
+            self.pending_delete = None;
+            true
+        } else {
+            self.pending_delete = Some(self.selected);
+            false
+        }
+    }
 }
 
 /// The interactive `/skills` overlay: a filterable toggle list. `query` is the
@@ -1039,6 +1120,8 @@ pub(super) enum Overlay {
     },
     /// `/skills` — the agent skills discovered for the working dir, toggleable.
     Skills(SkillsOverlay),
+    /// `/agents` — the named sub-agents discovered for the working dir.
+    Agents(AgentsOverlay),
     /// A multi-skill install source was staged — pick which skills to copy in.
     SkillInstall(SkillInstallOverlay),
     /// `/mcp` — the configured MCP servers with status, toggleable.
@@ -1236,6 +1319,8 @@ pub(super) struct PathMenuEntry {
 pub(super) enum MenuKind {
     Commands,
     AttachPath,
+    /// `@name` sub-agent mentions in the composer.
+    Mention,
 }
 
 /// A discovered skill surfaced as a user-typeable slash command (`/repo-study`),
@@ -1260,11 +1345,21 @@ impl SkillCommand {
     }
 }
 
+/// A discovered sub-agent offered by the `@` mention menu: name + one-line
+/// advert. Selecting it inserts `@name ` into the draft (it does not submit —
+/// a mention is part of a message still being composed).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct AgentMention {
+    pub(super) name: String,
+    pub(super) description: String,
+}
+
 #[derive(Clone)]
 pub(super) enum ComposerMenuEntry {
     Command(&'static SlashCommandSpec),
     Skill(SkillCommand),
     Path(PathMenuEntry),
+    Agent(AgentMention),
 }
 
 impl ComposerMenuEntry {
@@ -1273,6 +1368,7 @@ impl ComposerMenuEntry {
             Self::Command(command) => command.command_label(),
             Self::Skill(skill) => skill.command_label(),
             Self::Path(path) => path.label.clone(),
+            Self::Agent(agent) => format!("@{}", agent.name),
         }
     }
 
@@ -1281,6 +1377,7 @@ impl ComposerMenuEntry {
             Self::Command(command) => command.description,
             Self::Skill(skill) => &skill.description,
             Self::Path(path) => &path.description,
+            Self::Agent(agent) => &agent.description,
         }
     }
 }
@@ -1664,6 +1761,8 @@ pub(super) enum SlashCommand {
     Copy(Option<usize>),
     /// Agent skills: bare opens the overlay; `add …` / `rm <name>` manage them.
     Skills(Option<String>),
+    /// Named sub-agents: bare opens the overlay; `rm <name>` deletes one.
+    Agents(Option<String>),
     /// MCP servers: bare opens the overlay; `add …` / `rm <name>` manage them.
     Mcp(Option<String>),
     /// Goal mode: `<objective>` works autonomously until done; bare shows status,
@@ -2113,6 +2212,12 @@ pub(super) struct CodeTuiApp {
     /// startup and after any skill mutation; read by the `/` menu and command
     /// resolver. Empty when none; its length feeds the welcome chip.
     pub(super) skill_commands: Vec<SkillCommand>,
+    /// Subagent profiles discovered for the working dir, last time the set was
+    /// checked (startup + after each turn). Compared post-turn — full structs,
+    /// since the engine snapshots profiles at build and never re-reads them — so
+    /// a profile the agent just authored or edited (via the create-agent skill)
+    /// drops the cached engine and takes effect next turn.
+    pub(super) last_subagents: Vec<crate::agent::subagents::Subagent>,
     /// Enabled MCP servers for the welcome chip; refreshed on `/mcp` changes.
     pub(super) mcp_configured_count: usize,
     /// The [`WELCOME_TIPS`] entry showing now; advanced by `tick_welcome_tip`.

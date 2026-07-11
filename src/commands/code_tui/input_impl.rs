@@ -222,6 +222,54 @@ impl CodeTuiApp {
         Some(&self.draft["/attach ".len()..])
     }
 
+    /// An `@name` sub-agent mention being typed at the cursor: the byte offset
+    /// of the `@` and the partial name after it. Only at a word boundary (start
+    /// of draft or after whitespace) so emails and paths don't trigger it, and
+    /// only when discovered profiles exist to suggest. Command/attach modes win.
+    pub(super) fn active_mention_query(&self) -> Option<(usize, String)> {
+        if self.overlay.blocks_input()
+            || self.last_subagents.is_empty()
+            || self.active_command_query().is_some()
+            || self.active_attach_query().is_some()
+        {
+            return None;
+        }
+        let head = self.draft.get(..self.cursor)?;
+        let at = head.rfind('@')?;
+        if !head[..at]
+            .chars()
+            .next_back()
+            .is_none_or(char::is_whitespace)
+        {
+            return None;
+        }
+        let query = &head[at + 1..];
+        if query.chars().any(char::is_whitespace) {
+            return None;
+        }
+        Some((at, query.to_string()))
+    }
+
+    /// The `@` menu entries: discovered sub-agent profiles matching the partial
+    /// name, prefix matches first (same ranking as the skill-command filter).
+    pub(super) fn matching_mention_entries(&self, query: &str) -> Vec<ComposerMenuEntry> {
+        let mut prefix = Vec::new();
+        let mut fuzzy = Vec::new();
+        for sa in &self.last_subagents {
+            let entry = ComposerMenuEntry::Agent(AgentMention {
+                name: sa.name.clone(),
+                description: crate::agent::skills::advert_description(&sa.description),
+            });
+            if sa.name.starts_with(query) {
+                prefix.push(entry);
+            } else if matches_fuzzy(query, &sa.name) {
+                fuzzy.push(entry);
+            }
+        }
+        prefix.extend(fuzzy);
+        prefix
+    }
+
     /// Whether the draft is a `!cmd` local shell command — a single line whose
     /// first non-space char is a lone `!` (not the `!!` literal-`!` escape). Drives
     /// the composer's shell-command highlight; mirrors `prepare_submit_action`'s
@@ -270,8 +318,7 @@ impl CodeTuiApp {
         }
         let (kind, entries) = if let Some(query) = self.active_command_query() {
             (MenuKind::Commands, self.matching_command_entries(query))
-        } else {
-            let query = self.active_attach_query()?;
+        } else if let Some(query) = self.active_attach_query() {
             (
                 MenuKind::AttachPath,
                 // Suggest from the real launch dir (where relative paths actually
@@ -281,6 +328,10 @@ impl CodeTuiApp {
                     .map(ComposerMenuEntry::Path)
                     .collect::<Vec<_>>(),
             )
+        } else if let Some((_, query)) = self.active_mention_query() {
+            (MenuKind::Mention, self.matching_mention_entries(&query))
+        } else {
+            return None;
         };
         let selected = if entries.is_empty() {
             None
@@ -303,6 +354,8 @@ impl CodeTuiApp {
             query.to_string()
         } else if let Some(query) = self.active_attach_query() {
             query.to_string()
+        } else if let Some((_, query)) = self.active_mention_query() {
+            query
         } else {
             self.command_menu.reset();
             return;
@@ -319,8 +372,10 @@ impl CodeTuiApp {
 
         let matches = if self.active_command_query().is_some() {
             self.matching_command_entries(&query).len()
-        } else {
+        } else if self.active_attach_query().is_some() {
             collect_attach_path_suggestions(self.persist_cwd(), &query).len()
+        } else {
+            self.matching_mention_entries(&query).len()
         };
         if matches == 0 {
             self.command_menu.selected = 0;
@@ -358,7 +413,9 @@ impl CodeTuiApp {
     }
 
     pub(super) fn dismiss_command_menu(&mut self) -> bool {
-        if (self.active_command_query().is_none() && self.active_attach_query().is_none())
+        if (self.active_command_query().is_none()
+            && self.active_attach_query().is_none()
+            && self.active_mention_query().is_none())
             || self.command_menu.dismissed
         {
             return false;
@@ -403,8 +460,23 @@ impl CodeTuiApp {
                     self.command_menu.placement = None;
                 }
             }
+            ComposerMenuEntry::Agent(agent) => {
+                self.insert_mention(&agent.name);
+            }
         }
         true
+    }
+
+    /// Replace the `@partial` at the cursor with `@name ` — the mention is part
+    /// of a message still being composed, so the draft is never submitted here.
+    fn insert_mention(&mut self, name: &str) {
+        if let Some((at, _)) = self.active_mention_query() {
+            let mention = format!("@{name} ");
+            self.draft.replace_range(at..self.cursor, &mention);
+            self.cursor = at + mention.len();
+        }
+        self.command_menu.dismissed = true;
+        self.command_menu.placement = None;
     }
 
     pub(super) async fn execute_selected_command(&mut self) -> Result<bool> {
@@ -433,6 +505,12 @@ impl CodeTuiApp {
                 } else {
                     self.submit_draft().await
                 }
+            }
+            // Enter completes the mention like Tab — the user still has the
+            // actual request to type around it.
+            ComposerMenuEntry::Agent(agent) => {
+                self.insert_mention(&agent.name);
+                Ok(false)
             }
         }
     }
