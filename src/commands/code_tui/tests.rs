@@ -3093,13 +3093,9 @@ fn test_done_marker_appends_turn_note() {
     });
     let idx = app.history.len() - 1;
     app.turn_durations.insert(idx, 42_000);
-    app.turn_notes
-        .insert(idx, "3.1k tokens · ~$0.02".to_string());
+    app.turn_notes.insert(idx, "3.1k tokens".to_string());
     let plain = app.build_transcript().plain_lines.join("\n");
-    assert!(
-        plain.contains("✶ Done in 42s · 3.1k tokens · ~$0.02"),
-        "{plain}"
-    );
+    assert!(plain.contains("✶ Done in 42s · 3.1k tokens"), "{plain}");
 }
 
 #[tokio::test]

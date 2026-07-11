@@ -968,13 +968,10 @@ impl CodeTuiApp {
             if let Some(idx) = done_idx
                 && turn.completion_tokens > 0
             {
-                let mut note = format!(
+                let note = format!(
                     "{} tokens",
                     format_token_count_value(turn.completion_tokens)
                 );
-                if let Some(cost) = cost.filter(|c| *c > 0.0) {
-                    note.push_str(&format!(" · ~${}", format_usd(cost)));
-                }
                 self.turn_notes.insert(idx, note);
             }
             self.session_tokens = self.session_tokens.merge(turn);
