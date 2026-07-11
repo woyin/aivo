@@ -83,7 +83,9 @@ impl SandboxProfile {
     /// The accepted `--sandbox` values, for CLI help/validation.
     pub const VALUES: &'static [&'static str] = &["off", "workspace", "read-only", "strict"];
 
-    /// Child-network denial is macOS-only (Landlock can't gate network).
+    /// Child-network denial is macOS-only (Landlock can't gate network), so the
+    /// only non-test caller is the macOS SBPL builder.
+    #[cfg(any(test, target_os = "macos"))]
     fn deny_network(self) -> bool {
         matches!(self, Self::ReadOnly | Self::Strict)
     }
