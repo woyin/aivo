@@ -4046,6 +4046,58 @@ fn test_markdown_table_is_responsive_to_width() {
 }
 
 #[test]
+fn test_markdown_table_stacks_when_grid_would_break_words() {
+    // Four columns with a giant token can't grid at 44 cols without breaking
+    // words mid-character — the table must stack into `Header: value` blocks.
+    let md = "| Dimension | Their approach | Our approach | Worth adopting? |\n\
+        |---|---|---|---|\n\
+        | Shape | Bun workspace monorepo: packages/{shared,core,ui,session-core} | Single Rust crate | No |\n\
+        | Agent ownership | Thin agent-service | Native engine.rs | Partial |\n";
+    let lines = render_markdown_lines(md, 44);
+    let plain: Vec<&str> = lines.iter().map(|l| l.plain.as_str()).collect();
+    let joined = plain.join("\n");
+
+    assert!(
+        !joined.chars().any(|c| "│┌┐└┘├┤┬┴┼".contains(c)),
+        "expected stacked layout, got a grid:\n{joined}"
+    );
+    assert!(joined.contains("Dimension: Shape"), "{joined}");
+    assert!(joined.contains("Their approach: Bun workspace"), "{joined}");
+    let rules = plain.iter().filter(|l| l.contains("────")).count();
+    assert_eq!(rules, 1, "expected one row separator:\n{joined}");
+    let width = |s: &str| {
+        s.chars()
+            .map(|c| UnicodeWidthChar::width(c).unwrap_or(0))
+            .sum::<usize>()
+    };
+    assert!(plain.iter().all(|l| width(l) <= 44), "overflow:\n{joined}");
+    assert!(
+        plain.iter().any(|l| l.contains("monorepo:")),
+        "word hard-broken in stacked mode:\n{joined}"
+    );
+}
+
+#[test]
+fn test_markdown_table_grid_never_hard_breaks_words() {
+    // The long-token column must get its longest word, not an even per-column
+    // share that shears the token mid-character.
+    let md = "| Dimension | Their approach | Our approach | Worth adopting? |\n\
+        |---|---|---|---|\n\
+        | Shape | Bun workspace monorepo: packages/{shared,core,ui,session-core} | Single Rust crate | No |\n";
+    let lines = render_markdown_lines(md, 100);
+    let plain: Vec<&str> = lines.iter().map(|l| l.plain.as_str()).collect();
+    let joined = plain.join("\n");
+
+    assert!(joined.contains('┌'), "expected a grid:\n{joined}");
+    assert!(
+        plain
+            .iter()
+            .any(|l| l.contains("packages/{shared,core,ui,session-core}")),
+        "long token hard-broken inside grid cell:\n{joined}"
+    );
+}
+
+#[test]
 fn test_wrap_styled_line_word_wraps_and_hard_breaks() {
     use ratatui::text::Line;
 

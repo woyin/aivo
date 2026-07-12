@@ -2516,11 +2516,14 @@ fn fit_column_widths(natural: &[usize], min_word: &[usize], budget: usize) -> Ve
         return widths;
     }
 
-    // Soft floors: avoid shrinking a column below its longest word while another
-    // column still has slack — keeps words intact as long as possible. Cap the
-    // floor so one giant token can't starve every other column.
-    let floor_cap = (budget / ncols).max(1);
-    let floors: Vec<usize> = min_word.iter().map(|&w| w.min(floor_cap).max(1)).collect();
+    // Soft floors: a column's longest word, so words stay intact. Only when even
+    // the longest words can't all fit, cap so one giant token can't starve the rest.
+    let floors: Vec<usize> = if min_word.iter().map(|&w| w.max(1)).sum::<usize>() <= budget {
+        min_word.iter().map(|&w| w.max(1)).collect()
+    } else {
+        let floor_cap = (budget / ncols).max(1);
+        min_word.iter().map(|&w| w.min(floor_cap).max(1)).collect()
+    };
 
     // Shrink the widest column above its floor, one column at a time, until we fit
     // or every column is at its floor; then, if still over, shrink the widest
@@ -2581,6 +2584,61 @@ fn wrap_cell_text(text: &str, width: usize) -> Vec<String> {
     if !cur.is_empty() || out.is_empty() {
         out.push(cur);
     }
+    out
+}
+
+/// Word-wrap styled words to `width` display columns, hard-breaking oversized
+/// words; consecutive same-style words merge into one span.
+fn wrap_styled_words(words: &[(String, Style)], width: usize) -> Vec<Vec<Span<'static>>> {
+    let width = width.max(1);
+    fn flush(cur: &mut Vec<(String, Style)>, out: &mut Vec<Vec<Span<'static>>>) {
+        if cur.is_empty() {
+            return;
+        }
+        let mut spans: Vec<Span<'static>> = Vec::new();
+        for (i, (text, style)) in cur.drain(..).enumerate() {
+            let sep = if i == 0 { "" } else { " " };
+            match spans.last_mut() {
+                Some(last) if last.style == style => {
+                    last.content.to_mut().push_str(sep);
+                    last.content.to_mut().push_str(&text);
+                }
+                _ => spans.push(Span::styled(format!("{sep}{text}"), style)),
+            }
+        }
+        out.push(spans);
+    }
+
+    let mut out: Vec<Vec<Span<'static>>> = Vec::new();
+    let mut cur: Vec<(String, Style)> = Vec::new();
+    let mut cur_w = 0usize;
+    for (word, style) in words {
+        let ww = cell_width(word);
+        if ww > width {
+            flush(&mut cur, &mut out);
+            let chunks = wrap_one_line(word, width);
+            let split = chunks.len().saturating_sub(1);
+            for chunk in &chunks[..split] {
+                cur.push((chunk.clone(), *style));
+                flush(&mut cur, &mut out);
+            }
+            cur_w = 0;
+            if let Some(tail) = chunks.last() {
+                cur_w = cell_width(tail);
+                cur.push((tail.clone(), *style));
+            }
+            continue;
+        }
+        let sep = usize::from(!cur.is_empty());
+        if cur_w + sep + ww > width {
+            flush(&mut cur, &mut out);
+            cur_w = ww;
+        } else {
+            cur_w += sep + ww;
+        }
+        cur.push((word.clone(), *style));
+    }
+    flush(&mut cur, &mut out);
     out
 }
 
@@ -3181,12 +3239,9 @@ impl MarkdownRenderer {
         }
     }
 
-    /// Render a buffered GFM table as a bordered, width-aware box (Claude-Code
-    /// style): columns are sized to fit the available text width, long cells wrap
-    /// across multiple lines instead of overflowing, and the whole table never
-    /// exceeds the pane — so the transcript word-wrapper can't shear it apart.
-    /// A bold header row sits under a top border, a `├─┼─┤` rule splits it from
-    /// the body, and a bottom border closes the box.
+    /// Render a buffered GFM table responsively (Claude-Code style): a bordered
+    /// grid with word-wrapped cells when every column can hold its longest word,
+    /// otherwise stacked `Header: value` blocks so words never hard-break.
     fn emit_table(&mut self, table: TableAcc) {
         let rows = table.rows;
         let Some(ncols) = rows.iter().map(Vec::len).max().filter(|n| *n > 0) else {
@@ -3210,6 +3265,14 @@ impl MarkdownRenderer {
         // space of padding on each side of every cell. The rest is column content.
         let chrome = (ncols + 1) + 2 * ncols;
         let budget = self.table_width.saturating_sub(chrome).max(ncols);
+
+        // Stack below longest-word floors + slack; header-only tables have
+        // nothing to stack, so they stay a grid.
+        let floors: usize = min_word.iter().sum();
+        if rows.len() > 1 && floors + 2 * ncols > budget {
+            self.emit_table_stacked(&rows, ncols);
+            return;
+        }
         let widths = fit_column_widths(&natural, &min_word, budget);
 
         let border = Style::default().fg(FAINT);
@@ -3235,24 +3298,74 @@ impl MarkdownRenderer {
             for k in 0..height {
                 let mut spans: Vec<Span<'static>> = vec![Span::styled("│", border)];
                 for (i, w) in widths.iter().enumerate() {
-                    let text = cells[i].get(k).map(String::as_str).unwrap_or("");
+                    // Shorter cells sit vertically centered; header cells also center horizontally.
+                    let top = (height - cells[i].len()) / 2;
+                    let text = (k >= top)
+                        .then(|| cells[i].get(k - top).map(String::as_str))
+                        .flatten()
+                        .unwrap_or("");
+                    let pad = w.saturating_sub(cell_width(text));
+                    let lpad = if header { pad / 2 } else { 0 };
                     let mut padded = String::with_capacity(w + 2);
                     padded.push(' ');
+                    padded.push_str(&" ".repeat(lpad));
                     padded.push_str(text);
-                    padded.push_str(&" ".repeat(w.saturating_sub(cell_width(text))));
+                    padded.push_str(&" ".repeat(pad - lpad));
                     padded.push(' ');
                     spans.push(Span::styled(padded, cell_style));
                     spans.push(Span::styled("│", border));
                 }
                 self.lines.push(line_with_plain(spans));
             }
-            // Header gets a `├─┼─┤` rule only when a body follows; close with the
-            // bottom border after the final row.
-            if header && last > 0 {
+            if ri < last {
                 self.lines.push(rule("├", "┼", "┤"));
-            }
-            if ri == last {
+            } else {
                 self.lines.push(rule("└", "┴", "┘"));
+            }
+        }
+    }
+
+    /// Stacked fallback for tables too wide to grid: each body row becomes a
+    /// block of bold-`Header:` value lines at full width, rows separated by a rule.
+    fn emit_table_stacked(&mut self, rows: &[Vec<String>], ncols: usize) {
+        let width = self.table_width.max(8);
+        let headers = &rows[0];
+        let label_style = Style::default().fg(TEXT).add_modifier(Modifier::BOLD);
+        let value_style = Style::default().fg(TEXT);
+        let mut first = true;
+        for row in &rows[1..] {
+            if row.iter().all(|c| c.trim().is_empty()) {
+                continue;
+            }
+            if !first {
+                let rule = "─".repeat(width.min(40));
+                self.lines
+                    .push(line_plain(rule, Style::default().fg(FAINT)));
+            }
+            first = false;
+            for i in 0..ncols {
+                let header = headers.get(i).map(String::as_str).unwrap_or("").trim();
+                let value = row.get(i).map(String::as_str).unwrap_or("").trim();
+                let mut words: Vec<(String, Style)> = Vec::new();
+                let label: Vec<&str> = header.split_whitespace().collect();
+                for (wi, word) in label.iter().enumerate() {
+                    // Colon rides on the last label word so wrapping can't detach it.
+                    let text = if wi + 1 == label.len() {
+                        format!("{word}:")
+                    } else {
+                        (*word).to_string()
+                    };
+                    words.push((text, label_style));
+                }
+                for word in value.split_whitespace() {
+                    words.push((word.to_string(), value_style));
+                }
+                if words.is_empty() {
+                    continue;
+                }
+                for spans in wrap_styled_words(&words, width) {
+                    self.lines.push(line_with_plain(spans));
+                }
             }
         }
     }
