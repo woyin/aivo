@@ -148,7 +148,10 @@ impl UsageStatsStore {
         tool: &str,
         model: Option<&str>,
     ) -> Result<()> {
-        let _lock = self.stats_ctx.acquire_lock()?;
+        // Best-effort: an unavailable lock skips the write, never fails the launch.
+        let Ok(_lock) = self.stats_ctx.acquire_lock() else {
+            return Ok(());
+        };
         let mut stats = self.load_with_migration().await?;
         stats.record_selection(key_id, tool, model);
         self.stats_ctx.save(&stats).await
@@ -165,7 +168,9 @@ impl UsageStatsStore {
         cache_read_input_tokens: u64,
         cache_creation_input_tokens: u64,
     ) -> Result<()> {
-        let _lock = self.stats_ctx.acquire_lock()?;
+        let Ok(_lock) = self.stats_ctx.acquire_lock() else {
+            return Ok(());
+        };
         let mut stats = self.load_with_migration().await?;
         stats.record_tokens(
             key_id,
@@ -187,7 +192,9 @@ impl UsageStatsStore {
         steps: u64,
         tokens: u64,
     ) -> Result<()> {
-        let _lock = self.stats_ctx.acquire_lock()?;
+        let Ok(_lock) = self.stats_ctx.acquire_lock() else {
+            return Ok(());
+        };
         let mut stats = self.load_with_migration().await?;
         stats.record_agent_run(key_id, agent, ok, steps, tokens);
         self.stats_ctx.save(&stats).await
@@ -222,6 +229,26 @@ mod tests {
         let store = test_store(&dir);
         let stats = store.load().await.unwrap();
         assert!(stats.is_empty());
+    }
+
+    /// A held lock (wedged process) must skip the write, not fail or stall.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn record_skips_when_lock_held() {
+        let dir = TempDir::new().unwrap();
+        let store = test_store(&dir);
+        let held = store.stats_ctx.acquire_lock().unwrap();
+        store
+            .record_selection("key1", "claude", Some("opus"))
+            .await
+            .unwrap();
+        drop(held);
+        assert!(store.load().await.unwrap().is_empty());
+        store
+            .record_selection("key1", "claude", Some("opus"))
+            .await
+            .unwrap();
+        assert!(!store.load().await.unwrap().is_empty());
     }
 
     #[tokio::test]

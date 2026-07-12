@@ -3016,7 +3016,9 @@ fn compute_line_starts(
             let content = cache
                 .entry(d.path.clone())
                 .or_insert_with(|| {
-                    std::fs::read_to_string(crate::agent::tools::resolve(cwd, &d.path)).ok()
+                    let full = crate::agent::tools::resolve(cwd, &d.path);
+                    std::fs::metadata(&full).ok().filter(|m| m.is_file())?;
+                    std::fs::read_to_string(full).ok()
                 })
                 .as_ref()?;
             let mut hits = content.match_indices(&d.old);
@@ -3054,7 +3056,9 @@ fn capture_pre_write(
     }
     let path = args.get("path").and_then(|v| v.as_str())?;
     let abs = crate::agent::tools::resolve(cwd, path);
-    if std::fs::metadata(&abs).ok()?.len() > MAX_BYTES {
+    // `is_file`: a FIFO reports len 0 but would block the read.
+    let meta = std::fs::metadata(&abs).ok()?;
+    if !meta.is_file() || meta.len() > MAX_BYTES {
         return None;
     }
     std::fs::read_to_string(abs).ok()

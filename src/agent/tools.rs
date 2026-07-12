@@ -1669,19 +1669,25 @@ pub(crate) fn cap_tail_with(s: String, max_bytes: usize, max_lines: usize) -> St
 
 // --- read-only tools ---
 
+/// Refuse anything but a regular file: reading a FIFO or device (e.g. /dev/tty)
+/// blocks forever and wedges the single runtime thread. Stats before open — a
+/// FIFO with no writer blocks at open(), not read().
+pub(crate) fn regular_file_metadata(full: &Path) -> Result<std::fs::Metadata, String> {
+    let meta = std::fs::metadata(full).map_err(|e| e.to_string())?;
+    if meta.is_dir() {
+        return Err("is a directory (use list_dir)".to_string());
+    }
+    if !meta.is_file() {
+        return Err("not a regular file (fifo/device/socket)".to_string());
+    }
+    Ok(meta)
+}
+
 fn read_file(args: &Value, cwd: &Path) -> Result<String, String> {
     let path = arg_str(args, "path")?;
     let full = resolve(cwd, path);
-    // Reject a directory up front. On Windows `File::open` on a directory fails
-    // outright (a dir can't be opened as a file), so a post-open `is_dir` check
-    // would never run and the model would get a raw OS error instead of the
-    // "use list_dir" hint. On Unix opening a dir succeeds, so this single check
-    // covers both platforms.
-    if full.is_dir() {
-        return Err(format!("read {path}: is a directory (use list_dir)"));
-    }
+    let meta = regular_file_metadata(&full).map_err(|e| format!("read {path}: {e}"))?;
     let file = std::fs::File::open(&full).map_err(|e| format!("read {path}: {e}"))?;
-    let meta = file.metadata().map_err(|e| format!("read {path}: {e}"))?;
     // Slurp at most MAX_READ_BYTES so a multi-GB file can't OOM the process;
     // the model can page further with offset/limit or fall back to run_bash.
     let oversize = meta.len() > MAX_READ_BYTES;
@@ -1907,15 +1913,22 @@ fn grep_fallback(root: &Path, dir: &Path, needle: &str, context: usize, out: &mu
         // fast path) — so the pure-Rust fallback searches the SAME file set as
         // rg, and a symlinked directory cycle (`loop -> .`) can't recurse until
         // the stack overflows.
-        if e.file_type().map(|t| t.is_symlink()).unwrap_or(false) {
+        let Ok(ft) = e.file_type() else {
+            continue;
+        };
+        if ft.is_symlink() {
             continue;
         }
         let path = e.path();
         let name = e.file_name();
-        if path.is_dir() {
+        if ft.is_dir() {
             if !IGNORED_DIRS.contains(&name.to_string_lossy().as_ref()) {
                 grep_fallback(root, &path, needle, context, out);
             }
+            continue;
+        }
+        // rg skips non-regular files too; a FIFO would block read_to_string.
+        if !ft.is_file() {
             continue;
         }
         let Ok(content) = std::fs::read_to_string(&path) else {
@@ -2244,6 +2257,7 @@ fn edit_file(args: &Value, cwd: &Path) -> Result<String, String> {
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
     let full = resolve(cwd, path);
+    regular_file_metadata(&full).map_err(|e| format!("read {path}: {e}"))?;
     let content = std::fs::read_to_string(&full).map_err(|e| format!("read {path}: {e}"))?;
     let (updated, n) = apply_one_edit(&content, old, new, replace_all, path)?;
     atomic_write(&full, &updated).map_err(|e| format!("write {path}: {e}"))?;
@@ -2267,6 +2281,7 @@ fn multi_edit(args: &Value, cwd: &Path) -> Result<String, String> {
         return Err("`edits` must contain at least one edit".to_string());
     }
     let full = resolve(cwd, path);
+    regular_file_metadata(&full).map_err(|e| format!("read {path}: {e}"))?;
     let mut content = std::fs::read_to_string(&full).map_err(|e| format!("read {path}: {e}"))?;
     let mut replacements = 0usize;
     for (i, edit) in edits.iter().enumerate() {
@@ -3635,6 +3650,58 @@ mod tests {
         assert!(
             !out.iter().any(|l| l.contains("loop")),
             "followed a symlink during traversal: {out:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    fn mkfifo(path: &Path) {
+        let c = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o644) }, 0);
+    }
+
+    /// A FIFO/device read blocks forever and once froze the whole TUI — these
+    /// must error fast, never hang.
+    #[cfg(unix)]
+    #[test]
+    fn read_file_refuses_fifo_and_device() {
+        let dir = tmp();
+        mkfifo(&dir.join("pipe"));
+        let err = read_file(&json!({"path":"pipe"}), &dir).unwrap_err();
+        assert!(err.contains("not a regular file"), "got: {err}");
+        let err = read_file(&json!({"path":"/dev/null"}), &dir).unwrap_err();
+        assert!(err.contains("not a regular file"), "got: {err}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn edit_tools_refuse_fifo() {
+        let dir = tmp();
+        mkfifo(&dir.join("pipe"));
+        let err = edit_file(
+            &json!({"path":"pipe","old_string":"a","new_string":"b"}),
+            &dir,
+        )
+        .unwrap_err();
+        assert!(err.contains("not a regular file"), "got: {err}");
+        let err = multi_edit(
+            &json!({"path":"pipe","edits":[{"old_string":"a","new_string":"b"}]}),
+            &dir,
+        )
+        .unwrap_err();
+        assert!(err.contains("not a regular file"), "got: {err}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn grep_fallback_skips_fifo() {
+        let dir = tmp();
+        write_file(&json!({"path":"f.txt","content":"needle"}), &dir).unwrap();
+        mkfifo(&dir.join("pipe"));
+        let mut out = Vec::new();
+        grep_fallback(&dir, &dir, "needle", 0, &mut out);
+        assert!(
+            out.iter().any(|l| l.contains("f.txt")),
+            "missing match: {out:?}"
         );
     }
 

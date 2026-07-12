@@ -1273,6 +1273,15 @@ impl Drop for ConfigLockGuard {
     }
 }
 
+/// Cap on lock waits — a wedged holder must not hang every aivo process;
+/// legitimate holders take milliseconds.
+const LOCK_WAIT_MAX: std::time::Duration = if cfg!(feature = "__internal_test_fast_crypto") {
+    std::time::Duration::from_millis(200)
+} else {
+    std::time::Duration::from_secs(5)
+};
+const LOCK_POLL: std::time::Duration = std::time::Duration::from_millis(50);
+
 impl ConfigLockGuard {
     pub(crate) fn acquire(lock_path: &Path) -> Result<Self> {
         let file = OpenOptions::new()
@@ -1282,6 +1291,7 @@ impl ConfigLockGuard {
             .truncate(false)
             .open(lock_path)
             .with_context(|| format!("Failed to open lock file: {:?}", lock_path))?;
+        let deadline = std::time::Instant::now() + LOCK_WAIT_MAX;
 
         #[cfg(unix)]
         {
@@ -1289,16 +1299,24 @@ impl ConfigLockGuard {
 
             loop {
                 // SAFETY: the file descriptor stays open for the guard lifetime.
-                let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
+                let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
                 if rc == 0 {
                     break;
                 }
-
                 let err = std::io::Error::last_os_error();
-                if err.kind() != std::io::ErrorKind::Interrupted {
+                let busy = err.raw_os_error() == Some(libc::EWOULDBLOCK)
+                    || err.kind() == std::io::ErrorKind::Interrupted;
+                if !busy {
                     return Err(err)
                         .with_context(|| format!("Failed to acquire lock: {:?}", lock_path));
                 }
+                if std::time::Instant::now() >= deadline {
+                    anyhow::bail!(
+                        "lock {:?} is held by another process (wedged aivo?)",
+                        lock_path
+                    );
+                }
+                std::thread::sleep(LOCK_POLL);
             }
 
             Ok(ConfigLockGuard { _file: file })
@@ -1306,33 +1324,48 @@ impl ConfigLockGuard {
 
         #[cfg(not(any(unix, windows)))]
         {
-            let _ = file;
+            let _ = (file, deadline);
             Ok(ConfigLockGuard)
         }
 
         #[cfg(windows)]
         {
             use std::os::windows::io::AsRawHandle;
-            use windows_sys::Win32::Foundation::BOOL;
-            use windows_sys::Win32::Storage::FileSystem::{LOCKFILE_EXCLUSIVE_LOCK, LockFileEx};
+            use windows_sys::Win32::Foundation::{BOOL, ERROR_LOCK_VIOLATION};
+            use windows_sys::Win32::Storage::FileSystem::{
+                LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY, LockFileEx,
+            };
             use windows_sys::Win32::System::IO::OVERLAPPED;
 
             let handle = file.as_raw_handle();
-            let mut overlapped: OVERLAPPED = unsafe { std::mem::zeroed() };
-            // SAFETY: handle is valid; we own `file` for the guard's lifetime.
-            let rc: BOOL = unsafe {
-                LockFileEx(
-                    handle,
-                    LOCKFILE_EXCLUSIVE_LOCK,
-                    0,
-                    u32::MAX,
-                    u32::MAX,
-                    &mut overlapped,
-                )
-            };
-            if rc == 0 {
-                return Err(std::io::Error::last_os_error())
-                    .with_context(|| format!("Failed to acquire lock: {:?}", lock_path));
+            loop {
+                let mut overlapped: OVERLAPPED = unsafe { std::mem::zeroed() };
+                // SAFETY: handle is valid; we own `file` for the guard's lifetime.
+                let rc: BOOL = unsafe {
+                    LockFileEx(
+                        handle,
+                        LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY,
+                        0,
+                        u32::MAX,
+                        u32::MAX,
+                        &mut overlapped,
+                    )
+                };
+                if rc != 0 {
+                    break;
+                }
+                let err = std::io::Error::last_os_error();
+                if err.raw_os_error() != Some(ERROR_LOCK_VIOLATION as i32) {
+                    return Err(err)
+                        .with_context(|| format!("Failed to acquire lock: {:?}", lock_path));
+                }
+                if std::time::Instant::now() >= deadline {
+                    anyhow::bail!(
+                        "lock {:?} is held by another process (wedged aivo?)",
+                        lock_path
+                    );
+                }
+                std::thread::sleep(LOCK_POLL);
             }
             Ok(ConfigLockGuard { _file: file })
         }
@@ -2383,6 +2416,24 @@ mod tests {
     use super::*;
     use crate::services::api_key_store::{KEY_ID_ALPHABET, KEY_ID_LENGTH};
     use tempfile::TempDir;
+
+    /// A held lock must error within the bound, not wait forever.
+    #[cfg(unix)]
+    #[test]
+    fn config_lock_acquire_is_bounded() {
+        let dir = TempDir::new().unwrap();
+        let lock_path = dir.path().join("config.lock");
+        let held = ConfigLockGuard::acquire(&lock_path).unwrap();
+        let start = std::time::Instant::now();
+        let err = match ConfigLockGuard::acquire(&lock_path) {
+            Ok(_) => panic!("second acquire should time out"),
+            Err(e) => e,
+        };
+        assert!(err.to_string().contains("held"), "got: {err}");
+        assert!(start.elapsed() < std::time::Duration::from_secs(3));
+        drop(held);
+        ConfigLockGuard::acquire(&lock_path).unwrap();
+    }
 
     #[test]
     fn migrate_legacy_per_model_is_idempotent() {
