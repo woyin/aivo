@@ -1,5 +1,15 @@
 # Changelog
 
+## v0.39.1
+
+A patch release focused on `aivo code` TUI correctness and packaging. Markdown tables now stack into label:value blocks instead of breaking words when a grid won't fit, a freeze from special-file reads and wedged lock holders is fixed, and the parallel tool_result resume path and pack cache get a polish pass.
+
+- feat(code): responsive markdown tables — stack rows when a grid would break words (7d1d8ff)
+- fix(code): stop whole-TUI freezes from special-file reads and wedged lock holders (77b2bee)
+- fix(code): polish pass — parallel tool_result resume, pack cache, footer discoverability (60c134a)
+- fix(build): trim bundled SQLite and slim build-std to refit the 10 MiB gate (da90a02, 73842ba, e15b954, #20)
+- style(code): drop the parallel sub-agent notice when live rows show it (60b4b0b)
+
 ## v0.39.0
 
 The biggest `aivo code` release yet. The agent gains a lifecycle-hooks system, verbatim project guides, headless JSON output with resume, and LSP-backed self-verification on by default. Subagents now run in isolated git worktrees with per-repo profiles, report USD cost against a `--max-cost` budget, and stream live per-delegate progress when running in parallel. Extension packs bundle skills, agents, hooks, and MCP servers as a single installable unit. Under the hood the config directory splits into chartered state/secrets/cache/logs/run paths, and a raft of TUI correctness fixes land for `/rewind`, post-resume context estimates, and mid-turn steering.
