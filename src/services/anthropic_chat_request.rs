@@ -125,8 +125,8 @@ fn extract_system_text(content: Option<&Value>) -> Vec<String> {
 pub type ModelTransform = fn(&str) -> String;
 
 #[derive(Clone, Copy, Debug)]
-pub struct AnthropicToOpenAIConfig {
-    pub default_model: &'static str,
+pub struct AnthropicToOpenAIConfig<'a> {
+    pub default_model: &'a str,
     pub preserve_stream: bool,
     pub model_transform: Option<ModelTransform>,
     pub include_reasoning_content: bool,
@@ -716,7 +716,7 @@ fn sniff_base64_image_media_type(data: &str) -> Option<&'static str> {
 mod tests {
     use super::*;
 
-    fn test_config() -> AnthropicToOpenAIConfig {
+    fn test_config() -> AnthropicToOpenAIConfig<'static> {
         AnthropicToOpenAIConfig {
             default_model: "test-model",
             preserve_stream: false,
@@ -729,7 +729,7 @@ mod tests {
         }
     }
 
-    fn streaming_config() -> AnthropicToOpenAIConfig {
+    fn streaming_config() -> AnthropicToOpenAIConfig<'static> {
         AnthropicToOpenAIConfig {
             preserve_stream: true,
             ..test_config()

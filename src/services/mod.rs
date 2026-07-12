@@ -14,6 +14,7 @@ pub mod ai_launcher;
 pub mod ansi;
 pub mod anthropic_chat_request;
 pub mod anthropic_chat_response;
+pub mod anthropic_gemini_bridge;
 pub mod anthropic_route_pipeline;
 pub mod anthropic_router;
 pub mod anthropic_to_openai_router;
@@ -108,6 +109,7 @@ pub mod termux_exec;
 pub mod transform_mode;
 pub mod update_check;
 pub mod usage_stats_store;
+pub mod wire_format;
 
 pub use ai_launcher::AILauncher;
 pub use anthropic_router::{AnthropicRouter, AnthropicRouterConfig};

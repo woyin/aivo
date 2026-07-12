@@ -3,8 +3,10 @@
 //! Converts between OpenAI Responses API format and Chat Completions format.
 //! Used by the ResponsesToChatRouter and ServeRouter to bridge clients that
 //! speak the Responses API with providers that only support Chat Completions.
+use anyhow::Result;
+
 use crate::services::codex_model_map::map_model_for_codex_cli;
-use crate::services::http_utils::{self, current_unix_ts};
+use crate::services::http_utils::{self, SseLineBuffer, current_unix_ts, gen_id, sse_event};
 use crate::services::model_names::select_model_for_provider_attempt;
 use crate::services::openai_models::{
     OpenAIChatRequest, ResponsesResponse,
@@ -12,12 +14,21 @@ use crate::services::openai_models::{
     convert_responses_to_chat_response as convert_typed_responses_to_chat,
 };
 use crate::services::provider_protocol::ProviderProtocol;
-use crate::services::responses_to_chat_router::ResponsesToChatRouterConfig;
 use serde_json::{Value, json};
 use std::collections::HashSet;
-use std::sync::atomic::{AtomicU64, Ordering};
 
-static ID_COUNTER: AtomicU64 = AtomicU64::new(0);
+/// The subset of a router's config request conversion reads (model selection,
+/// token capping — not transport), keeping conversion above the router layer.
+pub struct ResponsesToChatConversionConfig {
+    pub requires_reasoning_content: bool,
+    pub target_base_url: String,
+    pub target_protocol: ProviderProtocol,
+    /// Whether the upstream uses a Copilot token (affects model selection).
+    pub is_copilot: bool,
+    pub model_prefix: Option<String>,
+    pub actual_model: Option<String>,
+    pub max_tokens_cap: Option<u64>,
+}
 
 /// Returns true if the body uses OpenAI Responses API format
 /// (has "input" array, no "messages" array)
@@ -111,7 +122,7 @@ pub(crate) fn sanitize_input_content(body: &mut Value) {
 /// Chat Completions requires `{type, function: {name, description, parameters}}`).
 pub fn convert_responses_to_chat_request(
     body: &Value,
-    config: &ResponsesToChatRouterConfig,
+    config: &ResponsesToChatConversionConfig,
 ) -> Value {
     let mut messages: Vec<Value> = vec![];
 
@@ -267,7 +278,7 @@ pub fn convert_responses_to_chat_request(
         config.actual_model.as_deref(),
         config.target_protocol,
     );
-    let model = if config.copilot_token_manager.is_none() {
+    let model = if !config.is_copilot {
         if config.target_protocol == ProviderProtocol::Openai {
             Value::String(super::responses_to_chat_router::transform_model_str(
                 &selected_model,
@@ -858,7 +869,7 @@ fn custom_input_from_args(args: &str) -> String {
 /// `convert_chat_response_to_responses_sse` replays its payload through this
 /// converter, and serve's /v1/responses streaming path drives it directly.
 pub struct ResponsesStreamConverter {
-    pending: Vec<u8>,
+    buf: SseLineBuffer,
     resp_id: String,
     created_at: u64,
     codex_model: String,
@@ -898,7 +909,7 @@ struct StreamToolCall {
 impl ResponsesStreamConverter {
     pub fn new(original_model: &str, requires_reasoning_content: bool) -> Self {
         Self {
-            pending: Vec::new(),
+            buf: SseLineBuffer::new(),
             resp_id: gen_id("resp"),
             created_at: current_unix_ts(),
             codex_model: map_model_for_codex_cli(original_model),
@@ -923,21 +934,13 @@ impl ResponsesStreamConverter {
 
     /// Feeds a network chunk of the upstream SSE body, returning any Responses API
     /// SSE to forward to the client. Buffers partial lines across calls.
-    pub fn push_bytes(&mut self, chunk: &[u8]) -> String {
+    pub fn push_bytes(&mut self, chunk: &[u8]) -> Result<String> {
         let mut out = String::new();
         self.ensure_created(&mut out);
-        self.pending.extend_from_slice(chunk);
-        while let Some(pos) = self.pending.iter().position(|&b| b == b'\n') {
-            let line = String::from_utf8_lossy(&self.pending[..pos]).into_owned();
-            self.pending.drain(..=pos);
-            self.process_line(line.trim_end_matches('\r'), &mut out);
+        for line in self.buf.push_chunk(chunk)? {
+            self.process_line(&line, &mut out);
         }
-        // OOM backstop: a newline-less upstream can't be converted anyway;
-        // drop the oversized partial line instead of buffering it forever.
-        if self.pending.len() > crate::services::http_utils::MAX_SSE_PENDING_BYTES {
-            self.pending = Vec::new();
-        }
-        out
+        Ok(out)
     }
 
     /// Flushes any buffered trailing line and emits the closing `.done` events
@@ -945,10 +948,8 @@ impl ResponsesStreamConverter {
     pub fn finish(&mut self) -> String {
         let mut out = String::new();
         self.ensure_created(&mut out);
-        if !self.pending.is_empty() {
-            let line = String::from_utf8_lossy(&self.pending).into_owned();
-            self.pending.clear();
-            self.process_line(line.trim_end_matches('\r'), &mut out);
+        if let Some(tail) = self.buf.take_tail() {
+            self.process_line(&tail, &mut out);
         }
         if self.finished {
             return out;
@@ -1555,20 +1556,6 @@ fn extract_message_text(message: &Value) -> String {
     extract_content_text(message.get("content"))
 }
 
-fn sse_event(event_type: &str, data: &Value) -> String {
-    format!(
-        "event: {}\ndata: {}\n\n",
-        event_type,
-        serde_json::to_string(data).unwrap_or_default()
-    )
-}
-
-/// Generates a unique ID using an atomic counter + timestamp
-fn gen_id(prefix: &str) -> String {
-    let n = ID_COUNTER.fetch_add(1, Ordering::Relaxed);
-    format!("{}_{}_{:06}", prefix, current_unix_ts(), n % 1_000_000)
-}
-
 // =============================================================================
 // CHAT COMPLETIONS → RESPONSES API CONVERSION
 // =============================================================================
@@ -1607,7 +1594,7 @@ pub fn convert_responses_json_to_chat(resp: &Value) -> Value {
 /// omp) can drive a model that only accepts `/v1/responses` (gpt-5.x with
 /// reasoning + tools) and still get incremental tokens. Buffers partial lines.
 pub struct ResponsesToChatStreamConverter {
-    pending: Vec<u8>,
+    buf: SseLineBuffer,
     id: String,
     created: u64,
     model: String,
@@ -1624,7 +1611,7 @@ pub struct ResponsesToChatStreamConverter {
 impl ResponsesToChatStreamConverter {
     pub fn new(original_model: &str, include_usage: bool) -> Self {
         Self {
-            pending: Vec::new(),
+            buf: SseLineBuffer::new(),
             id: gen_id("chatcmpl"),
             created: current_unix_ts(),
             model: original_model.to_string(),
@@ -1640,30 +1627,20 @@ impl ResponsesToChatStreamConverter {
 
     /// Feed a network chunk of the upstream Responses SSE; returns Chat
     /// Completions SSE to forward. Partial trailing lines buffer across calls.
-    pub fn push_bytes(&mut self, chunk: &[u8]) -> String {
+    pub fn push_bytes(&mut self, chunk: &[u8]) -> Result<String> {
         let mut out = String::new();
-        self.pending.extend_from_slice(chunk);
-        while let Some(pos) = self.pending.iter().position(|&b| b == b'\n') {
-            let line = String::from_utf8_lossy(&self.pending[..pos]).into_owned();
-            self.pending.drain(..=pos);
-            self.process_line(line.trim_end_matches('\r'), &mut out);
+        for line in self.buf.push_chunk(chunk)? {
+            self.process_line(&line, &mut out);
         }
-        // OOM backstop: a newline-less upstream can't be converted anyway;
-        // drop the oversized partial line instead of buffering it forever.
-        if self.pending.len() > crate::services::http_utils::MAX_SSE_PENDING_BYTES {
-            self.pending = Vec::new();
-        }
-        out
+        Ok(out)
     }
 
     /// Flush any buffered line, then emit the terminal `finish_reason` chunk, an
     /// optional usage-only chunk, and `data: [DONE]`.
     pub fn finish(&mut self) -> String {
         let mut out = String::new();
-        if !self.pending.is_empty() {
-            let line = String::from_utf8_lossy(&self.pending).into_owned();
-            self.pending.clear();
-            self.process_line(line.trim_end_matches('\r'), &mut out);
+        if let Some(tail) = self.buf.take_tail() {
+            self.process_line(&tail, &mut out);
         }
         if self.finished {
             return out;
@@ -1914,20 +1891,15 @@ mod tests {
 
     // ── convert_responses_to_chat_request ─────────────────────────────────────
 
-    fn openai_router_config() -> ResponsesToChatRouterConfig {
-        ResponsesToChatRouterConfig {
+    fn openai_router_config() -> ResponsesToChatConversionConfig {
+        ResponsesToChatConversionConfig {
             target_base_url: "https://api.example.com/v1".to_string(),
-            api_key: "sk-test".to_string(),
             target_protocol: ProviderProtocol::Openai,
-            target_path_variant: None,
-            copilot_token_manager: None,
+            is_copilot: false,
             model_prefix: None,
             requires_reasoning_content: false,
             actual_model: None,
             max_tokens_cap: None,
-            responses_api_supported: None,
-            is_starter: false,
-            aivo_prefix_models: Vec::new(),
         }
     }
 
@@ -2016,19 +1988,14 @@ mod tests {
         });
         let chat = convert_responses_to_chat_request(
             &body,
-            &ResponsesToChatRouterConfig {
+            &ResponsesToChatConversionConfig {
                 target_base_url: "https://ai-gateway.vercel.sh/v1".to_string(),
-                api_key: "sk-test".to_string(),
                 target_protocol: ProviderProtocol::Openai,
-                target_path_variant: None,
-                copilot_token_manager: None,
+                is_copilot: false,
                 model_prefix: None,
                 requires_reasoning_content: false,
                 actual_model: None,
                 max_tokens_cap: None,
-                responses_api_supported: None,
-                is_starter: false,
-                aivo_prefix_models: Vec::new(),
             },
         );
 
@@ -2049,19 +2016,14 @@ mod tests {
         });
         let chat = convert_responses_to_chat_request(
             &body,
-            &ResponsesToChatRouterConfig {
+            &ResponsesToChatConversionConfig {
                 target_base_url: "https://example.com/v1".to_string(),
-                api_key: String::new(),
                 target_protocol: ProviderProtocol::Openai,
-                target_path_variant: None,
-                copilot_token_manager: None,
+                is_copilot: false,
                 model_prefix: None,
                 requires_reasoning_content: false,
                 actual_model: None,
                 max_tokens_cap: None,
-                responses_api_supported: None,
-                is_starter: false,
-                aivo_prefix_models: Vec::new(),
             },
         );
         let msgs = chat["messages"].as_array().unwrap();
@@ -2082,19 +2044,14 @@ mod tests {
         });
         let chat = convert_responses_to_chat_request(
             &body,
-            &ResponsesToChatRouterConfig {
+            &ResponsesToChatConversionConfig {
                 target_base_url: "https://example.com/v1".to_string(),
-                api_key: String::new(),
                 target_protocol: ProviderProtocol::Openai,
-                target_path_variant: None,
-                copilot_token_manager: None,
+                is_copilot: false,
                 model_prefix: None,
                 requires_reasoning_content: false,
                 actual_model: None,
                 max_tokens_cap: None,
-                responses_api_supported: None,
-                is_starter: false,
-                aivo_prefix_models: Vec::new(),
             },
         );
         let msgs = chat["messages"].as_array().unwrap();
@@ -2128,19 +2085,14 @@ mod tests {
         });
         let chat = convert_responses_to_chat_request(
             &body,
-            &ResponsesToChatRouterConfig {
+            &ResponsesToChatConversionConfig {
                 target_base_url: "https://example.com/v1".to_string(),
-                api_key: String::new(),
                 target_protocol: ProviderProtocol::Openai,
-                target_path_variant: None,
-                copilot_token_manager: None,
+                is_copilot: false,
                 model_prefix: None,
                 requires_reasoning_content: false,
                 actual_model: None,
                 max_tokens_cap: None,
-                responses_api_supported: None,
-                is_starter: false,
-                aivo_prefix_models: Vec::new(),
             },
         );
         let msgs = chat["messages"].as_array().unwrap();
@@ -2161,20 +2113,15 @@ mod tests {
         assert_eq!(msgs[3]["tool_call_id"], "call_b");
     }
 
-    fn default_test_config() -> ResponsesToChatRouterConfig {
-        ResponsesToChatRouterConfig {
+    fn default_test_config() -> ResponsesToChatConversionConfig {
+        ResponsesToChatConversionConfig {
             target_base_url: "https://example.com/v1".to_string(),
-            api_key: String::new(),
             target_protocol: ProviderProtocol::Openai,
-            target_path_variant: None,
-            copilot_token_manager: None,
+            is_copilot: false,
             model_prefix: None,
             requires_reasoning_content: false,
             actual_model: None,
             max_tokens_cap: None,
-            responses_api_supported: None,
-            is_starter: false,
-            aivo_prefix_models: Vec::new(),
         }
     }
 
@@ -2470,19 +2417,14 @@ mod tests {
         });
         let chat = convert_responses_to_chat_request(
             &body,
-            &ResponsesToChatRouterConfig {
+            &ResponsesToChatConversionConfig {
                 target_base_url: "https://example.com/v1".to_string(),
-                api_key: String::new(),
                 target_protocol: ProviderProtocol::Openai,
-                target_path_variant: None,
-                copilot_token_manager: None,
+                is_copilot: false,
                 model_prefix: None,
                 requires_reasoning_content: false,
                 actual_model: None,
                 max_tokens_cap: None,
-                responses_api_supported: None,
-                is_starter: false,
-                aivo_prefix_models: Vec::new(),
             },
         );
         let msgs = chat["messages"].as_array().unwrap();
@@ -2503,19 +2445,14 @@ mod tests {
         });
         let chat = convert_responses_to_chat_request(
             &body,
-            &ResponsesToChatRouterConfig {
+            &ResponsesToChatConversionConfig {
                 target_base_url: "https://example.com/v1".to_string(),
-                api_key: String::new(),
                 target_protocol: ProviderProtocol::Openai,
-                target_path_variant: None,
-                copilot_token_manager: None,
+                is_copilot: false,
                 model_prefix: None,
                 requires_reasoning_content: false,
                 actual_model: None,
                 max_tokens_cap: None,
-                responses_api_supported: None,
-                is_starter: false,
-                aivo_prefix_models: Vec::new(),
             },
         );
         let tools = chat["tools"].as_array().unwrap();
@@ -2679,8 +2616,8 @@ mod tests {
 
         let chunk1 = "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_s\",\"function\":{\"name\":\"exec\",\"arguments\":\"{\\\"inp\"}}]},\"finish_reason\":null}]}\n";
         let chunk2 = "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"ut\\\":\\\"1+1\\\"}\"}}]},\"finish_reason\":\"tool_calls\"}]}\n";
-        let mut out = converter.push_bytes(chunk1.as_bytes());
-        out.push_str(&converter.push_bytes(chunk2.as_bytes()));
+        let mut out = converter.push_bytes(chunk1.as_bytes()).unwrap();
+        out.push_str(&converter.push_bytes(chunk2.as_bytes()).unwrap());
         assert!(!out.contains("output_item.added"), "{out}");
         assert!(!out.contains("function_call_arguments"), "{out}");
 
@@ -2696,7 +2633,7 @@ mod tests {
             ResponsesStreamConverter::new("gpt-5.6-sol", false).with_custom_tools(custom);
 
         let chunk = "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_w\",\"function\":{\"name\":\"wait\",\"arguments\":\"{}\"}}]},\"finish_reason\":\"tool_calls\"}]}\n";
-        let out = converter.push_bytes(chunk.as_bytes());
+        let out = converter.push_bytes(chunk.as_bytes()).unwrap();
         assert!(out.contains("output_item.added"), "{out}");
         assert!(out.contains("\"type\":\"function_call\""), "{out}");
 
@@ -2710,19 +2647,14 @@ mod tests {
         let body = json!({"model": "gpt-5.2-codex", "input": []});
         let chat = convert_responses_to_chat_request(
             &body,
-            &ResponsesToChatRouterConfig {
+            &ResponsesToChatConversionConfig {
                 target_base_url: "https://openrouter.ai/api/v1".to_string(),
-                api_key: String::new(),
                 target_protocol: ProviderProtocol::Openai,
-                target_path_variant: None,
-                copilot_token_manager: None,
+                is_copilot: false,
                 model_prefix: None,
                 requires_reasoning_content: false,
                 actual_model: None,
                 max_tokens_cap: None,
-                responses_api_supported: None,
-                is_starter: false,
-                aivo_prefix_models: Vec::new(),
             },
         );
         assert_eq!(chat["model"], "openai/gpt-5.2-codex");
@@ -2737,19 +2669,14 @@ mod tests {
         });
         let chat = convert_responses_to_chat_request(
             &body,
-            &ResponsesToChatRouterConfig {
+            &ResponsesToChatConversionConfig {
                 target_base_url: "https://example.com/v1".to_string(),
-                api_key: String::new(),
                 target_protocol: ProviderProtocol::Openai,
-                target_path_variant: None,
-                copilot_token_manager: None,
+                is_copilot: false,
                 model_prefix: None,
                 requires_reasoning_content: false,
                 actual_model: None,
                 max_tokens_cap: Some(8192),
-                responses_api_supported: None,
-                is_starter: false,
-                aivo_prefix_models: Vec::new(),
             },
         );
         assert_eq!(chat["max_tokens"], 8192);
@@ -2764,19 +2691,14 @@ mod tests {
         });
         let chat = convert_responses_to_chat_request(
             &body,
-            &ResponsesToChatRouterConfig {
+            &ResponsesToChatConversionConfig {
                 target_base_url: "https://example.com/v1".to_string(),
-                api_key: String::new(),
                 target_protocol: ProviderProtocol::Openai,
-                target_path_variant: None,
-                copilot_token_manager: None,
+                is_copilot: false,
                 model_prefix: None,
                 requires_reasoning_content: false,
                 actual_model: None,
                 max_tokens_cap: Some(8192),
-                responses_api_supported: None,
-                is_starter: false,
-                aivo_prefix_models: Vec::new(),
             },
         );
         assert_eq!(chat["max_tokens"], 8192);
@@ -2979,7 +2901,7 @@ mod tests {
         let mut sse = String::new();
         sse.push_str(&c.push_bytes(
             b"data: {\"choices\":[{\"delta\":{\"content\":\"x\"},\"finish_reason\":\"length\"}]}\n",
-        ));
+        ).unwrap());
         sse.push_str(&c.finish());
         assert!(sse.contains("\"status\":\"incomplete\""), "{sse}");
     }
@@ -3148,19 +3070,14 @@ mod tests {
     #[test]
     fn test_convert_request_copilot_skips_model_transform() {
         let body = json!({"model": "gpt-4o", "input": []});
-        let config = ResponsesToChatRouterConfig {
+        let config = ResponsesToChatConversionConfig {
             target_base_url: String::new(),
-            api_key: String::new(),
             target_protocol: ProviderProtocol::Openai,
-            target_path_variant: None,
-            copilot_token_manager: None,
+            is_copilot: false,
             model_prefix: None,
             requires_reasoning_content: false,
             actual_model: None,
             max_tokens_cap: None,
-            responses_api_supported: None,
-            is_starter: false,
-            aivo_prefix_models: Vec::new(),
         };
         let chat = convert_responses_to_chat_request(&body, &config);
         assert_eq!(chat["model"], "gpt-4o");
@@ -3187,19 +3104,14 @@ mod tests {
         let body = json!({"input": [{"type": "message", "role": "user", "content": "hi"}]});
         let chat = convert_responses_to_chat_request(
             &body,
-            &ResponsesToChatRouterConfig {
+            &ResponsesToChatConversionConfig {
                 target_base_url: "https://example.com/v1".to_string(),
-                api_key: String::new(),
                 target_protocol: ProviderProtocol::Openai,
-                target_path_variant: None,
-                copilot_token_manager: None,
+                is_copilot: false,
                 model_prefix: None,
                 requires_reasoning_content: false,
                 actual_model: None,
                 max_tokens_cap: None,
-                responses_api_supported: None,
-                is_starter: false,
-                aivo_prefix_models: Vec::new(),
             },
         );
         assert!(chat.get("model").is_some());
@@ -3210,19 +3122,14 @@ mod tests {
         let body = json!({"model": "gpt-4o", "input": []});
         let chat = convert_responses_to_chat_request(
             &body,
-            &ResponsesToChatRouterConfig {
+            &ResponsesToChatConversionConfig {
                 target_base_url: "https://example.com/v1".to_string(),
-                api_key: String::new(),
                 target_protocol: ProviderProtocol::Openai,
-                target_path_variant: None,
-                copilot_token_manager: None,
+                is_copilot: false,
                 model_prefix: None,
                 requires_reasoning_content: false,
                 actual_model: None,
                 max_tokens_cap: None,
-                responses_api_supported: None,
-                is_starter: false,
-                aivo_prefix_models: Vec::new(),
             },
         );
         let msgs = chat["messages"].as_array().unwrap();
@@ -3341,19 +3248,14 @@ mod tests {
             "model": "gpt-4o",
             "input": [{"type": "message", "role": "user", "content": "hello"}]
         });
-        let config = ResponsesToChatRouterConfig {
+        let config = ResponsesToChatConversionConfig {
             target_base_url: "https://example.com/v1".to_string(),
-            api_key: String::new(),
             target_protocol: ProviderProtocol::Openai,
-            target_path_variant: None,
-            copilot_token_manager: None,
+            is_copilot: false,
             model_prefix: None,
             requires_reasoning_content: false,
             actual_model: Some("kimi-k2.5".to_string()),
             max_tokens_cap: None,
-            responses_api_supported: None,
-            is_starter: false,
-            aivo_prefix_models: Vec::new(),
         };
         let chat = convert_responses_to_chat_request(&body, &config);
         assert_eq!(chat["model"], "kimi-k2.5");
@@ -3624,10 +3526,22 @@ mod tests {
     fn stream_converter_emits_reasoning_then_text_in_order() {
         let mut c = ResponsesStreamConverter::new("deepseek-reasoner", false);
         let mut sse = String::new();
-        sse.push_str(&c.push_bytes(&chat_chunk_line(json!({"reasoning_content": "thin"}))));
-        sse.push_str(&c.push_bytes(&chat_chunk_line(json!({"reasoning_content": "king"}))));
-        sse.push_str(&c.push_bytes(&chat_chunk_line(json!({"content": "Hel"}))));
-        sse.push_str(&c.push_bytes(&chat_chunk_line(json!({"content": "lo"}))));
+        sse.push_str(
+            &c.push_bytes(&chat_chunk_line(json!({"reasoning_content": "thin"})))
+                .unwrap(),
+        );
+        sse.push_str(
+            &c.push_bytes(&chat_chunk_line(json!({"reasoning_content": "king"})))
+                .unwrap(),
+        );
+        sse.push_str(
+            &c.push_bytes(&chat_chunk_line(json!({"content": "Hel"})))
+                .unwrap(),
+        );
+        sse.push_str(
+            &c.push_bytes(&chat_chunk_line(json!({"content": "lo"})))
+                .unwrap(),
+        );
         sse.push_str(&c.finish());
 
         let events = collect_events(&sse);
@@ -3689,10 +3603,13 @@ mod tests {
     fn stream_converter_accepts_spaceless_data_prefix() {
         let mut c = ResponsesStreamConverter::new("deepseek-chat", false);
         let mut sse = String::new();
-        sse.push_str(&c.push_bytes(
-            b"data:{\"choices\":[{\"delta\":{\"content\":\"hi\"},\"finish_reason\":null}]}\n",
-        ));
-        sse.push_str(&c.push_bytes(b"data:[DONE]\n"));
+        sse.push_str(
+            &c.push_bytes(
+                b"data:{\"choices\":[{\"delta\":{\"content\":\"hi\"},\"finish_reason\":null}]}\n",
+            )
+            .unwrap(),
+        );
+        sse.push_str(&c.push_bytes(b"data:[DONE]\n").unwrap());
         sse.push_str(&c.finish());
         assert!(sse.contains("\"delta\":\"hi\""), "{sse}");
     }
@@ -3702,13 +3619,19 @@ mod tests {
         let mut c = ResponsesStreamConverter::new("deepseek-chat", false);
         let mut sse = String::new();
         // First fragment carries id + name; later fragments only arguments.
-        sse.push_str(&c.push_bytes(&chat_chunk_line(json!({
-            "tool_calls": [{"index": 0, "id": "call_abc", "type": "function",
-                "function": {"name": "get_weather", "arguments": "{\"ci"}}]
-        }))));
-        sse.push_str(&c.push_bytes(&chat_chunk_line(json!({
-            "tool_calls": [{"index": 0, "function": {"arguments": "ty\":\"SF\"}"}}]
-        }))));
+        sse.push_str(
+            &c.push_bytes(&chat_chunk_line(json!({
+                "tool_calls": [{"index": 0, "id": "call_abc", "type": "function",
+                    "function": {"name": "get_weather", "arguments": "{\"ci"}}]
+            })))
+            .unwrap(),
+        );
+        sse.push_str(
+            &c.push_bytes(&chat_chunk_line(json!({
+                "tool_calls": [{"index": 0, "function": {"arguments": "ty\":\"SF\"}"}}]
+            })))
+            .unwrap(),
+        );
         sse.push_str(&c.finish());
 
         let events = collect_events(&sse);
@@ -3748,8 +3671,8 @@ mod tests {
         // Split the SSE line mid-way to exercise the pending-buffer reassembly.
         let (a, b) = line.split_at(line.len() / 2);
         let mut sse = String::new();
-        sse.push_str(&c.push_bytes(a));
-        sse.push_str(&c.push_bytes(b));
+        sse.push_str(&c.push_bytes(a).unwrap());
+        sse.push_str(&c.push_bytes(b).unwrap());
         sse.push_str(&c.finish());
 
         let completed = sse
@@ -3767,7 +3690,10 @@ mod tests {
     fn stream_converter_maps_usage_into_completed_event() {
         let mut c = ResponsesStreamConverter::new("deepseek-chat", false);
         let mut sse = String::new();
-        sse.push_str(&c.push_bytes(&chat_chunk_line(json!({"content": "x"}))));
+        sse.push_str(
+            &c.push_bytes(&chat_chunk_line(json!({"content": "x"})))
+                .unwrap(),
+        );
         // Trailing usage-only chunk (stream_options.include_usage).
         sse.push_str(&c.push_bytes(
             format!(
@@ -3775,8 +3701,8 @@ mod tests {
                 json!({"choices": [], "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}})
             )
             .as_bytes(),
-        ));
-        sse.push_str(&c.push_bytes(b"data: [DONE]\n\n"));
+        ).unwrap());
+        sse.push_str(&c.push_bytes(b"data: [DONE]\n\n").unwrap());
         sse.push_str(&c.finish());
 
         let completed = sse
@@ -3810,11 +3736,11 @@ mod tests {
 
         // chat → responses (oracle), then responses → chat (unit under test).
         let mut to_resp = ResponsesStreamConverter::new("gpt-5.4", false);
-        let mut responses_sse = to_resp.push_bytes(chat_sse.as_bytes());
+        let mut responses_sse = to_resp.push_bytes(chat_sse.as_bytes()).unwrap();
         responses_sse.push_str(&to_resp.finish());
 
         let mut to_chat = ResponsesToChatStreamConverter::new("gpt-5.4", true);
-        let mut back = to_chat.push_bytes(responses_sse.as_bytes());
+        let mut back = to_chat.push_bytes(responses_sse.as_bytes()).unwrap();
         back.push_str(&to_chat.finish());
 
         assert!(
@@ -3853,7 +3779,7 @@ mod tests {
             "data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":1,\"output_tokens\":2,\"total_tokens\":3}}}\n\n",
         );
         let mut c = ResponsesToChatStreamConverter::new("gpt-5.4", false);
-        let mut out = c.push_bytes(responses_sse.as_bytes());
+        let mut out = c.push_bytes(responses_sse.as_bytes()).unwrap();
         out.push_str(&c.finish());
         let acc = accumulate_chat_sse(&out);
         assert_eq!(acc["choices"][0]["message"]["content"], "hi");

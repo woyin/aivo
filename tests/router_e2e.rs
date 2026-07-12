@@ -51,6 +51,7 @@ fn classify(path: &str) -> Endpoint {
 enum Mode {
     /// 200 with a canned success body in the endpoint's native shape.
     Ok,
+    OkSse,
     /// 400 with a structured error envelope — a semantic rejection that must
     /// bail. Unlisted endpoints 404 with `{"error":"Not found"}`, a
     /// path-missing mismatch the cascade may walk past.
@@ -87,6 +88,78 @@ fn success_body(endpoint: Endpoint) -> String {
     }
 }
 
+fn sse_body(endpoint: Endpoint) -> String {
+    match endpoint {
+        Endpoint::Messages => concat!(
+            "event: message_start\n",
+            r#"data: {"type":"message_start","message":{"id":"msg_1","type":"message","role":"assistant","content":[],"model":"test-model","stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":1,"output_tokens":0}}}"#,
+            "\n\n",
+            "event: content_block_start\n",
+            r#"data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#,
+            "\n\n",
+            "event: content_block_delta\n",
+            r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hello from anthropic"}}"#,
+            "\n\n",
+            "event: content_block_stop\n",
+            r#"data: {"type":"content_block_stop","index":0}"#,
+            "\n\n",
+            "event: message_delta\n",
+            r#"data: {"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"output_tokens":1}}"#,
+            "\n\n",
+            "event: message_stop\n",
+            r#"data: {"type":"message_stop"}"#,
+            "\n\n",
+        )
+        .to_string(),
+        // Gemini streams bare JSON candidates as data lines.
+        _ => format!("data: {}\n\n", success_body(endpoint)),
+    }
+}
+
+/// Drains the body so the client never sees a closed pipe mid-write.
+fn read_request_head(stream: &mut std::net::TcpStream) -> String {
+    let mut request = Vec::new();
+    let mut buf = [0u8; 4096];
+    while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+        match stream.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => request.extend_from_slice(&buf[..n]),
+            Err(_) => break,
+        }
+    }
+    let head = String::from_utf8_lossy(&request).into_owned();
+    if let Some(len) = head
+        .lines()
+        .find(|l| l.to_ascii_lowercase().starts_with("content-length:"))
+        .and_then(|l| l.split(':').nth(1))
+        .and_then(|v| v.trim().parse::<usize>().ok())
+    {
+        let header_end = request
+            .windows(4)
+            .position(|w| w == b"\r\n\r\n")
+            .map(|p| p + 4)
+            .unwrap_or(request.len());
+        let mut have = request.len() - header_end;
+        while have < len {
+            match stream.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => have += n,
+                Err(_) => break,
+            }
+        }
+    }
+    head
+}
+
+fn request_endpoint(head: &str) -> Endpoint {
+    let path = head
+        .lines()
+        .next()
+        .and_then(|l| l.split_whitespace().nth(1))
+        .unwrap_or("/");
+    classify(path)
+}
+
 /// Spawns a blocking fake provider; `modes` maps endpoints to behaviors,
 /// anything unlisted 404s.
 fn spawn_fake(modes: &[(Endpoint, Mode)]) -> FakeProvider {
@@ -99,60 +172,29 @@ fn spawn_fake(modes: &[(Endpoint, Mode)]) -> FakeProvider {
     std::thread::spawn(move || {
         for stream in listener.incoming() {
             let Ok(mut stream) = stream else { continue };
-            let mut request = Vec::new();
-            let mut buf = [0u8; 4096];
-            // Read headers.
-            while !request.windows(4).any(|w| w == b"\r\n\r\n") {
-                match stream.read(&mut buf) {
-                    Ok(0) => break,
-                    Ok(n) => request.extend_from_slice(&buf[..n]),
-                    Err(_) => break,
-                }
-            }
-            let head = String::from_utf8_lossy(&request).into_owned();
-            // Drain the body so the client never sees a closed pipe mid-write.
-            if let Some(len) = head
-                .lines()
-                .find(|l| l.to_ascii_lowercase().starts_with("content-length:"))
-                .and_then(|l| l.split(':').nth(1))
-                .and_then(|v| v.trim().parse::<usize>().ok())
-            {
-                let header_end = request
-                    .windows(4)
-                    .position(|w| w == b"\r\n\r\n")
-                    .map(|p| p + 4)
-                    .unwrap_or(request.len());
-                let mut have = request.len() - header_end;
-                while have < len {
-                    match stream.read(&mut buf) {
-                        Ok(0) => break,
-                        Ok(n) => have += n,
-                        Err(_) => break,
-                    }
-                }
-            }
-
-            let path = head
-                .lines()
-                .next()
-                .and_then(|l| l.split_whitespace().nth(1))
-                .unwrap_or("/")
-                .to_string();
-            let endpoint = classify(&path);
+            let head = read_request_head(&mut stream);
+            let endpoint = request_endpoint(&head);
             hits_writer.lock().unwrap().push(endpoint);
 
-            let (status, reason, body) = match modes.get(&endpoint) {
-                Some(Mode::Ok) => (200, "OK", success_body(endpoint)),
+            let (status, reason, content_type, body) = match modes.get(&endpoint) {
+                Some(Mode::Ok) => (200, "OK", "application/json", success_body(endpoint)),
+                Some(Mode::OkSse) => (200, "OK", "text/event-stream", sse_body(endpoint)),
                 Some(Mode::SemanticReject) => (
                     400,
                     "Bad Request",
+                    "application/json",
                     r#"{"error":{"type":"invalid_request_error","message":"bad request body"}}"#
                         .to_string(),
                 ),
-                None => (404, "Not Found", r#"{"error":"Not found"}"#.to_string()),
+                None => (
+                    404,
+                    "Not Found",
+                    "application/json",
+                    r#"{"error":"Not found"}"#.to_string(),
+                ),
             };
             let head = format!(
-                "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                 body.len()
             );
             let _ = stream.write_all(head.as_bytes());
@@ -162,6 +204,52 @@ fn spawn_fake(modes: &[(Endpoint, Mode)]) -> FakeProvider {
     });
 
     FakeProvider { port, hits }
+}
+
+/// Withholds the closing SSE frames until the returned sender fires — distinguishes incremental forwarding from buffer-to-EOF.
+fn spawn_fake_sse_drip() -> (FakeProvider, std::sync::mpsc::Sender<()>) {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let hits: Arc<Mutex<Vec<Endpoint>>> = Arc::new(Mutex::new(Vec::new()));
+    let hits_writer = hits.clone();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            let head = read_request_head(&mut stream);
+            let endpoint = request_endpoint(&head);
+            hits_writer.lock().unwrap().push(endpoint);
+
+            if endpoint != Endpoint::Messages {
+                let body = r#"{"error":"Not found"}"#;
+                let head = format!(
+                    "HTTP/1.1 404 Not Found\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = stream.write_all(head.as_bytes());
+                let _ = stream.write_all(body.as_bytes());
+                continue;
+            }
+
+            let body = sse_body(Endpoint::Messages);
+            let split = body
+                .find("event: message_delta")
+                .expect("drip split marker");
+            let (first, tail) = body.split_at(split);
+            let head = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            let _ = stream.write_all(head.as_bytes());
+            let _ = stream.write_all(first.as_bytes());
+            let _ = stream.flush();
+            let _ = release_rx.recv_timeout(std::time::Duration::from_secs(15));
+            let _ = stream.write_all(tail.as_bytes());
+        }
+    });
+
+    (FakeProvider { port, hits }, release_tx)
 }
 
 // ── Client helpers ───────────────────────────────────────────────────────
@@ -181,6 +269,57 @@ async fn raw_post(port: u16, path: &str, body: &str) -> String {
     let mut buf = Vec::new();
     let _ = stream.read_to_end(&mut buf).await;
     String::from_utf8_lossy(&buf).into_owned()
+}
+
+/// Reads until `marker` appears (10s cap — a buffering proxy fails here), then to EOF after firing `release`.
+/// Returns (bytes seen at the marker, full response).
+async fn raw_post_until_marker_then_release(
+    port: u16,
+    path: &str,
+    body: &str,
+    marker: &str,
+    release: std::sync::mpsc::Sender<()>,
+) -> (String, String) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", port))
+        .await
+        .unwrap();
+    let req = format!(
+        "POST {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Bearer tok\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    stream.write_all(req.as_bytes()).await.unwrap();
+    let _ = stream.shutdown().await;
+
+    let mut buf = Vec::new();
+    let read_until_marker = async {
+        let mut chunk = [0u8; 4096];
+        while !String::from_utf8_lossy(&buf).contains(marker) {
+            let n = stream.read(&mut chunk).await.unwrap();
+            assert!(
+                n > 0,
+                "stream closed before {marker:?}: {}",
+                String::from_utf8_lossy(&buf)
+            );
+            buf.extend_from_slice(&chunk[..n]);
+        }
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(10), read_until_marker)
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "proxy did not forward {marker:?} while upstream was still open (buffered?): {}",
+                String::from_utf8_lossy(&buf)
+            )
+        });
+    let at_marker = String::from_utf8_lossy(&buf).into_owned();
+
+    release.send(()).unwrap();
+    let mut rest = Vec::new();
+    let _ = stream.read_to_end(&mut rest).await;
+    buf.extend_from_slice(&rest);
+    (at_marker, String::from_utf8_lossy(&buf).into_owned())
 }
 
 fn response_status(response: &str) -> u16 {
@@ -263,6 +402,7 @@ fn serve_config(base_url: String, protocol: ProviderProtocol) -> ServeRouterConf
         is_copilot: false,
         is_openrouter: false,
         is_starter: false,
+        requires_reasoning_content: false,
         cors: false,
         timeout: 30,
         auth_token: None,
@@ -426,6 +566,8 @@ async fn gemini_router_cascades_to_chat_upstream_and_learns_route() {
 // ── aivo serve (serve_router) ────────────────────────────────────────────
 
 const CHAT_REQ: &str = r#"{"model":"test-model","messages":[{"role":"user","content":"hi"}]}"#;
+const CHAT_REQ_STREAM: &str =
+    r#"{"model":"test-model","stream":true,"messages":[{"role":"user","content":"hi"}]}"#;
 
 async fn start_serve(fake: &FakeProvider, protocol: ProviderProtocol) -> u16 {
     start_serve_opt(fake, protocol, None).await
@@ -450,6 +592,20 @@ async fn start_serve_opt(
     if let Some(cache) = cache {
         router = router.with_route_cache(cache);
     }
+    let (_handle, _shutdown, port) = router
+        .start_background_with_addr("127.0.0.1", 0)
+        .await
+        .unwrap();
+    port
+}
+
+async fn start_serve_with_token(fake: &FakeProvider, protocol: ProviderProtocol) -> u16 {
+    let tmp = tempfile::tempdir().unwrap();
+    let log_store = LogStore::new(tmp.path().to_path_buf());
+    std::mem::forget(tmp);
+    let mut config = serve_config(fake.base_url(), protocol);
+    config.auth_token = Some("tok".to_string());
+    let router = ServeRouter::new(config, test_key(&fake.base_url()), log_store);
     let (_handle, _shutdown, port) = router
         .start_background_with_addr("127.0.0.1", 0)
         .await
@@ -514,6 +670,268 @@ async fn serve_router_seeded_route_skips_probe() {
         "seeded route must skip the chat probe: {:?}",
         fake.hits()
     );
+}
+
+#[tokio::test]
+async fn serve_streams_anthropic_sse_as_chat_sse() {
+    no_proxy();
+    let fake = spawn_fake(&[(Endpoint::Messages, Mode::OkSse)]);
+    let port = start_serve(&fake, ProviderProtocol::Anthropic).await;
+
+    let resp = raw_post(port, "/v1/chat/completions", CHAT_REQ_STREAM).await;
+    assert_eq!(response_status(&resp), 200, "{resp}");
+    assert!(resp.contains("text/event-stream"), "{resp}");
+    assert!(resp.contains("chat.completion.chunk"), "{resp}");
+    assert!(resp.contains("hello from anthropic"), "{resp}");
+    assert!(resp.contains("data: [DONE]"), "{resp}");
+}
+
+#[tokio::test]
+async fn serve_streams_gemini_sse_as_chat_sse() {
+    no_proxy();
+    let fake = spawn_fake(&[(Endpoint::Gemini, Mode::OkSse)]);
+    let port = start_serve(&fake, ProviderProtocol::Google).await;
+
+    let resp = raw_post(port, "/v1/chat/completions", CHAT_REQ_STREAM).await;
+    assert_eq!(response_status(&resp), 200, "{resp}");
+    assert!(resp.contains("text/event-stream"), "{resp}");
+    assert!(resp.contains("chat.completion.chunk"), "{resp}");
+    assert!(resp.contains("hello from gemini"), "{resp}");
+    assert!(resp.contains("data: [DONE]"), "{resp}");
+}
+
+/// First chunk must reach the client while the upstream SSE stream is still open — pins incremental forwarding against a buffer-to-EOF regression.
+#[tokio::test]
+async fn serve_streams_chat_first_chunk_before_upstream_completes() {
+    no_proxy();
+    let (fake, release) = spawn_fake_sse_drip();
+    let port = start_serve(&fake, ProviderProtocol::Anthropic).await;
+
+    let (at_marker, full) = raw_post_until_marker_then_release(
+        port,
+        "/v1/chat/completions",
+        CHAT_REQ_STREAM,
+        "hello from anthropic",
+        release,
+    )
+    .await;
+    assert!(at_marker.contains("chat.completion.chunk"), "{at_marker}");
+    assert!(
+        !at_marker.contains("data: [DONE]"),
+        "stream ended before upstream tail: {at_marker}"
+    );
+    assert!(full.contains("data: [DONE]"), "{full}");
+}
+
+/// Same incremental guarantee through the two-hop Responses route (chained adapters).
+#[tokio::test]
+async fn serve_responses_route_streams_first_chunk_before_upstream_completes() {
+    no_proxy();
+    let (fake, release) = spawn_fake_sse_drip();
+    let port = start_serve(&fake, ProviderProtocol::Anthropic).await;
+
+    let stream_req = r#"{"model":"test-model","stream":true,"input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]}]}"#;
+    let (at_marker, full) = raw_post_until_marker_then_release(
+        port,
+        "/v1/responses",
+        stream_req,
+        "hello from anthropic",
+        release,
+    )
+    .await;
+    assert!(
+        at_marker.contains("response.output_text.delta"),
+        "{at_marker}"
+    );
+    assert!(full.contains("response.completed"), "{full}");
+}
+
+// ── serve native-protocol inbound ────────────────────────────────────────
+
+const MESSAGES_REQ_STREAM: &str = r#"{"model":"test-model","max_tokens":128,"stream":true,"messages":[{"role":"user","content":"hi"}]}"#;
+
+#[tokio::test]
+async fn serve_messages_route_bridges_anthropic_client_to_chat_upstream() {
+    no_proxy();
+    let fake = spawn_fake(&[(Endpoint::Chat, Mode::Ok)]);
+    let port = start_serve(&fake, ProviderProtocol::Openai).await;
+
+    let resp = raw_post(port, "/v1/messages", ANTHROPIC_REQ).await;
+    assert_eq!(response_status(&resp), 200, "{resp}");
+    let json = response_json(&resp);
+    assert_eq!(json["type"], "message", "{resp}");
+    assert_eq!(json["role"], "assistant", "{resp}");
+    assert_eq!(json["content"][0]["text"], "hello from openai", "{resp}");
+    assert!(json["usage"]["input_tokens"].is_u64(), "{resp}");
+}
+
+/// Double hop (Anthropic SSE → Chat → Anthropic SSE) must still forward incrementally.
+#[tokio::test]
+async fn serve_messages_route_streams_first_chunk_before_upstream_completes() {
+    no_proxy();
+    let (fake, release) = spawn_fake_sse_drip();
+    let port = start_serve(&fake, ProviderProtocol::Anthropic).await;
+
+    let (at_marker, full) = raw_post_until_marker_then_release(
+        port,
+        "/v1/messages",
+        MESSAGES_REQ_STREAM,
+        "hello from anthropic",
+        release,
+    )
+    .await;
+    assert!(at_marker.contains("content_block_delta"), "{at_marker}");
+    assert!(full.contains("message_stop"), "{full}");
+}
+
+#[tokio::test]
+async fn serve_gemini_route_bridges_gemini_client_to_chat_upstream() {
+    no_proxy();
+    let fake = spawn_fake(&[(Endpoint::Chat, Mode::Ok)]);
+    let port = start_serve(&fake, ProviderProtocol::Openai).await;
+
+    let resp = raw_post(
+        port,
+        "/v1beta/models/test-model:generateContent",
+        GEMINI_REQ,
+    )
+    .await;
+    assert_eq!(response_status(&resp), 200, "{resp}");
+    let json = response_json(&resp);
+    assert_eq!(
+        json["candidates"][0]["content"]["parts"][0]["text"], "hello from openai",
+        "{resp}"
+    );
+}
+
+/// streamGenerateContent is emulated here (caps.stream: false): the buffered response ships as one Gemini SSE event.
+#[tokio::test]
+async fn serve_gemini_route_streams_as_single_sse_event() {
+    no_proxy();
+    let fake = spawn_fake(&[(Endpoint::Chat, Mode::Ok)]);
+    let port = start_serve(&fake, ProviderProtocol::Openai).await;
+
+    let resp = raw_post(
+        port,
+        "/v1beta/models/test-model:streamGenerateContent",
+        GEMINI_REQ,
+    )
+    .await;
+    assert_eq!(response_status(&resp), 200, "{resp}");
+    assert!(resp.contains("text/event-stream"), "{resp}");
+    assert!(resp.contains("hello from openai"), "{resp}");
+    assert!(resp.contains("data: "), "{resp}");
+}
+
+/// generateContent takes the direct reverse edge — hits /v1/messages, never /chat/completions.
+#[tokio::test]
+async fn serve_gemini_route_uses_direct_anthropic_edge() {
+    no_proxy();
+    let fake = spawn_fake(&[(Endpoint::Messages, Mode::Ok)]);
+    let port = start_serve(&fake, ProviderProtocol::Anthropic).await;
+
+    let resp = raw_post(
+        port,
+        "/v1beta/models/test-model:generateContent",
+        GEMINI_REQ,
+    )
+    .await;
+    assert_eq!(response_status(&resp), 200, "{resp}");
+    let json = response_json(&resp);
+    assert_eq!(
+        json["candidates"][0]["content"]["parts"][0]["text"], "hello from anthropic",
+        "{resp}"
+    );
+    assert!(fake.hit_count(Endpoint::Messages) >= 1, "{:?}", fake.hits());
+    assert_eq!(fake.hit_count(Endpoint::Chat), 0, "{:?}", fake.hits());
+}
+
+/// Reverse edge streaming is emulated (caps.stream: false): the buffered reply ships as one Gemini SSE event.
+#[tokio::test]
+async fn serve_gemini_route_direct_anthropic_edge_streams_single_event() {
+    no_proxy();
+    let fake = spawn_fake(&[(Endpoint::Messages, Mode::Ok)]);
+    let port = start_serve(&fake, ProviderProtocol::Anthropic).await;
+
+    let resp = raw_post(
+        port,
+        "/v1beta/models/test-model:streamGenerateContent",
+        GEMINI_REQ,
+    )
+    .await;
+    assert_eq!(response_status(&resp), 200, "{resp}");
+    assert!(resp.contains("text/event-stream"), "{resp}");
+    assert!(resp.contains("hello from anthropic"), "{resp}");
+    assert_eq!(fake.hit_count(Endpoint::Chat), 0, "{:?}", fake.hits());
+}
+
+#[tokio::test]
+async fn serve_native_routes_accept_native_auth_forms() {
+    no_proxy();
+    let fake = spawn_fake(&[(Endpoint::Chat, Mode::Ok)]);
+    let port = start_serve_with_token(&fake, ProviderProtocol::Openai).await;
+
+    let resp =
+        raw_post_with_auth(port, "/v1/messages", ANTHROPIC_REQ, Some("x-api-key: tok")).await;
+    assert_eq!(response_status(&resp), 200, "{resp}");
+
+    let resp = raw_post_with_auth(
+        port,
+        "/v1beta/models/test-model:generateContent",
+        GEMINI_REQ,
+        Some("x-goog-api-key: tok"),
+    )
+    .await;
+    assert_eq!(response_status(&resp), 200, "{resp}");
+    let resp = raw_post_with_auth(
+        port,
+        "/v1beta/models/test-model:generateContent?key=tok",
+        GEMINI_REQ,
+        None,
+    )
+    .await;
+    assert_eq!(response_status(&resp), 200, "{resp}");
+
+    let resp = raw_post_with_auth(
+        port,
+        "/v1beta/models/test-model:generateContent",
+        GEMINI_REQ,
+        Some("x-goog-api-key: wrong"),
+    )
+    .await;
+    assert_eq!(response_status(&resp), 401, "{resp}");
+}
+
+/// /v1/messages takes the direct Anthropic → Gemini edge — hits the Gemini endpoint, never /chat/completions.
+#[tokio::test]
+async fn serve_messages_route_uses_direct_gemini_edge() {
+    no_proxy();
+    let fake = spawn_fake(&[(Endpoint::Gemini, Mode::Ok)]);
+    let port = start_serve(&fake, ProviderProtocol::Google).await;
+
+    let resp = raw_post(port, "/v1/messages", ANTHROPIC_REQ).await;
+    assert_eq!(response_status(&resp), 200, "{resp}");
+    let json = response_json(&resp);
+    assert_eq!(json["type"], "message", "{resp}");
+    assert_eq!(json["content"][0]["text"], "hello from gemini", "{resp}");
+    assert!(fake.hit_count(Endpoint::Gemini) >= 1, "{:?}", fake.hits());
+    assert_eq!(fake.hit_count(Endpoint::Chat), 0, "{:?}", fake.hits());
+}
+
+#[tokio::test]
+async fn serve_messages_route_direct_gemini_edge_streams() {
+    no_proxy();
+    let fake = spawn_fake(&[(Endpoint::Gemini, Mode::OkSse)]);
+    let port = start_serve(&fake, ProviderProtocol::Google).await;
+
+    let resp = raw_post(port, "/v1/messages", MESSAGES_REQ_STREAM).await;
+    assert_eq!(response_status(&resp), 200, "{resp}");
+    assert!(resp.contains("text/event-stream"), "{resp}");
+    assert!(resp.contains("event: message_start"), "{resp}");
+    assert!(resp.contains("content_block_delta"), "{resp}");
+    assert!(resp.contains("hello from gemini"), "{resp}");
+    assert!(resp.contains("event: message_stop"), "{resp}");
+    assert_eq!(fake.hit_count(Endpoint::Chat), 0, "{:?}", fake.hits());
 }
 
 #[tokio::test]

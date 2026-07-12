@@ -472,6 +472,55 @@ pub fn http_chunked_response_head_with_extra(
 /// converters abort the stream, observers stop observing.
 pub(crate) const MAX_SSE_PENDING_BYTES: usize = 16 * 1024 * 1024;
 
+/// Reassembles arbitrary network chunks into complete lines (trailing `\r`
+/// stripped), buffering the partial tail — decoding chunk-by-chunk would tear
+/// multi-byte UTF-8 across a boundary.
+#[derive(Default)]
+pub(crate) struct SseLineBuffer {
+    pending: Vec<u8>,
+}
+
+impl SseLineBuffer {
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    /// Appends `chunk`, draining complete lines. Errors past
+    /// [`MAX_SSE_PENDING_BYTES`] — OOM backstop for a newline-less run.
+    pub(crate) fn push_chunk(&mut self, chunk: &[u8]) -> Result<Vec<String>> {
+        self.pending.extend_from_slice(chunk);
+        let mut lines = Vec::new();
+        while let Some(pos) = self.pending.iter().position(|&b| b == b'\n') {
+            let line = String::from_utf8_lossy(&self.pending[..pos])
+                .trim_end_matches('\r')
+                .to_string();
+            self.pending.drain(..=pos);
+            lines.push(line);
+        }
+        anyhow::ensure!(
+            self.pending.len() <= MAX_SSE_PENDING_BYTES,
+            "stream line exceeded {MAX_SSE_PENDING_BYTES} bytes without a newline"
+        );
+        Ok(lines)
+    }
+
+    /// Consumes the unterminated final line, if any. Call once at end of stream.
+    pub(crate) fn take_tail(&mut self) -> Option<String> {
+        if self.pending.is_empty() {
+            return None;
+        }
+        let tail = String::from_utf8_lossy(&self.pending)
+            .trim_end_matches('\r')
+            .to_string();
+        self.pending.clear();
+        if tail.trim().is_empty() {
+            None
+        } else {
+            Some(tail)
+        }
+    }
+}
+
 /// Formats a single chunk for HTTP chunked transfer encoding.
 /// Returns empty vec for empty input.
 pub fn format_http_chunk(chunk: &[u8]) -> Vec<u8> {
@@ -769,6 +818,21 @@ pub fn sse_data_payload(line: &str) -> Option<&str> {
     line.strip_prefix("data:").map(str::trim_start)
 }
 
+pub(crate) fn sse_event(event_type: &str, data: &Value) -> String {
+    format!(
+        "event: {}\ndata: {}\n\n",
+        event_type,
+        serde_json::to_string(data).unwrap_or_default()
+    )
+}
+
+pub(crate) fn gen_id(prefix: &str) -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static ID_COUNTER: AtomicU64 = AtomicU64::new(0);
+    let n = ID_COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("{}_{}_{:06}", prefix, current_unix_ts(), n % 1_000_000)
+}
+
 /// Shared `reqwest::ClientBuilder` for every outbound HTTP client in aivo.
 ///
 /// Off by default; opt in with `AIVO_HTTP_IPV4_ONLY=1` to bind outbound
@@ -937,6 +1001,64 @@ pub fn copilot_initiator_from_openai(body: &Value) -> &'static str {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn sse_line_buffer_reassembles_split_multibyte() {
+        // "…" (3 bytes) split across chunks must not become replacement chars.
+        let bytes = "data: …\n".as_bytes();
+        let split = 7; // mid-…
+        let mut buf = SseLineBuffer::new();
+        assert!(buf.push_chunk(&bytes[..split]).unwrap().is_empty());
+        assert_eq!(
+            buf.push_chunk(&bytes[split..]).unwrap(),
+            vec!["data: …".to_string()]
+        );
+    }
+
+    #[test]
+    fn sse_line_buffer_splits_and_strips_cr() {
+        let mut buf = SseLineBuffer::new();
+        let lines = buf.push_chunk(b"a\r\nb\nc").unwrap();
+        assert_eq!(lines, vec!["a".to_string(), "b".to_string()]);
+        assert_eq!(buf.push_chunk(b"\n").unwrap(), vec!["c".to_string()]);
+    }
+
+    #[test]
+    fn sse_line_buffer_tail_yields_unterminated_line_once() {
+        let mut buf = SseLineBuffer::new();
+        assert!(buf.push_chunk(b"data: tail").unwrap().is_empty());
+        assert_eq!(buf.take_tail(), Some("data: tail".to_string()));
+        assert_eq!(buf.take_tail(), None);
+
+        let mut blank = SseLineBuffer::new();
+        assert!(blank.push_chunk(b"  \r").unwrap().is_empty());
+        assert_eq!(blank.take_tail(), None, "whitespace-only tail is skipped");
+    }
+
+    #[test]
+    fn sse_line_buffer_errors_on_oversized_partial_line() {
+        let mut buf = SseLineBuffer::new();
+        assert!(!buf.push_chunk(b"x\n").unwrap().is_empty());
+        // A newline-less run past the cap must fail loudly, not buffer forever.
+        let big = vec![b'y'; MAX_SSE_PENDING_BYTES + 1];
+        assert!(buf.push_chunk(&big).is_err());
+    }
+
+    #[test]
+    fn sse_event_formats_named_event() {
+        assert_eq!(
+            sse_event("response.created", &json!({"a": 1})),
+            "event: response.created\ndata: {\"a\":1}\n\n"
+        );
+    }
+
+    #[test]
+    fn gen_id_is_prefixed_and_unique() {
+        let a = gen_id("resp");
+        let b = gen_id("resp");
+        assert!(a.starts_with("resp_"), "{a}");
+        assert_ne!(a, b);
+    }
 
     #[test]
     fn aivo_user_agent_is_versioned() {

@@ -9,7 +9,7 @@
 use anyhow::{Context, Result};
 use reqwest::header::{HeaderMap, HeaderValue};
 use serde_json::{Value, json};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
@@ -17,10 +17,10 @@ use crate::constants::CONTENT_TYPE_JSON;
 use crate::services::device_fingerprint;
 
 use crate::services::anthropic_chat_request::{
-    AnthropicToOpenAIConfig, convert_anthropic_to_openai_request, hoist_anthropic_system_messages,
+    AnthropicToOpenAIConfig, hoist_anthropic_system_messages,
 };
 use crate::services::anthropic_chat_response::{
-    OpenAIToAnthropicConfig, UsageValueMode, convert_openai_to_anthropic_message,
+    OpenAIStreamConverter, convert_openai_sse_to_anthropic, convert_openai_to_anthropic,
 };
 use crate::services::anthropic_route_pipeline::{
     CacheControlPatch, RequestContext, RequestPatch, ThinkingNormalizationPatch,
@@ -33,13 +33,9 @@ use crate::services::model_names::{
     strip_context_suffix,
 };
 use crate::services::openai_anthropic_bridge::convert_openai_chat_response_to_sse;
-use crate::services::openai_gemini_bridge::{
-    OpenAIToGeminiConfig, build_google_generate_content_url,
-    convert_gemini_to_openai_chat_response, convert_openai_chat_to_gemini_request,
-    openai_chat_model,
-};
+use crate::services::openai_gemini_bridge::{build_google_generate_content_url, openai_chat_model};
 use crate::services::openai_models::{
-    OpenAIChatChunk, OpenAIChatRequest, ResponsesResponse,
+    OpenAIChatRequest, ResponsesResponse,
     convert_chat_to_responses_request as convert_typed_chat_to_responses_request,
     convert_responses_to_chat_response as convert_typed_responses_to_chat_response,
     stringify_message_content as stringify_typed_message_content,
@@ -55,6 +51,9 @@ use crate::services::provider_protocol::{
 };
 use crate::services::route_cache::{PersistedRoute, RouteCache};
 use crate::services::serve_upstream::disable_stream_for_inception_with_tools;
+use crate::services::wire_format::{
+    RequestOptions, ResponseOptions, translate_request, translate_response,
+};
 
 #[derive(Clone)]
 pub struct AnthropicToOpenAIRouterConfig {
@@ -787,9 +786,9 @@ async fn handle_anthropic_to_upstream(
             ProviderProtocol::Google => {
                 req_body["stream"] = json!(false);
                 let model = openai_chat_model(&req_body, "gemini-2.5-pro");
-                let google_body = convert_openai_chat_to_gemini_request(
+                let google_body = translate_request(
                     &req_body,
-                    &OpenAIToGeminiConfig {
+                    &RequestOptions::ChatToGemini {
                         default_model: "gemini-2.5-pro",
                     },
                 );
@@ -812,8 +811,10 @@ async fn handle_anthropic_to_upstream(
                     None
                 } else {
                     let google_response: Value = serde_json::from_str(&response_body)?;
-                    let openai_response =
-                        convert_gemini_to_openai_chat_response(&google_response, &model);
+                    let openai_response = translate_response(
+                        &google_response,
+                        &ResponseOptions::ChatToGemini { model: &model },
+                    )?;
                     Some(openai_chat_response_to_anthropic_router(
                         &openai_response,
                         requested_stream,
@@ -891,7 +892,7 @@ async fn handle_anthropic_to_upstream(
                         let headers =
                             http_utils::http_chunked_response_head(200, "text/event-stream");
                         socket.write_all(headers.as_bytes()).await?;
-                        let mut converter = OpenAIStreamConverter::new();
+                        let mut converter = OpenAIStreamConverter::new("claude");
                         while let Some(chunk) = response.chunk().await? {
                             let converted = converter.push_bytes(&chunk)?;
                             if !converted.is_empty() {
@@ -1044,9 +1045,9 @@ fn build_simplified_openai_body(
 }
 
 fn anthropic_to_openai(body: &Value, requires_reasoning_content: bool) -> Result<Value> {
-    let mut req = convert_anthropic_to_openai_request(
+    let mut req = translate_request(
         body,
-        &AnthropicToOpenAIConfig {
+        &RequestOptions::AnthropicToChat(&AnthropicToOpenAIConfig {
             default_model: "gpt-4o",
             preserve_stream: true,
             model_transform: None,
@@ -1055,7 +1056,7 @@ fn anthropic_to_openai(body: &Value, requires_reasoning_content: bool) -> Result
             stringify_other_tool_result_content: true,
             tool_result_supports_multimodal: true,
             fallback_tool_arguments_json: "{}",
-        },
+        }),
     );
     let mut typed_req: OpenAIChatRequest = serde_json::from_value(req)
         .context("failed to convert anthropic request to typed OpenAI request")?;
@@ -1184,672 +1185,6 @@ fn cap_max_tokens_field(body: &mut Value, cap: Option<u64>) {
     }
 }
 
-/// Convert OpenAI /v1/chat/completions response to Anthropic /v1/messages format
-fn convert_openai_to_anthropic(response_body: &str, status_code: u16) -> Result<String> {
-    // If error status, return as-is
-    if status_code >= 400 {
-        return Ok(response_body.to_string());
-    }
-
-    let openai_resp: Value = serde_json::from_str(response_body)?;
-    let anthropic_resp = convert_openai_to_anthropic_message(
-        &openai_resp,
-        &OpenAIToAnthropicConfig {
-            fallback_id: "msg_default",
-            model: openai_resp
-                .get("model")
-                .and_then(|m| m.as_str())
-                .unwrap_or("unknown"),
-            include_created: true,
-            usage_value_mode: UsageValueMode::CoerceU64,
-        },
-    )?;
-
-    Ok(anthropic_resp.to_string())
-}
-
-#[derive(Default)]
-struct StreamToolBlock {
-    anthropic_idx: usize,
-    id: String,
-    name: String,
-    opened: bool,
-    pending_args: String,
-}
-
-fn append_sse_event(output: &mut String, event: &str, data: Value) {
-    output.push_str(&format!("event: {event}\ndata: {data}\n\n"));
-}
-
-fn ensure_message_start(
-    output: &mut String,
-    started: &mut bool,
-    message_id: &str,
-    model: &str,
-    input_tokens: u64,
-    cache_read_input_tokens: Option<u64>,
-    cache_creation_input_tokens: Option<u64>,
-) {
-    if *started {
-        return;
-    }
-    let mut usage = json!({
-        "input_tokens": input_tokens,
-        "output_tokens": 0
-    });
-    if let Some(value) = cache_read_input_tokens {
-        usage["cache_read_input_tokens"] = json!(value);
-    }
-    if let Some(value) = cache_creation_input_tokens {
-        usage["cache_creation_input_tokens"] = json!(value);
-    }
-    append_sse_event(
-        output,
-        "message_start",
-        json!({
-            "type": "message_start",
-            "message": {
-                "id": message_id,
-                "type": "message",
-                "role": "assistant",
-                "content": [],
-                "model": model,
-                "stop_reason": null,
-                "stop_sequence": null,
-                "usage": usage
-            }
-        }),
-    );
-    *started = true;
-}
-
-#[allow(clippy::too_many_arguments)]
-fn emit_tool_delta(
-    output: &mut String,
-    block_count: &mut usize,
-    tool_blocks: &mut HashMap<usize, StreamToolBlock>,
-    openai_idx: usize,
-    id: Option<&str>,
-    name: Option<&str>,
-    args_fragment: Option<&str>,
-    saw_tool_use: &mut bool,
-) {
-    let block = tool_blocks.entry(openai_idx).or_insert_with(|| {
-        let idx = *block_count;
-        *block_count += 1;
-        StreamToolBlock {
-            anthropic_idx: idx,
-            ..Default::default()
-        }
-    });
-
-    if let Some(v) = id
-        && !v.is_empty()
-    {
-        block.id = v.to_string();
-    }
-    if let Some(v) = name
-        && !v.is_empty()
-    {
-        block.name = v.to_string();
-    }
-
-    if let Some(fragment) = args_fragment
-        && !fragment.is_empty()
-    {
-        if block.opened {
-            append_sse_event(
-                output,
-                "content_block_delta",
-                json!({
-                    "type": "content_block_delta",
-                    "index": block.anthropic_idx,
-                    "delta": {
-                        "type": "input_json_delta",
-                        "partial_json": fragment
-                    }
-                }),
-            );
-        } else {
-            block.pending_args.push_str(fragment);
-        }
-    }
-
-    if !block.opened && !block.name.is_empty() {
-        if block.id.is_empty() {
-            block.id = format!("toolu_{}", uuid_simple());
-        }
-        append_sse_event(
-            output,
-            "content_block_start",
-            json!({
-                "type": "content_block_start",
-                "index": block.anthropic_idx,
-                "content_block": {
-                    "type": "tool_use",
-                    "id": block.id,
-                    "name": block.name
-                }
-            }),
-        );
-        block.opened = true;
-        *saw_tool_use = true;
-
-        if !block.pending_args.is_empty() {
-            append_sse_event(
-                output,
-                "content_block_delta",
-                json!({
-                    "type": "content_block_delta",
-                    "index": block.anthropic_idx,
-                    "delta": {
-                        "type": "input_json_delta",
-                        "partial_json": block.pending_args
-                    }
-                }),
-            );
-            block.pending_args.clear();
-        }
-    }
-}
-
-fn map_openai_finish_reason(reason: &str) -> &'static str {
-    match reason {
-        "tool_calls" => "tool_use",
-        "length" => "max_tokens",
-        _ => "end_turn",
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn finalize_stream_message(
-    output: &mut String,
-    message_started: &mut bool,
-    message_id: &str,
-    model: &str,
-    input_tokens: u64,
-    output_tokens: u64,
-    cache_read_input_tokens: Option<u64>,
-    cache_creation_input_tokens: Option<u64>,
-    thinking_block_idx: &mut Option<usize>,
-    text_block_idx: &mut Option<usize>,
-    tool_blocks: &mut HashMap<usize, StreamToolBlock>,
-    stop_reason: &str,
-) {
-    ensure_message_start(
-        output,
-        message_started,
-        message_id,
-        model,
-        input_tokens,
-        cache_read_input_tokens,
-        cache_creation_input_tokens,
-    );
-
-    if let Some(idx) = thinking_block_idx.take() {
-        append_sse_event(
-            output,
-            "content_block_stop",
-            json!({"type": "content_block_stop", "index": idx}),
-        );
-    }
-
-    if let Some(idx) = text_block_idx.take() {
-        append_sse_event(
-            output,
-            "content_block_stop",
-            json!({
-                "type": "content_block_stop",
-                "index": idx
-            }),
-        );
-    }
-
-    let mut ordered_tool_idxs = tool_blocks
-        .values()
-        .filter(|b| b.opened)
-        .map(|b| b.anthropic_idx)
-        .collect::<Vec<_>>();
-    ordered_tool_idxs.sort_unstable();
-    for idx in ordered_tool_idxs {
-        append_sse_event(
-            output,
-            "content_block_stop",
-            json!({
-                "type": "content_block_stop",
-                "index": idx
-            }),
-        );
-    }
-
-    // OpenAI-shape upstreams only emit `usage` in the final chunk, so
-    // `message_start` was already sent with `input_tokens: 0`. Repeat the
-    // input fields here — the Anthropic SDK merges `message_delta.usage`
-    // into the message's running usage, which is what Claude Code's
-    // status-line percent reads from.
-    let mut usage = json!({
-        "input_tokens": input_tokens,
-        "output_tokens": output_tokens
-    });
-    if let Some(value) = cache_read_input_tokens {
-        usage["cache_read_input_tokens"] = json!(value);
-    }
-    if let Some(value) = cache_creation_input_tokens {
-        usage["cache_creation_input_tokens"] = json!(value);
-    }
-    append_sse_event(
-        output,
-        "message_delta",
-        json!({
-            "type": "message_delta",
-            "delta": {
-                "stop_reason": stop_reason,
-                "stop_sequence": null
-            },
-            "usage": usage
-        }),
-    );
-    append_sse_event(
-        output,
-        "message_stop",
-        json!({
-            "type": "message_stop"
-        }),
-    );
-}
-
-struct OpenAIStreamConverter {
-    pending: Vec<u8>,
-    message_started: bool,
-    finished: bool,
-    block_count: usize,
-    thinking_block_idx: Option<usize>,
-    text_block_idx: Option<usize>,
-    tool_blocks: HashMap<usize, StreamToolBlock>,
-    message_id: String,
-    model: String,
-    /// Latest reported `prompt_tokens` from upstream. Whether it represents
-    /// "total including cached" (OpenAI semantics) or "fresh only" (Anthropic
-    /// semantics) is decided per-update by which cache field accompanies it.
-    raw_prompt_tokens: u64,
-    /// Latest OpenAI-style `prompt_tokens_details.cached_tokens`, kept around
-    /// so a later chunk reporting only `prompt_tokens` still derives correctly.
-    openai_cached_tokens: Option<u64>,
-    /// Anthropic-fresh input count derived from the fields above.
-    input_tokens: u64,
-    output_tokens: u64,
-    cache_read_input_tokens: Option<u64>,
-    cache_creation_input_tokens: Option<u64>,
-    pending_stop_reason: Option<&'static str>,
-    /// Raw finish_reason was "content_filter" — blocks tool_use promotion.
-    finish_was_content_filter: bool,
-    saw_tool_use: bool,
-}
-
-impl OpenAIStreamConverter {
-    fn new() -> Self {
-        Self {
-            pending: Vec::new(),
-            message_started: false,
-            finished: false,
-            block_count: 0,
-            thinking_block_idx: None,
-            text_block_idx: None,
-            tool_blocks: HashMap::new(),
-            message_id: "msg".to_string(),
-            model: "claude".to_string(),
-            raw_prompt_tokens: 0,
-            openai_cached_tokens: None,
-            input_tokens: 0,
-            output_tokens: 0,
-            cache_read_input_tokens: None,
-            cache_creation_input_tokens: None,
-            pending_stop_reason: None,
-            finish_was_content_filter: false,
-            saw_tool_use: false,
-        }
-    }
-
-    /// Final Anthropic stop_reason for this stream. Lenient upstreams emit
-    /// tool_calls yet finish with "stop"; trusting that strands the tool loop
-    /// (Claude Code renders the call, never runs it), so an end_turn with
-    /// tool_use blocks promotes to tool_use. length/content_filter never do —
-    /// a truncated or filtered tool call must not execute.
-    fn resolve_stop_reason(&self) -> &'static str {
-        let fallback = if self.saw_tool_use {
-            "tool_use"
-        } else {
-            "end_turn"
-        };
-        let resolved = self.pending_stop_reason.unwrap_or(fallback);
-        if resolved == "end_turn" && self.saw_tool_use && !self.finish_was_content_filter {
-            "tool_use"
-        } else {
-            resolved
-        }
-    }
-
-    /// Re-derives `input_tokens` and `cache_read_input_tokens` from the latest
-    /// raw inputs. Called whenever any usage field updates, so chunks that
-    /// report cache info and prompt info separately still produce consistent
-    /// final state.
-    fn recompute_anthropic_input(&mut self) {
-        let creation = self.cache_creation_input_tokens.unwrap_or(0);
-        let (input, cache_read) = crate::services::openai_models::resolve_anthropic_input_and_cache(
-            self.raw_prompt_tokens,
-            self.cache_read_input_tokens,
-            self.openai_cached_tokens,
-            creation,
-        );
-        self.input_tokens = input;
-        if cache_read.is_some() {
-            self.cache_read_input_tokens = cache_read;
-        }
-    }
-
-    fn push_bytes(&mut self, chunk: &[u8]) -> Result<String> {
-        self.pending.extend_from_slice(chunk);
-
-        let mut output = String::new();
-        while let Some(pos) = self.pending.iter().position(|&b| b == b'\n') {
-            let line = String::from_utf8_lossy(&self.pending[..pos]).into_owned();
-            self.pending.drain(..=pos);
-            self.process_line(line.trim_end_matches('\r'), &mut output)?;
-        }
-        anyhow::ensure!(
-            self.pending.len() <= http_utils::MAX_SSE_PENDING_BYTES,
-            "upstream SSE line exceeded {} bytes without a newline",
-            http_utils::MAX_SSE_PENDING_BYTES
-        );
-
-        Ok(output)
-    }
-
-    fn finish(&mut self) -> Result<String> {
-        let mut output = String::new();
-
-        if !self.pending.is_empty() {
-            let line = String::from_utf8_lossy(&self.pending).into_owned();
-            self.pending.clear();
-            self.process_line(line.trim_end_matches('\r'), &mut output)?;
-        }
-
-        if !self.finished && self.message_started {
-            let stop_reason = self.resolve_stop_reason();
-            finalize_stream_message(
-                &mut output,
-                &mut self.message_started,
-                &self.message_id,
-                &self.model,
-                self.input_tokens,
-                self.output_tokens,
-                self.cache_read_input_tokens,
-                self.cache_creation_input_tokens,
-                &mut self.thinking_block_idx,
-                &mut self.text_block_idx,
-                &mut self.tool_blocks,
-                stop_reason,
-            );
-            self.finished = true;
-        }
-
-        Ok(output)
-    }
-
-    fn process_line(&mut self, line: &str, output: &mut String) -> Result<()> {
-        let Some(data) = line.strip_prefix("data: ") else {
-            return Ok(());
-        };
-
-        if data == "[DONE]" {
-            if !self.finished {
-                let stop_reason = self.resolve_stop_reason();
-                finalize_stream_message(
-                    output,
-                    &mut self.message_started,
-                    &self.message_id,
-                    &self.model,
-                    self.input_tokens,
-                    self.output_tokens,
-                    self.cache_read_input_tokens,
-                    self.cache_creation_input_tokens,
-                    &mut self.thinking_block_idx,
-                    &mut self.text_block_idx,
-                    &mut self.tool_blocks,
-                    stop_reason,
-                );
-                self.finished = true;
-            }
-            return Ok(());
-        }
-
-        let chunk = match serde_json::from_str::<OpenAIChatChunk>(data) {
-            Ok(v) => v,
-            Err(_) => return Ok(()),
-        };
-
-        if let Some(v) = chunk.id.as_deref()
-            && !v.is_empty()
-        {
-            self.message_id = v.to_string();
-        }
-        if let Some(v) = chunk.model.as_deref()
-            && !v.is_empty()
-        {
-            self.model = v.to_string();
-        }
-        if let Some(usage) = chunk.usage {
-            if let Some(v) = usage.prompt_tokens {
-                self.raw_prompt_tokens = v;
-            }
-            if let Some(v) = usage.completion_tokens {
-                self.output_tokens = v;
-            }
-            if let Some(v) = usage.cache_read_input_tokens {
-                self.cache_read_input_tokens = Some(v);
-            }
-            if let Some(v) = usage.cache_creation_input_tokens {
-                self.cache_creation_input_tokens = Some(v);
-            }
-            self.openai_cached_tokens = usage
-                .prompt_tokens_details
-                .as_ref()
-                .and_then(|d| d.cached_tokens)
-                .or(usage.prompt_cache_hit_tokens)
-                .or(self.openai_cached_tokens);
-            self.recompute_anthropic_input();
-        }
-
-        for choice in chunk.choices {
-            let delta = choice.delta;
-
-            // DeepSeek-reasoner: emit reasoning_content as Anthropic thinking blocks
-            if let Some(thinking) = delta.reasoning_content.as_deref()
-                && !thinking.is_empty()
-            {
-                ensure_message_start(
-                    output,
-                    &mut self.message_started,
-                    &self.message_id,
-                    &self.model,
-                    self.input_tokens,
-                    self.cache_read_input_tokens,
-                    self.cache_creation_input_tokens,
-                );
-                if self.thinking_block_idx.is_none() {
-                    let idx = self.block_count;
-                    self.block_count += 1;
-                    self.thinking_block_idx = Some(idx);
-                    append_sse_event(
-                        output,
-                        "content_block_start",
-                        json!({
-                            "type": "content_block_start",
-                            "index": idx,
-                            "content_block": {
-                                "type": "thinking",
-                                "thinking": ""
-                            }
-                        }),
-                    );
-                }
-                append_sse_event(
-                    output,
-                    "content_block_delta",
-                    json!({
-                        "type": "content_block_delta",
-                        "index": self.thinking_block_idx.unwrap_or(0),
-                        "delta": {
-                            "type": "thinking_delta",
-                            "thinking": thinking
-                        }
-                    }),
-                );
-            }
-
-            if let Some(text) = delta.content.as_deref()
-                && !text.is_empty()
-            {
-                ensure_message_start(
-                    output,
-                    &mut self.message_started,
-                    &self.message_id,
-                    &self.model,
-                    self.input_tokens,
-                    self.cache_read_input_tokens,
-                    self.cache_creation_input_tokens,
-                );
-                // Close thinking block before starting text block
-                if let Some(thinking_idx) = self.thinking_block_idx.take() {
-                    append_sse_event(
-                        output,
-                        "content_block_stop",
-                        json!({"type": "content_block_stop", "index": thinking_idx}),
-                    );
-                }
-                if self.text_block_idx.is_none() {
-                    let idx = self.block_count;
-                    self.block_count += 1;
-                    self.text_block_idx = Some(idx);
-                    append_sse_event(
-                        output,
-                        "content_block_start",
-                        json!({
-                            "type": "content_block_start",
-                            "index": idx,
-                            "content_block": {
-                                "type": "text",
-                                "text": ""
-                            }
-                        }),
-                    );
-                }
-                append_sse_event(
-                    output,
-                    "content_block_delta",
-                    json!({
-                        "type": "content_block_delta",
-                        "index": self.text_block_idx.unwrap_or(0),
-                        "delta": {
-                            "type": "text_delta",
-                            "text": text
-                        }
-                    }),
-                );
-            }
-
-            if let Some(function_call) = delta.function_call {
-                ensure_message_start(
-                    output,
-                    &mut self.message_started,
-                    &self.message_id,
-                    &self.model,
-                    self.input_tokens,
-                    self.cache_read_input_tokens,
-                    self.cache_creation_input_tokens,
-                );
-                emit_tool_delta(
-                    output,
-                    &mut self.block_count,
-                    &mut self.tool_blocks,
-                    0,
-                    function_call.id.as_deref(),
-                    function_call.name.as_deref(),
-                    function_call.arguments.as_deref(),
-                    &mut self.saw_tool_use,
-                );
-            }
-
-            if let Some(tool_calls) = delta.tool_calls {
-                ensure_message_start(
-                    output,
-                    &mut self.message_started,
-                    &self.message_id,
-                    &self.model,
-                    self.input_tokens,
-                    self.cache_read_input_tokens,
-                    self.cache_creation_input_tokens,
-                );
-                for tc in tool_calls {
-                    let openai_idx = tc.index.unwrap_or(0) as usize;
-                    emit_tool_delta(
-                        output,
-                        &mut self.block_count,
-                        &mut self.tool_blocks,
-                        openai_idx,
-                        tc.id.as_deref(),
-                        tc.function.as_ref().and_then(|f| f.name.as_deref()),
-                        tc.function.as_ref().and_then(|f| f.arguments.as_deref()),
-                        &mut self.saw_tool_use,
-                    );
-                }
-            }
-
-            if let Some(finish_reason) = choice.finish_reason.as_deref()
-                && !finish_reason.is_empty()
-            {
-                // Some OpenAI-compatible providers (notably xAI) send the final
-                // usage object in a trailing usage-only chunk after finish_reason.
-                // Defer Anthropic message_delta until [DONE]/EOF so Claude Code
-                // logs the real token totals instead of zeros.
-                self.pending_stop_reason = Some(map_openai_finish_reason(finish_reason));
-                self.finish_was_content_filter = finish_reason == "content_filter";
-            }
-        }
-
-        Ok(())
-    }
-}
-
-/// Convert OpenAI SSE streaming response to Anthropic SSE format.
-fn convert_openai_sse_to_anthropic(response_body: &str, status_code: u16) -> Result<String> {
-    if status_code >= 400 {
-        return Ok(format!("data: {}\n\ndata: [DONE]\n\n", response_body));
-    }
-
-    let mut converter = OpenAIStreamConverter::new();
-    let mut sse_output = converter.push_bytes(response_body.as_bytes())?;
-    sse_output.push_str(&converter.finish()?);
-    Ok(sse_output)
-}
-
-/// Generate a collision-resistant unique ID using a monotonic counter + timestamp.
-fn uuid_simple() -> String {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    use std::time::{SystemTime, UNIX_EPOCH};
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-    let count = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let duration = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default();
-    format!(
-        "{:x}{:x}{:x}",
-        duration.as_secs(),
-        duration.subsec_nanos(),
-        count
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1958,41 +1293,6 @@ mod tests {
         assert!(!probe.record_upstream_error());
         assert!(!probe.record_upstream_error());
         assert!(probe.record_upstream_error());
-    }
-
-    #[test]
-    fn test_convert_openai_to_anthropic_uses_response_model_and_created() {
-        let openai_resp = r#"{
-            "id": "chatcmpl-123",
-            "created": 1700000000,
-            "model": "gpt-4",
-            "choices": [{
-                "message": {
-                    "role": "assistant",
-                    "content": "Hello!"
-                },
-                "finish_reason": "stop",
-                "index": 0
-            }],
-            "usage": {
-                "prompt_tokens": 10,
-                "completion_tokens": 5,
-                "total_tokens": 15,
-                "cache_read_input_tokens": 90,
-                "cache_creation_input_tokens": 15
-            }
-        }"#;
-
-        let result = convert_openai_to_anthropic(openai_resp, 200).unwrap();
-        let parsed: Value = serde_json::from_str(&result).unwrap();
-
-        assert_eq!(parsed["id"], "chatcmpl-123");
-        assert_eq!(parsed["model"], "gpt-4");
-        assert_eq!(parsed["created"], 1700000000);
-        assert_eq!(parsed["usage"]["input_tokens"], 10);
-        assert_eq!(parsed["usage"]["output_tokens"], 5);
-        assert_eq!(parsed["usage"]["cache_read_input_tokens"], 90);
-        assert_eq!(parsed["usage"]["cache_creation_input_tokens"], 15);
     }
 
     #[test]
@@ -2317,239 +1617,6 @@ mod tests {
     }
 
     #[test]
-    fn test_convert_openai_sse_to_anthropic_text() {
-        let sse = "data: {\"id\":\"chatcmpl_1\",\"model\":\"gpt-4o\",\"choices\":[{\"delta\":{\"content\":\"hello \"},\"finish_reason\":null}]}\n\
-data: {\"id\":\"chatcmpl_1\",\"model\":\"gpt-4o\",\"choices\":[{\"delta\":{\"content\":\"world\"},\"finish_reason\":\"stop\"}],\"usage\":{\"completion_tokens\":4,\"cache_read_input_tokens\":90,\"cache_creation_input_tokens\":15}}\n\
-data: [DONE]\n";
-        let result = convert_openai_sse_to_anthropic(sse, 200).unwrap();
-        assert!(result.contains("event: message_start"));
-        assert!(result.contains("\"type\":\"text_delta\""));
-        assert!(result.contains("\"text\":\"hello \""));
-        assert!(result.contains("\"text\":\"world\""));
-        assert!(result.contains("\"stop_reason\":\"end_turn\""));
-        assert!(result.contains("\"cache_read_input_tokens\":90"));
-        assert!(result.contains("\"cache_creation_input_tokens\":15"));
-        assert!(result.contains("event: message_stop"));
-    }
-
-    /// Regression: OpenAI-shape upstreams (DeepSeek, etc.) only emit `usage`
-    /// in the final chunk. Without forwarding `input_tokens` into the
-    /// Anthropic `message_delta`, Claude Code's status-line percent stays
-    /// at 0% because the SDK's running `message.usage.input_tokens` is
-    /// stuck at the placeholder value baked into `message_start`.
-    #[test]
-    fn openai_sse_to_anthropic_propagates_input_tokens_via_message_delta() {
-        let sse = "data: {\"id\":\"chatcmpl_x\",\"model\":\"deepseek-v4\",\"choices\":[{\"delta\":{\"content\":\"hi\"},\"finish_reason\":null}]}\n\
-data: {\"id\":\"chatcmpl_x\",\"model\":\"deepseek-v4\",\"choices\":[{\"delta\":{\"content\":\"!\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":32652,\"completion_tokens\":86}}\n\
-data: [DONE]\n";
-        let result = convert_openai_sse_to_anthropic(sse, 200).unwrap();
-        let delta_section = result
-            .split("event: message_delta\n")
-            .nth(1)
-            .expect("message_delta event present");
-        let data_line = delta_section
-            .lines()
-            .find(|l| l.starts_with("data: "))
-            .expect("data line after message_delta");
-        let payload: Value = serde_json::from_str(data_line.trim_start_matches("data: ")).unwrap();
-        assert_eq!(payload["usage"]["input_tokens"], 32652);
-        assert_eq!(payload["usage"]["output_tokens"], 86);
-    }
-
-    /// xAI/Grok and other OpenAI-compatible providers may emit usage with
-    /// `input_tokens`/`output_tokens` instead of `prompt_tokens`/`completion_tokens`.
-    /// The alias mapping ensures these are captured and forwarded to Claude Code.
-    #[test]
-    fn openai_sse_to_anthropic_accepts_input_output_token_names() {
-        let sse = "data: {\"id\":\"chatcmpl_xai\",\"model\":\"grok-4.3\",\"choices\":[{\"delta\":{\"content\":\"hi\"},\"finish_reason\":null}]}\n\
-		data: {\"id\":\"chatcmpl_xai\",\"model\":\"grok-4.3\",\"choices\":[{\"delta\":{\"content\":\"!\"},\"finish_reason\":\"stop\"}],\"usage\":{\"input_tokens\":15000,\"output_tokens\":42}}\n\
-		data: [DONE]\n";
-        let result = convert_openai_sse_to_anthropic(sse, 200).unwrap();
-        let delta_section = result
-            .split("event: message_delta\n")
-            .nth(1)
-            .expect("message_delta event present");
-        let data_line = delta_section
-            .lines()
-            .find(|l| l.starts_with("data: "))
-            .expect("data line after message_delta");
-        let payload: Value = serde_json::from_str(data_line.trim_start_matches("data: ")).unwrap();
-        assert_eq!(payload["usage"]["input_tokens"], 15000);
-        assert_eq!(payload["usage"]["output_tokens"], 42);
-    }
-
-    #[test]
-    fn openai_sse_to_anthropic_waits_for_trailing_usage_after_finish_reason() {
-        let sse = "data: {\"id\":\"chatcmpl_xai\",\"model\":\"grok-4.3\",\"choices\":[{\"delta\":{\"content\":\"hi\"},\"finish_reason\":null}]}\n\
-data: {\"id\":\"chatcmpl_xai\",\"model\":\"grok-4.3\",\"choices\":[{\"delta\":{\"content\":\"!\"},\"finish_reason\":\"stop\"}]}\n\
-data: {\"id\":\"chatcmpl_xai\",\"model\":\"grok-4.3\",\"choices\":[],\"usage\":{\"input_tokens\":15000,\"output_tokens\":42}}\n\
-data: [DONE]\n";
-        let result = convert_openai_sse_to_anthropic(sse, 200).unwrap();
-        let delta_section = result
-            .split("event: message_delta\n")
-            .nth(1)
-            .expect("message_delta event present");
-        let data_line = delta_section
-            .lines()
-            .find(|l| l.starts_with("data: "))
-            .expect("data line after message_delta");
-        let payload: Value = serde_json::from_str(data_line.trim_start_matches("data: ")).unwrap();
-        assert_eq!(payload["delta"]["stop_reason"], "end_turn");
-        assert_eq!(payload["usage"]["input_tokens"], 15000);
-        assert_eq!(payload["usage"]["output_tokens"], 42);
-    }
-
-    /// Regression: OpenAI-compatible upstreams (zai, DeepSeek, gemma —
-    /// everything `aivo/starter` routes to) emit cached input tokens at
-    /// `usage.prompt_tokens_details.cached_tokens`, not at
-    /// `cache_read_input_tokens`. Before the fix, aivo's stream converter
-    /// dropped that field, so Claude Code logged `cache_read_input_tokens=0`
-    /// and `aivo stats` undercounted cached usage for `aivo/starter`.
-    #[test]
-    fn openai_sse_to_anthropic_extracts_cached_tokens_from_prompt_tokens_details() {
-        let sse = "data: {\"id\":\"c\",\"model\":\"zai/glm-4.7-flash\",\"choices\":[{\"delta\":{\"content\":\"hi\"},\"finish_reason\":null}]}\n\
-data: {\"id\":\"c\",\"model\":\"zai/glm-4.7-flash\",\"choices\":[{\"delta\":{\"content\":\"!\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":1000,\"completion_tokens\":50,\"prompt_tokens_details\":{\"cached_tokens\":800}}}\n\
-data: [DONE]\n";
-        let result = convert_openai_sse_to_anthropic(sse, 200).unwrap();
-        let delta_section = result
-            .split("event: message_delta\n")
-            .nth(1)
-            .expect("message_delta event present");
-        let data_line = delta_section
-            .lines()
-            .find(|l| l.starts_with("data: "))
-            .expect("data line after message_delta");
-        let payload: Value = serde_json::from_str(data_line.trim_start_matches("data: ")).unwrap();
-        // Anthropic semantics: input_tokens is fresh-only.
-        assert_eq!(payload["usage"]["input_tokens"], 200); // 1000 − 800
-        assert_eq!(payload["usage"]["output_tokens"], 50);
-        assert_eq!(payload["usage"]["cache_read_input_tokens"], 800);
-    }
-
-    /// When upstream emits both shapes, the explicit Anthropic value wins —
-    /// it represents what the bridge already computed and `prompt_tokens` is
-    /// already fresh-only (so we must NOT subtract again).
-    #[test]
-    fn openai_sse_to_anthropic_prefers_explicit_cache_read_over_prompt_tokens_details() {
-        let sse = "data: {\"id\":\"c\",\"model\":\"m\",\"choices\":[{\"delta\":{\"content\":\"hi\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":12,\"completion_tokens\":7,\"cache_read_input_tokens\":90,\"prompt_tokens_details\":{\"cached_tokens\":999}}}\n\
-data: [DONE]\n";
-        let result = convert_openai_sse_to_anthropic(sse, 200).unwrap();
-        let delta_section = result
-            .split("event: message_delta\n")
-            .nth(1)
-            .expect("message_delta event present");
-        let data_line = delta_section
-            .lines()
-            .find(|l| l.starts_with("data: "))
-            .expect("data line after message_delta");
-        let payload: Value = serde_json::from_str(data_line.trim_start_matches("data: ")).unwrap();
-        assert_eq!(payload["usage"]["input_tokens"], 12);
-        assert_eq!(payload["usage"]["cache_read_input_tokens"], 90);
-    }
-
-    #[test]
-    fn openai_sse_to_anthropic_extracts_cached_tokens_from_deepseek_cache_hit_field() {
-        let sse = "data: {\"id\":\"c\",\"model\":\"deepseek-chat\",\"choices\":[{\"delta\":{\"content\":\"hi\"},\"finish_reason\":null}]}\n\
-data: {\"id\":\"c\",\"model\":\"deepseek-chat\",\"choices\":[{\"delta\":{\"content\":\"!\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":100,\"completion_tokens\":10,\"prompt_cache_hit_tokens\":90}}\n\
-data: [DONE]\n";
-        let result = convert_openai_sse_to_anthropic(sse, 200).unwrap();
-        let delta_section = result
-            .split("event: message_delta\n")
-            .nth(1)
-            .expect("message_delta event present");
-        let data_line = delta_section
-            .lines()
-            .find(|l| l.starts_with("data: "))
-            .expect("data line after message_delta");
-        let payload: Value = serde_json::from_str(data_line.trim_start_matches("data: ")).unwrap();
-        // Anthropic semantics: input_tokens is fresh-only (100 − 90).
-        assert_eq!(payload["usage"]["input_tokens"], 10);
-        assert_eq!(payload["usage"]["output_tokens"], 10);
-        assert_eq!(payload["usage"]["cache_read_input_tokens"], 90);
-    }
-
-    #[test]
-    fn test_convert_openai_sse_to_anthropic_split_tool_calls() {
-        let sse = "data: {\"id\":\"chatcmpl_2\",\"model\":\"gpt-4o\",\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"list_files\"}}]},\"finish_reason\":null}]}\n\
-data: {\"id\":\"chatcmpl_2\",\"model\":\"gpt-4o\",\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"{\\\"path\\\":\\\".\\\"}\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\
-data: [DONE]\n";
-        let result = convert_openai_sse_to_anthropic(sse, 200).unwrap();
-        assert!(result.contains("\"type\":\"tool_use\""));
-        assert!(result.contains("\"id\":\"call_1\""));
-        assert!(result.contains("\"name\":\"list_files\""));
-        assert!(result.contains("\"type\":\"input_json_delta\""));
-        assert!(result.contains("\"partial_json\":\"{\\\"path\\\":\\\".\\\"}\""));
-        assert!(result.contains("\"stop_reason\":\"tool_use\""));
-    }
-
-    #[test]
-    fn test_openai_stream_converter_handles_split_chunks() {
-        let mut converter = OpenAIStreamConverter::new();
-        let mut output = String::new();
-
-        output.push_str(
-            &converter
-                .push_bytes(b"data: {\"id\":\"chatcmpl_1\",\"model\":\"gpt-4o\",\"choices\":[{\"delta\":{\"content\":\"hel")
-                .unwrap(),
-        );
-        output.push_str(
-            &converter
-                .push_bytes(b"lo\"},\"finish_reason\":null}]}\n")
-                .unwrap(),
-        );
-        output.push_str(
-            &converter
-                .push_bytes(b"data: {\"choices\":[{\"delta\":{\"content\":\" world\"},\"finish_reason\":\"stop\"}],\"usage\":{\"completion_tokens\":2}}\n")
-                .unwrap(),
-        );
-        output.push_str(&converter.push_bytes(b"data: [DONE]\n").unwrap());
-        output.push_str(&converter.finish().unwrap());
-
-        assert!(output.contains("\"text\":\"hello\""));
-        assert!(output.contains("\"text\":\" world\""));
-        assert!(output.contains("\"stop_reason\":\"end_turn\""));
-        assert_eq!(output.matches("event: message_stop").count(), 1);
-    }
-
-    fn stream_tool_call_turn(finish_reason: &str) -> String {
-        let mut converter = OpenAIStreamConverter::new();
-        let mut output = String::new();
-        output.push_str(
-            &converter
-                .push_bytes(b"data: {\"id\":\"c1\",\"model\":\"m\",\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"function\":{\"name\":\"ls\",\"arguments\":\"{}\"}}]},\"finish_reason\":null}]}\n")
-                .unwrap(),
-        );
-        let finish = format!(
-            "data: {{\"choices\":[{{\"delta\":{{}},\"finish_reason\":\"{finish_reason}\"}}]}}\n"
-        );
-        output.push_str(&converter.push_bytes(finish.as_bytes()).unwrap());
-        output.push_str(&converter.push_bytes(b"data: [DONE]\n").unwrap());
-        output.push_str(&converter.finish().unwrap());
-        output
-    }
-
-    #[test]
-    fn stream_stop_with_tool_calls_promotes_to_tool_use() {
-        let output = stream_tool_call_turn("stop");
-        assert!(output.contains("\"stop_reason\":\"tool_use\""), "{output}");
-    }
-
-    #[test]
-    fn stream_length_with_tool_calls_keeps_max_tokens() {
-        let output = stream_tool_call_turn("length");
-        assert!(
-            output.contains("\"stop_reason\":\"max_tokens\""),
-            "{output}"
-        );
-    }
-
-    #[test]
-    fn stream_content_filter_with_tool_calls_keeps_end_turn() {
-        let output = stream_tool_call_turn("content_filter");
-        assert!(output.contains("\"stop_reason\":\"end_turn\""), "{output}");
-    }
-
-    #[test]
     fn native_pin_flip_only_on_auth_statuses() {
         assert!(native_terminal_flips_pin(401));
         assert!(native_terminal_flips_pin(403));
@@ -2623,34 +1690,6 @@ data: [DONE]\n";
     }
 
     #[test]
-    fn test_convert_openai_to_anthropic_error_status_passthrough() {
-        let error_body = r#"{"error":{"message":"rate limited"}}"#;
-        let result = convert_openai_to_anthropic(error_body, 429).unwrap();
-        // Error responses should be passed through as-is
-        assert!(result.contains("rate limited"));
-    }
-
-    #[test]
-    fn test_convert_openai_sse_to_anthropic_error_status_passthrough() {
-        let error_body = r#"{"error":"upstream down"}"#;
-        let result = convert_openai_sse_to_anthropic(error_body, 502).unwrap();
-        assert!(result.contains("upstream down"));
-        assert!(result.contains("data: "));
-    }
-
-    #[test]
-    fn test_convert_openai_to_anthropic_empty_body() {
-        let result = convert_openai_to_anthropic("", 200);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_convert_openai_to_anthropic_malformed_json() {
-        let result = convert_openai_to_anthropic("{not valid}", 200);
-        assert!(result.is_err());
-    }
-
-    #[test]
     fn test_anthropic_to_openai_empty_messages() {
         let body = json!({
             "model": "gpt-4o",
@@ -2673,26 +1712,6 @@ data: [DONE]\n";
         let mut req = json!({"model": "gpt-4o", "max_tokens": 4096});
         cap_max_tokens_field(&mut req, Some(8192));
         assert_eq!(req["max_tokens"], 4096);
-    }
-
-    #[test]
-    fn test_convert_openai_sse_to_anthropic_empty_sse() {
-        let result = convert_openai_sse_to_anthropic("", 200).unwrap();
-        // Empty input → no events emitted (converter never started)
-        assert!(result.is_empty());
-    }
-
-    #[test]
-    fn test_openai_stream_converter_malformed_json_in_data_line() {
-        let mut converter = OpenAIStreamConverter::new();
-        // Malformed JSON should be silently skipped, not error
-        let output = converter
-            .push_bytes(b"data: {invalid json}\ndata: [DONE]\n")
-            .unwrap();
-        let tail = converter.finish().unwrap();
-        // Should not panic and should produce empty/minimal output
-        let _ = output;
-        let _ = tail;
     }
 
     #[test]
@@ -2758,24 +1777,5 @@ data: [DONE]\n";
         );
         // Other fallbacks (Openai variants, Google) still present.
         assert!(cands.iter().any(|(p, _)| *p == ProviderProtocol::Google));
-    }
-
-    #[test]
-    fn convert_openai_sse_to_anthropic_done_only() {
-        // A stream consisting of only the [DONE] sentinel should produce
-        // a minimal valid Anthropic SSE stream (message_start + message_stop).
-        let result = convert_openai_sse_to_anthropic("data: [DONE]\n", 200).unwrap();
-        assert!(
-            result.contains("event: message_start"),
-            "must emit message_start"
-        );
-        assert!(
-            result.contains("event: message_stop"),
-            "must emit message_stop"
-        );
-        assert!(
-            result.contains("\"stop_reason\":\"end_turn\""),
-            "must have a stop_reason"
-        );
     }
 }

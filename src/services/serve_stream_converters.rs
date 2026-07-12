@@ -3,35 +3,8 @@ use serde_json::{Value, json};
 use std::collections::HashMap;
 
 use crate::services::bridge_defaults::BRIDGE_FALLBACK_OPENAI_RESPONSE_ID;
-use crate::services::http_utils::{current_unix_ts, sse_data_payload};
+use crate::services::http_utils::{SseLineBuffer, current_unix_ts, sse_data_payload};
 use crate::services::openai_anthropic_bridge::ANTHROPIC_THINKING_EXT;
-
-/// Drains the next complete SSE line from `pending`, returning its text
-/// with the trailing `\r` stripped. Returns `None` when no newline is in
-/// the buffer. Newlines (0x0A) never appear inside a multi-byte UTF-8
-/// sequence, so each complete line is valid UTF-8.
-fn drain_sse_line(pending: &mut Vec<u8>) -> Option<String> {
-    let pos = pending.iter().position(|&b| b == b'\n')?;
-    let line = String::from_utf8_lossy(&pending[..pos]).into_owned();
-    pending.drain(..=pos);
-    Some(line.trim_end_matches('\r').to_string())
-}
-
-/// Decodes any remaining bytes in `pending` as a trailing SSE line and
-/// returns the trimmed text if non-empty. Consumes the buffer.
-fn drain_sse_tail(pending: &mut Vec<u8>) -> Option<String> {
-    if pending.is_empty() {
-        return None;
-    }
-    let tail = String::from_utf8_lossy(pending).into_owned();
-    pending.clear();
-    let trimmed = tail.trim_end_matches('\r').trim();
-    if trimmed.is_empty() {
-        None
-    } else {
-        Some(trimmed.to_string())
-    }
-}
 
 #[derive(Default)]
 struct AnthropicToolCallState {
@@ -56,7 +29,7 @@ struct AnthropicThinkingBlockState {
 }
 
 pub(crate) struct AnthropicToOpenAIStreamConverter {
-    pending: Vec<u8>,
+    buf: SseLineBuffer,
     id: String,
     model: String,
     fallback_model: String,
@@ -79,7 +52,7 @@ pub(crate) struct AnthropicToOpenAIStreamConverter {
 }
 
 pub(crate) struct GeminiToOpenAIStreamConverter {
-    pending: Vec<u8>,
+    buf: SseLineBuffer,
     id: String,
     model: String,
     created: u64,
@@ -95,7 +68,7 @@ pub(crate) struct GeminiToOpenAIStreamConverter {
 impl AnthropicToOpenAIStreamConverter {
     pub(crate) fn new(fallback_model: &str) -> Self {
         Self {
-            pending: Vec::new(),
+            buf: SseLineBuffer::new(),
             id: BRIDGE_FALLBACK_OPENAI_RESPONSE_ID.to_string(),
             model: String::new(),
             fallback_model: fallback_model.to_string(),
@@ -114,25 +87,17 @@ impl AnthropicToOpenAIStreamConverter {
     }
 
     pub(crate) fn push_bytes(&mut self, chunk: &[u8]) -> Result<String> {
-        self.pending.extend_from_slice(chunk);
         let mut output = String::new();
-
-        while let Some(line) = drain_sse_line(&mut self.pending) {
+        for line in self.buf.push_chunk(chunk)? {
             self.process_line(&line, &mut output)?;
         }
-        anyhow::ensure!(
-            self.pending.len() <= crate::services::http_utils::MAX_SSE_PENDING_BYTES,
-            "upstream SSE line exceeded {} bytes without a newline",
-            crate::services::http_utils::MAX_SSE_PENDING_BYTES
-        );
-
         Ok(output)
     }
 
     pub(crate) fn finish(&mut self) -> Result<String> {
         let mut output = String::new();
 
-        if let Some(tail) = drain_sse_tail(&mut self.pending) {
+        if let Some(tail) = self.buf.take_tail() {
             self.process_line(&tail, &mut output)?;
         }
 
@@ -488,7 +453,7 @@ impl AnthropicToOpenAIStreamConverter {
 impl GeminiToOpenAIStreamConverter {
     pub(crate) fn new(model: &str) -> Self {
         Self {
-            pending: Vec::new(),
+            buf: SseLineBuffer::new(),
             id: BRIDGE_FALLBACK_OPENAI_RESPONSE_ID.to_string(),
             model: model.to_string(),
             created: current_unix_ts(),
@@ -503,25 +468,17 @@ impl GeminiToOpenAIStreamConverter {
     }
 
     pub(crate) fn push_bytes(&mut self, chunk: &[u8]) -> Result<String> {
-        self.pending.extend_from_slice(chunk);
         let mut output = String::new();
-
-        while let Some(line) = drain_sse_line(&mut self.pending) {
+        for line in self.buf.push_chunk(chunk)? {
             self.process_line(&line, &mut output)?;
         }
-        anyhow::ensure!(
-            self.pending.len() <= crate::services::http_utils::MAX_SSE_PENDING_BYTES,
-            "upstream SSE line exceeded {} bytes without a newline",
-            crate::services::http_utils::MAX_SSE_PENDING_BYTES
-        );
-
         Ok(output)
     }
 
     pub(crate) fn finish(&mut self) -> Result<String> {
         let mut output = String::new();
 
-        if let Some(tail) = drain_sse_tail(&mut self.pending) {
+        if let Some(tail) = self.buf.take_tail() {
             self.process_line(&tail, &mut output)?;
         }
 

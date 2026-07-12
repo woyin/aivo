@@ -24,7 +24,7 @@ use crate::services::copilot_auth::{
 use crate::services::cursor_acp::{self, CursorChunk};
 use crate::services::http_debug::LoggedSend;
 use crate::services::http_utils::copilot_initiator_from_openai;
-use crate::services::http_utils::sse_data_payload;
+use crate::services::http_utils::{SseLineBuffer, sse_data_payload};
 use crate::services::huggingface;
 use crate::services::model_names;
 use crate::services::models_cache::ModelsCache;
@@ -1728,25 +1728,6 @@ where
     Err(last_err.unwrap_or_else(|| anyhow::anyhow!("Request failed")))
 }
 
-/// Append a stream chunk to `buf` and drain every complete `\n`-terminated line
-/// (trailing `\r`/`\n` stripped). Accumulates RAW BYTES so a multi-byte char
-/// (CJK, emoji) straddling a chunk boundary is reassembled — decoding each chunk
-/// alone would split it into replacement chars. The partial trailing line stays
-/// buffered for the next chunk.
-fn drain_sse_lines(buf: &mut Vec<u8>, chunk: &[u8]) -> Vec<String> {
-    buf.extend_from_slice(chunk);
-    let mut lines = Vec::new();
-    while let Some(pos) = buf.iter().position(|&b| b == b'\n') {
-        let line_bytes: Vec<u8> = buf.drain(..=pos).collect();
-        lines.push(
-            String::from_utf8_lossy(&line_bytes)
-                .trim_end_matches(['\n', '\r'])
-                .to_string(),
-        );
-    }
-    lines
-}
-
 /// Sends a chat completion request and prints the response.
 /// Tries streaming first; falls back to non-streaming if the server returns a 5xx error.
 /// Returns the full assistant message content.
@@ -1798,7 +1779,7 @@ where
     let mut full_reasoning = String::new();
     let mut usage = None;
     let mut response_model: Option<String> = None;
-    let mut line_buf: Vec<u8> = Vec::new();
+    let mut line_buf = SseLineBuffer::new();
     let mut done = false;
 
     while !done {
@@ -1813,7 +1794,7 @@ where
         }) else {
             break;
         };
-        for line in drain_sse_lines(&mut line_buf, &chunk) {
+        for line in line_buf.push_chunk(&chunk)? {
             if let Some(data) = sse_data_payload(&line) {
                 if data.trim() == "[DONE]" {
                     done = true;
@@ -1841,7 +1822,7 @@ where
         }
     }
 
-    let tail_str = String::from_utf8_lossy(&line_buf);
+    let tail_str = line_buf.take_tail().unwrap_or_default();
     let tail = tail_str.trim();
     if !tail.is_empty() {
         if let Some(data) = sse_data_payload(tail) {
@@ -2059,7 +2040,7 @@ where
     let mut full_reasoning = String::new();
     let mut usage = None;
     let mut response_model: Option<String> = None;
-    let mut line_buf: Vec<u8> = Vec::new();
+    let mut line_buf = SseLineBuffer::new();
     let mut done = false;
 
     while !done {
@@ -2074,7 +2055,7 @@ where
         }) else {
             break;
         };
-        for line in drain_sse_lines(&mut line_buf, &chunk) {
+        for line in line_buf.push_chunk(&chunk)? {
             if let Some(data) = sse_data_payload(&line) {
                 if data.trim() == "[DONE]" {
                     done = true;
@@ -2102,7 +2083,7 @@ where
         }
     }
 
-    let tail_str = String::from_utf8_lossy(&line_buf);
+    let tail_str = line_buf.take_tail().unwrap_or_default();
     let tail = tail_str.trim();
     if !tail.is_empty() {
         if let Some(data) = sse_data_payload(tail) {
@@ -2267,10 +2248,10 @@ where
     let mut full_content = String::new();
     let mut usage = None;
     let mut response_model: Option<String> = None;
-    let mut line_buf: Vec<u8> = Vec::new();
+    let mut line_buf = SseLineBuffer::new();
 
     while let Some(chunk) = response.chunk().await? {
-        for line in drain_sse_lines(&mut line_buf, &chunk) {
+        for line in line_buf.push_chunk(&chunk)? {
             if let Some(data) = sse_data_payload(&line) {
                 if let Some(tokens) = parse_responses_usage_chunk(data) {
                     merge_token_usage(&mut usage, tokens);
@@ -2290,7 +2271,7 @@ where
         }
     }
 
-    let tail_str = String::from_utf8_lossy(&line_buf);
+    let tail_str = line_buf.take_tail().unwrap_or_default();
     let tail = tail_str.trim();
     if !tail.is_empty()
         && let Some(data) = sse_data_payload(tail)
@@ -2453,10 +2434,10 @@ where
     let mut full_content = String::new();
     let mut usage = None;
     let mut response_model: Option<String> = None;
-    let mut line_buf: Vec<u8> = Vec::new();
+    let mut line_buf = SseLineBuffer::new();
 
     while let Some(chunk) = response.chunk().await? {
-        for line in drain_sse_lines(&mut line_buf, &chunk) {
+        for line in line_buf.push_chunk(&chunk)? {
             if let Some(data) = sse_data_payload(&line) {
                 if let Some(tokens) = parse_responses_usage_chunk(data) {
                     merge_token_usage(&mut usage, tokens);
@@ -2476,7 +2457,7 @@ where
         }
     }
 
-    let tail_str = String::from_utf8_lossy(&line_buf);
+    let tail_str = line_buf.take_tail().unwrap_or_default();
     let tail = tail_str.trim();
     if !tail.is_empty()
         && let Some(data) = sse_data_payload(tail)
@@ -2595,10 +2576,10 @@ where
     let mut full_reasoning = String::new();
     let mut usage = None;
     let mut response_model: Option<String> = None;
-    let mut line_buf: Vec<u8> = Vec::new();
+    let mut line_buf = SseLineBuffer::new();
 
     while let Some(chunk) = response.chunk().await? {
-        for line in drain_sse_lines(&mut line_buf, &chunk) {
+        for line in line_buf.push_chunk(&chunk)? {
             if let Some(data) = sse_data_payload(&line) {
                 if let Some(tokens) = parse_anthropic_usage_chunk(data) {
                     merge_token_usage(&mut usage, tokens);
@@ -2627,7 +2608,7 @@ where
     // arrived — so the last fragment of a truncated reply isn't dropped. The
     // other five senders already do this; gating on `full_content.is_empty()`
     // here was the lone divergence and silently lost that fragment.
-    let tail_str = String::from_utf8_lossy(&line_buf);
+    let tail_str = line_buf.take_tail().unwrap_or_default();
     let tail = tail_str.trim();
     if !tail.is_empty()
         && let Some(data) = sse_data_payload(tail)
@@ -2787,10 +2768,10 @@ where
 
     let mut full_content = String::new();
     let mut usage = None;
-    let mut line_buf: Vec<u8> = Vec::new();
+    let mut line_buf = SseLineBuffer::new();
 
     while let Some(chunk) = response.chunk().await? {
-        for line in drain_sse_lines(&mut line_buf, &chunk) {
+        for line in line_buf.push_chunk(&chunk)? {
             if let Some(data) = sse_data_payload(&line) {
                 if let Some(tokens) = parse_google_usage_chunk(data) {
                     merge_token_usage(&mut usage, tokens);
@@ -2810,7 +2791,7 @@ where
     }
 
     // Process any remaining data in the buffer
-    let tail_str = String::from_utf8_lossy(&line_buf);
+    let tail_str = line_buf.take_tail().unwrap_or_default();
     let tail = tail_str.trim();
     if !tail.is_empty()
         && let Some(data) = sse_data_payload(tail)
@@ -3009,32 +2990,6 @@ mod tests {
             friendly_base_url("https://api.deepseek.com/v1"),
             "https://api.deepseek.com/v1"
         );
-    }
-
-    #[test]
-    fn test_drain_sse_lines_reassembles_split_multibyte() {
-        // A 3-byte char (`中`) split across two chunks must be reassembled, not
-        // corrupted into replacement chars.
-        let line = "data: 中文\n";
-        let bytes = line.as_bytes();
-        let split = line.find('中').unwrap() + 1; // mid-`中`
-        let mut buf: Vec<u8> = Vec::new();
-        // First chunk ends mid-char → no complete line yet.
-        assert!(drain_sse_lines(&mut buf, &bytes[..split]).is_empty());
-        // Second chunk completes it → the full, intact line.
-        assert_eq!(
-            drain_sse_lines(&mut buf, &bytes[split..]),
-            vec!["data: 中文".to_string()]
-        );
-    }
-
-    #[test]
-    fn test_drain_sse_lines_splits_and_strips_cr() {
-        let mut buf: Vec<u8> = Vec::new();
-        let lines = drain_sse_lines(&mut buf, b"a\r\nb\nc");
-        assert_eq!(lines, vec!["a".to_string(), "b".to_string()]);
-        // The partial `c` stays buffered until its newline arrives.
-        assert_eq!(drain_sse_lines(&mut buf, b"\n"), vec!["c".to_string()]);
     }
 
     #[test]

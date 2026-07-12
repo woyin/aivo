@@ -20,12 +20,12 @@ pub(crate) fn convert_chat_sse_to_responses_sse(
     chat_sse: &str,
     original_model: &str,
     custom_tools: &HashSet<String>,
-) -> String {
+) -> Result<String> {
     let mut converter = ResponsesStreamConverter::new(original_model, false)
         .with_custom_tools(custom_tools.clone());
-    let mut output = converter.push_bytes(chat_sse.as_bytes());
+    let mut output = converter.push_bytes(chat_sse.as_bytes())?;
     output.push_str(&converter.finish());
-    output
+    Ok(output)
 }
 
 fn extract_completed_response_from_sse(sse: &str) -> Option<Value> {
@@ -125,9 +125,9 @@ mod tests {
         let split = line.find("你好").unwrap() + 2; // mid-way through 你 (3 bytes)
 
         let mut converter = ResponsesStreamConverter::new("gpt-4o", false);
-        let mut out = converter.push_bytes(&bytes[..split]);
-        out.push_str(&converter.push_bytes(&bytes[split..]));
-        out.push_str(&converter.push_bytes(b"data: [DONE]\n"));
+        let mut out = converter.push_bytes(&bytes[..split]).unwrap();
+        out.push_str(&converter.push_bytes(&bytes[split..]).unwrap());
+        out.push_str(&converter.push_bytes(b"data: [DONE]\n").unwrap());
         out.push_str(&converter.finish());
 
         assert!(out.contains("你好"), "{out}");
@@ -143,7 +143,8 @@ mod tests {
             "data: [DONE]\n\n",
         );
 
-        let responses_sse = convert_chat_sse_to_responses_sse(chat_sse, "gpt-4o", &HashSet::new());
+        let responses_sse =
+            convert_chat_sse_to_responses_sse(chat_sse, "gpt-4o", &HashSet::new()).unwrap();
 
         assert!(responses_sse.contains("event: response.created"));
         assert!(responses_sse.contains("event: response.output_text.delta"));
@@ -161,7 +162,7 @@ mod tests {
         );
 
         let responses_sse =
-            convert_chat_sse_to_responses_sse(chat_sse, "grok-4.3", &HashSet::new());
+            convert_chat_sse_to_responses_sse(chat_sse, "grok-4.3", &HashSet::new()).unwrap();
         let response = extract_completed_response_from_sse(&responses_sse).unwrap();
 
         assert_eq!(response["usage"]["input_tokens"], 15000);
@@ -179,7 +180,7 @@ mod tests {
         );
 
         let responses_sse =
-            convert_chat_sse_to_responses_sse(chat_sse, "grok-4.3", &HashSet::new());
+            convert_chat_sse_to_responses_sse(chat_sse, "grok-4.3", &HashSet::new()).unwrap();
         let response = extract_completed_response_from_sse(&responses_sse).unwrap();
 
         assert_eq!(response["usage"]["input_tokens"], 15000);
@@ -196,7 +197,8 @@ mod tests {
             "data: [DONE]\n\n",
         );
 
-        let responses_sse = convert_chat_sse_to_responses_sse(chat_sse, "gpt-4o", &HashSet::new());
+        let responses_sse =
+            convert_chat_sse_to_responses_sse(chat_sse, "gpt-4o", &HashSet::new()).unwrap();
 
         assert!(responses_sse.contains("event: response.output_item.added"));
         assert!(responses_sse.contains("event: response.function_call_arguments.delta"));
@@ -216,7 +218,8 @@ mod tests {
         );
 
         let responses_sse =
-            convert_chat_sse_to_responses_sse(chat_sse, "deepseek-reasoner", &HashSet::new());
+            convert_chat_sse_to_responses_sse(chat_sse, "deepseek-reasoner", &HashSet::new())
+                .unwrap();
 
         assert!(responses_sse.contains("event: response.reasoning_summary_text.delta"));
         assert!(responses_sse.contains("\"delta\":\"thinking...\""));
@@ -232,7 +235,8 @@ mod tests {
             "data: [DONE]\n\n",
         );
 
-        let responses_sse = convert_chat_sse_to_responses_sse(chat_sse, "gpt-4o", &HashSet::new());
+        let responses_sse =
+            convert_chat_sse_to_responses_sse(chat_sse, "gpt-4o", &HashSet::new()).unwrap();
         let response = extract_completed_response_from_sse(&responses_sse).unwrap();
 
         assert_eq!(response["status"], "incomplete");

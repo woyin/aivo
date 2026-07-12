@@ -240,9 +240,27 @@ impl ServeCommand {
         println!(
             "{}",
             style::dim(
-                "Start a local OpenAI-compatible server. Proxies to the active key, or serves a local llama-server when given a hf:/URL REF."
+                "Start a local any-to-any AI proxy. Clients speak OpenAI Chat, Anthropic, Gemini, or the Responses API; aivo bridges to whatever protocol the active key's provider answers. Serves a local llama-server when given a hf:/URL REF."
             )
         );
+        println!();
+        println!("{}", style::bold("Endpoints:"));
+        let print_ep = |path: &str, desc: &str| {
+            println!(
+                "  {}{}",
+                style::cyan(format!("{:<44}", path)),
+                style::dim(desc)
+            );
+        };
+        print_ep("POST /v1/chat/completions", "OpenAI Chat Completions");
+        print_ep("POST /v1/responses", "OpenAI Responses API");
+        print_ep("POST /v1/messages", "Anthropic Messages");
+        print_ep(
+            "POST /v1beta/models/{model}:generateContent",
+            "Gemini (+ :streamGenerateContent)",
+        );
+        print_ep("POST /v1/embeddings", "OpenAI Embeddings");
+        print_ep("GET  /v1/models", "Model list from the upstream");
         println!();
         println!("{}", style::bold("Options:"));
         let print_opt = |flag: &str, desc: &str| {
@@ -267,7 +285,7 @@ impl ServeCommand {
         );
         print_opt(
             "--auth-token [TOKEN]",
-            "Require bearer token (auto-generated if omitted)",
+            "Require a token: Bearer/x-api-key/x-goog-api-key/?key= (auto-generated if omitted)",
         );
         println!();
         println!("{}", style::bold("Examples:"));

@@ -100,8 +100,8 @@ fn translate_openai_tool_to_anthropic(tool: &Value) -> Option<Value> {
 }
 
 #[derive(Clone, Copy, Debug)]
-pub struct OpenAIToAnthropicChatConfig {
-    pub default_model: &'static str,
+pub struct OpenAIToAnthropicChatConfig<'a> {
+    pub default_model: &'a str,
 }
 
 pub fn convert_openai_chat_to_anthropic_request(

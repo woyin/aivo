@@ -12,20 +12,13 @@ use crate::services::http_utils;
 use crate::services::model_names::{
     copilot_model_name, requires_max_completion_tokens, transform_model_for_openrouter,
 };
-use crate::services::openai_anthropic_bridge::{
-    OpenAIToAnthropicChatConfig, convert_anthropic_to_openai_chat_response,
-    convert_openai_chat_response_to_sse, convert_openai_chat_to_anthropic_request,
-};
+use crate::services::openai_anthropic_bridge::convert_openai_chat_response_to_sse;
 use crate::services::openai_gemini_bridge::{
-    OpenAIToGeminiConfig, build_google_generate_content_url,
-    build_google_stream_generate_content_url, convert_gemini_to_openai_chat_response,
-    convert_openai_chat_to_gemini_request,
+    build_google_generate_content_url, build_google_stream_generate_content_url,
 };
-use crate::services::responses_chat_conversion::{
-    ResponsesStreamConverter, convert_chat_to_responses_request, convert_responses_json_to_chat,
-};
-use crate::services::serve_stream_converters::{
-    AnthropicToOpenAIStreamConverter, GeminiToOpenAIStreamConverter,
+use crate::services::wire_format::{
+    RequestOptions, ResponseOptions, StreamAdapter, StreamOptions, stream_adapter,
+    translate_request, translate_response,
 };
 
 #[derive(Clone)]
@@ -67,17 +60,10 @@ pub(crate) enum RouterResponse {
 
 pub(crate) enum StreamingBody {
     Upstream(reqwest::Response),
-    Anthropic {
+    /// Upstream SSE converted to client shape via wire-format adapters.
+    Converted {
         upstream: reqwest::Response,
-        converter: AnthropicToOpenAIStreamConverter,
-    },
-    Gemini {
-        upstream: reqwest::Response,
-        converter: GeminiToOpenAIStreamConverter,
-    },
-    Responses {
-        source: Box<StreamingBody>,
-        converter: ResponsesStreamConverter,
+        adapter: Box<dyn StreamAdapter + Send>,
     },
 }
 
@@ -126,9 +112,9 @@ pub(crate) async fn send_gemini_chat(
         .unwrap_or("gemini-2.5-pro")
         .to_string();
 
-    let gemini_req = convert_openai_chat_to_gemini_request(
+    let gemini_req = translate_request(
         body,
-        &OpenAIToGeminiConfig {
+        &RequestOptions::ChatToGemini {
             default_model: "gemini-2.5-pro",
         },
     );
@@ -151,6 +137,86 @@ pub(crate) async fn send_gemini_chat(
         .await?;
 
     finalize_gemini_response(response, client_wants_stream, &model).await
+}
+
+/// Posts an already-Gemini-shaped body, returning the RAW Gemini response — the
+/// direct `Anthropic → Gemini` edge converts it itself; streaming passes through.
+pub(crate) async fn send_gemini_native(
+    gemini_req: &Value,
+    model: &str,
+    client_wants_stream: bool,
+    context: &UpstreamRequestContext,
+) -> Result<RouterResponse> {
+    let url = if client_wants_stream {
+        build_google_stream_generate_content_url(&context.upstream_base_url, model)
+    } else {
+        build_google_generate_content_url(&context.upstream_base_url, model)
+    };
+    let response = context
+        .with_device_headers(
+            context
+                .client
+                .post(&url)
+                .header("x-goog-api-key", context.upstream_api_key.as_str())
+                .header("Content-Type", CONTENT_TYPE_JSON),
+        )
+        .json(gemini_req)
+        .send_logged()
+        .await?;
+
+    let status = response.status().as_u16();
+    let content_type = http_utils::response_content_type(&response);
+    if status >= 400 {
+        return Ok(RouterResponse::buffered(
+            status,
+            &content_type,
+            response.bytes().await?.to_vec(),
+        ));
+    }
+    if client_wants_stream && content_type.contains("text/event-stream") {
+        return Ok(RouterResponse::Streaming {
+            status,
+            content_type: "text/event-stream".to_string(),
+            body: Box::new(StreamingBody::Upstream(response)),
+        });
+    }
+    Ok(RouterResponse::buffered(
+        200,
+        CONTENT_TYPE_JSON,
+        response.bytes().await?.to_vec(),
+    ))
+}
+
+/// Posts an already-Anthropic-shaped body to `/v1/messages`, returning the RAW
+/// response — the reverse direct edge converts it to Gemini shape itself.
+pub(crate) async fn send_anthropic_native(
+    anthropic_req: &Value,
+    context: &UpstreamRequestContext,
+) -> Result<RouterResponse> {
+    let mut anthropic_req = anthropic_req.clone();
+    anthropic_req["stream"] = json!(false);
+
+    let url = http_utils::build_target_url(&context.upstream_base_url, "/v1/messages");
+    let response = context
+        .with_device_headers(
+            context
+                .client
+                .post(&url)
+                .header("x-api-key", context.upstream_api_key.as_str())
+                .header("anthropic-version", "2023-06-01")
+                .header("Content-Type", CONTENT_TYPE_JSON),
+        )
+        .json(&anthropic_req)
+        .send_logged()
+        .await?;
+
+    let status = response.status().as_u16();
+    let content_type = http_utils::response_content_type(&response);
+    Ok(RouterResponse::buffered(
+        status,
+        &content_type,
+        response.bytes().await?.to_vec(),
+    ))
 }
 
 pub(crate) async fn send_openai_chat(
@@ -243,7 +309,7 @@ pub(crate) async fn send_copilot_responses(
     let mut chat_body = chat_body.clone();
     normalize_openai_request_model(&mut chat_body, false, true);
     strip_non_function_tools(&mut chat_body);
-    let responses_body = convert_chat_to_responses_request(&chat_body);
+    let responses_body = translate_request(&chat_body, &RequestOptions::ChatToResponses);
     // Bare path, not a URL: Copilot's endpoint comes from the token exchange, and
     // a URL built from the "copilot" sentinel base wouldn't parse to `/responses`.
     let initiator = http_utils::copilot_initiator_from_openai(&chat_body);
@@ -277,7 +343,7 @@ pub(crate) async fn send_copilot_responses(
     }
 
     let responses_json: Value = serde_json::from_str(&text)?;
-    let chat_json = convert_responses_json_to_chat(&responses_json);
+    let chat_json = translate_response(&responses_json, &ResponseOptions::ChatToResponses)?;
     if client_wants_stream {
         return Ok(RouterResponse::buffered(
             200,
@@ -336,9 +402,9 @@ fn build_anthropic_request(body: &Value, client_wants_stream: bool) -> (String, 
         inject_chat_completions_cache_control(&mut body_with_cache);
     }
 
-    let mut anthropic_req = convert_openai_chat_to_anthropic_request(
+    let mut anthropic_req = translate_request(
         &body_with_cache,
-        &OpenAIToAnthropicChatConfig {
+        &RequestOptions::ChatToAnthropic {
             default_model: "claude-sonnet-4-5",
         },
     );
@@ -456,16 +522,23 @@ async fn finalize_anthropic_response(
         return Ok(RouterResponse::Streaming {
             status,
             content_type: "text/event-stream".to_string(),
-            body: Box::new(StreamingBody::Anthropic {
+            body: Box::new(StreamingBody::Converted {
                 upstream: response,
-                converter: AnthropicToOpenAIStreamConverter::new(fallback_model),
+                adapter: stream_adapter(StreamOptions::ChatToAnthropic {
+                    model: fallback_model,
+                }),
             }),
         });
     }
 
     let resp_body = response.text().await?;
     let anthropic_resp: Value = serde_json::from_str(&resp_body)?;
-    let openai_resp = convert_anthropic_to_openai_chat_response(&anthropic_resp, fallback_model);
+    let openai_resp = translate_response(
+        &anthropic_resp,
+        &ResponseOptions::ChatToAnthropic {
+            model: fallback_model,
+        },
+    )?;
 
     if client_wants_stream {
         Ok(RouterResponse::buffered(
@@ -502,16 +575,16 @@ async fn finalize_gemini_response(
         return Ok(RouterResponse::Streaming {
             status,
             content_type: "text/event-stream".to_string(),
-            body: Box::new(StreamingBody::Gemini {
+            body: Box::new(StreamingBody::Converted {
                 upstream: response,
-                converter: GeminiToOpenAIStreamConverter::new(model),
+                adapter: stream_adapter(StreamOptions::ChatToGemini { model }),
             }),
         });
     }
 
     let resp_body = response.text().await?;
     let gemini_resp: Value = serde_json::from_str(&resp_body)?;
-    let openai_resp = convert_gemini_to_openai_chat_response(&gemini_resp, model);
+    let openai_resp = translate_response(&gemini_resp, &ResponseOptions::ChatToGemini { model })?;
 
     if client_wants_stream {
         Ok(RouterResponse::buffered(

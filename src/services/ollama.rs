@@ -290,22 +290,19 @@ pub async fn pull_model(name: &str) -> Result<()> {
     let mut last_status = String::new();
     let mut saw_success = false;
     // Network chunks split at arbitrary byte offsets, not line boundaries —
-    // buffer and consume complete lines, or a JSON line straddling two
-    // chunks (including the final success/error line) is silently dropped.
-    let mut pending: Vec<u8> = Vec::new();
+    // reassemble lines, else a JSON line straddling two chunks is dropped.
+    let mut buf = crate::services::http_utils::SseLineBuffer::new();
     while let Some(chunk) = resp
         .chunk()
         .await
         .context("Stream error during model pull")?
     {
-        pending.extend_from_slice(&chunk);
-        while let Some(pos) = pending.iter().position(|&b| b == b'\n') {
-            let line: Vec<u8> = pending.drain(..=pos).collect();
-            apply_pull_line(&line[..line.len() - 1], &mut last_status, &mut saw_success)?;
+        for line in buf.push_chunk(&chunk)? {
+            apply_pull_line(&line, &mut last_status, &mut saw_success)?;
         }
     }
-    if !pending.is_empty() {
-        apply_pull_line(&pending, &mut last_status, &mut saw_success)?;
+    if let Some(tail) = buf.take_tail() {
+        apply_pull_line(&tail, &mut last_status, &mut saw_success)?;
     }
 
     if !saw_success {
@@ -326,11 +323,11 @@ pub async fn pull_model(name: &str) -> Result<()> {
 
 /// Applies one complete /api/pull progress line (a JSON object with status
 /// and optional progress fields). Bails on an in-stream error object.
-fn apply_pull_line(line: &[u8], last_status: &mut String, saw_success: &mut bool) -> Result<()> {
+fn apply_pull_line(line: &str, last_status: &mut String, saw_success: &mut bool) -> Result<()> {
     if line.is_empty() {
         return Ok(());
     }
-    let Ok(v) = serde_json::from_slice::<serde_json::Value>(line) else {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
         return Ok(());
     };
     if let Some(error) = v["error"].as_str() {
@@ -415,19 +412,16 @@ mod tests {
         // Simulate the reassembly loop from pull_model: the success line
         // arrives split across two network chunks.
         let chunks: [&[u8]; 2] = [b"{\"status\":\"succ", b"ess\"}\n"];
-        let mut pending: Vec<u8> = Vec::new();
+        let mut buf = crate::services::http_utils::SseLineBuffer::new();
         let mut last_status = String::new();
         let mut saw_success = false;
         for chunk in chunks {
-            pending.extend_from_slice(chunk);
-            while let Some(pos) = pending.iter().position(|&b| b == b'\n') {
-                let line: Vec<u8> = pending.drain(..=pos).collect();
-                apply_pull_line(&line[..line.len() - 1], &mut last_status, &mut saw_success)
-                    .unwrap();
+            for line in buf.push_chunk(chunk).unwrap() {
+                apply_pull_line(&line, &mut last_status, &mut saw_success).unwrap();
             }
         }
         assert!(saw_success);
-        assert!(pending.is_empty());
+        assert!(buf.take_tail().is_none());
     }
 
     #[test]
@@ -435,7 +429,7 @@ mod tests {
         let mut last_status = String::new();
         let mut saw_success = false;
         let err = apply_pull_line(
-            b"{\"error\":\"manifest unknown\"}",
+            "{\"error\":\"manifest unknown\"}",
             &mut last_status,
             &mut saw_success,
         );

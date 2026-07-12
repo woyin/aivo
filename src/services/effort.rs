@@ -116,6 +116,16 @@ impl CanonicalEffort {
         }
     }
 
+    /// Inverse of [`Self::to_gemini_thinking_level`].
+    pub(crate) fn from_gemini_thinking_level(level: &str) -> Option<Self> {
+        match level.to_ascii_lowercase().as_str() {
+            "low" => Some(Self::Low),
+            "medium" => Some(Self::Medium),
+            "high" => Some(Self::High),
+            _ => None,
+        }
+    }
+
     /// Map to Gemini 3 `thinking_level`. Gemini has only three tiers, so
     /// `Max` collapses to `high`.
     pub(crate) fn to_gemini_thinking_level(self) -> Option<&'static str> {

@@ -11,10 +11,14 @@ use std::sync::Arc;
 
 use crate::commands::models::fetch_models;
 use crate::constants::CONTENT_TYPE_JSON;
+use crate::services::anthropic_chat_request::AnthropicToOpenAIConfig;
+use crate::services::anthropic_chat_response::{OpenAIToAnthropicConfig, UsageValueMode};
 use crate::services::copilot_auth::CopilotTokenManager;
 use crate::services::http_utils::{self, router_http_client_with_timeout};
 use crate::services::log_store::{LogEvent, LogStore};
 use crate::services::model_list_response;
+use crate::services::openai_anthropic_bridge::convert_openai_chat_response_to_sse;
+use crate::services::openai_gemini_bridge::convert_openai_chat_to_gemini_sse;
 use crate::services::protocol_fallback::{
     FirstError, MismatchDirective, commit_protocol_switch, mismatch_directive, protocol_candidates,
     record_request_outcome,
@@ -23,22 +27,22 @@ use crate::services::provider_protocol::{
     PathVariant, ProviderProtocol, classify_failed_attempt, is_protocol_mismatch,
 };
 use crate::services::request_log::RequestLogger;
-use crate::services::responses_chat_conversion::ResponsesStreamConverter;
 use crate::services::responses_to_chat_router::{
     ResponsesToChatRouterConfig, collect_custom_tool_names, convert_chat_response_to_responses_sse,
-    convert_responses_to_chat_request,
 };
 use crate::services::route_cache::{RouteCache, RouteSlot};
-use crate::services::serve_responses::{
-    convert_chat_response_to_responses_json, convert_chat_sse_to_responses_sse,
-};
+use crate::services::serve_responses::convert_chat_sse_to_responses_sse;
 use crate::services::serve_upstream::{
     RouterResponse, StreamingBody, UpstreamRequestContext, copilot_requires_responses_api,
-    send_anthropic_chat, send_copilot_responses, send_gemini_chat, send_openai_chat,
-    send_openai_embeddings,
+    send_anthropic_chat, send_anthropic_native, send_copilot_responses, send_gemini_chat,
+    send_gemini_native, send_openai_chat, send_openai_embeddings,
 };
 use crate::services::session_store::{ApiKey, SessionStore};
 use crate::services::usage_stats_store::RunTokenTally;
+use crate::services::wire_format::{
+    Chain, RequestOptions, ResponseOptions, StreamOptions, WireFormat, stream_adapter,
+    translate_request, translate_response,
+};
 
 use std::sync::LazyLock;
 
@@ -65,6 +69,9 @@ pub struct ServeRouterConfig {
     pub is_copilot: bool,
     pub is_openrouter: bool,
     pub is_starter: bool,
+    /// Upstream requires `reasoning_content` on assistant turns (deepseek/moonshot);
+    /// injected to avoid a 400. From the provider profile at startup.
+    pub requires_reasoning_content: bool,
     pub cors: bool,
     pub timeout: u64,
     pub auth_token: Option<String>,
@@ -98,6 +105,7 @@ impl ServeRouterConfig {
             is_copilot: profile.serve_flags.is_copilot,
             is_openrouter: profile.serve_flags.is_openrouter,
             is_starter: profile.serve_flags.is_starter,
+            requires_reasoning_content: profile.quirks.requires_reasoning_content,
             cors,
             timeout,
             auth_token,
@@ -310,6 +318,7 @@ impl ServeRouter {
                         is_copilot,
                         is_openrouter: profile.serve_flags.is_openrouter,
                         is_starter: profile.serve_flags.is_starter,
+                        requires_reasoning_content: profile.quirks.requires_reasoning_content,
                         cors: false,
                         timeout,
                         auth_token: None,
@@ -358,13 +367,7 @@ async fn run_accept_loop(listener: tokio::net::TcpListener, state: Arc<ServeStat
     };
     // Accept both forms Claude Code sends: `Authorization: Bearer <token>`
     // (when ANTHROPIC_AUTH_TOKEN is set) and `x-api-key: <token>` (when
-    // ANTHROPIC_API_KEY is set). The two Arcs share lifetime with the loop;
-    // both are None when no auth_token is configured.
-    let expected_bearer: Option<Arc<str>> = state
-        .config
-        .auth_token
-        .as_ref()
-        .map(|t| Arc::from(format!("Bearer {}", t)));
+    // ANTHROPIC_API_KEY is set); Google SDKs send `x-goog-api-key` / `?key=`.
     let expected_token: Option<Arc<str>> = state
         .config
         .auth_token
@@ -402,7 +405,6 @@ async fn run_accept_loop(listener: tokio::net::TcpListener, state: Arc<ServeStat
             Ok(p) => p,
             Err(_) => continue, // semaphore closed during shutdown
         };
-        let expected_bearer = expected_bearer.clone();
         let expected_token = expected_token.clone();
 
         tokio::spawn(async move {
@@ -446,30 +448,21 @@ async fn run_accept_loop(listener: tokio::net::TcpListener, state: Arc<ServeStat
             let path = http_utils::extract_request_path(&request);
             let path_no_query = path.split('?').next().unwrap_or(&path);
 
-            // Auth check (skip /health). Claude Code sends `Authorization:
-            // Bearer <token>` for ANTHROPIC_AUTH_TOKEN and `x-api-key: <token>`
-            // for ANTHROPIC_API_KEY; accept either against the configured token.
-            if let (Some(bearer), Some(token)) = (&expected_bearer, &expected_token)
+            // Auth check (skip /health): accept any client-native auth form.
+            if let Some(token) = &expected_token
                 && path_no_query != "/health"
+                && !http_utils::request_loopback_authorized(&request, token)
             {
-                let headers_end = request.find("\r\n\r\n").unwrap_or(request.len());
-                let head = &request[..headers_end];
-                let auth_header = http_utils::header_value(head, "Authorization");
-                let api_key_header = http_utils::header_value(head, "x-api-key");
-                let bearer_match = auth_header == Some(&**bearer);
-                let api_key_match = api_key_header == Some(&**token);
-                if !bearer_match && !api_key_match {
-                    let _ = socket
-                        .write_all(
-                            http_utils::http_error_response(
-                                401,
-                                "Invalid or missing auth token (expected Authorization: Bearer or x-api-key)",
-                            )
-                            .as_bytes(),
+                let _ = socket
+                    .write_all(
+                        http_utils::http_error_response(
+                            401,
+                            "Invalid or missing auth token (expected Authorization: Bearer, x-api-key, x-goog-api-key, or ?key=)",
                         )
-                        .await;
-                    return;
-                }
+                        .as_bytes(),
+                    )
+                    .await;
+                return;
             }
 
             let request_start = std::time::Instant::now();
@@ -507,6 +500,28 @@ async fn run_accept_loop(listener: tokio::net::TcpListener, state: Arc<ServeStat
                         ))
                     } else {
                         handle_responses_with_failover(&request, &state).await
+                    }
+                }
+                "/v1/messages" | "/messages" => {
+                    if !request.starts_with("POST ") {
+                        Ok(RouterResponse::buffered(
+                            405,
+                            CONTENT_TYPE_JSON,
+                            br#"{"error":{"message":"Method not allowed"}}"#.to_vec(),
+                        ))
+                    } else {
+                        handle_messages_with_failover(&request, &state).await
+                    }
+                }
+                p if gemini_generate_target(p).is_some() => {
+                    if !request.starts_with("POST ") {
+                        Ok(RouterResponse::buffered(
+                            405,
+                            CONTENT_TYPE_JSON,
+                            br#"{"error":{"message":"Method not allowed"}}"#.to_vec(),
+                        ))
+                    } else {
+                        handle_gemini_with_failover(&request, &state).await
                     }
                 }
                 "/v1/embeddings" => {
@@ -915,7 +930,10 @@ async fn handle_responses(request: &str, state: &ServeState) -> Result<RouterRes
     let mut config = responses_router_config(state, resolve_slot(&body, state).current().0);
     config.actual_model = Some(original_model.clone());
     let custom_tools = collect_custom_tool_names(&body);
-    let mut chat_body = convert_responses_to_chat_request(&body, &config);
+    let mut chat_body = translate_request(
+        &body,
+        &RequestOptions::ResponsesToChat(&config.conversion_config()),
+    );
     chat_body["stream"] = json!(client_wants_stream);
     let chat_response = handle_chat_body(chat_body, state).await?;
     convert_chat_response_for_responses_route(
@@ -924,6 +942,352 @@ async fn handle_responses(request: &str, state: &ServeState) -> Result<RouterRes
         &original_model,
         custom_tools,
     )
+}
+
+/// Anthropic `/v1/messages` inbound: pivot through Chat, or take the direct
+/// Gemini edge when the upstream is confirmed Gemini (`handle_messages_gemini_direct`).
+async fn handle_messages(request: &str, state: &ServeState) -> Result<RouterResponse> {
+    let body_str = http_utils::extract_request_body(request)?;
+    let mut body = match parse_json_body(body_str) {
+        Ok(v) => v,
+        Err(r) => return Ok(r),
+    };
+
+    if !body.get("messages").is_some_and(|v| v.is_array()) {
+        return Ok(RouterResponse::buffered(
+            400,
+            CONTENT_TYPE_JSON,
+            br#"{"error":{"message":"Missing required field: messages"}}"#.to_vec(),
+        ));
+    }
+    apply_alias(&mut body, &state.config.aliases);
+    let original_model = body
+        .get("model")
+        .and_then(|v| v.as_str())
+        .unwrap_or("claude-sonnet-4-5")
+        .to_string();
+    let client_wants_stream = body
+        .get("stream")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    // Confirmed Gemini upstream: take the direct edge (one conversion, not two)
+    // to preserve the thinking budget + thought-signature round-trip.
+    if WireFormat::from(resolve_slot(&body, state).current().0) == WireFormat::Gemini {
+        return handle_messages_gemini_direct(&body, &original_model, client_wants_stream, state)
+            .await;
+    }
+
+    let config = AnthropicToOpenAIConfig {
+        default_model: &original_model,
+        preserve_stream: true,
+        model_transform: None,
+        include_reasoning_content: true,
+        require_non_empty_reasoning_content: false,
+        stringify_other_tool_result_content: true,
+        tool_result_supports_multimodal: true,
+        fallback_tool_arguments_json: "{}",
+    };
+    let mut chat_body = translate_request(&body, &RequestOptions::AnthropicToChat(&config));
+    chat_body["stream"] = json!(client_wants_stream);
+    let chat_response = handle_chat_body(chat_body, state).await?;
+    convert_chat_response_for_messages_route(chat_response, client_wants_stream, &original_model)
+}
+
+fn convert_chat_response_for_messages_route(
+    chat_response: RouterResponse,
+    client_wants_stream: bool,
+    original_model: &str,
+) -> Result<RouterResponse> {
+    match chat_response {
+        RouterResponse::Buffered {
+            status,
+            content_type,
+            body,
+        } => {
+            if status >= 400 {
+                return Ok(RouterResponse::buffered(status, &content_type, body));
+            }
+
+            if client_wants_stream {
+                let chat_sse = if content_type.contains("text/event-stream") {
+                    String::from_utf8(body)?
+                } else {
+                    let chat_json: Value = serde_json::from_slice(&body)?;
+                    convert_openai_chat_response_to_sse(&chat_json)?
+                };
+                let mut adapter = stream_adapter(StreamOptions::AnthropicToChat {
+                    fallback_model: original_model,
+                });
+                let mut sse = adapter.push_bytes(chat_sse.as_bytes())?;
+                sse.push_str(&adapter.finish()?);
+                Ok(RouterResponse::buffered(
+                    200,
+                    "text/event-stream",
+                    sse.into_bytes(),
+                ))
+            } else {
+                let chat_json: Value = serde_json::from_slice(&body)?;
+                let anthropic = translate_response(
+                    &chat_json,
+                    &ResponseOptions::AnthropicToChat(&OpenAIToAnthropicConfig {
+                        fallback_id: "msg_default",
+                        model: chat_json
+                            .get("model")
+                            .and_then(|m| m.as_str())
+                            .unwrap_or(original_model),
+                        include_created: true,
+                        usage_value_mode: UsageValueMode::CoerceU64,
+                    }),
+                )?;
+                Ok(RouterResponse::buffered(
+                    200,
+                    CONTENT_TYPE_JSON,
+                    serde_json::to_vec(&anthropic)?,
+                ))
+            }
+        }
+        RouterResponse::Streaming {
+            status,
+            content_type: _,
+            body,
+        } => {
+            if !client_wants_stream {
+                anyhow::bail!(
+                    "internal error: messages route received streaming body for non-streaming request"
+                );
+            }
+
+            let converter = stream_adapter(StreamOptions::AnthropicToChat {
+                fallback_model: original_model,
+            });
+            let body = match *body {
+                StreamingBody::Upstream(upstream) => StreamingBody::Converted {
+                    upstream,
+                    adapter: converter,
+                },
+                StreamingBody::Converted { upstream, adapter } => StreamingBody::Converted {
+                    upstream,
+                    adapter: Box::new(Chain::new(adapter, converter)),
+                },
+            };
+            Ok(RouterResponse::Streaming {
+                status,
+                content_type: "text/event-stream".to_string(),
+                body: Box::new(body),
+            })
+        }
+    }
+}
+
+/// Direct `Anthropic → Gemini` edge for `/v1/messages`: one conversion each way
+/// instead of two Chat hops, so the thinking budget and thought signature survive.
+async fn handle_messages_gemini_direct(
+    body: &Value,
+    original_model: &str,
+    client_wants_stream: bool,
+    state: &ServeState,
+) -> Result<RouterResponse> {
+    let gemini_req = translate_request(
+        body,
+        &RequestOptions::AnthropicToGemini {
+            default_model: original_model,
+        },
+    );
+    let response = send_gemini_native(
+        &gemini_req,
+        original_model,
+        client_wants_stream,
+        &upstream_context(state),
+    )
+    .await?;
+
+    match response {
+        RouterResponse::Buffered {
+            status,
+            content_type,
+            body,
+        } => {
+            if status >= 400 {
+                return Ok(RouterResponse::buffered(status, &content_type, body));
+            }
+            let gemini_json: Value = serde_json::from_slice(&body)?;
+            if client_wants_stream {
+                // Client wants a stream but upstream returned non-SSE; emulate via the
+                // stream adapter as one Gemini event → Anthropic SSE.
+                let mut adapter = stream_adapter(StreamOptions::GeminiToAnthropic {
+                    model: original_model,
+                });
+                let event = format!("data: {}\n\n", serde_json::to_string(&gemini_json)?);
+                let mut sse = adapter.push_bytes(event.as_bytes())?;
+                sse.push_str(&adapter.finish()?);
+                return Ok(RouterResponse::buffered(
+                    200,
+                    "text/event-stream",
+                    sse.into_bytes(),
+                ));
+            }
+            let anthropic = translate_response(
+                &gemini_json,
+                &ResponseOptions::GeminiToAnthropic {
+                    model: original_model,
+                },
+            )?;
+            Ok(RouterResponse::buffered(
+                200,
+                CONTENT_TYPE_JSON,
+                serde_json::to_vec(&anthropic)?,
+            ))
+        }
+        RouterResponse::Streaming { status, body, .. } => {
+            let adapter = stream_adapter(StreamOptions::GeminiToAnthropic {
+                model: original_model,
+            });
+            let body = match *body {
+                StreamingBody::Upstream(upstream) => StreamingBody::Converted { upstream, adapter },
+                // send_gemini_native only ever returns a raw Upstream stream.
+                other => other,
+            };
+            Ok(RouterResponse::Streaming {
+                status,
+                content_type: "text/event-stream".to_string(),
+                body: Box::new(body),
+            })
+        }
+    }
+}
+
+/// Model + stream flag from a Gemini `generateContent`/`streamGenerateContent` path.
+fn gemini_generate_target(path: &str) -> Option<(&str, bool)> {
+    let path = path.split('?').next().unwrap_or(path);
+    let rest = path
+        .strip_prefix("/v1beta/models/")
+        .or_else(|| path.strip_prefix("/v1/models/"))?;
+    if let Some(model) = rest.strip_suffix(":streamGenerateContent") {
+        return Some((model, true));
+    }
+    rest.strip_suffix(":generateContent").map(|m| (m, false))
+}
+
+/// Gemini `generateContent` inbound. Streaming is emulated — no incremental
+/// adapter for this edge, so the reply ships buffered as one Gemini SSE event.
+async fn handle_gemini(request: &str, state: &ServeState) -> Result<RouterResponse> {
+    let path = http_utils::extract_request_path(request);
+    let Some((model, client_wants_stream)) = gemini_generate_target(&path) else {
+        return Ok(RouterResponse::buffered(
+            404,
+            CONTENT_TYPE_JSON,
+            br#"{"error":{"message":"Not found"}}"#.to_vec(),
+        ));
+    };
+    let body_str = http_utils::extract_request_body(request)?;
+    let body = match parse_json_body(body_str) {
+        Ok(v) => v,
+        Err(r) => return Ok(r),
+    };
+    if body.get("contents").is_none() {
+        return Ok(RouterResponse::buffered(
+            400,
+            CONTENT_TYPE_JSON,
+            br#"{"error":{"message":"Missing required field: contents"}}"#.to_vec(),
+        ));
+    }
+
+    // Resolve aliases before the route decision so it uses the real model, not the alias.
+    let resolved_model =
+        crate::cli_args::resolve_alias_in_memory(&state.config.aliases, Some(model.to_string()))
+            .unwrap_or_else(|| model.to_string());
+    let model = resolved_model.as_str();
+
+    // Confirmed Anthropic upstream → direct reverse edge. Model lives in the
+    // path, so resolve the route by it, not the body.
+    let upstream = WireFormat::from(state.route_cache.resolve(model).current().0);
+    if upstream == WireFormat::Anthropic {
+        return handle_gemini_anthropic_direct(&body, model, client_wants_stream, state).await;
+    }
+
+    let mut chat_body = translate_request(
+        &body,
+        &RequestOptions::GeminiToChat {
+            model,
+            requires_reasoning_content: state.config.requires_reasoning_content,
+            max_tokens_cap: None,
+        },
+    );
+    chat_body["stream"] = json!(false);
+    let chat_response = handle_chat_body(chat_body, state).await?;
+
+    match chat_response {
+        RouterResponse::Buffered {
+            status,
+            content_type,
+            body,
+        } => {
+            if status >= 400 {
+                return Ok(RouterResponse::buffered(status, &content_type, body));
+            }
+            let chat_json: Value = serde_json::from_slice(&body)?;
+            if client_wants_stream {
+                let sse = convert_openai_chat_to_gemini_sse(&chat_json);
+                Ok(RouterResponse::buffered(
+                    200,
+                    "text/event-stream",
+                    sse.into_bytes(),
+                ))
+            } else {
+                let gemini = translate_response(&chat_json, &ResponseOptions::GeminiToChat)?;
+                Ok(RouterResponse::buffered(
+                    200,
+                    CONTENT_TYPE_JSON,
+                    serde_json::to_vec(&gemini)?,
+                ))
+            }
+        }
+        RouterResponse::Streaming { .. } => {
+            anyhow::bail!("internal error: gemini route received streaming body")
+        }
+    }
+}
+
+/// Direct reverse edge for `generateContent` on a confirmed Anthropic upstream:
+/// Gemini → Anthropic → Gemini. Streaming is emulated as one SSE event.
+async fn handle_gemini_anthropic_direct(
+    body: &Value,
+    model: &str,
+    client_wants_stream: bool,
+    state: &ServeState,
+) -> Result<RouterResponse> {
+    let anthropic_req = translate_request(body, &RequestOptions::GeminiToAnthropic { model });
+    let response = send_anthropic_native(&anthropic_req, &upstream_context(state)).await?;
+
+    let RouterResponse::Buffered {
+        status,
+        content_type,
+        body,
+    } = response
+    else {
+        anyhow::bail!("internal error: send_anthropic_native returned a streaming body");
+    };
+    if status >= 400 {
+        return Ok(RouterResponse::buffered(status, &content_type, body));
+    }
+
+    let anthropic_json: Value = serde_json::from_slice(&body)?;
+    let gemini = translate_response(&anthropic_json, &ResponseOptions::AnthropicToGemini)?;
+    if client_wants_stream {
+        let sse = format!("data: {}\n\n", serde_json::to_string(&gemini)?);
+        Ok(RouterResponse::buffered(
+            200,
+            "text/event-stream",
+            sse.into_bytes(),
+        ))
+    } else {
+        Ok(RouterResponse::buffered(
+            200,
+            CONTENT_TYPE_JSON,
+            serde_json::to_vec(&gemini)?,
+        ))
+    }
 }
 
 /// Returns true if the status code should trigger failover.
@@ -1010,6 +1374,8 @@ macro_rules! impl_with_failover {
 
 impl_with_failover!(handle_chat_with_failover, handle_chat);
 impl_with_failover!(handle_responses_with_failover, handle_responses);
+impl_with_failover!(handle_messages_with_failover, handle_messages);
+impl_with_failover!(handle_gemini_with_failover, handle_gemini);
 impl_with_failover!(handle_embeddings_with_failover, handle_embeddings);
 
 async fn handle_embeddings(request: &str, state: &ServeState) -> Result<RouterResponse> {
@@ -1187,7 +1553,7 @@ fn responses_router_config(
         target_path_variant: None,
         copilot_token_manager: state.copilot_tokens.clone(),
         model_prefix: None,
-        requires_reasoning_content: false,
+        requires_reasoning_content: state.config.requires_reasoning_content,
         actual_model: None,
         max_tokens_cap: None,
         responses_api_supported: None,
@@ -1276,102 +1642,18 @@ async fn write_router_response(
                         write_chunk(socket, &chunk).await?;
                     }
                 }
-                StreamingBody::Anthropic {
+                StreamingBody::Converted {
                     mut upstream,
-                    mut converter,
+                    mut adapter,
                 } => {
                     while let Some(chunk) = upstream.chunk().await? {
                         sniffer.observe(&chunk);
-                        let mapped = converter.push_bytes(&chunk)?;
+                        let mapped = adapter.push_bytes(&chunk)?;
                         if !mapped.is_empty() {
                             write_chunk(socket, mapped.as_bytes()).await?;
                         }
                     }
-                    let tail = converter.finish()?;
-                    if !tail.is_empty() {
-                        write_chunk(socket, tail.as_bytes()).await?;
-                    }
-                }
-                StreamingBody::Gemini {
-                    mut upstream,
-                    mut converter,
-                } => {
-                    while let Some(chunk) = upstream.chunk().await? {
-                        sniffer.observe(&chunk);
-                        let mapped = converter.push_bytes(&chunk)?;
-                        if !mapped.is_empty() {
-                            write_chunk(socket, mapped.as_bytes()).await?;
-                        }
-                    }
-                    let tail = converter.finish()?;
-                    if !tail.is_empty() {
-                        write_chunk(socket, tail.as_bytes()).await?;
-                    }
-                }
-                StreamingBody::Responses {
-                    source,
-                    mut converter,
-                } => {
-                    match *source {
-                        StreamingBody::Upstream(mut upstream) => {
-                            while let Some(chunk) = upstream.chunk().await? {
-                                sniffer.observe(&chunk);
-                                let mapped = converter.push_bytes(&chunk);
-                                if !mapped.is_empty() {
-                                    write_chunk(socket, mapped.as_bytes()).await?;
-                                }
-                            }
-                        }
-                        StreamingBody::Anthropic {
-                            mut upstream,
-                            converter: mut openai_converter,
-                        } => {
-                            while let Some(chunk) = upstream.chunk().await? {
-                                sniffer.observe(&chunk);
-                                let openai = openai_converter.push_bytes(&chunk)?;
-                                if !openai.is_empty() {
-                                    let mapped = converter.push_bytes(openai.as_bytes());
-                                    if !mapped.is_empty() {
-                                        write_chunk(socket, mapped.as_bytes()).await?;
-                                    }
-                                }
-                            }
-                            let openai_tail = openai_converter.finish()?;
-                            if !openai_tail.is_empty() {
-                                let mapped = converter.push_bytes(openai_tail.as_bytes());
-                                if !mapped.is_empty() {
-                                    write_chunk(socket, mapped.as_bytes()).await?;
-                                }
-                            }
-                        }
-                        StreamingBody::Gemini {
-                            mut upstream,
-                            converter: mut openai_converter,
-                        } => {
-                            while let Some(chunk) = upstream.chunk().await? {
-                                sniffer.observe(&chunk);
-                                let openai = openai_converter.push_bytes(&chunk)?;
-                                if !openai.is_empty() {
-                                    let mapped = converter.push_bytes(openai.as_bytes());
-                                    if !mapped.is_empty() {
-                                        write_chunk(socket, mapped.as_bytes()).await?;
-                                    }
-                                }
-                            }
-                            let openai_tail = openai_converter.finish()?;
-                            if !openai_tail.is_empty() {
-                                let mapped = converter.push_bytes(openai_tail.as_bytes());
-                                if !mapped.is_empty() {
-                                    write_chunk(socket, mapped.as_bytes()).await?;
-                                }
-                            }
-                        }
-                        StreamingBody::Responses { .. } => {
-                            anyhow::bail!("nested responses stream sources are not supported");
-                        }
-                    }
-
-                    let tail = converter.finish();
+                    let tail = adapter.finish()?;
                     if !tail.is_empty() {
                         write_chunk(socket, tail.as_bytes()).await?;
                     }
@@ -1418,7 +1700,7 @@ fn convert_chat_response_for_responses_route(
                         std::str::from_utf8(&body)?,
                         original_model,
                         &custom_tools,
-                    )
+                    )?
                 } else {
                     let chat_json: Value = serde_json::from_slice(&body)?;
                     convert_chat_response_to_responses_sse(
@@ -1435,10 +1717,12 @@ fn convert_chat_response_for_responses_route(
                 ))
             } else {
                 let chat_json: Value = serde_json::from_slice(&body)?;
-                let response_json = convert_chat_response_to_responses_json(
+                let response_json = translate_response(
                     &chat_json,
-                    original_model,
-                    &custom_tools,
+                    &ResponseOptions::ResponsesToChat {
+                        model: original_model,
+                        custom_tools: &custom_tools,
+                    },
                 )?;
                 Ok(RouterResponse::buffered(
                     200,
@@ -1458,14 +1742,25 @@ fn convert_chat_response_for_responses_route(
                 );
             }
 
+            let converter = stream_adapter(StreamOptions::ResponsesToChat {
+                model: original_model,
+                requires_reasoning_content: false,
+                custom_tools,
+            });
+            let body = match *body {
+                StreamingBody::Upstream(upstream) => StreamingBody::Converted {
+                    upstream,
+                    adapter: converter,
+                },
+                StreamingBody::Converted { upstream, adapter } => StreamingBody::Converted {
+                    upstream,
+                    adapter: Box::new(Chain::new(adapter, converter)),
+                },
+            };
             Ok(RouterResponse::Streaming {
                 status,
                 content_type: "text/event-stream".to_string(),
-                body: Box::new(StreamingBody::Responses {
-                    source: body,
-                    converter: ResponsesStreamConverter::new(original_model, false)
-                        .with_custom_tools(custom_tools),
-                }),
+                body: Box::new(body),
             })
         }
     }
@@ -1509,6 +1804,7 @@ mod tests {
                 is_copilot: false,
                 is_openrouter: false,
                 is_starter: false,
+                requires_reasoning_content: false,
                 cors: false,
                 timeout: 300,
                 auth_token: None,
@@ -1655,6 +1951,7 @@ mod tests {
                 is_copilot: false,
                 is_openrouter: true,
                 is_starter: false,
+                requires_reasoning_content: false,
                 cors: false,
                 timeout: 300,
                 auth_token: None,
@@ -1834,6 +2131,7 @@ mod tests {
                 is_copilot: false,
                 is_openrouter: false,
                 is_starter: false,
+                requires_reasoning_content: false,
                 cors: false,
                 timeout: 300,
                 auth_token: None,
@@ -1869,6 +2167,7 @@ mod tests {
             is_copilot: false,
             is_openrouter: false,
             is_starter: false,
+            requires_reasoning_content: false,
             cors: false,
             timeout: 300,
             auth_token: None,
@@ -1903,6 +2202,7 @@ mod tests {
                 is_copilot: false,
                 is_openrouter: false,
                 is_starter: false,
+                requires_reasoning_content: false,
                 cors: false,
                 timeout: 300,
                 auth_token: None,

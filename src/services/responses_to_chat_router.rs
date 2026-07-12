@@ -22,14 +22,9 @@ use crate::services::http_utils::{self};
 use crate::services::model_list_response;
 use crate::services::model_names::select_model_for_provider_attempt;
 use crate::services::openai_anthropic_bridge::{
-    OpenAIToAnthropicChatConfig, convert_anthropic_to_openai_chat_response,
-    convert_openai_chat_response_to_sse, convert_openai_chat_to_anthropic_request,
+    convert_anthropic_to_openai_chat_response, convert_openai_chat_response_to_sse,
 };
-use crate::services::openai_gemini_bridge::{
-    OpenAIToGeminiConfig, build_google_generate_content_url,
-    convert_gemini_to_openai_chat_response, convert_openai_chat_to_gemini_request,
-    openai_chat_model,
-};
+use crate::services::openai_gemini_bridge::{build_google_generate_content_url, openai_chat_model};
 use crate::services::protocol_fallback::{
     AttemptOutcome, FirstError, MismatchDirective, QuirkRetryState, classify_attempt,
     commit_protocol_switch, mismatch_directive, protocol_candidates, record_request_outcome,
@@ -41,6 +36,10 @@ use crate::services::provider_protocol::{
 };
 use crate::services::responses_chat_conversion;
 use crate::services::route_cache::{PersistedRoute, RouteCache, RouteSlot};
+use crate::services::wire_format::{
+    RequestOptions, ResponseOptions, StreamOptions, stream_adapter, translate_request,
+    translate_response,
+};
 use anyhow::Result;
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
@@ -56,9 +55,8 @@ pub use responses_chat_conversion::{
 // Internal re-exports used within this router
 use crate::services::serve_router::{StreamUsageSniffer, TokenUsage, parse_token_usage};
 use responses_chat_conversion::{
-    ResponsesStreamConverter, ResponsesToChatStreamConverter, apply_max_tokens_cap_to_fields,
-    cap_reasoning_effort, convert_chat_to_responses_request, convert_responses_json_to_chat,
-    sanitize_input_content,
+    apply_max_tokens_cap_to_fields, cap_reasoning_effort, convert_chat_to_responses_request,
+    convert_responses_json_to_chat, sanitize_input_content,
 };
 
 #[derive(Clone)]
@@ -93,6 +91,23 @@ pub struct ResponsesToChatRouterConfig {
     /// `starter`). When the body's outgoing model matches an entry here,
     /// the router prepends `aivo/` so the upstream resolves the alias.
     pub aivo_prefix_models: Vec<String>,
+}
+
+impl ResponsesToChatRouterConfig {
+    /// Projects the router config down to the conversion-only view.
+    pub fn conversion_config(
+        &self,
+    ) -> crate::services::responses_chat_conversion::ResponsesToChatConversionConfig {
+        crate::services::responses_chat_conversion::ResponsesToChatConversionConfig {
+            requires_reasoning_content: self.requires_reasoning_content,
+            target_base_url: self.target_base_url.clone(),
+            target_protocol: self.target_protocol,
+            is_copilot: self.copilot_token_manager.is_some(),
+            model_prefix: self.model_prefix.clone(),
+            actual_model: self.actual_model.clone(),
+            max_tokens_cap: self.max_tokens_cap,
+        }
+    }
 }
 
 pub struct ResponsesToChatRouter {
@@ -807,17 +822,20 @@ async fn run_chat_via_responses(
         socket
             .write_all(http_utils::http_chunked_response_head(200, "text/event-stream").as_bytes())
             .await?;
-        let mut conv = ResponsesToChatStreamConverter::new(&original_model, include_usage);
+        let mut conv = stream_adapter(StreamOptions::ChatToResponses {
+            model: &original_model,
+            include_usage,
+        });
         while let Some(chunk) = response.chunk().await? {
             sniffer.observe(&chunk);
-            let out = conv.push_bytes(&chunk);
+            let out = conv.push_bytes(&chunk)?;
             if !out.is_empty() {
                 socket
                     .write_all(&http_utils::format_http_chunk(out.as_bytes()))
                     .await?;
             }
         }
-        let tail = conv.finish();
+        let tail = conv.finish()?;
         if !tail.is_empty() {
             socket
                 .write_all(&http_utils::format_http_chunk(tail.as_bytes()))
@@ -1032,7 +1050,10 @@ async fn handle_responses_api_via_chat(
     }
     chat_config.requires_reasoning_content =
         config.requires_reasoning_content || learned_requires_reasoning.load(Ordering::Relaxed);
-    let chat_body = convert_responses_to_chat_request(body, &chat_config);
+    let chat_body = translate_request(
+        body,
+        &RequestOptions::ResponsesToChat(&chat_config.conversion_config()),
+    );
     let chat_response = match forward_openai_chat_request(
         &chat_body,
         config,
@@ -1102,7 +1123,10 @@ async fn stream_responses_via_chat(
         chat_config.actual_model = Some(original_model.clone());
     }
     chat_config.requires_reasoning_content = effective_requires_reasoning;
-    let mut chat_body = convert_responses_to_chat_request(body, &chat_config);
+    let mut chat_body = translate_request(
+        body,
+        &RequestOptions::ResponsesToChat(&chat_config.conversion_config()),
+    );
     chat_body["stream"] = json!(true);
     chat_body["stream_options"] = json!({"include_usage": true});
 
@@ -1148,19 +1172,21 @@ async fn stream_responses_via_chat(
     use tokio::io::AsyncWriteExt;
     let headers = http_utils::http_chunked_response_head(200, "text/event-stream");
     socket.write_all(headers.as_bytes()).await?;
-    let mut converter =
-        ResponsesStreamConverter::new(&original_model, effective_requires_reasoning)
-            .with_custom_tools(collect_custom_tool_names(body));
+    let mut converter = stream_adapter(StreamOptions::ResponsesToChat {
+        model: &original_model,
+        requires_reasoning_content: effective_requires_reasoning,
+        custom_tools: collect_custom_tool_names(body),
+    });
     while let Some(chunk) = response.chunk().await? {
         sniffer.observe(&chunk);
-        let converted = converter.push_bytes(&chunk);
+        let converted = converter.push_bytes(&chunk)?;
         if !converted.is_empty() {
             socket
                 .write_all(&http_utils::format_http_chunk(converted.as_bytes()))
                 .await?;
         }
     }
-    let tail = converter.finish();
+    let tail = converter.finish()?;
     if !tail.is_empty() {
         socket
             .write_all(&http_utils::format_http_chunk(tail.as_bytes()))
@@ -1610,9 +1636,9 @@ async fn forward_anthropic_protocol(
         inject_chat_completions_cache_control(&mut body_with_cache);
     }
 
-    let mut anthropic_body = convert_openai_chat_to_anthropic_request(
+    let mut anthropic_body = translate_request(
         &body_with_cache,
-        &OpenAIToAnthropicChatConfig {
+        &RequestOptions::ChatToAnthropic {
             default_model: "claude-sonnet-4-5",
         },
     );
@@ -1676,9 +1702,9 @@ async fn forward_google_protocol(
     config: &ResponsesToChatRouterConfig,
     client: &reqwest::Client,
 ) -> Result<AttemptOutcome<Value>> {
-    let google_body = convert_openai_chat_to_gemini_request(
+    let google_body = translate_request(
         body,
-        &OpenAIToGeminiConfig {
+        &RequestOptions::ChatToGemini {
             default_model: "gemini-2.5-pro",
         },
     );
@@ -1699,10 +1725,10 @@ async fn forward_google_protocol(
     let response_text = response.text().await?;
     let parsed = if status_code == 200 {
         let google_response: Value = serde_json::from_str(&response_text)?;
-        Some(convert_gemini_to_openai_chat_response(
+        Some(translate_response(
             &google_response,
-            &model,
-        ))
+            &ResponseOptions::ChatToGemini { model: &model },
+        )?)
     } else {
         None
     };
