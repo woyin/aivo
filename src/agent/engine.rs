@@ -2127,11 +2127,14 @@ you were working. If the outcome matters to the task, inspect the log; otherwise
                 .collect()
         };
         if subagent_idx.len() >= 2 {
-            ui.notify(&format!(
-                "running {} sub-agents in parallel",
-                subagent_idx.len()
-            ));
             let sink = ui.subagent_sink();
+            // A sink's live rows already show the fan-out; notify headless only.
+            if sink.is_none() {
+                ui.notify(&format!(
+                    "running {} sub-agents in parallel",
+                    subagent_idx.len()
+                ));
+            }
             if let Some(s) = &sink {
                 let labels: Vec<String> = subagent_idx
                     .iter()
