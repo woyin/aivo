@@ -88,6 +88,10 @@ pub fn create_agent_builtin() -> Skill {
 /// on-disk skill already claimed the name, so the tool enum never holds
 /// duplicates). The one assembler for every engine-construction site — the
 /// live send path, the `/context` preview, and headless one-shot.
+///
+/// [`create_skill_builtin`] is deliberately NOT injected: it's reached only
+/// via the user-typed `/create-skill`, while create-agent has no slash
+/// command by design, so this injection is its only route to the model.
 pub fn engine_skills(cwd: &Path, disabled: &std::collections::HashSet<String>) -> Vec<Skill> {
     with_builtins(discover_skills(cwd), disabled)
 }

@@ -2700,7 +2700,7 @@ impl CodeTuiApp {
     /// Blank spacer, optional capability chip, then the rotating tip. Shared by
     /// the empty state, the transcript intro, and `empty_state_height` (kept in
     /// lockstep, measuring the same lines).
-    fn welcome_status_lines(&self) -> Vec<StyledLine> {
+    pub(super) fn welcome_status_lines(&self) -> Vec<StyledLine> {
         let mut lines = vec![blank_line()];
         if let Some(chip) = self.welcome_capabilities_label() {
             lines.push(line_plain(chip, Style::default().fg(MUTED)));
@@ -2711,6 +2711,11 @@ impl CodeTuiApp {
             Span::styled("✶ Tip  ", Style::default().fg(ACCENT)),
             Span::styled(tip.to_string(), Style::default().fg(MUTED)),
         ]));
+        // Static essentials a new user needs before any rotating tip matters.
+        lines.push(line_plain(
+            "       /help commands · Shift+Tab modes · Esc interrupts".to_string(),
+            Style::default().fg(FAINT),
+        ));
         lines
     }
 
@@ -2830,8 +2835,23 @@ impl CodeTuiApp {
         // when thinking is on, the effort tier. The effort is a static setting, so
         // it stays quiet MUTED — only the meter's warning/error warmth draws the eye.
         let (meter_label, meter_color) = self.footer_status_label();
-        let mut right_spans: Vec<Span<'static>> =
-            vec![Span::styled(meter_label, Style::default().fg(meter_color))];
+        let mut right_spans: Vec<Span<'static>> = Vec::new();
+        // Extras are width-gated so the meter and model win on narrow terminals.
+        if area.width >= 90 && !self.session_id.is_empty() {
+            let short: String = self.session_id.chars().take(8).collect();
+            right_spans.push(Span::styled(
+                format!("#{short}"),
+                Style::default().fg(FAINT),
+            ));
+            right_spans.push(Span::styled(" · ", Style::default().fg(FAINT)));
+        }
+        if area.width >= 70
+            && let Some((mcp_label, mcp_color)) = self.footer_mcp_label()
+        {
+            right_spans.push(Span::styled(mcp_label, Style::default().fg(mcp_color)));
+            right_spans.push(Span::styled(" · ", Style::default().fg(FAINT)));
+        }
+        right_spans.push(Span::styled(meter_label, Style::default().fg(meter_color)));
         if let Some(effort) = self.footer_effort_label() {
             right_spans.push(Span::styled(" · ", Style::default().fg(FAINT)));
             right_spans.push(Span::styled(effort, Style::default().fg(MUTED)));
@@ -2898,16 +2918,41 @@ impl CodeTuiApp {
         frame.render_widget(Paragraph::new(Line::from(spans)), area);
     }
 
-    /// Effort tier for the status line: Cursor's from the model id, else the engine's
-    /// effective level (only while thinking is on, so the two can't disagree).
+    /// Effort tier for the status line: Cursor's from the model id, else the
+    /// engine's level while thinking is on, else "thinking off" (nothing on
+    /// models that can't think at all).
     pub(super) fn footer_effort_label(&self) -> Option<String> {
         if let Some(label) = self.cursor_effort_label.as_deref() {
             Some(label.to_string())
-        } else if self.thinking_enabled && self.model_supports_thinking {
+        } else if !self.model_supports_thinking {
+            None
+        } else if self.thinking_enabled {
             self.effective_reasoning_effort()
         } else {
-            None
+            Some("thinking off".to_string())
         }
+    }
+
+    /// Aggregate MCP health for the status line, or `None` with no configured
+    /// servers. Quiet MUTED when healthy — only trouble gets warmth.
+    pub(super) fn footer_mcp_label(&self) -> Option<(String, Color)> {
+        let n = self.mcp_configured_count;
+        if n == 0 {
+            return None;
+        }
+        if let Some(client) = &self.mcp_client {
+            if client.any_dead() || !client.errors().is_empty() {
+                return Some((format!("mcp:{n}!"), ERROR));
+            }
+            if client.any_needs_auth() {
+                return Some((format!("mcp:{n}!"), WARNING));
+            }
+            return Some((format!("mcp:{n}"), MUTED));
+        }
+        if self.mcp_connecting {
+            return Some((format!("mcp:{n}…"), FAINT));
+        }
+        Some((format!("mcp:{n}"), FAINT))
     }
 
     /// Present-tense label for the in-flight tool step (e.g. `running grep`), or

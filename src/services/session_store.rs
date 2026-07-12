@@ -1449,7 +1449,6 @@ impl SessionStore {
     }
 
     /// Creates a new SessionStore with a custom config path (for testing)
-    #[allow(dead_code)]
     pub fn with_path(config_path: PathBuf) -> Self {
         let config_dir = config_path
             .parent()
@@ -1480,7 +1479,6 @@ impl SessionStore {
     }
 
     /// Gets the config path
-    #[allow(dead_code)]
     pub fn get_config_path(&self) -> &PathBuf {
         &self.ctx.config_path
     }
@@ -2205,7 +2203,6 @@ impl SessionStore {
 
     // ── Chat sessions (delegated to CodeSessionStore) ─────────────────────
 
-    #[allow(dead_code)]
     pub fn session_file_path(&self, session_id: &str) -> PathBuf {
         self.sessions.session_file_path(session_id)
     }
@@ -2325,7 +2322,6 @@ impl SessionStore {
     }
 
     /// Removes session files for all sessions belonging to a key.
-    #[allow(dead_code)]
     pub async fn remove_sessions_for_key(&self, key_id: &str) -> Result<()> {
         self.sessions.remove_sessions_for_key(key_id).await
     }

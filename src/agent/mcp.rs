@@ -816,6 +816,31 @@ impl McpClient {
             .is_some_and(|s| s.dead.load(Ordering::Relaxed))
     }
 
+    /// Test-only client with canned failure state.
+    #[cfg(test)]
+    pub fn with_state_for_tests(
+        errors: Vec<(String, String)>,
+        needs_auth: HashSet<String>,
+    ) -> McpClient {
+        McpClient {
+            servers: HashMap::new(),
+            errors,
+            needs_auth,
+        }
+    }
+
+    /// Any connected server whose transport has since died.
+    pub fn any_dead(&self) -> bool {
+        self.servers
+            .values()
+            .any(|s| s.dead.load(Ordering::Relaxed))
+    }
+
+    /// Any server waiting on OAuth (`/mcp` → authorize).
+    pub fn any_needs_auth(&self) -> bool {
+        !self.needs_auth.is_empty()
+    }
+
     /// Tools discovered for `name`, or `None` if that server isn't connected
     /// (disabled, failed, or not yet attempted). Drives the `/mcp` status column.
     pub fn tool_count(&self, name: &str) -> Option<usize> {
@@ -3050,6 +3075,71 @@ for line in sys.stdin:
             ok.contains("echoed: again"),
             "server wrongly disabled: {ok}"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A `tools/call` slower than the (short, injected) handshake timeout must
+    /// still succeed — pins the handshake/call timeout split from ac4253b.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn mcp_tool_call_outlives_the_handshake_timeout() {
+        if tokio::process::Command::new("python3")
+            .arg("--version")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .await
+            .is_err()
+        {
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!(
+            "aivo-mcp-slowcall-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // Instant handshake; tools/call sleeps past the injected handshake timeout.
+        let script = r#"
+import sys, json, time
+def send(o):
+    sys.stdout.write(json.dumps(o)+"\n"); sys.stdout.flush()
+for line in sys.stdin:
+    line=line.strip()
+    if not line: continue
+    m=json.loads(line)
+    method=m.get("method")
+    if method=="initialize":
+        send({"jsonrpc":"2.0","id":m["id"],"result":{"protocolVersion":"2024-11-05","capabilities":{},"serverInfo":{"name":"s","version":"1"}}})
+    elif method=="tools/list":
+        send({"jsonrpc":"2.0","id":m["id"],"result":{"tools":[{"name":"slow","description":"s","inputSchema":{"type":"object"}}]}})
+    elif method=="tools/call":
+        time.sleep(3.5)
+        send({"jsonrpc":"2.0","id":m["id"],"result":{"content":[{"type":"text","text":"finally"}]}})
+"#;
+        let config = json!({"mcpServers":{"s":{"command":"python3","args":["-c", script]}}});
+        std::fs::write(dir.join(".mcp.json"), config.to_string()).unwrap();
+
+        let client = McpClient::connect_inner(
+            None,
+            &dir,
+            &HashSet::new(),
+            Duration::from_secs(2),
+            None,
+            None,
+        )
+        .await;
+        if !client.has_tools() {
+            // Environment too slow to handshake python3 in 2 s — skip, don't flake.
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        }
+        let out = client
+            .call("mcp__s__slow", &json!({}))
+            .await
+            .expect("a call slower than the handshake timeout must still succeed");
+        assert!(out.contains("finally"), "got: {out}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

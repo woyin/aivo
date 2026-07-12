@@ -76,12 +76,13 @@ pub(super) async fn run_anthropic_messages(
     // up to TOOL_CALL_PARK_TIMEOUT (10 min). Deliver the result, tear
     // the bridge session down, and let the legacy text-flatten path
     // handle the actual response.
-    if !stream_flag && let Some((tool_use_id, content, is_error)) = extract_last_tool_result(&body)
-    {
-        state
-            .mcp_bridge
-            .deliver_and_drop_parked(&tool_use_id, content, is_error)
-            .await;
+    if !stream_flag {
+        for (tool_use_id, content, is_error) in extract_last_tool_results(&body) {
+            state
+                .mcp_bridge
+                .deliver_and_drop_parked(&tool_use_id, content, is_error)
+                .await;
+        }
     }
 
     // Streaming + tools array → bridge path: tools are exposed to the
@@ -176,26 +177,27 @@ pub(super) fn warn_if_resumption_drops_blocks(body: &Value) {
     }
 }
 
-/// Find the first `tool_result` block in the final user message and return
-/// (`tool_use_id`, MCP-shaped content array, `is_error`). Returns `None`
-/// when the last message isn't a user message or carries no `tool_result`.
-/// Multiple `tool_result` blocks in one user message (parallel tool_use)
-/// are not yet supported — we take the first.
-pub(super) fn extract_last_tool_result(body: &Value) -> Option<(String, Vec<Value>, bool)> {
-    let messages = body.get("messages")?.as_array()?;
-    let last = messages.last()?;
-    if last.get("role").and_then(Value::as_str)? != "user" {
-        return None;
-    }
-    let blocks = last.get("content")?.as_array()?;
+/// Every `tool_result` block in the final user message as
+/// (`tool_use_id`, MCP-shaped content array, `is_error`), in message order.
+pub(super) fn extract_last_tool_results(body: &Value) -> Vec<(String, Vec<Value>, bool)> {
+    let blocks = (|| {
+        let last = body.get("messages")?.as_array()?.last()?;
+        if last.get("role").and_then(Value::as_str)? != "user" {
+            return None;
+        }
+        last.get("content")?.as_array()
+    })();
+    let Some(blocks) = blocks else {
+        return Vec::new();
+    };
+    let mut results = Vec::new();
     for block in blocks {
-        if block.get("type").and_then(Value::as_str)? != "tool_result" {
+        if block.get("type").and_then(Value::as_str) != Some("tool_result") {
             continue;
         }
-        let id = block
-            .get("tool_use_id")
-            .and_then(Value::as_str)?
-            .to_string();
+        let Some(id) = block.get("tool_use_id").and_then(Value::as_str) else {
+            continue;
+        };
         let is_error = block
             .get("is_error")
             .and_then(Value::as_bool)
@@ -205,9 +207,9 @@ pub(super) fn extract_last_tool_result(body: &Value) -> Option<(String, Vec<Valu
             Some(Value::Array(arr)) => arr.clone(),
             _ => Vec::new(),
         };
-        return Some((id, content, is_error));
+        results.push((id.to_string(), content, is_error));
     }
-    None
+    results
 }
 
 pub(super) async fn run_anthropic_bridged(
@@ -216,14 +218,26 @@ pub(super) async fn run_anthropic_bridged(
     body: Value,
     requested_model: Option<String>,
 ) -> Result<Option<String>> {
-    // Resumption — claude-cli is delivering a tool_result for a previously
-    // parked tool_use. Try to match it to a still-running ACP session.
-    if let Some((tool_use_id, content, is_error)) = extract_last_tool_result(&body)
-        && let Some(session) = state
+    // Resumption — the session parks a single call, so at most one id can
+    // match; try each, since the live id may sit after stale ones.
+    let tool_results = extract_last_tool_results(&body);
+    let sibling_count = tool_results.len().saturating_sub(1);
+    for (tool_use_id, content, is_error) in tool_results {
+        let Some(session) = state
             .mcp_bridge
             .resume_with_tool_result(&tool_use_id, content, is_error)
             .await
-    {
+        else {
+            continue;
+        };
+        if sibling_count > 0 {
+            eprintln!(
+                "aivo: cursor bridge resumption delivered tool_result {tool_use_id} to the \
+                 parked call; the other {sibling_count} tool_result block(s) in the same user \
+                 message have no parked call and are dropped. The cursor session waits on one \
+                 tool call at a time — send parallel results as separate turns."
+            );
+        }
         warn_if_resumption_drops_blocks(&body);
         return run_anthropic_bridged_resume(socket, state, session, &body, requested_model).await;
     }

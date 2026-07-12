@@ -2578,6 +2578,110 @@ fn test_footer_shows_plain_chat_badge_when_agent_tools_off() {
 }
 
 #[test]
+fn test_footer_effort_label_reports_thinking_off_on_capable_models() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+
+    app.model_supports_thinking = false;
+    app.thinking_enabled = false;
+    assert_eq!(app.footer_effort_label(), None);
+
+    app.model_supports_thinking = true;
+    assert_eq!(app.footer_effort_label().as_deref(), Some("thinking off"));
+
+    app.thinking_enabled = true;
+    assert_ne!(app.footer_effort_label().as_deref(), Some("thinking off"));
+
+    // A cursor-derived label wins over the local toggles.
+    app.cursor_effort_label = Some("max".to_string());
+    assert_eq!(app.footer_effort_label().as_deref(), Some("max"));
+}
+
+#[test]
+fn test_footer_mcp_label_reflects_aggregate_health() {
+    use crate::agent::mcp::McpClient;
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+
+    app.mcp_configured_count = 0;
+    assert!(app.footer_mcp_label().is_none());
+
+    app.mcp_configured_count = 2;
+    app.mcp_connecting = true;
+    assert_eq!(app.footer_mcp_label().unwrap().0, "mcp:2…");
+
+    app.mcp_connecting = false;
+    app.mcp_client = Some(std::sync::Arc::new(McpClient::with_state_for_tests(
+        Vec::new(),
+        std::collections::HashSet::new(),
+    )));
+    assert_eq!(
+        app.footer_mcp_label().unwrap(),
+        ("mcp:2".to_string(), MUTED)
+    );
+
+    app.mcp_client = Some(std::sync::Arc::new(McpClient::with_state_for_tests(
+        vec![("db".to_string(), "spawn failed".to_string())],
+        std::collections::HashSet::new(),
+    )));
+    assert_eq!(
+        app.footer_mcp_label().unwrap(),
+        ("mcp:2!".to_string(), ERROR)
+    );
+
+    // OAuth-pending with nothing failed is WARNING, not ERROR.
+    app.mcp_client = Some(std::sync::Arc::new(McpClient::with_state_for_tests(
+        Vec::new(),
+        std::collections::HashSet::from(["gh".to_string()]),
+    )));
+    assert_eq!(
+        app.footer_mcp_label().unwrap(),
+        ("mcp:2!".to_string(), WARNING)
+    );
+}
+
+#[test]
+fn test_footer_shows_short_session_id_only_on_wide_terminals() {
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    fn footer_text(app: &CodeTuiApp, width: u16) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(width, 1)).unwrap();
+        terminal
+            .draw(|frame| app.render_footer(frame, frame.area()))
+            .unwrap();
+        let buf = terminal.backend().buffer();
+        (0..buf.area.width)
+            .map(|x| buf.cell((x, 0)).unwrap().symbol().to_string())
+            .collect()
+    }
+
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.session_id = "abcdef12-3456-7890-abcd-ef1234567890".to_string();
+
+    assert!(footer_text(&app, 100).contains("#abcdef12"));
+    assert!(!footer_text(&app, 80).contains("#abcdef12"));
+}
+
+#[test]
+fn test_welcome_status_lines_include_static_essentials_hint() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let app = make_test_app(tx, rx);
+    let plain: Vec<String> = app
+        .welcome_status_lines()
+        .into_iter()
+        .map(|sl| sl.plain)
+        .collect();
+    assert!(
+        plain
+            .iter()
+            .any(|l| l.contains("/help commands") && l.contains("Esc interrupts")),
+        "essentials hint missing from welcome: {plain:?}"
+    );
+}
+
+#[test]
 fn test_footer_status_label_updates_live_during_turn() {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let mut app = make_test_app(tx, rx);
@@ -5145,6 +5249,28 @@ fn test_folded_run_bash_result_keeps_streaming_tail_height() {
     assert!(
         !plain.contains("row 20"),
         "earlier lines fold away: {plain}"
+    );
+
+    // One huge single line (a JSON blob) is clamped like the live tail rows —
+    // not wrapped into a screenful under a "+3 lines" fold.
+    app.apply_agent_tool_call(
+        None,
+        "run_bash".to_string(),
+        serde_json::json!({"command": "gh api"}),
+        vec![],
+        None,
+    );
+    let blob = format!("head-marker {}", "x".repeat(30_000));
+    app.apply_agent_tool_result(format!("banner line\n{blob}\n[exit 0]"));
+    let plain_lines = app.build_transcript().plain_lines;
+    let row = plain_lines
+        .iter()
+        .find(|l| l.contains("head-marker"))
+        .expect("tail row present");
+    assert!(
+        row.len() < 120,
+        "tail row must be clamped, got {} chars",
+        row.len()
     );
 
     // A non-run_bash tool has no tail, so it stays a summary line only.

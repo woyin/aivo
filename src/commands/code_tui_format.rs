@@ -2,8 +2,6 @@ use std::path::Path;
 use std::time::Duration;
 
 use chrono::{DateTime, Local, Utc};
-use ratatui::text::Text;
-use ratatui::widgets::{Paragraph, Wrap};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::commands::code::ChatMessage;
@@ -247,17 +245,6 @@ fn read_head_branch(git_dir: &Path) -> Option<String> {
     None
 }
 
-#[allow(dead_code)]
-pub(super) fn wrapped_text_line_count(text: impl Into<Text<'static>>, width: u16) -> usize {
-    if width == 0 {
-        return 0;
-    }
-
-    Paragraph::new(text)
-        .wrap(Wrap { trim: false })
-        .line_count(width)
-}
-
 pub(super) fn format_session_group_label(updated_at: &str) -> String {
     let parsed = DateTime::parse_from_rfc3339(updated_at)
         .map(|value| value.with_timezone(&Local))
@@ -364,7 +351,7 @@ mod tests {
     use super::{
         build_footer_text, display_width, format_request_elapsed, format_session_match_count,
         format_time_ago_short, format_token_count, format_token_count_value, format_usd,
-        git_branch_for, truncate_for_display_width, truncate_for_width, wrapped_text_line_count,
+        git_branch_for, truncate_for_display_width, truncate_for_width,
     };
     use crate::commands::code::TokenUsage;
     use chrono::{Duration as ChronoDuration, Utc};
@@ -378,14 +365,6 @@ mod tests {
         assert_eq!(format_usd(0.000065), "0.000065");
         assert_eq!(format_usd(0.009999), "0.01");
         assert_eq!(format_usd(0.0), "0.00");
-    }
-
-    #[test]
-    fn test_wrapped_text_line_count_uses_ratatui_word_wrap() {
-        assert_eq!(wrapped_text_line_count("", 10), 1);
-        assert_eq!(wrapped_text_line_count("hello", 10), 1);
-        assert_eq!(wrapped_text_line_count("abcdefghij", 5), 2);
-        assert_eq!(wrapped_text_line_count("word word word", 8), 3);
     }
 
     #[test]

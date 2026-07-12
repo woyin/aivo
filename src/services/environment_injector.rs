@@ -261,12 +261,6 @@ impl EnvironmentInjector {
         env
     }
 
-    /// `for_claude_with_overrides` with no per-slot overrides. Used by the
-    /// in-tree and integration test suites; production callers go through
-    /// the overrides-aware entry point directly. `#[cfg(test)]` doesn't fit
-    /// here because integration tests live in a separate crate that sees
-    /// only the non-test build of this lib.
-    #[allow(dead_code)]
     /// Builds the env block for a tool whose key is a cursor ACP sentinel.
     /// Sets a placeholder loopback `base_url_env` plus the `AIVO_USE_CURSOR_ROUTER`
     /// scaffolding flags that `launch_runtime::start_cursor_router` reads to
@@ -374,6 +368,9 @@ impl EnvironmentInjector {
         env
     }
 
+    /// [`Self::for_claude_with_overrides`] with no per-slot overrides. Test-only
+    /// caller; not `#[cfg(test)]` because integration tests see only the
+    /// non-test build of this lib.
     pub fn for_claude(&self, key: &ApiKey, model: Option<&str>) -> HashMap<String, String> {
         self.for_claude_with_overrides(key, model, &ClaudeModelOverrides::default())
     }

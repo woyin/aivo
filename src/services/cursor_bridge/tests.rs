@@ -1107,6 +1107,60 @@ fn extract_last_openai_tool_message_picks_latest_tool_role() {
 }
 
 #[test]
+fn extract_last_tool_results_returns_all_blocks_in_order() {
+    let body = json!({
+        "messages": [
+            {"role": "user", "content": "run both"},
+            {"role": "assistant", "content": [
+                {"type": "tool_use", "id": "t1", "name": "a", "input": {}},
+                {"type": "tool_use", "id": "t2", "name": "b", "input": {}},
+            ]},
+            {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "t1", "content": "one"},
+                {"type": "text", "text": "aside"},
+                {"type": "tool_result", "tool_use_id": "t2", "is_error": true, "content": [
+                    {"type": "text", "text": "two"},
+                ]},
+            ]},
+        ],
+    });
+    let results = extract_last_tool_results(&body);
+    assert_eq!(results.len(), 2);
+    assert_eq!(results[0].0, "t1");
+    assert_eq!(results[0].1, vec![json!({"type": "text", "text": "one"})]);
+    assert!(!results[0].2);
+    assert_eq!(results[1].0, "t2");
+    assert_eq!(results[1].1, vec![json!({"type": "text", "text": "two"})]);
+    assert!(results[1].2);
+}
+
+#[test]
+fn extract_last_tool_results_skips_malformed_blocks_and_non_user_last() {
+    let body = json!({
+        "messages": [
+            {"role": "user", "content": [
+                {"note": "typeless"},
+                {"type": "tool_result", "content": "no id"},
+                {"type": "tool_result", "tool_use_id": "kept"},
+            ]},
+        ],
+    });
+    let results = extract_last_tool_results(&body);
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].0, "kept");
+    assert!(results[0].1.is_empty());
+
+    let assistant_last = json!({
+        "messages": [
+            {"role": "assistant", "content": [
+                {"type": "tool_result", "tool_use_id": "t1", "content": "x"},
+            ]},
+        ],
+    });
+    assert!(extract_last_tool_results(&assistant_last).is_empty());
+}
+
+#[test]
 fn extract_gemini_tools_normalized_flattens_function_declarations() {
     let body = json!({
         "tools": [

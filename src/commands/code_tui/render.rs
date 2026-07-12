@@ -1701,11 +1701,10 @@ pub(super) fn render_tool_result(
                 )]));
             }
         } else if tool == Some("run_bash") {
-            // Keep the streamed tail under the summary so landing doesn't jump the view.
             for line in result.lines().skip(count.saturating_sub(STREAM_TAIL_LINES)) {
                 let is_exit_line = line.trim().starts_with("[exit ");
                 lines.push(line_with_plain(vec![Span::styled(
-                    format!("    {}", strip_ansi_and_controls(line)),
+                    tool_tail_row_text(&strip_ansi_and_controls(line)),
                     Style::default().fg(if is_exit_line { ERROR } else { FAINT }),
                 )]));
             }
