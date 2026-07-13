@@ -2226,54 +2226,32 @@ impl KeysCommand {
 
     async fn add_joycode_interactive(&self, name: &str) -> Result<ExitCode> {
         keys_ui::provider_info(JOYCODE_INFO.0, JOYCODE_INFO.1);
-
         let final_name = if name.is_empty() { "joycode" } else { name };
 
-        keys_ui::step_header(3, 3, "JD QR Login", "scan with JD app (京东App)");
-        eprintln!();
-
-        let creds = crate::services::joycode_auth::qr_login(&|msg| {
-            eprintln!("{} {}", style::dim("·"), msg);
-        })
-        .await;
-
-        let creds = match creds {
-            Ok(c) => c,
-            Err(e) => {
-                eprintln!("{} QR login failed: {}", style::red("Error:"), e);
-                eprintln!(
-                    "  {} Or use 'aivo keys add joycode --key <ptKey>' to add manually.",
-                    style::dim("hint:"),
-                );
-                return Ok(ExitCode::UserError);
+        let pt_key = loop {
+            let input = term_read_line(&format!("{} {}: ", style::dim("·"), "ptKey"))
+                .map_err(|e| anyhow::anyhow!("failed to read ptKey: {e}"))?;
+            let trimmed = input.trim().to_string();
+            if !trimmed.is_empty() {
+                break trimmed;
             }
+            eprintln!(
+                "{} ptKey is required (from JoyCode IDE / browser)",
+                style::red("Error:")
+            );
         };
 
-        let key_json = creds
-            .to_key_json()
-            .map_err(|e| anyhow::anyhow!("serialize credential: {e}"))?;
-
-        let id = self
-            .session_store
-            .add_key_with_protocol(final_name, "https://joycode-api.jd.com", None, &key_json)
-            .await?;
-
-        self.finalize_add(
-            &id,
-            final_name,
-            &format!("JoyCode user: {}", creds.user_id),
-            Some(("aivo claude", "")),
-        )
-        .await?;
-        Ok(ExitCode::Success)
+        self.add_joycode_with_key(final_name, &pt_key).await
     }
 
     async fn add_joycode_manual(&self, name: &str, pt_key: &str) -> Result<ExitCode> {
         keys_ui::provider_info(JOYCODE_INFO.0, JOYCODE_INFO.1);
+        self.add_joycode_with_key(name, pt_key).await
+    }
 
+    async fn add_joycode_with_key(&self, name: &str, pt_key: &str) -> Result<ExitCode> {
         keys_ui::step_header(3, 3, "Validating", "checking ptKey with JoyCode...");
-        let creds = crate::services::joycode_auth::validate_pt_key(pt_key).await;
-        let creds = match creds {
+        let creds = match crate::services::joycode_auth::validate_pt_key(pt_key).await {
             Ok(c) => c,
             Err(e) => {
                 eprintln!("{} ptKey validation failed: {}", style::red("Error:"), e);
