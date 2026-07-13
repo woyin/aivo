@@ -885,6 +885,9 @@ impl PluginServe {
 fn plugin_serve(key: &ApiKey) -> PluginServe {
     if key.is_cursor_acp() {
         PluginServe::Cursor
+    } else if key.is_grok_oauth() {
+        // SuperGrok OAuth is servable: aivo's endpoint injects the token upstream.
+        PluginServe::Serve
     } else if key.is_any_oauth() {
         PluginServe::Blocked
     } else {
@@ -1122,6 +1125,28 @@ fn apply_endpoint(
         Ok(ep) => {
             extra_env.push(("AIVO_ENDPOINT_URL".to_string(), ep.url.clone()));
             extra_env.push(("AIVO_ENDPOINT_TOKEN".to_string(), ep.token.clone()));
+            // The plugin only talks to this loopback endpoint (aivo proxies real
+            // upstream itself). A system proxy would route the 127.0.0.1 request
+            // through it, and plugins that ignore NO_PROXY (e.g. the Node grok
+            // client) then fail. Neutralize the proxy vars so it connects direct.
+            const PROXY_VARS: &[&str] = &[
+                "HTTP_PROXY",
+                "http_proxy",
+                "HTTPS_PROXY",
+                "https_proxy",
+                "ALL_PROXY",
+                "all_proxy",
+            ];
+            let proxy_set = PROXY_VARS
+                .iter()
+                .any(|v| std::env::var(v).is_ok_and(|s| !s.is_empty()));
+            if proxy_set {
+                for var in PROXY_VARS {
+                    extra_env.push(((*var).to_string(), String::new()));
+                }
+                extra_env.push(("NO_PROXY".to_string(), "*".to_string()));
+                extra_env.push(("no_proxy".to_string(), "*".to_string()));
+            }
             *endpoint = Some(ep);
         }
         Err(e) => eprintln!(

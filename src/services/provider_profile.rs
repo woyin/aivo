@@ -153,6 +153,10 @@ pub fn is_oauth_or_copilot_base(base_url: &str) -> bool {
 pub fn resolve_starter_base_url(base_url: &str) -> String {
     if base_url == crate::constants::AIVO_STARTER_SENTINEL {
         crate::constants::AIVO_STARTER_REAL_URL.to_string()
+    } else if base_url == crate::services::grok_oauth::GROK_OAUTH_SENTINEL {
+        // Resolve the grok sentinel to the CLI proxy so base_url-derived URLs
+        // stay valid; the token manager still owns the final host per request.
+        crate::services::grok_oauth::INFERENCE_BASE_URL.to_string()
     } else {
         base_url.to_string()
     }

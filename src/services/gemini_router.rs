@@ -398,6 +398,7 @@ async fn forward_to_provider(
                     &target_url,
                     &config.api_key,
                     config.copilot_token_manager.as_deref(),
+                    None,
                     initiator,
                 )
                 .await?;
@@ -427,6 +428,7 @@ async fn forward_to_provider(
                     &target_url,
                     &config.api_key,
                     config.copilot_token_manager.as_deref(),
+                    None,
                     initiator,
                 )
                 .await?;

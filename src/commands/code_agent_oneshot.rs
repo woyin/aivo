@@ -26,9 +26,10 @@ use crate::errors::ExitCode;
 use crate::services::models_cache::ModelsCache;
 use crate::services::session_store::{ApiKey, SessionStore, SessionTokens};
 
-/// Whether `key` can drive the in-process agent (not OAuth/copilot/cursor).
+/// Whether `key` can drive the in-process agent. SuperGrok OAuth qualifies
+/// (OpenAI-compatible via the serve layer); other OAuth/copilot/cursor don't.
 pub(crate) fn key_is_agent_capable(key: &ApiKey) -> bool {
-    !key.is_any_oauth() && !key.is_cursor_acp() && !key.is_copilot()
+    (!key.is_any_oauth() || key.is_grok_oauth()) && !key.is_cursor_acp() && !key.is_copilot()
 }
 
 /// Unattended `-e` backstops (env-overridable, 0 disables) — the TUI relies on esc instead.
@@ -325,15 +326,23 @@ async fn run_agent_captured(
         let port = crate::services::fake_model::start(bodies)?;
         (format!("http://127.0.0.1:{port}"), None, None)
     } else {
-        use crate::services::serve_router::{ServeRouter, ServeRouterConfig, random_auth_token};
+        use crate::services::serve_router::{
+            ServeRouter, ServeRouterConfig, random_auth_token, resolve_grok_fallback,
+        };
         let auth = random_auth_token();
+        let grok_fallback = if key.is_grok_oauth() {
+            resolve_grok_fallback(session_store).await
+        } else {
+            None
+        };
         let config = ServeRouterConfig::from_key(
             key,
             false,
             300,
             Some(auth.clone()),
             std::collections::HashMap::new(),
-        );
+        )
+        .with_grok_fallback(grok_fallback);
         let router = ServeRouter::new(config, key.clone(), session_store.logs())
             .with_usage_accounting(session_store.clone(), "code".to_string())
             .quiet(true);

@@ -110,8 +110,37 @@ pub async fn authorized_openai_post(
     target_url: &str,
     api_key: &str,
     copilot_token_manager: Option<&CopilotTokenManager>,
+    grok_token_manager: Option<&crate::services::grok_oauth::GrokTokenManager>,
     initiator: Option<&str>,
 ) -> Result<reqwest::RequestBuilder> {
+    if let Some(gtm) = grok_token_manager {
+        // Grok: host + bearer come from the token manager (refreshed, or the
+        // XAI_API_KEY fallback after a 403). Headers below mark a CLI session;
+        // omitted on the fallback path.
+        use crate::services::grok_oauth;
+        let auth = gtm.authorize().await?;
+        let path = copilot_path_from_target(target_url);
+        let url = format!("{}{}", auth.base_url.trim_end_matches('/'), path);
+        let mut b = client
+            .post(&url)
+            .header("Authorization", format!("Bearer {}", auth.bearer))
+            .header("Content-Type", CONTENT_TYPE_JSON);
+        if !auth.is_api_key {
+            // The CLI proxy 426s without the session marker + client version;
+            // the api.x.ai fallback takes none of these.
+            b = b
+                .header(grok_oauth::TOKEN_AUTH_HEADER, grok_oauth::TOKEN_AUTH_VALUE)
+                .header(
+                    grok_oauth::CLIENT_VERSION_HEADER,
+                    grok_oauth::CLIENT_VERSION,
+                )
+                .header(
+                    grok_oauth::CLIENT_SURFACE_HEADER,
+                    grok_oauth::INFERENCE_SURFACE,
+                );
+        }
+        return Ok(b);
+    }
     if let Some(tm) = copilot_token_manager {
         let (token, api_endpoint) = tm.get_token().await?;
         let copilot_path = copilot_path_from_target(target_url);

@@ -554,9 +554,9 @@ impl CodeCommand {
             }
         };
 
-        // OAuth keys target subscription backends only the native CLIs can
-        // speak; reject them for `aivo code`.
-        if !hf_active && key.is_any_oauth() {
+        // OAuth keys target CLI-only subscription backends; reject them for
+        // `aivo code`. SuperGrok is the exception (OpenAI-compatible endpoint).
+        if !hf_active && key.is_any_oauth() && !key.is_grok_oauth() {
             key = match crate::commands::keys::swap_incompatible_key(
                 &self.session_store,
                 &key,

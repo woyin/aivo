@@ -319,7 +319,8 @@ impl ModelsCommand {
             },
         };
 
-        if key.is_any_oauth() {
+        // Grok is the exception: its token lists models on the CLI proxy.
+        if key.is_any_oauth() && !key.is_grok_oauth() {
             eprintln!(
                 "{} Key '{}' is an OAuth credential — it doesn't have a model listing API.",
                 style::red("Error:"),
@@ -354,7 +355,14 @@ impl ModelsCommand {
                 .filter(|(ids, _)| !cursor_cache_looks_corrupt(&key, ids))
         };
 
-        let mut models = if let Some((ids, meta)) = cached_entry {
+        let mut models = if key.is_grok_oauth() {
+            // Grok lists models via the CLI proxy (token-authed); id-only here,
+            // enrichment below fills limits.
+            SessionStore::decrypt_key_secret(&mut key)?;
+            let mut creds = crate::services::grok_oauth::GrokOAuthCredential::from_json(&key.key)?;
+            let ids = crate::services::grok_oauth::fetch_model_ids(&mut creds).await?;
+            ids.into_iter().map(ModelInfo::id_only).collect()
+        } else if let Some((ids, meta)) = cached_entry {
             models_from_cache(ids, meta)
         } else {
             SessionStore::decrypt_key_secret(&mut key)?;

@@ -87,7 +87,9 @@ impl ServeCommand {
             }
         };
 
-        if key.is_any_oauth() {
+        // SuperGrok OAuth is proxyable (OpenAI-compatible); only the CLI-bound
+        // OAuth credentials (Codex/Claude) can't be served.
+        if key.is_any_oauth() && !key.is_grok_oauth() {
             eprintln!(
                 "{} Key '{}' is an OAuth credential — `aivo serve` can't proxy it.",
                 style::red("Error:"),
@@ -110,6 +112,8 @@ impl ServeCommand {
             );
         }
 
+        // No SessionStore here to resolve the sibling `xai` fallback key, so
+        // grok's 403 fallback is unavailable on `aivo serve` (OAuth path works).
         let config = ServeRouterConfig::from_key(&key, cors, timeout, auth_token, aliases);
 
         // Capture display info before moving key into the router

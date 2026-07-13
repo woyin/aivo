@@ -60,10 +60,22 @@ pub(crate) async fn prepare_runtime_env(
     }
 
     if tool == AIToolType::Claude && env.contains_key("AIVO_USE_ANTHROPIC_TO_OPENAI_ROUTER") {
-        let (port, cache, learned) = start_anthropic_to_openai_router(&env).await?;
-        route_cache = Some(cache);
-        learned_requires_reasoning = Some(learned);
-        set_local_base_url(&mut env, "ANTHROPIC_BASE_URL", port);
+        // Grok can't ride the static-key anthropic→openai router; route it
+        // through the universal ServeRouter (converts Anthropic→OpenAI + injects
+        // the grok token). Detected by the router key parsing as a grok credential.
+        let router_key = env
+            .get("AIVO_ANTHROPIC_TO_OPENAI_ROUTER_API_KEY")
+            .cloned()
+            .unwrap_or_default();
+        if crate::services::grok_oauth::GrokOAuthCredential::from_json(&router_key).is_ok() {
+            let port = start_grok_serve_router(&env, router_key, session_store).await?;
+            set_local_base_url(&mut env, "ANTHROPIC_BASE_URL", port);
+        } else {
+            let (port, cache, learned) = start_anthropic_to_openai_router(&env).await?;
+            route_cache = Some(cache);
+            learned_requires_reasoning = Some(learned);
+            set_local_base_url(&mut env, "ANTHROPIC_BASE_URL", port);
+        }
     }
 
     if tool == AIToolType::Claude && env.contains_key("AIVO_USE_COPILOT_ROUTER") {
@@ -989,6 +1001,39 @@ fn merge_loopback_entries(existing: &str) -> String {
 fn loopback_auth_token(env: &HashMap<String, String>) -> Option<String> {
     env.get(crate::services::environment_injector::AIVO_ROUTER_AUTH_TOKEN)
         .cloned()
+}
+
+/// Starts a universal ServeRouter for a grok-oauth credential and returns its
+/// loopback port. It converts Anthropic `/v1/messages` → OpenAI and injects the
+/// grok token, so `aivo claude` reaches grok via the same path as `aivo code`.
+async fn start_grok_serve_router(
+    env: &HashMap<String, String>,
+    creds_json: String,
+    session_store: &SessionStore,
+) -> Result<u16> {
+    use crate::services::grok_oauth::GROK_OAUTH_SENTINEL;
+    use crate::services::serve_router::{ServeRouter, ServeRouterConfig, resolve_grok_fallback};
+
+    let key = ApiKey::new_with_protocol(
+        "grok".to_string(),
+        "grok".to_string(),
+        GROK_OAUTH_SENTINEL.to_string(),
+        None,
+        creds_json,
+    );
+    let fallback = resolve_grok_fallback(session_store).await;
+    let config =
+        ServeRouterConfig::from_key(&key, false, 300, loopback_auth_token(env), HashMap::new())
+            .with_grok_fallback(fallback);
+    let (handle, _shutdown, port) = ServeRouter::new(config, key, session_store.logs())
+        .start_background_with_addr("127.0.0.1", 0)
+        .await?;
+    tokio::spawn(async move {
+        if let Ok(Err(e)) = handle.await {
+            eprintln!("aivo: grok serve router exited unexpectedly: {e}");
+        }
+    });
+    Ok(port)
 }
 
 async fn start_anthropic_router(env: &HashMap<String, String>) -> Result<u16> {

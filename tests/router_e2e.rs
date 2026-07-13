@@ -400,6 +400,8 @@ fn serve_config(base_url: String, protocol: ProviderProtocol) -> ServeRouterConf
         upstream_api_key: "sk-test".to_string(),
         upstream_protocol: protocol,
         is_copilot: false,
+        is_grok: false,
+        grok_fallback_api_key: None,
         is_openrouter: false,
         is_starter: false,
         requires_reasoning_content: false,

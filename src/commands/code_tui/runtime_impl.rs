@@ -543,9 +543,9 @@ impl CodeTuiApp {
     }
 
     /// True when the current key can drive the in-process agent: anything serve
-    /// can proxy (incl. Copilot). OAuth and cursor have their own paths.
+    /// can proxy (incl. Copilot and SuperGrok OAuth).
     pub(super) fn agent_capable(&self) -> bool {
-        !self.key.is_any_oauth() && !self.key.is_cursor_acp()
+        (!self.key.is_any_oauth() || self.key.is_grok_oauth()) && !self.key.is_cursor_acp()
     }
 
     /// Refresh the cached git branch for `display_cwd`, throttled so the footer's
@@ -965,15 +965,23 @@ impl CodeTuiApp {
     /// Start this turn's loopback serve (sole egress, usage under "code"); sets
     /// `self.agent_serve`, returns `(base, auth)`. Shared by run/compact turns.
     async fn start_agent_serve(&mut self) -> Result<(String, String)> {
-        use crate::services::serve_router::{ServeRouter, ServeRouterConfig, random_auth_token};
+        use crate::services::serve_router::{
+            ServeRouter, ServeRouterConfig, random_auth_token, resolve_grok_fallback,
+        };
         let auth = random_auth_token();
+        let grok_fallback = if self.key.is_grok_oauth() {
+            resolve_grok_fallback(&self.session_store).await
+        } else {
+            None
+        };
         let config = ServeRouterConfig::from_key(
             &self.key,
             false,
             300,
             Some(auth.clone()),
             std::collections::HashMap::new(),
-        );
+        )
+        .with_grok_fallback(grok_fallback);
         // Route cache carries the negotiated protocol to `persist_agent_route`;
         // `.quiet` keeps router stderr off the raw-mode prompt.
         let router = ServeRouter::new(config, self.key.clone(), self.session_store.logs())

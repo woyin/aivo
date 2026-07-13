@@ -30,6 +30,7 @@ pub(crate) struct UpstreamRequestContext {
     pub(crate) is_openrouter: bool,
     pub(crate) is_starter: bool,
     pub(crate) copilot_tokens: Option<Arc<CopilotTokenManager>>,
+    pub(crate) grok_tokens: Option<Arc<crate::services::grok_oauth::GrokTokenManager>>,
     /// Usage accounting is on — streamed OpenAI requests must ask for the
     /// trailing usage chunk or the sniffer records zero for the turn.
     pub(crate) accounting: bool,
@@ -256,24 +257,60 @@ pub(crate) async fn send_openai_chat(
     } else {
         None
     };
+
+    // Grok's proxy routes by the request model via `x-grok-model-override`.
+    let grok_model = context.grok_tokens.as_ref().and_then(|_| {
+        body.get("model")
+            .and_then(|m| m.as_str())
+            .map(|s| s.to_string())
+    });
+
+    let response = {
+        let response =
+            send_openai_chat_once(context, &url, body, initiator, grok_model.as_deref()).await?;
+        // Standard SuperGrok tiers can 403; latch the XAI_API_KEY fallback and
+        // retry once.
+        if response.status().as_u16() == 403
+            && let Some(gtm) = context.grok_tokens.as_ref()
+            && gtm.mark_gated().await
+        {
+            send_openai_chat_once(context, &url, body, initiator, grok_model.as_deref()).await?
+        } else {
+            response
+        }
+    };
+    finalize_openai_response(response, client_wants_stream).await
+}
+
+/// Builds and sends a single OpenAI-chat upstream request. Split out so the
+/// SuperGrok 403→API-key path can retry the identical send.
+async fn send_openai_chat_once(
+    context: &UpstreamRequestContext,
+    url: &str,
+    body: &Value,
+    initiator: Option<&str>,
+    grok_model: Option<&str>,
+) -> Result<reqwest::Response> {
     let mut req = http_utils::authorized_openai_post(
         &context.client,
-        &url,
+        url,
         context.upstream_api_key.as_str(),
         context.copilot_tokens.as_deref(),
+        context.grok_tokens.as_deref(),
         initiator,
     )
     .await?;
     if context.is_copilot && http_utils::body_requests_vision(body) {
         req = req.header("Copilot-Vision-Request", "true");
     }
-
-    let response = context
+    if let Some(model) = grok_model {
+        req = req.header(crate::services::grok_oauth::MODEL_OVERRIDE_HEADER, model);
+    }
+    Ok(context
         .with_device_headers(req)
-        .json(&*body)
+        .json(body)
         .send_logged()
-        .await?;
-    finalize_openai_response(response, client_wants_stream).await
+        .await?)
 }
 
 /// When usage accounting is on, streamed OpenAI upstreams only emit the
@@ -318,6 +355,7 @@ pub(crate) async fn send_copilot_responses(
         "/v1/responses",
         context.upstream_api_key.as_str(),
         context.copilot_tokens.as_deref(),
+        None,
         Some(initiator),
     )
     .await?;
@@ -368,6 +406,7 @@ pub(crate) async fn send_openai_embeddings(
         &url,
         context.upstream_api_key.as_str(),
         context.copilot_tokens.as_deref(),
+        None,
         None,
     )
     .await?;

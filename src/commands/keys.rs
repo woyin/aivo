@@ -552,6 +552,10 @@ const CURSOR_INFO: (&str, &str) = (
     "Cursor",
     "uses cursor-agent login or CURSOR_API_KEY for model discovery",
 );
+const GROK_OAUTH_INFO: (&str, &str) = (
+    "SuperGrok (xAI)",
+    "sign in with your SuperGrok / X Premium+ subscription — usable by any coding agent",
+);
 const OLLAMA_INFO: (&str, &str) = ("Ollama", "install: ollama.com/download");
 const STARTER_INFO: (&str, &str) = ("aivo starter", "free shared key, no signup needed");
 
@@ -2062,6 +2066,7 @@ impl KeysCommand {
             Copilot,
             CodexOAuth,
             ClaudeOAuth,
+            GrokOAuth,
             Cursor,
             Ollama,
             Starter,
@@ -2094,6 +2099,10 @@ impl KeysCommand {
                 ProviderChoice::ClaudeOAuth => (
                     "Claude Code (Anthropic)",
                     "browser login — multi-account".to_string(),
+                ),
+                ProviderChoice::GrokOAuth => (
+                    "SuperGrok (xAI)",
+                    "device login — any coding agent".to_string(),
                 ),
                 ProviderChoice::Cursor => ("Cursor", "cursor-agent login/API key".to_string()),
                 ProviderChoice::Starter => ("aivo starter", "free".to_string()),
@@ -2130,6 +2139,7 @@ impl KeysCommand {
                     "copilot" => Some(ProviderChoice::Copilot),
                     "codex" => Some(ProviderChoice::CodexOAuth),
                     "claude" => Some(ProviderChoice::ClaudeOAuth),
+                    "grok" | "supergrok" => Some(ProviderChoice::GrokOAuth),
                     "cursor" => Some(ProviderChoice::Cursor),
                     _ => None,
                 }
@@ -2162,6 +2172,7 @@ impl KeysCommand {
             ProviderChoice::Copilot,
             ProviderChoice::CodexOAuth,
             ProviderChoice::ClaudeOAuth,
+            ProviderChoice::GrokOAuth,
             ProviderChoice::Cursor,
         ] {
             if hoisted_special == Some(choice) {
@@ -2212,6 +2223,7 @@ impl KeysCommand {
             ProviderChoice::Copilot => self.add_copilot_interactive(name).await,
             ProviderChoice::CodexOAuth => self.add_codex_oauth_interactive(name).await,
             ProviderChoice::ClaudeOAuth => self.add_claude_oauth_interactive(name).await,
+            ProviderChoice::GrokOAuth => self.add_grok_oauth_interactive(name).await,
             ProviderChoice::Cursor => self.add_cursor_interactive(name, None).await,
             ProviderChoice::Ollama => self.add_ollama_interactive(name).await,
             ProviderChoice::Starter => self.add_starter_interactive(name).await,
@@ -2418,6 +2430,37 @@ impl KeysCommand {
             final_name,
             "Signed in to Claude Code",
             Some(("aivo run claude", "(launches claude with this account)")),
+        )
+        .await?;
+        Ok(ExitCode::Success)
+    }
+
+    /// Interactive SuperGrok / X Premium+ OAuth sign-in (device-code flow). The
+    /// stored credential is a provider bearer usable by any coding agent.
+    async fn add_grok_oauth_interactive(&self, name: &str) -> Result<ExitCode> {
+        use crate::services::grok_oauth::{GROK_OAUTH_SENTINEL, interactive_login};
+
+        keys_ui::provider_info(GROK_OAUTH_INFO.0, GROK_OAUTH_INFO.1);
+        keys_ui::step_header(3, 3, "Sign in", "enter the code shown below at the URL");
+
+        let creds = interactive_login().await?;
+        let derived_name = creds
+            .account_label
+            .clone()
+            .unwrap_or_else(|| "grok".to_string());
+        let final_name = if name.is_empty() { &derived_name } else { name };
+        let creds_json = creds.to_json()?;
+
+        let id = self
+            .session_store
+            .add_key_with_protocol(final_name, GROK_OAUTH_SENTINEL, None, &creds_json)
+            .await?;
+
+        self.finalize_add(
+            &id,
+            final_name,
+            "Signed in to SuperGrok",
+            Some(("aivo code", "(any coding agent can use this subscription)")),
         )
         .await?;
         Ok(ExitCode::Success)
@@ -2828,6 +2871,10 @@ impl KeysCommand {
                     (
                         crate::services::claude_oauth::CLAUDE_OAUTH_SENTINEL,
                         "Claude Code login needs browser auth",
+                    ),
+                    (
+                        crate::services::grok_oauth::GROK_OAUTH_SENTINEL,
+                        "SuperGrok login needs the device flow",
                     ),
                 ];
                 let reject = |msg: String| -> Option<ExitCode> {

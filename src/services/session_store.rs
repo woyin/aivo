@@ -279,12 +279,20 @@ impl ApiKey {
         self.base_url == crate::services::gemini_oauth::GEMINI_OAUTH_SENTINEL
     }
 
+    /// True when this entry stores a SuperGrok OAuth credential — a *provider*
+    /// bearer usable by any coding agent, not a single-CLI credential.
+    pub fn is_grok_oauth(&self) -> bool {
+        self.base_url == crate::services::grok_oauth::GROK_OAUTH_SENTINEL
+    }
+
     /// True when this entry is any of the multi-account OAuth variants
-    /// (Codex/Claude/Gemini) — used by callers that share the same
-    /// "OAuth entries lack a REST endpoint / are tied to a specific CLI"
-    /// semantics.
+    /// (Codex/Claude/Gemini/Grok) — used by callers that share the same
+    /// "OAuth entries lack a REST endpoint / hold a credential blob" semantics.
     pub fn is_any_oauth(&self) -> bool {
-        self.is_codex_oauth() || self.is_claude_oauth() || self.is_gemini_oauth()
+        self.is_codex_oauth()
+            || self.is_claude_oauth()
+            || self.is_gemini_oauth()
+            || self.is_grok_oauth()
     }
 
     pub fn oauth_tool_hint(&self) -> &'static str {
@@ -294,6 +302,8 @@ impl ApiKey {
             "aivo codex"
         } else if self.is_gemini_oauth() {
             "aivo gemini"
+        } else if self.is_grok_oauth() {
+            "aivo code"
         } else {
             "aivo <tool>"
         }
@@ -309,13 +319,14 @@ impl ApiKey {
         } else if self.is_gemini_oauth() {
             Some("Gemini sign-in removed — re-add with an API key")
         } else {
+            // Grok OAuth works with any coding agent — no run restriction.
             None
         }
     }
 
-    /// "Claude Code" / "Codex ChatGPT" / "Gemini", or generic "OAuth" for
-    /// non-OAuth keys so callers can unconditionally use it in messages
-    /// guarded by `is_any_oauth`.
+    /// "Claude Code" / "Codex ChatGPT" / "Gemini" / "SuperGrok", or generic
+    /// "OAuth" for non-OAuth keys so callers can unconditionally use it in
+    /// messages guarded by `is_any_oauth`.
     pub fn oauth_kind_label(&self) -> &'static str {
         if self.is_claude_oauth() {
             "Claude Code"
@@ -323,6 +334,8 @@ impl ApiKey {
             "Codex ChatGPT"
         } else if self.is_gemini_oauth() {
             "Gemini"
+        } else if self.is_grok_oauth() {
+            "SuperGrok"
         } else {
             "OAuth"
         }
@@ -349,6 +362,8 @@ impl ApiKey {
             Some("<Codex OAuth>")
         } else if self.is_gemini_oauth() {
             Some("<Gemini OAuth>")
+        } else if self.is_grok_oauth() {
+            Some("<SuperGrok OAuth>")
         } else if self.is_copilot() {
             Some("<Copilot>")
         } else if self.is_cursor_acp() {
