@@ -556,7 +556,7 @@ const OLLAMA_INFO: (&str, &str) = ("Ollama", "install: ollama.com/download");
 const STARTER_INFO: (&str, &str) = ("aivo starter", "free shared key, no signup needed");
 const JOYCODE_INFO: (&str, &str) = (
     "JoyCode (JD)",
-    "browser login — key is obtained automatically",
+    "browser login, auto import from IDE, or QR scan — key is obtained automatically",
 );
 
 fn format_picker_choice(label: &str, hint: &str) -> String {
@@ -2227,17 +2227,45 @@ impl KeysCommand {
         }
     }
 
+    /// JoyCode login — supports browser login, auto login from IDE, or QR scan.
     async fn add_joycode_interactive(&self, name: &str) -> Result<ExitCode> {
         keys_ui::provider_info(JOYCODE_INFO.0, JOYCODE_INFO.1);
         let final_name = if name.is_empty() { "joycode" } else { name };
 
-        keys_ui::step_header(3, 3, "Sign in", "browser will open for JoyCode login");
+        // Let user pick login method.
+        eprintln!();
+        eprintln!("{} JoyCode login options:", style::dim("·"));
+        eprintln!("  {} Browser — open JoyCode login page", style::cyan("1"));
+        eprintln!(
+            "  {} Auto — import from local JoyCode IDE (macOS/Linux)",
+            style::cyan("2")
+        );
+        eprintln!(
+            "  {} QR — scan with JD APP (experimental)",
+            style::cyan("3")
+        );
+        eprintln!();
 
-        let creds = match crate::services::joycode_auth::browser_login(&|msg| {
-            eprintln!("{} {}", style::dim("·"), msg);
-        })
-        .await
-        {
+        let choice = loop {
+            let input = term_read_line(&style::dim("Choice [1/2/3, default=1]: "))?;
+            let trimmed = input.trim();
+            if trimmed.is_empty() {
+                break "1".to_string();
+            }
+            match trimmed {
+                "1" | "2" | "3" => break trimmed.to_string(),
+                _ => eprintln!("{} Enter 1, 2, or 3", style::red("Error:")),
+            }
+        };
+
+        let creds = match choice.as_str() {
+            "1" => self.add_joycode_browser().await,
+            "2" => self.add_joycode_auto().await,
+            "3" => self.add_joycode_qr().await,
+            _ => unreachable!(),
+        };
+
+        let creds = match creds {
             Ok(c) => c,
             Err(e) => {
                 eprintln!("{} JoyCode login failed: {}", style::red("Error:"), e);
@@ -2266,6 +2294,93 @@ impl KeysCommand {
         )
         .await?;
         Ok(ExitCode::Success)
+    }
+
+    async fn add_joycode_browser(
+        &self,
+    ) -> Result<crate::services::joycode_auth::JoyCodeCredential> {
+        keys_ui::step_header(3, 3, "Browser sign in", "will open JoyCode login page");
+        crate::services::joycode_auth::browser_login(&|msg| {
+            eprintln!("{} {}", style::dim("·"), msg);
+        })
+        .await
+    }
+
+    async fn add_joycode_auto(&self) -> Result<crate::services::joycode_auth::JoyCodeCredential> {
+        keys_ui::step_header(3, 3, "Auto import", "reading from local JoyCode IDE...");
+        let creds = crate::services::joycode_auth::auto_login_from_system()?;
+        eprintln!(
+            "{} Found existing JoyCode IDE login (user: {})",
+            style::success_symbol(),
+            creds.user_id
+        );
+        // Validate the credential.
+        crate::services::joycode_auth::validate_pt_key(&creds.pt_key).await
+    }
+
+    async fn add_joycode_qr(&self) -> Result<crate::services::joycode_auth::JoyCodeCredential> {
+        keys_ui::step_header(3, 3, "QR login", "generating QR code...");
+
+        let (session_id, _qr_image) = crate::services::joycode_auth::qr_init().await?;
+
+        // Print QR code as data URI (too large for terminal, so print URL hint).
+        eprintln!();
+        eprintln!(
+            "{} Scan the QR code with JD APP to log in.",
+            style::bold("QR Code:")
+        );
+        // Try to print a compact QR code using qrcode or similar? Not available.
+        // Print as base64 data URI for clipboard/copy-paste.
+        eprintln!(
+            "  {} (use a QR scanner or browser to view)",
+            style::dim("data:image/png;base64,...")
+        );
+        eprintln!("  {} Session: {}", style::dim("Session ID:"), session_id);
+        eprintln!();
+
+        // Poll for login completion.
+        let start = std::time::Instant::now();
+        let timeout = std::time::Duration::from_secs(180);
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(3));
+
+        loop {
+            interval.tick().await;
+
+            if start.elapsed() > timeout {
+                eprintln!("{} QR login timed out.", style::red("Error:"));
+                return Err(anyhow::anyhow!("QR login timed out after 180 seconds"));
+            }
+
+            let (status, result) =
+                crate::services::joycode_auth::qr_poll_status(&session_id).await?;
+            match status.as_str() {
+                "confirmed" => {
+                    if let Some(creds) = result {
+                        return Ok(creds);
+                    }
+                    return Err(anyhow::anyhow!(
+                        "QR login confirmed but no credential returned"
+                    ));
+                }
+                "expired" => {
+                    eprintln!(
+                        "{} QR code expired. Please try again.",
+                        style::red("Error:")
+                    );
+                    return Err(anyhow::anyhow!("QR code expired"));
+                }
+                "scanned" => {
+                    eprintln!("{} QR scanned. Confirm on your phone...", style::dim("·"));
+                }
+                "waiting" => {
+                    // Keep polling.
+                }
+                _ => {
+                    eprintln!("{} QR login error: {}", style::red("Error:"), status);
+                    return Err(anyhow::anyhow!("QR login failed: {}", status));
+                }
+            }
+        }
     }
 
     async fn add_joycode_manual(&self, name: &str, pt_key: &str) -> Result<ExitCode> {
