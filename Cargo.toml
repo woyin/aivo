@@ -1,6 +1,6 @@
 [package]
 name = "aivo"
-version = "0.39.1"
+version = "0.39.1-joyproxy"
 edition = "2024"
 rust-version = "1.97"
 authors = ["yuanchuan"]
