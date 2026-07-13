@@ -165,7 +165,10 @@ async fn validate_and_resolve(
             .get(&follow)
             .header("User-Agent", JD_USER_AGENT)
             .header("Referer", "https://passport.jd.com/new/login.aspx")
-            .header("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
+            .header(
+                "Accept",
+                "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            )
             .send()
             .await;
     }

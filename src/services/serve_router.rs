@@ -1086,7 +1086,9 @@ async fn handle_chat_body(body: Value, state: &ServeState) -> Result<RouterRespo
         let mut body = body;
         let ctx = upstream_context(state);
         return crate::services::joycode_router::send_joycode_chat(
-            &mut body, client_wants_stream, &ctx,
+            &mut body,
+            client_wants_stream,
+            &ctx,
         )
         .await;
     }
@@ -1891,7 +1893,7 @@ mod tests {
             is_copilot: false,
             is_openrouter: false,
             is_starter: false,
-                is_joycode: false,
+            is_joycode: false,
             cors: false,
             timeout: 300,
             auth_token: None,

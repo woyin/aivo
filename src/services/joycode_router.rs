@@ -92,20 +92,14 @@ fn color_sign(function_id: &str) -> (String, String) {
     let result = mac.finalize();
     let sign = hex::encode(result.into_bytes());
 
-    let query = format!(
-        "appid={COLOR_GATEWAY_APP_ID}&functionId={function_id}&t={ts}"
-    );
+    let query = format!("appid={COLOR_GATEWAY_APP_ID}&functionId={function_id}&t={ts}");
     (query, sign)
 }
 
 /// Build the final request URL for a JoyCode endpoint.
 /// If color_base_url is set (enterprise tenant), use color gateway with signing.
 /// Otherwise, use direct v2 path.
-fn request_url(
-    endpoint: &str,
-    color_base_url: &str,
-    master_base_url: &str,
-) -> String {
+fn request_url(endpoint: &str, color_base_url: &str, master_base_url: &str) -> String {
     let endpoints = color_endpoints();
 
     if let Some(ep) = endpoints.get(endpoint) {
@@ -177,7 +171,10 @@ impl JoyCodeKeyData {
 /// Build JoyCode-specific request headers.
 fn joycode_headers(pt_key: &str, login_type: &str) -> reqwest::header::HeaderMap {
     let mut headers = reqwest::header::HeaderMap::new();
-    headers.insert("Content-Type", "application/json; charset=UTF-8".parse().unwrap());
+    headers.insert(
+        "Content-Type",
+        "application/json; charset=UTF-8".parse().unwrap(),
+    );
     headers.insert("source-type", "joycoder-ide".parse().unwrap());
     headers.insert("ptKey", pt_key.parse().unwrap());
     headers.insert(
@@ -193,7 +190,10 @@ fn joycode_headers(pt_key: &str, login_type: &str) -> reqwest::header::HeaderMap
     headers.insert("User-Agent", JOYCODE_USER_AGENT.parse().unwrap());
     headers.insert("Accept", "*/*".parse().unwrap());
     headers.insert("Accept-Encoding", "gzip, deflate".parse().unwrap());
-    headers.insert("Accept-Language", "zh-CN,zh;q=0.9,en;q=0.8".parse().unwrap());
+    headers.insert(
+        "Accept-Language",
+        "zh-CN,zh;q=0.9,en;q=0.8".parse().unwrap(),
+    );
     headers
 }
 
@@ -240,19 +240,23 @@ pub(crate) async fn send_joycode_chat(
 
     // Determine the endpoint
     let endpoint = "/api/saas/openai/v1/chat/completions";
-    let url = request_url(endpoint, &key_data.color_base_url, &key_data.master_base_url);
+    let url = request_url(
+        endpoint,
+        &key_data.color_base_url,
+        &key_data.master_base_url,
+    );
 
     // Build headers
     let headers = joycode_headers(&key_data.pt_key, &key_data.login_type);
 
     let client = &context.client;
-    let req_builder = client
-        .post(&url)
-        .headers(headers)
-        .json(&*body);
+    let req_builder = client.post(&url).headers(headers).json(&*body);
 
     // Send the request
-    let response = req_builder.send().await.context("send JoyCode chat request")?;
+    let response = req_builder
+        .send()
+        .await
+        .context("send JoyCode chat request")?;
 
     let status = response.status().as_u16();
 
@@ -285,16 +289,26 @@ pub(crate) async fn send_joycode_chat(
         } else {
             resp_body.to_vec()
         };
-        Ok(RouterResponse::buffered(200, "application/json", resp_bytes))
+        Ok(RouterResponse::buffered(
+            200,
+            "application/json",
+            resp_bytes,
+        ))
     }
 }
 
 /// Send a models list request through the JoyCode router.
-pub(crate) async fn send_joycode_models(context: &UpstreamRequestContext) -> Result<RouterResponse> {
+pub(crate) async fn send_joycode_models(
+    context: &UpstreamRequestContext,
+) -> Result<RouterResponse> {
     let key_data = JoyCodeKeyData::from_key_json(&context.upstream_api_key)?;
 
     let endpoint = "/api/saas/models/v1/modelList";
-    let url = request_url(endpoint, &key_data.color_base_url, &key_data.master_base_url);
+    let url = request_url(
+        endpoint,
+        &key_data.color_base_url,
+        &key_data.master_base_url,
+    );
     let headers = joycode_headers(&key_data.pt_key, &key_data.login_type);
 
     let body = json!({
@@ -318,10 +332,16 @@ pub(crate) async fn send_joycode_models(context: &UpstreamRequestContext) -> Res
     let status = response.status().as_u16();
     if status != 200 {
         let error_body = response.text().await.unwrap_or_default();
-        anyhow::bail!("JoyCode models error {status}: {}", &error_body[..error_body.len().min(500)]);
+        anyhow::bail!(
+            "JoyCode models error {status}: {}",
+            &error_body[..error_body.len().min(500)]
+        );
     }
 
-    let resp_body = response.bytes().await.context("read JoyCode models response")?;
+    let resp_body = response
+        .bytes()
+        .await
+        .context("read JoyCode models response")?;
     let resp_bytes = if resp_body.starts_with(&[0x1f, 0x8b]) {
         use std::io::Read;
         let mut decoder = flate2::read::GzDecoder::new(&resp_body[..]);
@@ -336,7 +356,11 @@ pub(crate) async fn send_joycode_models(context: &UpstreamRequestContext) -> Res
     let jc_resp: Value = serde_json::from_slice(&resp_bytes).context("parse JoyCode models")?;
     let openai_models = translate_models(jc_resp);
 
-    Ok(RouterResponse::buffered(200, "application/json", serde_json::to_vec(&openai_models)?))
+    Ok(RouterResponse::buffered(
+        200,
+        "application/json",
+        serde_json::to_vec(&openai_models)?,
+    ))
 }
 
 /// Translate JoyCode model list response to OpenAI /v1/models format.
@@ -384,12 +408,11 @@ mod tests {
 
     #[test]
     fn request_url_direct_mode() {
-        let url = request_url(
-            "/api/saas/openai/v1/chat/completions",
-            "",
-            "",
+        let url = request_url("/api/saas/openai/v1/chat/completions", "", "");
+        assert_eq!(
+            url,
+            "https://joycode-api.jd.com/api/saas/openai/v2/chat/completions"
         );
-        assert_eq!(url, "https://joycode-api.jd.com/api/saas/openai/v2/chat/completions");
     }
 
     #[test]

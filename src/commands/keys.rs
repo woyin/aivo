@@ -2249,17 +2249,13 @@ impl KeysCommand {
             }
         };
 
-        let key_json = creds.to_key_json()
+        let key_json = creds
+            .to_key_json()
             .map_err(|e| anyhow::anyhow!("serialize credential: {e}"))?;
 
         let id = self
             .session_store
-            .add_key_with_protocol(
-                final_name,
-                "https://joycode-api.jd.com",
-                None,
-                &key_json,
-            )
+            .add_key_with_protocol(final_name, "https://joycode-api.jd.com", None, &key_json)
             .await?;
 
         self.finalize_add(
@@ -2285,17 +2281,13 @@ impl KeysCommand {
             }
         };
 
-        let key_json = creds.to_key_json()
+        let key_json = creds
+            .to_key_json()
             .map_err(|e| anyhow::anyhow!("serialize credential: {e}"))?;
 
         let id = self
             .session_store
-            .add_key_with_protocol(
-                name,
-                "https://joycode-api.jd.com",
-                None,
-                &key_json,
-            )
+            .add_key_with_protocol(name, "https://joycode-api.jd.com", None, &key_json)
             .await?;
 
         self.finalize_add(
@@ -2872,13 +2864,15 @@ impl KeysCommand {
 
         // 'aivo keys add joycode' (no --key) → QR login flow.
         // 'aivo keys add joycode --key <ptKey>' → manual ptKey validation.
-        let is_joycode_name = name.eq_ignore_ascii_case("joycode")
-            && add_options.base_url.is_none();
+        let is_joycode_name =
+            name.eq_ignore_ascii_case("joycode") && add_options.base_url.is_none();
         if is_joycode_name && add_options.key.is_none() {
             return self.add_joycode_interactive(&name).await;
         }
         if is_joycode_name && add_options.key.is_some() {
-            return self.add_joycode_manual(&name, add_options.key.unwrap()).await;
+            return self
+                .add_joycode_manual(&name, add_options.key.unwrap())
+                .await;
         }
         let interactive =
             add_options.base_url.is_none() && add_options.key.is_none() && !is_starter_name;
