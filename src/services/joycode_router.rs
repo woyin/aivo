@@ -97,7 +97,7 @@ fn color_sign(function_id: &str) -> (String, String) {
 /// Build the final request URL for a JoyCode endpoint.
 /// If color_base_url is set (enterprise tenant), use color gateway with signing.
 /// Otherwise, use direct v2 path.
-fn request_url(endpoint: &str, color_base_url: &str, master_base_url: &str) -> String {
+pub(crate) fn request_url(endpoint: &str, color_base_url: &str, master_base_url: &str) -> String {
     let endpoints = color_endpoints();
 
     if let Some(ep) = endpoints.get(endpoint) {

@@ -57,7 +57,7 @@ dependencies = [
 
 [[package]]
 name = "aivo"
-version = "0.39.1-joyproxy.1"
+version = "0.39.1-joyproxy.2"
 dependencies = [
  "aes",
  "aes-gcm",

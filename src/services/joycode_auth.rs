@@ -645,15 +645,19 @@ async fn validate_qr_ticket(cookies: &str, ticket: &str) -> Result<JoyCodeCreden
 /// Used by browser login, auto login, QR login, and manual ptKey entry.
 pub async fn validate_pt_key(pt_key: &str) -> Result<JoyCodeCredential> {
     let client = reqwest::Client::new();
+    let endpoint = "/api/saas/user/v1/userInfo";
+    let url = crate::services::joycode_router::request_url(endpoint, "https://api-ai.jd.com", "");
     let resp = client
-        .post("https://joycode-api.jd.com/api/saas/user/v1/userInfo")
+        .post(url)
         .header("Content-Type", "application/json; charset=UTF-8")
         .header("source-type", "joycoder-ide")
         .header("ptKey", pt_key)
         .header("loginType", "N_PIN_PC")
         .header("User-Agent", JOYCODE_USER_AGENT)
+        .header("Accept", "*/*")
         .json(&serde_json::json!({
             "tenant": "JOYCODE",
+            "orgFullName": "",
             "userId": "",
             "client": "JoyCode",
             "clientVersion": JOYCODE_CLIENT_VERSION,
@@ -663,24 +667,65 @@ pub async fn validate_pt_key(pt_key: &str) -> Result<JoyCodeCredential> {
         .await
         .context("validate ptKey")?;
 
-    let result: serde_json::Value = resp.json().await.context("parse response")?;
+    let status = resp.status();
+    let content_type = resp
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("unknown")
+        .to_string();
+    let body = resp.bytes().await.context("read validation response")?;
+    if !status.is_success() {
+        anyhow::bail!(
+            "ptKey validation HTTP {} ({content_type}): {}",
+            status.as_u16(),
+            response_preview(&body)
+        );
+    }
+
+    let result: serde_json::Value = serde_json::from_slice(&body).with_context(|| {
+        format!(
+            "parse validation response ({content_type}): {}",
+            response_preview(&body)
+        )
+    })?;
     if result["code"].as_i64().unwrap_or(-1) != 0 {
         let msg = result["msg"].as_str().unwrap_or("unknown");
         anyhow::bail!("ptKey validation failed: {msg}");
     }
 
     let d = &result["data"];
+    let user_id = d["userId"].as_str().unwrap_or("");
+    if user_id.is_empty() {
+        anyhow::bail!("ptKey validation response missing userId");
+    }
+
     Ok(JoyCodeCredential {
         pt_key: d["ptKey"].as_str().unwrap_or(pt_key).to_string(),
         pt_pin: String::new(),
-        user_id: d["userId"].as_str().unwrap_or("").to_string(),
+        user_id: user_id.to_string(),
         real_name: d["realName"].as_str().unwrap_or("").to_string(),
-        color_base_url: d["colorBaseUrl"].as_str().unwrap_or("").to_string(),
+        color_base_url: d["colorBaseUrl"]
+            .as_str()
+            .unwrap_or("https://api-ai.jd.com")
+            .to_string(),
         master_base_url: d["masterBaseUrl"].as_str().unwrap_or("").to_string(),
         tenant: d["tenant"].as_str().unwrap_or("JOYCODE").to_string(),
         login_type: d["loginType"].as_str().unwrap_or("N_PIN_PC").to_string(),
         org_full_name: d["orgFullName"].as_str().unwrap_or("").to_string(),
     })
+}
+
+fn response_preview(body: &[u8]) -> String {
+    const LIMIT: usize = 500;
+    let text = String::from_utf8_lossy(body);
+    let mut chars = text.chars();
+    let preview: String = chars.by_ref().take(LIMIT).collect();
+    if chars.next().is_some() {
+        format!("{preview}...")
+    } else {
+        preview
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -820,6 +865,14 @@ mod tests {
 
         assert!(String::from_utf8_lossy(&response).contains("200 OK"));
         assert_eq!(callback.await.unwrap().unwrap(), "test+key");
+    }
+
+    #[test]
+    fn response_preview_is_utf8_safe_and_bounded() {
+        let body = "你".repeat(501);
+        let preview = response_preview(body.as_bytes());
+        assert_eq!(preview.chars().count(), 503);
+        assert!(preview.ends_with("..."));
     }
 
     #[test]
