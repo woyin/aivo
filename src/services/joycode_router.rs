@@ -13,6 +13,7 @@ use anyhow::{Context, Result};
 use hmac::{Hmac, Mac};
 use serde_json::{Value, json};
 use sha2::Sha256;
+use std::collections::HashMap;
 
 use crate::services::serve_upstream::{RouterResponse, StreamingBody, UpstreamRequestContext};
 
@@ -39,7 +40,6 @@ struct ColorEndpoint {
 }
 
 fn color_endpoints() -> HashMap<&'static str, ColorEndpoint> {
-    use std::collections::HashMap;
     let mut m = HashMap::new();
     m.insert(
         "/api/saas/openai/v1/chat/completions",
@@ -78,8 +78,6 @@ fn color_endpoints() -> HashMap<&'static str, ColorEndpoint> {
     );
     m
 }
-
-use std::collections::HashMap;
 
 /// Compute color gateway HMAC signature.
 /// Canonical string = appid + "&" + functionId + "&" + timestamp

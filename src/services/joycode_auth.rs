@@ -8,7 +8,6 @@
 //! the `ptKey` HTTP header on every JoyCode API request.
 
 use anyhow::{Context, Result};
-use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 use serde::{Deserialize, Serialize};
 use std::time::{Duration, Instant};
 
