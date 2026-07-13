@@ -159,6 +159,8 @@ impl CodeTuiApp {
             }
         }
 
+        let (inline_result, consumed_results) = self.parallel_batch_pairing(render_len);
+
         let mut idx = 0;
         while idx < render_len {
             let message = &self.history[idx];
@@ -288,8 +290,20 @@ impl CodeTuiApp {
                             &line_starts,
                             old_content.as_deref(),
                         );
+                        if let Some(&res_idx) = inline_result.get(&idx) {
+                            render_tool_result(
+                                &mut block,
+                                &self.history[res_idx].content,
+                                cwd,
+                                Some(name.as_str()),
+                                None,
+                                self.expanded_output.contains(&res_idx),
+                            );
+                        }
                     }
                 }
+                // Drawn under its call; empty block still carries a `✶ Done in` marker.
+                "tool_result" if consumed_results.contains(&idx) => {}
                 "tool_result" => {
                     // `tool` fixes the unit (files/entries/matches); a detached
                     // call's target tags the result (see `tool_result_source`).
@@ -438,6 +452,54 @@ impl CodeTuiApp {
             push_block(&mut lines, &mut bars, block, Some(color));
         }
         (lines, bars)
+    }
+
+    /// Pairs each `tool_call` in a parallel batch (a run of ≥2 calls followed by a
+    /// run of results) with its result: (`call idx → result idx`, `result idxs
+    /// drawn under a call`). Coalescing batches are skipped — interleaving one of
+    /// their results would reorder fold rows and desync the click-to-expand ordinal
+    /// map (`expandable_output_indices` is history-ordered).
+    fn parallel_batch_pairing(
+        &self,
+        render_len: usize,
+    ) -> (
+        std::collections::HashMap<usize, usize>,
+        std::collections::HashSet<usize>,
+    ) {
+        let mut inline = std::collections::HashMap::new();
+        let mut consumed = std::collections::HashSet::new();
+        let role = |i: usize| self.history[i].role.as_str();
+        let mut i = 0;
+        while i < render_len {
+            if role(i) != "tool_call" {
+                i += 1;
+                continue;
+            }
+            let call_start = i;
+            while i < render_len && role(i) == "tool_call" {
+                i += 1;
+            }
+            let res_start = i;
+            while i < render_len && role(i) == "tool_result" {
+                i += 1;
+            }
+            let calls = res_start - call_start;
+            let results = i - res_start;
+            if calls < 2
+                || results == 0
+                || (call_start..res_start - 1).any(|k| {
+                    tool_group_key(&decode_tool_call(&self.history[k].content).0)
+                        == tool_group_key(&decode_tool_call(&self.history[k + 1].content).0)
+                })
+            {
+                continue;
+            }
+            for j in 0..calls.min(results) {
+                inline.insert(call_start + j, res_start + j);
+                consumed.insert(res_start + j);
+            }
+        }
+        (inline, consumed)
     }
 
     /// Length of the run of consecutive `tool_call` entries starting at `start`

@@ -5290,6 +5290,86 @@ fn test_folded_run_bash_result_keeps_streaming_tail_height() {
 }
 
 #[test]
+fn test_parallel_mcp_batch_interleaves_call_and_result() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+
+    let names = ["query_qoe_devices", "query_qoe_quality", "query_qoe_users"];
+    let markers = ["ALPHA", "BETA", "GAMMA"];
+    for name in names {
+        app.apply_agent_tool_call(
+            None,
+            format!("mcp__localhost__{name}"),
+            serde_json::json!({"mode": "count"}),
+            vec![],
+            None,
+        );
+    }
+    for marker in markers {
+        app.apply_agent_tool_result(format!(
+            "<untrusted source=\"mcp:localhost\">\n{{\"count\":1,\"m\":\"{marker}\"}}\n</untrusted>"
+        ));
+    }
+
+    let refresh = |app: &mut CodeTuiApp| -> Vec<String> {
+        let body = app.build_transcript_history_body(80);
+        let wrapped = wrap_transcript(&body.lines, &body.bar_colors, 80);
+        app.transcript_hitbox = Some(TranscriptHitbox {
+            area: Rect::new(0, 0, 80, 40),
+            first_row: 0,
+            rows: wrapped.rows.clone(),
+        });
+        wrapped.rows
+    };
+    let rows = refresh(&mut app);
+
+    let shape: Vec<&str> = rows
+        .iter()
+        .filter_map(|r| {
+            if r.contains("localhost/") {
+                Some("call")
+            } else if is_output_expander(r) {
+                Some("fold")
+            } else {
+                None
+            }
+        })
+        .collect();
+    assert_eq!(
+        shape,
+        vec!["call", "fold", "call", "fold", "call", "fold"],
+        "each fold draws under its call:\n{}",
+        rows.join("\n")
+    );
+    let devices_row = rows
+        .iter()
+        .position(|r| r.contains("query_qoe_devices"))
+        .unwrap();
+    assert!(is_output_expander(&rows[devices_row + 1]));
+    assert!(markers.iter().all(|m| rows.iter().all(|r| !r.contains(m))));
+
+    let fold_rows: Vec<usize> = rows
+        .iter()
+        .enumerate()
+        .filter(|(_, r)| is_output_expander(r))
+        .map(|(i, _)| i)
+        .collect();
+    assert!(app.toggle_output_at_row(fold_rows[1]));
+    let rows = refresh(&mut app);
+    assert!(
+        rows.iter().any(|r| r.contains("BETA")),
+        "middle result expands:\n{}",
+        rows.join("\n")
+    );
+    assert!(
+        rows.iter()
+            .all(|r| !r.contains("ALPHA") && !r.contains("GAMMA")),
+        "only the clicked result expands:\n{}",
+        rows.join("\n")
+    );
+}
+
+#[test]
 fn test_native_tool_paths_render_relative_to_cwd() {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let mut app = make_test_app(tx, rx);
@@ -5442,12 +5522,10 @@ fn test_run_bash_label_strips_redundant_cd_prefix() {
 }
 
 #[test]
-fn test_detached_results_in_batch_carry_their_target() {
+fn test_detached_results_in_batch_interleave_under_their_call() {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let mut app = make_test_app(tx, rx);
 
-    // read_file + grep in one batch: both results land after both calls, so each
-    // must name its own target to stay distinguishable.
     app.apply_agent_tool_call(
         None,
         "read_file".to_string(),
@@ -5465,9 +5543,40 @@ fn test_detached_results_in_batch_carry_their_target() {
     app.apply_agent_tool_result("a\nb\nc".to_string()); // read -> 3 lines
     app.apply_agent_tool_result("1:x\n2:y".to_string()); // grep -> 2 matches
 
-    let plain = app.build_transcript().plain_lines.join("\n");
-    assert!(plain.contains("▸ +3 lines · gemini_router.rs"), "{plain}");
-    assert!(plain.contains("▸ +2 matches · 400|sanitize"), "{plain}");
+    let lines = app.build_transcript().plain_lines;
+    let read_call = lines
+        .iter()
+        .position(|l| l.contains("gemini_router.rs"))
+        .unwrap();
+    let grep_call = lines
+        .iter()
+        .position(|l| l.contains("400|sanitize"))
+        .unwrap();
+    assert!(
+        lines[read_call + 1].contains("+3 lines"),
+        "read fold under read call:\n{}",
+        lines.join("\n")
+    );
+    assert!(
+        read_call + 1 < grep_call,
+        "read pair precedes grep pair:\n{}",
+        lines.join("\n")
+    );
+    assert!(
+        lines[grep_call + 1].contains("+2 matches"),
+        "grep fold under grep call:\n{}",
+        lines.join("\n")
+    );
+    assert!(
+        lines[read_call].trim_start().starts_with("→"),
+        "{}",
+        lines.join("\n")
+    );
+    assert!(
+        lines[grep_call].trim_start().starts_with("→"),
+        "{}",
+        lines.join("\n")
+    );
 }
 
 #[test]
