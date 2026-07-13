@@ -36,9 +36,6 @@ const JOYCODE_CLIENT_VERSION: &str = "2.7.5";
 /// JoyCode SSO login page URL.
 const JOYCODE_LOGIN_URL: &str = "https://joycode.jd.com/login";
 
-/// Local callback path for the OAuth redirect.
-const CALLBACK_PATH: &str = "/joycode/callback";
-
 /// Maximum size for callback request line.
 const MAX_REQUEST_LINE: usize = 8192;
 
@@ -170,20 +167,26 @@ async fn accept_browser_callback(listener: TcpListener, expected_auth_key: &str)
 
         let path_and_query = parse_request_target(&request_line);
 
-        // Only respond to our callback path; 404 everything else (favicon, etc.)
-        if !path_and_query.starts_with(CALLBACK_PATH) {
+        let (path, query) = path_and_query
+            .split_once('?')
+            .map_or((path_and_query, ""), |(path, query)| (path, query));
+
+        // JoyCode receives only authPort, so it chooses the callback path.
+        // Current web login uses `/`; older integrations used `/api/oauth-callback`.
+        if !is_browser_callback_path(path) {
             respond(&mut stream, 404, "text/plain; charset=utf-8", b"not found").await;
             continue;
         }
 
-        let query = path_and_query.split_once('?').map(|(_, q)| q).unwrap_or("");
-
         // Parse query parameters into a map.
         let params = parse_query_params(query);
 
-        // Validate authKey.
-        let auth_key = params.get("authKey").map(String::as_str).unwrap_or("");
-        if auth_key != expected_auth_key {
+        // Some JoyCode deployments echo authKey, others omit it. Reject only
+        // an explicit mismatch; requiring it breaks the current web login flow.
+        if params
+            .get("authKey")
+            .is_some_and(|auth_key| auth_key != expected_auth_key)
+        {
             respond(
                 &mut stream,
                 403,
@@ -735,6 +738,10 @@ fn parse_request_target(request_line: &str) -> &str {
     parts.next().unwrap_or("")
 }
 
+fn is_browser_callback_path(path: &str) -> bool {
+    matches!(path, "/" | "/api/oauth-callback" | "/joycode/callback")
+}
+
 /// Parse query parameters into a HashMap.
 fn parse_query_params(query: &str) -> HashMap<String, String> {
     let mut params = HashMap::new();
@@ -783,6 +790,37 @@ async fn respond(stream: &mut tokio::net::TcpStream, status: u16, content_type: 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn browser_callback_accepts_paths_used_by_joycode() {
+        assert!(is_browser_callback_path("/"));
+        assert!(is_browser_callback_path("/api/oauth-callback"));
+        assert!(is_browser_callback_path("/joycode/callback"));
+        assert!(!is_browser_callback_path("/favicon.ico"));
+    }
+
+    #[tokio::test]
+    async fn browser_callback_captures_root_pt_key_without_echoed_auth_key() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let callback =
+            tokio::spawn(
+                async move { accept_browser_callback(listener, "expected-auth-key").await },
+            );
+
+        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        stream
+            .write_all(
+                b"GET /?pt_key=test%2Bkey&login_type=PIN HTTP/1.1\r\nHost: localhost\r\n\r\n",
+            )
+            .await
+            .unwrap();
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response).await.unwrap();
+
+        assert!(String::from_utf8_lossy(&response).contains("200 OK"));
+        assert_eq!(callback.await.unwrap().unwrap(), "test+key");
+    }
 
     #[test]
     fn parse_query_params_basic() {
