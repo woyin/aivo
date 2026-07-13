@@ -39,6 +39,7 @@ pub mod cursor_bridge;
 pub mod cursor_home_shadow;
 pub mod device_auth;
 pub mod device_fingerprint;
+pub mod device_login_ui;
 #[cfg(target_env = "musl")]
 pub mod dns_resolver;
 pub mod effort;

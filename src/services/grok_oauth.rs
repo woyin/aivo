@@ -288,34 +288,48 @@ fn credential_from_tokens(
     })
 }
 
-/// Device-code sign-in: show the URL + user code, poll until approved.
+/// Device-code sign-in: show the code, offer Enter-to-open-browser, poll until
+/// approved. Mirrors the `aivo login` UX — the browser open is a convenience
+/// (the poll runs regardless), and Ctrl+C cancels cleanly.
 pub async fn interactive_login() -> Result<GrokOAuthCredential> {
+    use crate::services::device_login_ui;
     use crate::style;
+    use std::io::IsTerminal;
 
     let device = request_device_code().await?;
 
-    let url = device
+    // The `_complete` URL pre-fills the code, so opening or scanning it needs no
+    // typing; it's also what Enter opens.
+    let open_url = device
         .verification_uri_complete
         .clone()
         .or_else(|| device.verification_uri.clone())
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| ISSUER.to_string());
+    let interactive = std::io::stdin().is_terminal();
 
     eprintln!();
     eprintln!("  {}", style::bold("Sign in to SuperGrok"));
     eprintln!(
-        "  Visit {} and enter code: {}",
-        style::blue(&url),
+        "  Enter this code when prompted:  {}",
         style::cyan(style::bold(&device.user_code))
     );
+    if interactive {
+        eprintln!(
+            "  Press {} to open your browser, or visit {}",
+            style::keycap(" Enter "),
+            style::blue(&open_url)
+        );
+    } else {
+        eprintln!("  Visit {} to sign in.", style::blue(&open_url));
+    }
     eprintln!();
 
-    let (spinning, spinner_handle) = style::start_spinner(Some(" Waiting for approval…"));
-    let result = poll_device_token(&device.device_code, device.interval, device.expires_in).await;
-    style::stop_spinner(&spinning);
-    let _ = spinner_handle.await;
-
-    result
+    let poll = poll_device_token(&device.device_code, device.interval, device.expires_in);
+    match device_login_ui::wait_for_approval(open_url, poll).await {
+        Some(result) => result,
+        None => anyhow::bail!("sign-in cancelled"),
+    }
 }
 
 /// Masks token values in a response body before logging.

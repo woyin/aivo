@@ -1025,6 +1025,17 @@ async fn fetch_models_detailed_filtered(
     key: &ApiKey,
     chat_only: bool,
 ) -> Result<Vec<ModelInfo>> {
+    // Grok is the exception: its OAuth token lists models on the CLI proxy, so
+    // every picker/warm path (`aivo code`, `start`, ai_launcher) can enumerate
+    // it. Handle it before the generic OAuth bail. id-only here; enrichment
+    // fills limits downstream, matching the `aivo models` handler.
+    if key.is_grok_oauth() {
+        let mut key = key.clone();
+        SessionStore::decrypt_key_secret(&mut key)?;
+        let mut creds = crate::services::grok_oauth::GrokOAuthCredential::from_json(&key.key)?;
+        let ids = crate::services::grok_oauth::fetch_model_ids(&mut creds).await?;
+        return Ok(ids.into_iter().map(ModelInfo::id_only).collect());
+    }
     if key.is_any_oauth() {
         anyhow::bail!(
             "Key '{}' is an OAuth credential with no model listing API. Use `{}` to launch directly, or switch to a regular API key with `aivo use`.",

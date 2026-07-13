@@ -13,7 +13,7 @@ use anyhow::Result;
 use crate::cli::{LoginArgs, LogoutArgs};
 use crate::errors::ExitCode;
 use crate::services::session_store::SessionStore;
-use crate::services::{account_store, browser_open, device_auth};
+use crate::services::{account_store, device_auth, device_login_ui};
 use crate::style;
 use crate::version::VERSION;
 
@@ -121,32 +121,9 @@ impl LoginCommand {
         }
         println!();
 
-        // Scoped so echo is restored — and the Enter→browser opener cancelled —
-        // the moment polling ends, before any later output.
-        let outcome = {
-            // Without this, the newline echoed on Enter scrolls the in-place
-            // spinner, duplicating the "Waiting…" line.
-            let _echo_guard = EchoGuard::disable();
-            // Opens the browser on Enter, concurrently with (never blocking) the poll.
-            let opener = spawn_browser_opener_on_enter(open_url);
-            let (spinning, spinner_handle) = style::start_spinner(Some(" Waiting for approval…"));
-            // Catch Ctrl+C here rather than let the default SIGINT kill the
-            // process mid-poll: that skips `EchoGuard`'s drop, leaving the
-            // terminal with echo off and a half-drawn spinner line.
-            let outcome = tokio::select! {
-                r = device_auth::poll_device_token(
-                    &device.device_code,
-                    device.interval,
-                    device.expires_in,
-                ) => Some(r),
-                _ = tokio::signal::ctrl_c() => None,
-            };
-            style::stop_spinner(&spinning);
-            let _ = spinner_handle.await;
-            opener.abort();
-            outcome
-        };
-        let user = match outcome {
+        let poll =
+            device_auth::poll_device_token(&device.device_code, device.interval, device.expires_in);
+        let user = match device_login_ui::wait_for_approval(open_url, poll).await {
             Some(result) => result?,
             None => {
                 println!("  {}", style::dim("Cancelled."));
@@ -306,86 +283,6 @@ async fn clear_starter_model_cache() {
         .await;
 }
 
-/// Prints `prompt`, then on an interactive terminal reads one line and returns
-/// it trimmed. Returns `None` on a non-TTY session — there's no one to ask.
-async fn read_line_if_tty(prompt: &str) -> Option<String> {
-    use std::io::{IsTerminal, Write};
-    if !std::io::stdin().is_terminal() {
-        return None;
-    }
-    print!("{prompt}");
-    let _ = std::io::stdout().flush();
-    let line = tokio::task::spawn_blocking(|| {
-        let mut s = String::new();
-        let _ = std::io::stdin().read_line(&mut s);
-        s
-    })
-    .await
-    .unwrap_or_default();
-    Some(line.trim().to_string())
-}
-
-/// Spawns a detached task that opens `verify_url` when the user presses Enter
-/// on a TTY (no-op on a non-TTY). The caller aborts it once polling ends, so a
-/// never-pressed Enter never gates login — it's purely a convenience.
-fn spawn_browser_opener_on_enter(verify_url: String) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
-        if read_line_if_tty("").await.is_some() && browser_open::open_url(&verify_url).is_err() {
-            println!(
-                "  {}",
-                style::dim("(couldn't open a browser — visit the URL above)")
-            );
-        }
-    })
-}
-
-/// Suppresses terminal echo for its lifetime (restored on drop), leaving
-/// canonical mode and signals on so line reads and Ctrl+C still work. `disable`
-/// returns `None` (a no-op) off a TTY or on non-Unix.
-#[cfg(unix)]
-struct EchoGuard {
-    fd: std::os::fd::RawFd,
-    original: libc::termios,
-}
-
-#[cfg(unix)]
-impl EchoGuard {
-    fn disable() -> Option<Self> {
-        use std::os::fd::AsRawFd;
-        let fd = std::io::stdin().as_raw_fd();
-        let mut original = std::mem::MaybeUninit::uninit();
-        if unsafe { libc::tcgetattr(fd, original.as_mut_ptr()) } != 0 {
-            return None;
-        }
-        let original = unsafe { original.assume_init() };
-        let mut quiet = original;
-        quiet.c_lflag &= !libc::ECHO;
-        if unsafe { libc::tcsetattr(fd, libc::TCSANOW, &quiet) } != 0 {
-            return None;
-        }
-        Some(Self { fd, original })
-    }
-}
-
-#[cfg(unix)]
-impl Drop for EchoGuard {
-    fn drop(&mut self) {
-        let _ = unsafe { libc::tcsetattr(self.fd, libc::TCSANOW, &self.original) };
-    }
-}
-
-#[cfg(not(unix))]
-#[allow(dead_code)] // Never constructed here; `disable` is always a no-op.
-struct EchoGuard;
-
-#[cfg(not(unix))]
-impl EchoGuard {
-    // The echo trail is Unix-only; nothing to suppress here.
-    fn disable() -> Option<Self> {
-        None
-    }
-}
-
 /// Default device label: `aivo <version> on <hostname>` when a hostname is
 /// discoverable, else `aivo <version> CLI`. Best-effort and cross-platform.
 fn default_label() -> String {
@@ -475,7 +372,7 @@ async fn confirm_unlink(account: &account_store::Account) -> Result<bool> {
         "  Unlink this device from {}? [y/N]: ",
         style::bold(account.display())
     );
-    match read_line_if_tty(&prompt).await {
+    match device_login_ui::read_line_if_tty(&prompt).await {
         None => anyhow::bail!(
             "Refusing to unlink without confirmation on a non-interactive session. Pass --yes to proceed."
         ),
