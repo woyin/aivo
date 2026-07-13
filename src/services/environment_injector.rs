@@ -3523,4 +3523,42 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn for_claude_per_key_requires_reasoning_override_injects_strict_flag() {
+        // Host not in the static DeepSeek/Moonshot list — only the per-key
+        // learned quirk enables strict mode.
+        let injector = EnvironmentInjector::new();
+        let mut key = test_key();
+        key.base_url = "https://api.example-thinking.dev/v1".to_string();
+        key.requires_reasoning_content = Some(true);
+        let env = injector.for_claude(&key, None);
+
+        assert_eq!(
+            env.get("AIVO_ANTHROPIC_TO_OPENAI_ROUTER_REQUIRE_REASONING")
+                .map(String::as_str),
+            Some("1"),
+            "per-key learned quirk must inject strict mode for hosts not in the static list"
+        );
+    }
+
+    #[test]
+    fn for_claude_without_per_key_reasoning_override_does_not_force_strict_flag() {
+        let injector = EnvironmentInjector::new();
+        let mut key = test_key();
+        key.base_url = "https://api.example-thinking.dev/v1".to_string();
+        let env = injector.for_claude(&key, None);
+
+        assert!(!env.contains_key("AIVO_ANTHROPIC_TO_OPENAI_ROUTER_REQUIRE_REASONING"));
+    }
+
+    #[test]
+    fn for_claude_without_model_omits_model_vars() {
+        let injector = EnvironmentInjector::new();
+        let mut key = test_key();
+        key.base_url = "https://api.anthropic.com/v1".to_string();
+        let env = injector.for_claude(&key, None);
+
+        assert!(!env.contains_key("ANTHROPIC_MODEL"));
+    }
 }

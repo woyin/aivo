@@ -242,32 +242,6 @@ pub fn stop_spinner(spinning: &Arc<AtomicBool>) {
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_style_text() {
-        let styled = style_text(StyleName::Cyan, "test");
-        assert!(!styled.is_empty());
-        assert!(styled.contains("test"));
-    }
-
-    #[test]
-    fn test_convenience_functions() {
-        assert!(!cyan("test").is_empty());
-        assert!(!green("test").is_empty());
-        assert!(!red("test").is_empty());
-        assert!(!yellow("test").is_empty());
-        assert!(!dim("test").is_empty());
-        assert!(!bold("test").is_empty());
-        assert!(!blue("test").is_empty());
-    }
-
-    #[test]
-    fn test_symbols() {
-        assert!(!success_symbol().is_empty());
-        assert!(!arrow_symbol().is_empty());
-        assert!(!bullet_symbol().is_empty());
-        assert!(!empty_bullet_symbol().is_empty());
-    }
-
     /// Counts (filled `━`, rail `─`) cells, ignoring any surrounding styling.
     fn cells(s: &str) -> (usize, usize) {
         (

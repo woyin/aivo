@@ -1960,4 +1960,84 @@ mod tests {
         let cli = Cli::try_parse_from(["aivo", "logout", "-y"]).unwrap();
         assert!(matches!(cli.command, Some(Commands::Logout(_))));
     }
+
+    #[test]
+    fn test_no_command_yields_none() {
+        let cli = Cli::try_parse_from(["aivo"]).unwrap();
+        assert!(cli.command.is_none());
+    }
+
+    #[test]
+    fn test_version_and_help_flags() {
+        let cli = Cli::try_parse_from(["aivo", "--version"]).unwrap();
+        assert!(cli.version);
+        let cli = Cli::try_parse_from(["aivo", "--help"]).unwrap();
+        assert!(cli.help);
+    }
+
+    #[test]
+    fn test_tool_alias_pi() {
+        let args = rewrite_alias(&["aivo", "pi"]);
+        let cli = Cli::try_parse_from(&args).unwrap();
+        assert!(
+            matches!(cli.command, Some(Commands::Run(ref a)) if a.tool == Some("pi".to_string()))
+        );
+    }
+
+    #[test]
+    fn test_models_refresh_flag() {
+        let cli = Cli::try_parse_from(["aivo", "models", "-r"]).unwrap();
+        if let Some(Commands::Models(args)) = cli.command {
+            assert!(args.refresh);
+        } else {
+            panic!("Expected Models command");
+        }
+    }
+
+    #[test]
+    fn test_serve_default_port() {
+        let cli = Cli::try_parse_from(["aivo", "serve"]).unwrap();
+        if let Some(Commands::Serve(args)) = cli.command {
+            assert_eq!(args.port, 24860);
+        } else {
+            panic!("Expected Serve command");
+        }
+    }
+
+    #[test]
+    fn test_info_command_and_ls_alias() {
+        let cli = Cli::try_parse_from(["aivo", "info"]).unwrap();
+        if let Some(Commands::Info(args)) = cli.command {
+            assert!(!args.ping);
+        } else {
+            panic!("Expected Info command");
+        }
+
+        let cli = Cli::try_parse_from(["aivo", "info", "--ping"]).unwrap();
+        if let Some(Commands::Info(args)) = cli.command {
+            assert!(args.ping);
+        } else {
+            panic!("Expected Info command with --ping");
+        }
+
+        let cli = Cli::try_parse_from(["aivo", "ls"]).unwrap();
+        assert!(matches!(cli.command, Some(Commands::Info(_))));
+
+        let cli = Cli::try_parse_from(["aivo", "ls", "--ping"]).unwrap();
+        if let Some(Commands::Info(args)) = cli.command {
+            assert!(args.ping);
+        } else {
+            panic!("Expected Info command via ls alias");
+        }
+    }
+
+    #[test]
+    fn test_track_command_is_unrecognized() {
+        let err = Cli::try_parse_from(["aivo", "track", "hello"]).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("track") || msg.contains("unrecognized") || msg.contains("subcommand"),
+            "expected unrecognized-subcommand error, got: {msg}"
+        );
+    }
 }

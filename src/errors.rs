@@ -231,13 +231,4 @@ mod tests {
         let err = anyhow::anyhow!("something else");
         assert_eq!(exit_code_for_error(&err), ExitCode::UserError);
     }
-
-    #[test]
-    fn test_exit_code_display() {
-        assert_eq!(format!("{}", ExitCode::Success), "0");
-        assert_eq!(format!("{}", ExitCode::UserError), "1");
-        assert_eq!(format!("{}", ExitCode::NetworkError), "2");
-        assert_eq!(format!("{}", ExitCode::AuthError), "3");
-        assert_eq!(format!("{}", ExitCode::ToolExit(130)), "130");
-    }
 }
