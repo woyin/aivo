@@ -1,5 +1,17 @@
 # Changelog
 
+## v0.40.0
+
+A provider-auth and protocol release. Codex ChatGPT OAuth and SuperGrok OAuth both become usable by any coding agent (not just their native CLIs), Grok models show up in the `code`/`start` pickers with an `aivo-login`-style sign-in flow, and `aivo serve` gains a wire-format registry with native protocol edges. The TUI also fixes parallel tool batches so each result draws under its call.
+
+- feat(codex): Codex ChatGPT OAuth usable by any coding agent (2b2c891)
+- feat(grok): SuperGrok OAuth login usable by any coding agent (2473ff1)
+- feat(serve): wire-format registry + native protocol edges (1d8fa26)
+- fix(grok): enumerate models in code/start pickers + aivo-login-style sign-in (dbbd1c6)
+- fix(code): interleave parallel tool batches so each result draws under its call (69dfe97)
+- fix(ci): update deny action version (cbe3e96)
+- test: drop redundant integration and trivial unit tests (a26bb52)
+
 ## v0.39.1
 
 A patch release focused on `aivo code` TUI correctness and packaging. Markdown tables now stack into label:value blocks instead of breaking words when a grid won't fit, a freeze from special-file reads and wedged lock holders is fixed, and the parallel tool_result resume path and pack cache get a polish pass.
