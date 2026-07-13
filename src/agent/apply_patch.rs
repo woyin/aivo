@@ -301,6 +301,8 @@ pub fn apply(patch: &str, cwd: &Path) -> Result<String, String> {
             }
             ChangeKind::Update { move_to, sections } => {
                 let full = resolve(cwd, &ch.path);
+                crate::agent::tools::regular_file_metadata(&full)
+                    .map_err(|e| format!("read {}: {e}", ch.path))?;
                 let content =
                     std::fs::read_to_string(&full).map_err(|e| format!("read {}: {e}", ch.path))?;
                 let updated =

@@ -8,6 +8,7 @@ enum OverlayKeyAction {
     ToggleSkill(usize),
     AddSkill(String),
     RemoveSkill(usize),
+    RemoveAgent(usize),
     InstallStagedSkills(Vec<String>),
     CancelSkillInstall,
     ToggleMcpServer(usize),
@@ -23,6 +24,7 @@ enum OverlayKeyAction {
 }
 
 const GOAL_STOP_CONFIRM_NOTICE: &str = "Press Esc again to stop goal mode";
+const QUEUE_ROW_GONE_NOTICE: &str = "That message was already picked up by the agent";
 
 impl CodeTuiApp {
     pub(super) async fn handle_key(&mut self, key: KeyEvent) -> Result<bool> {
@@ -40,7 +42,16 @@ impl CodeTuiApp {
                 return Ok(true);
             }
             self.exit_confirm_pending = true;
-            self.notice = Some((WARNING, "Press Ctrl+C again to exit".to_string()));
+            // Mid-turn, a reflexive Ctrl+C usually means "stop the agent" — point
+            // at esc before the second press tears down the TUI.
+            self.notice = Some((
+                WARNING,
+                if self.sending {
+                    "esc stops the agent's turn — Ctrl+C again exits aivo".to_string()
+                } else {
+                    "Press Ctrl+C again to exit".to_string()
+                },
+            ));
             return Ok(false);
         }
 
@@ -126,6 +137,10 @@ impl CodeTuiApp {
         }
 
         if let Some(should_exit) = self.handle_overlay_key(key).await? {
+            return Ok(should_exit);
+        }
+
+        if let Some(should_exit) = self.handle_queue_focus_key(key) {
             return Ok(should_exit);
         }
 
@@ -602,23 +617,21 @@ impl CodeTuiApp {
         if self.plan_mode {
             self.leave_plan_mode(false).await;
             self.set_review_quiet(true);
-            self.show_toast("Review mode — every edit shows a diff to approve");
+            self.show_toast("Review mode — approve each edit");
         } else if self.agent_review_edits {
             self.set_review_quiet(false);
-            self.show_toast("Normal mode — risky and remote-mutating actions ask first");
+            self.show_toast("Normal mode — risky actions ask first");
         } else if self.agent_auto_approve {
             self.set_auto_quiet(false);
             if !self.sending && self.enter_plan_mode().await {
-                self.show_toast("Plan mode — read-only until you approve a plan");
+                self.show_toast("Plan mode — read-only until you approve");
             } else {
                 self.set_review_quiet(true);
-                self.show_toast("Review mode — every edit shows a diff to approve");
+                self.show_toast("Review mode — approve each edit");
             }
         } else {
             self.set_auto_quiet(true);
-            self.show_toast(
-                "Auto-approve mode — everything runs without asking (catastrophic still confirms)",
-            );
+            self.show_toast("Auto-approve mode — tools run without asking");
         }
     }
 
@@ -643,9 +656,9 @@ impl CodeTuiApp {
     pub(super) fn set_auto_approve(&mut self, on: bool) {
         self.set_auto_quiet(on);
         self.show_toast(if on {
-            "Auto-approve mode — everything runs without asking (catastrophic still confirms)"
+            "Auto-approve mode — tools run without asking"
         } else {
-            "Normal mode — risky and remote-mutating actions ask first"
+            "Normal mode — risky actions ask first"
         });
     }
 
@@ -653,7 +666,7 @@ impl CodeTuiApp {
     pub(super) fn set_review_edits(&mut self, on: bool) {
         self.set_review_quiet(on);
         self.show_toast(if on {
-            "Review mode — the agent shows edits for approval before writing"
+            "Review mode — approve each edit"
         } else {
             "Review edits off — in-cwd edits apply without a review card"
         });
@@ -679,6 +692,10 @@ impl CodeTuiApp {
             }
             OverlayKeyAction::RemoveSkill(index) => {
                 self.remove_skill(index).await?;
+                Ok(Some(false))
+            }
+            OverlayKeyAction::RemoveAgent(index) => {
+                self.remove_agent(index).await?;
                 Ok(Some(false))
             }
             OverlayKeyAction::InstallStagedSkills(names) => {
@@ -758,6 +775,11 @@ impl CodeTuiApp {
                     state.query.push_str(clean);
                     state.refilter();
                 }
+                true
+            }
+            Overlay::Agents(state) => {
+                state.query.push_str(clean);
+                state.refilter();
                 true
             }
             Overlay::SkillInstall(state) => {
@@ -888,6 +910,56 @@ impl CodeTuiApp {
                         let confirmed = state.arm_or_confirm_delete();
                         if confirmed {
                             return OverlayKeyAction::RemoveSkill(state.selected);
+                        }
+                    }
+                    // Page keys scroll the split's right detail pane.
+                    KeyCode::PageUp | KeyCode::PageDown | KeyCode::Home | KeyCode::End if split => {
+                        apply_detail_scroll(&mut state.detail_scroll, key, ctrl);
+                    }
+                    KeyCode::Backspace => {
+                        state.query.pop();
+                        state.refilter();
+                    }
+                    KeyCode::Char(c) if !ctrl && c != ' ' => {
+                        state.query.push(c);
+                        state.refilter();
+                    }
+                    _ => {}
+                }
+                OverlayKeyAction::Handled
+            }
+            Overlay::Agents(state) => {
+                let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+                // Narrow-only drill-in: scroll the body; Esc/Enter/Tab back out.
+                if state.viewing.is_some() && !split {
+                    apply_detail_scroll(&mut state.detail_scroll, key, ctrl);
+                    if matches!(key.code, KeyCode::Esc | KeyCode::Enter | KeyCode::Tab) {
+                        state.viewing = None;
+                        state.detail_scroll = 0;
+                    }
+                    return OverlayKeyAction::Handled;
+                }
+                // List mode: plain keys type into the filter; no toggle/add —
+                // Enter/Tab view (narrow), Ctrl+D removes the file (two-press).
+                match key.code {
+                    KeyCode::Esc if state.pending_delete.is_some() => state.pending_delete = None,
+                    KeyCode::Esc if !state.query.is_empty() => {
+                        state.query.clear();
+                        state.refilter();
+                    }
+                    KeyCode::Esc => self.overlay = Overlay::None,
+                    KeyCode::Up => state.select_prev(),
+                    KeyCode::Char('p') if ctrl => state.select_prev(),
+                    KeyCode::Down => state.select_next(),
+                    KeyCode::Char('n') if ctrl => state.select_next(),
+                    KeyCode::Enter | KeyCode::Tab if state.has_selection() && !split => {
+                        state.pending_delete = None;
+                        state.viewing = Some(state.selected);
+                    }
+                    KeyCode::Char('d') if ctrl && state.has_selection() => {
+                        let confirmed = state.arm_or_confirm_delete();
+                        if confirmed {
+                            return OverlayKeyAction::RemoveAgent(state.selected);
                         }
                     }
                     // Page keys scroll the split's right detail pane.
@@ -1224,6 +1296,108 @@ impl CodeTuiApp {
         }
     }
 
+    /// Queue-focus mode over the queued-input panel (↑ on an empty composer
+    /// enters it). Sits between the overlay and global handlers: pre-empts the
+    /// sending-scroll ↑/↓ and Esc-interrupt branches, yields to modal cards.
+    /// `None` = fall through, exiting focus first so typing resumes composing.
+    fn handle_queue_focus_key(&mut self, key: KeyEvent) -> Option<bool> {
+        let Some(selected) = self.queue_focus else {
+            if matches!(key.code, KeyCode::Up)
+                && key.modifiers.is_empty()
+                && self.draft.is_empty()
+                && self.loading_resume.is_none()
+            {
+                let rows = self.queued_rows();
+                if !rows.is_empty() {
+                    self.queue_focus = Some(rows.len() - 1);
+                    return Some(false);
+                }
+            }
+            return None;
+        };
+
+        let rows = self.queued_rows();
+        if rows.is_empty() {
+            self.queue_focus = None;
+            return None;
+        }
+        let selected = selected.min(rows.len() - 1);
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let reorder = key
+            .modifiers
+            .intersects(KeyModifiers::ALT | KeyModifiers::SHIFT)
+            && !ctrl;
+        match key.code {
+            KeyCode::Up if reorder => {
+                if self.queue_row_move(&rows[selected], -1) {
+                    self.queue_focus = Some(selected.saturating_sub(1));
+                }
+            }
+            KeyCode::Down if reorder => {
+                if self.queue_row_move(&rows[selected], 1) {
+                    self.queue_focus = Some(selected + 1);
+                }
+            }
+            KeyCode::Up if key.modifiers.is_empty() => {
+                self.queue_focus = Some(selected.saturating_sub(1));
+            }
+            KeyCode::Char('p') if ctrl => {
+                self.queue_focus = Some(selected.saturating_sub(1));
+            }
+            KeyCode::Down if key.modifiers.is_empty() => {
+                if selected + 1 < rows.len() {
+                    self.queue_focus = Some(selected + 1);
+                } else {
+                    self.queue_focus = None;
+                }
+            }
+            KeyCode::Char('n') if ctrl => {
+                if selected + 1 < rows.len() {
+                    self.queue_focus = Some(selected + 1);
+                } else {
+                    self.queue_focus = None;
+                }
+            }
+            KeyCode::Enter => match self.queue_row_recall(&rows[selected]) {
+                Some(text) => {
+                    self.queue_focus = None;
+                    self.draft = text;
+                    self.cursor = self.draft.len();
+                    self.sync_command_menu_state();
+                }
+                None => {
+                    self.notice = Some((MUTED, QUEUE_ROW_GONE_NOTICE.to_string()));
+                }
+            },
+            KeyCode::Backspace | KeyCode::Delete => {
+                if !self.queue_row_remove(&rows[selected]) {
+                    self.notice = Some((MUTED, QUEUE_ROW_GONE_NOTICE.to_string()));
+                }
+                match self.queued_rows().len() {
+                    0 => self.queue_focus = None,
+                    n => self.queue_focus = Some(selected.min(n - 1)),
+                }
+            }
+            KeyCode::Char('d') if ctrl => {
+                if !self.queue_row_remove(&rows[selected]) {
+                    self.notice = Some((MUTED, QUEUE_ROW_GONE_NOTICE.to_string()));
+                }
+                match self.queued_rows().len() {
+                    0 => self.queue_focus = None,
+                    n => self.queue_focus = Some(selected.min(n - 1)),
+                }
+            }
+            KeyCode::Esc => {
+                self.queue_focus = None;
+            }
+            _ => {
+                self.queue_focus = None;
+                return None;
+            }
+        }
+        Some(false)
+    }
+
     async fn handle_global_key(&mut self, key: KeyEvent) -> Result<Option<bool>> {
         if is_help_shortcut(key) {
             self.open_help_overlay();
@@ -1268,6 +1442,13 @@ impl CodeTuiApp {
             }
             KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.scroll_up();
+                true
+            }
+            // Keyboard path to the `▸ +N lines` fold toggle.
+            KeyCode::Char('o') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                if !self.toggle_latest_output() {
+                    self.notice = Some((MUTED, "no collapsed output to expand".to_string()));
+                }
                 true
             }
             // Ctrl+D is left for the composer's delete-forward (emacs `delete-char`);

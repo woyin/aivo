@@ -1,8 +1,8 @@
 [package]
 name = "aivo"
-version = "0.39.0"
+version = "0.39.1"
 edition = "2024"
-rust-version = "1.95"
+rust-version = "1.97"
 authors = ["yuanchuan"]
 description = "A lightweight CLI for managing API keys and running Claude Code, Codex, and Gemini CLI across providers"
 license = "MIT"

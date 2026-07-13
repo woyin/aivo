@@ -215,6 +215,7 @@ impl CodeSessionStore {
                 completion_tokens: 0,
                 cache_read_tokens: 0,
                 cache_write_tokens: 0,
+                cost_usd: 0.0,
             };
             if let Some(i) = pos {
                 index.entries[i] = entry;
@@ -328,6 +329,7 @@ impl CodeSessionStore {
                     completion_tokens: 0,
                     cache_read_tokens: 0,
                     cache_write_tokens: 0,
+                    cost_usd: 0.0,
                 });
             }
         }
@@ -479,6 +481,7 @@ impl CodeSessionStore {
         title: &str,
         preview: &str,
         tokens: SessionTokens,
+        cost_usd: f64,
     ) -> Result<()> {
         self.migrate_sessions_if_needed().await?;
         let _lock = self.acquire_session_lock()?;
@@ -545,6 +548,7 @@ impl CodeSessionStore {
             completion_tokens: tokens.completion_tokens,
             cache_read_tokens: tokens.cache_read_tokens,
             cache_write_tokens: tokens.cache_write_tokens,
+            cost_usd,
         };
 
         match existing_pos {
@@ -591,15 +595,29 @@ impl CodeSessionStore {
     /// running total when a chat is resumed so later turns keep accumulating on
     /// top of the prior total instead of overwriting it with only the new turns.
     pub(crate) async fn chat_session_tokens(&self, session_id: &str) -> SessionTokens {
+        self.chat_session_billing(session_id).await.0
+    }
+
+    /// Index billing snapshot: cumulative tokens, upstream billed model, and spend.
+    pub(crate) async fn chat_session_billing(
+        &self,
+        session_id: &str,
+    ) -> (SessionTokens, Option<String>, f64) {
         self.load_index()
             .await
             .ok()
             .and_then(|idx| idx.entries.into_iter().find(|e| e.session_id == session_id))
-            .map(|e| SessionTokens {
-                prompt_tokens: e.prompt_tokens,
-                completion_tokens: e.completion_tokens,
-                cache_read_tokens: e.cache_read_tokens,
-                cache_write_tokens: e.cache_write_tokens,
+            .map(|e| {
+                (
+                    SessionTokens {
+                        prompt_tokens: e.prompt_tokens,
+                        completion_tokens: e.completion_tokens,
+                        cache_read_tokens: e.cache_read_tokens,
+                        cache_write_tokens: e.cache_write_tokens,
+                    },
+                    e.billed_model,
+                    e.cost_usd,
+                )
             })
             .unwrap_or_default()
     }
@@ -763,6 +781,7 @@ mod tests {
                 "hello world",
                 "hello world",
                 SessionTokens::default(),
+                0.0,
             )
             .await
             .unwrap();
@@ -798,6 +817,7 @@ mod tests {
                     "t",
                     "t",
                     SessionTokens::default(),
+                    0.0,
                 )
                 .await
                 .unwrap();
@@ -871,6 +891,7 @@ mod tests {
                 "hello",
                 "hello",
                 SessionTokens::default(),
+                0.0,
             )
             .await
             .unwrap();
@@ -903,6 +924,7 @@ mod tests {
                 "hello",
                 "hello",
                 SessionTokens::default(),
+                0.0,
             )
             .await
             .unwrap();
@@ -939,6 +961,7 @@ mod tests {
                     "hello",
                     "hello",
                     SessionTokens::default(),
+                    0.0,
                 )
                 .await
                 .unwrap();
@@ -968,6 +991,7 @@ mod tests {
                 "hello",
                 "hello",
                 SessionTokens::default(),
+                0.0,
             )
             .await
             .unwrap();
@@ -1001,6 +1025,7 @@ mod tests {
                     "title",
                     "preview",
                     SessionTokens::default(),
+                    0.0,
                 )
                 .await
                 .unwrap();
@@ -1031,6 +1056,7 @@ mod tests {
                 "title-a",
                 "preview-a",
                 SessionTokens::default(),
+                0.0,
             )
             .await
             .unwrap();
@@ -1048,6 +1074,7 @@ mod tests {
                 "title-b",
                 "preview-b",
                 SessionTokens::default(),
+                0.0,
             )
             .await
             .unwrap();
@@ -1079,6 +1106,7 @@ mod tests {
                 "t",
                 "p",
                 SessionTokens::default(),
+                0.0,
             )
             .await
             .unwrap();
@@ -1095,6 +1123,7 @@ mod tests {
                 "t",
                 "p",
                 SessionTokens::default(),
+                0.0,
             )
             .await
             .unwrap();
@@ -1110,6 +1139,7 @@ mod tests {
                 "t",
                 "p",
                 SessionTokens::default(),
+                0.0,
             )
             .await
             .unwrap();
@@ -1149,6 +1179,7 @@ mod tests {
                 "title",
                 "preview",
                 SessionTokens::default(),
+                0.0,
             )
             .await
             .unwrap();
@@ -1170,6 +1201,7 @@ mod tests {
                 "title2",
                 "preview2",
                 SessionTokens::default(),
+                0.0,
             )
             .await
             .unwrap();
@@ -1197,6 +1229,7 @@ mod tests {
                 "title",
                 "preview",
                 SessionTokens::default(),
+                0.0,
             )
             .await
             .unwrap();
@@ -1214,6 +1247,7 @@ mod tests {
                 "title2",
                 "preview2",
                 SessionTokens::default(),
+                0.0,
             )
             .await
             .unwrap();
@@ -1248,6 +1282,7 @@ mod tests {
                 "title",
                 "preview",
                 SessionTokens::default(),
+                0.0,
             )
             .await
             .unwrap();
@@ -1405,6 +1440,7 @@ mod tests {
                     completion_tokens: 0,
                     cache_read_tokens: 0,
                     cache_write_tokens: 0,
+                    cost_usd: 0.0,
                 },
                 SessionIndexEntry {
                     session_id: "recent".to_string(),
@@ -1421,6 +1457,7 @@ mod tests {
                     completion_tokens: 0,
                     cache_read_tokens: 0,
                     cache_write_tokens: 0,
+                    cost_usd: 0.0,
                 },
             ],
         };
@@ -1458,6 +1495,7 @@ mod tests {
                     completion_tokens: c,
                     cache_read_tokens: 0,
                     cache_write_tokens: 0,
+                    cost_usd: 0.0,
                 }
             };
 
@@ -1522,6 +1560,7 @@ mod tests {
                     completion_tokens: 50,
                     cache_read_tokens: 0,
                     cache_write_tokens: 0,
+                    cost_usd: 0.0,
                 },
                 SessionIndexEntry {
                     session_id: "legacy-session".to_string(),
@@ -1538,6 +1577,7 @@ mod tests {
                     completion_tokens: 3,
                     cache_read_tokens: 0,
                     cache_write_tokens: 0,
+                    cost_usd: 0.0,
                 },
             ],
         };
@@ -1584,6 +1624,7 @@ mod tests {
                     cache_read_tokens: 0,
                     cache_write_tokens: 0,
                 },
+                0.0,
             )
             .await
             .unwrap();
@@ -1610,6 +1651,7 @@ mod tests {
                 "title",
                 "preview",
                 SessionTokens::default(),
+                0.0,
             )
             .await
             .unwrap();

@@ -148,7 +148,10 @@ impl UsageStatsStore {
         tool: &str,
         model: Option<&str>,
     ) -> Result<()> {
-        let _lock = self.stats_ctx.acquire_lock()?;
+        // Best-effort: an unavailable lock skips the write, never fails the launch.
+        let Ok(_lock) = self.stats_ctx.acquire_lock() else {
+            return Ok(());
+        };
         let mut stats = self.load_with_migration().await?;
         stats.record_selection(key_id, tool, model);
         self.stats_ctx.save(&stats).await
@@ -165,7 +168,9 @@ impl UsageStatsStore {
         cache_read_input_tokens: u64,
         cache_creation_input_tokens: u64,
     ) -> Result<()> {
-        let _lock = self.stats_ctx.acquire_lock()?;
+        let Ok(_lock) = self.stats_ctx.acquire_lock() else {
+            return Ok(());
+        };
         let mut stats = self.load_with_migration().await?;
         stats.record_tokens(
             key_id,
@@ -176,6 +181,22 @@ impl UsageStatsStore {
             cache_read_input_tokens,
             cache_creation_input_tokens,
         );
+        self.stats_ctx.save(&stats).await
+    }
+
+    pub(crate) async fn record_agent_run(
+        &self,
+        key_id: &str,
+        agent: &str,
+        ok: bool,
+        steps: u64,
+        tokens: u64,
+    ) -> Result<()> {
+        let Ok(_lock) = self.stats_ctx.acquire_lock() else {
+            return Ok(());
+        };
+        let mut stats = self.load_with_migration().await?;
+        stats.record_agent_run(key_id, agent, ok, steps, tokens);
         self.stats_ctx.save(&stats).await
     }
 
@@ -208,6 +229,26 @@ mod tests {
         let store = test_store(&dir);
         let stats = store.load().await.unwrap();
         assert!(stats.is_empty());
+    }
+
+    /// A held lock (wedged process) must skip the write, not fail or stall.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn record_skips_when_lock_held() {
+        let dir = TempDir::new().unwrap();
+        let store = test_store(&dir);
+        let held = store.stats_ctx.acquire_lock().unwrap();
+        store
+            .record_selection("key1", "claude", Some("opus"))
+            .await
+            .unwrap();
+        drop(held);
+        assert!(store.load().await.unwrap().is_empty());
+        store
+            .record_selection("key1", "claude", Some("opus"))
+            .await
+            .unwrap();
+        assert!(!store.load().await.unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -247,6 +288,32 @@ mod tests {
         assert_eq!(model.prompt_tokens, 300);
         assert_eq!(model.completion_tokens, 150);
         assert_eq!(model.cache_read_input_tokens, 80);
+    }
+
+    #[tokio::test]
+    async fn record_agent_run_persists_and_accumulates() {
+        let dir = TempDir::new().unwrap();
+        let store = test_store(&dir);
+        store
+            .record_agent_run("key1", "code-reviewer", true, 6, 900)
+            .await
+            .unwrap();
+        store
+            .record_agent_run("key1", "code-reviewer", false, 3, 400)
+            .await
+            .unwrap();
+        let stats = store.load().await.unwrap();
+        let agent = stats
+            .key_usage
+            .get("key1")
+            .unwrap()
+            .per_agent
+            .get("code-reviewer")
+            .unwrap();
+        assert_eq!(agent.runs, 2);
+        assert_eq!(agent.ok_runs, 1);
+        assert_eq!(agent.steps, 9);
+        assert_eq!(agent.tokens, 1300);
     }
 
     #[tokio::test]

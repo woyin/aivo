@@ -245,7 +245,19 @@ pub(super) fn role_bar_color(role: &str) -> Color {
         "assistant" => ACCENT,
         "local_command" => SHELL,
         "tool_call" | "tool_result" | "plan" => TOOL,
+        "error" => ERROR,
         _ => MUTED,
+    }
+}
+
+/// A turn-level error persisted into the transcript: `✗ message` in the error hue.
+pub(super) fn render_error_message(lines: &mut Vec<StyledLine>, content: &str) {
+    for (i, line) in content.lines().enumerate() {
+        let prefix = if i == 0 { "✗ " } else { "  " };
+        lines.push(line_with_plain(vec![Span::styled(
+            format!("{prefix}{line}"),
+            Style::default().fg(ERROR),
+        )]));
     }
 }
 
@@ -267,6 +279,38 @@ fn wrap_one_line(line: &str, width: usize) -> Vec<String> {
     }
     wrapped.push(current);
     wrapped
+}
+
+/// Greedy word wrap by display width, for prose that must stay readable on
+/// narrow terminals — words never split mid-word (an oversized single word
+/// falls back to the character wrap).
+pub(super) fn wrap_words(text: &str, width: usize) -> Vec<String> {
+    let width = width.max(1);
+    let mut lines: Vec<String> = Vec::new();
+    let mut current = String::new();
+    for word in text.split_whitespace() {
+        let sep = usize::from(!current.is_empty());
+        let current_width: usize = current.chars().map(char_cell_width).sum();
+        let word_width: usize = word.chars().map(char_cell_width).sum();
+        if !current.is_empty() && current_width + sep + word_width > width {
+            lines.push(std::mem::take(&mut current));
+        }
+        if !current.is_empty() {
+            current.push(' ');
+        }
+        current.push_str(word);
+    }
+    if !current.is_empty() {
+        lines.push(current);
+    }
+    lines
+        .into_iter()
+        .flat_map(|l| wrap_one_line(&l, width))
+        .collect()
+}
+
+fn char_cell_width(ch: char) -> usize {
+    UnicodeWidthChar::width(ch).unwrap_or(0).max(1)
 }
 
 pub(super) fn wrap_plain_lines(lines: &[String], width: u16) -> Vec<String> {
@@ -402,14 +446,14 @@ pub(super) fn push_block(
     lines.extend(block);
 }
 
-/// The two-row half-block "aivo code" wordmark, 31 columns wide.
+/// The two-row half-block "aivo code" wordmark, 30 columns wide.
 pub(super) const BRAND_WORDMARK: [&str; 2] = [
-    "▄▀█ █ █░█ █▀█   █▀▀ █▀█ █▀▄ █▀█",
-    "█▀█ █ ▀▄▀ █▄█   █▄▄ █▄█ █▄▀ █▄▄",
+    "▄▀█ █ █░█ █▀█  █▀▀ █▀█ █▀▄ █▀█",
+    "█▀█ █ ▀▄▀ █▄█  █▄▄ █▄█ █▄▀ █▄▄",
 ];
 /// Narrow "aivo" fallback for columns too slim for the full mark.
 pub(super) const BRAND_WORDMARK_NARROW: [&str; 2] = ["▄▀█ █ █░█ █▀█", "█▀█ █ ▀▄▀ █▄█"];
-pub(super) const BRAND_WORDMARK_WIDTH: u16 = 31;
+pub(super) const BRAND_WORDMARK_WIDTH: u16 = 30;
 pub(super) const BRAND_WORDMARK_NARROW_WIDTH: u16 = 13;
 
 fn brand_wordmark_for(width: u16) -> (&'static [&'static str; 2], u16) {
@@ -779,11 +823,16 @@ pub(super) fn render_pending_status(
     frame_tick: usize,
     reduce_motion: bool,
     elapsed: Duration,
+    deadline: Option<Duration>,
     activity: &str,
     tail: &str,
 ) {
     let spinner = spinner_frame_indexed(frame_tick, reduce_motion);
-    let elapsed = format_request_elapsed(elapsed);
+    let mut elapsed = format_request_elapsed(elapsed);
+    // A step with a timeout budget shows the deadline it will be killed at.
+    if let Some(deadline) = deadline {
+        elapsed = format!("{elapsed} / {}", format_request_elapsed(deadline));
+    }
     // Empty tail → just the clock.
     let text = if tail.is_empty() {
         format!("{spinner} {activity} ({elapsed})")
@@ -799,6 +848,16 @@ pub(super) fn render_pending_status(
 
 /// Row-name cap — short enough that the delegate's action stays visible.
 const SUBAGENT_ROW_NAME_MAX_COLS: usize = 28;
+
+/// One live tail row, truncated so a long line can't re-wrap taller each frame.
+pub(super) fn tool_tail_row_text(line: &str) -> String {
+    const TOOL_TAIL_MAX_COLS: usize = 96;
+    let line = line.replace('\t', "  ");
+    format!(
+        "    {}",
+        truncate_label(line.trim_end(), TOOL_TAIL_MAX_COLS)
+    )
+}
 
 /// One live row for a parallel delegate: `↳ name — action · step N (12s)`,
 /// flipping to `✓ name — done (32s · 8 step(s) · 1.2k tokens)`.
@@ -826,6 +885,42 @@ pub(super) fn subagent_row_text(row: &super::shared::SubagentRow) -> String {
         line.push_str(&format!(" · {tool} denied"));
     }
     line
+}
+
+/// One row for a call in a trailing parallel batch: `↳ Audit the auth flow`,
+/// flipping to `✓ Audit the auth flow — 34 lines` / `✗ … — <error>`. No
+/// per-row clock — history entries carry no start time.
+pub(super) fn parallel_call_row_text(
+    name: &str,
+    args: &serde_json::Value,
+    outcome: (Option<String>, bool),
+    cwd: &str,
+) -> String {
+    // A delegate reads as its task — the headline already says "sub-agents".
+    let label = if canonical_tool_name(name) == "subagent" {
+        let task = tool_arg_summary(name, args, cwd);
+        if task.is_empty() {
+            "sub-agent".to_string()
+        } else {
+            task
+        }
+    } else {
+        tool_action_label(name, args, cwd)
+    };
+    let detail = |text: &str| {
+        truncate_label(
+            text.lines().next().unwrap_or_default().trim(),
+            ACTION_TARGET_MAX_COLS,
+        )
+    };
+    match outcome {
+        (result, true) => format!(
+            "  ✗ {label} — {}",
+            detail(result.as_deref().unwrap_or("failed"))
+        ),
+        (Some(result), false) => format!("  ✓ {label} — {}", detail(&result)),
+        (None, false) => format!("  ↳ {label}"),
+    }
 }
 
 /// Footer context-stat color by fullness: a quiet signal that warms toward the
@@ -904,6 +999,7 @@ pub(super) fn render_system_message(
 /// bridge stores these as `tool_call` entries whose `content` is JSON
 /// `{"name", "args"}` (chat history is a display log; the engine owns the real
 /// LLM context).
+#[allow(clippy::too_many_arguments)]
 pub(super) fn render_tool_call(
     lines: &mut Vec<StyledLine>,
     name: &str,
@@ -912,6 +1008,7 @@ pub(super) fn render_tool_call(
     failed: bool,
     cwd: &str,
     line_starts: &[Option<usize>],
+    old_content: Option<&str>,
 ) {
     let name = canonical_tool_name(name);
     let summary = tool_arg_summary(name, args, cwd);
@@ -942,10 +1039,10 @@ pub(super) fn render_tool_call(
         }
     }
     lines.push(line_with_plain(spans));
-    // For edit tools, show a compact diff of what changed so the user can review
-    // the agent's edit without opening the file (no-op for tools without a
-    // textual old/new, e.g. cursor edits or write_file).
-    render_edit_diff(lines, name, args, line_starts);
+    // For edit/write tools, show a compact diff of what changed so the user can
+    // review the agent's edit without opening the file (no-op for tools without
+    // a textual old/new, e.g. cursor edits).
+    render_edit_diff(lines, name, args, line_starts, old_content);
     // Cursor stores its result on the call entry (the in-process agent emits a
     // separate `tool_result` line instead) — surface it as a compact `⎿` line,
     // in the error hue when the tool failed.
@@ -985,6 +1082,16 @@ pub(super) fn decode_line_starts(content: &str) -> Vec<Option<usize>> {
         .and_then(|v| v.get("line_starts").and_then(|x| x.as_array()).cloned())
         .map(|arr| arr.iter().map(|x| x.as_u64().map(|n| n as usize)).collect())
         .unwrap_or_default()
+}
+
+/// The pre-write snapshot a `write_file` `tool_call` entry carries; absent
+/// (new/non-UTF8/oversized/older entries) → all-additions fallback.
+pub(super) fn decode_old_content(content: &str) -> Option<String> {
+    serde_json::from_str::<serde_json::Value>(content)
+        .ok()?
+        .get("old_content")?
+        .as_str()
+        .map(str::to_string)
 }
 
 /// Decode a `tool_call` history entry's JSON `{name, args}` payload.
@@ -1277,6 +1384,10 @@ pub(super) const MAX_OUTPUT_LINES: usize = 40;
 /// change — an unbounded 50k-line expand would re-freeze the UI each turn.
 pub(super) const MAX_EXPANDED_OUTPUT_LINES: usize = 2_000;
 
+/// Trailing lines a folded `run_bash` result keeps visible — its live streaming
+/// window (`push_tool_output`'s tail), so landing doesn't drop them and jump the view.
+pub(super) const STREAM_TAIL_LINES: usize = 4;
+
 /// How many output lines a finished `!cmd` persists into its `local_command` history
 /// entry (and the on-disk session) — a bounded preview that caps session size and is
 /// what an expanded block falls back to after a resume. The true count rides along as
@@ -1294,13 +1405,16 @@ pub(super) const OUTPUT_COLLAPSED_PREFIX: &str = "▸ +";
 /// Leading marker of an expanded `!cmd` output (`▾ collapse`).
 pub(super) const OUTPUT_EXPANDED_PREFIX: &str = "▾ collapse";
 
-/// Whether a rendered transcript row is a clickable `!cmd` output expander — the
-/// folded `▸ +N more lines` or the expanded `▾ collapse` toggle. The click handler
-/// maps it back to its `local_command` block; ordinary output rows are indented
-/// with their own text, so they don't match these arrow-led markers.
+/// Whether a rendered transcript row is a clickable output expander: folded
+/// `▸ +N…`, expanded `⎿ ▾ N lines` summary, or trailing `▾ collapse`.
 pub(super) fn is_output_expander(row: &str) -> bool {
     let row = row.trim_start();
-    row.starts_with(OUTPUT_COLLAPSED_PREFIX) || row.starts_with(OUTPUT_EXPANDED_PREFIX)
+    let row = row.strip_prefix("⎿ ").unwrap_or(row);
+    row.starts_with(OUTPUT_COLLAPSED_PREFIX)
+        || row.starts_with(OUTPUT_EXPANDED_PREFIX)
+        || row
+            .strip_prefix("▾ ")
+            .is_some_and(|r| r.starts_with(|c: char| c.is_ascii_digit()))
 }
 
 /// The true output line count a `local_command` entry carries (its persisted
@@ -1492,22 +1606,111 @@ pub(super) fn render_local_command(
     }
 }
 
+/// The `[exit N]` tail a nonzero-exit `run_bash` result carries — scan the last
+/// few lines, since a sandbox note or spill pointer can follow it.
+pub(super) fn bash_exit_code(result: &str) -> Option<i32> {
+    result.lines().rev().take(4).find_map(|l| {
+        l.trim()
+            .strip_prefix("[exit ")
+            .and_then(|r| r.strip_suffix(']'))
+            .and_then(|n| n.parse().ok())
+    })
+}
+
 /// Render an agent tool result as a compact `⎿ summary` line under its call.
+/// A multi-line summary doubles as the fold toggle (`▸ +N lines`); a nonzero
+/// `run_bash` exit reads in the error hue so a broken build can't pass for green.
 pub(super) fn render_tool_result(
     lines: &mut Vec<StyledLine>,
     result: &str,
     cwd: &str,
     tool: Option<&str>,
     label: Option<&str>,
+    expanded: bool,
 ) {
-    // A failure arrives as a single-line `error: …` (see `ChatAgentUi`); show it
-    // in the error hue. Multi-line output containing "error:" stays neutral.
-    let failed = result.lines().count() <= 1 && result.trim_start().starts_with("error:");
+    let tool = tool.map(canonical_tool_name);
+    let count = result.lines().count();
+    let exit = (tool == Some("run_bash"))
+        .then(|| bash_exit_code(result))
+        .flatten()
+        .filter(|&c| c != 0);
+    // Multi-line "error:" text stays neutral — only a single-line `error: …`
+    // (see `ChatAgentUi`) or a nonzero exit is a real failure.
+    let failed = exit.is_some() || (count <= 1 && result.trim_start().starts_with("error:"));
     let summary_color = if failed { ERROR } else { FAINT };
     let mut spans = vec![Span::styled(
         "  ⎿ ".to_string(),
         Style::default().fg(summary_color),
     )];
+    if count > 1 {
+        // The summary line is the fold toggle in both states.
+        let unit = count_unit(tool, count);
+        let summary = if expanded {
+            format!("▾ {count} {unit}")
+        } else {
+            format!("{OUTPUT_COLLAPSED_PREFIX}{count} {unit}")
+        };
+        spans.push(Span::styled(
+            summary,
+            Style::default().fg(if failed { ERROR } else { MUTED }),
+        ));
+        if let Some(code) = exit {
+            spans.push(Span::styled(
+                format!(" · exited {code}"),
+                Style::default().fg(ERROR),
+            ));
+        }
+        if let Some(label) = label.filter(|l| !l.is_empty()) {
+            spans.push(Span::styled(
+                format!(" · {}", truncate_chars(label, 40)),
+                Style::default().fg(MUTED),
+            ));
+        }
+        // A search's or subagent's first line is the payoff — preview it.
+        if matches!(tool, Some("grep" | "glob" | "subagent")) {
+            let first = result
+                .lines()
+                .map(str::trim)
+                .find(|l| !l.is_empty())
+                .unwrap_or("");
+            spans.push(Span::styled(
+                format!(" · {}", truncate_chars(&strip_ansi_and_controls(first), 48)),
+                Style::default().fg(summary_color),
+            ));
+        }
+        lines.push(line_with_plain(spans));
+        if expanded {
+            for line in result.lines().take(MAX_EXPANDED_OUTPUT_LINES) {
+                let is_exit_line = line.trim().starts_with("[exit ");
+                lines.push(line_with_plain(vec![Span::styled(
+                    format!("    {}", strip_ansi_and_controls(line)),
+                    Style::default().fg(if is_exit_line { ERROR } else { FAINT }),
+                )]));
+            }
+            if count > MAX_EXPANDED_OUTPUT_LINES {
+                lines.push(line_with_plain(vec![Span::styled(
+                    format!("    … (+{} more lines)", count - MAX_EXPANDED_OUTPUT_LINES),
+                    Style::default().fg(FAINT),
+                )]));
+            }
+            // A long block also folds from its far end.
+            if count > MAX_OUTPUT_LINES {
+                lines.push(line_with_plain(vec![Span::styled(
+                    format!("  {OUTPUT_EXPANDED_PREFIX}"),
+                    Style::default().fg(MUTED),
+                )]));
+            }
+        } else if tool == Some("run_bash") {
+            for line in result.lines().skip(count.saturating_sub(STREAM_TAIL_LINES)) {
+                let is_exit_line = line.trim().starts_with("[exit ");
+                lines.push(line_with_plain(vec![Span::styled(
+                    tool_tail_row_text(&strip_ansi_and_controls(line)),
+                    Style::default().fg(if is_exit_line { ERROR } else { FAINT }),
+                )]));
+            }
+        }
+        return;
+    }
     if let Some(label) = label.filter(|l| !l.is_empty()) {
         spans.push(Span::styled(
             format!("{} · ", truncate_chars(label, 40)),
@@ -1515,7 +1718,7 @@ pub(super) fn render_tool_result(
         ));
     }
     spans.push(Span::styled(
-        tool_result_summary(result, cwd, tool),
+        tool_result_summary(result, cwd),
         Style::default().fg(summary_color),
     ));
     lines.push(line_with_plain(spans));
@@ -1689,12 +1892,27 @@ pub(super) struct EditDiff {
 }
 
 /// The pairs an edit tool applies, in render order (one per `edit_file`, per
-/// `multi_edit` step, per `apply_patch` hunk) — so `line_starts` aligns by index.
+/// `multi_edit` step, per `apply_patch` hunk, whole content for `write_file`) —
+/// so `line_starts` aligns by index. `write_file` defaults to all-additions;
+/// the review card ([`review_edit_diffs`]) and the transcript card (via the
+/// `old_content` snapshot in [`render_edit_diff`]) upgrade it to a real diff.
 pub(super) fn edit_diffs(name: &str, args: &serde_json::Value) -> Vec<EditDiff> {
     let pick = |v: &serde_json::Value, k: &str| {
         v.get(k).and_then(|x| x.as_str()).unwrap_or("").to_string()
     };
     match name {
+        "write_file" => {
+            let new = pick(args, "content");
+            if new.is_empty() {
+                vec![]
+            } else {
+                vec![EditDiff {
+                    path: pick(args, "path"),
+                    old: String::new(),
+                    new,
+                }]
+            }
+        }
         "edit_file" => {
             let (old, new) = (pick(args, "old_string"), pick(args, "new_string"));
             if old.is_empty() && new.is_empty() {
@@ -2018,22 +2236,33 @@ fn render_change_row(
     line_with_plain(spans)
 }
 
+/// One cap for every edit tool's diff card — the same change shouldn't truncate
+/// differently depending on which tool the model picked.
+const MAX_DIFF_LINES: usize = 22;
+
 /// The compact diff card under an edit tool call: removed lines red, added green,
 /// changed tokens brightened, unchanged lines dim context. Capped so a big rewrite
 /// can't flood the transcript; nothing for tools with no textual diff.
+/// `old_content` upgrades a `write_file` card to a real diff.
 fn render_edit_diff(
     lines: &mut Vec<StyledLine>,
     name: &str,
     args: &serde_json::Value,
     line_starts: &[Option<usize>],
+    old_content: Option<&str>,
 ) {
     if name == "apply_patch" {
         render_patch_diff(lines, args, line_starts);
         return;
     }
-    const MAX_DIFF_LINES: usize = 14;
     const CONTEXT: usize = 3;
-    let diffs = edit_diffs(name, args);
+    let mut diffs = edit_diffs(name, args);
+    if name == "write_file"
+        && let Some(old) = old_content
+        && let [diff] = diffs.as_mut_slice()
+    {
+        diff.old = old.to_string();
+    }
     if diffs.is_empty() {
         return;
     }
@@ -2075,7 +2304,7 @@ fn render_patch_diff(
     args: &serde_json::Value,
     line_starts: &[Option<usize>],
 ) {
-    const MAX_LINES: usize = 22;
+    const MAX_LINES: usize = MAX_DIFF_LINES;
     const CONTEXT: usize = 3;
     let diffs = edit_diffs("apply_patch", args);
     if diffs.is_empty() {
@@ -2286,11 +2515,14 @@ fn fit_column_widths(natural: &[usize], min_word: &[usize], budget: usize) -> Ve
         return widths;
     }
 
-    // Soft floors: avoid shrinking a column below its longest word while another
-    // column still has slack — keeps words intact as long as possible. Cap the
-    // floor so one giant token can't starve every other column.
-    let floor_cap = (budget / ncols).max(1);
-    let floors: Vec<usize> = min_word.iter().map(|&w| w.min(floor_cap).max(1)).collect();
+    // Soft floors: a column's longest word, so words stay intact. Only when even
+    // the longest words can't all fit, cap so one giant token can't starve the rest.
+    let floors: Vec<usize> = if min_word.iter().map(|&w| w.max(1)).sum::<usize>() <= budget {
+        min_word.iter().map(|&w| w.max(1)).collect()
+    } else {
+        let floor_cap = (budget / ncols).max(1);
+        min_word.iter().map(|&w| w.min(floor_cap).max(1)).collect()
+    };
 
     // Shrink the widest column above its floor, one column at a time, until we fit
     // or every column is at its floor; then, if still over, shrink the widest
@@ -2351,6 +2583,61 @@ fn wrap_cell_text(text: &str, width: usize) -> Vec<String> {
     if !cur.is_empty() || out.is_empty() {
         out.push(cur);
     }
+    out
+}
+
+/// Word-wrap styled words to `width` display columns, hard-breaking oversized
+/// words; consecutive same-style words merge into one span.
+fn wrap_styled_words(words: &[(String, Style)], width: usize) -> Vec<Vec<Span<'static>>> {
+    let width = width.max(1);
+    fn flush(cur: &mut Vec<(String, Style)>, out: &mut Vec<Vec<Span<'static>>>) {
+        if cur.is_empty() {
+            return;
+        }
+        let mut spans: Vec<Span<'static>> = Vec::new();
+        for (i, (text, style)) in cur.drain(..).enumerate() {
+            let sep = if i == 0 { "" } else { " " };
+            match spans.last_mut() {
+                Some(last) if last.style == style => {
+                    last.content.to_mut().push_str(sep);
+                    last.content.to_mut().push_str(&text);
+                }
+                _ => spans.push(Span::styled(format!("{sep}{text}"), style)),
+            }
+        }
+        out.push(spans);
+    }
+
+    let mut out: Vec<Vec<Span<'static>>> = Vec::new();
+    let mut cur: Vec<(String, Style)> = Vec::new();
+    let mut cur_w = 0usize;
+    for (word, style) in words {
+        let ww = cell_width(word);
+        if ww > width {
+            flush(&mut cur, &mut out);
+            let chunks = wrap_one_line(word, width);
+            let split = chunks.len().saturating_sub(1);
+            for chunk in &chunks[..split] {
+                cur.push((chunk.clone(), *style));
+                flush(&mut cur, &mut out);
+            }
+            cur_w = 0;
+            if let Some(tail) = chunks.last() {
+                cur_w = cell_width(tail);
+                cur.push((tail.clone(), *style));
+            }
+            continue;
+        }
+        let sep = usize::from(!cur.is_empty());
+        if cur_w + sep + ww > width {
+            flush(&mut cur, &mut out);
+            cur_w = ww;
+        } else {
+            cur_w += sep + ww;
+        }
+        cur.push((word.clone(), *style));
+    }
+    flush(&mut cur, &mut out);
     out
 }
 
@@ -2418,11 +2705,13 @@ fn tool_arg_summary(name: &str, args: &serde_json::Value, cwd: &str) -> String {
         // "subagent" is jargon — the short `label`, else the task (preamble
         // stripped), renders as the label itself (see `render_tool_call`).
         // `description`/`prompt` are Claude Code's names for the same args.
+        // A named delegation (`agent`/`subagent_type`) leads with the profile
+        // name so the transcript attributes the work: `code-reviewer — <task>`.
         "subagent" => {
             let label = [pick("label"), pick("description")]
                 .into_iter()
                 .find(|s| !s.trim().is_empty());
-            match label {
+            let body = match label {
                 Some(l) => truncate_chars(l.trim(), 72),
                 None => {
                     let task = if pick("task").is_empty() {
@@ -2432,6 +2721,14 @@ fn tool_arg_summary(name: &str, args: &serde_json::Value, cwd: &str) -> String {
                     };
                     truncate_chars(&condense_subagent_task(task), 72)
                 }
+            };
+            match [pick("agent"), pick("subagent_type")]
+                .into_iter()
+                .find(|s| !s.trim().is_empty())
+            {
+                Some(agent) if !body.is_empty() => format!("{} — {}", agent.trim(), body),
+                Some(agent) => agent.trim().to_string(),
+                None => body,
             }
         }
         _ => String::new(),
@@ -2648,43 +2945,17 @@ pub(super) fn render_output_line(raw: &str) -> String {
     line.into_iter().collect()
 }
 
-fn tool_result_summary(s: &str, cwd: &str, tool: Option<&str>) -> String {
-    let tool = tool.map(canonical_tool_name);
-    // Multi-line output (read_file's numbered lines, dir listings, command
-    // output) collapses to a clean count — the `→ verb(args)` line above already
-    // says what ran, so a peek at the noisy first line (line numbers, etc.) adds
-    // nothing. Single-line results are the meaningful outcome ("wrote x", "+1 −1").
-    let count = s.lines().count();
-    // A subagent's result is its written report; a bare line count ("243 lines")
-    // says nothing about what it found and can't be told apart from a sibling's.
-    // Preview the first non-empty line (with a `+N more` tail) so each subagent's
-    // outcome is legible at a glance.
-    if tool == Some("subagent") {
-        let first = s
-            .lines()
-            .map(str::trim)
-            .find(|l| !l.is_empty())
-            .unwrap_or("");
-        let preview = truncate_chars(&strip_ansi_and_controls(first), 56);
-        let extra = count.saturating_sub(1);
-        return if extra > 0 {
-            format!("{preview} (+{extra} more)")
-        } else {
-            preview
-        };
-    }
-    if count > 1 {
-        format!("{count} {}", count_unit(tool, count))
+/// A single-line result is the meaningful outcome ("wrote x", "+1 −1") — show it
+/// cwd-stripped and sanitized. Multi-line results fold in [`render_tool_result`].
+fn tool_result_summary(s: &str, cwd: &str) -> String {
+    let cwd = cwd.trim_end_matches(['/', '\\']);
+    let clean = strip_ansi_and_controls(s.trim());
+    let stripped = if cwd.is_empty() {
+        clean
     } else {
-        let cwd = cwd.trim_end_matches(['/', '\\']);
-        let clean = strip_ansi_and_controls(s.trim());
-        let stripped = if cwd.is_empty() {
-            clean
-        } else {
-            clean.replace(&format!("{cwd}/"), "")
-        };
-        truncate_chars(&stripped, 60)
-    }
+        clean.replace(&format!("{cwd}/"), "")
+    };
+    truncate_chars(&stripped, 60)
 }
 
 /// Unit for a tool's multi-line result count. File listers/searchers count
@@ -2967,12 +3238,9 @@ impl MarkdownRenderer {
         }
     }
 
-    /// Render a buffered GFM table as a bordered, width-aware box (Claude-Code
-    /// style): columns are sized to fit the available text width, long cells wrap
-    /// across multiple lines instead of overflowing, and the whole table never
-    /// exceeds the pane — so the transcript word-wrapper can't shear it apart.
-    /// A bold header row sits under a top border, a `├─┼─┤` rule splits it from
-    /// the body, and a bottom border closes the box.
+    /// Render a buffered GFM table responsively (Claude-Code style): a bordered
+    /// grid with word-wrapped cells when every column can hold its longest word,
+    /// otherwise stacked `Header: value` blocks so words never hard-break.
     fn emit_table(&mut self, table: TableAcc) {
         let rows = table.rows;
         let Some(ncols) = rows.iter().map(Vec::len).max().filter(|n| *n > 0) else {
@@ -2996,6 +3264,14 @@ impl MarkdownRenderer {
         // space of padding on each side of every cell. The rest is column content.
         let chrome = (ncols + 1) + 2 * ncols;
         let budget = self.table_width.saturating_sub(chrome).max(ncols);
+
+        // Stack below longest-word floors + slack; header-only tables have
+        // nothing to stack, so they stay a grid.
+        let floors: usize = min_word.iter().sum();
+        if rows.len() > 1 && floors + 2 * ncols > budget {
+            self.emit_table_stacked(&rows, ncols);
+            return;
+        }
         let widths = fit_column_widths(&natural, &min_word, budget);
 
         let border = Style::default().fg(FAINT);
@@ -3021,24 +3297,74 @@ impl MarkdownRenderer {
             for k in 0..height {
                 let mut spans: Vec<Span<'static>> = vec![Span::styled("│", border)];
                 for (i, w) in widths.iter().enumerate() {
-                    let text = cells[i].get(k).map(String::as_str).unwrap_or("");
+                    // Shorter cells sit vertically centered; header cells also center horizontally.
+                    let top = (height - cells[i].len()) / 2;
+                    let text = (k >= top)
+                        .then(|| cells[i].get(k - top).map(String::as_str))
+                        .flatten()
+                        .unwrap_or("");
+                    let pad = w.saturating_sub(cell_width(text));
+                    let lpad = if header { pad / 2 } else { 0 };
                     let mut padded = String::with_capacity(w + 2);
                     padded.push(' ');
+                    padded.push_str(&" ".repeat(lpad));
                     padded.push_str(text);
-                    padded.push_str(&" ".repeat(w.saturating_sub(cell_width(text))));
+                    padded.push_str(&" ".repeat(pad - lpad));
                     padded.push(' ');
                     spans.push(Span::styled(padded, cell_style));
                     spans.push(Span::styled("│", border));
                 }
                 self.lines.push(line_with_plain(spans));
             }
-            // Header gets a `├─┼─┤` rule only when a body follows; close with the
-            // bottom border after the final row.
-            if header && last > 0 {
+            if ri < last {
                 self.lines.push(rule("├", "┼", "┤"));
-            }
-            if ri == last {
+            } else {
                 self.lines.push(rule("└", "┴", "┘"));
+            }
+        }
+    }
+
+    /// Stacked fallback for tables too wide to grid: each body row becomes a
+    /// block of bold-`Header:` value lines at full width, rows separated by a rule.
+    fn emit_table_stacked(&mut self, rows: &[Vec<String>], ncols: usize) {
+        let width = self.table_width.max(8);
+        let headers = &rows[0];
+        let label_style = Style::default().fg(TEXT).add_modifier(Modifier::BOLD);
+        let value_style = Style::default().fg(TEXT);
+        let mut first = true;
+        for row in &rows[1..] {
+            if row.iter().all(|c| c.trim().is_empty()) {
+                continue;
+            }
+            if !first {
+                let rule = "─".repeat(width.min(40));
+                self.lines
+                    .push(line_plain(rule, Style::default().fg(FAINT)));
+            }
+            first = false;
+            for i in 0..ncols {
+                let header = headers.get(i).map(String::as_str).unwrap_or("").trim();
+                let value = row.get(i).map(String::as_str).unwrap_or("").trim();
+                let mut words: Vec<(String, Style)> = Vec::new();
+                let label: Vec<&str> = header.split_whitespace().collect();
+                for (wi, word) in label.iter().enumerate() {
+                    // Colon rides on the last label word so wrapping can't detach it.
+                    let text = if wi + 1 == label.len() {
+                        format!("{word}:")
+                    } else {
+                        (*word).to_string()
+                    };
+                    words.push((text, label_style));
+                }
+                for word in value.split_whitespace() {
+                    words.push((word.to_string(), value_style));
+                }
+                if words.is_empty() {
+                    continue;
+                }
+                for spans in wrap_styled_words(&words, width) {
+                    self.lines.push(line_with_plain(spans));
+                }
             }
         }
     }
@@ -3271,8 +3597,8 @@ pub(super) fn compact_lines_and_bars(lines: &mut Vec<StyledLine>, bars: &mut Vec
 #[cfg(test)]
 mod render_tests {
     use super::{
-        condense_subagent_task, render_edit_diff, strip_ansi_and_controls, subagent_row_text,
-        tool_arg_summary, tool_result_summary,
+        condense_subagent_task, parallel_call_row_text, render_edit_diff, strip_ansi_and_controls,
+        subagent_row_text, tool_arg_summary, tool_result_summary,
     };
 
     #[test]
@@ -3283,7 +3609,7 @@ mod render_tests {
             "new_string": "\tif len(hours) > 12 {\n\t\tstep = 4\n\t}",
         });
         let mut lines = Vec::new();
-        render_edit_diff(&mut lines, "edit_file", &args, &[None]);
+        render_edit_diff(&mut lines, "edit_file", &args, &[None], None);
         assert!(!lines.is_empty());
         let texts: Vec<String> = lines
             .iter()
@@ -3303,6 +3629,42 @@ mod render_tests {
             texts.iter().any(|t| t.contains("    if len(hours) > 12 {")),
             "expanded indent missing: {texts:?}"
         );
+    }
+
+    #[test]
+    fn write_file_renders_content_as_additions() {
+        let args = serde_json::json!({
+            "path": "src/new.rs",
+            "content": "fn main() {\n    println!(\"hi\");\n}\n",
+        });
+        let mut lines = Vec::new();
+        render_edit_diff(&mut lines, "write_file", &args, &[Some(1)], None);
+        let texts: Vec<String> = lines
+            .iter()
+            .map(|l| {
+                l.line
+                    .spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect();
+        assert!(
+            texts.iter().any(|t| t.contains("fn main() {")),
+            "written content missing from diff: {texts:?}"
+        );
+        assert!(
+            texts.iter().any(|t| t.contains("println!(\"hi\");")),
+            "written content missing from diff: {texts:?}"
+        );
+    }
+
+    #[test]
+    fn write_file_empty_content_renders_nothing() {
+        let args = serde_json::json!({ "path": "src/empty.rs", "content": "" });
+        let mut lines = Vec::new();
+        render_edit_diff(&mut lines, "write_file", &args, &[None], None);
+        assert!(lines.is_empty(), "empty write should emit no diff rows");
     }
 
     #[test]
@@ -3383,6 +3745,46 @@ mod render_tests {
     }
 
     #[test]
+    fn tool_arg_summary_subagent_leads_with_named_agent() {
+        // A named delegation attributes the row to the profile: `agent — task`.
+        assert_eq!(
+            tool_arg_summary(
+                "subagent",
+                &serde_json::json!({"agent": "code-reviewer", "label": "audit auth flow"}),
+                ""
+            ),
+            "code-reviewer — audit auth flow"
+        );
+        // Claude Code's `subagent_type` is the same field; falls back to the task.
+        assert_eq!(
+            tool_arg_summary(
+                "Task",
+                &serde_json::json!({"subagent_type": "explorer", "prompt": "Please investigate the crash"}),
+                ""
+            ),
+            "explorer — investigate the crash"
+        );
+        // Named delegate with no label/task renders the bare agent name.
+        assert_eq!(
+            tool_arg_summary(
+                "subagent",
+                &serde_json::json!({"agent": "code-reviewer"}),
+                ""
+            ),
+            "code-reviewer"
+        );
+        // No agent → unchanged label-only behavior (generic delegate).
+        assert_eq!(
+            tool_arg_summary(
+                "subagent",
+                &serde_json::json!({"label": "audit auth flow"}),
+                ""
+            ),
+            "audit auth flow"
+        );
+    }
+
+    #[test]
     fn subagent_row_text_running_and_done_forms() {
         use std::time::{Duration, Instant};
         let mut row = super::super::shared::SubagentRow {
@@ -3417,6 +3819,41 @@ mod render_tests {
     }
 
     #[test]
+    fn parallel_call_row_text_forms() {
+        let args = serde_json::json!({"label": "Audit the auth flow"});
+        assert_eq!(
+            parallel_call_row_text("subagent", &args, (None, false), ""),
+            "  ↳ Audit the auth flow"
+        );
+        assert_eq!(
+            parallel_call_row_text(
+                "subagent",
+                &args,
+                (Some("34 lines\nmore".into()), false),
+                ""
+            ),
+            "  ✓ Audit the auth flow — 34 lines"
+        );
+        assert_eq!(
+            parallel_call_row_text("subagent", &args, (Some("boom".into()), true), ""),
+            "  ✗ Audit the auth flow — boom"
+        );
+        assert_eq!(
+            parallel_call_row_text("subagent", &serde_json::json!({}), (None, false), ""),
+            "  ↳ sub-agent"
+        );
+        assert_eq!(
+            parallel_call_row_text(
+                "grep",
+                &serde_json::json!({"pattern": "hover"}),
+                (None, false),
+                ""
+            ),
+            "  ↳ searching hover"
+        );
+    }
+
+    #[test]
     fn strip_ansi_removes_csi_osc_and_controls() {
         // CSI color codes gone, visible text kept.
         assert_eq!(strip_ansi_and_controls("\x1b[32mok\x1b[0m"), "ok");
@@ -3434,7 +3871,7 @@ mod render_tests {
     #[test]
     fn single_line_summary_is_sanitized() {
         // A single-line colored result renders with no escape bytes leaking in.
-        let out = tool_result_summary("\x1b[31mfatal: bad ref\x1b[0m", "", None);
+        let out = tool_result_summary("\x1b[31mfatal: bad ref\x1b[0m", "");
         assert_eq!(out, "fatal: bad ref");
         assert!(!out.contains('\x1b'));
     }

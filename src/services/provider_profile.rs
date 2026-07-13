@@ -196,10 +196,9 @@ pub fn parse_aws_region(input: &str) -> Option<String> {
     let host = parsed.host_str()?;
     let region = if let Some(rest) = host.strip_prefix("bedrock-mantle.") {
         rest.strip_suffix(".api.aws")?
-    } else if let Some(rest) = host.strip_prefix("bedrock-runtime.") {
-        rest.strip_suffix(".amazonaws.com")?
     } else {
-        return None;
+        let rest = host.strip_prefix("bedrock-runtime.")?;
+        rest.strip_suffix(".amazonaws.com")?
     };
     is_plausible_region(region).then(|| region.to_string())
 }
@@ -236,11 +235,8 @@ pub fn cloudflare_ai_base(base_url: &str) -> Option<String> {
     }
 
     if !base.ends_with("/ai") {
-        if let Some(idx) = base.find("/ai/") {
-            base.truncate(idx + "/ai".len());
-        } else {
-            return None;
-        }
+        let idx = base.find("/ai/")?;
+        base.truncate(idx + "/ai".len());
     }
 
     Some(base)

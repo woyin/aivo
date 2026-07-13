@@ -934,7 +934,7 @@ mod tests {
             ("Proxy-Authorization", "Basic xxx"),
         ]);
         let out = redact_headers(&h);
-        for (k, _) in h.iter() {
+        for k in h.keys() {
             assert_eq!(out[k], "[REDACTED]", "header {k} not redacted");
         }
     }

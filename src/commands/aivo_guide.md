@@ -146,6 +146,15 @@ aivo code "<text>"            # TUI with the text sent as the first message
 --add-dir <dir>               extra writable workspace root (repeatable) — writes
                               there skip the out-of-workspace confirm and stay
                               inside the sandbox confinement
+--sandbox <profile>          shell sandbox: off, workspace (default), read-only
+                              (no writes/network — also blocks edit tools), strict
+                              (writes confined to workspace + temp, no child network)
+--best-of-n <N>              run -e N ways in parallel (N ≤ 10), return the
+                              LLM-judged best; costs N× tokens (--max-cost is
+                              per candidate) and the sandbox defaults to
+                              read-only — candidates share the working tree
+--json-schema <schema>       constrain the -e final answer to a JSON Schema
+                              (inline JSON or @path to a file)
 -r, --refresh                 refresh the model list (skip cache)
 --resume [last|id]            resume a saved session (TUI and -e; -e runs persist too)
 --share                       share this session live (needs `aivo login`)
@@ -232,6 +241,19 @@ aivo code mcp import [tool] [name]  # copy servers from claude/cursor/gemini/cop
 ```
 
 Per-tool toggles within a connected server live in the TUI (`/mcp`, `Ctrl+T`).
+
+### Subagents — named specialists the agent delegates to
+
+A subagent is a `<name>.md` file (frontmatter + instructions) the main agent can hand a
+self-contained task to — a "code reviewer", "software architect", "test writer". Two ship
+built-in: `explorer` (read-only codebase exploration) and `aivo-guide` (answers questions about
+aivo itself); shadow either by creating a same-named file. The rest are discovered from the repo
+(`.aivo/agents`, `.claude/agents`), `~/.config/aivo/agents`, and installed packs; an existing
+Claude Code `.claude/agents` fleet is picked up as-is (`model: inherit` honored — prefer full
+model ids over `sonnet`-style shorthands, which pass through verbatim). Just **ask the agent
+to create one** ("make me a code-reviewer subagent") and it authors the file for you; it's
+delegatable immediately (profiles resolve fresh at delegation time). Scope its tools (`tools: [read_file, grep]`), give it its own
+`model:`, or run it in a throwaway worktree (`isolation: worktree`) — all optional frontmatter.
 
 ### Extension packs — `aivo code packs`
 

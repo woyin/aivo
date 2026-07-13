@@ -87,6 +87,7 @@ impl CodeTuiApp {
         for &idx in plan_indices.iter().rev() {
             self.history.remove(idx);
             shift_index_map_after_removal(&mut self.turn_durations, idx);
+            shift_index_map_after_removal(&mut self.turn_notes, idx);
             shift_index_map_after_removal(&mut self.reasoning_durations, idx);
             shift_index_map_after_removal(&mut self.local_outputs, idx);
             shift_index_set_after_removal(&mut self.expanded_thinking, idx);
@@ -110,10 +111,11 @@ impl CodeTuiApp {
 
     pub(super) fn should_show_input_cursor(&self) -> bool {
         // Cursor stays live during a turn (type-to-queue), but not while a resume
-        // loads or a permission card holds the keyboard.
+        // loads, a permission card holds the keyboard, or queue focus is active.
         !self.overlay.blocks_input()
             && self.loading_resume.is_none()
             && self.agent_permission.is_none()
+            && self.queue_focus.is_none()
     }
 
     pub(super) fn abort_resume_task(&mut self) {
@@ -180,6 +182,7 @@ impl CodeTuiApp {
         self.local_outputs.clear();
         self.reasoning_durations.clear();
         self.turn_durations.clear();
+        self.turn_notes.clear();
         self.clear_transcript_selection();
         self.reset_composer();
         self.pending_response.clear();

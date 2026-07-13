@@ -90,6 +90,58 @@ pub(crate) fn is_retryable_error(err: &str) -> bool {
     PATTERNS.iter().any(|p| e.contains(p))
 }
 
+/// Short label for a retryable failure's notice — "connection issue" for a 429
+/// reads as the user's network being broken, so name the class.
+pub(crate) fn retryable_error_label(e: &serve_client::ServeError) -> &'static str {
+    match e.status {
+        Some(429) => "rate limited",
+        Some(408) => "timed out",
+        Some(s) if s >= 500 => "server error",
+        _ => "connection issue",
+    }
+}
+
+/// Terminal model-call failure → failure class + fix, then the truncated raw
+/// detail. The raw `upstream NNN:` must stay in the text — the headless
+/// exit-code classifier (`classify_agent_error`) parses the status from it.
+pub(crate) fn terminal_error_notice(e: &serve_client::ServeError) -> String {
+    let lower = e.message.to_ascii_lowercase();
+    let quota = ["quota", "billing", "credit", "balance"]
+        .iter()
+        .any(|k| lower.contains(k));
+    let advice = if is_context_overflow_error(&e.message) {
+        "the conversation no longer fits the model's context window even after compacting — \
+         /compact to shrink it further, or /new to start fresh"
+    } else {
+        match e.status {
+            Some(401 | 403) if !quota => {
+                "this API key was rejected — check it with `aivo keys ls`, update it with \
+                 `aivo keys edit`, or re-run `aivo login`"
+            }
+            Some(402) => "this key is out of credits — top up, or switch keys",
+            _ if quota => {
+                "this key is out of quota/credits — top up, or switch key/model with /model"
+            }
+            Some(429) => {
+                "rate limited (retries exhausted) — wait a moment and resend, or switch \
+                 key/model with /model"
+            }
+            Some(404) => "this model isn't available on this key — pick another with /model",
+            Some(s) if s >= 500 => {
+                "server error (retries exhausted) — usually transient; resend in a moment"
+            }
+            _ => return format!("LLM error: {e}"),
+        }
+    };
+    // One line: the notice slot renders a single row (the transcript entry wraps).
+    let mut raw: String = e.message.replace(['\n', '\r'], " ");
+    const MAX_RAW: usize = 240;
+    if raw.chars().count() > MAX_RAW {
+        raw = raw.chars().take(MAX_RAW - 1).collect::<String>() + "…";
+    }
+    format!("{advice} ({raw})")
+}
+
 /// Provider rejecting the request as over the model's input limit — recoverable by
 /// compaction+retry. Wordings vary, hence the phrase list.
 pub(crate) fn is_context_overflow_error(err: &str) -> bool {
@@ -204,6 +256,57 @@ mod tests {
             "context_length_exceeded",
             Some(400)
         )));
+    }
+
+    #[test]
+    fn terminal_error_notice_classifies_and_keeps_the_raw_status() {
+        let err = |msg: &str, status: Option<u16>| serve_client::ServeError {
+            message: msg.into(),
+            status,
+            retry_after: None,
+        };
+        let auth = terminal_error_notice(&err("upstream 401: {\"error\":\"bad key\"}", Some(401)));
+        assert!(auth.contains("aivo keys"), "{auth}");
+        assert!(
+            auth.contains("upstream 401:"),
+            "the headless exit-code classifier reads the raw status: {auth}"
+        );
+        let quota = terminal_error_notice(&err("upstream 403: insufficient quota", Some(403)));
+        assert!(quota.contains("quota"), "{quota}");
+        let rate = terminal_error_notice(&err("upstream 429: slow down", Some(429)));
+        assert!(rate.contains("rate limited"), "{rate}");
+        let overflow = terminal_error_notice(&err(
+            "upstream 400: maximum context length exceeded",
+            Some(400),
+        ));
+        assert!(overflow.contains("/new"), "{overflow}");
+        let server = terminal_error_notice(&err("upstream 503: overloaded", Some(503)));
+        assert!(server.contains("server error"), "{server}");
+        // Unclassifiable → the raw dump, unchanged.
+        assert_eq!(
+            terminal_error_notice(&err("upstream 418: teapot", Some(418))),
+            "LLM error: upstream 418: teapot"
+        );
+        let big = format!("upstream 401: {}", "x".repeat(2000));
+        let n = terminal_error_notice(&err(&big, Some(401)));
+        assert!(
+            n.chars().count() < 400,
+            "not truncated: {} chars",
+            n.chars().count()
+        );
+        assert!(!n.contains('\n'));
+    }
+
+    #[test]
+    fn retryable_error_label_names_the_class() {
+        let err = |status: Option<u16>| serve_client::ServeError {
+            message: String::new(),
+            status,
+            retry_after: None,
+        };
+        assert_eq!(retryable_error_label(&err(Some(429))), "rate limited");
+        assert_eq!(retryable_error_label(&err(Some(503))), "server error");
+        assert_eq!(retryable_error_label(&err(None)), "connection issue");
     }
 
     #[test]

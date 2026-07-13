@@ -42,10 +42,13 @@ pub fn open_url(url: &str) -> std::io::Result<()> {
 
 #[cfg(target_os = "windows")]
 pub fn open_url(url: &str) -> std::io::Result<()> {
-    // cmd's `start` treats the first quoted argument as the window title,
-    // so we pass an empty title then the URL.
-    Command::new("cmd")
-        .args(["/C", "start", "", url])
+    // NOT `cmd /C start`: cmd reparses the command line, so a URL's `&` becomes a
+    // command separator (truncating every OAuth authorize URL after the first
+    // query param) and `%xx` percent-encodings get env-expanded. `explorer.exe`
+    // receives argv directly and hands the whole URL to the default protocol
+    // handler. It exits 1 even on success, so the ignored status is fine.
+    Command::new("explorer")
+        .arg(url)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())

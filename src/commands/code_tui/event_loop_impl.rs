@@ -9,6 +9,10 @@ impl CodeTuiApp {
             self.handle_runtime_event(event).await?;
             handled = true;
         }
+        if handled {
+            // Any runtime event is proof of life for the stall detector.
+            self.last_stream_activity = Some(Instant::now());
+        }
         Ok(handled)
     }
 
@@ -66,7 +70,8 @@ impl CodeTuiApp {
                 name,
                 args,
                 line_starts,
-            } => self.apply_agent_tool_call(id, name, args, line_starts),
+                old_content,
+            } => self.apply_agent_tool_call(id, name, args, line_starts, old_content),
             RuntimeEvent::AgentSubActivity {
                 agent,
                 tool,
@@ -87,7 +92,11 @@ impl CodeTuiApp {
                 ok,
                 steps,
                 tokens,
-            } => self.apply_subagent_done(slot, ok, steps, tokens),
+            } => {
+                if let Some(agent) = self.apply_subagent_done(slot, ok, steps, tokens) {
+                    self.record_agent_run(agent, ok, steps, tokens);
+                }
+            }
             RuntimeEvent::AgentSubFinish => self.subagent_rows.clear(),
             RuntimeEvent::AgentToolUpdate {
                 id,
@@ -95,6 +104,7 @@ impl CodeTuiApp {
                 result,
                 failed,
             } => self.apply_agent_tool_update(id, args, result, failed),
+            RuntimeEvent::AgentToolOutput { chunk } => self.push_tool_output(&chunk),
             RuntimeEvent::AgentToolResult { content } => self.apply_agent_tool_result(content),
             RuntimeEvent::AgentSteered(text) => self.apply_agent_steered(text),
             RuntimeEvent::AgentDiscardSegment => self.discard_streamed_segment(),
@@ -150,7 +160,7 @@ impl CodeTuiApp {
             }
             // Typed early-stop (guard stop / step limit) — remembered for /goal steering.
             RuntimeEvent::AgentTurnStop(stop) => self.goal_guard_stop = Some(stop),
-            RuntimeEvent::AgentError(text) => self.notice = Some((ERROR, text)),
+            RuntimeEvent::AgentError(text) => self.apply_agent_error(text),
             RuntimeEvent::AgentPermission {
                 tool,
                 preview,
@@ -472,18 +482,28 @@ impl CodeTuiApp {
         name: String,
         args: serde_json::Value,
         line_starts: Vec<Option<usize>>,
+        old_content: Option<String>,
     ) {
         self.clear_sandbox_escalation_notice();
         self.flush_pending_assistant();
+        self.clear_tool_output();
         // Stamp the status-line action label for the in-flight step.
         let cwd = if self.real_cwd.is_empty() {
             self.cwd.clone()
         } else {
             self.real_cwd.clone()
         };
+        // Timeout budget for the status clock (mirrors the engine's resolution).
+        let deadline = (name == "run_bash").then(|| {
+            args.get("timeout")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(120)
+                .min(600)
+        });
         self.last_tool_action = Some((
             super::render::tool_action_label(&name, &args, &cwd),
             Instant::now(),
+            deadline,
         ));
         let mut obj = serde_json::Map::new();
         obj.insert("name".to_string(), serde_json::Value::String(name.clone()));
@@ -494,6 +514,10 @@ impl CodeTuiApp {
         // Carry the pre-edit line numbers so the diff card can number rows.
         if !line_starts.is_empty() {
             obj.insert("line_starts".to_string(), serde_json::json!(line_starts));
+        }
+        // Carry a write_file's pre-write snapshot so the card shows a real diff.
+        if let Some(old) = old_content.filter(|o| !o.is_empty()) {
+            obj.insert("old_content".to_string(), serde_json::Value::String(old));
         }
         let content = serde_json::to_string(&serde_json::Value::Object(obj)).unwrap_or(name);
         self.history.push(ChatMessage {
@@ -535,7 +559,7 @@ impl CodeTuiApp {
         } else {
             format!("↳ {who}: {inner}")
         };
-        self.last_tool_action = Some((label, Instant::now()));
+        self.last_tool_action = Some((label, Instant::now(), None));
     }
 
     /// Unnamed delegates get numbered so every row stays distinguishable.
@@ -603,11 +627,35 @@ impl CodeTuiApp {
         ));
     }
 
-    pub(super) fn apply_subagent_done(&mut self, slot: usize, ok: bool, steps: usize, tokens: u64) {
-        let Some(row) = self.subagent_rows.get_mut(slot) else {
-            return;
-        };
+    /// Returns the profile name to attribute in lifetime stats when the finished
+    /// row names a discovered subagent; generic/labeled delegates return `None`
+    /// so they never pollute per-agent stats.
+    pub(super) fn apply_subagent_done(
+        &mut self,
+        slot: usize,
+        ok: bool,
+        steps: usize,
+        tokens: u64,
+    ) -> Option<String> {
+        let row = self.subagent_rows.get_mut(slot)?;
         row.done = Some((ok, steps, tokens, row.started.elapsed()));
+        let name = row.name.clone();
+        self.last_subagents
+            .iter()
+            .any(|s| s.name == name)
+            .then_some(name)
+    }
+
+    /// Persist one finished named delegation under the active key. Fire-and-forget:
+    /// a stats write must never block or fail the turn.
+    fn record_agent_run(&self, agent: String, ok: bool, steps: usize, tokens: u64) {
+        let session_store = self.session_store.clone();
+        let key_id = self.key.id.clone();
+        tokio::spawn(async move {
+            let _ = session_store
+                .record_agent_run(&key_id, &agent, ok, steps as u64, tokens)
+                .await;
+        });
     }
 
     /// Enrich the matching tool-call entry in place (cursor reports the resolved
@@ -633,6 +681,7 @@ impl CodeTuiApp {
         };
         let mut obj = serde_json::from_str::<serde_json::Value>(&entry.content)
             .unwrap_or_else(|_| serde_json::json!({}));
+        let args_updated = args.is_some();
         if let Some(args) = args {
             obj["args"] = args;
         }
@@ -643,6 +692,20 @@ impl CodeTuiApp {
             obj["failed"] = serde_json::Value::Bool(true);
         }
         entry.content = obj.to_string();
+        // Enriched args on a live call refresh the status label too
+        // (a `cursor/task` notice delivers the real task after the call frame).
+        let relabel = (args_updated && decode_tool_outcome(&entry.content).0.is_none() && !failed)
+            .then(|| super::render::decode_tool_call(&entry.content));
+        if let Some((name, new_args)) = relabel {
+            let cwd = if self.real_cwd.is_empty() {
+                self.cwd.clone()
+            } else {
+                self.real_cwd.clone()
+            };
+            if let Some((label, _, _)) = self.last_tool_action.as_mut() {
+                *label = super::render::tool_action_label(&name, &new_args, &cwd);
+            }
+        }
         self.transcript_revision = self.transcript_revision.wrapping_add(1);
     }
 
@@ -726,7 +789,23 @@ impl CodeTuiApp {
         }
     }
 
+    /// A turn-level agent error: the transient notice, plus a durable `error`
+    /// transcript entry — else a failed turn reads as a prompt with no reply
+    /// after scrolling or resume. Display-only; `agent_seed_turns` skips it.
+    pub(super) fn apply_agent_error(&mut self, text: String) {
+        self.flush_pending_assistant();
+        self.notice = Some((ERROR, text.clone()));
+        self.history.push(ChatMessage {
+            model: None,
+            role: "error".to_string(),
+            content: text,
+            reasoning_content: None,
+            attachments: vec![],
+        });
+    }
+
     pub(super) fn apply_agent_tool_result(&mut self, content: String) {
+        self.clear_tool_output();
         self.history.push(ChatMessage {
             model: None,
             role: "tool_result".to_string(),
@@ -736,6 +815,37 @@ impl CodeTuiApp {
         });
         // Same as the tool-call append: leave `follow_output` alone so a user
         // reading scrolled-up output isn't snapped to the bottom each step.
+    }
+
+    /// Fold a live output chunk into the tail; a bare \r (progress redraw)
+    /// counts as a line break.
+    pub(super) fn push_tool_output(&mut self, chunk: &str) {
+        const TAIL_LINES: usize = super::render::STREAM_TAIL_LINES;
+        const PARTIAL_CAP: usize = 512;
+        self.tool_output_partial.push_str(chunk);
+        while let Some(pos) = self.tool_output_partial.find(['\n', '\r']) {
+            let rest = self.tool_output_partial.split_off(pos + 1);
+            let line = std::mem::replace(&mut self.tool_output_partial, rest);
+            let line = line.trim_end_matches(['\n', '\r']);
+            if !line.trim().is_empty() {
+                if self.tool_output_tail.len() >= TAIL_LINES {
+                    self.tool_output_tail.pop_front();
+                }
+                self.tool_output_tail.push_back(line.to_string());
+            }
+        }
+        if self.tool_output_partial.len() > PARTIAL_CAP {
+            let mut cut = PARTIAL_CAP;
+            while !self.tool_output_partial.is_char_boundary(cut) {
+                cut -= 1;
+            }
+            self.tool_output_partial.truncate(cut);
+        }
+    }
+
+    pub(super) fn clear_tool_output(&mut self) {
+        self.tool_output_tail.clear();
+        self.tool_output_partial.clear();
     }
 
     /// Commit a consumed interjection at its injection point (events arrive in
@@ -776,6 +886,16 @@ impl CodeTuiApp {
         // Don't force-follow on a plan refresh; respect the user's scroll position.
     }
 
+    /// Pricing for the session's model, else the upstream-echoed `billed_model`
+    /// (an alias like `aivo/starter` has no snapshot row).
+    pub(super) fn session_pricing(&self) -> Option<crate::services::model_metadata::Pricing> {
+        crate::services::model_metadata::model_pricing(&self.model).or_else(|| {
+            self.billed_model
+                .as_deref()
+                .and_then(crate::services::model_metadata::model_pricing)
+        })
+    }
+
     async fn finish_agent_turn(
         &mut self,
         _steps: usize,
@@ -785,6 +905,8 @@ impl CodeTuiApp {
         self.flush_pending_assistant();
         // A `/compact` turn has no assistant reply: report freed context, not a marker.
         let compact_before = self.compact_before.take();
+        // Marker index, so the per-turn usage below can note tokens/cost on it.
+        let mut done_idx = None;
         if let Some(before) = compact_before {
             let freed = before.saturating_sub(context_tokens) as usize;
             self.notice = Some(freed_notice(freed, "summarized older turns"));
@@ -801,6 +923,7 @@ impl CodeTuiApp {
                     && let Some(idx) = self.history.iter().rposition(|m| m.role != "plan")
                 {
                     self.turn_durations.insert(idx, elapsed.as_millis() as u64);
+                    done_idx = Some(idx);
                 }
             }
         }
@@ -809,6 +932,7 @@ impl CodeTuiApp {
         self.clear_retry_notice();
         self.sending = false;
         self.subagent_rows.clear();
+        self.clear_tool_output();
         self.request_started_at = None;
         self.response_task = None;
         self.pending_submit = None;
@@ -837,11 +961,33 @@ impl CodeTuiApp {
         // total BEFORE a possible MCP rebuild drops the engine, so the chat index
         // entry (and thus `aivo stats --since`) carries actual chat tokens.
         if let Some(session) = self.agent_engine.as_ref() {
-            let turn = session.engine.lock().await.take_turn_usage();
-            if let Some(cost) = crate::services::model_metadata::model_pricing(&self.model)
-                .and_then(|p| p.cost_usd(&turn))
-            {
+            let (turn, reported_cost, billed) = {
+                let mut engine = session.engine.lock().await;
+                (
+                    engine.take_turn_usage(),
+                    engine.take_turn_cost_usd(),
+                    engine.billed_model().map(str::to_string),
+                )
+            };
+            if billed.is_some() {
+                self.billed_model = billed;
+            }
+            // Provider-reported spend beats list-price × usage when available.
+            let cost =
+                reported_cost.or_else(|| self.session_pricing().and_then(|p| p.cost_usd(&turn)));
+            if let Some(cost) = cost {
                 self.session_cost_usd += cost;
+            }
+            // The spinner's live token count vanishes at turn end — keep the
+            // final figure on the `✶ Done` line.
+            if let Some(idx) = done_idx
+                && turn.completion_tokens > 0
+            {
+                let note = format!(
+                    "{} tokens",
+                    format_token_count_value(turn.completion_tokens)
+                );
+                self.turn_notes.insert(idx, note);
             }
             self.session_tokens = self.session_tokens.merge(turn);
         }
@@ -1046,6 +1192,7 @@ impl CodeTuiApp {
         // Reset the turn, fail-closed like an interrupt.
         self.sending = false;
         self.subagent_rows.clear();
+        self.clear_tool_output();
         self.request_started_at = None;
         self.pending_submit = None;
         // A dead compact turn must not mark the NEXT turn as a compact.
@@ -1078,6 +1225,7 @@ impl CodeTuiApp {
     ) -> Result<()> {
         self.sending = false;
         self.subagent_rows.clear();
+        self.clear_tool_output();
         self.request_started_at = None;
         self.response_task = None;
         // The turn's format belongs to the model that ran it — don't clobber a
@@ -1214,9 +1362,7 @@ impl CodeTuiApp {
             cache_read_tokens: usage.cache_read_input_tokens,
             cache_write_tokens: usage.cache_creation_input_tokens,
         };
-        if let Some(cost) = crate::services::model_metadata::model_pricing(&self.model)
-            .and_then(|p| p.cost_usd(&split))
-        {
+        if let Some(cost) = self.session_pricing().and_then(|p| p.cost_usd(&split)) {
             self.session_cost_usd += cost;
         }
         self.session_tokens = self.session_tokens.merge(split);
@@ -1380,6 +1526,19 @@ impl CodeTuiApp {
         if !self.history.is_empty() {
             let _ = self.persist_history().await;
         }
+
+        // Searchable session topic for `memory_search` — user text only
+        // (shell commands can embed secrets).
+        if !self.real_cwd.is_empty()
+            && let Some(topic) = self.history.iter().find(|m| m.role == "user")
+        {
+            let date = chrono::Local::now().format("%Y-%m-%d").to_string();
+            crate::agent::memory::record_session_summary(
+                std::path::Path::new(&self.real_cwd),
+                &topic.content,
+                &date,
+            );
+        }
     }
 
     /// Debounced `/resume` preview loader: after the selection rests on an
@@ -1504,6 +1663,7 @@ impl CodeTuiApp {
                 Err(err) => break Err(err),
             }
 
+            self.tick_decision_wait();
             self.tick_status_throttle();
 
             // Refresh the cached job count (this reaps) at most every 250ms — a badge
@@ -2312,20 +2472,71 @@ impl CodeTuiApp {
             .collect()
     }
 
-    /// History indices of `local_command` entries that render an output expander, in
-    /// display order — i.e. runs whose output exceeds `MAX_OUTPUT_LINES` (shorter
-    /// runs show in full with no marker). The Nth expander row maps to the Nth entry
-    /// (folded and expanded blocks alike render exactly one marker). A still-running
-    /// command's preview is absent: it has no history index and a plain, non-clickable
-    /// marker.
+    /// History index behind each expander marker row, in display order. Must
+    /// repeat an index exactly as many times as the render emits markers for
+    /// it — one per block, two for a long expanded tool result.
     fn expandable_output_indices(&self) -> Vec<usize> {
         self.history
             .iter()
             .enumerate()
-            .filter(|(_, m)| m.role == "local_command")
-            .filter(|(_, m)| local_command_total_lines(&m.content) > MAX_OUTPUT_LINES)
-            .map(|(i, _)| i)
+            .flat_map(|(i, m)| {
+                let markers = match m.role.as_str() {
+                    "local_command" => {
+                        usize::from(local_command_total_lines(&m.content) > MAX_OUTPUT_LINES)
+                    }
+                    "tool_result" => {
+                        let count = m.content.lines().count();
+                        if count <= 1 {
+                            0
+                        } else if self.expanded_output.contains(&i) && count > MAX_OUTPUT_LINES {
+                            2
+                        } else {
+                            1
+                        }
+                    }
+                    _ => 0,
+                };
+                std::iter::repeat_n(i, markers)
+            })
             .collect()
+    }
+
+    /// While a decision card is up, push the step + turn clocks forward by each
+    /// waiting interval — decision time must not read as tool runtime or
+    /// inflate `✶ Done in …`. Called per frame beside `tick_status_throttle`.
+    pub(super) fn tick_decision_wait(&mut self) {
+        let waiting = self.sending
+            && (self.agent_permission.is_some()
+                || self.agent_ask.is_some()
+                || self.agent_review.is_some()
+                || self.agent_plan_approval.is_some());
+        if !waiting {
+            self.wait_tick = None;
+            return;
+        }
+        let now = Instant::now();
+        let Some(dt) = self.wait_tick.replace(now).map(|prev| now - prev) else {
+            return;
+        };
+        if let Some((_, since, _)) = &mut self.last_tool_action {
+            *since += dt;
+        }
+        if let Some(started) = &mut self.request_started_at {
+            *started += dt;
+        }
+    }
+
+    /// Toggle the most recent expandable output block (Ctrl+O) — the keyboard
+    /// path to the `▸ +N lines` click. Returns false when there is none.
+    pub(super) fn toggle_latest_output(&mut self) -> bool {
+        let Some(&idx) = self.expandable_output_indices().last() else {
+            return false;
+        };
+        if !self.expanded_output.insert(idx) {
+            self.expanded_output.remove(&idx);
+        }
+        self.transcript_revision = self.transcript_revision.wrapping_add(1);
+        true
     }
 
     /// If transcript `row` is a `▸ +N more lines` / `▾ collapse` output marker, toggle
@@ -2457,6 +2668,23 @@ impl CodeTuiApp {
                 Ok(Some(false))
             }
             (Overlay::Skills(_), _) => Ok(Some(false)),
+            (Overlay::Agents(_), MouseEventKind::ScrollUp | MouseEventKind::ScrollDown) => {
+                let up = matches!(mouse.kind, MouseEventKind::ScrollUp);
+                let over_detail = self
+                    .overlay_detail_area
+                    .is_some_and(|area| rect_contains(area, (mouse.column, mouse.row)));
+                if let Overlay::Agents(state) = &mut self.overlay {
+                    if state.viewing.is_some() || over_detail {
+                        state.detail_scroll = wheel_scroll(state.detail_scroll, up);
+                    } else if up {
+                        state.select_prev();
+                    } else {
+                        state.select_next();
+                    }
+                }
+                Ok(Some(false))
+            }
+            (Overlay::Agents(_), _) => Ok(Some(false)),
             (Overlay::SkillInstall(_), MouseEventKind::ScrollUp | MouseEventKind::ScrollDown) => {
                 let up = matches!(mouse.kind, MouseEventKind::ScrollUp);
                 let over_detail = self

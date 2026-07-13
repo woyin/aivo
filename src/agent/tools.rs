@@ -303,6 +303,8 @@ pub fn is_read_only(name: &str) -> bool {
             | "ask_user"
             // Job control on a process the agent itself started; never touches files.
             | "check_job"
+            // Loads deferred MCP schemas — engine state only, never the workspace.
+            | "search_tools"
     )
 }
 
@@ -670,7 +672,10 @@ fn bash_is_catastrophic(cmd: &str) -> bool {
                 .any(|t| t.strip_prefix("of=").is_some_and(is_raw_device_path)),
             "chmod" | "chown" | "chgrp" => {
                 has_short_or_long(tokens, &['r'], &["recursive"])
-                    && tokens.iter().skip(1).any(|t| *t == "/")
+                    && tokens
+                        .iter()
+                        .skip(1)
+                        .any(|t| strip_matching_quotes(t) == "/")
             }
             "shutdown" | "reboot" | "halt" | "poweroff" => true,
             "init" => matches!(tokens.get(1), Some(&"0") | Some(&"6")),
@@ -716,6 +721,7 @@ fn windows_seg_is_catastrophic(tokens: &[&str]) -> bool {
 /// A Windows drive/home/system root (`C:\`, `\`, `~`, `$env:`/`%…%`) whose
 /// recursive deletion is unrecoverable. A subpath is not matched.
 fn is_windows_root_target(arg: &str) -> bool {
+    let arg = strip_matching_quotes(arg);
     let trimmed = arg.trim_end_matches(['*', '\\', '/']);
     // "<letter>:" drive root.
     if let [letter, b':'] = trimmed.as_bytes()
@@ -792,11 +798,23 @@ fn effective_command<'a>(tokens: &'a [&'a str]) -> &'a [&'a str] {
 /// or the whole cwd (`.`), with or without a trailing `/` or `/*`. A workspace
 /// subpath (`./build`, `~/Documents`) is not matched. `arg` arrives lowercased.
 fn is_root_or_home_target(arg: &str) -> bool {
+    let arg = strip_matching_quotes(arg);
     let base = arg.strip_suffix("/*").unwrap_or(arg).trim_end_matches('/');
     if arg.starts_with('/') && base.is_empty() {
         return true; // "/", "//", "/*"
     }
     matches!(base, "~" | "$home" | "${home}" | ".")
+}
+
+/// Strip one layer of matching surrounding quotes (`"$HOME"` → `$HOME`).
+fn strip_matching_quotes(arg: &str) -> &str {
+    let bytes = arg.as_bytes();
+    match (bytes.first(), bytes.last()) {
+        (Some(b'"'), Some(b'"')) | (Some(b'\''), Some(b'\'')) if bytes.len() >= 2 => {
+            &arg[1..arg.len() - 1]
+        }
+        _ => arg,
+    }
 }
 
 /// A real `/dev/` block device (`/dev/sda`) vs. a harmless pseudo-device.
@@ -1425,6 +1443,17 @@ pub async fn execute(name: &str, args: &Value, cwd: &Path) -> Result<String, Str
         Some(n) => n,
         None => name,
     };
+    // The OS sandbox confines only the shell; refuse in-process edits here too.
+    if matches!(
+        name,
+        "write_file" | "edit_file" | "multi_edit" | "apply_patch"
+    ) && crate::agent::sandbox::current_profile()
+        == crate::agent::sandbox::SandboxProfile::ReadOnly
+    {
+        return Err(format!(
+            "{name}: refused — the read-only sandbox profile is active, so no files may be written."
+        ));
+    }
     match name {
         "read_file" => read_file(args, cwd),
         "list_dir" => list_dir(args, cwd),
@@ -1480,6 +1509,95 @@ pub(crate) fn resolve(cwd: &Path, p: &str) -> PathBuf {
     }
 }
 
+/// Effective `read_file` range (offset/limit aliases + defaults) — shared with
+/// `read_dedupe_key` so the dedupe identity can't drift from the read.
+pub(crate) fn read_file_range(args: &Value) -> (u64, u64) {
+    let offset = arg_u64(args, "offset")
+        .or_else(|| arg_u64(args, "start_line"))
+        .unwrap_or(1)
+        .max(1);
+    let limit = arg_u64(args, "limit")
+        .or_else(|| arg_u64(args, "end_line").map(|end| end.saturating_sub(offset - 1)))
+        .unwrap_or(DEFAULT_READ_LIMIT as u64);
+    (offset, limit)
+}
+
+/// Effective `grep` context lines (clamped). Shared with `read_dedupe_key`.
+fn grep_context(args: &Value) -> u64 {
+    arg_u64(args, "context").unwrap_or(0).min(100)
+}
+
+/// Effective `web_fetch` char cap (default + ceiling). Shared with `read_dedupe_key`.
+fn web_fetch_max_chars(args: &Value) -> usize {
+    arg_u64(args, "max_chars")
+        .map(|n| n as usize)
+        .unwrap_or(MAX_OUTPUT)
+        .min(WEB_FETCH_CHAR_CEIL)
+}
+
+/// Repeat-supersedable tools; checked before paying to parse a call's arguments.
+pub(crate) fn is_dedupe_eligible(name: &str) -> bool {
+    matches!(
+        name,
+        "read_file" | "list_dir" | "glob" | "grep" | "web_fetch"
+    )
+}
+
+/// Canonical identity of a repeatable read-only call (`None` = ineligible).
+/// Paths resolve against `cwd` and args normalize through the tools' own
+/// helpers, so two calls share a key iff the tool would return the same content.
+pub(crate) fn read_dedupe_key(name: &str, args: &Value, cwd: &Path) -> Option<String> {
+    let path_of = |default: Option<&str>| -> Option<String> {
+        let p = arg_str_opt(args, "path").or(default)?;
+        Some(
+            lexical_normalize(&resolve(cwd, p))
+                .to_string_lossy()
+                .into_owned(),
+        )
+    };
+    match name {
+        "read_file" => {
+            let path = path_of(None)?;
+            let (offset, limit) = read_file_range(args);
+            Some(format!("read_file\u{0}{path}\u{0}{offset}\u{0}{limit}"))
+        }
+        "list_dir" => Some(format!("list_dir\u{0}{}", path_of(Some("."))?)),
+        "glob" => {
+            let pattern = arg_str_opt(args, "pattern")?;
+            Some(format!("glob\u{0}{}\u{0}{pattern}", path_of(Some("."))?))
+        }
+        "grep" => {
+            let pattern = arg_str_opt(args, "pattern")?;
+            Some(format!(
+                "grep\u{0}{}\u{0}{pattern}\u{0}{}",
+                path_of(Some("."))?,
+                grep_context(args)
+            ))
+        }
+        "web_fetch" => {
+            let url = arg_str_opt(args, "url")?;
+            Some(format!(
+                "web_fetch\u{0}{url}\u{0}{}",
+                web_fetch_max_chars(args)
+            ))
+        }
+        _ => None,
+    }
+}
+
+/// Truncate to ≤ `max` bytes on a UTF-8 boundary; returns whether anything was cut.
+fn truncate_on_char_boundary(s: &mut String, max: usize) -> bool {
+    if s.len() <= max {
+        return false;
+    }
+    let mut end = max;
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    s.truncate(end);
+    true
+}
+
 /// Cap keeping the HEAD — for file reads / listings, where the start matters.
 fn cap_head(s: String) -> String {
     let total_lines = s.lines().count();
@@ -1493,14 +1611,7 @@ fn cap_head(s: String) -> String {
     } else {
         s
     };
-    if out.len() > MAX_OUTPUT {
-        let mut end = MAX_OUTPUT;
-        while !out.is_char_boundary(end) {
-            end -= 1;
-        }
-        out.truncate(end);
-        truncated = true;
-    }
+    truncated |= truncate_on_char_boundary(&mut out, MAX_OUTPUT);
     if truncated {
         let kept_lines = out.lines().count();
         let kept_bytes = out.len();
@@ -1558,19 +1669,25 @@ pub(crate) fn cap_tail_with(s: String, max_bytes: usize, max_lines: usize) -> St
 
 // --- read-only tools ---
 
+/// Refuse anything but a regular file: reading a FIFO or device (e.g. /dev/tty)
+/// blocks forever and wedges the single runtime thread. Stats before open — a
+/// FIFO with no writer blocks at open(), not read().
+pub(crate) fn regular_file_metadata(full: &Path) -> Result<std::fs::Metadata, String> {
+    let meta = std::fs::metadata(full).map_err(|e| e.to_string())?;
+    if meta.is_dir() {
+        return Err("is a directory (use list_dir)".to_string());
+    }
+    if !meta.is_file() {
+        return Err("not a regular file (fifo/device/socket)".to_string());
+    }
+    Ok(meta)
+}
+
 fn read_file(args: &Value, cwd: &Path) -> Result<String, String> {
     let path = arg_str(args, "path")?;
     let full = resolve(cwd, path);
-    // Reject a directory up front. On Windows `File::open` on a directory fails
-    // outright (a dir can't be opened as a file), so a post-open `is_dir` check
-    // would never run and the model would get a raw OS error instead of the
-    // "use list_dir" hint. On Unix opening a dir succeeds, so this single check
-    // covers both platforms.
-    if full.is_dir() {
-        return Err(format!("read {path}: is a directory (use list_dir)"));
-    }
+    let meta = regular_file_metadata(&full).map_err(|e| format!("read {path}: {e}"))?;
     let file = std::fs::File::open(&full).map_err(|e| format!("read {path}: {e}"))?;
-    let meta = file.metadata().map_err(|e| format!("read {path}: {e}"))?;
     // Slurp at most MAX_READ_BYTES so a multi-GB file can't OOM the process;
     // the model can page further with offset/limit or fall back to run_bash.
     let oversize = meta.len() > MAX_READ_BYTES;
@@ -1587,13 +1704,8 @@ fn read_file(args: &Value, cwd: &Path) -> Result<String, String> {
     let lines: Vec<&str> = content.lines().collect();
     let total = lines.len();
     // Accept `start_line`/`end_line` as aliases — ignoring them re-paged line 1 forever.
-    let offset = arg_u64(args, "offset")
-        .or_else(|| arg_u64(args, "start_line"))
-        .unwrap_or(1)
-        .max(1) as usize;
-    let limit = arg_u64(args, "limit")
-        .or_else(|| arg_u64(args, "end_line").map(|end| end.saturating_sub(offset as u64 - 1)))
-        .unwrap_or(DEFAULT_READ_LIMIT as u64) as usize;
+    let (offset, limit) = read_file_range(args);
+    let (offset, limit) = (offset as usize, limit as usize);
     let start = offset - 1;
     let mut out = String::new();
     for (i, line) in lines.iter().skip(start).take(limit).enumerate() {
@@ -1726,7 +1838,7 @@ async fn grep(args: &Value, cwd: &Path) -> Result<String, String> {
     let pattern = arg_str(args, "pattern")?;
     let path = arg_str_opt(args, "path").unwrap_or(".");
     // Context lines per match (grep -C), clamped so it can't dump whole files.
-    let context = arg_u64(args, "context").unwrap_or(0).min(100) as usize;
+    let context = grep_context(args) as usize;
     // All three tiers (rg → grep -rn → pure-Rust walk) must search the SAME file
     // set, or results would vary by which tool is installed. The pure-Rust walk
     // defines the contract: skip only `IGNORED_DIRS`, do NOT honor `.gitignore`.
@@ -1801,15 +1913,22 @@ fn grep_fallback(root: &Path, dir: &Path, needle: &str, context: usize, out: &mu
         // fast path) — so the pure-Rust fallback searches the SAME file set as
         // rg, and a symlinked directory cycle (`loop -> .`) can't recurse until
         // the stack overflows.
-        if e.file_type().map(|t| t.is_symlink()).unwrap_or(false) {
+        let Ok(ft) = e.file_type() else {
+            continue;
+        };
+        if ft.is_symlink() {
             continue;
         }
         let path = e.path();
         let name = e.file_name();
-        if path.is_dir() {
+        if ft.is_dir() {
             if !IGNORED_DIRS.contains(&name.to_string_lossy().as_ref()) {
                 grep_fallback(root, &path, needle, context, out);
             }
+            continue;
+        }
+        // rg skips non-regular files too; a FIFO would block read_to_string.
+        if !ft.is_file() {
             continue;
         }
         let Ok(content) = std::fs::read_to_string(&path) else {
@@ -1943,8 +2062,14 @@ fn apply_one_edit(
         } else {
             (old, new)
         };
+    // The constant head must fill failure_signature's 80-char window, so
+    // per-attempt hint text can't split one flailing-edit streak into many.
     match content.matches(old).count() {
-        0 => Err(format!("old_string not found in {path}")),
+        0 => Err(format!(
+            "old_string not found in {path} — the given text does not appear verbatim in the \
+file's current contents{}",
+            no_match_hint(content, old)
+        )),
         n if n > 1 && !replace_all => Err(format!(
             "old_string matches {n} times in {path}; make it unique or set replace_all"
         )),
@@ -1963,6 +2088,142 @@ fn apply_one_edit(
 /// CRLF file): collapse existing CRLF to LF first so no `\r\r\n` is produced.
 fn to_crlf(s: &str) -> String {
     s.replace("\r\n", "\n").replace('\n', "\r\n")
+}
+
+/// Max lines / bytes of file text echoed back in a no-match hint.
+const HINT_SNIPPET_LINES: usize = 8;
+const HINT_SNIPPET_BYTES: usize = 700;
+/// Past this many file lines the collapse+window scan is skipped (cost cap).
+const HINT_SCAN_MAX_LINES: usize = 5_000;
+
+/// Diagnose a failed exact match with the file's exact text at the closest
+/// region, so the model can re-anchor instead of retrying blind.
+fn no_match_hint(content: &str, old: &str) -> String {
+    // Most common miss: `old_string` pasted with read_file's `NNN\t` prefixes.
+    if let Some(stripped) = strip_line_number_prefixes(old)
+        && content.contains(&stripped)
+    {
+        return ". old_string includes read_file's line-number prefixes — resend the exact \
+text without them"
+            .to_string();
+    }
+    let lines: Vec<&str> = content.lines().collect();
+    if lines.len() > HINT_SCAN_MAX_LINES {
+        return ". The file may have changed since you read it — re-read the region and copy \
+the exact text"
+            .to_string();
+    }
+    let norm: Vec<String> = lines.iter().map(|l| collapse_ws(l)).collect();
+    let mut old_norm: Vec<String> = old.lines().map(collapse_ws).collect();
+    // Blank boundary lines collapse to "" and would match ANY line — drop them.
+    while old_norm.first().is_some_and(|l| l.is_empty()) {
+        old_norm.remove(0);
+    }
+    while old_norm.last().is_some_and(|l| l.is_empty()) {
+        old_norm.pop();
+    }
+    if old_norm.is_empty() || lines.is_empty() {
+        return String::new();
+    }
+    // Whitespace-insensitive window scan, gated on one distinctive line — a
+    // brace-only window matches all over a file and would name the wrong block.
+    let distinctive = old_norm.iter().any(|l| l.len() >= 4);
+    let starts: Vec<usize> = if distinctive {
+        (0..lines.len().saturating_sub(old_norm.len() - 1))
+            .filter(|&s| window_matches_ws(&norm, &old_norm, s))
+            .collect()
+    } else {
+        Vec::new()
+    };
+    if let Some(&s) = starts.first() {
+        let n = old_norm.len();
+        let many = if starts.len() > 1 {
+            format!(" ({} such regions; the first is shown)", starts.len())
+        } else {
+            String::new()
+        };
+        return format!(
+            ". Lines {}\u{2013}{} differ only in whitespace/indentation{many}; the file's exact \
+text is:\n{}\nRetry with old_string copied exactly from that",
+            s + 1,
+            s + n,
+            hint_snippet(&lines, s, n)
+        );
+    }
+    // Anchor on old_string's most distinctive line to point at the closest region.
+    let anchor = old_norm
+        .iter()
+        .enumerate()
+        .filter(|(_, l)| l.len() >= 12)
+        .max_by_key(|(_, l)| l.len());
+    if let Some((old_idx, anchor)) = anchor
+        && let Some(hit) = norm.iter().position(|l| l == anchor)
+    {
+        // Keep the anchor inside the capped snippet.
+        let s = hit
+            .saturating_sub(old_idx)
+            .max(hit.saturating_sub(HINT_SNIPPET_LINES - 1));
+        return format!(
+            ". Closest match is near line {}:\n{}\nCopy old_string exactly from the file's \
+current text",
+            hit + 1,
+            hint_snippet(&lines, s, old_norm.len())
+        );
+    }
+    ". No similar text found — the file may have changed since you read it; re-read it and retry"
+        .to_string()
+}
+
+/// Whitespace-collapsed form of a line: trimmed, inner runs squeezed to one space.
+fn collapse_ws(s: &str) -> String {
+    s.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Does `old_norm` match the collapsed file lines at `start`? First/last lines
+/// match as suffix/prefix so an `old_string` cut mid-line still anchors.
+fn window_matches_ws(norm: &[String], old_norm: &[String], start: usize) -> bool {
+    let n = old_norm.len();
+    if n == 1 {
+        return !old_norm[0].is_empty() && norm[start].contains(old_norm[0].as_str());
+    }
+    norm[start].ends_with(old_norm[0].as_str())
+        && norm[start + n - 1].starts_with(old_norm[n - 1].as_str())
+        && (1..n - 1).all(|k| norm[start + k] == old_norm[k])
+}
+
+/// Verbatim file lines `[start, start+len)` for a hint, capped so the error stays small.
+fn hint_snippet(lines: &[&str], start: usize, len: usize) -> String {
+    let end = (start + len).min(lines.len());
+    let shown = (end - start).min(HINT_SNIPPET_LINES);
+    let mut out = lines[start..start + shown].join("\n");
+    let mut capped = shown < end - start;
+    capped |= truncate_on_char_boundary(&mut out, HINT_SNIPPET_BYTES);
+    if capped {
+        out.push_str("\n… (snippet truncated)");
+    }
+    out
+}
+
+/// Strip `read_file`-style `NNN\t` prefixes when every non-blank line has one.
+/// Tab-only: a `NNN:` form would misfire on numeric-key literals (`200: "OK",`).
+fn strip_line_number_prefixes(s: &str) -> Option<String> {
+    let mut out = Vec::new();
+    let mut stripped = false;
+    for line in s.lines() {
+        if line.trim().is_empty() {
+            out.push(line.to_string());
+            continue;
+        }
+        let t = line.trim_start();
+        let digits = t.chars().take_while(|c| c.is_ascii_digit()).count();
+        if digits == 0 {
+            return None;
+        }
+        let rest = t[digits..].strip_prefix('\t')?;
+        out.push(rest.to_string());
+        stripped = true;
+    }
+    stripped.then(|| out.join("\n"))
 }
 
 /// Write `content` to `full` atomically: stage it in a sibling temp file, then
@@ -1996,6 +2257,7 @@ fn edit_file(args: &Value, cwd: &Path) -> Result<String, String> {
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
     let full = resolve(cwd, path);
+    regular_file_metadata(&full).map_err(|e| format!("read {path}: {e}"))?;
     let content = std::fs::read_to_string(&full).map_err(|e| format!("read {path}: {e}"))?;
     let (updated, n) = apply_one_edit(&content, old, new, replace_all, path)?;
     atomic_write(&full, &updated).map_err(|e| format!("write {path}: {e}"))?;
@@ -2019,6 +2281,7 @@ fn multi_edit(args: &Value, cwd: &Path) -> Result<String, String> {
         return Err("`edits` must contain at least one edit".to_string());
     }
     let full = resolve(cwd, path);
+    regular_file_metadata(&full).map_err(|e| format!("read {path}: {e}"))?;
     let mut content = std::fs::read_to_string(&full).map_err(|e| format!("read {path}: {e}"))?;
     let mut replacements = 0usize;
     for (i, edit) in edits.iter().enumerate() {
@@ -2056,21 +2319,32 @@ pub struct BashOutcome {
     pub sandbox_blocked: bool,
 }
 
+/// Live `run_bash` output chunks for the UI; never changes the final result.
+pub type BashProgress = tokio::sync::mpsc::UnboundedSender<String>;
+
 /// Run a shell command with file writes confined to the workspace sandbox.
 async fn run_bash(args: &Value, cwd: &Path) -> Result<String, String> {
-    run_bash_confined(args, cwd).await.result
+    run_bash_confined(args, cwd, None).await.result
 }
 
 /// Like [`run_bash`], but also reports whether the sandbox blocked a write so
 /// the engine can offer to escalate (see [`run_bash_unconfined`]).
-pub async fn run_bash_confined(args: &Value, cwd: &Path) -> BashOutcome {
-    run_bash_inner(args, cwd, true).await
+pub async fn run_bash_confined(
+    args: &Value,
+    cwd: &Path,
+    progress: Option<BashProgress>,
+) -> BashOutcome {
+    run_bash_inner(args, cwd, true, progress).await
 }
 
 /// Run a shell command WITHOUT the workspace sandbox. Reserved for the
 /// user-approved escalation of a command the sandbox blocked.
-pub async fn run_bash_unconfined(args: &Value, cwd: &Path) -> Result<String, String> {
-    run_bash_inner(args, cwd, false).await.result
+pub async fn run_bash_unconfined(
+    args: &Value,
+    cwd: &Path,
+    progress: Option<BashProgress>,
+) -> Result<String, String> {
+    run_bash_inner(args, cwd, false, progress).await.result
 }
 
 fn is_shell_operator(tok: &str) -> bool {
@@ -2294,7 +2568,49 @@ impl Drop for GroupKillGuard {
     }
 }
 
-async fn run_bash_inner(args: &Value, cwd: &Path, confined: bool) -> BashOutcome {
+/// Read a child pipe to EOF, forwarding complete-UTF-8 chunks to `progress`
+/// (a split code point carries over rather than rendering as �).
+async fn drain_pipe<R: tokio::io::AsyncRead + Unpin>(
+    reader: Option<R>,
+    progress: Option<&BashProgress>,
+) -> Vec<u8> {
+    let mut collected = Vec::new();
+    let Some(mut reader) = reader else {
+        return collected;
+    };
+    use tokio::io::AsyncReadExt;
+    let mut chunk = [0u8; 8192];
+    let mut sent = 0; // bytes of `collected` already forwarded
+    loop {
+        match reader.read(&mut chunk).await {
+            Ok(0) | Err(_) => break,
+            Ok(n) => {
+                collected.extend_from_slice(&chunk[..n]);
+                let Some(tx) = progress else { continue };
+                let pending = &collected[sent..];
+                let valid = match std::str::from_utf8(pending) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        let (valid, _) = pending.split_at(e.valid_up_to());
+                        std::str::from_utf8(valid).unwrap_or("")
+                    }
+                };
+                if !valid.is_empty() {
+                    let _ = tx.send(valid.to_string());
+                    sent += valid.len();
+                }
+            }
+        }
+    }
+    collected
+}
+
+async fn run_bash_inner(
+    args: &Value,
+    cwd: &Path,
+    confined: bool,
+    progress: Option<BashProgress>,
+) -> BashOutcome {
     let early = |result| BashOutcome {
         result,
         sandbox_blocked: false,
@@ -2334,7 +2650,7 @@ async fn run_bash_inner(args: &Value, cwd: &Path, confined: bool) -> BashOutcome
     }
     let mut builder = tokio::process::Command::from(builder);
     builder.kill_on_drop(true);
-    let child = match builder.spawn() {
+    let mut child = match builder.spawn() {
         Ok(c) => c,
         Err(e) => return early(Err(format!("spawn shell: {e}"))),
     };
@@ -2344,10 +2660,21 @@ async fn run_bash_inner(args: &Value, cwd: &Path, confined: bool) -> BashOutcome
     let mut tree_kill = GroupKillGuard::new(child.id());
     #[cfg(windows)]
     let pid = child.id();
-    let output =
-        match tokio::time::timeout(Duration::from_secs(timeout), child.wait_with_output()).await {
-            Ok(Ok(o)) => o,
-            Ok(Err(e)) => return early(Err(format!("run command: {e}"))),
+    // Drain pipes concurrently with the wait — no deadlock on a full pipe.
+    let stdout_pipe = child.stdout.take();
+    let stderr_pipe = child.stderr.take();
+    let run = async {
+        let (out_bytes, err_bytes, status) = tokio::join!(
+            drain_pipe(stdout_pipe, progress.as_ref()),
+            drain_pipe(stderr_pipe, progress.as_ref()),
+            child.wait(),
+        );
+        (status, out_bytes, err_bytes)
+    };
+    let (status, out_bytes, err_bytes) =
+        match tokio::time::timeout(Duration::from_secs(timeout), run).await {
+            Ok((Ok(status), out_bytes, err_bytes)) => (status, out_bytes, err_bytes),
+            Ok((Err(e), ..)) => return early(Err(format!("run command: {e}"))),
             Err(_) => {
                 #[cfg(windows)]
                 if let Some(pid) = pid {
@@ -2368,8 +2695,8 @@ async fn run_bash_inner(args: &Value, cwd: &Path, confined: bool) -> BashOutcome
     #[cfg(unix)]
     tree_kill.disarm();
     let mut out = String::new();
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&out_bytes);
+    let stderr = String::from_utf8_lossy(&err_bytes);
     if !stdout.trim().is_empty() {
         out.push_str(&stdout);
     }
@@ -2379,7 +2706,7 @@ async fn run_bash_inner(args: &Value, cwd: &Path, confined: bool) -> BashOutcome
         }
         out.push_str(&stderr);
     }
-    let code = output.status.code().unwrap_or(-1);
+    let code = status.code().unwrap_or(-1);
     let mut sandbox_blocked = false;
     if code != 0 {
         out.push_str(&format!("\n[exit {code}]"));
@@ -2430,10 +2757,7 @@ pub(crate) fn wrap_untrusted(source: &str, body: &str) -> String {
 
 async fn web_fetch(args: &Value) -> Result<String, String> {
     let url = arg_str(args, "url")?;
-    let max_chars = arg_u64(args, "max_chars")
-        .map(|n| n as usize)
-        .unwrap_or(MAX_OUTPUT)
-        .min(WEB_FETCH_CHAR_CEIL);
+    let max_chars = web_fetch_max_chars(args);
     let allow_local = web_fetch_allow_local();
     // Follow redirects manually (Policy::none) so every hop — the initial URL and
     // each 30x target — is re-validated against the SSRF blocklist below. The
@@ -3329,6 +3653,58 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    fn mkfifo(path: &Path) {
+        let c = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o644) }, 0);
+    }
+
+    /// A FIFO/device read blocks forever and once froze the whole TUI — these
+    /// must error fast, never hang.
+    #[cfg(unix)]
+    #[test]
+    fn read_file_refuses_fifo_and_device() {
+        let dir = tmp();
+        mkfifo(&dir.join("pipe"));
+        let err = read_file(&json!({"path":"pipe"}), &dir).unwrap_err();
+        assert!(err.contains("not a regular file"), "got: {err}");
+        let err = read_file(&json!({"path":"/dev/null"}), &dir).unwrap_err();
+        assert!(err.contains("not a regular file"), "got: {err}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn edit_tools_refuse_fifo() {
+        let dir = tmp();
+        mkfifo(&dir.join("pipe"));
+        let err = edit_file(
+            &json!({"path":"pipe","old_string":"a","new_string":"b"}),
+            &dir,
+        )
+        .unwrap_err();
+        assert!(err.contains("not a regular file"), "got: {err}");
+        let err = multi_edit(
+            &json!({"path":"pipe","edits":[{"old_string":"a","new_string":"b"}]}),
+            &dir,
+        )
+        .unwrap_err();
+        assert!(err.contains("not a regular file"), "got: {err}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn grep_fallback_skips_fifo() {
+        let dir = tmp();
+        write_file(&json!({"path":"f.txt","content":"needle"}), &dir).unwrap();
+        mkfifo(&dir.join("pipe"));
+        let mut out = Vec::new();
+        grep_fallback(&dir, &dir, "needle", 0, &mut out);
+        assert!(
+            out.iter().any(|l| l.contains("f.txt")),
+            "missing match: {out:?}"
+        );
+    }
+
     #[test]
     fn glob_match_semantics() {
         assert!(glob_match("*.rs", "main.rs"));
@@ -3347,6 +3723,24 @@ mod tests {
         assert!(ok.contains("hi"));
         let bad = run_bash(&json!({"command":"exit 3"}), &dir).await.unwrap();
         assert!(bad.contains("[exit 3]"));
+    }
+
+    /// The first chunk arrives before the command completes; result unchanged.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn run_bash_streams_progress_before_completion() {
+        let dir = tmp();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let args = json!({"command":"echo first; sleep 2; echo second"});
+        let fut = run_bash_confined(&args, &dir, Some(tx));
+        let mut fut = std::pin::pin!(fut);
+        let first = tokio::select! {
+            _ = &mut fut => panic!("command finished before any chunk streamed"),
+            chunk = rx.recv() => chunk.expect("a live chunk"),
+        };
+        assert!(first.contains("first"));
+        let out = fut.await.result.unwrap();
+        assert!(out.contains("first") && out.contains("second"));
     }
 
     #[cfg(unix)]
@@ -3421,7 +3815,7 @@ mod tests {
         let cmd = json!({ "command": format!("echo hi > '{}'", outside.display()) });
 
         // Confined: blocked, flagged, file absent, hint present.
-        let confined = run_bash_confined(&cmd, &dir).await;
+        let confined = run_bash_confined(&cmd, &dir, None).await;
         assert!(
             confined.sandbox_blocked,
             "out-of-workspace write was not flagged as blocked"
@@ -3430,7 +3824,7 @@ mod tests {
         assert!(confined.result.unwrap().contains("write-sandbox"));
 
         // Unconfined: same command, write lands, no sandbox hint.
-        let out = run_bash_unconfined(&cmd, &dir).await.unwrap();
+        let out = run_bash_unconfined(&cmd, &dir, None).await.unwrap();
         let existed = outside.exists();
         let _ = std::fs::remove_file(&outside);
         assert!(existed, "unconfined write was still blocked");
@@ -3455,7 +3849,7 @@ mod tests {
     async fn run_bash_runs_in_its_own_process_group() {
         let dir = tmp();
         // Unconfined: macOS seatbelt denies `ps`; the spawn builder is shared.
-        let out = run_bash_unconfined(&json!({"command":"ps -o pgid= -p $$"}), &dir)
+        let out = run_bash_unconfined(&json!({"command":"ps -o pgid= -p $$"}), &dir, None)
             .await
             .unwrap();
         let child_pgid: i32 = out
@@ -3818,6 +4212,20 @@ mod tests {
         assert!(bash_is_catastrophic("shutdown -h now"));
         assert!(bash_is_catastrophic("sudo reboot"));
         assert!(bash_is_catastrophic("init 0"));
+
+        // Quoted targets classify the same as bare ones.
+        assert!(bash_is_catastrophic("rm -rf \"$HOME\""));
+        assert!(bash_is_catastrophic("rm -rf '$HOME'"));
+        assert!(bash_is_catastrophic("rm -rf \"${HOME}\""));
+        assert!(bash_is_catastrophic("rm -rf \"~\""));
+        assert!(bash_is_catastrophic("rm -rf '~'"));
+        assert!(bash_is_catastrophic("rm -rf \".\""));
+        assert!(bash_is_catastrophic("rm -rf \"/\""));
+        assert!(bash_is_catastrophic("chmod -R 777 \"/\""));
+        assert!(bash_is_catastrophic("chown -R root '/'"));
+        assert!(!bash_is_catastrophic("rm -rf \"~/Documents\""));
+        assert!(!bash_is_catastrophic("rm -rf \"./build\""));
+        assert!(bash_is_catastrophic("ri -recurse \"~\"")); // PowerShell side
 
         // The whole point: workspace-local destruction stays WAIVABLE (must NOT
         // be in the floor, or `/goal` / `-y` runs break). These are still caught
@@ -4252,6 +4660,195 @@ mod tests {
         assert!(
             !raw.contains("beta\nGAMMA"),
             "introduced a lone LF: {raw:?}"
+        );
+    }
+
+    #[test]
+    fn edit_no_match_flags_leaked_line_number_prefixes() {
+        let content = "fn main() {\n    let x = 1;\n}\n";
+        let old = "    12\tfn main() {\n    13\t    let x = 1;";
+        let err = apply_one_edit(content, old, "X", false, "f.rs").unwrap_err();
+        assert!(err.contains("line-number prefixes"), "got: {err}");
+    }
+
+    #[test]
+    fn edit_no_match_points_at_whitespace_mismatch_with_exact_text() {
+        let content = "impl Foo {\n    fn bar(&self) -> u32 {\n        self.n\n    }\n}\n";
+        let old = "impl Foo {\n\tfn bar(&self) -> u32 {\n\t\tself.n\n\t}\n}";
+        let err = apply_one_edit(content, old, "X", false, "f.rs").unwrap_err();
+        assert!(err.contains("whitespace"), "got: {err}");
+        assert!(
+            err.contains("    fn bar(&self) -> u32 {"),
+            "snippet must carry the file's exact text: {err}"
+        );
+        assert!(err.contains("Lines 1\u{2013}5"), "got: {err}");
+    }
+
+    #[test]
+    fn edit_no_match_anchors_on_the_closest_distinctive_line() {
+        let content = "a\nb\nfn compute_total_price(cart: &Cart) -> f64 {\n    cart.sum()\n}\n";
+        let old = "fn compute_total_price(cart: &Cart) -> f64 {\n    cart.total\n}";
+        let err = apply_one_edit(content, old, "X", false, "f.rs").unwrap_err();
+        assert!(err.contains("near line 3"), "got: {err}");
+        assert!(
+            err.contains("cart.sum()"),
+            "snippet must show the actual body: {err}"
+        );
+    }
+
+    /// Different wrong old_strings must share one failure signature (streak guard).
+    #[test]
+    fn edit_no_match_error_head_is_stable_across_attempts() {
+        let content = "impl Foo {\n    fn bar(&self) -> u32 {\n        self.n\n    }\n}\n";
+        let e1 = apply_one_edit(
+            content,
+            "impl Foo {\n\tfn bar(&self) -> u32 {",
+            "X",
+            false,
+            "f.rs",
+        )
+        .unwrap_err();
+        let e2 = apply_one_edit(
+            content,
+            "totally unrelated missing text",
+            "X",
+            false,
+            "f.rs",
+        )
+        .unwrap_err();
+        assert_ne!(e1, e2, "hints differ per attempt");
+        assert_eq!(
+            crate::agent::guards::failure_signature("edit_file", &e1),
+            crate::agent::guards::failure_signature("edit_file", &e2),
+            "the signature head must stay constant per path"
+        );
+    }
+
+    /// Numeric-key literals must not read as leaked line numbers (tab-only rule).
+    #[test]
+    fn edit_no_match_does_not_flag_numeric_key_literals_as_prefixes() {
+        let content = "codes = {\n    \"OK\",\n    \"Not Found\",\n}\n";
+        let old = "200: \"OK\",\n404: \"Not Found\",";
+        let err = apply_one_edit(content, old, "X", false, "f.rs").unwrap_err();
+        assert!(
+            !err.contains("line-number prefixes"),
+            "colon-form numeric keys misclassified: {err}"
+        );
+    }
+
+    /// Blank boundary lines must not anchor the window scan.
+    #[test]
+    fn edit_no_match_ignores_blank_boundary_lines_in_window_scan() {
+        let content = "alpha\nbeta\ngamma\n";
+        let old = "\n\tbeta\n";
+        let err = apply_one_edit(content, old, "X", false, "f.rs").unwrap_err();
+        assert!(
+            err.contains("Lines 2\u{2013}2") || err.contains("beta"),
+            "hint should anchor on the real line: {err}"
+        );
+        assert!(
+            !err.contains("Lines 1\u{2013}"),
+            "must not anchor on a blank-line pseudo-match at the top: {err}"
+        );
+    }
+
+    /// A deep anchor must still appear inside the capped snippet.
+    #[test]
+    fn edit_no_match_anchor_stays_inside_the_capped_snippet() {
+        let mut content: String = (1..=19).map(|i| format!("x{i}\n")).collect();
+        content.push_str("let the_special_marker = compute_value();\n");
+        let old: String = (1..=9).map(|i| format!("aaa{i}\n")).collect::<String>()
+            + "let the_special_marker = compute_value();";
+        let err = apply_one_edit(&content, &old, "X", false, "f.rs").unwrap_err();
+        assert!(err.contains("near line 20"), "got: {err}");
+        assert!(
+            err.contains("the_special_marker"),
+            "the named line must be inside the snippet: {err}"
+        );
+    }
+
+    /// Brace-only old_strings must not produce a (wrong-block) whitespace hint.
+    #[test]
+    fn edit_no_match_skips_window_scan_for_brace_only_old_strings() {
+        let err = apply_one_edit(
+            "}\n{\nlet unique_a = 1;\n}\n{\n",
+            "\t}\n\t{",
+            "X\nY",
+            false,
+            "f.rs",
+        )
+        .unwrap_err();
+        assert!(
+            !err.contains("differ only in whitespace"),
+            "brace-only window must not be trusted: {err}"
+        );
+        assert!(err.contains("re-read"), "got: {err}");
+    }
+
+    #[test]
+    fn edit_no_match_suggests_reread_when_nothing_is_similar() {
+        let err = apply_one_edit(
+            "alpha beta\n",
+            "zzz qqq totally different line here",
+            "X",
+            false,
+            "f.rs",
+        )
+        .unwrap_err();
+        assert!(err.contains("re-read"), "got: {err}");
+    }
+
+    #[test]
+    fn read_dedupe_key_normalizes_paths_aliases_and_defaults() {
+        let cwd = Path::new("/w");
+        let a = read_dedupe_key("read_file", &json!({"path":"src/x.rs"}), cwd);
+        let b = read_dedupe_key("read_file", &json!({"path":"./src/x.rs","offset":1}), cwd);
+        let c = read_dedupe_key(
+            "read_file",
+            &json!({"path":"/w/src/x.rs","start_line":1}),
+            cwd,
+        );
+        assert!(a.is_some());
+        assert_eq!(a, b, "relative/`./`-prefixed + default offset collide");
+        assert_eq!(a, c, "absolute path + start_line alias collide");
+        let paged = read_dedupe_key("read_file", &json!({"path":"src/x.rs","offset":100}), cwd);
+        assert_ne!(a, paged, "a different page is a different read");
+        assert_eq!(
+            read_dedupe_key("run_bash", &json!({"command":"ls"}), cwd),
+            None,
+            "non-repeatable tools are ineligible"
+        );
+        assert_eq!(
+            read_dedupe_key("grep", &json!({"pattern":"foo"}), cwd),
+            read_dedupe_key(
+                "grep",
+                &json!({"pattern":"foo","path":".","context":0}),
+                cwd
+            ),
+            "grep defaults normalize"
+        );
+        assert_eq!(
+            read_dedupe_key("grep", &json!({"pattern":"foo","context":150}), cwd),
+            read_dedupe_key("grep", &json!({"pattern":"foo","context":100}), cwd),
+            "grep context mirrors the tool's clamp"
+        );
+        assert_eq!(
+            read_dedupe_key("web_fetch", &json!({"url":"https://e.co/d"}), cwd),
+            read_dedupe_key(
+                "web_fetch",
+                &json!({"url":"https://e.co/d","max_chars":30_000}),
+                cwd
+            ),
+            "web_fetch default max_chars mirrors the tool's MAX_OUTPUT"
+        );
+        assert_ne!(
+            read_dedupe_key("web_fetch", &json!({"url":"https://e.co/d"}), cwd),
+            read_dedupe_key(
+                "web_fetch",
+                &json!({"url":"https://e.co/d","max_chars":0}),
+                cwd
+            ),
+            "an explicit tiny cap is a different fetch — must not collide with a full one"
         );
     }
 

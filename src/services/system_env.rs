@@ -94,11 +94,18 @@ pub fn is_pid_alive(pid: u32) -> bool {
             OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, WaitForSingleObject,
         };
 
+        // WaitForSingleObject requires the SYNCHRONIZE (0x0010_0000) access right;
+        // without it the wait returns WAIT_FAILED and the liveness check collapses
+        // to "did the handle open?", never detecting an exited-but-still-openable
+        // PID. windows-sys files the constant under an unrelated module, so define
+        // it locally.
+        const SYNCHRONIZE: u32 = 0x0010_0000;
+
         // SAFETY: OpenProcess/WaitForSingleObject/CloseHandle take integer or
         // handle values only; no memory is dereferenced here. Returned handles
         // are always closed before returning.
         unsafe {
-            let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+            let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE, 0, pid);
             if handle.is_null() {
                 // Open failure is almost always "no such process" for PIDs we
                 // own; treat it as dead so stale entries get pruned instead
@@ -260,11 +267,16 @@ fn expand_tilde_with_home(path: &str, home: Option<&Path>) -> PathBuf {
             .map(Path::to_path_buf)
             .unwrap_or_else(|| PathBuf::from("~"));
     }
-    if let Some(rest) = path.strip_prefix("~/")
+    // `~/dir` everywhere, plus `~\dir` on Windows where `\` is also a separator.
+    // `std::path::is_separator` is platform-aware, so Unix backslashes (valid
+    // filename chars) are left intact.
+    if let Some(rest) = path
+        .strip_prefix('~')
+        .and_then(|r| r.strip_prefix(std::path::is_separator))
         && let Some(home) = home
     {
         return rest
-            .split('/')
+            .split(std::path::is_separator)
             .filter(|s| !s.is_empty())
             .fold(home.to_path_buf(), |mut p, s| {
                 p.push(s);
@@ -349,6 +361,21 @@ mod tests {
         assert_eq!(
             expand_tilde_with_home("~/docs", None),
             PathBuf::from("~/docs")
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn expand_tilde_accepts_backslash_on_windows() {
+        let home = Path::new(r"C:\Users\example");
+        // Both separators must expand after the tilde on Windows.
+        assert_eq!(
+            expand_tilde_with_home(r"~\Documents", Some(home)),
+            home.join("Documents")
+        );
+        assert_eq!(
+            expand_tilde_with_home("~/Documents", Some(home)),
+            home.join("Documents")
         );
     }
 

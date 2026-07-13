@@ -2388,6 +2388,7 @@ mod tests {
                 "title",
                 "preview",
                 crate::services::session_store::SessionTokens::default(),
+                0.0,
             )
             .await
             .expect("save code session");

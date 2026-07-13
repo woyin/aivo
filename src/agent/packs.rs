@@ -5,6 +5,8 @@
 //! hooks and stdio MCP servers execute code, so `add` lists them and asks first.
 
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+use std::time::SystemTime;
 
 #[derive(Clone, Debug)]
 pub struct Pack {
@@ -43,10 +45,31 @@ pub fn packs_root() -> Option<PathBuf> {
     Some(crate::services::paths::config_dir().join("packs"))
 }
 
+/// Parsed-pack cache keyed by (root, root mtime); install/remove touch a
+/// direct child of the root, so its mtime bump invalidates the entry.
+static PACKS_CACHE: Mutex<Vec<(PathBuf, SystemTime, Vec<Pack>)>> = Mutex::new(Vec::new());
+
 pub fn installed_packs() -> Vec<Pack> {
     packs_root()
-        .map(|r| installed_packs_at(&r))
+        .map(|r| installed_packs_cached(&r))
         .unwrap_or_default()
+}
+
+fn installed_packs_cached(root: &Path) -> Vec<Pack> {
+    let Ok(mtime) = std::fs::metadata(root).and_then(|m| m.modified()) else {
+        return installed_packs_at(root);
+    };
+    {
+        let cache = PACKS_CACHE.lock().unwrap();
+        if let Some((_, _, packs)) = cache.iter().find(|(r, t, _)| r == root && *t == mtime) {
+            return packs.clone();
+        }
+    }
+    let packs = installed_packs_at(root);
+    let mut cache = PACKS_CACHE.lock().unwrap();
+    cache.retain(|(r, _, _)| r != root);
+    cache.push((root.to_path_buf(), mtime, packs.clone()));
+    packs
 }
 
 pub fn installed_packs_at(root: &Path) -> Vec<Pack> {
@@ -306,6 +329,34 @@ mod tests {
             victim.is_dir(),
             "traversal name must not delete outside the packs root"
         );
+    }
+
+    #[test]
+    fn installed_packs_cache_serves_unchanged_root_and_refreshes_on_change() {
+        let root = tmp();
+        write(
+            root.join("alpha/.claude-plugin/plugin.json"),
+            r#"{"name":"alpha-name"}"#,
+        );
+        let packs = installed_packs_cached(&root);
+        assert_eq!(packs.len(), 1);
+        assert_eq!(packs[0].name, "alpha-name");
+        // In-place manifest edit: root mtime unchanged → cached parse served.
+        write(
+            root.join("alpha/.claude-plugin/plugin.json"),
+            r#"{"name":"renamed"}"#,
+        );
+        assert_eq!(installed_packs_cached(&root)[0].name, "alpha-name");
+        // Install bumps root mtime → whole set re-parsed.
+        write(
+            root.join("beta/.claude-plugin/plugin.json"),
+            r#"{"name":"beta-name"}"#,
+        );
+        let packs = installed_packs_cached(&root);
+        let names: Vec<_> = packs.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, vec!["renamed", "beta-name"]);
+        std::fs::remove_dir_all(root.join("beta")).unwrap();
+        assert_eq!(installed_packs_cached(&root).len(), 1);
     }
 
     #[test]

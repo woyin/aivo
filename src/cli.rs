@@ -104,6 +104,10 @@ pub enum Commands {
     #[command(name = "code packs", hide = true)]
     Packs(PacksArgs),
 
+    /// Manage the coding agent's named sub-agents (list, cat, rm)
+    #[command(name = "code agents", hide = true)]
+    Agents(AgentsArgs),
+
     /// Alias for `aivo logs share` — share a session via tunneled viewer URL.
     /// Both forms accept the same flags.
     Share(ShareArgs),
@@ -478,6 +482,36 @@ pub struct SkillsInstallArgs {
 #[derive(Args, Debug, Clone)]
 pub struct SkillsNameArgs {
     /// Skill name as shown by `aivo code skills list`
+    #[arg(value_name = "NAME", value_parser = non_empty())]
+    pub name: String,
+}
+
+/// Arguments for `aivo code agents` (pre-clap rewrite to the hidden top-level
+/// `code agents`). No subcommand → `list`. Creation is conversational — ask the
+/// agent inside `aivo code` to make one — so there is no `add` verb here.
+#[derive(Args, Debug, Clone)]
+pub struct AgentsArgs {
+    #[command(subcommand)]
+    pub command: Option<AgentsSubcommand>,
+}
+
+#[derive(Subcommand, Debug, Clone)]
+pub enum AgentsSubcommand {
+    /// List discovered sub-agents (repo + user + pack scope)
+    #[command(alias = "ls")]
+    List,
+
+    /// Show one sub-agent in full (scope, model, tools, instructions)
+    Cat(AgentsNameArgs),
+
+    /// Remove a repo- or user-scope sub-agent by name
+    #[command(name = "rm", alias = "remove")]
+    Remove(AgentsNameArgs),
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct AgentsNameArgs {
+    /// Sub-agent name as shown by `aivo code agents list`
     #[arg(value_name = "NAME", value_parser = non_empty())]
     pub name: String,
 }
@@ -1051,6 +1085,38 @@ pub struct CodeArgs {
     /// the out-of-workspace confirmation and inside the sandbox confinement.
     #[arg(long = "add-dir", value_name = "DIR")]
     pub add_dir: Vec<String>,
+
+    /// Shell sandbox profile (overrides AIVO_AGENT_SANDBOX): `off`, `workspace`
+    /// (default — confine shell writes to the workspace + caches), `read-only`
+    /// (no writes anywhere, no child network — also blocks the agent's own edit
+    /// tools), or `strict` (writes confined to the workspace + temp, no child
+    /// network). Child-network denial is macOS-only (Landlock can't gate network).
+    #[arg(
+        long = "sandbox",
+        value_name = "PROFILE",
+        value_parser = clap::builder::PossibleValuesParser::new(
+            crate::agent::sandbox::SandboxProfile::VALUES
+        )
+    )]
+    pub sandbox: Option<String>,
+
+    /// Run the task N ways in parallel (N ≤ 10) and return the best (LLM-judged).
+    /// Costs N× tokens; --max-cost applies per candidate. Candidates share the
+    /// working tree, so the sandbox defaults to read-only unless --sandbox is
+    /// given. Requires -e/--exec; 1 runs a single pass as usual.
+    #[arg(
+        long = "best-of-n",
+        value_name = "N",
+        requires = "exec",
+        value_parser = clap::value_parser!(u32).range(1..=10)
+    )]
+    pub best_of_n: Option<u32>,
+
+    /// Constrain the final answer to a JSON Schema (inline JSON, or `@path` to a
+    /// file). Instructs the agent to emit one conforming JSON value. Requires
+    /// -e/--exec; best paired with `--output-format json`.
+    #[arg(long = "json-schema", value_name = "SCHEMA", requires = "exec")]
+    pub json_schema: Option<String>,
 
     /// Print the upstream provider's raw JSON response (requires -p; useful for scripting)
     #[arg(long, requires = "prompt")]

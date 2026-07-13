@@ -52,7 +52,6 @@ impl LastSelectionStore {
         self.ctx.save_raw(&config).await
     }
 
-    #[allow(dead_code)]
     pub(crate) async fn clear(&self) -> Result<()> {
         let _lock = self.ctx.acquire_config_lock()?;
         let mut config = self.ctx.load().await?;

@@ -849,13 +849,19 @@ pub fn router_http_client_loopback() -> reqwest::Client {
 
 /// Per-read inactivity timeout, no overall budget — for multi-GB body streams.
 pub fn router_http_streaming_client(read_timeout_secs: u64) -> reqwest::Client {
+    streaming_client_builder(read_timeout_secs)
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new())
+}
+
+/// Timeout config shared with the regression test: per-read timeout, NO
+/// overall `.timeout()`.
+fn streaming_client_builder(read_timeout_secs: u64) -> reqwest::ClientBuilder {
     aivo_http_client_builder()
         .connect_timeout(std::time::Duration::from_secs(30))
         .read_timeout(std::time::Duration::from_secs(read_timeout_secs))
         .pool_max_idle_per_host(10)
         .tcp_keepalive(std::time::Duration::from_secs(60))
-        .build()
-        .unwrap_or_else(|_| reqwest::Client::new())
 }
 
 /// Detects `X-Initiator` value from an Anthropic Messages API body.
@@ -1682,5 +1688,77 @@ mod tests {
         assert!(!super::force_ipv4_with(Some("0")));
         assert!(!super::force_ipv4_with(Some("no")));
         assert!(!super::force_ipv4_with(Some("")));
+    }
+
+    /// Pins f7f14e7: a mid-body stall errors promptly, while a flowing stream
+    /// whose TOTAL duration exceeds the read timeout completes (no wall-clock cap).
+    #[tokio::test]
+    async fn streaming_client_times_out_stalls_but_not_slow_flow() {
+        use std::io::{Read, Write};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            for conn in listener.incoming() {
+                let Ok(mut s) = conn else { break };
+                std::thread::spawn(move || {
+                    let mut buf = [0u8; 1024];
+                    let n = s.read(&mut buf).unwrap_or(0);
+                    let stall = buf[..n].starts_with(b"GET /stall");
+                    let _ = write!(s, "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n");
+                    let _ = s.flush();
+                    if stall {
+                        let _ = write!(s, "3\r\nabc\r\n");
+                        let _ = s.flush();
+                        std::thread::sleep(std::time::Duration::from_secs(12));
+                    } else {
+                        // Each 800 ms gap is under the 2 s read timeout; the
+                        // 2.4 s total is over it.
+                        for _ in 0..3 {
+                            let _ = write!(s, "3\r\nabc\r\n");
+                            let _ = s.flush();
+                            std::thread::sleep(std::time::Duration::from_millis(800));
+                        }
+                        let _ = write!(s, "0\r\n\r\n");
+                        let _ = s.flush();
+                    }
+                });
+            }
+        });
+
+        // `.no_proxy()` keeps a dev machine's proxy env off the loopback request.
+        let client = super::streaming_client_builder(2)
+            .no_proxy()
+            .build()
+            .unwrap();
+
+        let started = std::time::Instant::now();
+        let resp = client
+            .get(format!("http://{addr}/stall"))
+            .send()
+            .await
+            .unwrap();
+        let mut resp = resp;
+        assert!(resp.chunk().await.unwrap().is_some(), "first chunk flows");
+        assert!(
+            resp.chunk().await.is_err(),
+            "a stalled body must surface a read-timeout error"
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(10),
+            "stall detection took {:?}",
+            started.elapsed()
+        );
+
+        let resp = client
+            .get(format!("http://{addr}/flow"))
+            .send()
+            .await
+            .unwrap();
+        let body = resp
+            .bytes()
+            .await
+            .expect("a flowing stream slower than the read timeout in total must complete");
+        assert_eq!(&body[..], b"abcabcabc");
     }
 }

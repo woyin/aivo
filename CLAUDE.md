@@ -58,5 +58,5 @@ src/main.rs → SessionStore → EnvironmentInjector → AILauncher → Command 
 
 ## Instructions
 
-Restate the question in fully concrete terms, making every implicit detail explicit. Then answer.
-
+* Restate the question in fully concrete terms, making every implicit detail explicit. Then answer.
+* Make comments clean, concise, and professional. Avoid unnecessary verbosity. Don't overly comment obvious code.

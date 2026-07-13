@@ -23,13 +23,14 @@ use crate::agent::protocol::{
 use crate::agent::request::{assistant_to_openai, role, tool_to_openai};
 use crate::agent::retry::{
     error_is_retryable, is_context_overflow_error, resolve_max_steps, retry_delay,
+    retryable_error_label, terminal_error_notice,
 };
 use crate::agent::secrets_guard;
 use crate::agent::skills::{self, Skill};
 use crate::agent::subagents::{self, Subagent};
 use crate::agent::system_prompt::system_prompt;
 use crate::agent::tokens::{content_to_parts, estimate_str_tokens, estimate_tokens, usage_tokens};
-use crate::agent::{serve_client, tool_repair, tools, verify};
+use crate::agent::{serve_client, tool_repair, tool_search, tools, verify};
 use crate::services::serve_router::extract_usage_from_value;
 use crate::services::session_store::SessionTokens;
 
@@ -69,6 +70,12 @@ pub(crate) const STOP_TOOL_FAILURE: &str = "stopping: a tool call kept failing t
 const COMPLETION_NUDGE: &str = "That may not be finished. If the task is genuinely complete, \
 briefly confirm what you did and verified, then stop. Otherwise keep going — don't stop until \
 it's done or you're truly blocked (then say exactly what's blocking you).";
+/// Cap on unstarted-plan nudges per turn.
+const MAX_PLAN_NUDGES: usize = 1;
+const PLAN_NUDGE: &str = "You set a plan this turn but haven't started any of its steps. \
+Execute the plan now, updating each step's status as you go. If the work is already done or \
+you can't proceed, call `update_plan` to reflect that (or say exactly what's blocking you), \
+then finish.";
 
 /// Compaction window assumed when the model's real one is unknown (0); without it
 /// such models never compact and resend the whole transcript. A real window wins.
@@ -153,6 +160,9 @@ pub trait AgentUi: Send {
     /// The agent set/updated its plan via `update_plan`; rendered as a checklist card. Default no-op.
     fn plan_updated(&mut self, _items: &[PlanItem]) {}
     fn tool_start(&mut self, name: &str, args: &Value);
+    /// Live output chunk from an in-flight `run_bash` (local display only,
+    /// pre-redaction like `tool_result`). Default no-op.
+    fn tool_output(&mut self, _name: &str, _chunk: &str) {}
     fn tool_result(&mut self, name: &str, result: &Result<String, String>);
     fn notify(&mut self, text: &str);
     /// The turn ended early for `stop` (also announced via `notify` for display).
@@ -344,11 +354,22 @@ pub struct AgentEngine {
     /// Named specialist sub-agents (top-level engine only). The `subagent` tool's
     /// `agent` field selects one; `run_subagent` applies its model/instructions/scope.
     subagents: Vec<Subagent>,
+    /// Config dir for re-discovering profiles at delegation time. When set,
+    /// `run_subagent` resolves `agent` fresh from disk — a profile authored or
+    /// edited this very turn delegates correctly; unset falls back to the
+    /// build-time `subagents` snapshot (tests, callers without a store).
+    agents_dir: Option<PathBuf>,
     /// Kept so `subagent` can build a sub-engine with the same identity (date + guides).
     date: String,
     guides: Vec<String>,
     /// Extra tools beyond the built-ins (MCP servers), if any are configured.
     external: Option<std::sync::Arc<dyn ExternalTools>>,
+    /// External specs deferred behind `search_tools`; loading moves a spec
+    /// from here into `tools_openai`. See [`tool_search`].
+    pub(crate) deferred_tools: Vec<Value>,
+    /// Deferral threshold (estimate tokens); `None` = always inline. Read from
+    /// the env once at construction so tests can override the field.
+    pub(crate) mcp_defer_tokens: Option<usize>,
     /// Body of the last compaction summary (no prefix). Fed back to the summarizer
     /// next compaction so facts carry forward instead of being re-compressed lossily.
     pub(crate) last_summary: Option<String>,
@@ -427,6 +448,10 @@ pub struct AgentEngine {
     /// chars/4 tokens of the `-c` block folded into the system prompt, so
     /// `context_report` can split it back out.
     injected_context_tokens: usize,
+    /// Provider-reported USD spend summed across the turn's steps (`usage.cost`).
+    turn_cost_usd: f64,
+    /// Upstream model echoed by responses — resolves aliases for pricing/stats.
+    billed_model: Option<String>,
 }
 
 /// Calibrated chars/4 breakdown of what fills the context window, for `/context`.
@@ -442,6 +467,8 @@ pub struct ContextReport {
     pub tool_count: usize,
     pub mcp_tools: u64,
     pub mcp_tool_count: usize,
+    /// External tools deferred behind `search_tools` (schemas not in context).
+    pub mcp_deferred_count: usize,
     /// Transcript: every message after the system prompt.
     pub messages: u64,
     pub message_count: usize,
@@ -527,6 +554,8 @@ impl AgentEngine {
         }
         specs.push(plan::plan_tool_spec());
         specs.push(notes::note_tool_spec());
+        specs.push(crate::agent::memory::memory_tool_spec());
+        specs.push(crate::agent::memory::memory_search_tool_spec());
         specs.push(subagent_tool_spec(&[]));
         let mut tools_openai: Vec<Value> = specs.into_iter().map(tool_to_openai).collect();
         // Native-search providers get the server tool instead of the local one (mutually exclusive).
@@ -549,9 +578,12 @@ impl AgentEngine {
             grants: crate::agent::grant_store::GrantStore::default(),
             skills: skills.to_vec(),
             subagents: Vec::new(),
+            agents_dir: None,
             date: date.to_string(),
             guides: guides.to_vec(),
             external: None,
+            deferred_tools: Vec::new(),
+            mcp_defer_tokens: tool_search::defer_threshold(),
             last_summary: None,
             plan: Vec::new(),
             touched_files: Vec::new(),
@@ -583,6 +615,8 @@ impl AgentEngine {
             max_cost_usd: 0.0,
             cost_pricing: None,
             injected_context_tokens: 0,
+            turn_cost_usd: 0.0,
+            billed_model: None,
         }
     }
 
@@ -883,11 +917,84 @@ questions.",
         std::mem::take(&mut self.turn_usage)
     }
 
-    /// Attach an external tool source (MCP): advertise its schemas alongside the
-    /// built-ins and route its calls to it. Call once, after construction.
+    /// Upstream model echoed by this session's responses, when any step carried one.
+    pub fn billed_model(&self) -> Option<&str> {
+        self.billed_model.as_deref()
+    }
+
+    /// Drain the turn's provider-reported USD spend, when any step carried one.
+    pub fn take_turn_cost_usd(&mut self) -> Option<f64> {
+        let cost = std::mem::take(&mut self.turn_cost_usd);
+        (cost > 0.0).then_some(cost)
+    }
+
+    /// Attach an external tool source (MCP). Call once, after construction. Past
+    /// the deferral threshold the schemas defer behind `search_tools` instead of
+    /// permanently occupying the window; calls still route by name.
     pub fn set_external_tools(&mut self, ext: std::sync::Arc<dyn ExternalTools>) {
-        self.tools_openai.extend(ext.specs());
+        let specs = ext.specs();
+        self.deferred_tools.clear();
+        if self
+            .mcp_defer_tokens
+            .is_some_and(|t| tool_search::should_defer_at(&specs, t))
+        {
+            self.deferred_tools = specs;
+        } else {
+            self.tools_openai.extend(specs);
+        }
+        self.refresh_search_tools();
         self.external = Some(ext);
+    }
+
+    /// Rebuild the `search_tools` advertisement: present iff anything is deferred.
+    fn refresh_search_tools(&mut self) {
+        self.tools_openai
+            .retain(|t| t["function"]["name"].as_str() != Some("search_tools"));
+        if !self.deferred_tools.is_empty() {
+            self.tools_openai
+                .push(tool_to_openai(tool_search::search_tools_spec(
+                    &self.deferred_tools,
+                )));
+        }
+    }
+
+    /// Move the deferred specs at `idxs` into the live tool list and refresh
+    /// `search_tools`; returns the loaded specs in deferred order.
+    fn load_deferred_tools(&mut self, idxs: &[usize]) -> Vec<Value> {
+        let want: std::collections::HashSet<usize> = idxs.iter().copied().collect();
+        if want.is_empty() {
+            return Vec::new();
+        }
+        let mut loaded = Vec::with_capacity(want.len());
+        let mut kept = Vec::with_capacity(self.deferred_tools.len());
+        for (i, t) in std::mem::take(&mut self.deferred_tools)
+            .into_iter()
+            .enumerate()
+        {
+            if want.contains(&i) {
+                loaded.push(t);
+            } else {
+                kept.push(t);
+            }
+        }
+        self.deferred_tools = kept;
+        if !loaded.is_empty() {
+            self.tools_openai.extend(loaded.iter().cloned());
+            self.refresh_search_tools();
+        }
+        loaded
+    }
+
+    /// A direct call to a still-deferred tool works (routing is name-based) —
+    /// promote its schema so later steps see it as a first-class tool.
+    fn promote_deferred_tool(&mut self, name: &str) {
+        if let Some(i) = self
+            .deferred_tools
+            .iter()
+            .position(|t| t["function"]["name"].as_str() == Some(name))
+        {
+            self.load_deferred_tools(&[i]);
+        }
     }
 
     /// Fill in the compaction context window if unknown (0) at construction (a
@@ -931,6 +1038,23 @@ questions.",
             sys["content"] = json!(format!("{cur}{section}"));
         }
         self.subagents = subagents.to_vec();
+    }
+
+    /// Enable delegation-time profile re-discovery (see the `agents_dir` field).
+    pub fn set_agents_dir(&mut self, config_dir: &Path) {
+        self.agents_dir = Some(config_dir.to_path_buf());
+    }
+
+    /// The profile a delegation should run: fresh from disk when an agents dir is
+    /// configured (the snapshot goes stale the moment the model authors or edits
+    /// a profile mid-turn), else from the build-time snapshot.
+    fn resolve_profile(&self, cwd: &Path, name: &str) -> Option<Subagent> {
+        match &self.agents_dir {
+            Some(cfg) => subagents::discover_subagents(cwd, cfg)
+                .into_iter()
+                .find(|s| s.name == name),
+            None => self.subagents.iter().find(|s| s.name == name).cloned(),
+        }
     }
 
     /// Append a `--context` block to the system prompt. Re-applied per build
@@ -980,6 +1104,9 @@ questions.",
                     || allowed.contains(&name)
                     || (is_editor && editor_allowed)
             });
+            // `resolved_tools` normalizes to built-ins, so the retain just dropped
+            // `search_tools`; clear the now-unreachable deferred set too.
+            self.deferred_tools.clear();
         }
     }
 
@@ -1187,13 +1314,11 @@ questions.",
 
     /// Run one user turn to convergence: call the model, execute tool calls
     /// (permission-gated), repeat until it stops or a stop condition trips; footer.
-    /// chars/4 estimate of the next request's prompt (system + tools + conversation).
-    /// Seeds the live context-fill before real usage — the visible transcript omits
-    /// the system prompt and tool defs, which dominate an agent prompt.
+    /// Estimate of the next request's prompt (system + tools + conversation), on the
+    /// same [`estimate_tokens`] ruler as `context_report` so footer and `/context`
+    /// agree. Seeds the live context-fill before real usage.
     pub(crate) fn estimated_prompt_tokens(&self) -> u64 {
-        let msg_chars: usize = self.messages.iter().map(|m| m.to_string().len()).sum();
-        let tool_chars: usize = self.tools_openai.iter().map(|t| t.to_string().len()).sum();
-        ((msg_chars + tool_chars) / 4) as u64
+        (estimate_tokens(&self.messages) + estimate_tokens(&self.tools_openai)) as u64
     }
 
     /// Calibrated composition snapshot for the `/context` viewer.
@@ -1205,13 +1330,21 @@ questions.",
         let sys_full = estimate_tokens(&self.messages[..self.messages.len().min(1)]);
         let injected = self.injected_context_tokens.min(sys_full);
 
-        let mcp_specs = self
-            .external
-            .as_ref()
-            .map(|e| e.specs())
-            .unwrap_or_default();
-        let mcp_tok = estimate_tokens(&mcp_specs);
-        let mcp_tool_count = mcp_specs.len();
+        // Count the external specs actually advertised (deferred ones cost nothing).
+        let is_external = |t: &Value| {
+            self.external
+                .as_ref()
+                .is_some_and(|e| t["function"]["name"].as_str().is_some_and(|n| e.handles(n)))
+        };
+        let (mcp_tok, mcp_tool_count) = self.tools_openai.iter().filter(|t| is_external(t)).fold(
+            (0usize, 0usize),
+            |(tok, n), t| {
+                (
+                    tok + crate::agent::tokens::estimate_message_tokens(t),
+                    n + 1,
+                )
+            },
+        );
         let tools_full = estimate_tokens(&self.tools_openai);
         let transcript = &self.messages[self.messages.len().min(1)..];
 
@@ -1223,6 +1356,7 @@ questions.",
             tool_count: self.tools_openai.len().saturating_sub(mcp_tool_count),
             mcp_tools: calib(mcp_tok),
             mcp_tool_count,
+            mcp_deferred_count: self.deferred_tools.len(),
             messages: calib(estimate_tokens(transcript)),
             message_count: transcript.len(),
             calibration: cal,
@@ -1317,6 +1451,9 @@ questions.",
         let mut steps = 0usize;
         let mut leaked_nudges = 0usize;
         let mut completion_nudges = 0usize;
+        let mut plan_nudges = 0usize;
+        // Keeps a stale plan from an earlier turn from triggering the nudge.
+        let mut plan_set_this_turn = false;
         // Post-edit self-verification (opt-in): the project's validator, detected once.
         let validator = self.self_correct.then(|| verify::detect(ctx.cwd)).flatten();
         let mut selfcorrect_attempts = 0usize;
@@ -1375,6 +1512,7 @@ questions.",
             // Auto-retry transient failures with backoff — only when nothing streamed yet (re-streaming double-renders).
             let mut retries = 0usize;
             let mut forced_compactions = 0usize;
+            let mut terminal_error = false;
             let message = loop {
                 let mut streamed = false;
                 let result = serve_client::complete(
@@ -1396,10 +1534,18 @@ questions.",
                     Ok(m) => break m,
                     Err(e) if retries < MAX_RETRIES && !streamed && error_is_retryable(&e) => {
                         retries += 1;
+                        // Show the wait so a Retry-After pause doesn't read as a frozen UI.
+                        let delay = retry_delay(retries, e.retry_after);
+                        let wait = if delay.as_secs() >= 2 {
+                            format!(" in {}s", delay.as_secs())
+                        } else {
+                            String::new()
+                        };
                         ui.notify(&format!(
-                            "connection issue — retrying ({retries}/{MAX_RETRIES})…"
+                            "{} — retrying{wait} ({retries}/{MAX_RETRIES})…",
+                            retryable_error_label(&e)
                         ));
-                        tokio::time::sleep(retry_delay(retries, e.retry_after)).await;
+                        tokio::time::sleep(delay).await;
                     }
                     // Over the input limit despite our budget check: calibrate from the
                     // rejection, force-fit, retry — else the 400 is terminal and re-sends every turn.
@@ -1416,16 +1562,34 @@ questions.",
                         ui.notify("context over the model's limit — compacting and retrying…");
                     }
                     Err(e) => {
-                        ui.notify_error(&format!("LLM error: {e}"));
+                        ui.notify_error(&terminal_error_notice(&e));
+                        terminal_error = true;
                         break AssistantMessage {
-                            content: Some(format!("[error: {e}]")),
+                            content: None,
                             tool_calls: vec![],
                             usage: None,
+                            truncated: false,
+                            model: None,
                         };
                     }
                 }
             };
+            // End the turn without recording — an "[error: …]" assistant turn
+            // would replay the failure to the model every later step and on resume.
+            if terminal_error {
+                converged = true;
+                break;
+            }
+            if message.truncated {
+                // The kept partial must not pass for a complete answer.
+                ui.notify_error(
+                    "the connection dropped mid-reply — the answer above may be incomplete",
+                );
+            }
             steps += 1;
+            if let Some(m) = &message.model {
+                self.billed_model = Some(m.clone());
+            }
             let step_tokens = usage_tokens(&message.usage);
             tokens += step_tokens;
             if message.usage.is_some() {
@@ -1434,16 +1598,21 @@ questions.",
                 self.update_calibration(sent_estimate, step_tokens);
             }
             // Sum the real prompt/completion/cache split across steps (same parser as the serve, for a consistent index).
-            if let Some(u) = &message.usage
-                && let Some(split) = extract_usage_from_value(&json!({ "usage": u }))
-            {
-                self.turn_usage = self.turn_usage.merge(SessionTokens {
-                    prompt_tokens: split.prompt,
-                    completion_tokens: split.completion,
-                    cache_read_tokens: split.cache_read,
-                    cache_write_tokens: split.cache_creation,
-                });
-                ui.turn_tokens(self.turn_usage.completion_tokens);
+            if let Some(u) = &message.usage {
+                if let Some(split) = extract_usage_from_value(&json!({ "usage": u })) {
+                    self.turn_usage = self.turn_usage.merge(SessionTokens {
+                        prompt_tokens: split.prompt,
+                        completion_tokens: split.completion,
+                        cache_read_tokens: split.cache_read,
+                        cache_write_tokens: split.cache_creation,
+                    });
+                    ui.turn_tokens(self.turn_usage.completion_tokens);
+                }
+                if let Some(cost) = u.get("cost").and_then(|x| x.as_f64())
+                    && cost > 0.0
+                {
+                    self.turn_cost_usd += cost;
+                }
             }
 
             // Per-turn cost breaker for unattended runs (0 = no cap; TUI relies on esc).
@@ -1477,8 +1646,9 @@ questions.",
             let no_output = message.tool_calls.is_empty()
                 && message.content.as_deref().is_none_or(str::is_empty);
             if no_output {
-                // Silent convergence reads as success ("Done" with no answer); say so.
-                ui.notify("the model returned an empty response — no answer produced");
+                // No answer = a failed turn: the error channel persists it, skips
+                // the `✶ Done` marker, and fails a headless run closed.
+                ui.notify_error("the model returned an empty response — no answer produced");
                 converged = true;
                 break;
             }
@@ -1503,6 +1673,8 @@ questions.",
                     content: Some(recorded),
                     tool_calls: Vec::new(),
                     usage: message.usage.clone(),
+                    truncated: false,
+                    model: None,
                 };
                 self.messages.push(assistant_to_openai(&recorded_msg));
                 self.push_text_turn("user", LEAKED_TOOL_CALL_NUDGE.to_string());
@@ -1523,6 +1695,19 @@ questions.",
                     completion_nudges += 1;
                     ui.notify("the answer looks unfinished — asking the model to continue");
                     self.push_text_turn("user", COMPLETION_NUDGE.to_string());
+                    continue;
+                }
+                // A plan set this turn but never started isn't done — nudge once.
+                // Plan mode is exempt: proposing without executing is the point.
+                if !self.read_only
+                    && plan_set_this_turn
+                    && plan_nudges < MAX_PLAN_NUDGES
+                    && !self.plan.is_empty()
+                    && !plan::started(&self.plan)
+                {
+                    plan_nudges += 1;
+                    ui.notify("the plan hasn't been started — asking the model to continue");
+                    self.push_text_turn("user", PLAN_NUDGE.to_string());
                     continue;
                 }
                 // A declared-done turn isn't accepted while the validator fails — feed
@@ -1584,6 +1769,10 @@ questions.",
                 page_repeats = 0;
                 last_page = page;
             }
+
+            plan_set_this_turn |= message.tool_calls.iter().any(|c| {
+                subagents::normalize_tool_name(&c.name).unwrap_or(&c.name) == "update_plan"
+            });
 
             // Execute this batch (permission-gated); returns extra tokens accrued inside
             // it (sub-agent calls) plus each failed call's (tool, error) for the guard.
@@ -1938,11 +2127,14 @@ you were working. If the outcome matters to the task, inspect the log; otherwise
                 .collect()
         };
         if subagent_idx.len() >= 2 {
-            ui.notify(&format!(
-                "running {} sub-agents in parallel",
-                subagent_idx.len()
-            ));
             let sink = ui.subagent_sink();
+            // A sink's live rows already show the fan-out; notify headless only.
+            if sink.is_none() {
+                ui.notify(&format!(
+                    "running {} sub-agents in parallel",
+                    subagent_idx.len()
+                ));
+            }
             if let Some(s) = &sink {
                 let labels: Vec<String> = subagent_idx
                     .iter()
@@ -2066,6 +2258,40 @@ you were working. If the outcome matters to the task, inspect the log; otherwise
                     }),
                     Err(e) => Err(e),
                 }
+            } else if n == "remember" {
+                // Notify so a saved memory never lands silently (poison audit).
+                match crate::agent::memory::parse_remember(&call.arguments) {
+                    Ok((fact, scope)) => {
+                        let path = crate::agent::memory::path_for_scope(ctx.cwd, scope);
+                        let label = scope.label();
+                        match crate::agent::memory::remember(&path, &fact) {
+                            Ok(crate::agent::memory::RememberOutcome::Added(count)) => {
+                                // Global facts ride into every project — call that out.
+                                if scope == crate::agent::memory::MemoryScope::Global {
+                                    ui.notify(&format!(
+                                        "remembered (GLOBAL — injected into ALL projects): {fact}"
+                                    ));
+                                } else {
+                                    ui.notify(&format!("remembered ({label}): {fact}"));
+                                }
+                                Ok(format!(
+                                    "Remembered ({count} saved, {label} scope) — this is injected \
+into every future session. The user can audit or edit it via /memory."
+                                ))
+                            }
+                            Ok(crate::agent::memory::RememberOutcome::Refreshed) => {
+                                Ok("Already remembered (recency refreshed).".to_string())
+                            }
+                            Err(e) => Err(e),
+                        }
+                    }
+                    Err(e) => Err(e),
+                }
+            } else if n == "memory_search" {
+                match crate::agent::memory::parse_query(&call.arguments) {
+                    Ok(query) => Ok(crate::agent::memory::search_result_text(ctx.cwd, &query)),
+                    Err(e) => Err(e),
+                }
             } else if n == "switch_model" {
                 match call.arguments.get("model").and_then(|v| v.as_str()) {
                     Some(m) if !m.trim().is_empty() => ui.switch_chat_model(m.trim()).await,
@@ -2110,8 +2336,29 @@ planning is off) — continue with the task."
                         Err(e) => Err(e),
                     }
                 }
+            } else if n == "search_tools" {
+                // Deferred-MCP discovery: load matching schemas (engine state → ordered pass).
+                match call.arguments.get("query").and_then(|v| v.as_str()) {
+                    Some(q) if !q.trim().is_empty() => {
+                        let max = call
+                            .arguments
+                            .get("max_results")
+                            .and_then(|v| v.as_u64())
+                            .map(|v| v as usize)
+                            .unwrap_or(tool_search::SEARCH_DEFAULT_RESULTS)
+                            .clamp(1, tool_search::SEARCH_MAX_RESULTS);
+                        let hits = tool_search::rank(&self.deferred_tools, q.trim(), max);
+                        let loaded = self.load_deferred_tools(&hits);
+                        Ok(tool_search::format_loaded(
+                            &loaded,
+                            self.deferred_tools.len(),
+                        ))
+                    }
+                    _ => Err("missing required string argument `query`".to_string()),
+                }
             } else if let Some(ext) = self.external.clone().filter(|e| e.handles(&call.name)) {
                 // External tool — keyed on its raw advertised name (`mcp__*`), never normalized (matches the shadow check).
+                self.promote_deferred_tool(&call.name);
                 ext.call(&call.name, &call.arguments).await
             } else if n == "run_bash" && jobs::wants_background(&call.arguments) {
                 // Detached job — no escalation flow (a spawn returns before a sandbox block shows).
@@ -2217,6 +2464,7 @@ command in the foreground (drop `background`)."
         }
 
         // Emit results and append tool messages in call order (call↔result pairing intact).
+        let mut repeated_reads: Vec<(String, String)> = Vec::new();
         for (i, call) in tool_calls.iter().enumerate() {
             let n = subagents::normalize_tool_name(&call.name).unwrap_or(&call.name);
             let result = outcomes[i]
@@ -2231,6 +2479,9 @@ command in the foreground (drop `background`)."
                 // A successful mutation (or delegated work) invalidates the last green verify.
                 if tools::is_mutating(n) || n == "subagent" {
                     self.dirty_since_verify = true;
+                }
+                if let Some(k) = tools::read_dedupe_key(n, &call.arguments, ctx.cwd) {
+                    repeated_reads.push((k, call.id.clone()));
                 }
             }
             let raw = match result {
@@ -2253,6 +2504,8 @@ command in the foreground (drop `background`)."
                 "content": content,
             }));
         }
+        // Older copies of any read this batch repeated verbatim are now dead weight.
+        self.supersede_duplicate_reads(ctx.cwd, &repeated_reads);
 
         (extra_tokens, failures)
     }
@@ -2284,7 +2537,9 @@ Before calling `{tool}` again, make its arguments match this schema exactly:\n{s
         ui: &mut dyn AgentUi,
         args: &Value,
     ) -> Result<String, String> {
-        let outcome = tools::run_bash_confined(args, ctx.cwd).await;
+        let outcome =
+            Self::pump_bash_progress(ui, |tx| tools::run_bash_confined(args, ctx.cwd, Some(tx)))
+                .await;
         if !outcome.sandbox_blocked {
             return outcome.result;
         }
@@ -2318,7 +2573,29 @@ Re-run the full command without write confinement?",
             return outcome.result;
         }
         ui.notify(SANDBOX_ESCALATION_NOTICE);
-        tools::run_bash_unconfined(args, ctx.cwd).await
+        Self::pump_bash_progress(ui, |tx| tools::run_bash_unconfined(args, ctx.cwd, Some(tx))).await
+    }
+
+    /// Run a `run_bash` future, forwarding its live output chunks to the UI.
+    async fn pump_bash_progress<T, F, Fut>(ui: &mut dyn AgentUi, run: F) -> T
+    where
+        F: FnOnce(tools::BashProgress) -> Fut,
+        Fut: std::future::Future<Output = T>,
+    {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let fut = run(tx);
+        let mut fut = std::pin::pin!(fut);
+        let out = loop {
+            tokio::select! {
+                out = &mut fut => break out,
+                Some(chunk) = rx.recv() => ui.tool_output("run_bash", &chunk),
+            }
+        };
+        // Completion can race chunks still queued in the channel.
+        while let Ok(chunk) = rx.try_recv() {
+            ui.tool_output("run_bash", &chunk);
+        }
+        out
     }
 
     /// True when a `write_file` would overwrite an existing file the model hasn't
@@ -2449,21 +2726,24 @@ Re-run the full command without write confinement?",
         };
         let task =
             str_arg(&["task", "prompt"]).ok_or_else(|| "subagent: missing `task`".to_string())?;
-        // Named specialist if `agent` matches; unknown names fall back to generic (lenient, don't fail the turn).
-        let profile = str_arg(&["agent", "subagent_type"])
-            .and_then(|n| self.subagents.iter().find(|s| s.name == n));
+        // Named specialist if `agent` matches — resolved fresh from disk (see
+        // `resolve_profile`), so a profile authored this turn delegates correctly.
+        // Unknown names fall back to generic (lenient, don't fail the turn) but
+        // the result says so; a silent fallback would fake the specialist's test.
+        let requested_agent = str_arg(&["agent", "subagent_type"]);
+        let profile = requested_agent.and_then(|n| self.resolve_profile(ctx.cwd, n));
         // Model precedence: explicit `model` arg > profile's pinned model > parent's model.
         let model = args
             .get("model")
             .and_then(|v| v.as_str())
             .filter(|m| !m.is_empty())
-            .or_else(|| profile.and_then(|p| p.model.as_deref()))
+            .or_else(|| profile.as_ref().and_then(|p| p.model.as_deref()))
             .unwrap_or(&self.model);
 
         // Isolation: explicit arg wins, else the profile's flag; unavailable falls
         // back to the shared workspace with a note.
         let isolate = args.get("isolation").and_then(|v| v.as_str()) == Some("worktree")
-            || profile.is_some_and(|p| p.isolation_worktree);
+            || profile.as_ref().is_some_and(|p| p.isolation_worktree);
         let mut guard: Option<subagents::WorktreeGuard> = None;
         let mut sub_cwd: PathBuf = ctx.cwd.to_path_buf();
         let mut isolation_note: Option<String> = None;
@@ -2483,12 +2763,33 @@ Re-run the full command without write confinement?",
             }
         }
 
+        // Delegates keep the parent's skills except the create-agent builtin: a
+        // sub-engine can't delegate (tool dropped below), so it could author a
+        // profile but never test it — the workflow is top-level only. A profile
+        // whose tool scope excludes `skill` gets NO skills: `apply_profile` would
+        // strip the tool, and an advert the tool can't load is a prompt/toolset
+        // contradiction.
+        let scope_has_skill = profile
+            .as_ref()
+            .and_then(|p| p.resolved_tools())
+            .is_none_or(|allowed| allowed.contains(&"skill"));
+        let sub_skills: Vec<Skill> = if scope_has_skill {
+            self.skills
+                .iter()
+                .filter(|s| {
+                    !(s.name == skills::CREATE_AGENT_SKILL_NAME && s.dir.as_os_str().is_empty())
+                })
+                .cloned()
+                .collect()
+        } else {
+            Vec::new()
+        };
         let mut sub = AgentEngine::new(
             &sub_cwd.display().to_string(),
             model,
             &self.date,
             &self.guides,
-            &self.skills,
+            &sub_skills,
             self.context_window,
             SUBAGENT_MAX_STEPS,
         );
@@ -2520,7 +2821,7 @@ Re-run the full command without write confinement?",
             sub.set_jobs(jobs.clone());
         }
         // Fold in the specialist's role + scope. After MCP wiring so a `tools` allow-list applies to the full offered set.
-        if let Some(p) = profile {
+        if let Some(p) = &profile {
             sub.apply_profile(p);
         }
 
@@ -2553,6 +2854,27 @@ Re-run the full command without write confinement?",
             msg.push_str(&g.finalize());
         } else if let Some(note) = isolation_note {
             msg.push_str(&note);
+        }
+        if profile.is_none()
+            && let Some(name) = requested_agent
+        {
+            msg.push_str(&format!(
+                "\n\n[subagent] no profile named `{name}` — ran a generic sub-agent \
+instead. No such file in the agents dirs (project `.aivo/agents`/`.claude/agents`, \
+user config, packs); check the filename / `name:` frontmatter."
+            ));
+        }
+        // A failed run on a model aivo's catalog doesn't know is most often a bad
+        // profile `model:` — name the likely cause instead of a bare empty result.
+        if ui.answer().is_empty()
+            && model != self.model
+            && crate::services::model_metadata::snapshot_limits(model).is_none()
+        {
+            msg.push_str(&format!(
+                "\n\n[subagent] note: model `{model}` isn't in aivo's catalog — if the \
+run failed at the provider, fix the profile's `model:` (use a full model id) or omit \
+it to inherit yours."
+            ));
         }
         // Gate on the STORED length (not the bare answer) so the tail can't push it over
         // the clear threshold and get cleared without a pointer.
@@ -3019,7 +3341,12 @@ mod tests {
         let injected = format!("PRIOR SESSION CONTEXT: {}", "x".repeat(4_000));
         e.append_system_context(&injected);
         let with_ctx = e.context_report();
-        assert!(with_ctx.injected_context >= 900, "≈4k chars/4 ≈ 1k tokens");
+        let injected_est = estimate_str_tokens(&injected) as u64;
+        assert!(
+            with_ctx.injected_context.abs_diff(injected_est) <= 5,
+            "injected segment ≈ the block's estimate: {} vs {injected_est}",
+            with_ctx.injected_context
+        );
         assert!(
             with_ctx.system_prompt.abs_diff(base.system_prompt) <= 5,
             "base system prompt unchanged by the append: {} vs {}",
@@ -3058,11 +3385,22 @@ mod tests {
         assert!(r.used() > 0);
     }
 
+    #[test]
+    fn take_turn_cost_usd_drains_reported_spend() {
+        let mut e = AgentEngine::new("/tmp", "m", "", &[], &[], 0, 0);
+        assert_eq!(e.take_turn_cost_usd(), None);
+        e.turn_cost_usd = 0.0421;
+        assert_eq!(e.take_turn_cost_usd(), Some(0.0421));
+        assert_eq!(e.take_turn_cost_usd(), None, "drained with the turn");
+    }
+
     #[derive(Default)]
     struct CapturingUi {
         tools: Vec<String>,
         text: String,
         notices: Vec<String>,
+        /// `notify_error` notices, separate so tests can assert the channel.
+        errors: Vec<String>,
         plans: Vec<usize>,
         /// Statuses from the most recent `plan_updated` (to assert finalization).
         last_plan: Vec<PlanStatus>,
@@ -3104,6 +3442,9 @@ mod tests {
         fn tool_result(&mut self, _: &str, _: &Result<String, String>) {}
         fn notify(&mut self, t: &str) {
             self.notices.push(t.to_string());
+        }
+        fn notify_error(&mut self, t: &str) {
+            self.errors.push(t.to_string());
         }
         fn footer(&mut self, _: Option<&str>, _: usize, tokens: u64, _: u64, _: u64) {
             self.footer_tokens = tokens;
@@ -4659,6 +5000,14 @@ mod tests {
                 .iter()
                 .any(|m| role(m) == "user" && content_str(m) == "hi")
         );
+        // No answer must ride the ERROR channel (persisted entry, no `✶ Done`,
+        // headless fails closed).
+        assert!(
+            ui.errors.iter().any(|e| e.contains("empty response")),
+            "empty response must use notify_error: {:?} / {:?}",
+            ui.errors,
+            ui.notices
+        );
     }
 
     /// A denied dangerous tool (destructive bash) doesn't run; the refusal feeds back and the next turn converges.
@@ -4955,10 +5304,10 @@ mod tests {
         );
     }
 
-    /// An all-pending plan means the model planned but converged WITHOUT executing;
-    /// the `started` gate must not fabricate completion.
+    /// An all-pending plan at convergence gets one nudge; if the model still
+    /// stops, the `started` gate must not fabricate completion.
     #[tokio::test]
-    async fn engine_leaves_unstarted_plan_alone_on_convergence() {
+    async fn engine_nudges_unstarted_plan_once_then_leaves_it_alone() {
         let dir = tmp();
         let plan = tool_call_sse(
             "update_plan",
@@ -4967,7 +5316,11 @@ mod tests {
                 {"step": "b", "status": "pending"}
             ]}),
         );
-        let port = spawn_sse_sequence(vec![plan, FINAL_TEXT_SSE.to_string()]);
+        let port = spawn_sse_sequence(vec![
+            plan,
+            FINAL_TEXT_SSE.to_string(),
+            FINAL_TEXT_SSE.to_string(),
+        ]);
         let client = reqwest::Client::builder().no_proxy().build().unwrap();
         let base = format!("http://127.0.0.1:{port}");
         let mut engine = AgentEngine::new(&dir.display().to_string(), "m", "", &[], &[], 0, 0);
@@ -4980,9 +5333,101 @@ mod tests {
         )
         .await;
 
+        let nudges = engine
+            .messages
+            .iter()
+            .filter(|m| {
+                role(m) == "user" && content_str(m).contains("haven't started any of its steps")
+            })
+            .count();
+        assert_eq!(nudges, 1, "unstarted plan gets exactly one nudge");
+        assert_no_consecutive_user(&engine.messages);
+        assert_eq!(engine.messages.last().unwrap()["content"], "done");
         // Only the model's event fired — no engine finalization.
         assert_eq!(ui.plans, vec![2]);
         assert_eq!(ui.last_plan, vec![PlanStatus::Pending, PlanStatus::Pending]);
+    }
+
+    /// Plan mode proposes without executing — no unstarted-plan nudge there.
+    #[tokio::test]
+    async fn plan_mode_skips_unstarted_plan_nudge() {
+        let dir = tmp();
+        let plan = tool_call_sse(
+            "update_plan",
+            json!({"plan": [
+                {"step": "a", "status": "pending"},
+                {"step": "b", "status": "pending"}
+            ]}),
+        );
+        let port = spawn_sse_sequence(vec![plan, FINAL_TEXT_SSE.to_string()]);
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let base = format!("http://127.0.0.1:{port}");
+        let mut engine = AgentEngine::new(&dir.display().to_string(), "m", "", &[], &[], 0, 0);
+        engine.set_plan_mode(true);
+        let mut ui = CapturingUi::default();
+        run_session(
+            &mut engine,
+            &turn_ctx(&client, &base, &dir),
+            Some("plan only".into()),
+            &mut ui,
+        )
+        .await;
+
+        assert!(
+            !engine
+                .messages
+                .iter()
+                .any(|m| content_str(m).contains("haven't started any of its steps")),
+            "plan mode must not nudge an unstarted plan"
+        );
+        assert_eq!(engine.messages.last().unwrap()["content"], "done");
+    }
+
+    /// A stale unstarted plan from an earlier turn must not nudge a later turn.
+    #[tokio::test]
+    async fn stale_plan_from_prior_turn_does_not_nudge() {
+        let dir = tmp();
+        let plan = tool_call_sse(
+            "update_plan",
+            json!({"plan": [
+                {"step": "a", "status": "pending"},
+                {"step": "b", "status": "pending"}
+            ]}),
+        );
+        // Turn 1: plan, nudged converge, stop. Turn 2: plain answer.
+        let port = spawn_sse_sequence(vec![
+            plan,
+            FINAL_TEXT_SSE.to_string(),
+            FINAL_TEXT_SSE.to_string(),
+            FINAL_TEXT_SSE.to_string(),
+        ]);
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let base = format!("http://127.0.0.1:{port}");
+        let mut engine = AgentEngine::new(&dir.display().to_string(), "m", "", &[], &[], 0, 0);
+        let mut ui = CapturingUi::default();
+        let ctx = turn_ctx(&client, &base, &dir);
+        run_session(&mut engine, &ctx, Some("plan only".into()), &mut ui).await;
+        let nudges_after_turn1 = engine
+            .messages
+            .iter()
+            .filter(|m| content_str(m).contains("haven't started any of its steps"))
+            .count();
+        run_session(
+            &mut engine,
+            &ctx,
+            Some("unrelated question".into()),
+            &mut ui,
+        )
+        .await;
+
+        let nudges = engine
+            .messages
+            .iter()
+            .filter(|m| content_str(m).contains("haven't started any of its steps"))
+            .count();
+        assert_eq!(nudges_after_turn1, 1);
+        assert_eq!(nudges, 1, "the stale plan must not nudge a later turn");
+        assert_eq!(engine.messages.last().unwrap()["content"], "done");
     }
 
     /// A `subagent` call spawns a fresh sub-engine; its text result feeds back as the parent's tool result and the parent converges.
@@ -5075,6 +5520,150 @@ mod tests {
                 .any(|m| role(m) == "tool" && content_str(m) == "pong"),
             "external tool result not routed back"
         );
+    }
+
+    /// 80 filler tools + one distinctive `alpha_sync` (~16k est tokens — defers).
+    struct BigExt;
+    impl crate::agent::engine::ExternalTools for BigExt {
+        fn specs(&self) -> Vec<Value> {
+            let mut specs: Vec<Value> = (0..80)
+                .map(|i| {
+                    json!({
+                        "type": "function",
+                        "function": {
+                            "name": format!("mcp__demo__filler_{i}"),
+                            "description": "filler tool with a long schema description ".repeat(20),
+                            "parameters": {"type": "object"}
+                        }
+                    })
+                })
+                .collect();
+            specs.push(json!({
+                "type": "function",
+                "function": {
+                    "name": "mcp__demo__alpha_sync",
+                    "description": "Synchronize alpha records upstream",
+                    "parameters": {"type": "object"}
+                }
+            }));
+            specs
+        }
+        fn handles(&self, name: &str) -> bool {
+            name.starts_with("mcp__demo__")
+        }
+        fn call<'a>(
+            &'a self,
+            name: &'a str,
+            _args: &'a Value,
+        ) -> BoxFuture<'a, Result<String, String>> {
+            Box::pin(async move { Ok(format!("ran {name}")) })
+        }
+    }
+
+    /// Defer → search loads the match → the loaded tool routes to its source.
+    #[tokio::test]
+    async fn bulky_external_tools_defer_and_load_via_search() {
+        let dir = tmp();
+        let search = tool_call_sse("search_tools", json!({"query": "alpha sync"}));
+        let call = tool_call_sse("mcp__demo__alpha_sync", json!({}));
+        let port = spawn_sse_sequence(vec![search, call, FINAL_TEXT_SSE.to_string()]);
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let base = format!("http://127.0.0.1:{port}");
+        let mut engine = AgentEngine::new(&dir.display().to_string(), "m", "", &[], &[], 0, 0);
+        // Pin the threshold so an exported AIVO_AGENT_MCP_DEFER_TOKENS can't flip the test.
+        engine.mcp_defer_tokens = Some(8_000);
+        engine.set_external_tools(std::sync::Arc::new(BigExt));
+
+        let names = tool_names(&engine);
+        assert!(
+            names.iter().any(|n| n == "search_tools"),
+            "meta-tool advertised"
+        );
+        assert!(
+            !names.iter().any(|n| n.starts_with("mcp__")),
+            "no external schema inlined while deferred"
+        );
+        assert_eq!(engine.deferred_tools.len(), 81);
+        let report = engine.context_report();
+        assert_eq!(report.mcp_tool_count, 0, "deferred specs cost no context");
+        assert_eq!(report.mcp_tools, 0);
+        assert_eq!(report.mcp_deferred_count, 81);
+
+        let mut ui = CapturingUi::default();
+        run_session(
+            &mut engine,
+            &turn_ctx(&client, &base, &dir),
+            Some("sync the alpha records".into()),
+            &mut ui,
+        )
+        .await;
+
+        assert!(
+            tool_names(&engine)
+                .iter()
+                .any(|n| n == "mcp__demo__alpha_sync"),
+            "search must load the matching schema"
+        );
+        assert_eq!(engine.deferred_tools.len(), 80);
+        assert!(
+            engine.messages.iter().any(|m| role(m) == "tool"
+                && content_str(m).contains("Loaded 1 tool(s)")
+                && content_str(m).contains("mcp__demo__alpha_sync")),
+            "search result names what loaded"
+        );
+        assert!(
+            engine
+                .messages
+                .iter()
+                .any(|m| role(m) == "tool" && content_str(m) == "ran mcp__demo__alpha_sync"),
+            "loaded tool routed to the external source"
+        );
+        let report = engine.context_report();
+        assert_eq!(report.mcp_tool_count, 1, "loaded spec now counted");
+        assert!(report.mcp_tools > 0);
+        assert_eq!(report.mcp_deferred_count, 80);
+    }
+
+    /// A direct call to a still-deferred tool executes and promotes its schema.
+    #[tokio::test]
+    async fn direct_call_to_deferred_tool_routes_and_promotes() {
+        let dir = tmp();
+        let call = tool_call_sse("mcp__demo__filler_3", json!({}));
+        let port = spawn_sse_sequence(vec![call, FINAL_TEXT_SSE.to_string()]);
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let base = format!("http://127.0.0.1:{port}");
+        let mut engine = AgentEngine::new(&dir.display().to_string(), "m", "", &[], &[], 0, 0);
+        engine.mcp_defer_tokens = Some(8_000);
+        engine.set_external_tools(std::sync::Arc::new(BigExt));
+        assert!(
+            !tool_names(&engine)
+                .iter()
+                .any(|n| n == "mcp__demo__filler_3")
+        );
+
+        let mut ui = CapturingUi::default();
+        run_session(
+            &mut engine,
+            &turn_ctx(&client, &base, &dir),
+            Some("run filler 3".into()),
+            &mut ui,
+        )
+        .await;
+
+        assert!(
+            engine
+                .messages
+                .iter()
+                .any(|m| role(m) == "tool" && content_str(m) == "ran mcp__demo__filler_3"),
+            "deferred tool must still execute when called directly"
+        );
+        assert!(
+            tool_names(&engine)
+                .iter()
+                .any(|n| n == "mcp__demo__filler_3"),
+            "direct call promotes the schema"
+        );
+        assert_eq!(engine.deferred_tools.len(), 80);
     }
 
     /// The model calls `take_note`; the engine stores it (no prompt, no `tools::execute`), echoes a confirmation, retains it for pinning.
@@ -5826,6 +6415,7 @@ mod tests {
 
     // --- user lifecycle hooks ---
 
+    #[cfg(unix)] // every caller is a #[cfg(unix)] hook test; ungated it's dead code on Windows
     fn hookset(
         dir: &std::path::Path,
         json_str: &str,
@@ -6434,7 +7024,7 @@ mod tests {
     #[test]
     fn compact_now_local_clears_stale_tool_output() {
         let mut engine = AgentEngine::new("/tmp", "m", "", &[], &[], 0, 0);
-        let recent = "r".repeat(120_000); // ~30k tokens — fills the 20k keep window
+        let recent = "r".repeat(200_000); // ~25k tokens — fills the 20k keep window
         let stale = "s".repeat(8_000); // > TOOL_RESULT_CLEAR_MIN, older than the cut
         engine.messages = vec![
             json!({"role":"system","content":"sys"}),
@@ -7071,7 +7661,7 @@ mod tests {
     #[test]
     fn clear_stale_tool_results_clears_only_old_bulky_outputs() {
         let mut e = AgentEngine::new("/tmp", "m", "", &[], &[], 0, 0);
-        let big = "x".repeat(5000);
+        let big = "x".repeat(10_000); // ~1.25k tokens
         // [0 system, 1 user, 2 assistant(call), 3 tool BIG(old), 4 user, 5 tool BIG(recent), 6 asst]
         e.messages.push(json!({"role":"user","content":"go"}));
         e.messages.push(json!({"role":"assistant","tool_calls":[
@@ -7090,7 +7680,7 @@ mod tests {
         assert_eq!(e.messages[3]["tool_call_id"], "c1"); // pairing intact
         assert_eq!(
             e.messages[5]["content"].as_str().unwrap().len(),
-            5000,
+            10_000,
             "recent tool output untouched"
         );
         assert_eq!(e.stale_tool_result_savings(cut), 0, "idempotent");
@@ -7915,6 +8505,42 @@ mod tests {
                 .get("agent")
                 .is_none()
         );
+    }
+
+    /// Delegation-time profile resolution: with an agents dir configured, a
+    /// profile written AFTER engine build (or edited since) resolves fresh from
+    /// disk; without one, the build-time snapshot answers.
+    #[test]
+    fn resolve_profile_prefers_disk_over_snapshot() {
+        let cwd = tempfile::tempdir().unwrap();
+        let cfg = tempfile::tempdir().unwrap();
+
+        // Snapshot-only engine: unknown dir → falls back to set_subagents.
+        let mut e = AgentEngine::new("/tmp", "m", "", &[], &[], 0, 0);
+        e.set_subagents(&[subagent("reviewer", None, None)]);
+        let p = e.resolve_profile(cwd.path(), "reviewer").unwrap();
+        assert!(p.body.contains("reviewer playbook"), "snapshot body");
+
+        // With an agents dir, a file authored after build wins over the snapshot…
+        e.set_agents_dir(cfg.path());
+        let dir = cwd.path().join(".aivo/agents");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("reviewer.md"),
+            "---\nname: reviewer\ndescription: fresh\n---\nFRESH BODY v2\n",
+        )
+        .unwrap();
+        let p = e.resolve_profile(cwd.path(), "reviewer").unwrap();
+        assert_eq!(p.body, "FRESH BODY v2", "disk beats snapshot");
+        // …and a brand-new name (created mid-turn) is delegatable immediately.
+        std::fs::write(
+            dir.join("tester.md"),
+            "---\nname: tester\ndescription: t\n---\nTEST BODY\n",
+        )
+        .unwrap();
+        assert!(e.resolve_profile(cwd.path(), "tester").is_some());
+        // Unknown names still miss (→ generic fallback with a note).
+        assert!(e.resolve_profile(cwd.path(), "ghost").is_none());
     }
 
     /// A profile's body folds into the system prompt; a `tools` allow-list restricts the built-ins (keeping `update_plan`).

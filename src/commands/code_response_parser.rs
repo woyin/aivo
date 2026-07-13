@@ -337,19 +337,21 @@ pub(crate) fn parse_responses_model_chunk(data: &str) -> Option<String> {
         .map(str::to_string)
 }
 
+/// Per-field max: stream counts are cumulative, and a partial Anthropic
+/// `message_delta` must not clobber the cache-normalized prompt from `message_start`.
 pub(crate) fn merge_token_usage(usage: &mut Option<TokenUsage>, update: TokenUsageUpdate) {
     let current = usage.get_or_insert_with(TokenUsage::default);
     if let Some(tokens) = update.prompt_tokens {
-        current.prompt_tokens = tokens;
+        current.prompt_tokens = current.prompt_tokens.max(tokens);
     }
     if let Some(tokens) = update.completion_tokens {
-        current.completion_tokens = tokens;
+        current.completion_tokens = current.completion_tokens.max(tokens);
     }
     if let Some(tokens) = update.cache_read_input_tokens {
-        current.cache_read_input_tokens = tokens;
+        current.cache_read_input_tokens = current.cache_read_input_tokens.max(tokens);
     }
     if let Some(tokens) = update.cache_creation_input_tokens {
-        current.cache_creation_input_tokens = tokens;
+        current.cache_creation_input_tokens = current.cache_creation_input_tokens.max(tokens);
     }
 }
 
@@ -389,6 +391,26 @@ pub(crate) fn parse_responses_chunk(data: &str) -> Option<ChatResponseChunk> {
     }
 }
 
+/// Responses-API usage; `input_tokens` already includes the cached subset.
+fn responses_usage_update(usage: &serde_json::Value) -> TokenUsageUpdate {
+    TokenUsageUpdate {
+        prompt_tokens: usage.get("input_tokens").and_then(parse_token_u64),
+        completion_tokens: usage.get("output_tokens").and_then(parse_token_u64),
+        cache_read_input_tokens: usage
+            .get("cache_read_input_tokens")
+            .and_then(parse_token_u64)
+            .or_else(|| {
+                usage
+                    .get("input_tokens_details")
+                    .and_then(|d| d.get("cached_tokens"))
+                    .and_then(parse_token_u64)
+            }),
+        cache_creation_input_tokens: usage
+            .get("cache_creation_input_tokens")
+            .and_then(parse_token_u64),
+    }
+}
+
 /// Extracts usage from a Responses API SSE `response.completed` event.
 pub(crate) fn parse_responses_usage_chunk(data: &str) -> Option<TokenUsageUpdate> {
     let value: serde_json::Value = serde_json::from_str(data).ok()?;
@@ -396,17 +418,7 @@ pub(crate) fn parse_responses_usage_chunk(data: &str) -> Option<TokenUsageUpdate
     if event_type != "response.completed" {
         return None;
     }
-    let usage = value.get("response")?.get("usage")?;
-    let update = TokenUsageUpdate {
-        prompt_tokens: usage.get("input_tokens").and_then(parse_token_u64),
-        completion_tokens: usage.get("output_tokens").and_then(parse_token_u64),
-        cache_read_input_tokens: usage
-            .get("cache_read_input_tokens")
-            .and_then(parse_token_u64),
-        cache_creation_input_tokens: usage
-            .get("cache_creation_input_tokens")
-            .and_then(parse_token_u64),
-    };
+    let update = responses_usage_update(value.get("response")?.get("usage")?);
     if update.is_empty() {
         None
     } else {
@@ -444,17 +456,7 @@ pub(crate) fn extract_responses_message(body: &serde_json::Value) -> AssistantRe
 
 /// Extracts usage from a non-streaming Responses API response.
 pub(crate) fn extract_responses_usage(body: &serde_json::Value) -> Option<TokenUsage> {
-    let usage = body.get("usage")?;
-    let update = TokenUsageUpdate {
-        prompt_tokens: usage.get("input_tokens").and_then(parse_token_u64),
-        completion_tokens: usage.get("output_tokens").and_then(parse_token_u64),
-        cache_read_input_tokens: usage
-            .get("cache_read_input_tokens")
-            .and_then(parse_token_u64),
-        cache_creation_input_tokens: usage
-            .get("cache_creation_input_tokens")
-            .and_then(parse_token_u64),
-    };
+    let update = responses_usage_update(body.get("usage")?);
     if update.is_empty() {
         None
     } else {
@@ -823,6 +825,40 @@ mod tests {
                 cache_creation_input_tokens: 0,
             })
         );
+    }
+
+    #[test]
+    fn test_merge_keeps_cache_normalized_prompt_over_partial_delta() {
+        let mut usage = None;
+        merge_token_usage(
+            &mut usage,
+            parse_anthropic_usage_chunk(
+                r#"{"usage":{"input_tokens":61,"cache_read_input_tokens":5000,"cache_creation_input_tokens":120}}"#,
+            )
+            .unwrap(),
+        );
+        // A later event with input but no cache fields must not shrink the prompt.
+        merge_token_usage(
+            &mut usage,
+            parse_anthropic_usage_chunk(r#"{"usage":{"input_tokens":61,"output_tokens":32}}"#)
+                .unwrap(),
+        );
+        let u = usage.unwrap();
+        assert_eq!(u.prompt_tokens, 5_181);
+        assert_eq!(u.completion_tokens, 32);
+    }
+
+    #[test]
+    fn test_responses_usage_captures_details_cached_tokens() {
+        let body = serde_json::json!({
+            "usage": {
+                "input_tokens": 1_000,
+                "output_tokens": 40,
+                "input_tokens_details": {"cached_tokens": 800}
+            }
+        });
+        let u = extract_responses_usage(&body).unwrap();
+        assert_eq!((u.prompt_tokens, u.cache_read_input_tokens), (1_000, 800));
     }
 
     #[test]

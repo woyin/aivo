@@ -420,6 +420,22 @@ impl ModelCounter {
     }
 }
 
+/// Per-named-subagent lifetime tally. Only delegations whose name matches a
+/// discovered profile are attributed here (generic/labeled delegates are
+/// excluded), so this never fills with ad-hoc task labels.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct AgentUsage {
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub runs: u64,
+    /// Runs that finished successfully (`runs - ok_runs` = failures).
+    #[serde(rename = "okRuns", default, skip_serializing_if = "is_zero")]
+    pub ok_runs: u64,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub steps: u64,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub tokens: u64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct UsageCounter {
     #[serde(rename = "promptTokens", default, skip_serializing_if = "is_zero")]
@@ -459,6 +475,14 @@ pub struct UsageCounter {
         skip_serializing_if = "HashMap::is_empty"
     )]
     pub per_tool_model_usage: HashMap<String, HashMap<String, ModelCounter>>,
+    /// Per-named-subagent run tallies (only populated in key_usage entries).
+    /// Forward-only — old stats files load with this empty.
+    #[serde(
+        rename = "perAgent",
+        default,
+        skip_serializing_if = "HashMap::is_empty"
+    )]
+    pub per_agent: HashMap<String, AgentUsage>,
     /// Legacy per-model total tokens. Read by the migration helper, never written
     /// after this version. Kept on the type for forward/backward compatibility
     /// with on-disk data recorded before the schema collapse.
@@ -723,6 +747,26 @@ impl UsageStats {
             }
         }
     }
+
+    /// Attribute one finished delegation to a named subagent profile. The caller
+    /// only records rows whose delegate name matches a discovered profile.
+    pub(crate) fn record_agent_run(
+        &mut self,
+        key_id: &str,
+        agent: &str,
+        ok: bool,
+        steps: u64,
+        tokens: u64,
+    ) {
+        let key_stats = self.key_usage.entry(key_id.to_string()).or_default();
+        let entry = key_stats.per_agent.entry(agent.to_string()).or_default();
+        entry.runs = entry.runs.saturating_add(1);
+        if ok {
+            entry.ok_runs = entry.ok_runs.saturating_add(1);
+        }
+        entry.steps = entry.steps.saturating_add(steps);
+        entry.tokens = entry.tokens.saturating_add(tokens);
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -902,9 +946,14 @@ pub struct SessionIndexEntry {
     pub cache_read_tokens: u64,
     #[serde(default, skip_serializing_if = "is_zero")]
     pub cache_write_tokens: u64,
+    /// Cumulative estimated/reported spend, so resume doesn't lose the figure.
+    #[serde(default, skip_serializing_if = "is_zero_f64")]
+    pub cost_usd: f64,
 }
 
 /// Token usage for a single chat turn or accumulated across a session.
+/// `prompt_tokens` is the total input side — cache reads/writes are a subset of
+/// it (OpenAI-style); Anthropic's disjoint counts are normalized at ingestion.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct SessionTokens {
     pub prompt_tokens: u64,
@@ -930,10 +979,8 @@ impl SessionTokens {
     }
 
     pub fn total(&self) -> u64 {
-        self.prompt_tokens
-            .saturating_add(self.completion_tokens)
-            .saturating_add(self.cache_read_tokens)
-            .saturating_add(self.cache_write_tokens)
+        // Cache counts are ⊂ prompt_tokens — adding them would double count.
+        self.prompt_tokens.saturating_add(self.completion_tokens)
     }
 }
 
@@ -961,6 +1008,10 @@ impl ChatTokenWindow {
 
 fn is_zero(value: &u64) -> bool {
     *value == 0
+}
+
+fn is_zero_f64(value: &f64) -> bool {
+    *value == 0.0
 }
 
 fn default_chat_session_id() -> String {
@@ -1222,6 +1273,15 @@ impl Drop for ConfigLockGuard {
     }
 }
 
+/// Cap on lock waits — a wedged holder must not hang every aivo process;
+/// legitimate holders take milliseconds.
+const LOCK_WAIT_MAX: std::time::Duration = if cfg!(feature = "__internal_test_fast_crypto") {
+    std::time::Duration::from_millis(200)
+} else {
+    std::time::Duration::from_secs(5)
+};
+const LOCK_POLL: std::time::Duration = std::time::Duration::from_millis(50);
+
 impl ConfigLockGuard {
     pub(crate) fn acquire(lock_path: &Path) -> Result<Self> {
         let file = OpenOptions::new()
@@ -1231,6 +1291,7 @@ impl ConfigLockGuard {
             .truncate(false)
             .open(lock_path)
             .with_context(|| format!("Failed to open lock file: {:?}", lock_path))?;
+        let deadline = std::time::Instant::now() + LOCK_WAIT_MAX;
 
         #[cfg(unix)]
         {
@@ -1238,16 +1299,24 @@ impl ConfigLockGuard {
 
             loop {
                 // SAFETY: the file descriptor stays open for the guard lifetime.
-                let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
+                let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
                 if rc == 0 {
                     break;
                 }
-
                 let err = std::io::Error::last_os_error();
-                if err.kind() != std::io::ErrorKind::Interrupted {
+                let busy = err.raw_os_error() == Some(libc::EWOULDBLOCK)
+                    || err.kind() == std::io::ErrorKind::Interrupted;
+                if !busy {
                     return Err(err)
                         .with_context(|| format!("Failed to acquire lock: {:?}", lock_path));
                 }
+                if std::time::Instant::now() >= deadline {
+                    anyhow::bail!(
+                        "lock {:?} is held by another process (wedged aivo?)",
+                        lock_path
+                    );
+                }
+                std::thread::sleep(LOCK_POLL);
             }
 
             Ok(ConfigLockGuard { _file: file })
@@ -1255,33 +1324,48 @@ impl ConfigLockGuard {
 
         #[cfg(not(any(unix, windows)))]
         {
-            let _ = file;
+            let _ = (file, deadline);
             Ok(ConfigLockGuard)
         }
 
         #[cfg(windows)]
         {
             use std::os::windows::io::AsRawHandle;
-            use windows_sys::Win32::Foundation::BOOL;
-            use windows_sys::Win32::Storage::FileSystem::{LOCKFILE_EXCLUSIVE_LOCK, LockFileEx};
+            use windows_sys::Win32::Foundation::{BOOL, ERROR_LOCK_VIOLATION};
+            use windows_sys::Win32::Storage::FileSystem::{
+                LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY, LockFileEx,
+            };
             use windows_sys::Win32::System::IO::OVERLAPPED;
 
             let handle = file.as_raw_handle();
-            let mut overlapped: OVERLAPPED = unsafe { std::mem::zeroed() };
-            // SAFETY: handle is valid; we own `file` for the guard's lifetime.
-            let rc: BOOL = unsafe {
-                LockFileEx(
-                    handle,
-                    LOCKFILE_EXCLUSIVE_LOCK,
-                    0,
-                    u32::MAX,
-                    u32::MAX,
-                    &mut overlapped,
-                )
-            };
-            if rc == 0 {
-                return Err(std::io::Error::last_os_error())
-                    .with_context(|| format!("Failed to acquire lock: {:?}", lock_path));
+            loop {
+                let mut overlapped: OVERLAPPED = unsafe { std::mem::zeroed() };
+                // SAFETY: handle is valid; we own `file` for the guard's lifetime.
+                let rc: BOOL = unsafe {
+                    LockFileEx(
+                        handle,
+                        LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY,
+                        0,
+                        u32::MAX,
+                        u32::MAX,
+                        &mut overlapped,
+                    )
+                };
+                if rc != 0 {
+                    break;
+                }
+                let err = std::io::Error::last_os_error();
+                if err.raw_os_error() != Some(ERROR_LOCK_VIOLATION as i32) {
+                    return Err(err)
+                        .with_context(|| format!("Failed to acquire lock: {:?}", lock_path));
+                }
+                if std::time::Instant::now() >= deadline {
+                    anyhow::bail!(
+                        "lock {:?} is held by another process (wedged aivo?)",
+                        lock_path
+                    );
+                }
+                std::thread::sleep(LOCK_POLL);
             }
             Ok(ConfigLockGuard { _file: file })
         }
@@ -1365,7 +1449,6 @@ impl SessionStore {
     }
 
     /// Creates a new SessionStore with a custom config path (for testing)
-    #[allow(dead_code)]
     pub fn with_path(config_path: PathBuf) -> Self {
         let config_dir = config_path
             .parent()
@@ -1396,7 +1479,6 @@ impl SessionStore {
     }
 
     /// Gets the config path
-    #[allow(dead_code)]
     pub fn get_config_path(&self) -> &PathBuf {
         &self.ctx.config_path
     }
@@ -2106,9 +2188,21 @@ impl SessionStore {
             .await
     }
 
+    pub async fn record_agent_run(
+        &self,
+        key_id: &str,
+        agent: &str,
+        ok: bool,
+        steps: u64,
+        tokens: u64,
+    ) -> Result<()> {
+        self.stats
+            .record_agent_run(key_id, agent, ok, steps, tokens)
+            .await
+    }
+
     // ── Chat sessions (delegated to CodeSessionStore) ─────────────────────
 
-    #[allow(dead_code)]
     pub fn session_file_path(&self, session_id: &str) -> PathBuf {
         self.sessions.session_file_path(session_id)
     }
@@ -2156,6 +2250,14 @@ impl SessionStore {
         self.sessions.chat_session_tokens(session_id).await
     }
 
+    /// Index billing snapshot: cumulative tokens, upstream billed model, and spend.
+    pub async fn chat_session_billing(
+        &self,
+        session_id: &str,
+    ) -> (SessionTokens, Option<String>, f64) {
+        self.sessions.chat_session_billing(session_id).await
+    }
+
     pub async fn all_chat_sessions(&self) -> Result<Vec<SessionIndexEntry>> {
         self.sessions.all_chat_sessions().await
     }
@@ -2173,6 +2275,7 @@ impl SessionStore {
         title: &str,
         preview: &str,
         tokens: SessionTokens,
+        cost_usd: f64,
     ) -> Result<()> {
         self.sessions
             .save_code_session_with_id(
@@ -2186,6 +2289,7 @@ impl SessionStore {
                 title,
                 preview,
                 tokens,
+                cost_usd,
             )
             .await
     }
@@ -2218,7 +2322,6 @@ impl SessionStore {
     }
 
     /// Removes session files for all sessions belonging to a key.
-    #[allow(dead_code)]
     pub async fn remove_sessions_for_key(&self, key_id: &str) -> Result<()> {
         self.sessions.remove_sessions_for_key(key_id).await
     }
@@ -2310,6 +2413,24 @@ mod tests {
     use crate::services::api_key_store::{KEY_ID_ALPHABET, KEY_ID_LENGTH};
     use tempfile::TempDir;
 
+    /// A held lock must error within the bound, not wait forever.
+    #[cfg(unix)]
+    #[test]
+    fn config_lock_acquire_is_bounded() {
+        let dir = TempDir::new().unwrap();
+        let lock_path = dir.path().join("config.lock");
+        let held = ConfigLockGuard::acquire(&lock_path).unwrap();
+        let start = std::time::Instant::now();
+        let err = match ConfigLockGuard::acquire(&lock_path) {
+            Ok(_) => panic!("second acquire should time out"),
+            Err(e) => e,
+        };
+        assert!(err.to_string().contains("held"), "got: {err}");
+        assert!(start.elapsed() < std::time::Duration::from_secs(3));
+        drop(held);
+        ConfigLockGuard::acquire(&lock_path).unwrap();
+    }
+
     #[test]
     fn migrate_legacy_per_model_is_idempotent() {
         // First run folds legacy maps into per_model_usage; a second run on the
@@ -2355,6 +2476,51 @@ mod tests {
         // Reading data with all zero fields produces a default-valued struct.
         let empty: ModelCounter = serde_json::from_str("{}").unwrap();
         assert_eq!(empty, ModelCounter::default());
+    }
+
+    #[test]
+    fn usage_counter_without_per_agent_loads_default() {
+        // A stats file recorded before per-agent tracking has no `perAgent` key;
+        // it must deserialize with an empty map (forward-compat).
+        let json = r#"{"promptTokens":300,"totalTokens":300}"#;
+        let counter: UsageCounter = serde_json::from_str(json).unwrap();
+        assert!(counter.per_agent.is_empty());
+        // Re-serializing an empty per_agent omits the field entirely.
+        let out = serde_json::to_string(&counter).unwrap();
+        assert!(!out.contains("perAgent"));
+    }
+
+    #[test]
+    fn agent_usage_serde_round_trip() {
+        let usage = AgentUsage {
+            runs: 5,
+            ok_runs: 4,
+            steps: 42,
+            tokens: 12_000,
+        };
+        let json = serde_json::to_string(&usage).unwrap();
+        assert!(json.contains("okRuns"));
+        let parsed: AgentUsage = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, usage);
+        // All-zero fields collapse to `{}` and read back as the default.
+        assert_eq!(serde_json::to_string(&AgentUsage::default()).unwrap(), "{}");
+        let empty: AgentUsage = serde_json::from_str("{}").unwrap();
+        assert_eq!(empty, AgentUsage::default());
+    }
+
+    #[test]
+    fn record_agent_run_accumulates_per_key() {
+        let mut stats = UsageStats::default();
+        stats.record_agent_run("k1", "code-reviewer", true, 6, 900);
+        stats.record_agent_run("k1", "code-reviewer", false, 3, 400);
+        stats.record_agent_run("k1", "explorer", true, 2, 100);
+        let agents = &stats.key_usage.get("k1").unwrap().per_agent;
+        let reviewer = agents.get("code-reviewer").unwrap();
+        assert_eq!(reviewer.runs, 2);
+        assert_eq!(reviewer.ok_runs, 1); // one run failed
+        assert_eq!(reviewer.steps, 9);
+        assert_eq!(reviewer.tokens, 1300);
+        assert_eq!(agents.get("explorer").unwrap().runs, 1);
     }
 
     #[test]
@@ -3117,6 +3283,7 @@ mod tests {
                 "hello",
                 "hello",
                 SessionTokens::default(),
+                0.0,
             )
             .await
             .unwrap();
@@ -3155,6 +3322,7 @@ mod tests {
                 "second",
                 "second",
                 SessionTokens::default(),
+                0.0,
             )
             .await
             .unwrap();

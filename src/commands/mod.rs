@@ -81,6 +81,7 @@ pub(crate) fn starter_provider_label(
 }
 
 pub mod account;
+pub mod agents;
 pub mod alias;
 pub mod code;
 pub(crate) mod code_agent_oneshot;

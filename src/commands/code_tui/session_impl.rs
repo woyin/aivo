@@ -515,11 +515,15 @@ is preserved."
         let cwd = std::path::Path::new(&real_cwd);
         let date = chrono::Local::now().format("%Y-%m-%d").to_string();
         let guides = crate::agent::system_prompt::discover_project_guides(cwd);
-        let mut skills = crate::agent::skills::discover_skills(cwd);
-        if let Ok(disabled) = self.session_store.get_disabled_skills().await {
-            let disabled: std::collections::HashSet<String> = disabled.into_iter().collect();
-            skills.retain(|s| !disabled.contains(&s.name));
-        }
+        // Same assembler as the send path, so the report reflects the real prompt.
+        let disabled: std::collections::HashSet<String> = self
+            .session_store
+            .get_disabled_skills()
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .collect();
+        let skills = crate::agent::skills::engine_skills(cwd, &disabled);
         let window = self.context_window.min(u32::MAX as u64) as u32;
         let mut engine =
             AgentEngine::new(&real_cwd, &self.model, &date, &guides, &skills, window, 0);
@@ -744,6 +748,131 @@ is preserved."
             detail_scroll: 0,
         });
         Ok(())
+    }
+
+    /// `/agents`: discover the named sub-agents for the working dir and show them
+    /// in a filterable list with a detail pane. Discovery is on-demand, so the
+    /// list reflects profiles the agent authored since launch.
+    pub(super) fn open_agents_overlay(&mut self) {
+        let cwd = if self.real_cwd.is_empty() {
+            ".".to_string()
+        } else {
+            self.real_cwd.clone()
+        };
+        let config_dir = self.session_store.config_dir().to_path_buf();
+        let user_root = config_dir.join("agents");
+        let items: Vec<AgentRow> =
+            crate::agent::subagents::discover_subagents(std::path::Path::new(&cwd), &config_dir)
+                .into_iter()
+                .map(|sa| AgentRow {
+                    scope: if sa.is_builtin() {
+                        "builtin"
+                    } else if sa.repo_local {
+                        "repo"
+                    } else if sa.source.starts_with(&user_root) {
+                        "user"
+                    } else {
+                        "pack"
+                    },
+                    tools: sa.resolved_tools(),
+                    name: sa.name,
+                    description: sa.description,
+                    source: sa.source,
+                    model: sa.model,
+                    isolation_worktree: sa.isolation_worktree,
+                    body: sa.body,
+                })
+                .collect();
+        self.overlay = Overlay::Agents(AgentsOverlay {
+            items,
+            selected: 0,
+            query: String::new(),
+            pending_delete: None,
+            viewing: None,
+            detail_scroll: 0,
+        });
+    }
+
+    /// `/agents` from the composer: bare opens the overlay; `rm <name>` deletes a
+    /// profile without opening it. There is no `add` — creation is conversational.
+    pub(super) async fn run_agents_command(&mut self, arg: Option<String>) -> Result<()> {
+        let Some(arg) = arg.map(|s| s.trim().to_string()).filter(|s| !s.is_empty()) else {
+            self.open_agents_overlay();
+            return Ok(());
+        };
+        match arg.split_once(char::is_whitespace) {
+            Some(("remove" | "rm", rest)) if !rest.trim().is_empty() => {
+                self.remove_agent_named(rest.trim()).await
+            }
+            _ => {
+                self.notice = Some((
+                    ERROR,
+                    "Usage: /agents [rm <name>] — to create one, just ask (\"make me a code-reviewer subagent\")"
+                        .to_string(),
+                ));
+                Ok(())
+            }
+        }
+    }
+
+    /// Delete a sub-agent's file by name (repo or user scope only — a pack's
+    /// profiles are removed with the pack). Rebuilds the engine so the advert
+    /// and the `agent` enum drop the name next turn.
+    pub(super) async fn remove_agent_named(&mut self, name: &str) -> Result<()> {
+        let cwd = if self.real_cwd.is_empty() {
+            ".".to_string()
+        } else {
+            self.real_cwd.clone()
+        };
+        let config_dir = self.session_store.config_dir().to_path_buf();
+        let Some(sa) =
+            crate::agent::subagents::discover_subagents(std::path::Path::new(&cwd), &config_dir)
+                .into_iter()
+                .find(|s| s.name == name)
+        else {
+            self.notice = Some((ERROR, format!("No sub-agent named “{name}”")));
+            return Ok(());
+        };
+        if sa.is_builtin() {
+            self.notice = Some((
+                ERROR,
+                format!("“{name}” is built into aivo — shadow it with your own {name}.md instead"),
+            ));
+            return Ok(());
+        }
+        let user_root = config_dir.join("agents");
+        if !sa.repo_local && !sa.source.starts_with(&user_root) {
+            self.notice = Some((
+                ERROR,
+                format!("“{name}” ships with a pack — remove the pack instead (aivo code packs)"),
+            ));
+            return Ok(());
+        }
+        match std::fs::remove_file(&sa.source) {
+            Ok(()) => {
+                self.notice = Some((MUTED, format!("Removed sub-agent “{name}”")));
+                self.request_engine_rebuild();
+                // Refresh the open overlay so the row disappears immediately.
+                if matches!(self.overlay, Overlay::Agents(_)) {
+                    self.open_agents_overlay();
+                }
+            }
+            Err(e) => {
+                self.notice = Some((ERROR, format!("Failed to remove “{name}”: {e}")));
+            }
+        }
+        Ok(())
+    }
+
+    /// Ctrl+D-confirmed delete of the `/agents` row at `index`.
+    pub(super) async fn remove_agent(&mut self, index: usize) -> Result<()> {
+        let Overlay::Agents(state) = &self.overlay else {
+            return Ok(());
+        };
+        let Some(name) = state.items.get(index).map(|it| it.name.clone()) else {
+            return Ok(());
+        };
+        self.remove_agent_named(&name).await
     }
 
     /// `/skills` from the composer: bare opens the overlay; `add <name>
@@ -2362,6 +2491,7 @@ is preserved."
                 &title,
                 &preview,
                 self.session_tokens,
+                self.session_cost_usd,
             )
             .await?;
         // Durable resume: also persist the agent engine's exact conversation
@@ -2455,16 +2585,13 @@ is preserved."
                 .session_artifacts_dir(&self.session_id)
                 .join("jobs"),
         );
-        // Re-seed the running token total from the stored entry so further turns
-        // accumulate on top of it (the index save overwrites with the cumulative).
-        self.session_tokens = self
+        // Re-seed the running totals from the stored entry so further turns
+        // accumulate on top of them (the index save overwrites with the cumulative).
+        let (tokens, stored_billed, stored_cost) = self
             .session_store
-            .chat_session_tokens(&self.session_id)
+            .chat_session_billing(&self.session_id)
             .await;
-        // Re-estimated from the resumed totals (the `~` label tolerates price drift).
-        self.session_cost_usd = crate::services::model_metadata::model_pricing(&self.model)
-            .and_then(|p| p.cost_usd(&self.session_tokens))
-            .unwrap_or(0.0);
+        self.session_tokens = tokens;
         self.history = session.messages;
         // Resumed rows never map to live checkpoints (the store is session-scoped).
         self.agent_turn_indices.clear();
@@ -2473,6 +2600,7 @@ is preserved."
         self.local_outputs.clear();
         self.reasoning_durations.clear();
         self.turn_durations.clear();
+        self.turn_notes.clear();
         // Restore the exact agent transcript (tool calls + results with ids) into
         // the next engine build instead of the lossy text seed. `None` for
         // non-agent or pre-feature sessions → falls back to the text seed.
@@ -2491,7 +2619,16 @@ is preserved."
         self.raw_model = session.raw_model.clone();
         self.model =
             CodeCommand::transform_model_for_provider(&self.key.base_url, &session.raw_model);
-        self.billed_model = None;
+        self.billed_model = stored_billed;
+        // Stored spend survives resume verbatim (it may include provider-reported
+        // figures); legacy entries without one fall back to a list-price estimate.
+        self.session_cost_usd = if stored_cost > 0.0 {
+            stored_cost
+        } else {
+            self.session_pricing()
+                .and_then(|p| p.cost_usd(&self.session_tokens))
+                .unwrap_or(0.0)
+        };
         self.refresh_context_window().await;
         // After model/window are set, so the preview mirrors the resumed session.
         self.context_tokens = self.estimated_context_used().await;

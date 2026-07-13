@@ -32,7 +32,17 @@ const GUIDE_WALK_CAP: usize = 32;
 /// own (bare names; others absolute). Symlinked duplicates collapse to one entry.
 pub fn discover_project_guides(cwd: &Path) -> Vec<String> {
     let global = crate::services::paths::config_dir();
-    discover_project_guides_at(cwd, Some(&global))
+    let mut guides = discover_project_guides_at(cwd, Some(&global));
+    // Memory rides in as guides: global first, project second (later wins).
+    let global_memory = crate::agent::memory::global_memory_path();
+    if global_memory.is_file() {
+        guides.push(global_memory.display().to_string());
+    }
+    let memory = crate::agent::memory::project_memory_path(cwd);
+    if memory.is_file() {
+        guides.push(memory.display().to_string());
+    }
+    guides
 }
 
 /// [`discover_project_guides`] with the global config dir injectable for tests.
@@ -187,6 +197,11 @@ For a long, multi-step task, use `take_note` to jot down decisions, findings, an
 you go — notes persist verbatim even after older conversation is compacted away, so they keep you \
 oriented across many steps. Reuse a note's `id` to revise it (decisions change) instead of \
 stacking near-duplicates. Skip it for quick work.\n\n\
+`remember` is different: it saves one durable fact to this project's persistent memory, injected \
+into every FUTURE session here (shown among the conventions as an `aivo project memory` file). \
+Use it sparingly for what's worth knowing weeks from now — a settled decision and its why, a user \
+preference or correction, a non-obvious gotcha. Never save session progress (that's `take_note`), \
+facts derivable from the code, or secrets.\n\n\
 For a large, self-contained chunk of work — a deep investigation that would clutter your context, or \
 something a stronger model should handle — you can hand it to a fresh sub-agent with `subagent` (pass \
 `model` to use a stronger model) and build on its result. For ordinary steps, just use your own tools. \

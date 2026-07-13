@@ -887,6 +887,12 @@ impl CodeCommand {
                         cache_read_tokens: usage.cache_read_input_tokens,
                         cache_write_tokens: usage.cache_creation_input_tokens,
                     };
+                    let cost = crate::services::model_metadata::model_pricing(&raw_model)
+                        .or_else(|| {
+                            billed_model.and_then(crate::services::model_metadata::model_pricing)
+                        })
+                        .and_then(|p| p.cost_usd(&session_tokens))
+                        .unwrap_or(0.0);
                     let _ = self
                         .session_store
                         .save_code_session_with_id(
@@ -900,6 +906,7 @@ impl CodeCommand {
                             &title,
                             &preview,
                             session_tokens,
+                            cost,
                         )
                         .await;
                     if json {
@@ -986,6 +993,11 @@ impl CodeCommand {
         println!("{}", style::bold("Subcommands:"));
         println!(
             "  {}{}",
+            style::cyan(format!("{:<26}", "agents")),
+            style::dim("Manage named sub-agents (aivo code agents --help)")
+        );
+        println!(
+            "  {}{}",
             style::cyan(format!("{:<26}", "mcp")),
             style::dim("Manage MCP servers (aivo code mcp --help)")
         );
@@ -1027,6 +1039,18 @@ impl CodeCommand {
         print_opt(
             "--add-dir <dir>",
             "Extra writable workspace root (repeatable)",
+        );
+        print_opt(
+            "--sandbox <profile>",
+            "Shell sandbox: off, workspace, read-only, strict",
+        );
+        print_opt(
+            "--best-of-n <N>",
+            "Run -e N ways in parallel, return the best (N ≤ 10; read-only sandbox)",
+        );
+        print_opt(
+            "--json-schema <schema>",
+            "Constrain the -e answer to a JSON Schema (inline or @file)",
         );
         print_opt("-r, --refresh", "Refresh the model list (skip cache)");
         print_opt(

@@ -41,13 +41,15 @@ pub struct Pricing {
 }
 
 impl Pricing {
-    /// Estimated USD for a usage split; `None` without both input and output prices.
-    /// OpenAI-style counts (cache ⊂ prompt) are exact; Anthropic-style (cache
-    /// disjoint) slightly underestimates — callers present it as an estimate.
+    /// Estimated USD for a usage split (cache ⊂ prompt, the `SessionTokens`
+    /// convention); `None` without both input and output prices.
     pub fn cost_usd(&self, t: &crate::services::session_store::SessionTokens) -> Option<f64> {
         let (input, output) = (self.input?, self.output?);
         let per = 1e-6;
-        let base_in = t.prompt_tokens.saturating_sub(t.cache_read_tokens) as f64;
+        let base_in = t
+            .prompt_tokens
+            .saturating_sub(t.cache_read_tokens)
+            .saturating_sub(t.cache_write_tokens) as f64;
         Some(
             base_in * input * per
                 + t.cache_read_tokens as f64 * self.cache_read.unwrap_or(input) * per
@@ -643,13 +645,14 @@ mod tests {
         assert_eq!(pricing.cache_write, Some(6.25));
 
         let tokens = crate::services::session_store::SessionTokens {
-            prompt_tokens: 1_000_000, // includes the 500k cache reads (OpenAI-style)
+            prompt_tokens: 1_000_000,
             completion_tokens: 100_000,
             cache_read_tokens: 500_000,
             cache_write_tokens: 200_000,
         };
+        // 300k fresh × $5 + 500k read × $0.5 + 200k write × $6.25 + 100k out × $25
         let cost = pricing.cost_usd(&tokens).unwrap();
-        assert!((cost - 6.5).abs() < 1e-9, "got {cost}");
+        assert!((cost - 5.5).abs() < 1e-9, "got {cost}");
         // No input/output price → no estimate.
         assert!(Pricing::default().cost_usd(&tokens).is_none());
     }

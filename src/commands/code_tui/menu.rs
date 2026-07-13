@@ -239,6 +239,7 @@ pub(super) fn render_command_menu_rows(
             match menu.kind {
                 MenuKind::Commands => "No matching command",
                 MenuKind::AttachPath => "No matching path",
+                MenuKind::Mention => "No matching sub-agent",
             },
             Style::default().fg(MUTED),
         ))];

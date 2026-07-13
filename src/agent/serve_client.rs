@@ -103,23 +103,28 @@ pub async fn complete(
     let mut content = String::new();
     let mut tools: Vec<ToolAcc> = Vec::new();
     let mut usage: Option<Value> = None;
+    let mut model: Option<String> = None;
     // Accumulate raw BYTES, not lossily-decoded chunks: a multi-byte char (CJK,
     // emoji) can straddle a chunk boundary, and decoding each chunk separately
     // would turn each half into a replacement char. A `\n`-terminated line never
     // splits a char, so we decode only complete lines.
     let mut buf: Vec<u8> = Vec::new();
     let mut done = false;
+    let mut truncated = false;
     let mut stream = resp.bytes_stream();
 
     while let Some(chunk) = stream.next().await {
         let bytes = match chunk {
             Ok(b) => b,
             // A mid-stream drop AFTER a text-only partial reply: keep what
-            // already streamed (the user saw it) instead of discarding it as an
-            // error — matching the plain-chat sender. But if a tool call was
+            // already streamed (the user saw it), flagged as truncated —
+            // matching the plain-chat sender. But if a tool call was
             // mid-assembly its arguments may be truncated, so bail rather than
             // risk executing a malformed call.
-            Err(_) if !content.is_empty() && tools.is_empty() => break,
+            Err(_) if !content.is_empty() && tools.is_empty() => {
+                truncated = true;
+                break;
+            }
             Err(e) => return Err(ServeError::transport(format!("stream error: {e}"))),
         };
         buf.extend_from_slice(&bytes);
@@ -142,6 +147,12 @@ pub async fn complete(
                 && !u.is_null()
             {
                 usage = Some(u.clone());
+            }
+            if model.is_none()
+                && let Some(m) = v.get("model").and_then(|x| x.as_str())
+                && !m.is_empty()
+            {
+                model = Some(m.to_string());
             }
             let Some(delta) = v.pointer("/choices/0/delta") else {
                 continue;
@@ -195,6 +206,8 @@ pub async fn complete(
         content: (!content.is_empty()).then_some(content),
         tool_calls,
         usage,
+        truncated,
+        model,
     })
 }
 
@@ -363,10 +376,29 @@ data: [DONE]\n\n";
 
         assert_eq!(seen, "Hello");
         assert_eq!(msg.content.as_deref(), Some("Hello"));
+        assert!(!msg.truncated);
         assert_eq!(msg.tool_calls.len(), 1);
         assert_eq!(msg.tool_calls[0].name, "read_file");
         assert_eq!(msg.tool_calls[0].id, "call_1");
         assert_eq!(msg.tool_calls[0].arguments["path"], "a.txt");
+    }
+
+    #[tokio::test]
+    async fn captures_upstream_model_from_chunks() {
+        let body = "data: {\"model\":\"deepseek-v4-flash\",\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n\
+data: [DONE]\n\n";
+        let port = spawn_sse(body);
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let msg = complete(
+            &client,
+            &format!("http://127.0.0.1:{port}"),
+            None,
+            &req(),
+            &mut |_| {},
+        )
+        .await
+        .unwrap();
+        assert_eq!(msg.model.as_deref(), Some("deepseek-v4-flash"));
     }
 
     #[test]
@@ -585,5 +617,9 @@ data: [DONE]\n\n";
         assert_eq!(msg.content.as_deref(), Some("partial"));
         assert_eq!(seen, "partial");
         assert!(msg.tool_calls.is_empty());
+        assert!(
+            msg.truncated,
+            "a kept partial must be flagged so it can't pass for a complete answer"
+        );
     }
 }

@@ -1,7 +1,7 @@
 # Makefile for aivo CLI
 # Quick commands for development
 
-.PHONY: build build-debug build-release test test-release npm-test check clippy clean install fmt dev release eval-fake
+.PHONY: build build-debug build-release test test-release npm-test check clippy clean install install-cargo fmt dev release eval-fake
 
 # Default target
 .DEFAULT_GOAL := help
@@ -45,6 +45,9 @@ clean: ## Clean build artifacts
 install: build ## Install debug binary to /usr/local/bin (re-signs for macOS arm64)
 	cp target/debug/aivo /usr/local/bin/aivo
 	codesign --force -s - /usr/local/bin/aivo 2>/dev/null || true
+
+install-cargo: ## Install debug binary to ~/.cargo/bin via cargo +1.97.0
+	cargo +1.97.0 install --path . --debug
 
 eval-fake: install ## Deterministic behavior eval (scripted model, no live provider)
 	AIVO_EVAL_KEY=$(AIVO_EVAL_KEY) AIVO_EVAL_MODEL=$(AIVO_EVAL_MODEL) eval/fake/run.sh

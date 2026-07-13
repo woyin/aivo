@@ -724,30 +724,29 @@ pub(crate) fn extract_usage_from_value(v: &Value) -> Option<TokenUsage> {
         .or_else(|| v.get("message").and_then(|m| m.get("usage")))
         .or_else(|| v.get("response").and_then(|r| r.get("usage")))
     {
-        let num = |a: &str, b: &str| -> u64 {
-            u.get(a)
-                .or_else(|| u.get(b))
-                .and_then(|x| x.as_u64())
-                .unwrap_or(0)
-        };
-        let cache_read = u
-            .get("prompt_tokens_details")
-            .and_then(|d| d.get("cached_tokens"))
+        let num = |k: &str| u.get(k).and_then(|x| x.as_u64());
+        // details/hit-style cached counts are ⊂ the prompt figure; Anthropic-named
+        // fields are disjoint from `input_tokens` and get added back.
+        let details_cached = crate::services::openai_models::extract_cached_prompt_tokens(u)
             .or_else(|| {
                 u.get("input_tokens_details")
                     .and_then(|d| d.get("cached_tokens"))
-            })
-            .or_else(|| u.get("cache_read_input_tokens"))
-            .and_then(|x| x.as_u64())
-            .unwrap_or(0);
+                    .and_then(|x| x.as_u64())
+            });
+        let anthropic_read = num("cache_read_input_tokens");
+        let cache_creation = num("cache_creation_input_tokens").unwrap_or(0);
+        let prompt = match num("prompt_tokens") {
+            Some(p) => p,
+            None if details_cached.is_some() => num("input_tokens").unwrap_or(0),
+            None => num("input_tokens").unwrap_or(0) + anthropic_read.unwrap_or(0) + cache_creation,
+        };
         let usage = TokenUsage {
-            prompt: num("prompt_tokens", "input_tokens"),
-            completion: num("completion_tokens", "output_tokens"),
-            cache_read,
-            cache_creation: u
-                .get("cache_creation_input_tokens")
-                .and_then(|x| x.as_u64())
+            prompt,
+            completion: num("completion_tokens")
+                .or_else(|| num("output_tokens"))
                 .unwrap_or(0),
+            cache_read: details_cached.or(anthropic_read).unwrap_or(0),
+            cache_creation,
         };
         return (!usage.is_zero()).then_some(usage);
     }
@@ -2125,6 +2124,50 @@ mod tests {
     }
 
     #[test]
+    fn parse_token_usage_anthropic_shape_folds_cache_into_prompt() {
+        let body = json!({
+            "usage": {
+                "input_tokens": 61, "output_tokens": 32,
+                "cache_read_input_tokens": 5000, "cache_creation_input_tokens": 120
+            }
+        })
+        .to_string();
+        let u = parse_token_usage(body.as_bytes()).unwrap();
+        assert_eq!(
+            (u.prompt, u.completion, u.cache_read, u.cache_creation),
+            (5181, 32, 5000, 120)
+        );
+    }
+
+    #[test]
+    fn parse_token_usage_deepseek_hit_tokens_as_cache_read() {
+        // DeepSeek without the OpenAI-style details block: hit tokens ⊂ prompt.
+        let body = json!({
+            "usage": {
+                "prompt_tokens": 5000, "completion_tokens": 100,
+                "prompt_cache_hit_tokens": 4800, "prompt_cache_miss_tokens": 200
+            }
+        })
+        .to_string();
+        let u = parse_token_usage(body.as_bytes()).unwrap();
+        assert_eq!((u.prompt, u.cache_read), (5000, 4800));
+    }
+
+    #[test]
+    fn parse_token_usage_responses_cached_subset_not_double_added() {
+        let body = json!({
+            "object": "response",
+            "usage": {
+                "input_tokens": 1000, "output_tokens": 40,
+                "input_tokens_details": {"cached_tokens": 800}
+            }
+        })
+        .to_string();
+        let u = parse_token_usage(body.as_bytes()).unwrap();
+        assert_eq!((u.prompt, u.cache_read), (1000, 800));
+    }
+
+    #[test]
     fn parse_token_usage_none_when_absent_or_zero() {
         assert!(parse_token_usage(br#"{"choices":[]}"#).is_none());
         assert!(parse_token_usage(b"not json").is_none());
@@ -2151,14 +2194,15 @@ mod tests {
 
     #[test]
     fn sniffer_anthropic_merges_start_and_delta() {
-        // Anthropic splits input (message_start) and output (message_delta).
+        // Anthropic splits input (message_start) and output (message_delta); its
+        // disjoint cache counts fold into the inclusive prompt (100+20+5).
         let mut s = StreamUsageSniffer::new(true);
         s.observe(b"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":100,\"cache_read_input_tokens\":20,\"cache_creation_input_tokens\":5,\"output_tokens\":1}}}\n\n");
         s.observe(b"event: message_delta\ndata: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":42}}\n\n");
         let u = s.finish().unwrap();
         assert_eq!(
             (u.prompt, u.completion, u.cache_read, u.cache_creation),
-            (100, 42, 20, 5)
+            (125, 42, 20, 5)
         );
     }
 

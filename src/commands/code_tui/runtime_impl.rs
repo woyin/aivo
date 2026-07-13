@@ -17,6 +17,41 @@ going. Use `take_note` for key decisions and dead-ends so they survive context c
 const GOAL_CONTINUE: &str = "Continue toward the goal. If the objective is now fully met, reply \
 with exactly `GOAL COMPLETE` and nothing else; otherwise do the next step.";
 
+/// The `/review` directive: a read-only, line-by-line review of a diff.
+const REVIEW_PREAMBLE: &str = "[Code review] Review the changes below as a senior engineer \
+would before a merge. This is READ-ONLY: do not modify, create, or delete any file.\n\
+\n\
+1. Establish the diff. With no target given, review the working diff: `git status --short` \
+plus `git diff HEAD` (staged + unstaged). If the working tree is clean, review the last \
+commit (`git show HEAD`). If a target is given and names a git ref, review \
+`git diff <target>...HEAD` (plus the working diff); if it names a path or topic, restrict \
+the review to that scope.\n\
+2. For every changed hunk, read enough surrounding code to judge it in context — follow \
+callers and callees a change could break. Never judge from the diff alone.\n\
+3. Report only findings that matter: correctness bugs, edge cases, races, security issues, \
+API misuse, behavior changes callers don't expect, dead or duplicated logic, missing tests \
+for risky changes. Skip style nits a formatter or linter would catch.\n\
+4. Present the review as:\n\
+   - One finding per bullet: `file:line — [P0|P1|P2] summary`, then 1-3 sentences of why \
+it's wrong (with a concrete failure scenario) and a suggested fix. P0 = must fix before \
+merge, P1 = should fix, P2 = polish. Order by severity.\n\
+   - A closing verdict paragraph: overall quality, whether it's safe to merge, and what \
+you checked but found sound.\n\
+   - If there are no findings, say so explicitly and list what you verified.";
+
+/// Bare-`/plan` kick-off: interview for an objective. `ask_user` keeps the turn
+/// alive — a prose question would end it and be stamped as a drafted plan.
+pub(super) const PLAN_KICKOFF_MESSAGE: &str = "The user entered plan mode without saying what \
+to plan. Interview them for the objective before any planning:\n\
+1. Orient briefly (git status/log, project layout) — only as far as it yields concrete \
+suggestions.\n\
+2. Call `ask_user` asking what they want to build, fix, or change — offer candidates you \
+noticed as options; they can also type their own.\n\
+3. With the objective clear, investigate the code it touches and call `exit_plan_mode` with \
+the complete plan.\n\
+Never call `exit_plan_mode` before the user states an objective; if their answer is ambiguous, \
+ask one focused follow-up.";
+
 /// The `/plan go` message — the plan is already in engine history, so only the
 /// go-ahead + guidance is sent.
 pub(super) fn plan_go_message(guidance: &str) -> String {
@@ -280,6 +315,17 @@ impl CodeTuiApp {
         input: String,
         record: Option<String>,
     ) -> Result<()> {
+        self.dispatch_user_message_shown(input, record, None).await
+    }
+
+    /// Like [`dispatch_user_message`], but the transcript shows `display`
+    /// (e.g. `/review main`) while the model receives the full `input`.
+    pub(super) async fn dispatch_user_message_shown(
+        &mut self,
+        input: String,
+        record: Option<String>,
+        display: Option<String>,
+    ) -> Result<()> {
         // A known text-only model would 400 on image bytes; refuse here instead,
         // keeping the draft + attachment so the user can switch models and resend.
         if self.model_image_input == Some(false)
@@ -329,6 +375,9 @@ impl CodeTuiApp {
         self.subagent_rows.clear();
         self.turn_output_tokens = 0;
         self.retrying = false;
+        // Fresh stall clock — a stale stamp would flag a "stall" at turn start.
+        self.last_stream_activity = Some(Instant::now());
+        self.wait_tick = None;
         self.pending_submit = Some(PendingSubmission {
             content: input.clone(),
             attachments: attachments.clone(),
@@ -340,7 +389,7 @@ impl CodeTuiApp {
         self.history.push(ChatMessage {
             model: None,
             role: "user".to_string(),
-            content: input.clone(),
+            content: display.unwrap_or_else(|| input.clone()),
             reasoning_content: None,
             attachments: attachments.clone(),
         });
@@ -647,12 +696,17 @@ impl CodeTuiApp {
             let guides = crate::agent::system_prompt::discover_project_guides(
                 std::path::Path::new(&real_cwd),
             );
-            let mut skills = crate::agent::skills::discover_skills(std::path::Path::new(&real_cwd));
-            // Drop skills the user turned off in `/skills`.
-            if let Ok(disabled) = self.session_store.get_disabled_skills().await {
-                let disabled: std::collections::HashSet<String> = disabled.into_iter().collect();
-                skills.retain(|s| !disabled.contains(&s.name));
-            }
+            // Discovered skills minus `/skills`-disabled, plus the create-agent
+            // builtin (natural-language subagent authoring via the `skill` tool).
+            let disabled: std::collections::HashSet<String> = self
+                .session_store
+                .get_disabled_skills()
+                .await
+                .unwrap_or_default()
+                .into_iter()
+                .collect();
+            let skills =
+                crate::agent::skills::engine_skills(std::path::Path::new(&real_cwd), &disabled);
             // A `--max-context` override wins; otherwise resolve from catalog/snapshot.
             let context_window = match self.context_window_override {
                 Some(w) => w,
@@ -707,6 +761,9 @@ impl CodeTuiApp {
                 self.session_store.config_dir(),
             );
             engine.set_subagents(&subagents);
+            // Delegations re-resolve profiles from disk, so one authored or edited
+            // mid-turn runs correctly even before the advert refreshes.
+            engine.set_agents_dir(self.session_store.config_dir());
             // Persistent grant store so "always allow"s survive across sessions.
             engine.set_grants_path(self.session_store.config_dir());
             // Durable sub-agent reports under this session's artifacts dir (survive compaction).
@@ -1109,7 +1166,41 @@ impl CodeTuiApp {
             ask_question: Some(self.cursor_ask_question_prompt()),
             update_todos: Some(self.cursor_todos_sink()),
             create_plan: Some(self.cursor_plan_prompt()),
+            task: Some(self.cursor_task_sink()),
         }
+    }
+
+    /// `cursor/task`: enrich the matching call entry with the real task
+    /// description the generic `Task: Subagent task` title lacks.
+    fn cursor_task_sink(&self) -> cursor_acp::CursorTaskSink {
+        let tx = self.tx.clone();
+        std::sync::Arc::new(move |notice: cursor_acp::CursorTaskNotice| {
+            if notice.tool_call_id.is_empty()
+                || (notice.description.is_empty() && notice.prompt.is_empty())
+            {
+                return;
+            }
+            let mut args = serde_json::Map::new();
+            if !notice.description.is_empty() {
+                args.insert("label".into(), notice.description.into());
+            }
+            if !notice.prompt.is_empty() {
+                args.insert("task".into(), notice.prompt.into());
+            }
+            // Attribute specialists (`explore — <task>`); default types are noise.
+            if !matches!(
+                notice.subagent_type.as_str(),
+                "" | "unspecified" | "generalPurpose"
+            ) {
+                args.insert("agent".into(), notice.subagent_type.into());
+            }
+            let _ = tx.send(RuntimeEvent::AgentToolUpdate {
+                id: notice.tool_call_id,
+                args: Some(serde_json::Value::Object(args)),
+                result: None,
+                failed: false,
+            });
+        })
     }
 
     /// `cursor/create_plan`: render the plan as markdown, reuse the
@@ -1399,6 +1490,10 @@ impl CodeTuiApp {
                 self.run_skills_command(arg).await?;
                 Ok(false)
             }
+            SlashCommand::Agents(arg) => {
+                self.run_agents_command(arg).await?;
+                Ok(false)
+            }
             SlashCommand::Mcp(arg) => {
                 self.run_mcp_command(arg).await?;
                 Ok(false)
@@ -1409,6 +1504,14 @@ impl CodeTuiApp {
             }
             SlashCommand::Plan(arg) => {
                 self.run_plan_command(arg).await;
+                Ok(false)
+            }
+            SlashCommand::Review(arg) => {
+                self.run_review_command(arg).await;
+                Ok(false)
+            }
+            SlashCommand::Memory => {
+                self.run_memory_command();
                 Ok(false)
             }
             SlashCommand::Effort(arg) => {
@@ -1489,10 +1592,20 @@ impl CodeTuiApp {
         // model (and the `skill` tool's enum updates). The exact conversation is
         // preserved across the rebuild. Body-only edits don't change this list; the
         // `/name` path re-reads the body fresh regardless.
-        if next != self.skill_commands {
+        //
+        // Same for subagents, comparing FULL profiles: delegation re-resolves from
+        // disk (`set_agents_dir`), but the system-prompt advert and the `agent`
+        // enum are baked at build — any change (a new specialist, a retuned
+        // description) drops the engine so the next turn re-advertises.
+        let next_subagents = crate::agent::subagents::discover_subagents(
+            std::path::Path::new(&cwd),
+            self.session_store.config_dir(),
+        );
+        if next != self.skill_commands || next_subagents != self.last_subagents {
             self.reset_engine_preserving_conversation();
         }
         self.skill_commands = next;
+        self.last_subagents = next_subagents;
     }
 
     /// Drop the cached agent engine while keeping its exact transcript, so the next
@@ -1733,6 +1846,11 @@ impl CodeTuiApp {
                 "Rewound (conversation only — file edits not reverted)".to_string()
             }
         };
+        // The measured fill described the truncated turns — re-estimate, or the
+        // footer and `/context` keep anchoring to the stale total.
+        self.context_tokens = self.estimated_context_used().await;
+        self.context_is_estimate = true;
+        self.last_usage = None;
         self.notice = Some((MUTED, notice));
         self.persist_history().await?;
         Ok(())
@@ -1847,10 +1965,107 @@ impl CodeTuiApp {
         self.draft_history_stash = None;
     }
 
-    /// `/goal`: autonomous goal mode. `<objective>` starts it (submits the first
-    /// turn with goal framing); bare shows status/usage; `stop`/`off`/`cancel`
-    /// ends it. Only for the native agent path. The loop itself is driven by
-    /// `maybe_continue_goal`, called after each agent turn finishes.
+    /// `/memory`: audit surface for `remember` — the saved facts as a card,
+    /// with the file path for hand edits. Local, no model call.
+    pub(super) fn run_memory_command(&mut self) {
+        let cwd = if self.real_cwd.is_empty() {
+            self.cwd.clone()
+        } else {
+            self.real_cwd.clone()
+        };
+        let path = crate::agent::memory::project_memory_path(std::path::Path::new(&cwd));
+        let entries = crate::agent::memory::load_entries(&path);
+        let global_path = crate::agent::memory::global_memory_path();
+        let global = crate::agent::memory::load_entries(&global_path);
+        if entries.is_empty() && global.is_empty() {
+            self.notice = Some((
+                MUTED,
+                "No memory yet — the agent saves durable facts with its `remember` tool"
+                    .to_string(),
+            ));
+            return;
+        }
+        let mut content = String::new();
+        if !entries.is_empty() {
+            content.push_str(&format!(
+                "{} project fact(s) injected into every session here:\n\n",
+                entries.len()
+            ));
+            for e in &entries {
+                content.push_str(&format!("- {e}\n"));
+            }
+            content.push_str(&format!("\nEdit or delete lines: `{}`\n", path.display()));
+        }
+        if !global.is_empty() {
+            if !entries.is_empty() {
+                content.push('\n');
+            }
+            content.push_str(&format!(
+                "{} global fact(s) injected in every project:\n\n",
+                global.len()
+            ));
+            for e in &global {
+                content.push_str(&format!("- {e}\n"));
+            }
+            content.push_str(&format!(
+                "\nEdit or delete lines: `{}`",
+                global_path.display()
+            ));
+        }
+        self.history.push(ChatMessage {
+            model: None,
+            role: "memory".to_string(),
+            content,
+            reasoning_content: None,
+            attachments: vec![],
+        });
+        self.transcript_revision = self.transcript_revision.wrapping_add(1);
+    }
+
+    /// `/review [ref|scope]`: one agent turn under the review directive — no
+    /// mode state, the directive travels in the message.
+    pub(super) async fn run_review_command(&mut self, arg: Option<String>) {
+        if self.sending {
+            self.queue_command(SlashCommand::Review(arg), "/review");
+            return;
+        }
+        if self.plan_mode {
+            self.notice = Some((
+                ERROR,
+                "Plan mode is active — approve the plan or /plan stop before /review".to_string(),
+            ));
+            return;
+        }
+        if !self.agent_capable() {
+            self.notice = Some((
+                ERROR,
+                "/review needs the native agent (an API key or Copilot — not OAuth or cursor)"
+                    .to_string(),
+            ));
+            return;
+        }
+        let target = arg.as_deref().map(str::trim).unwrap_or("");
+        let (prompt, typed) = if target.is_empty() {
+            (
+                format!("{REVIEW_PREAMBLE}\n\nReview target: the current working diff."),
+                "/review".to_string(),
+            )
+        } else {
+            (
+                format!("{REVIEW_PREAMBLE}\n\nReview target: `{target}`"),
+                format!("/review {target}"),
+            )
+        };
+        if let Err(e) = self
+            .dispatch_user_message_shown(prompt, None, Some(typed))
+            .await
+        {
+            self.notice = Some((ERROR, e.to_string()));
+        }
+    }
+
+    /// `/goal`: autonomous goal mode. `<objective>` starts it; bare shows
+    /// status; `stop` ends it. The loop is driven by `maybe_continue_goal`.
     pub(super) async fn run_goal_command(&mut self, arg: Option<String>) {
         match arg.as_deref().map(str::trim) {
             None | Some("") => {
@@ -1909,11 +2124,11 @@ impl CodeTuiApp {
                 // Fresh objective: no stale guard-stop from a prior loop.
                 self.goal_guard_stop = None;
                 let first = format!("{GOAL_PREAMBLE}\n\nObjective: {objective}");
-                // The model receives the expanded preamble, but draft history must
-                // record only the typed `/goal <objective>` (done by `submit_draft`),
-                // not this machine text — so send with `record: None`. Mirrors how
-                // `send_skill_message` keeps the re-runnable `/name args` recallable.
-                if let Err(e) = self.dispatch_user_message(first, None).await {
+                let typed = format!("/goal {objective}");
+                if let Err(e) = self
+                    .dispatch_user_message_shown(first, None, Some(typed))
+                    .await
+                {
                     self.goal_mode = None;
                     self.notice = Some((ERROR, e.to_string()));
                     return;
@@ -2014,7 +2229,9 @@ pieces and keep going"
         let draft = std::mem::take(&mut self.draft);
         let cursor = self.cursor;
         let attachments = std::mem::take(&mut self.draft_attachments);
-        let sent = self.dispatch_user_message(continuation, None).await;
+        let sent = self
+            .dispatch_user_message_shown(continuation, None, Some("/goal — continue".to_string()))
+            .await;
         self.draft = draft;
         self.cursor = cursor;
         self.draft_attachments = attachments;
@@ -2078,8 +2295,9 @@ pieces and keep going"
         self.plan_exit_pending = false;
     }
 
-    /// `/plan`: `[objective]` enters plan mode; `go [guidance]` approves a drafted
-    /// plan and executes it in the same session; `stop` leaves.
+    /// `/plan`: `[objective]` enters plan mode; bare also sends a kick-off turn
+    /// so the agent interviews for the objective; `go [guidance]` approves a
+    /// drafted plan and executes it in the same session; `stop` leaves.
     pub(super) async fn run_plan_command(&mut self, arg: Option<String>) {
         let arg = arg.as_deref().map(str::trim).unwrap_or("");
         // First word = action; the rest is `go`'s optional guidance.
@@ -2146,8 +2364,12 @@ pieces and keep going"
                 if self.plan_mode {
                     self.notice = Some((
                         MUTED,
-                        "Plan mode is on — approve the plan card (or /plan go), or /plan stop to leave"
-                            .to_string(),
+                        if self.pending_plan.is_some() {
+                            "Plan mode is on — approve the plan card (or /plan go), or /plan stop to leave"
+                        } else {
+                            "Plan mode is on — describe what to plan, or /plan stop to leave"
+                        }
+                        .to_string(),
                     ));
                     return;
                 }
@@ -2164,12 +2386,32 @@ pieces and keep going"
                     ));
                     return;
                 }
+                // Stash the composer so the kick-off can't swallow a draft or
+                // staged attachment; the transcript shows the compact `/plan`.
+                let draft = std::mem::take(&mut self.draft);
+                let cursor = self.cursor;
+                let attachments = std::mem::take(&mut self.draft_attachments);
+                let sent = self
+                    .dispatch_user_message_shown(
+                        PLAN_KICKOFF_MESSAGE.to_string(),
+                        None,
+                        Some("/plan".to_string()),
+                    )
+                    .await;
+                self.draft = draft;
+                self.cursor = cursor;
+                self.draft_attachments = attachments;
+                self.sync_command_menu_state();
+                if let Err(e) = sent {
+                    self.notice = Some((ERROR, e.to_string()));
+                    return;
+                }
                 self.notice = Some((
                     MUTED,
                     if goal_stopped {
                         "Goal mode stopped — plan mode is read-only until you approve the plan"
                     } else {
-                        "Plan mode — describe what to plan; read-only until you approve the plan"
+                        "Plan mode — read-only until you approve the plan"
                     }
                     .to_string(),
                 ));
@@ -2341,6 +2583,7 @@ pieces and keep going"
         self.pending_reasoning.clear();
         self.pending_submit = None;
         self.sending = false;
+        self.clear_tool_output();
         self.request_started_at = None;
         self.session_id = new_code_session_id();
         // New session → re-root NEW jobs' logs (running jobs keep their absolute paths).
@@ -2419,9 +2662,7 @@ pieces and keep going"
         self.agent_ask = None;
         self.agent_review = None;
         self.agent_plan_approval = None;
-        self.queued_messages.clear();
-        self.clear_steering_queue();
-        self.queued_commands.clear();
+        let discarded = self.discard_queued_input();
         if was_sending && let Some(session) = self.cursor_acp_session.as_ref() {
             // Fire-and-forget session/cancel so the agent stops generating
             // even though our task already dropped the prompt stream.
@@ -2467,7 +2708,7 @@ pieces and keep going"
         self.pending_finish = None;
         self.pending_reasoning.clear();
         self.follow_output = true;
-        self.notice = Some((MUTED, "Request cancelled".to_string()));
+        self.notice = Some((MUTED, with_discarded("Request cancelled", discarded)));
     }
 
     pub(super) async fn interrupt_inflight_request(&mut self) -> Result<()> {
@@ -2514,9 +2755,7 @@ pieces and keep going"
         self.agent_ask = None;
         self.agent_review = None;
         self.agent_plan_approval = None;
-        self.queued_messages.clear();
-        self.clear_steering_queue();
-        self.queued_commands.clear();
+        let discarded = self.discard_queued_input();
 
         let partial = std::mem::take(&mut self.pending_response);
         // Keep the reasoning shown for this partial reply (the user saw it); the
@@ -2542,14 +2781,33 @@ pieces and keep going"
         self.persist_history().await?;
         self.notice = Some((
             MUTED,
-            if goal_was_active {
-                "Response interrupted — goal mode stopped"
-            } else {
-                "Response interrupted"
-            }
-            .to_string(),
+            with_discarded(
+                if goal_was_active {
+                    "Response interrupted — goal mode stopped"
+                } else {
+                    "Response interrupted"
+                },
+                discarded,
+            ),
         ));
         Ok(())
+    }
+
+    /// Drop unconsumed mid-turn input, returning the count so the interrupt
+    /// notice can say so instead of losing it silently.
+    pub(super) fn discard_queued_input(&mut self) -> usize {
+        let count = self.queued_messages.len()
+            + self.queued_commands.len()
+            + self
+                .steering_queue
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .len();
+        self.queued_messages.clear();
+        self.clear_steering_queue();
+        self.queued_commands.clear();
+        self.queue_focus = None;
+        count
     }
 
     pub(super) fn record_draft_history(&mut self, input: &str) {
@@ -2758,7 +3016,9 @@ fn compute_line_starts(
             let content = cache
                 .entry(d.path.clone())
                 .or_insert_with(|| {
-                    std::fs::read_to_string(crate::agent::tools::resolve(cwd, &d.path)).ok()
+                    let full = crate::agent::tools::resolve(cwd, &d.path);
+                    std::fs::metadata(&full).ok().filter(|m| m.is_file())?;
+                    std::fs::read_to_string(full).ok()
                 })
                 .as_ref()?;
             let mut hits = content.match_indices(&d.old);
@@ -2770,6 +3030,38 @@ fn compute_line_starts(
             Some(1 + content[..offset].matches('\n').count())
         })
         .collect()
+}
+
+/// Interrupt notice + how many queued messages it threw away.
+fn with_discarded(base: &str, discarded: usize) -> String {
+    match discarded {
+        0 => base.to_string(),
+        1 => format!("{base} — 1 queued message discarded"),
+        n => format!("{base} — {n} queued messages discarded"),
+    }
+}
+
+/// A `write_file`'s pre-write snapshot for the transcript diff card, captured
+/// before the write applies (by commit time the old content is gone). `None`
+/// (missing/non-UTF8/oversized) keeps the all-additions card; the byte cap also
+/// bounds what the session file persists per write.
+fn capture_pre_write(
+    cwd: &std::path::Path,
+    name: &str,
+    args: &serde_json::Value,
+) -> Option<String> {
+    const MAX_BYTES: u64 = 256 * 1024;
+    if name != "write_file" {
+        return None;
+    }
+    let path = args.get("path").and_then(|v| v.as_str())?;
+    let abs = crate::agent::tools::resolve(cwd, path);
+    // `is_file`: a FIFO reports len 0 but would block the read.
+    let meta = std::fs::metadata(&abs).ok()?;
+    if !meta.is_file() || meta.len() > MAX_BYTES {
+        return None;
+    }
+    std::fs::read_to_string(abs).ok()
 }
 
 /// Bridges the in-process `AgentEngine` to the chat TUI: engine callbacks become
@@ -2917,12 +3209,22 @@ impl crate::agent::engine::AgentUi for ChatAgentUi {
         // Runs on the engine thread before the edit applies, so the probe sees
         // the pre-edit file.
         let line_starts = compute_line_starts(&self.cwd, name, args);
+        let old_content = capture_pre_write(&self.cwd, name, args);
         self.tx
             .send(RuntimeEvent::AgentToolCall {
                 id: None,
                 name: name.to_string(),
                 args: args.clone(),
                 line_starts,
+                old_content,
+            })
+            .ok();
+    }
+
+    fn tool_output(&mut self, _name: &str, chunk: &str) {
+        self.tx
+            .send(RuntimeEvent::AgentToolOutput {
+                chunk: chunk.to_string(),
             })
             .ok();
     }
@@ -3295,6 +3597,7 @@ async fn drive_cursor_turn(
                 args,
                 // Cursor edits carry no file offset to number.
                 line_starts: vec![],
+                old_content: None,
             },
             CursorChunk::ToolUpdate {
                 id,

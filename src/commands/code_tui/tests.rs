@@ -197,6 +197,7 @@ async fn test_streamed_steps_keep_scroll_when_user_scrolled_up() {
         "read_file".to_string(),
         serde_json::json!({"path": "x"}),
         vec![],
+        None,
     );
     assert!(
         !app.follow_output,
@@ -769,10 +770,14 @@ fn test_visible_command_menu_filters_and_hides_escaped_slash() {
     app.cursor = 3;
     app.sync_command_menu_state();
     let menu = app.visible_command_menu().unwrap();
-    assert_eq!(menu.entries.len(), 1);
+    assert_eq!(menu.entries.len(), 2); // "mo" → model + memory
     assert!(matches!(
         menu.entries[0],
         ComposerMenuEntry::Command(command) if command.name == "model"
+    ));
+    assert!(matches!(
+        menu.entries[1],
+        ComposerMenuEntry::Command(command) if command.name == "memory"
     ));
     assert_eq!(menu.selected, Some(0));
 
@@ -1384,6 +1389,7 @@ fn make_test_app(
         cursor: 0,
         command_menu: CommandMenuState::default(),
         skill_commands: Vec::new(),
+        last_subagents: Vec::new(),
         mcp_configured_count: 0,
         welcome_tip_index: 0,
         welcome_tip_rotated_at: None,
@@ -1403,7 +1409,11 @@ fn make_test_app(
         request_started_at: None,
         compact_before: None,
         last_tool_action: None,
+        wait_tick: None,
+        last_stream_activity: None,
         subagent_rows: Vec::new(),
+        tool_output_tail: std::collections::VecDeque::new(),
+        tool_output_partial: String::new(),
         status_display: None,
         turn_output_tokens: 0,
         retrying: false,
@@ -1500,6 +1510,7 @@ fn make_test_app(
         queued_messages: Vec::new(),
         steering_queue: SteeringQueue::default(),
         queued_commands: Vec::new(),
+        queue_focus: None,
         project_mcp_consent: ProjectMcpConsent::default(),
         pending_mcp_consent: None,
         local_command: None,
@@ -1512,6 +1523,7 @@ fn make_test_app(
         agent_turn_indices: std::collections::HashSet::new(),
         reasoning_durations: std::collections::HashMap::new(),
         turn_durations: std::collections::HashMap::new(),
+        turn_notes: std::collections::HashMap::new(),
         reasoning_started_at: None,
         reasoning_elapsed_ms: None,
         installing_skill: None,
@@ -1583,6 +1595,43 @@ async fn test_rewind_truncates_history_and_restores_draft() {
     // The rewound message is restored to the composer with the cursor at the end.
     assert_eq!(app.draft, "second question");
     assert_eq!(app.cursor, app.draft.len());
+}
+
+/// A rewind invalidates the measured fill — footer and `/context` must drop
+/// back to a flagged estimate of the surviving turns.
+#[tokio::test]
+async fn test_rewind_reestimates_context_fill() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.session_id = "rewind-ctx".to_string();
+    seed_two_exchanges(&mut app);
+    app.context_tokens = 100_000;
+    app.context_is_estimate = false;
+    app.last_usage = Some(crate::commands::code_response_parser::TokenUsage {
+        prompt_tokens: 99_000,
+        completion_tokens: 1_000,
+        ..Default::default()
+    });
+
+    app.rewind_to_turn(2, None).await.unwrap();
+
+    assert!(app.context_is_estimate, "measured flag must not survive");
+    assert_eq!(app.last_usage, None);
+    assert!(
+        app.context_tokens < 100_000,
+        "fill must be re-estimated from the truncated history, got {}",
+        app.context_tokens
+    );
+}
+
+#[tokio::test]
+async fn test_session_pricing_falls_back_to_billed_model() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.model = "aivo/starter".to_string();
+    assert!(app.session_pricing().is_none(), "alias alone is unpriced");
+    app.billed_model = Some("claude-opus-4-8".to_string());
+    assert!(app.session_pricing().is_some(), "billed model resolves");
 }
 
 #[tokio::test]
@@ -2438,7 +2487,7 @@ fn test_footer_status_label_shows_window_on_pristine_session() {
     app.context_window = 1_000_000;
     app.context_tokens = 0; // no turn yet → no fill to gauge
 
-    // The welcome screen shows the window size, not an empty `0 / 1M` meter.
+    // The welcome screen shows the window size, not an empty `0/1M` meter.
     let (label, color) = app.footer_status_label();
     assert_eq!(label, "1M context");
     assert_eq!(color, MUTED);
@@ -2446,7 +2495,7 @@ fn test_footer_status_label_shows_window_on_pristine_session() {
     // The first tokens flip it to the live gauge.
     app.context_tokens = 50_000;
     app.context_is_estimate = false;
-    assert_eq!(app.footer_status_label().0, "50k / 1M");
+    assert_eq!(app.footer_status_label().0, "50k/1M");
 }
 
 #[test]
@@ -2457,9 +2506,9 @@ fn test_footer_status_label_shows_context_utilization() {
     app.context_tokens = 10_000;
     app.context_is_estimate = false; // a provider-measured fill
 
-    // used / window, quiet until it nears the limit.
+    // used/window, quiet until it nears the limit.
     let (label, color) = app.footer_status_label();
-    assert_eq!(label, "10k / 200k");
+    assert_eq!(label, "10k/200k");
     assert_eq!(color, MUTED);
 
     // Warms toward the window limit (compaction territory).
@@ -2474,7 +2523,7 @@ fn test_footer_status_label_shows_context_utilization() {
         completion_tokens: 0,
         ..Default::default()
     });
-    assert_eq!(app.footer_status_label().0, "40k / 200k");
+    assert_eq!(app.footer_status_label().0, "40k/200k");
 }
 
 #[test]
@@ -2488,7 +2537,7 @@ fn test_footer_status_label_marks_estimates() {
     // understates the model's real context, so flag it with `~`.
     app.context_is_estimate = true;
     app.last_usage = None;
-    assert_eq!(app.footer_status_label().0, "~10k / 200k");
+    assert_eq!(app.footer_status_label().0, "~10k/200k");
 
     // A provider-measured last-turn total is exact even if the estimate flag
     // lingers from a prior turn — no tilde.
@@ -2497,7 +2546,7 @@ fn test_footer_status_label_marks_estimates() {
         completion_tokens: 0,
         ..Default::default()
     });
-    assert_eq!(app.footer_status_label().0, "40k / 200k");
+    assert_eq!(app.footer_status_label().0, "40k/200k");
 }
 
 #[test]
@@ -2529,6 +2578,110 @@ fn test_footer_shows_plain_chat_badge_when_agent_tools_off() {
 }
 
 #[test]
+fn test_footer_effort_label_reports_thinking_off_on_capable_models() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+
+    app.model_supports_thinking = false;
+    app.thinking_enabled = false;
+    assert_eq!(app.footer_effort_label(), None);
+
+    app.model_supports_thinking = true;
+    assert_eq!(app.footer_effort_label().as_deref(), Some("thinking off"));
+
+    app.thinking_enabled = true;
+    assert_ne!(app.footer_effort_label().as_deref(), Some("thinking off"));
+
+    // A cursor-derived label wins over the local toggles.
+    app.cursor_effort_label = Some("max".to_string());
+    assert_eq!(app.footer_effort_label().as_deref(), Some("max"));
+}
+
+#[test]
+fn test_footer_mcp_label_reflects_aggregate_health() {
+    use crate::agent::mcp::McpClient;
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+
+    app.mcp_configured_count = 0;
+    assert!(app.footer_mcp_label().is_none());
+
+    app.mcp_configured_count = 2;
+    app.mcp_connecting = true;
+    assert_eq!(app.footer_mcp_label().unwrap().0, "mcp:2…");
+
+    app.mcp_connecting = false;
+    app.mcp_client = Some(std::sync::Arc::new(McpClient::with_state_for_tests(
+        Vec::new(),
+        std::collections::HashSet::new(),
+    )));
+    assert_eq!(
+        app.footer_mcp_label().unwrap(),
+        ("mcp:2".to_string(), MUTED)
+    );
+
+    app.mcp_client = Some(std::sync::Arc::new(McpClient::with_state_for_tests(
+        vec![("db".to_string(), "spawn failed".to_string())],
+        std::collections::HashSet::new(),
+    )));
+    assert_eq!(
+        app.footer_mcp_label().unwrap(),
+        ("mcp:2!".to_string(), ERROR)
+    );
+
+    // OAuth-pending with nothing failed is WARNING, not ERROR.
+    app.mcp_client = Some(std::sync::Arc::new(McpClient::with_state_for_tests(
+        Vec::new(),
+        std::collections::HashSet::from(["gh".to_string()]),
+    )));
+    assert_eq!(
+        app.footer_mcp_label().unwrap(),
+        ("mcp:2!".to_string(), WARNING)
+    );
+}
+
+#[test]
+fn test_footer_shows_short_session_id_only_on_wide_terminals() {
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    fn footer_text(app: &CodeTuiApp, width: u16) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(width, 1)).unwrap();
+        terminal
+            .draw(|frame| app.render_footer(frame, frame.area()))
+            .unwrap();
+        let buf = terminal.backend().buffer();
+        (0..buf.area.width)
+            .map(|x| buf.cell((x, 0)).unwrap().symbol().to_string())
+            .collect()
+    }
+
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.session_id = "abcdef12-3456-7890-abcd-ef1234567890".to_string();
+
+    assert!(footer_text(&app, 100).contains("#abcdef12"));
+    assert!(!footer_text(&app, 80).contains("#abcdef12"));
+}
+
+#[test]
+fn test_welcome_status_lines_include_static_essentials_hint() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let app = make_test_app(tx, rx);
+    let plain: Vec<String> = app
+        .welcome_status_lines()
+        .into_iter()
+        .map(|sl| sl.plain)
+        .collect();
+    assert!(
+        plain
+            .iter()
+            .any(|l| l.contains("/help commands") && l.contains("Esc interrupts")),
+        "essentials hint missing from welcome: {plain:?}"
+    );
+}
+
+#[test]
 fn test_footer_status_label_updates_live_during_turn() {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let mut app = make_test_app(tx, rx);
@@ -2540,7 +2693,7 @@ fn test_footer_status_label_updates_live_during_turn() {
     // baseline (no drop at turn start) and grows it as text streams in, flagged `~`.
     app.sending = true;
     app.pending_response = "x".repeat(4_000); // ~1k tokens streamed so far
-    assert_eq!(app.footer_status_label().0, "~41k / 200k");
+    assert_eq!(app.footer_status_label().0, "~41k/200k");
 
     // Provider-measured usage arrives mid-stream (Anthropic message_start/_delta):
     // the live figure replaces the estimate immediately, no `~`.
@@ -2549,7 +2702,7 @@ fn test_footer_status_label_updates_live_during_turn() {
         completion_tokens: 2_000,
         ..Default::default()
     });
-    assert_eq!(app.footer_status_label().0, "52k / 200k");
+    assert_eq!(app.footer_status_label().0, "52k/200k");
 
     // Turn ends: the fold into last_usage keeps the measured total on the footer.
     app.sending = false;
@@ -2559,7 +2712,7 @@ fn test_footer_status_label_updates_live_during_turn() {
         completion_tokens: 2_500,
         ..Default::default()
     });
-    assert_eq!(app.footer_status_label().0, "52.5k / 200k");
+    assert_eq!(app.footer_status_label().0, "52.5k/200k");
 }
 
 #[test]
@@ -2573,13 +2726,13 @@ fn test_agent_context_drives_footer_live() {
     // counts the real request the engine sends, not just the visible transcript.
     // Flagged `~` since it is a chars/4 estimate.
     app.apply_agent_context(50_000, false);
-    assert_eq!(app.footer_status_label().0, "~50k / 200k");
+    assert_eq!(app.footer_status_label().0, "~50k/200k");
 
     // The step's measured total arrives → exact figure, no `~`, and streamed text
     // is not re-added on top (it is already in the measured completion).
     app.pending_response = "x".repeat(8_000); // would add ~2k if double-counted
     app.apply_agent_context(60_000, true);
-    assert_eq!(app.footer_status_label().0, "60k / 200k");
+    assert_eq!(app.footer_status_label().0, "60k/200k");
 }
 
 #[test]
@@ -2595,6 +2748,7 @@ fn test_current_action_label_reflects_phase() {
         "run_bash".to_string(),
         serde_json::json!({"command": "ls"}),
         vec![],
+        None,
     );
     assert_eq!(app.current_action_label().as_deref(), Some("running ls"));
     // Streamed tokens arriving → the step is over, heartbeat only.
@@ -2650,6 +2804,7 @@ fn test_current_action_shows_inline_on_status_line() {
         "grep".to_string(),
         serde_json::json!({"pattern": "parse_expr"}),
         vec![],
+        None,
     );
     // The action replaces "Thinking" on the SAME single status line (no extra
     // line), so the layout never shifts as steps come and go.
@@ -2675,6 +2830,7 @@ fn test_subagent_activity_drives_status_line() {
         "subagent".to_string(),
         serde_json::json!({"agent": "code-reviewer", "task": "review mcp.rs"}),
         vec![],
+        None,
     );
     app.apply_subagent_activity(
         "code-reviewer".to_string(),
@@ -2709,6 +2865,7 @@ fn test_parallel_subagent_rows_render_under_status_line() {
         "subagent".to_string(),
         serde_json::json!({"label": "audit auth flow", "task": "…"}),
         vec![],
+        None,
     );
     app.apply_subagent_begin(vec!["audit auth flow".to_string(), String::new()]);
     // The unnamed delegate is numbered so its row stays distinguishable.
@@ -2746,6 +2903,33 @@ fn test_parallel_subagent_rows_render_under_status_line() {
     // Batch end retires the rows and hands the headline back.
     app.subagent_rows.clear();
     assert_ne!(app.desired_status(), "running 2 sub-agents (1 done)");
+}
+
+#[test]
+fn subagent_done_attributes_only_discovered_profiles() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    let profile = |name: &str| crate::agent::subagents::Subagent {
+        name: name.to_string(),
+        description: String::new(),
+        model: None,
+        tools: None,
+        body: String::new(),
+        isolation_worktree: false,
+        repo_local: false,
+        source: std::path::PathBuf::new(),
+    };
+    app.last_subagents = vec![profile("code-reviewer")];
+    app.apply_subagent_begin(vec!["code-reviewer".to_string(), "sub-agent 2".to_string()]);
+    // A row named after a discovered profile is attributed to it.
+    assert_eq!(
+        app.apply_subagent_done(0, true, 6, 900),
+        Some("code-reviewer".to_string())
+    );
+    // A generic/labeled delegate is not (it would pollute per-agent stats).
+    assert_eq!(app.apply_subagent_done(1, true, 4, 200), None);
+    // An out-of-range slot is a defensive no-op.
+    assert_eq!(app.apply_subagent_done(9, true, 1, 1), None);
 }
 
 #[test]
@@ -2843,6 +3027,7 @@ fn test_in_flight_tool_card_hidden_until_result() {
         "run_bash".to_string(),
         serde_json::json!({"command": "lsof -ti:3000"}),
         vec![],
+        None,
     );
     // In flight: only the status names it — the `→ run_bash(…)` card is held back
     // so the same action isn't shown twice (the dup the user reported).
@@ -2865,17 +3050,111 @@ fn test_in_flight_tool_card_hidden_until_result() {
 }
 
 #[test]
+fn test_parallel_bridged_batch_counts_and_lists_calls() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.sending = true;
+    for (id, task) in [("1", "Audit auth"), ("2", "Map engine"), ("3", "Scan CLI")] {
+        app.apply_agent_tool_call(
+            Some(id.to_string()),
+            "subagent".to_string(),
+            serde_json::json!({"label": task}),
+            vec![],
+            None,
+        );
+    }
+    assert_eq!(app.desired_status(), "running 3 sub-agents (0 done)");
+    let plain = app.build_transcript().plain_lines.join("\n");
+    assert!(plain.contains("↳ Audit auth"), "per-call rows: {plain:?}");
+    assert!(plain.contains("↳ Scan CLI"), "per-call rows: {plain:?}");
+
+    // Newest call resolving first: no "Thinking" flip, card held with the batch.
+    app.apply_agent_tool_update("3".to_string(), None, Some("12 files".to_string()), false);
+    assert_eq!(app.desired_status(), "running 3 sub-agents (1 done)");
+    assert!(app.current_action_label().is_some());
+    let plain = app.build_transcript().plain_lines.join("\n");
+    assert!(
+        plain.contains("✓ Scan CLI — 12 files"),
+        "done row: {plain:?}"
+    );
+    assert!(
+        !plain.contains("Scan CLI ⎿") && !plain.contains("subagent("),
+        "cards held until the batch settles: {plain:?}"
+    );
+
+    // All resolved → the batch is over: rows gone, cards render.
+    app.apply_agent_tool_update("1".to_string(), None, Some("ok".to_string()), false);
+    app.apply_agent_tool_update("2".to_string(), None, Some("ok".to_string()), true);
+    assert_ne!(app.desired_status(), "running 3 sub-agents (3 done)");
+    let plain = app.build_transcript().plain_lines.join("\n");
+    assert!(!plain.contains("↳ "), "live rows cleared: {plain:?}");
+    assert!(plain.contains("Audit auth"), "cards render: {plain:?}");
+}
+
+#[test]
+fn test_cursor_task_notice_renames_generic_batch_rows() {
+    // A `cursor/task` notice arrives as an args-only AgentToolUpdate.
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.sending = true;
+    for id in ["1", "2"] {
+        app.apply_agent_tool_call(
+            Some(id.to_string()),
+            "subagent".to_string(),
+            serde_json::json!({"label": "Subagent task"}),
+            vec![],
+            None,
+        );
+    }
+    app.apply_agent_tool_update(
+        "2".to_string(),
+        Some(serde_json::json!({"label": "Audit the auth flow", "agent": "explore"})),
+        None,
+        false,
+    );
+    let plain = app.build_transcript().plain_lines.join("\n");
+    assert!(
+        plain.contains("↳ explore — Audit the auth flow"),
+        "row renamed by the notice: {plain:?}"
+    );
+    assert!(
+        plain.contains("↳ Subagent task"),
+        "sibling untouched: {plain:?}"
+    );
+    // Enrichment also refreshes the one-line status label.
+    assert_eq!(
+        app.current_action_label().as_deref(),
+        Some("delegating: Audit the auth flow")
+    );
+}
+
+#[test]
+fn test_parallel_bridged_batch_mixed_tools_noun() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.sending = true;
+    for (id, name, args) in [
+        ("1", "grep", serde_json::json!({"pattern": "hover"})),
+        ("2", "subagent", serde_json::json!({"label": "Audit"})),
+    ] {
+        app.apply_agent_tool_call(Some(id.to_string()), name.to_string(), args, vec![], None);
+    }
+    assert_eq!(app.desired_status(), "running 2 parallel steps (0 done)");
+}
+
+#[test]
 fn test_status_tail_shows_turn_output_tokens() {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let mut app = make_test_app(tx, rx);
     app.sending = true;
     app.pending_response = "x".repeat(4_000); // ~1k tokens streamed
-    // Before any measured turn output: a live ~-flagged estimate, never esc.
+    // A live ~-flagged estimate, alongside the always-present interrupt hint —
+    // stopping a runaway turn must be discoverable mid-turn.
     let plain = app.build_transcript().plain_lines.join("\n");
     assert!(plain.contains("tokens"), "estimate shown: {plain:?}");
     assert!(
-        !plain.contains("esc to interrupt"),
-        "no esc hint in status: {plain:?}"
+        plain.contains("esc to interrupt"),
+        "esc hint in the agent-turn status: {plain:?}"
     );
     // The engine reports the turn's cumulative generated tokens → exact (no ~),
     // distinct from the prompt-dominated context total (which stays in the footer).
@@ -2883,6 +3162,137 @@ fn test_status_tail_shows_turn_output_tokens() {
     let plain = app.build_transcript().plain_lines.join("\n");
     assert!(plain.contains("512 tokens"), "turn output shown: {plain:?}");
     assert!(!plain.contains("~512"), "measured, not estimate: {plain:?}");
+}
+
+#[test]
+fn test_status_tail_counts_queued_input() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.sending = true;
+    app.queued_messages.push("follow-up one".to_string());
+    app.queued_messages.push("follow-up two".to_string());
+    let plain = app.build_transcript().plain_lines.join("\n");
+    assert!(plain.contains("2 queued"), "queued chip missing: {plain:?}");
+}
+
+#[test]
+fn test_desired_status_names_decision_waits_and_stalls() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.sending = true;
+    // A permission card means blocked on the user — the status must not read as
+    // the (possibly destructive) command already executing.
+    let (reply, _rx) = tokio::sync::oneshot::channel();
+    app.agent_permission = Some(PendingPermission {
+        tool: "run_bash".to_string(),
+        preview: Some("rm -rf build".to_string()),
+        reply,
+    });
+    assert_eq!(app.desired_status(), "waiting for your approval");
+    app.agent_permission = None;
+
+    // A silent stream reads as a stall, not an ever-ticking "Thinking".
+    app.last_stream_activity =
+        std::time::Instant::now().checked_sub(std::time::Duration::from_secs(15));
+    assert_eq!(app.desired_status(), "waiting");
+    app.last_stream_activity = Some(std::time::Instant::now());
+    assert_eq!(app.desired_status(), "Thinking");
+}
+
+#[test]
+fn test_decision_wait_freezes_step_and_turn_clocks() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.sending = true;
+    let t0 = std::time::Instant::now();
+    app.last_tool_action = Some(("running rm -rf build".to_string(), t0, None));
+    app.request_started_at = Some(t0);
+    let (reply, _rx) = tokio::sync::oneshot::channel();
+    app.agent_permission = Some(PendingPermission {
+        tool: "run_bash".to_string(),
+        preview: None,
+        reply,
+    });
+    // Two ticks a real interval apart: the waiting span must be pushed out of
+    // both clocks, so their effective elapsed stays near zero.
+    app.tick_decision_wait();
+    std::thread::sleep(std::time::Duration::from_millis(30));
+    app.tick_decision_wait();
+    let (_, since, _) = app.last_tool_action.as_ref().unwrap();
+    assert!(
+        since.elapsed() < std::time::Duration::from_millis(15),
+        "tool clock ran during the wait: {:?}",
+        since.elapsed()
+    );
+    assert!(
+        app.request_started_at.unwrap().elapsed() < std::time::Duration::from_millis(15),
+        "turn clock ran during the wait"
+    );
+    // Card resolved → clocks run again from here.
+    app.agent_permission = None;
+    app.tick_decision_wait();
+    assert!(app.wait_tick.is_none());
+}
+
+#[test]
+fn test_discard_queued_input_counts_and_clears() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.queued_messages.push("a".to_string());
+    app.queued_messages.push("b".to_string());
+    app.steering_queue.lock().unwrap().push("steer".to_string());
+    assert_eq!(app.discard_queued_input(), 3);
+    assert!(app.queued_messages.is_empty());
+    assert!(app.steering_queue.lock().unwrap().is_empty());
+    assert_eq!(app.discard_queued_input(), 0);
+}
+
+#[test]
+fn test_bash_status_clock_shows_timeout_budget() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.sending = true;
+    app.apply_agent_tool_call(
+        None,
+        "run_bash".to_string(),
+        serde_json::json!({"command": "cargo test", "timeout": 300}),
+        vec![],
+        None,
+    );
+    let (_, _, budget) = app.last_tool_action.as_ref().unwrap();
+    assert_eq!(*budget, Some(300));
+    let plain = app.build_transcript().plain_lines.join("\n");
+    assert!(
+        plain.contains(" / "),
+        "deadline missing from clock: {plain:?}"
+    );
+    // Non-bash steps carry no budget.
+    app.apply_agent_tool_call(
+        None,
+        "read_file".to_string(),
+        serde_json::json!({"path": "x.rs"}),
+        vec![],
+        None,
+    );
+    assert_eq!(app.last_tool_action.as_ref().unwrap().2, None);
+}
+
+#[test]
+fn test_done_marker_appends_turn_note() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.history.push(ChatMessage {
+        model: None,
+        role: "assistant".to_string(),
+        content: "done".to_string(),
+        reasoning_content: None,
+        attachments: vec![],
+    });
+    let idx = app.history.len() - 1;
+    app.turn_durations.insert(idx, 42_000);
+    app.turn_notes.insert(idx, "3.1k tokens".to_string());
+    let plain = app.build_transcript().plain_lines.join("\n");
+    assert!(plain.contains("✶ Done in 42s · 3.1k tokens"), "{plain}");
 }
 
 #[tokio::test]
@@ -2901,6 +3311,31 @@ async fn test_agent_error_notice_uses_error_color() {
         .unwrap();
     app.handle_runtime_events().await.unwrap();
     assert_eq!(app.notice, Some((MUTED, "compacting context…".to_string())));
+}
+
+#[tokio::test]
+async fn test_agent_error_persists_in_transcript() {
+    // Beyond the transient notice, the error must land as a durable transcript entry.
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.tx
+        .send(RuntimeEvent::AgentError(
+            "the provider rejected this API key (upstream 401: bad key)".to_string(),
+        ))
+        .unwrap();
+    app.handle_runtime_events().await.unwrap();
+    let last = app.history.last().expect("error entry committed");
+    assert_eq!(last.role, "error");
+    let plain = app.build_transcript().plain_lines.join("\n");
+    assert!(
+        plain.contains("✗ the provider rejected this API key"),
+        "{plain}"
+    );
+    // Never seeded back to the model on an engine rebuild.
+    assert!(
+        super::runtime_impl::agent_seed_turns(&app.history).is_empty(),
+        "error entries must stay display-only"
+    );
 }
 
 #[tokio::test]
@@ -2957,6 +3392,7 @@ async fn test_sandbox_escalation_notice_clears_on_next_output() {
             name: "read_file".to_string(),
             args: serde_json::json!({"path": "x"}),
             line_starts: vec![],
+            old_content: None,
         })
         .unwrap();
     app.handle_runtime_events().await.unwrap();
@@ -2990,6 +3426,7 @@ async fn test_sandbox_escalation_notice_clears_on_next_output() {
             name: "read_file".to_string(),
             args: serde_json::json!({"path": "y"}),
             line_starts: vec![],
+            old_content: None,
         })
         .unwrap();
     app.handle_runtime_events().await.unwrap();
@@ -3087,6 +3524,7 @@ fn test_status_label_throttled_to_min_duration() {
         "grep".to_string(),
         serde_json::json!({"pattern": "foo"}),
         vec![],
+        None,
     );
     app.tick_status_throttle();
     assert_eq!(
@@ -3168,8 +3606,8 @@ fn test_transcript_intro_is_brand_only() {
     assert_eq!(
         app.transcript_intro_lines(80),
         vec![
-            "▄▀█ █ █░█ █▀█   █▀▀ █▀█ █▀▄ █▀█".to_string(),
-            format!("█▀█ █ ▀▄▀ █▄█   █▄▄ █▄█ █▄▀ █▄▄{version}"),
+            "▄▀█ █ █░█ █▀█  █▀▀ █▀█ █▀▄ █▀█".to_string(),
+            format!("█▀█ █ ▀▄▀ █▄█  █▄▄ █▄█ █▄▀ █▄▄{version}"),
         ]
     );
 }
@@ -3186,8 +3624,8 @@ fn test_transcript_intro_narrow_falls_back_to_aivo() {
     );
     // Exactly the mark width keeps the full mark (version needs more room).
     assert_eq!(
-        app.transcript_intro_lines(31)[0],
-        "▄▀█ █ █░█ █▀█   █▀▀ █▀█ █▀▄ █▀█"
+        app.transcript_intro_lines(30)[0],
+        "▄▀█ █ █░█ █▀█  █▀▀ █▀█ █▀▄ █▀█"
     );
     let version = format!("v{}", crate::version::VERSION);
     assert!(
@@ -3709,6 +4147,58 @@ fn test_markdown_table_is_responsive_to_width() {
             "content dropped at width {width}"
         );
     }
+}
+
+#[test]
+fn test_markdown_table_stacks_when_grid_would_break_words() {
+    // Four columns with a giant token can't grid at 44 cols without breaking
+    // words mid-character — the table must stack into `Header: value` blocks.
+    let md = "| Dimension | Their approach | Our approach | Worth adopting? |\n\
+        |---|---|---|---|\n\
+        | Shape | Bun workspace monorepo: packages/{shared,core,ui,session-core} | Single Rust crate | No |\n\
+        | Agent ownership | Thin agent-service | Native engine.rs | Partial |\n";
+    let lines = render_markdown_lines(md, 44);
+    let plain: Vec<&str> = lines.iter().map(|l| l.plain.as_str()).collect();
+    let joined = plain.join("\n");
+
+    assert!(
+        !joined.chars().any(|c| "│┌┐└┘├┤┬┴┼".contains(c)),
+        "expected stacked layout, got a grid:\n{joined}"
+    );
+    assert!(joined.contains("Dimension: Shape"), "{joined}");
+    assert!(joined.contains("Their approach: Bun workspace"), "{joined}");
+    let rules = plain.iter().filter(|l| l.contains("────")).count();
+    assert_eq!(rules, 1, "expected one row separator:\n{joined}");
+    let width = |s: &str| {
+        s.chars()
+            .map(|c| UnicodeWidthChar::width(c).unwrap_or(0))
+            .sum::<usize>()
+    };
+    assert!(plain.iter().all(|l| width(l) <= 44), "overflow:\n{joined}");
+    assert!(
+        plain.iter().any(|l| l.contains("monorepo:")),
+        "word hard-broken in stacked mode:\n{joined}"
+    );
+}
+
+#[test]
+fn test_markdown_table_grid_never_hard_breaks_words() {
+    // The long-token column must get its longest word, not an even per-column
+    // share that shears the token mid-character.
+    let md = "| Dimension | Their approach | Our approach | Worth adopting? |\n\
+        |---|---|---|---|\n\
+        | Shape | Bun workspace monorepo: packages/{shared,core,ui,session-core} | Single Rust crate | No |\n";
+    let lines = render_markdown_lines(md, 100);
+    let plain: Vec<&str> = lines.iter().map(|l| l.plain.as_str()).collect();
+    let joined = plain.join("\n");
+
+    assert!(joined.contains('┌'), "expected a grid:\n{joined}");
+    assert!(
+        plain
+            .iter()
+            .any(|l| l.contains("packages/{shared,core,ui,session-core}")),
+        "long token hard-broken inside grid cell:\n{joined}"
+    );
 }
 
 #[test]
@@ -4692,6 +5182,7 @@ fn test_agent_events_build_display_history() {
         "read_file".to_string(),
         serde_json::json!({"path": "a.rs"}),
         vec![],
+        None,
     );
     assert!(app.pending_response.is_empty());
     assert_eq!(app.history.len(), 2);
@@ -4711,9 +5202,91 @@ fn test_agent_events_build_display_history() {
         "edit_file".to_string(),
         serde_json::json!({"path": "a.rs"}),
         vec![],
+        None,
     );
     assert_eq!(app.history.len(), 4);
     assert_eq!(app.history[3].role, "tool_call");
+}
+
+#[test]
+fn test_folded_run_bash_result_keeps_streaming_tail_height() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+
+    // Short output stays whole under the summary — nothing vanishes.
+    app.apply_agent_tool_call(
+        None,
+        "run_bash".to_string(),
+        serde_json::json!({"command": "make"}),
+        vec![],
+        None,
+    );
+    app.apply_agent_tool_result("line one\nline two\nline three".to_string());
+    let plain = app.build_transcript().plain_lines.join("\n");
+    assert!(plain.contains("line one"), "{plain}");
+    assert!(plain.contains("line three"), "{plain}");
+
+    // Long output keeps only the last `STREAM_TAIL_LINES` — no collapse, no flood.
+    app.apply_agent_tool_call(
+        None,
+        "run_bash".to_string(),
+        serde_json::json!({"command": "curl"}),
+        vec![],
+        None,
+    );
+    let long = (1..=40)
+        .map(|n| format!("row {n}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    app.apply_agent_tool_result(long);
+    let plain = app.build_transcript().plain_lines.join("\n");
+    assert!(plain.contains("row 40"), "last line kept: {plain}");
+    assert!(plain.contains("row 37"), "tail window kept: {plain}");
+    assert!(
+        !plain.contains("row 36"),
+        "earlier lines fold away: {plain}"
+    );
+    assert!(
+        !plain.contains("row 20"),
+        "earlier lines fold away: {plain}"
+    );
+
+    // One huge single line (a JSON blob) is clamped like the live tail rows —
+    // not wrapped into a screenful under a "+3 lines" fold.
+    app.apply_agent_tool_call(
+        None,
+        "run_bash".to_string(),
+        serde_json::json!({"command": "gh api"}),
+        vec![],
+        None,
+    );
+    let blob = format!("head-marker {}", "x".repeat(30_000));
+    app.apply_agent_tool_result(format!("banner line\n{blob}\n[exit 0]"));
+    let plain_lines = app.build_transcript().plain_lines;
+    let row = plain_lines
+        .iter()
+        .find(|l| l.contains("head-marker"))
+        .expect("tail row present");
+    assert!(
+        row.len() < 120,
+        "tail row must be clamped, got {} chars",
+        row.len()
+    );
+
+    // A non-run_bash tool has no tail, so it stays a summary line only.
+    app.apply_agent_tool_call(
+        None,
+        "read_file".to_string(),
+        serde_json::json!({"path": "a.rs"}),
+        vec![],
+        None,
+    );
+    app.apply_agent_tool_result("secret-alpha\nsecret-beta".to_string());
+    let plain = app.build_transcript().plain_lines.join("\n");
+    assert!(
+        !plain.contains("secret-alpha"),
+        "a non-run_bash result stays folded: {plain}"
+    );
 }
 
 #[test]
@@ -4728,6 +5301,7 @@ fn test_native_tool_paths_render_relative_to_cwd() {
         "read_file".to_string(),
         serde_json::json!({"path": "/Users/alice/proj/src/ui/views/panel.rs"}),
         vec![],
+        None,
     );
     app.apply_agent_tool_result("128 lines".to_string());
     let plain = app.build_transcript().plain_lines.join("\n");
@@ -4745,7 +5319,7 @@ fn test_native_tool_paths_render_relative_to_cwd() {
         None,
         "read_file".to_string(),
         serde_json::json!({"path": "/Users/alice/proj/src/module/feature/component/section/detail/view/inner/widget.rs"}),
-    vec![]);
+    vec![], None);
     let plain = app.build_transcript().plain_lines.join("\n");
     assert!(plain.contains("…/"), "expected left-truncation: {plain}");
     assert!(plain.contains("widget.rs"), "basename lost: {plain}");
@@ -4769,6 +5343,7 @@ fn test_tool_result_count_units_by_tool() {
             tool.to_string(),
             serde_json::json!({"path": "x"}),
             vec![],
+            None,
         );
         app.apply_agent_tool_result(output.to_string());
         let plain = app.build_transcript().plain_lines.join("\n");
@@ -4792,6 +5367,7 @@ fn test_batched_tool_results_resolve_unit_and_target_by_position() {
             "grep".to_string(),
             serde_json::json!({"pattern": pat}),
             vec![],
+            None,
         );
     }
     app.apply_agent_tool_result("1: x\n2: y".to_string()); // 2 matches
@@ -4827,6 +5403,7 @@ fn test_adjacent_search_tools_merge_into_one_group() {
             tool.to_string(),
             serde_json::json!({"pattern": pat}),
             vec![],
+            None,
         );
     }
     app.apply_agent_tool_result("a.rs\nb.rs\nc.rs".to_string()); // glob -> 3 files
@@ -4854,6 +5431,7 @@ fn test_run_bash_label_strips_redundant_cd_prefix() {
         "run_bash".to_string(),
         serde_json::json!({"command": "cd /Users/alice/project/work/aivo && git show f391ffd"}),
         vec![],
+        None,
     );
     let plain = app.build_transcript().plain_lines.join("\n");
     assert!(plain.contains("run_bash(git show f391ffd)"), "{plain}");
@@ -4875,19 +5453,21 @@ fn test_detached_results_in_batch_carry_their_target() {
         "read_file".to_string(),
         serde_json::json!({"path": "src/gemini_router.rs"}),
         vec![],
+        None,
     );
     app.apply_agent_tool_call(
         None,
         "grep".to_string(),
         serde_json::json!({"pattern": "400|sanitize"}),
         vec![],
+        None,
     );
     app.apply_agent_tool_result("a\nb\nc".to_string()); // read -> 3 lines
     app.apply_agent_tool_result("1:x\n2:y".to_string()); // grep -> 2 matches
 
     let plain = app.build_transcript().plain_lines.join("\n");
-    assert!(plain.contains("gemini_router.rs · 3 lines"), "{plain}");
-    assert!(plain.contains("400|sanitize · 2 matches"), "{plain}");
+    assert!(plain.contains("▸ +3 lines · gemini_router.rs"), "{plain}");
+    assert!(plain.contains("▸ +2 matches · 400|sanitize"), "{plain}");
 }
 
 #[test]
@@ -4901,6 +5481,7 @@ fn test_failed_tool_result_renders_in_error_hue() {
         "",
         Some("run_bash"),
         None,
+        false,
     );
     assert!(
         lines[0]
@@ -4919,9 +5500,221 @@ fn test_failed_tool_result_renders_in_error_hue() {
 
     // A normal multi-line result stays neutral even when a line says "error:".
     let mut ok = Vec::new();
-    render_tool_result(&mut ok, "error: x\nmore\nlines", "", Some("grep"), None);
+    render_tool_result(
+        &mut ok,
+        "error: x\nmore\nlines",
+        "",
+        Some("grep"),
+        None,
+        false,
+    );
     assert!(ok[0].line.spans.iter().any(|s| s.style.fg == Some(FAINT)));
     assert!(ok[0].line.spans.iter().all(|s| s.style.fg != Some(ERROR)));
+}
+
+#[test]
+fn test_failed_bash_result_shows_exit_code_in_error_hue() {
+    // Nonzero exit arrives as Ok(output + "[exit N]") — the summary must still read red.
+    let mut lines = Vec::new();
+    render_tool_result(
+        &mut lines,
+        "compiling…\nerror[E0308]: mismatched types\n[exit 101]",
+        "",
+        Some("run_bash"),
+        None,
+        false,
+    );
+    assert!(lines[0].plain.contains("exited 101"), "{}", lines[0].plain);
+    assert!(
+        lines[0]
+            .line
+            .spans
+            .iter()
+            .any(|s| s.style.fg == Some(ERROR)),
+        "failed bash summary should carry the error hue"
+    );
+
+    // The `[exit N]` tail is found past the spill pointer, and a clean run
+    // stays neutral.
+    assert_eq!(
+        bash_exit_code("x\ny\n[exit 2]\n[full output: /tmp/f]"),
+        Some(2)
+    );
+    assert_eq!(bash_exit_code("all good\n[done]"), None);
+    let mut ok = Vec::new();
+    render_tool_result(&mut ok, "a\nb\nc", "", Some("run_bash"), None, false);
+    assert!(
+        ok[0].line.spans.iter().all(|s| s.style.fg != Some(ERROR)),
+        "clean bash output must not read as a failure"
+    );
+}
+
+#[test]
+fn test_tool_result_expands_inline_via_keyboard_toggle() {
+    // Folded run_bash keeps only the streamed tail; Ctrl+O (toggle_latest_output)
+    // reveals the full output in place and folds back.
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.apply_agent_tool_call(
+        None,
+        "run_bash".to_string(),
+        serde_json::json!({"command": "cargo test"}),
+        vec![],
+        None,
+    );
+    // Eight lines: folded keeps the tail, so the first lines only appear expanded.
+    app.apply_agent_tool_result(
+        "test 1 ... ok\ntest 2 ... ok\ntest 3 ... ok\ntest a ... ok\n\
+         test b ... FAILED\ntest c ... ok\ntest d ... ok\n[exit 1]"
+            .to_string(),
+    );
+
+    let plain = app.build_transcript().plain_lines.join("\n");
+    assert!(plain.contains("▸ +8 lines"), "{plain}");
+    assert!(plain.contains("exited 1"), "{plain}");
+    // The streamed tail stays put, but earlier lines fold away.
+    assert!(plain.contains("[exit 1]"), "tail line kept: {plain}");
+    assert!(
+        !plain.contains("test 1 ... ok"),
+        "folded result hides its early lines: {plain}"
+    );
+
+    assert!(app.toggle_latest_output());
+    let plain = app.build_transcript().plain_lines.join("\n");
+    assert!(
+        plain.contains("test 1 ... ok"),
+        "expanded result must show all its lines: {plain}"
+    );
+    // The summary stays the (sole) toggle for a short block — no trailing collapse.
+    assert!(plain.contains("▾ 8 lines"), "{plain}");
+    assert!(!plain.contains(OUTPUT_EXPANDED_PREFIX), "{plain}");
+
+    assert!(app.toggle_latest_output());
+    let plain = app.build_transcript().plain_lines.join("\n");
+    assert!(!plain.contains("test 1 ... ok"), "{plain}");
+}
+
+#[test]
+fn expanded_tool_result_refolds_from_its_summary_row() {
+    // Regression: expanding flipped the summary to a dead "▾ N lines" row, so a
+    // long read_file could only fold from the far end of the block.
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.apply_agent_tool_call(
+        None,
+        "read_file".to_string(),
+        serde_json::json!({"path": "big.rs"}),
+        vec![],
+        None,
+    );
+    let content: String = (1..=100).map(|i| format!("{i}: line\n")).collect();
+    app.apply_agent_tool_result(content.trim_end().to_string());
+    let idx = app.history.len() - 1;
+
+    let refresh = |app: &mut CodeTuiApp| -> Vec<String> {
+        let body = app.build_transcript_history_body(80);
+        let wrapped = wrap_transcript(&body.lines, &body.bar_colors, 80);
+        app.transcript_hitbox = Some(TranscriptHitbox {
+            area: Rect::new(0, 0, 80, 40),
+            first_row: 0,
+            rows: wrapped.rows.clone(),
+        });
+        wrapped.rows
+    };
+
+    let rows = refresh(&mut app);
+    let marker = rows.iter().position(|r| is_output_expander(r)).unwrap();
+    assert!(app.toggle_output_at_row(marker));
+    assert!(app.expanded_output.contains(&idx));
+
+    // A long expanded block renders two toggles, both mapping to this entry.
+    let rows = refresh(&mut app);
+    let markers: Vec<usize> = rows
+        .iter()
+        .enumerate()
+        .filter(|(_, r)| is_output_expander(r))
+        .map(|(i, _)| i)
+        .collect();
+    assert_eq!(markers.len(), 2, "rows:\n{}", rows.join("\n"));
+    assert!(
+        rows[markers[0]].contains("▾ 100 lines"),
+        "{}",
+        rows[markers[0]]
+    );
+    assert!(rows[markers[1]].contains(OUTPUT_EXPANDED_PREFIX));
+
+    assert!(app.toggle_output_at_row(markers[0]));
+    assert!(!app.expanded_output.contains(&idx));
+
+    refresh(&mut app);
+    let rows = refresh(&mut app);
+    let marker = rows.iter().position(|r| is_output_expander(r)).unwrap();
+    assert!(app.toggle_output_at_row(marker));
+    let rows = refresh(&mut app);
+    let bottom = rows.iter().rposition(|r| is_output_expander(r)).unwrap();
+    assert!(app.toggle_output_at_row(bottom));
+    assert!(!app.expanded_output.contains(&idx));
+}
+
+#[test]
+fn tool_result_expander_click_maps_across_mixed_blocks() {
+    // A `!cmd` fold and a tool-result fold interleave; clicking the second
+    // marker row must toggle the tool result, not the shell block.
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    let full: String = (1..=250).map(|i| format!("L{i:04}\n")).collect();
+    app.record_local_output("seq 250".to_string(), full, String::new(), 0, false, false);
+    app.apply_agent_tool_call(
+        None,
+        "read_file".to_string(),
+        serde_json::json!({"path": "x.rs"}),
+        vec![],
+        None,
+    );
+    app.apply_agent_tool_result("alpha\nbeta".to_string());
+    let result_idx = app.history.len() - 1;
+
+    let body = app.build_transcript_history_body(80);
+    let wrapped = wrap_transcript(&body.lines, &body.bar_colors, 80);
+    app.transcript_hitbox = Some(TranscriptHitbox {
+        area: Rect::new(0, 0, 80, 40),
+        first_row: 0,
+        rows: wrapped.rows.clone(),
+    });
+    let marker_rows: Vec<usize> = wrapped
+        .rows
+        .iter()
+        .enumerate()
+        .filter(|(_, r)| is_output_expander(r))
+        .map(|(i, _)| i)
+        .collect();
+    assert_eq!(marker_rows.len(), 2, "rows:\n{}", wrapped.rows.join("\n"));
+
+    assert!(app.toggle_output_at_row(marker_rows[1]));
+    assert!(app.expanded_output.contains(&result_idx));
+    let plain = app.build_transcript().plain_lines.join("\n");
+    assert!(plain.contains("beta"), "{plain}");
+}
+
+#[test]
+fn write_file_snapshot_rides_tool_call_entry() {
+    // The tool_start snapshot turns the write_file card into a real diff.
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.apply_agent_tool_call(
+        None,
+        "write_file".to_string(),
+        serde_json::json!({"path": "a.rs", "content": "fn keep() {}\nfn renamed() {}\n"}),
+        vec![Some(1)],
+        Some("fn keep() {}\nfn original() {}\n".to_string()),
+    );
+    let plain = app.build_transcript().plain_lines.join("\n");
+    assert!(plain.contains("original"), "old side missing: {plain}");
+    assert!(plain.contains("renamed"), "new side missing: {plain}");
+    assert!(
+        plain.contains(" - ") && plain.contains(" + "),
+        "expected real del/ins rows, not all-additions: {plain}"
+    );
 }
 
 #[test]
@@ -4933,6 +5726,7 @@ fn test_run_bash_label_drops_redirection_noise() {
         "run_bash".to_string(),
         serde_json::json!({"command": "which aivo 2>/dev/null && aivo --help 2>&1"}),
         vec![],
+        None,
     );
     let plain = app.build_transcript().plain_lines.join("\n");
     assert!(plain.contains("which aivo && aivo --help"), "{plain}");
@@ -4971,12 +5765,14 @@ fn test_subagents_render_individually_not_coalesced() {
         "subagent".to_string(),
         serde_json::json!({"task": "Review the chat API endpoint for gaps"}),
         vec![],
+        None,
     );
     app.apply_agent_tool_call(
         None,
         "subagent".to_string(),
         serde_json::json!({"agent": "reviewer", "task": "Audit the auth flow"}),
         vec![],
+        None,
     );
     app.apply_agent_tool_result("## Findings\nfirst\nsecond".to_string());
 
@@ -4995,19 +5791,16 @@ fn test_subagents_render_individually_not_coalesced() {
         plain.contains("→ Review the chat API endpoint for gaps"),
         "first delegated task missing: {plain}"
     );
+    // A named delegation leads with the profile name so the row attributes it.
     assert!(
-        plain.contains("→ Audit the auth flow"),
+        plain.contains("→ reviewer — Audit the auth flow"),
         "second delegated task missing: {plain}"
     );
-    // The result previews the report's first line + a `+N more` tail — not a bare
-    // "3 lines" count that says nothing about what the subagent found.
+    // The result previews the report's first line after the fold toggle — not a
+    // bare count alone that says nothing about what the subagent found.
     assert!(
-        plain.contains("## Findings (+2 more)"),
+        plain.contains("▸ +3 lines · ## Findings"),
         "subagent result preview missing: {plain}"
-    );
-    assert!(
-        !plain.contains("3 lines"),
-        "bare line count leaked for subagent: {plain}"
     );
 }
 
@@ -5021,6 +5814,7 @@ fn test_delegating_spinner_label_drops_subagent_word() {
         "subagent".to_string(),
         serde_json::json!({"task": "Audit the auth flow"}),
         vec![],
+        None,
     );
     let activity = app.current_action_label().unwrap_or_default();
     assert_eq!(
@@ -5045,6 +5839,7 @@ fn test_cursor_tool_update_enriches_call_in_place() {
         "read_file".to_string(),
         serde_json::json!({"path": "Read File"}),
         vec![],
+        None,
     );
     let rev_before = app.transcript_revision;
     let plain = app.build_transcript().plain_lines.join("\n");
@@ -5099,6 +5894,7 @@ async fn test_cursor_turn_ending_on_tool_does_not_duplicate_prose() {
         "edit_file".to_string(),
         serde_json::json!({"path": "a.rs"}),
         vec![],
+        None,
     );
     app.apply_agent_tool_result("done".to_string());
     assert!(app.pending_response.is_empty());
@@ -5233,7 +6029,7 @@ fn test_build_transcript_renders_tool_steps() {
         "missing tool-call line in:\n{plain}"
     );
     assert!(
-        plain.contains("⎿ 3 lines"),
+        plain.contains("⎿ ▸ +3 lines"),
         "missing tool-result line in:\n{plain}"
     );
     assert!(
@@ -5251,7 +6047,7 @@ fn test_build_transcript_renders_tool_steps() {
     let result_idx = transcript
         .plain_lines
         .iter()
-        .position(|l| l.contains("⎿ 3 lines"))
+        .position(|l| l.contains("⎿ ▸ +3 lines"))
         .unwrap();
     assert_eq!(result_idx, call_idx + 1, "result should hug its call");
     assert_eq!(transcript.bar_colors[call_idx], Some(TOOL));
@@ -7947,8 +8743,8 @@ async fn test_plan_card_idx_shifts_on_removal() {
 
 /// Plan-mode state machine without the dispatch paths (which need a serve):
 /// a finished plan-mode turn drafts its reply as the pending plan while the
-/// MODE PERSISTS; `stop` leaves the mode; bare reports status / enters it;
-/// `go` with nothing pending just guides.
+/// MODE PERSISTS; `stop` leaves the mode; bare while on reports status (with
+/// vs without a draft); `go` with nothing pending just guides.
 #[tokio::test]
 async fn test_plan_capture_discard_and_status() {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
@@ -7961,9 +8757,19 @@ async fn test_plan_capture_discard_and_status() {
         attachments: vec![],
     };
 
+    // Bare `/plan` in the mode with nothing drafted points at the composer.
+    app.plan_mode = true;
+    app.run_plan_command(None).await;
+    assert!(
+        app.notice
+            .as_ref()
+            .unwrap()
+            .1
+            .contains("describe what to plan")
+    );
+
     // A finished plan-mode turn stashes the reply as the draft — and stays in
     // plan mode (persistent until approved or stopped).
-    app.plan_mode = true;
     app.history.push(assistant("1. do X\n2. do Y"));
     app.capture_plan_draft();
     assert!(app.plan_mode, "plan mode persists after a draft");
@@ -7975,9 +8781,15 @@ async fn test_plan_capture_discard_and_status() {
         app.history.iter().rposition(|m| m.role == "assistant")
     );
 
-    // Bare `/plan` while in plan mode reports status.
+    // Bare `/plan` with a drafted plan points at the approval card instead.
     app.run_plan_command(None).await;
-    assert!(app.notice.as_ref().unwrap().1.contains("Plan mode is on"));
+    assert!(
+        app.notice
+            .as_ref()
+            .unwrap()
+            .1
+            .contains("approve the plan card")
+    );
 
     // `/plan stop` leaves plan mode, discarding the draft and the card frame.
     app.run_plan_command(Some("stop".to_string())).await;
@@ -8009,19 +8821,18 @@ async fn test_plan_capture_discard_and_status() {
     assert!(!app.plan_mode);
 }
 
-/// Bare `/plan` enters plan mode without dispatching a turn; the approval-card
-/// verdicts pick the exit mode Claude Code-style: 1 = approve + auto-approve,
-/// 2 = approve + manual approval, 3 = keep planning.
+/// Approval-card verdicts, Claude Code-style: 1 = approve + auto-approve,
+/// 2 = approve + manual approval, 3 = keep planning. (Bare `/plan`'s kick-off
+/// dispatch is covered in `test_plan_bare_dispatches_kickoff`.)
 #[tokio::test]
 async fn test_plan_mode_enter_and_approval_verdicts() {
     use crate::agent::protocol::PlanDecision;
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let mut app = make_test_app(tx, rx);
 
-    // Bare `/plan` while off enters the mode (no engine yet — build-time entry).
-    app.run_plan_command(None).await;
+    // Enter the mode (no engine yet — build-time entry).
+    assert!(app.enter_plan_mode().await);
     assert!(app.plan_mode);
-    assert!(app.notice.as_ref().unwrap().1.contains("Plan mode"));
 
     // Approve & auto-approve: mode off, execution continues unattended.
     let (reply, mut rx1) = tokio::sync::oneshot::channel();
@@ -8281,6 +9092,166 @@ async fn test_create_skill_is_a_builtin_command() {
         screen.contains("/create-skill"),
         "transcript should show the compact command:\n{screen}"
     );
+}
+
+/// Creating a subagent is natural-language only, by design: there is NO
+/// `/create-agent` slash command (it would be redundant with the advertised
+/// skill and clutter the menu). The workflow is instead exposed to the model as
+/// a folderless built-in skill it reaches for on a request like "make a
+/// code-reviewer subagent".
+#[test]
+fn test_create_agent_has_no_slash_command() {
+    // Not registered as a typeable command — absent from the menu/help and unknown
+    // to the parser.
+    assert!(
+        !SLASH_COMMANDS.iter().any(|c| c.name == "create-agent"),
+        "create-agent must NOT be a slash command — it's natural-language only"
+    );
+    assert!(
+        parse_slash_command("create-agent").is_err(),
+        "typing /create-agent is an unknown command, not a builtin"
+    );
+
+    // The workflow still exists as a model-facing builtin skill (this is what the
+    // send path injects into the engine's skill list to advertise it).
+    let sc = crate::agent::skills::create_agent_builtin();
+    assert_eq!(sc.name, "create-agent");
+    assert!(!sc.body.is_empty());
+}
+
+/// `/agents`: registered as a typeable command; bare opens the overlay, `rm`
+/// on an unknown name reports instead of erroring, and anything else prints
+/// usage (there is no `add` — creation is conversational by design).
+#[tokio::test]
+async fn test_agents_command_opens_overlay_and_validates_args() {
+    assert!(SLASH_COMMANDS.iter().any(|c| c.name == "agents"));
+    assert!(matches!(
+        parse_slash_command("agents"),
+        Ok(SlashCommand::Agents(None))
+    ));
+
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.run_agents_command(None).await.unwrap();
+    assert!(matches!(app.overlay, Overlay::Agents(_)));
+
+    app.overlay = Overlay::None;
+    app.run_agents_command(Some("rm no-such-agent".to_string()))
+        .await
+        .unwrap();
+    assert!(matches!(app.overlay, Overlay::None));
+    let notice = app.notice.as_ref().expect("notice set").1.clone();
+    assert!(notice.contains("no-such-agent"), "{notice}");
+
+    app.run_agents_command(Some("add reviewer".to_string()))
+        .await
+        .unwrap();
+    let notice = app.notice.as_ref().expect("usage notice").1.clone();
+    assert!(notice.contains("Usage: /agents"), "{notice}");
+
+    // Built-ins can't be removed — the notice points at shadowing instead.
+    app.run_agents_command(Some("rm explorer".to_string()))
+        .await
+        .unwrap();
+    let notice = app.notice.as_ref().expect("builtin notice").1.clone();
+    assert!(notice.contains("built into aivo"), "{notice}");
+}
+
+/// The `/agents` empty state reads intact on a narrow terminal: the body clips
+/// rather than wraps, so every line must be pre-wrapped short enough (~40 cols)
+/// — the quoted example must survive whole, not as "make me a cod".
+#[test]
+fn test_agents_overlay_empty_state_fits_narrow_terminals() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.overlay = Overlay::Agents(AgentsOverlay::default());
+    let (top, _) = render_full_screen(&mut app, 46, 18);
+    // Keep only the modal interior (between the │ borders), then collapse
+    // whitespace: wrapping may split lines, but every WORD must survive whole.
+    let interior: String = top
+        .lines()
+        .filter_map(|row| {
+            let first = row.find('\u{2502}')?;
+            let last = row.rfind('\u{2502}')?;
+            (last > first).then(|| row[first + '\u{2502}'.len_utf8()..last].to_string())
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    let flat = interior.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(flat.contains("No sub-agents yet"), "{top}");
+    assert!(
+        flat.contains("\u{201c}make me a code-reviewer subagent\u{201d}"),
+        "quoted example clipped:\n{top}"
+    );
+    assert!(flat.contains("or drop a <name>.md profile in:"), "{top}");
+    assert!(flat.contains("~/.config/aivo/agents"), "{top}");
+}
+
+/// The `@` mention menu: word-boundary trigger (mid-message ok, emails no),
+/// prefix-first filtering over discovered profiles, and completion that inserts
+/// `@name ` at the token without submitting the draft.
+#[test]
+fn test_at_mention_menu_completes_subagent_names() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    let profile = |name: &str| crate::agent::subagents::Subagent {
+        name: name.to_string(),
+        description: format!("{name} does things. Extra sentence."),
+        model: None,
+        tools: None,
+        body: String::new(),
+        isolation_worktree: false,
+        repo_local: false,
+        source: std::path::PathBuf::new(),
+    };
+
+    // No discovered profiles → no menu, even on a bare `@`.
+    app.draft = "@".to_string();
+    app.cursor = 1;
+    assert!(app.active_mention_query().is_none());
+
+    app.last_subagents = vec![profile("code-reviewer"), profile("architect")];
+
+    // Mid-message mention at a word boundary; query is the partial after `@`.
+    app.draft = "use @co on the diff".to_string();
+    app.cursor = 7; // after "use @co"
+    let (at, query) = app.active_mention_query().expect("mention active");
+    assert_eq!((at, query.as_str()), (4, "co"));
+    let menu = app.visible_command_menu().expect("menu visible");
+    assert!(matches!(menu.kind, MenuKind::Mention));
+    assert_eq!(menu.entries.len(), 1);
+    assert_eq!(menu.entries[0].label(), "@code-reviewer");
+
+    // Tab completion replaces just the token and keeps composing (no submit).
+    assert!(app.insert_selected_command());
+    assert_eq!(app.draft, "use @code-reviewer  on the diff");
+    assert_eq!(app.cursor, "use @code-reviewer ".len());
+
+    // A bare `@` lists every profile.
+    app.draft = "@".to_string();
+    app.cursor = 1;
+    app.command_menu.reset();
+    let menu = app.visible_command_menu().expect("menu visible");
+    assert_eq!(menu.entries.len(), 2);
+
+    // No word boundary (email-style) → no menu; ditto once the token has a space.
+    app.draft = "mail me a@b".to_string();
+    app.cursor = app.draft.len();
+    assert!(app.active_mention_query().is_none());
+    app.draft = "@code-reviewer go".to_string();
+    app.cursor = app.draft.len();
+    assert!(app.active_mention_query().is_none());
+
+    // `/attach` path mode wins over mention parsing…
+    app.draft = "/attach @x".to_string();
+    app.cursor = app.draft.len();
+    assert!(app.active_mention_query().is_none());
+    // …but a mention inside an ordinary command ARGUMENT works (`/goal`, `/plan`
+    // steering a named agent is a legit composition).
+    app.draft = "/goal ship it with @arch".to_string();
+    app.cursor = app.draft.len();
+    let (_, query) = app.active_mention_query().expect("mention in command arg");
+    assert_eq!(query, "arch");
 }
 
 /// `/goal` status/stop and the start guards — none of which send a turn.
@@ -8597,10 +9568,12 @@ async fn test_goal_continuation_preserves_composer_draft() {
     assert_eq!(app.cursor, 4, "cursor survives the dispatch");
     let last = app.history.last().unwrap();
     assert_eq!(last.role, "user");
+    assert_eq!(last.content, "/goal — continue");
+    let sent = app.pending_submit.as_ref().unwrap();
     assert!(
-        last.content.starts_with("Continue toward the goal"),
+        sent.content.starts_with("Continue toward the goal"),
         "the continuation still went out: {}",
-        last.content
+        sent.content
     );
     assert!(app.goal_mode.is_none(), "plain-chat route disarms the loop");
     assert!(app.notice.as_ref().unwrap().1.contains("plain chat"));
@@ -8631,15 +9604,20 @@ async fn test_goal_guard_stop_enriches_continuation() {
 
     let last = app.history.last().unwrap();
     assert_eq!(last.role, "user");
+    assert_eq!(
+        last.content, "/goal — continue",
+        "compact transcript marker"
+    );
+    let sent = app.pending_submit.as_ref().unwrap();
     assert!(
-        last.content.starts_with("[Previous turn stopped early:"),
+        sent.content.starts_with("[Previous turn stopped early:"),
         "guard-stop should enrich the continuation: {}",
-        last.content
+        sent.content
     );
     assert!(
-        last.content.contains("Continue toward the goal"),
+        sent.content.contains("Continue toward the goal"),
         "the base continuation still rides along: {}",
-        last.content
+        sent.content
     );
     assert!(
         app.goal_guard_stop.is_none(),
@@ -8670,11 +9648,11 @@ async fn test_goal_step_limit_steers_continuation() {
 
     app.maybe_continue_goal().await.unwrap();
 
-    let last = app.history.last().unwrap();
+    let sent = app.pending_submit.as_ref().unwrap();
     assert!(
-        last.content.contains("ran out of steps"),
+        sent.content.contains("ran out of steps"),
         "step-limit gets its own steering: {}",
-        last.content
+        sent.content
     );
 }
 
@@ -8825,10 +9803,27 @@ async fn test_plan_entry_stops_goal_mode() {
         iteration: 3,
         max: 20,
     });
+    // Image in history + unknown vision pins the kick-off to plain chat — an
+    // agent engine build would touch real config/git.
+    app.history.push(ChatMessage {
+        model: None,
+        role: "user".to_string(),
+        content: "look".to_string(),
+        reasoning_content: None,
+        attachments: vec![MessageAttachment {
+            name: "shot.png".to_string(),
+            mime_type: "image/png".to_string(),
+            storage: AttachmentStorage::Inline {
+                data: "iVBOR".to_string(),
+            },
+        }],
+    });
+    app.model_image_input = None;
     app.run_plan_command(None).await;
 
     assert!(app.plan_mode, "plan mode is on");
     assert!(app.goal_mode.is_none(), "plan entry ends the goal loop");
+    assert!(app.sending, "the kick-off turn went out");
     assert!(app.notice.as_ref().unwrap().1.contains("Goal mode stopped"));
 }
 
@@ -9059,6 +10054,54 @@ async fn test_plan_go_preserves_composer_draft() {
     assert!(app.sending, "the go message went out");
     assert_eq!(app.draft, "note to self", "draft survives the dispatch");
     assert_eq!(app.cursor, 4);
+}
+
+/// Bare `/plan` enters the mode AND dispatches the kick-off turn: the model
+/// gets the machine text, the transcript shows the compact `/plan`, and
+/// neither a composer draft nor ↑ recall picks it up.
+#[tokio::test]
+async fn test_plan_bare_dispatches_kickoff() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    // Image in history + unknown vision pins the kick-off to plain chat — an
+    // agent engine build would touch real config/git.
+    app.history.push(ChatMessage {
+        model: None,
+        role: "user".to_string(),
+        content: "look".to_string(),
+        reasoning_content: None,
+        attachments: vec![MessageAttachment {
+            name: "shot.png".to_string(),
+            mime_type: "image/png".to_string(),
+            storage: AttachmentStorage::Inline {
+                data: "iVBOR".to_string(),
+            },
+        }],
+    });
+    app.model_image_input = None;
+    app.draft = "note to self".to_string();
+    app.cursor = 4;
+
+    app.run_plan_command(None).await;
+
+    assert!(app.plan_mode, "bare /plan enters the mode");
+    assert!(app.sending, "the kick-off went out");
+    assert_eq!(
+        app.pending_submit.as_ref().unwrap().content,
+        super::runtime_impl::PLAN_KICKOFF_MESSAGE,
+        "the model receives the interview instructions"
+    );
+    assert_eq!(
+        app.history.last().unwrap().content,
+        "/plan",
+        "the transcript shows the compact command, not the machine text"
+    );
+    assert_eq!(app.draft, "note to self", "draft survives the dispatch");
+    assert_eq!(app.cursor, 4);
+    assert!(
+        app.draft_history.is_empty(),
+        "machine text never enters ↑ recall"
+    );
 }
 
 /// A non-UTF8 file under a text mime (unknown extension) is refused with a clear
@@ -12529,6 +13572,7 @@ async fn test_resume_last_jumps_to_newest_from_fresh_launch() {
             "older",
             "older",
             crate::services::session_store::SessionTokens::default(),
+            0.0,
         )
         .await
         .unwrap();
@@ -12546,6 +13590,7 @@ async fn test_resume_last_jumps_to_newest_from_fresh_launch() {
             "newer",
             "newer",
             crate::services::session_store::SessionTokens::default(),
+            0.0,
         )
         .await
         .unwrap();
@@ -12595,6 +13640,7 @@ async fn test_resume_last_in_session_skips_current_chat() {
             "previous",
             "previous",
             crate::services::session_store::SessionTokens::default(),
+            0.0,
         )
         .await
         .unwrap();
@@ -12712,6 +13758,7 @@ async fn test_open_resume_picker_scopes_to_cwd_but_id_is_global() {
                 sid,
                 sid,
                 crate::services::session_store::SessionTokens::default(),
+                0.0,
             )
             .await
             .unwrap();
@@ -12790,6 +13837,7 @@ async fn test_delete_picker_selection_removes_saved_chat() {
             "hello",
             "hello · hi there",
             crate::services::session_store::SessionTokens::default(),
+            0.0,
         )
         .await
         .unwrap();
@@ -12863,6 +13911,7 @@ async fn test_ctrl_d_requires_confirmation_before_delete() {
             "hello",
             "hello",
             crate::services::session_store::SessionTokens::default(),
+            0.0,
         )
         .await
         .unwrap();
@@ -13062,10 +14111,59 @@ async fn test_resume_footer_estimate_uses_durable_transcript() {
         "post-resume fill is an estimate until measured"
     );
     assert!(
-        app.context_tokens >= 50_000,
-        "estimate must reflect the ~50k-token transcript, got {}",
+        app.context_tokens >= 20_000,
+        "estimate must reflect the ~25k-token transcript, got {}",
         app.context_tokens
     );
+}
+
+/// Resume restores the stored spend and billed model verbatim — an alias with no
+/// snapshot pricing must not zero the figure the session already accumulated.
+#[tokio::test]
+async fn test_resume_restores_session_cost_and_billed_model() {
+    let temp_dir = TempDir::new().unwrap();
+    let store = SessionStore::with_path(temp_dir.path().join("config.json"));
+    let key_id = store
+        .add_key_with_protocol("prod", "https://api.example.com", None, "sk-test")
+        .await
+        .unwrap();
+    let key = store.get_key_by_id(&key_id).await.unwrap().unwrap();
+    store
+        .save_code_session_with_id(
+            &key.id,
+            &key.base_url,
+            "/tmp/proj",
+            "cost-sess",
+            "aivo/starter",
+            Some("deepseek-v4-flash"),
+            &[],
+            "t",
+            "p",
+            SessionTokens {
+                prompt_tokens: 5,
+                completion_tokens: 176,
+                ..Default::default()
+            },
+            0.000_065,
+        )
+        .await
+        .unwrap();
+
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.session_store = store;
+    app.key = key;
+    let session = LoadedSession {
+        key_id,
+        session_id: "cost-sess".to_string(),
+        raw_model: "aivo/starter".to_string(),
+        messages: vec![],
+        engine_messages: None,
+    };
+    app.apply_loaded_session(session).await.unwrap();
+
+    assert_eq!(app.session_cost_usd, 0.000_065);
+    assert_eq!(app.billed_model.as_deref(), Some("deepseek-v4-flash"));
 }
 
 #[tokio::test]
@@ -13158,6 +14256,7 @@ async fn test_resume_snapshots_scope_by_cwd() {
             "older",
             "older",
             crate::services::session_store::SessionTokens::default(),
+            0.0,
         )
         .await
         .unwrap();
@@ -14439,6 +15538,340 @@ async fn test_queued_commands_cleared_on_cancel() {
 
     app.cancel_inflight_request(CancelKind::Discard);
     assert!(app.queued_commands.is_empty());
+}
+
+#[tokio::test]
+async fn test_queue_focus_entered_by_up_on_empty_composer() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.sending = true;
+    app.queued_messages = vec!["first".to_string(), "second".to_string()];
+
+    app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE))
+        .await
+        .unwrap();
+    assert_eq!(app.queue_focus, Some(1), "newest row selected");
+
+    // A non-empty draft blocks entry.
+    app.queue_focus = None;
+    app.draft = "typing".to_string();
+    app.cursor = app.draft.len();
+    app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE))
+        .await
+        .unwrap();
+    assert_eq!(app.queue_focus, None);
+    assert_eq!(app.draft, "typing");
+}
+
+#[tokio::test]
+async fn test_queue_focus_selection_and_down_past_end_exits() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.sending = true;
+    app.queued_messages = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+
+    app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE))
+        .await
+        .unwrap();
+    assert_eq!(app.queue_focus, Some(2));
+    app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE))
+        .await
+        .unwrap();
+    assert_eq!(app.queue_focus, Some(1));
+    app.handle_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL))
+        .await
+        .unwrap();
+    assert_eq!(app.queue_focus, Some(0));
+    app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE))
+        .await
+        .unwrap();
+    assert_eq!(app.queue_focus, Some(0));
+
+    app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE))
+        .await
+        .unwrap();
+    assert_eq!(app.queue_focus, Some(1));
+    app.handle_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL))
+        .await
+        .unwrap();
+    assert_eq!(app.queue_focus, Some(2));
+    app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE))
+        .await
+        .unwrap();
+    assert_eq!(app.queue_focus, None, "↓ past the last row exits");
+}
+
+#[tokio::test]
+async fn test_queue_focus_enter_recalls_message_into_composer() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.sending = true;
+    app.queued_messages = vec!["fix login".to_string(), "run tests".to_string()];
+
+    app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE))
+        .await
+        .unwrap();
+    app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        .await
+        .unwrap();
+    assert_eq!(app.draft, "run tests");
+    assert_eq!(app.cursor, app.draft.len());
+    assert_eq!(app.queued_messages, vec!["fix login".to_string()]);
+    assert_eq!(app.queue_focus, None);
+}
+
+#[tokio::test]
+async fn test_queue_focus_recalls_steering_row() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.sending = true;
+    app.steering_queue
+        .lock()
+        .unwrap()
+        .push("steer it".to_string());
+
+    app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE))
+        .await
+        .unwrap();
+    app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        .await
+        .unwrap();
+    assert_eq!(app.draft, "steer it");
+    assert!(app.steering_queue.lock().unwrap().is_empty());
+}
+
+/// Ops on a steering row the engine drained mid-event fail gracefully.
+#[test]
+fn test_queue_row_ops_validate_after_steering_drain() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.steering_queue.lock().unwrap().push("steer".to_string());
+    let rows = app.queued_rows();
+    assert_eq!(rows.len(), 1);
+
+    // Simulate the engine draining the batch between snapshot and op.
+    app.steering_queue.lock().unwrap().clear();
+    assert!(!app.queue_row_remove(&rows[0]));
+    assert!(app.queue_row_recall(&rows[0]).is_none());
+    assert!(!app.queue_row_move(&rows[0], 1));
+}
+
+#[tokio::test]
+async fn test_queue_focus_delete_clamps_and_exits_when_empty() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.sending = true;
+    app.queued_messages = vec!["a".to_string(), "b".to_string()];
+
+    app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE))
+        .await
+        .unwrap();
+    assert_eq!(app.queue_focus, Some(1));
+    app.handle_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL))
+        .await
+        .unwrap();
+    assert_eq!(app.queued_messages, vec!["a".to_string()]);
+    assert_eq!(app.queue_focus, Some(0), "selection clamps to the survivor");
+    app.handle_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE))
+        .await
+        .unwrap();
+    assert!(app.queued_messages.is_empty());
+    assert_eq!(app.queue_focus, None, "focus exits with the last row");
+}
+
+/// Reorder stays within a segment — delivery semantics differ across them.
+#[tokio::test]
+async fn test_queue_focus_reorder_within_segment_not_across() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.sending = true;
+    app.steering_queue
+        .lock()
+        .unwrap()
+        .extend(["s1".to_string(), "s2".to_string()]);
+    app.queued_commands.push(SlashCommand::Rewind);
+    app.queued_messages = vec!["m1".to_string(), "m2".to_string()];
+    // Unified rows: [s1, s2, /rewind, m1, m2].
+
+    app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE))
+        .await
+        .unwrap();
+    assert_eq!(app.queue_focus, Some(4)); // m2
+    app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::ALT))
+        .await
+        .unwrap();
+    assert_eq!(
+        app.queued_messages,
+        vec!["m2".to_string(), "m1".to_string()]
+    );
+    assert_eq!(app.queue_focus, Some(3), "selection follows the moved row");
+
+    // No crossing into the command segment.
+    app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::ALT))
+        .await
+        .unwrap();
+    assert_eq!(
+        app.queued_messages,
+        vec!["m2".to_string(), "m1".to_string()]
+    );
+    assert_eq!(app.queued_commands, vec![SlashCommand::Rewind]);
+    assert_eq!(app.queue_focus, Some(3));
+
+    // Shift is the alias for terminals that don't deliver Alt+arrows.
+    app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::SHIFT))
+        .await
+        .unwrap();
+    assert_eq!(
+        app.queued_messages,
+        vec!["m1".to_string(), "m2".to_string()]
+    );
+    assert_eq!(app.queue_focus, Some(4));
+    app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::ALT))
+        .await
+        .unwrap();
+    assert_eq!(
+        app.queued_messages,
+        vec!["m1".to_string(), "m2".to_string()]
+    );
+    assert_eq!(app.queue_focus, Some(4));
+
+    app.queue_focus = Some(1); // s2
+    app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::ALT))
+        .await
+        .unwrap();
+    assert_eq!(
+        *app.steering_queue.lock().unwrap(),
+        vec!["s2".to_string(), "s1".to_string()]
+    );
+    assert_eq!(app.queue_focus, Some(0));
+    app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::ALT))
+        .await
+        .unwrap();
+    assert_eq!(
+        *app.steering_queue.lock().unwrap(),
+        vec!["s2".to_string(), "s1".to_string()]
+    );
+}
+
+#[tokio::test]
+async fn test_queue_focus_esc_exits_without_interrupting() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.sending = true;
+    app.queued_messages = vec!["a".to_string()];
+
+    app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE))
+        .await
+        .unwrap();
+    assert_eq!(app.queue_focus, Some(0));
+    app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+        .await
+        .unwrap();
+    assert_eq!(app.queue_focus, None);
+    assert!(app.sending, "Esc in focus mode must not interrupt the turn");
+    assert_eq!(app.queued_messages, vec!["a".to_string()]);
+}
+
+#[tokio::test]
+async fn test_queue_focus_typing_char_exits_and_inserts() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.sending = true;
+    app.queued_messages = vec!["a".to_string()];
+
+    app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE))
+        .await
+        .unwrap();
+    app.handle_key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE))
+        .await
+        .unwrap();
+    assert_eq!(app.queue_focus, None);
+    assert_eq!(app.draft, "h");
+    assert_eq!(app.queued_messages, vec!["a".to_string()]);
+}
+
+#[test]
+fn test_command_recall_text_round_trips() {
+    for cmd in [
+        SlashCommand::Compact { fast: false },
+        SlashCommand::Compact { fast: true },
+        SlashCommand::Rewind,
+        SlashCommand::Review(None),
+        SlashCommand::Review(Some("main".to_string())),
+        SlashCommand::Goal(Some("ship the fix".to_string())),
+        SlashCommand::Plan(Some("go".to_string())),
+    ] {
+        let text = queue_impl::command_recall_text(&cmd);
+        assert!(text.starts_with('/'), "{text}");
+        assert_eq!(parse_slash_command(&text[1..]).unwrap(), cmd, "{text}");
+    }
+    // Skills aren't in the static parser; they resolve by name at submit time.
+    assert_eq!(
+        queue_impl::command_recall_text(&SlashCommand::Skill {
+            name: "repo-study".to_string(),
+            argument: Some("this repo".to_string()),
+        }),
+        "/repo-study this repo"
+    );
+}
+
+#[test]
+fn test_queued_panel_rows_render_with_cap_and_more() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.sending = true;
+    app.steering_queue
+        .lock()
+        .unwrap()
+        .push("steer msg".to_string());
+    app.queued_commands.push(SlashCommand::Rewind);
+    app.queued_messages.push("plain msg".to_string());
+    let (screen, _rows) = render_full_screen(&mut app, 70, 20);
+    assert!(screen.contains("» steer msg"), "steering row:\n{screen}");
+    assert!(screen.contains("/rewind"), "command row:\n{screen}");
+    assert!(screen.contains("· plain msg"), "message row:\n{screen}");
+
+    // An expanded skill body renders as its compact /name form.
+    app.queued_messages.push(
+        "Use the \"my-skill\" skill. Follow these instructions:\n\nLong body.\n\nInput: hello"
+            .to_string(),
+    );
+    let (screen, _rows) = render_full_screen(&mut app, 70, 20);
+    assert!(screen.contains("/my-skill hello"), "{screen}");
+    assert!(!screen.contains("Follow these instructions"), "{screen}");
+
+    // Overflow: 7 messages cap at QUEUE_PANEL_MAX_ROWS + an indicator.
+    app.steering_queue.lock().unwrap().clear();
+    app.queued_commands.clear();
+    app.queued_messages = (1..=7).map(|i| format!("q{i}")).collect();
+    let (screen, _rows) = render_full_screen(&mut app, 70, 20);
+    assert!(
+        screen.contains("· q1") && screen.contains("· q5"),
+        "{screen}"
+    );
+    assert!(!screen.contains("· q6"), "{screen}");
+    assert!(screen.contains("… +2 more"), "{screen}");
+    assert!(
+        !screen.contains("enter edit"),
+        "no hint unfocused:\n{screen}"
+    );
+
+    // Focused on the newest row: the window follows the selection.
+    app.queue_focus = Some(6);
+    let (screen, _rows) = render_full_screen(&mut app, 70, 20);
+    assert!(screen.contains("▸ · q7"), "{screen}");
+    assert!(screen.contains("… +2 earlier"), "{screen}");
+    assert!(screen.contains("enter edit · ctrl+d remove"), "{screen}");
+}
+
+#[test]
+fn test_queue_focus_cleared_by_discard_queued_input() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.queued_messages = vec!["a".to_string()];
+    app.queue_focus = Some(0);
+    app.discard_queued_input();
+    assert_eq!(app.queue_focus, None);
 }
 
 /// `/mcp` Ctrl+D arms a two-press delete (removal edits the user mcp.json), the

@@ -34,7 +34,8 @@ use super::code_tui_format::{
     build_footer_text, display_width, estimate_context_tokens, footer_host_label,
     format_picker_match_count, format_request_elapsed, format_session_group_label,
     format_session_match_count, format_session_time, format_time_ago_short, format_token_count,
-    format_token_count_value, git_branch_for, truncate_for_display_width, truncate_for_width,
+    format_token_count_value, format_usd, git_branch_for, truncate_for_display_width,
+    truncate_for_width,
 };
 use super::*;
 
@@ -66,6 +67,8 @@ mod input_impl;
 mod key_handler_impl;
 #[path = "code_tui/live_impl.rs"]
 mod live_impl;
+#[path = "code_tui/queue_impl.rs"]
+mod queue_impl;
 #[path = "code_tui/runtime_impl.rs"]
 mod runtime_impl;
 #[path = "code_tui/session_impl.rs"]
@@ -170,6 +173,7 @@ impl CodeTuiApp {
             cursor: 0,
             command_menu: CommandMenuState::default(),
             skill_commands: Vec::new(),
+            last_subagents: Vec::new(),
             mcp_configured_count,
             welcome_tip_index,
             welcome_tip_rotated_at: None,
@@ -189,7 +193,11 @@ impl CodeTuiApp {
             request_started_at: None,
             compact_before: None,
             last_tool_action: None,
+            wait_tick: None,
+            last_stream_activity: None,
             subagent_rows: Vec::new(),
+            tool_output_tail: std::collections::VecDeque::new(),
+            tool_output_partial: String::new(),
             status_display: None,
             turn_output_tokens: 0,
             retrying: false,
@@ -294,6 +302,7 @@ impl CodeTuiApp {
             queued_messages: Vec::new(),
             steering_queue: SteeringQueue::default(),
             queued_commands: Vec::new(),
+            queue_focus: None,
             project_mcp_consent: ProjectMcpConsent::default(),
             pending_mcp_consent: None,
             local_command: None,
@@ -306,6 +315,7 @@ impl CodeTuiApp {
             agent_turn_indices: std::collections::HashSet::new(),
             reasoning_durations: std::collections::HashMap::new(),
             turn_durations: std::collections::HashMap::new(),
+            turn_notes: std::collections::HashMap::new(),
             reasoning_started_at: None,
             reasoning_elapsed_ms: None,
             installing_skill: None,

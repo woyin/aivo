@@ -141,18 +141,21 @@ impl CodeTuiApp {
         // coalesced call line drops its target list to avoid repeating it.
         let separate_results = self.history.iter().any(|m| m.role == "tool_result");
 
-        // Hide an in-flight tool's card (trailing `tool_call`, no result yet)
-        // while sending — the status line names it instead, so it's not shown
-        // twice. It renders once its result lands (no longer at the tail).
+        // Hide the trailing `tool_call` run while any of it is in flight — the
+        // status line (and batch rows) names the work instead. Cursor resolves
+        // entries out of order, so the cards wait for the whole run.
         let mut render_len = self.history.len();
         if self.sending {
-            while render_len > 0 {
-                let m = &self.history[render_len - 1];
-                if m.role == "tool_call" && decode_tool_outcome(&m.content).0.is_none() {
-                    render_len -= 1;
-                } else {
-                    break;
-                }
+            let mut start = render_len;
+            while start > 0 && self.history[start - 1].role == "tool_call" {
+                start -= 1;
+            }
+            let live = self.history[start..render_len].iter().any(|m| {
+                let (result, failed) = decode_tool_outcome(&m.content);
+                result.is_none() && !failed
+            });
+            if live {
+                render_len = start;
             }
         }
 
@@ -274,6 +277,7 @@ impl CodeTuiApp {
                     } else {
                         let (result, failed) = decode_tool_outcome(&message.content);
                         let line_starts = decode_line_starts(&message.content);
+                        let old_content = decode_old_content(&message.content);
                         render_tool_call(
                             &mut block,
                             &name,
@@ -282,6 +286,7 @@ impl CodeTuiApp {
                             failed,
                             cwd,
                             &line_starts,
+                            old_content.as_deref(),
                         );
                     }
                 }
@@ -301,6 +306,7 @@ impl CodeTuiApp {
                         cwd,
                         tool.as_deref(),
                         label.as_deref(),
+                        self.expanded_output.contains(&idx),
                     );
                 }
                 "local_command" => {
@@ -316,19 +322,28 @@ impl CodeTuiApp {
                     render_local_command(&mut block, &message.content, view);
                 }
                 "plan" => render_plan(&mut block, &message.content),
+                "error" => render_error_message(&mut block, &message.content),
                 other => render_system_message(&mut block, other, &message.content, text_width),
             }
             let bar = role_bar_color(message.role.as_str());
             push_block(&mut lines, &mut bars, block, Some(bar));
             // The `✶ Done in …` marker for a turn stamped on its last entry (which
             // may sit inside a coalesced block, so scan the block's index range).
-            if let Some(&ms) = (idx..idx + advance).find_map(|i| self.turn_durations.get(&i)) {
+            if let Some((i, &ms)) =
+                (idx..idx + advance).find_map(|i| self.turn_durations.get(&i).map(|ms| (i, ms)))
+            {
                 push_styled_line(&mut lines, String::new(), Style::default());
                 bars.push(None);
+                // Trailing per-turn tokens/cost note, when the finish recorded one.
+                let note = self
+                    .turn_notes
+                    .get(&i)
+                    .map(|n| format!(" · {n}"))
+                    .unwrap_or_default();
                 push_styled_line(
                     &mut lines,
                     format!(
-                        "✶ Done in {}",
+                        "✶ Done in {}{note}",
                         format_request_elapsed(std::time::Duration::from_millis(ms))
                     ),
                     Style::default().fg(MUTED).add_modifier(Modifier::ITALIC),
@@ -485,6 +500,7 @@ impl CodeTuiApp {
                 self.frame_tick,
                 self.reduce_motion,
                 progress.started.elapsed(),
+                None,
                 &progress.status_text(),
                 "",
             );
@@ -502,9 +518,9 @@ impl CodeTuiApp {
             Some((label, _)) => label.clone(),
             None => self.desired_status(),
         };
-        // This turn's generated tokens (measured, else a ~chars/4 estimate); 0 is
-        // omitted. A `!cmd` run has no round, so it keeps the interrupt hint.
+        // Tokens (measured, else ~chars/4; 0 omitted) · queued count · esc hint.
         let tail = if self.sending {
+            let mut parts: Vec<String> = Vec::new();
             let (used, is_estimate) = if self.turn_output_tokens > 0 {
                 (self.turn_output_tokens, false)
             } else {
@@ -513,26 +529,35 @@ impl CodeTuiApp {
                     + self.pending_reasoning.len();
                 (streamed as u64 / 4, true)
             };
-            if used == 0 {
-                String::new()
-            } else {
+            if used > 0 {
                 let approx = if is_estimate { "~" } else { "" };
-                format!("{approx}{} tokens", format_token_count_value(used))
+                parts.push(format!("{approx}{} tokens", format_token_count_value(used)));
             }
+            let queued = self.queued_input_count();
+            if queued > 0 {
+                parts.push(format!("{queued} queued"));
+            }
+            parts.push("esc to interrupt".to_string());
+            parts.join(" · ")
         } else {
             "esc to interrupt".to_string()
         };
         // A named tool step is timed by its own runtime, not the whole turn's —
         // else a fast read reads "20m" when a sibling subagent dominates the turn.
-        let elapsed = if self.current_action_label().is_some() {
+        let (elapsed, deadline) = if self.current_action_label().is_some() {
             self.last_tool_action
                 .as_ref()
-                .map(|(_, since)| since.elapsed())
+                .map(|(_, since, budget)| {
+                    (since.elapsed(), budget.map(std::time::Duration::from_secs))
+                })
                 .unwrap_or_default()
         } else {
-            started_at
-                .map(|started_at| started_at.elapsed())
-                .unwrap_or_default()
+            (
+                started_at
+                    .map(|started_at| started_at.elapsed())
+                    .unwrap_or_default(),
+                None,
+            )
         };
         let mut block = Vec::new();
         render_pending_status(
@@ -540,17 +565,42 @@ impl CodeTuiApp {
             self.frame_tick,
             self.reduce_motion,
             elapsed,
+            deadline,
             &activity,
             &tail,
         );
         block.into_iter().next()
     }
 
-    /// The status label right now, pre-throttle: a tool step names itself, else
-    /// streaming reads "Working" and pre-output compute reads "Thinking".
+    /// Input typed mid-turn still waiting to run: steering + follow-ups + commands.
+    pub(super) fn queued_input_count(&self) -> usize {
+        let steering = self
+            .steering_queue
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len();
+        steering + self.queued_messages.len() + self.queued_commands.len()
+    }
+
+    /// The status label right now, pre-throttle: a decision card names the wait,
+    /// a tool step names itself, else "Working"/"Thinking" (or a stall's "waiting").
     pub(super) fn desired_status(&self) -> String {
         if !self.sending {
             return "running command".to_string();
+        }
+        // Blocked on the user — "running rm -rf build (38s)" would imply the
+        // command is already executing.
+        if self.agent_permission.is_some() {
+            return "waiting for your approval".to_string();
+        }
+        if self.agent_ask.is_some() {
+            return "waiting for your answer".to_string();
+        }
+        if self.agent_review.is_some() {
+            return "waiting for your review".to_string();
+        }
+        if self.agent_plan_approval.is_some() {
+            return "waiting for plan approval".to_string();
         }
         // A parallel sub-agent batch owns the headline while its rows are live.
         if !self.subagent_rows.is_empty() {
@@ -564,10 +614,32 @@ impl CodeTuiApp {
                 self.subagent_rows.len()
             );
         }
+        // A bridged parallel batch: count the trailing run rather than naming
+        // only the newest call.
+        if let Some((start, total, done)) = self.trailing_tool_batch()
+            && total >= 2
+        {
+            let all_delegates = self.history[start..].iter().all(|m| {
+                super::render::canonical_tool_name(&decode_tool_call(&m.content).0) == "subagent"
+            });
+            let noun = if all_delegates {
+                "sub-agents"
+            } else {
+                "parallel steps"
+            };
+            return format!("running {total} {noun} ({done} done)");
+        }
         if let Some(action) = self.current_action_label() {
             return action;
         }
-        // Streaming output or recovering from a retry → "Working", else "Thinking".
+        // Streaming/retrying → "Working", else "Thinking" — unless silent long
+        // enough to look like a stall.
+        const STALL_AFTER: std::time::Duration = std::time::Duration::from_secs(10);
+        if let Some(last) = self.last_stream_activity
+            && last.elapsed() >= STALL_AFTER
+        {
+            return "waiting".to_string();
+        }
         if self.retrying || !self.pending_response.is_empty() || !self.incoming_buffer.is_empty() {
             return "Working".to_string();
         }
@@ -610,19 +682,72 @@ impl CodeTuiApp {
             lines.push(row);
             bars.push(None);
         }
+        for row in self.tool_output_tail_rows() {
+            lines.push(row);
+            bars.push(None);
+        }
     }
 
     /// Live parallel-batch rows, styled like the spinner they sit under. Empty
-    /// when idle so an interrupted batch can't leave ghost rows.
+    /// when idle so an interrupted batch can't leave ghost rows. Without sink
+    /// rows (a bridged engine), a trailing parallel run derives its rows from
+    /// the history entries instead.
     fn subagent_status_rows(&self) -> Vec<StyledLine> {
         if !self.sending {
             return Vec::new();
         }
         let style = Style::default().fg(MUTED).add_modifier(Modifier::ITALIC);
-        self.subagent_rows
+        if !self.subagent_rows.is_empty() {
+            return self
+                .subagent_rows
+                .iter()
+                .map(|row| line_plain(super::render::subagent_row_text(row), style))
+                .collect();
+        }
+        let Some((start, total, _)) = self.trailing_tool_batch() else {
+            return Vec::new();
+        };
+        if total < 2 {
+            return Vec::new();
+        }
+        let cwd = if self.real_cwd.is_empty() {
+            self.cwd.as_str()
+        } else {
+            self.real_cwd.as_str()
+        };
+        self.history[start..]
             .iter()
-            .map(|row| line_plain(super::render::subagent_row_text(row), style))
+            .map(|m| {
+                let (name, args) = decode_tool_call(&m.content);
+                let outcome = decode_tool_outcome(&m.content);
+                line_plain(
+                    super::render::parallel_call_row_text(&name, &args, outcome, cwd),
+                    style,
+                )
+            })
             .collect()
+    }
+
+    /// Live `run_bash` tail rows under the spinner; empty when idle so an
+    /// interrupted turn can't leave ghost output.
+    fn tool_output_tail_rows(&self) -> Vec<StyledLine> {
+        if !self.sending {
+            return Vec::new();
+        }
+        let style = Style::default().fg(MUTED);
+        let mut rows: Vec<StyledLine> = self
+            .tool_output_tail
+            .iter()
+            .map(|line| line_plain(super::render::tool_tail_row_text(line), style))
+            .collect();
+        let partial = self.tool_output_partial.trim_end();
+        if !partial.trim().is_empty() {
+            rows.push(line_plain(
+                super::render::tool_tail_row_text(partial),
+                style,
+            ));
+        }
+        rows
     }
 
     /// A cheap O(1) fingerprint of everything the cached *history body* depends
@@ -851,6 +976,10 @@ impl CodeTuiApp {
                 tail.push(row);
                 tail_bars.push(None);
             }
+            for row in self.tool_output_tail_rows() {
+                tail.push(row);
+                tail_bars.push(None);
+            }
             let wrapped_tail = wrap_transcript(&tail, &tail_bars, text_width);
             text_lines.extend(wrapped_tail.text.lines);
             rows.extend(wrapped_tail.rows);
@@ -932,6 +1061,20 @@ impl CodeTuiApp {
                         s.detail_scroll = c;
                     }
                     // Canonicalize a drill-in that a resize carried into split mode.
+                    if split {
+                        s.viewing = None;
+                    }
+                }
+            }
+            Overlay::Agents(agents) => {
+                let (area, split) = split_overlay_area(body, 84, 80, 64, 80);
+                self.screen_region = Some(overlay_content_rect(area));
+                let out = self.render_agents_overlay(frame, area, &agents, split);
+                self.overlay_detail_area = out.detail_area;
+                if let Overlay::Agents(s) = &mut self.overlay {
+                    if let Some(c) = out.detail_scroll {
+                        s.detail_scroll = c;
+                    }
                     if split {
                         s.viewing = None;
                     }
@@ -1770,9 +1913,27 @@ impl CodeTuiApp {
         let plan_lines = self.plan_panel_lines();
         let plan_panel_height =
             self.plan_panel_height(&plan_lines, area, composer_height, footer_height);
+        // Clamp queue focus each frame — the engine or a turn-end drain may
+        // have emptied the rows it selects since the last event.
+        let queue_rows = self.queued_rows();
+        match (&mut self.queue_focus, queue_rows.len()) {
+            (focus @ Some(_), 0) => *focus = None,
+            (Some(sel), n) => *sel = (*sel).min(n - 1),
+            (None, _) => {}
+        }
+        let queue_lines = self.queued_panel_lines(&queue_rows, area.width);
+        let queue_panel_height = self.queued_panel_height(
+            &queue_lines,
+            area,
+            composer_height,
+            footer_height,
+            plan_panel_height,
+        );
         let max_transcript_height = area
             .height
-            .saturating_sub(composer_height + footer_height + plan_panel_height)
+            .saturating_sub(
+                composer_height + footer_height + plan_panel_height + queue_panel_height,
+            )
             .max(1);
         let is_empty = self.is_transcript_empty();
         // Memoize the heavy history body build + wrap AND the volatile tail
@@ -1814,6 +1975,7 @@ impl CodeTuiApp {
         };
         let stack_height = transcript_height
             .saturating_add(plan_panel_height)
+            .saturating_add(queue_panel_height)
             .saturating_add(composer_height)
             .saturating_add(footer_height)
             .min(area.height.max(1));
@@ -1822,11 +1984,15 @@ impl CodeTuiApp {
             .direction(Direction::Vertical)
             .constraints([Constraint::Length(stack_height), Constraint::Min(0)])
             .split(area);
-        // transcript / [plan panel] / composer / footer — the plan row is present
-        // only when there's a plan, so the indices below shift accordingly.
+        // transcript / [plan panel] / [queue panel] / composer / footer — the
+        // plan and queue rows are present only when non-empty, so the indices
+        // below shift accordingly.
         let mut constraints = vec![Constraint::Length(transcript_height)];
         if plan_panel_height > 0 {
             constraints.push(Constraint::Length(plan_panel_height));
+        }
+        if queue_panel_height > 0 {
+            constraints.push(Constraint::Length(queue_panel_height));
         }
         constraints.push(Constraint::Length(composer_height));
         constraints.push(Constraint::Length(footer_height));
@@ -1838,6 +2004,13 @@ impl CodeTuiApp {
         let transcript_area = chunks[0];
         let mut chunk_idx = 1usize;
         let plan_panel_area = if plan_panel_height > 0 {
+            let a = chunks[chunk_idx];
+            chunk_idx += 1;
+            Some(a)
+        } else {
+            None
+        };
+        let queue_panel_area = if queue_panel_height > 0 {
             let a = chunks[chunk_idx];
             chunk_idx += 1;
             Some(a)
@@ -1939,6 +2112,10 @@ impl CodeTuiApp {
 
         if let Some(plan_panel_area) = plan_panel_area {
             self.render_plan_panel(frame, plan_panel_area, &plan_lines);
+        }
+
+        if let Some(queue_panel_area) = queue_panel_area {
+            self.render_queued_panel(frame, queue_panel_area, &queue_lines);
         }
 
         // A blank spacing row, then the divider rule, then the input. The blank
@@ -2170,6 +2347,89 @@ impl CodeTuiApp {
             .map(|i| (i + 1 - usize::from(body.height)) as u16)
             .unwrap_or(0);
         frame.render_widget(Paragraph::new(wrapped.text).scroll((scroll, 0)), body);
+    }
+
+    /// Queued-input panel lines: a blank spacer, one line per item (windowed
+    /// around the selection with `… +k` indicators), a hint line while focused.
+    fn queued_panel_lines(&self, rows: &[QueuedRow], width: u16) -> Vec<Line<'static>> {
+        if rows.is_empty() {
+            return Vec::new();
+        }
+        let selected = self.queue_focus;
+        let start = selected
+            .map(|sel| sel.saturating_sub(QUEUE_PANEL_MAX_ROWS - 1))
+            .unwrap_or(0)
+            .min(rows.len().saturating_sub(QUEUE_PANEL_MAX_ROWS));
+        let end = (start + QUEUE_PANEL_MAX_ROWS).min(rows.len());
+        let mut lines = vec![Line::default()];
+        if start > 0 {
+            lines.push(Line::from(Span::styled(
+                format!("  … +{start} earlier"),
+                Style::default().fg(FAINT),
+            )));
+        }
+        for (i, row) in rows.iter().enumerate().take(end).skip(start) {
+            let is_selected = selected == Some(i);
+            let marker = if is_selected { "▸ " } else { "  " };
+            let prefix = match row.segment {
+                QueueSegment::Steering => "» ",
+                QueueSegment::Command => "",
+                QueueSegment::Message => "· ",
+            };
+            let room = usize::from(width).saturating_sub(3 + prefix.chars().count());
+            let (marker_style, text_style) = if is_selected {
+                (Style::default().fg(ACCENT), Style::default().fg(TEXT))
+            } else {
+                (Style::default().fg(MUTED), Style::default().fg(MUTED))
+            };
+            lines.push(Line::from(vec![
+                Span::styled(marker.to_string(), marker_style),
+                Span::styled(
+                    format!("{prefix}{}", truncate_for_display_width(&row.display, room)),
+                    text_style,
+                ),
+            ]));
+        }
+        if end < rows.len() {
+            lines.push(Line::from(Span::styled(
+                format!("  … +{} more", rows.len() - end),
+                Style::default().fg(FAINT),
+            )));
+        }
+        if selected.is_some() {
+            lines.push(Line::from(Span::styled(
+                "  enter edit · ctrl+d remove · alt+↑↓ move · esc back",
+                Style::default().fg(FAINT),
+            )));
+        }
+        lines
+    }
+
+    /// Panel height, clamped so the transcript keeps a usable minimum.
+    fn queued_panel_height(
+        &self,
+        lines: &[Line<'static>],
+        area: Rect,
+        composer_height: u16,
+        footer_height: u16,
+        plan_panel_height: u16,
+    ) -> u16 {
+        if lines.is_empty() {
+            return 0;
+        }
+        let reserved = composer_height
+            .saturating_add(footer_height)
+            .saturating_add(plan_panel_height)
+            .saturating_add(PLAN_PANEL_MIN_TRANSCRIPT);
+        (lines.len() as u16).min(area.height.saturating_sub(reserved))
+    }
+
+    fn render_queued_panel(&self, frame: &mut Frame<'_>, area: Rect, lines: &[Line<'static>]) {
+        if area.height == 0 || lines.is_empty() {
+            return;
+        }
+        frame.render_widget(Clear, area);
+        frame.render_widget(Paragraph::new(Text::from(lines.to_vec())), area);
     }
 
     pub(super) fn empty_state_height(&self, width: u16) -> u16 {
@@ -2440,7 +2700,7 @@ impl CodeTuiApp {
     /// Blank spacer, optional capability chip, then the rotating tip. Shared by
     /// the empty state, the transcript intro, and `empty_state_height` (kept in
     /// lockstep, measuring the same lines).
-    fn welcome_status_lines(&self) -> Vec<StyledLine> {
+    pub(super) fn welcome_status_lines(&self) -> Vec<StyledLine> {
         let mut lines = vec![blank_line()];
         if let Some(chip) = self.welcome_capabilities_label() {
             lines.push(line_plain(chip, Style::default().fg(MUTED)));
@@ -2451,6 +2711,11 @@ impl CodeTuiApp {
             Span::styled("✶ Tip  ", Style::default().fg(ACCENT)),
             Span::styled(tip.to_string(), Style::default().fg(MUTED)),
         ]));
+        // Static essentials a new user needs before any rotating tip matters.
+        lines.push(line_plain(
+            "       /help commands · Shift+Tab modes · Esc interrupts".to_string(),
+            Style::default().fg(FAINT),
+        ));
         lines
     }
 
@@ -2570,8 +2835,23 @@ impl CodeTuiApp {
         // when thinking is on, the effort tier. The effort is a static setting, so
         // it stays quiet MUTED — only the meter's warning/error warmth draws the eye.
         let (meter_label, meter_color) = self.footer_status_label();
-        let mut right_spans: Vec<Span<'static>> =
-            vec![Span::styled(meter_label, Style::default().fg(meter_color))];
+        let mut right_spans: Vec<Span<'static>> = Vec::new();
+        // Extras are width-gated so the meter and model win on narrow terminals.
+        if area.width >= 90 && !self.session_id.is_empty() {
+            let short: String = self.session_id.chars().take(8).collect();
+            right_spans.push(Span::styled(
+                format!("#{short}"),
+                Style::default().fg(FAINT),
+            ));
+            right_spans.push(Span::styled(" · ", Style::default().fg(FAINT)));
+        }
+        if area.width >= 70
+            && let Some((mcp_label, mcp_color)) = self.footer_mcp_label()
+        {
+            right_spans.push(Span::styled(mcp_label, Style::default().fg(mcp_color)));
+            right_spans.push(Span::styled(" · ", Style::default().fg(FAINT)));
+        }
+        right_spans.push(Span::styled(meter_label, Style::default().fg(meter_color)));
         if let Some(effort) = self.footer_effort_label() {
             right_spans.push(Span::styled(" · ", Style::default().fg(FAINT)));
             right_spans.push(Span::styled(effort, Style::default().fg(MUTED)));
@@ -2638,38 +2918,75 @@ impl CodeTuiApp {
         frame.render_widget(Paragraph::new(Line::from(spans)), area);
     }
 
-    /// Effort tier for the status line: Cursor's from the model id, else the engine's
-    /// effective level (only while thinking is on, so the two can't disagree).
+    /// Effort tier for the status line: Cursor's from the model id, else the
+    /// engine's level while thinking is on, else "thinking off" (nothing on
+    /// models that can't think at all).
     pub(super) fn footer_effort_label(&self) -> Option<String> {
         if let Some(label) = self.cursor_effort_label.as_deref() {
             Some(label.to_string())
-        } else if self.thinking_enabled && self.model_supports_thinking {
+        } else if !self.model_supports_thinking {
+            None
+        } else if self.thinking_enabled {
             self.effective_reasoning_effort()
         } else {
-            None
+            Some("thinking off".to_string())
         }
+    }
+
+    /// Aggregate MCP health for the status line, or `None` with no configured
+    /// servers. Quiet MUTED when healthy — only trouble gets warmth.
+    pub(super) fn footer_mcp_label(&self) -> Option<(String, Color)> {
+        let n = self.mcp_configured_count;
+        if n == 0 {
+            return None;
+        }
+        if let Some(client) = &self.mcp_client {
+            if client.any_dead() || !client.errors().is_empty() {
+                return Some((format!("mcp:{n}!"), ERROR));
+            }
+            if client.any_needs_auth() {
+                return Some((format!("mcp:{n}!"), WARNING));
+            }
+            return Some((format!("mcp:{n}"), MUTED));
+        }
+        if self.mcp_connecting {
+            return Some((format!("mcp:{n}…"), FAINT));
+        }
+        Some((format!("mcp:{n}"), FAINT))
     }
 
     /// Present-tense label for the in-flight tool step (e.g. `running grep`), or
     /// `None`. Uses the same in-flight test that hides the tool's card (trailing
-    /// `tool_call`, no result yet), so the status and the card never both show.
+    /// `tool_call` run with a pending result), so the status and the card never
+    /// both show.
     pub(super) fn current_action_label(&self) -> Option<String> {
-        if !self.sending {
-            return None;
-        }
-        if !self.pending_response.is_empty() || !self.incoming_buffer.is_empty() {
-            return None;
-        }
-        let in_flight = self
-            .history
-            .last()
-            .is_some_and(|m| m.role == "tool_call" && decode_tool_outcome(&m.content).0.is_none());
-        if !in_flight {
-            return None;
-        }
+        self.trailing_tool_batch()?;
         self.last_tool_action
             .as_ref()
-            .map(|(label, _)| label.clone())
+            .map(|(label, _, _)| label.clone())
+    }
+
+    /// The trailing contiguous `tool_call` run while the model is between
+    /// replies: `(start index, total, resolved)`. `None` when idle, once reply
+    /// text is streaming, or when every call has its outcome — cursor resolves
+    /// entries in place, so a batch stays live until its last member resolves.
+    pub(super) fn trailing_tool_batch(&self) -> Option<(usize, usize, usize)> {
+        if !self.sending || !self.pending_response.is_empty() || !self.incoming_buffer.is_empty() {
+            return None;
+        }
+        let mut start = self.history.len();
+        while start > 0 && self.history[start - 1].role == "tool_call" {
+            start -= 1;
+        }
+        let total = self.history.len() - start;
+        let done = self.history[start..]
+            .iter()
+            .filter(|m| {
+                let (result, failed) = decode_tool_outcome(&m.content);
+                result.is_some() || failed
+            })
+            .count();
+        (done < total).then_some((start, total, done))
     }
 
     /// Tokens to show in the footer fill right now, and whether the figure is a
@@ -2731,7 +3048,7 @@ impl CodeTuiApp {
         // the number understates the true fill — `~` flags it as approximate.
         let approx = if is_estimate && used > 0 { "~" } else { "" };
         let label = format!(
-            "{approx}{} / {}{}",
+            "{approx}{}/{}{}",
             format_token_count_value(used),
             format_token_count_value(self.context_window),
             self.session_cost_label(),
@@ -2739,13 +3056,13 @@ impl CodeTuiApp {
         (label, context_fill_color(pct))
     }
 
-    /// ` · ~$X.XX` session-spend suffix; empty below half a cent or without pricing.
+    /// ` · ~$X.XX` session-spend suffix; empty only without any recorded spend.
     /// Always `~`: snapshot list prices × parsed usage is an estimate, not a bill.
     pub(super) fn session_cost_label(&self) -> String {
-        if self.session_cost_usd < 0.005 {
+        if self.session_cost_usd <= 0.0 {
             return String::new();
         }
-        format!(" · ~${:.2}", self.session_cost_usd)
+        format!(" · ~${}", format_usd(self.session_cost_usd))
     }
 
     pub(super) fn composer_height(&self, width: u16) -> u16 {

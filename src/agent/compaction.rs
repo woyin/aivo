@@ -24,6 +24,10 @@ pub(crate) const TOOL_RESULT_CLEAR_MIN: usize = 1_000;
 /// Stub for a cleared tool result. Below [`TOOL_RESULT_CLEAR_MIN`] so clearing is
 /// idempotent; the message + `tool_call_id` stay so assistant↔tool pairing holds.
 pub(crate) const TOOL_RESULT_CLEARED: &str = "[earlier tool output cleared to save context]";
+/// Stub for a read result superseded by an identical later call. Below
+/// [`TOOL_RESULT_CLEAR_MIN`] so the stale-clear pass leaves it alone; idempotent.
+pub(crate) const TOOL_RESULT_SUPERSEDED: &str =
+    "[superseded — this exact call was repeated later; see the newest result]";
 pub(crate) const SUMMARY_SYSTEM_PROMPT: &str = "You are compressing a coding-agent conversation to free up \
 context. Write a concise but complete summary under these exact headings:\n\
 ## Goal\n## Constraints & Preferences\n## Progress (Done / In Progress / Blocked)\n\
@@ -221,8 +225,8 @@ impl AgentEngine {
         (before, self.estimated_context_tokens())
     }
 
-    /// Tokens (chars/4) reclaimable by [`clear_stale_tool_results`]: for each OLD `tool`
-    /// message over the threshold, the bytes dropped (a retained pointer line is excluded).
+    /// Tokens reclaimable by [`clear_stale_tool_results`], on the [`estimate_tokens`]
+    /// ruler — the cheap compaction path trusts this figure without re-checking the budget.
     pub(crate) fn stale_tool_result_savings(&self, cut: usize) -> usize {
         self.messages
             .get(1..cut)
@@ -232,11 +236,98 @@ impl AgentEngine {
             .filter_map(|m| m.get("content").and_then(|c| c.as_str()))
             .filter(|s| s.len() > TOOL_RESULT_CLEAR_MIN)
             .map(|s| {
-                let retained =
-                    TOOL_RESULT_CLEARED.len() + artifact_pointer_line(s).map_or(0, |p| p.len() + 1);
-                s.len().saturating_sub(retained) / 4
+                let retained = estimate_str_tokens(TOOL_RESULT_CLEARED)
+                    + artifact_pointer_line(s).map_or(0, |p| estimate_str_tokens(p) + 1);
+                estimate_str_tokens(s).saturating_sub(retained)
             })
             .sum()
+    }
+
+    /// Stub older results of calls the latest batch repeated verbatim. `batch` =
+    /// `(dedupe key, tool_call_id)` per SUCCESSFUL eligible call; that result is
+    /// authoritative and only results BEFORE it are stubbed (a same-batch failed
+    /// duplicate keeps its error text). Pairing stays intact.
+    pub(crate) fn supersede_duplicate_reads(
+        &mut self,
+        cwd: &std::path::Path,
+        batch: &[(String, String)],
+    ) {
+        use std::collections::{HashMap, HashSet};
+        if batch.is_empty() {
+            return;
+        }
+        let keys: HashSet<&str> = batch.iter().map(|(k, _)| k.as_str()).collect();
+        // Newest successful call wins when one batch repeats a key.
+        let mut authoritative: HashMap<&str, &str> = HashMap::new();
+        for (k, id) in batch {
+            authoritative.insert(k.as_str(), id.as_str());
+        }
+        // tool_call_id → key for calls matching a batch key; the name gate runs
+        // before the arguments parse so bulky ineligible calls cost nothing.
+        let mut call_keys: HashMap<String, String> = HashMap::new();
+        for m in &self.messages {
+            let Some(tcs) = m.get("tool_calls").and_then(Value::as_array) else {
+                continue;
+            };
+            for tc in tcs {
+                let (Some(id), Some(f)) =
+                    (tc.get("id").and_then(Value::as_str), tc.get("function"))
+                else {
+                    continue;
+                };
+                let Some(name) = f.get("name").and_then(Value::as_str) else {
+                    continue;
+                };
+                let name = crate::agent::subagents::normalize_tool_name(name).unwrap_or(name);
+                if !crate::agent::tools::is_dedupe_eligible(name) {
+                    continue;
+                }
+                let Some(args) = f.get("arguments").and_then(Value::as_str) else {
+                    continue;
+                };
+                let Ok(args) = serde_json::from_str::<Value>(args) else {
+                    continue;
+                };
+                if let Some(k) = crate::agent::tools::read_dedupe_key(name, &args, cwd)
+                    && keys.contains(k.as_str())
+                {
+                    call_keys.insert(id.to_string(), k);
+                }
+            }
+        }
+        let mut stub: Vec<usize> = Vec::new();
+        for (key, auth_id) in &authoritative {
+            // rposition: providers may reuse call ids across turns — bind to the newest.
+            let Some(auth_idx) = self.messages.iter().rposition(|m| {
+                role(m) == "tool" && m.get("tool_call_id").and_then(Value::as_str) == Some(*auth_id)
+            }) else {
+                continue;
+            };
+            stub.extend(
+                self.messages[..auth_idx]
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, m)| {
+                        role(m) == "tool"
+                            && m.get("tool_call_id")
+                                .and_then(Value::as_str)
+                                .is_some_and(|id| {
+                                    call_keys.get(id).map(String::as_str) == Some(*key)
+                                })
+                    })
+                    .map(|(i, _)| i),
+            );
+        }
+        for i in stub {
+            // Skip results already smaller than the stub.
+            let len = self.messages[i]
+                .get("content")
+                .and_then(Value::as_str)
+                .map_or(0, str::len);
+            if len > TOOL_RESULT_SUPERSEDED.len() {
+                self.messages[i]["content"] = json!(TOOL_RESULT_SUPERSEDED);
+            }
+        }
     }
 
     /// Replace bulky OLD `tool` output with [`TOOL_RESULT_CLEARED`], reclaiming
@@ -603,6 +694,156 @@ mod tests {
         assert!(
             savings <= reclaimed + 2,
             "savings {savings} overestimates actual reclaim {reclaimed}"
+        );
+    }
+
+    #[test]
+    fn supersede_duplicate_reads_stubs_all_but_the_newest() {
+        let mut e = engine();
+        let cwd = std::path::Path::new("/w");
+        e.messages = vec![
+            json!({"role":"system","content":"sys"}),
+            json!({"role":"user","content":"q"}),
+            json!({"role":"assistant","content":"","tool_calls":[
+                {"id":"a","type":"function","function":{"name":"read_file","arguments":"{\"path\":\"src/x.rs\"}"}}]}),
+            json!({"role":"tool","tool_call_id":"a","content": "old read ".repeat(50)}),
+            json!({"role":"assistant","content":"","tool_calls":[
+                {"id":"b","type":"function","function":{"name":"read_file","arguments":"{\"path\":\"./src/x.rs\",\"offset\":1}"}}]}),
+            json!({"role":"tool","tool_call_id":"b","content":"new read"}),
+        ];
+        let key =
+            crate::agent::tools::read_dedupe_key("read_file", &json!({"path":"src/x.rs"}), cwd)
+                .unwrap();
+        e.supersede_duplicate_reads(cwd, &[(key, "b".to_string())]);
+        assert_eq!(
+            e.messages[3]["content"],
+            json!(TOOL_RESULT_SUPERSEDED),
+            "older duplicate stubbed (path + default-offset normalization)"
+        );
+        assert_eq!(
+            e.messages[5]["content"],
+            json!("new read"),
+            "the newest result stays authoritative"
+        );
+    }
+
+    /// Reused call ids across turns must bind to the newest message, not the first.
+    #[test]
+    fn supersede_duplicate_reads_handles_reused_call_ids_across_turns() {
+        let mut e = engine();
+        let cwd = std::path::Path::new("/w");
+        e.messages = vec![
+            json!({"role":"system","content":"sys"}),
+            json!({"role":"user","content":"q"}),
+            json!({"role":"assistant","content":"","tool_calls":[
+                {"id":"c0","type":"function","function":{"name":"read_file","arguments":"{\"path\":\"src/x.rs\"}"}}]}),
+            json!({"role":"tool","tool_call_id":"c0","content": "first read ".repeat(50)}),
+            json!({"role":"assistant","content":"","tool_calls":[
+                {"id":"c0","type":"function","function":{"name":"read_file","arguments":"{\"path\":\"src/x.rs\"}"}}]}),
+            json!({"role":"tool","tool_call_id":"c0","content": "second read ".repeat(50)}),
+        ];
+        let key =
+            crate::agent::tools::read_dedupe_key("read_file", &json!({"path":"src/x.rs"}), cwd)
+                .unwrap();
+        e.supersede_duplicate_reads(cwd, &[(key, "c0".to_string())]);
+        assert_eq!(
+            e.messages[3]["content"],
+            json!(TOOL_RESULT_SUPERSEDED),
+            "the older same-id duplicate is stubbed"
+        );
+        assert!(
+            e.messages[5]["content"]
+                .as_str()
+                .unwrap()
+                .starts_with("second read"),
+            "the newest result survives"
+        );
+    }
+
+    /// A same-batch failed duplicate after the success keeps its error; the success survives.
+    #[test]
+    fn supersede_duplicate_reads_keeps_success_over_later_same_batch_failure() {
+        let mut e = engine();
+        let cwd = std::path::Path::new("/w");
+        e.messages = vec![
+            json!({"role":"system","content":"sys"}),
+            json!({"role":"user","content":"q"}),
+            json!({"role":"assistant","content":"","tool_calls":[
+                {"id":"old","type":"function","function":{"name":"read_file","arguments":"{\"path\":\"src/x.rs\"}"}}]}),
+            json!({"role":"tool","tool_call_id":"old","content": "stale read ".repeat(50)}),
+            json!({"role":"assistant","content":"","tool_calls":[
+                {"id":"ok","type":"function","function":{"name":"read_file","arguments":"{\"path\":\"src/x.rs\"}"}},
+                {"id":"boom","type":"function","function":{"name":"read_file","arguments":"{\"path\":\"src/x.rs\"}"}}]}),
+            json!({"role":"tool","tool_call_id":"ok","content": "fresh read ".repeat(50)}),
+            json!({"role":"tool","tool_call_id":"boom","content":"read src/x.rs: transient error while the file was being replaced, plus enough text to exceed the stub length"}),
+        ];
+        let key =
+            crate::agent::tools::read_dedupe_key("read_file", &json!({"path":"src/x.rs"}), cwd)
+                .unwrap();
+        // Only the successful call reaches `batch` (keys are pushed on Ok only).
+        e.supersede_duplicate_reads(cwd, &[(key, "ok".to_string())]);
+        assert_eq!(
+            e.messages[3]["content"],
+            json!(TOOL_RESULT_SUPERSEDED),
+            "the older duplicate is stubbed"
+        );
+        assert!(
+            e.messages[5]["content"]
+                .as_str()
+                .unwrap()
+                .starts_with("fresh read"),
+            "the successful (authoritative) result must survive"
+        );
+        assert!(
+            e.messages[6]["content"]
+                .as_str()
+                .unwrap()
+                .contains("transient error"),
+            "a later same-batch failure keeps its error text"
+        );
+    }
+
+    #[test]
+    fn supersede_duplicate_reads_skips_other_pages_and_tiny_results() {
+        let mut e = engine();
+        let cwd = std::path::Path::new("/w");
+        e.messages = vec![
+            json!({"role":"system","content":"sys"}),
+            json!({"role":"user","content":"q"}),
+            // A different page of the same file: not a duplicate of the full read.
+            json!({"role":"assistant","content":"","tool_calls":[
+                {"id":"a","type":"function","function":{"name":"read_file","arguments":"{\"path\":\"src/x.rs\",\"offset\":100}"}}]}),
+            json!({"role":"tool","tool_call_id":"a","content": "page two ".repeat(50)}),
+            // An identical earlier grep, but its result is already tiny.
+            json!({"role":"assistant","content":"","tool_calls":[
+                {"id":"g1","type":"function","function":{"name":"grep","arguments":"{\"pattern\":\"foo\"}"}}]}),
+            json!({"role":"tool","tool_call_id":"g1","content":"(no matches)"}),
+            json!({"role":"assistant","content":"","tool_calls":[
+                {"id":"g2","type":"function","function":{"name":"grep","arguments":"{\"pattern\":\"foo\"}"}},
+                {"id":"b","type":"function","function":{"name":"read_file","arguments":"{\"path\":\"src/x.rs\"}"}}]}),
+            json!({"role":"tool","tool_call_id":"g2","content":"(no matches)"}),
+            json!({"role":"tool","tool_call_id":"b","content": "full read ".repeat(50)}),
+        ];
+        let read_key =
+            crate::agent::tools::read_dedupe_key("read_file", &json!({"path":"src/x.rs"}), cwd)
+                .unwrap();
+        let grep_key =
+            crate::agent::tools::read_dedupe_key("grep", &json!({"pattern":"foo"}), cwd).unwrap();
+        e.supersede_duplicate_reads(
+            cwd,
+            &[(read_key, "b".to_string()), (grep_key, "g2".to_string())],
+        );
+        assert!(
+            e.messages[3]["content"]
+                .as_str()
+                .unwrap()
+                .starts_with("page two"),
+            "a different page must not be stubbed"
+        );
+        assert_eq!(
+            e.messages[5]["content"],
+            json!("(no matches)"),
+            "a result already smaller than the stub is left alone"
         );
     }
 
