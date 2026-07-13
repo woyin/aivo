@@ -285,6 +285,12 @@ impl ApiKey {
         self.base_url == crate::services::grok_oauth::GROK_OAUTH_SENTINEL
     }
 
+    /// OAuth credentials aivo can route to any coding agent via the ServeRouter
+    /// (SuperGrok, Codex), as opposed to single-CLI logins.
+    pub fn is_provider_oauth(&self) -> bool {
+        self.is_grok_oauth() || self.is_codex_oauth()
+    }
+
     /// True when this entry is any of the multi-account OAuth variants
     /// (Codex/Claude/Gemini/Grok) — used by callers that share the same
     /// "OAuth entries lack a REST endpoint / hold a credential blob" semantics.
@@ -314,12 +320,11 @@ impl ApiKey {
     pub fn oauth_run_requirement(&self) -> Option<&'static str> {
         if self.is_claude_oauth() {
             Some("needs `aivo claude`")
-        } else if self.is_codex_oauth() {
-            Some("needs `aivo codex`")
         } else if self.is_gemini_oauth() {
             Some("Gemini sign-in removed — re-add with an API key")
         } else {
-            // Grok OAuth works with any coding agent — no run restriction.
+            // Grok/Codex are provider credentials usable by any agent; `aivo
+            // codex` still prefers native launch via `is_codex_family`.
             None
         }
     }

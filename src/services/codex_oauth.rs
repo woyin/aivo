@@ -21,6 +21,8 @@ use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::sync::Arc;
+use tokio::sync::RwLock;
 
 /// OpenAI Codex OAuth application (shared with the native `codex` CLI; see
 /// `codex-rs/login/src/auth/manager.rs::CLIENT_ID`).
@@ -28,6 +30,22 @@ pub const CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 
 pub const AUTHORIZE_URL: &str = "https://auth.openai.com/oauth/authorize";
 pub const TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
+
+/// ChatGPT Codex Responses-API backend — the OAuth token's inference endpoint,
+/// the same host the native `codex` CLI hits.
+pub const CHATGPT_BACKEND_BASE_URL: &str = "https://chatgpt.com/backend-api/codex";
+pub const CHATGPT_RESPONSES_URL: &str = "https://chatgpt.com/backend-api/codex/responses";
+
+pub const ACCOUNT_ID_HEADER: &str = "chatgpt-account-id";
+pub const OPENAI_BETA_HEADER: &str = "OpenAI-Beta";
+pub const OPENAI_BETA_VALUE: &str = "responses=experimental";
+pub const ORIGINATOR_HEADER: &str = "originator";
+pub const ORIGINATOR_VALUE: &str = "codex_cli_rs";
+pub const SESSION_ID_HEADER: &str = "session_id";
+pub const CODEX_USER_AGENT: &str = "codex_cli_rs/0.144.1";
+
+/// Fallback when a client asks for a non-Codex model; plain `gpt-5` is rejected.
+pub const DEFAULT_CODEX_MODEL: &str = "gpt-5.5";
 
 /// The port must be exactly 1455 because the OAuth application has this
 /// redirect URI registered. If it is unavailable the flow falls back to
@@ -411,6 +429,138 @@ fn manual_paste_prompt() -> Result<String> {
     code.ok_or_else(|| anyhow!("callback URL missing `code`"))
 }
 
+/// Random UUIDv4-shaped id for the `session_id` request header.
+pub fn generate_session_id() -> String {
+    let mut buf = [0u8; 16];
+    rand::thread_rng().fill_bytes(&mut buf);
+    buf[6] = (buf[6] & 0x0f) | 0x40; // version 4
+    buf[8] = (buf[8] & 0x3f) | 0x80; // RFC 4122 variant
+    format!(
+        "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+        buf[0],
+        buf[1],
+        buf[2],
+        buf[3],
+        buf[4],
+        buf[5],
+        buf[6],
+        buf[7],
+        buf[8],
+        buf[9],
+        buf[10],
+        buf[11],
+        buf[12],
+        buf[13],
+        buf[14],
+        buf[15]
+    )
+}
+
+/// Model ids for a ChatGPT-account Codex credential. The backend has no
+/// `/v1/models` catalog, so read codex's own discovered cache, else fall back.
+pub fn known_model_ids() -> Vec<String> {
+    cached_codex_model_ids().unwrap_or_else(|| {
+        ["gpt-5.5", "gpt-5.4", "gpt-5.4-mini"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect()
+    })
+}
+
+/// `$CODEX_HOME` or `~/.codex`.
+pub fn codex_home_dir() -> Option<std::path::PathBuf> {
+    if let Ok(v) = std::env::var("CODEX_HOME") {
+        let p = std::path::PathBuf::from(v);
+        if p.is_dir() {
+            return Some(p);
+        }
+    }
+    crate::services::system_env::home_dir().map(|h| h.join(".codex"))
+}
+
+/// Adopts an existing native `codex` sign-in (`$CODEX_HOME/auth.json`) so users
+/// already logged into codex skip the browser OAuth. `Ok(None)` when there is no
+/// auth.json or it holds only an `OPENAI_API_KEY`.
+pub async fn import_from_codex_home() -> Result<Option<CodexOAuthCredential>> {
+    use crate::services::codex_home_shadow::CodexHomeShadow;
+
+    let Some(home) = codex_home_dir() else {
+        return Ok(None);
+    };
+    let Some(auth) = CodexHomeShadow::read_auth_path(home.join("auth.json")).await? else {
+        return Ok(None);
+    };
+    if auth.tokens.access_token.is_empty() || auth.tokens.refresh_token.is_empty() {
+        return Ok(None);
+    }
+    let email = decode_id_token_claims(&auth.tokens.id_token).0;
+    // Fall back to now so the first `authorize()` refreshes and validates it.
+    let expires_at = jwt_exp_claim(&auth.tokens.access_token).unwrap_or_else(Utc::now);
+    Ok(Some(auth.into_credential(email, expires_at)))
+}
+
+fn jwt_exp_claim(jwt: &str) -> Option<DateTime<Utc>> {
+    let payload = jwt.split('.').nth(1)?;
+    let bytes = URL_SAFE_NO_PAD
+        .decode(payload)
+        .or_else(|_| STANDARD_NO_PAD.decode(payload))
+        .ok()?;
+    let value: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    DateTime::from_timestamp(value.get("exp")?.as_i64()?, 0)
+}
+
+fn cached_codex_model_ids() -> Option<Vec<String>> {
+    let home = codex_home_dir()?;
+    let bytes = std::fs::read(home.join("models_cache.json")).ok()?;
+    let value: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    let models = value.get("models")?.as_array()?;
+    let ids: Vec<String> = models
+        .iter()
+        .filter(|m| {
+            m.get("visibility").and_then(|v| v.as_str()) != Some("hide")
+                && m.get("supported_in_api").and_then(|v| v.as_bool()) != Some(false)
+        })
+        .filter_map(|m| m.get("slug").and_then(|s| s.as_str()).map(str::to_string))
+        .collect();
+    (!ids.is_empty()).then_some(ids)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CodexAuth {
+    pub access_token: String,
+    pub account_id: Option<String>,
+}
+
+/// Refreshes the access token on expiry. No API-key fallback, unlike
+/// `GrokTokenManager`.
+#[derive(Clone)]
+pub struct CodexTokenManager {
+    creds: Arc<RwLock<CodexOAuthCredential>>,
+}
+
+impl CodexTokenManager {
+    pub fn new(creds: CodexOAuthCredential) -> Self {
+        Self {
+            creds: Arc::new(RwLock::new(creds)),
+        }
+    }
+
+    pub async fn authorize(&self) -> Result<CodexAuth> {
+        let mut creds = self.creds.write().await;
+        if creds.is_expired(REFRESH_SKEW_SECS) {
+            refresh(&mut creds).await?;
+        }
+        Ok(CodexAuth {
+            access_token: creds.access_token.clone(),
+            account_id: creds.account_id.clone(),
+        })
+    }
+
+    pub async fn current_credential(&self) -> CodexOAuthCredential {
+        self.creds.read().await.clone()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -521,5 +671,52 @@ mod tests {
         assert!(!red.contains("rt-real"));
         assert!(red.contains("<redacted>"));
         assert!(red.contains("3600"));
+    }
+
+    #[test]
+    fn session_id_is_uuid_v4_shaped() {
+        let id = generate_session_id();
+        // 8-4-4-4-12 hex with version nibble 4 and RFC 4122 variant.
+        let parts: Vec<&str> = id.split('-').collect();
+        assert_eq!(
+            parts.iter().map(|p| p.len()).collect::<Vec<_>>(),
+            vec![8, 4, 4, 4, 12]
+        );
+        assert!(id.chars().all(|c| c.is_ascii_hexdigit() || c == '-'));
+        assert_eq!(parts[2].as_bytes()[0], b'4');
+        assert!(matches!(parts[3].as_bytes()[0], b'8' | b'9' | b'a' | b'b'));
+        assert_ne!(generate_session_id(), generate_session_id());
+    }
+
+    #[test]
+    fn known_model_ids_never_empty() {
+        assert!(!known_model_ids().is_empty());
+    }
+
+    #[test]
+    fn jwt_exp_claim_reads_exp_and_tolerates_garbage() {
+        let payload = URL_SAFE_NO_PAD.encode(br#"{"exp":1783949405,"sub":"u"}"#);
+        let jwt = format!("h.{payload}.sig");
+        assert_eq!(jwt_exp_claim(&jwt), DateTime::from_timestamp(1783949405, 0));
+        assert!(jwt_exp_claim("not-a-jwt").is_none());
+        let no_exp = format!("h.{}.sig", URL_SAFE_NO_PAD.encode(br#"{"sub":"u"}"#));
+        assert!(jwt_exp_claim(&no_exp).is_none());
+    }
+
+    #[tokio::test]
+    async fn token_manager_authorize_returns_fresh_auth() {
+        let creds = CodexOAuthCredential {
+            id_token: "id".into(),
+            access_token: "at".into(),
+            refresh_token: "rt".into(),
+            account_id: Some("acct_1".into()),
+            email: None,
+            expires_at: Utc::now() + ChronoDuration::seconds(3600),
+            last_refresh: Utc::now(),
+        };
+        let mgr = CodexTokenManager::new(creds);
+        let auth = mgr.authorize().await.unwrap();
+        assert_eq!(auth.access_token, "at");
+        assert_eq!(auth.account_id.as_deref(), Some("acct_1"));
     }
 }

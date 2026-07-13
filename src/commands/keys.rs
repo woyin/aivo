@@ -2326,21 +2326,50 @@ impl KeysCommand {
         Ok(ExitCode::Success)
     }
 
-    /// Interactive Codex ChatGPT OAuth sign-in. Unlike Copilot we allow
-    /// MULTIPLE accounts — each login produces a fresh key entry. The name
-    /// defaults to the account's email claim on the id_token.
+    /// Prompt to adopt an existing codex sign-in (default yes; non-TTY auto-yes).
+    fn offer_codex_import(&self, email: Option<&str>) -> Result<bool> {
+        use std::io::IsTerminal;
+        let who = match email {
+            Some(e) => format!("Found an existing codex sign-in for {e}."),
+            None => "Found an existing codex sign-in.".to_string(),
+        };
+        eprintln!("  {}", style::dim(&who));
+        if !std::io::stdin().is_terminal() {
+            return Ok(true);
+        }
+        let input = term_read_line("  Import it (skip browser login)? [Y/n]: ")?;
+        Ok(!matches!(
+            input.trim().to_ascii_lowercase().as_str(),
+            "n" | "no"
+        ))
+    }
+
+    /// Interactive Codex ChatGPT OAuth sign-in (multi-account). Prefers adopting
+    /// an existing native `codex` session when present.
     async fn add_codex_oauth_interactive(&self, name: &str) -> Result<ExitCode> {
-        use crate::services::codex_oauth::{CODEX_OAUTH_SENTINEL, interactive_login};
+        use crate::services::codex_oauth::{
+            CODEX_OAUTH_SENTINEL, import_from_codex_home, interactive_login,
+        };
 
         keys_ui::provider_info(CODEX_OAUTH_INFO.0, CODEX_OAUTH_INFO.1);
-        keys_ui::step_header(
-            3,
-            3,
-            "Sign in",
-            "follow the URL below — the browser opens automatically if possible",
-        );
 
-        let creds = interactive_login().await?;
+        // Adopt an existing codex sign-in when present, else browser login.
+        let existing = import_from_codex_home().await.unwrap_or(None);
+        let creds = match existing {
+            Some(creds) if self.offer_codex_import(creds.email.as_deref())? => {
+                keys_ui::step_header(3, 3, "Import", "adopting your existing codex sign-in");
+                creds
+            }
+            _ => {
+                keys_ui::step_header(
+                    3,
+                    3,
+                    "Sign in",
+                    "follow the URL below — the browser opens automatically if possible",
+                );
+                interactive_login().await?
+            }
+        };
         let derived_name = creds.email.clone().unwrap_or_else(|| "codex".to_string());
         let final_name = if name.is_empty() { &derived_name } else { name };
         let creds_json = creds.to_json()?;

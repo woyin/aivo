@@ -87,9 +87,8 @@ impl ServeCommand {
             }
         };
 
-        // SuperGrok OAuth is proxyable (OpenAI-compatible); only the CLI-bound
-        // OAuth credentials (Codex/Claude) can't be served.
-        if key.is_any_oauth() && !key.is_grok_oauth() {
+        // Provider OAuth (grok/codex) is proxyable; CLI-bound OAuth isn't.
+        if key.is_any_oauth() && !key.is_provider_oauth() {
             eprintln!(
                 "{} Key '{}' is an OAuth credential — `aivo serve` can't proxy it.",
                 style::red("Error:"),

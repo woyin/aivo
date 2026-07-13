@@ -34,8 +34,8 @@ use crate::services::route_cache::{RouteCache, RouteSlot};
 use crate::services::serve_responses::convert_chat_sse_to_responses_sse;
 use crate::services::serve_upstream::{
     RouterResponse, StreamingBody, UpstreamRequestContext, copilot_requires_responses_api,
-    send_anthropic_chat, send_anthropic_native, send_copilot_responses, send_gemini_chat,
-    send_gemini_native, send_openai_chat, send_openai_embeddings,
+    send_anthropic_chat, send_anthropic_native, send_codex_responses, send_copilot_responses,
+    send_gemini_chat, send_gemini_native, send_openai_chat, send_openai_embeddings,
 };
 use crate::services::session_store::{ApiKey, SessionStore};
 use crate::services::usage_stats_store::RunTokenTally;
@@ -71,6 +71,8 @@ pub struct ServeRouterConfig {
     pub is_grok: bool,
     /// `XAI_API_KEY` fallback for grok 403s; `None` if unset.
     pub grok_fallback_api_key: Option<String>,
+    /// `upstream_api_key` holds the Codex OAuth credential JSON, not a bearer.
+    pub is_codex: bool,
     pub is_openrouter: bool,
     pub is_starter: bool,
     /// Upstream requires `reasoning_content` on assistant turns (deepseek/moonshot);
@@ -109,6 +111,7 @@ impl ServeRouterConfig {
             is_copilot: profile.serve_flags.is_copilot,
             is_grok: key.is_grok_oauth(),
             grok_fallback_api_key: None,
+            is_codex: key.is_codex_oauth(),
             is_openrouter: profile.serve_flags.is_openrouter,
             is_starter: profile.serve_flags.is_starter,
             requires_reasoning_content: profile.quirks.requires_reasoning_content,
@@ -161,6 +164,7 @@ struct ServeState {
     key: ApiKey,
     copilot_tokens: Option<Arc<CopilotTokenManager>>,
     grok_tokens: Option<Arc<crate::services::grok_oauth::GrokTokenManager>>,
+    codex_tokens: Option<Arc<crate::services::codex_oauth::CodexTokenManager>>,
     /// Per-model learned protocol routes (in-memory only — `aivo serve` doesn't
     /// persist routes yet). Replaces the old single per-process pin so a
     /// multi-model gateway key learns a route per model instead of thrashing
@@ -182,6 +186,7 @@ struct FailoverEntry {
     key: ApiKey,
     copilot_tokens: Option<Arc<CopilotTokenManager>>,
     grok_tokens: Option<Arc<crate::services::grok_oauth::GrokTokenManager>>,
+    codex_tokens: Option<Arc<crate::services::codex_oauth::CodexTokenManager>>,
     /// Shared across failover attempts so a route learned during one failover
     /// carries to the next request instead of being re-probed every time.
     route_cache: Arc<RouteCache>,
@@ -293,6 +298,7 @@ impl ServeRouter {
             None
         };
         let grok_tokens = build_grok_tokens(&self.config);
+        let codex_tokens = build_codex_tokens(&self.config);
 
         let initial_protocol = self.config.upstream_protocol;
         let timeout = self.config.timeout;
@@ -333,9 +339,10 @@ impl ServeRouter {
                         upstream_api_key: fk.key.as_str().to_string(),
                         upstream_protocol: protocol,
                         is_copilot,
-                        // Failover keys never carry grok state.
+                        // Failover keys never carry grok/codex state.
                         is_grok: false,
                         grok_fallback_api_key: None,
+                        is_codex: false,
                         is_openrouter: profile.serve_flags.is_openrouter,
                         is_starter: profile.serve_flags.is_starter,
                         requires_reasoning_content: profile.quirks.requires_reasoning_content,
@@ -347,6 +354,7 @@ impl ServeRouter {
                     key: fk,
                     copilot_tokens: ct,
                     grok_tokens: None,
+                    codex_tokens: None,
                     route_cache: Arc::new(RouteCache::new(
                         "serve",
                         protocol,
@@ -364,6 +372,7 @@ impl ServeRouter {
             key: self.key,
             copilot_tokens,
             grok_tokens,
+            codex_tokens,
             route_cache,
             log_store: self.log_store,
             logger: self.logger,
@@ -1334,6 +1343,7 @@ fn failover_state(
         key: entry.key.clone(),
         copilot_tokens: entry.copilot_tokens.clone(),
         grok_tokens: entry.grok_tokens.clone(),
+        codex_tokens: entry.codex_tokens.clone(),
         route_cache: entry.route_cache.clone(),
         log_store: log_store.clone(),
         logger: None,
@@ -1485,6 +1495,11 @@ async fn handle_chat_body(body: Value, state: &ServeState) -> Result<RouterRespo
         return handle_chat_openai(&mut body, client_wants_stream, state).await;
     }
 
+    // Codex speaks Responses API only; send there directly, no protocol probing.
+    if state.config.is_codex {
+        return send_codex_responses(&body, client_wants_stream, &upstream_context(state)).await;
+    }
+
     // Protocol-only candidates: serve's upstream senders own their URLs, so
     // path variants don't apply, and ResponsesApi shares the OpenAI chat
     // handler — keep only the first candidate per handler family.
@@ -1602,6 +1617,7 @@ fn upstream_context(state: &ServeState) -> UpstreamRequestContext {
         is_starter: state.config.is_starter,
         copilot_tokens: state.copilot_tokens.clone(),
         grok_tokens: state.grok_tokens.clone(),
+        codex_tokens: state.codex_tokens.clone(),
         accounting: state.usage_sink.is_some(),
     }
 }
@@ -1631,6 +1647,19 @@ fn build_grok_tokens(
             creds,
             config.grok_fallback_api_key.clone(),
         ))),
+        Err(_) => None,
+    }
+}
+
+fn build_codex_tokens(
+    config: &ServeRouterConfig,
+) -> Option<Arc<crate::services::codex_oauth::CodexTokenManager>> {
+    use crate::services::codex_oauth::{CodexOAuthCredential, CodexTokenManager};
+    if !config.is_codex {
+        return None;
+    }
+    match CodexOAuthCredential::from_json(&config.upstream_api_key) {
+        Ok(creds) => Some(Arc::new(CodexTokenManager::new(creds))),
         Err(_) => None,
     }
 }
@@ -1864,6 +1893,7 @@ mod tests {
                 is_copilot: false,
                 is_grok: false,
                 grok_fallback_api_key: None,
+                is_codex: false,
                 is_openrouter: false,
                 is_starter: false,
                 requires_reasoning_content: false,
@@ -1876,6 +1906,7 @@ mod tests {
             key: test_key(),
             copilot_tokens: None,
             grok_tokens: None,
+            codex_tokens: None,
             route_cache: Arc::new(RouteCache::new(
                 "serve",
                 protocol,
@@ -2014,6 +2045,7 @@ mod tests {
                 is_copilot: false,
                 is_grok: false,
                 grok_fallback_api_key: None,
+                is_codex: false,
                 is_openrouter: true,
                 is_starter: false,
                 requires_reasoning_content: false,
@@ -2026,6 +2058,7 @@ mod tests {
             key: test_key(),
             copilot_tokens: None,
             grok_tokens: None,
+            codex_tokens: None,
             route_cache: Arc::new(RouteCache::new(
                 "serve",
                 ProviderProtocol::Openai,
@@ -2197,6 +2230,7 @@ mod tests {
                 is_copilot: false,
                 is_grok: false,
                 grok_fallback_api_key: None,
+                is_codex: false,
                 is_openrouter: false,
                 is_starter: false,
                 requires_reasoning_content: false,
@@ -2208,6 +2242,7 @@ mod tests {
             key: test_key(),
             copilot_tokens: None,
             grok_tokens: None,
+            codex_tokens: None,
             route_cache: Arc::new(RouteCache::new(
                 "serve",
                 ProviderProtocol::Openai,
@@ -2236,6 +2271,7 @@ mod tests {
             is_copilot: false,
             is_grok: false,
             grok_fallback_api_key: None,
+            is_codex: false,
             is_openrouter: false,
             is_starter: false,
             requires_reasoning_content: false,
@@ -2250,6 +2286,7 @@ mod tests {
             key: test_key(),
             copilot_tokens: None,
             grok_tokens: None,
+            codex_tokens: None,
             route_cache: Arc::new(RouteCache::new(
                 "serve",
                 ProviderProtocol::Openai,
@@ -2274,6 +2311,7 @@ mod tests {
                 is_copilot: false,
                 is_grok: false,
                 grok_fallback_api_key: None,
+                is_codex: false,
                 is_openrouter: false,
                 is_starter: false,
                 requires_reasoning_content: false,
@@ -2285,6 +2323,7 @@ mod tests {
             key: test_key(),
             copilot_tokens: None,
             grok_tokens: None,
+            codex_tokens: None,
             route_cache: Arc::new(RouteCache::new(
                 "serve",
                 ProviderProtocol::Openai,

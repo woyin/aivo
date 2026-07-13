@@ -402,6 +402,7 @@ fn serve_config(base_url: String, protocol: ProviderProtocol) -> ServeRouterConf
         is_copilot: false,
         is_grok: false,
         grok_fallback_api_key: None,
+        is_codex: false,
         is_openrouter: false,
         is_starter: false,
         requires_reasoning_content: false,

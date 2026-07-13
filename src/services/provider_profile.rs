@@ -157,6 +157,8 @@ pub fn resolve_starter_base_url(base_url: &str) -> String {
         // Resolve the grok sentinel to the CLI proxy so base_url-derived URLs
         // stay valid; the token manager still owns the final host per request.
         crate::services::grok_oauth::INFERENCE_BASE_URL.to_string()
+    } else if base_url == crate::services::codex_oauth::CODEX_OAUTH_SENTINEL {
+        crate::services::codex_oauth::CHATGPT_BACKEND_BASE_URL.to_string()
     } else {
         base_url.to_string()
     }

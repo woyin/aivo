@@ -543,9 +543,9 @@ impl CodeTuiApp {
     }
 
     /// True when the current key can drive the in-process agent: anything serve
-    /// can proxy (incl. Copilot and SuperGrok OAuth).
+    /// can proxy (incl. Copilot and grok/codex provider OAuth).
     pub(super) fn agent_capable(&self) -> bool {
-        (!self.key.is_any_oauth() || self.key.is_grok_oauth()) && !self.key.is_cursor_acp()
+        (!self.key.is_any_oauth() || self.key.is_provider_oauth()) && !self.key.is_cursor_acp()
     }
 
     /// Refresh the cached git branch for `display_cwd`, throttled so the footer's

@@ -26,10 +26,10 @@ use crate::errors::ExitCode;
 use crate::services::models_cache::ModelsCache;
 use crate::services::session_store::{ApiKey, SessionStore, SessionTokens};
 
-/// Whether `key` can drive the in-process agent. SuperGrok OAuth qualifies
-/// (OpenAI-compatible via the serve layer); other OAuth/copilot/cursor don't.
+/// Whether `key` can drive the in-process agent. Provider OAuth (grok/codex)
+/// qualifies; other OAuth/copilot/cursor don't.
 pub(crate) fn key_is_agent_capable(key: &ApiKey) -> bool {
-    (!key.is_any_oauth() || key.is_grok_oauth()) && !key.is_cursor_acp() && !key.is_copilot()
+    (!key.is_any_oauth() || key.is_provider_oauth()) && !key.is_cursor_acp() && !key.is_copilot()
 }
 
 /// Unattended `-e` backstops (env-overridable, 0 disables) — the TUI relies on esc instead.

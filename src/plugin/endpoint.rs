@@ -885,8 +885,8 @@ impl PluginServe {
 fn plugin_serve(key: &ApiKey) -> PluginServe {
     if key.is_cursor_acp() {
         PluginServe::Cursor
-    } else if key.is_grok_oauth() {
-        // SuperGrok OAuth is servable: aivo's endpoint injects the token upstream.
+    } else if key.is_provider_oauth() {
+        // Grok/Codex OAuth are servable: aivo injects the token upstream.
         PluginServe::Serve
     } else if key.is_any_oauth() {
         PluginServe::Blocked
@@ -1516,12 +1516,16 @@ mod tests {
         // Cursor has its own ACP-backed router for coding-agent plugins.
         assert_eq!(plugin_serve(&key(CURSOR_ACP_SENTINEL)), PluginServe::Cursor);
         assert!(plugin_serve(&key(CURSOR_ACP_SENTINEL)).is_servable());
-        // OAuth credentials are native-agent-only — blocked (no plugin proxy).
+        // Provider OAuth (grok/codex) is servable.
         for base in [
-            CLAUDE_OAUTH_SENTINEL,
+            crate::services::grok_oauth::GROK_OAUTH_SENTINEL,
             CODEX_OAUTH_SENTINEL,
-            GEMINI_OAUTH_SENTINEL,
         ] {
+            assert_eq!(plugin_serve(&key(base)), PluginServe::Serve, "{base}");
+            assert!(plugin_serve(&key(base)).is_servable(), "{base}");
+        }
+        // Single-CLI OAuth credentials are native-agent-only — blocked.
+        for base in [CLAUDE_OAUTH_SENTINEL, GEMINI_OAUTH_SENTINEL] {
             assert_eq!(plugin_serve(&key(base)), PluginServe::Blocked, "{base}");
             assert!(!plugin_serve(&key(base)).is_servable(), "{base}");
         }

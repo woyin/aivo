@@ -1570,7 +1570,29 @@ pub fn convert_chat_to_responses_request(body: &Value) -> Value {
         .unwrap_or_else(|_| json!({"model": "gpt-4o", "input": [], "stream": false}));
     // Force non-streaming for the fallback path
     resp["stream"] = json!(false);
+    // `cache_control` is an Anthropic-only field the Anthropic→Chat step preserves
+    // for caching-aware gateways; it has no place in the Responses schema and
+    // strict backends (ChatGPT Codex) 400 on it.
+    strip_key_recursive(&mut resp, "cache_control");
     resp
+}
+
+/// Removes every occurrence of `key` anywhere in the JSON tree.
+fn strip_key_recursive(v: &mut Value, key: &str) {
+    match v {
+        Value::Object(map) => {
+            map.remove(key);
+            for val in map.values_mut() {
+                strip_key_recursive(val, key);
+            }
+        }
+        Value::Array(arr) => {
+            for val in arr.iter_mut() {
+                strip_key_recursive(val, key);
+            }
+        }
+        _ => {}
+    }
 }
 
 /// Converts a Responses API JSON response to Chat Completions format.
@@ -1802,6 +1824,23 @@ fn responses_usage_to_chat_usage(usage: &Value) -> Value {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn chat_to_responses_strips_anthropic_cache_control() {
+        let chat = json!({
+            "model": "gpt-5.5",
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "hi", "cache_control": {"type": "ephemeral"}}
+                ]
+            }]
+        });
+        let resp = convert_chat_to_responses_request(&chat);
+        let dumped = resp.to_string();
+        assert!(!dumped.contains("cache_control"), "leaked: {dumped}");
+        assert!(dumped.contains("hi"));
+    }
 
     // ── is_responses_api_format ────────────────────────────────────────────────
 

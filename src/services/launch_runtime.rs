@@ -60,15 +60,11 @@ pub(crate) async fn prepare_runtime_env(
     }
 
     if tool == AIToolType::Claude && env.contains_key("AIVO_USE_ANTHROPIC_TO_OPENAI_ROUTER") {
-        // Grok can't ride the static-key anthropic→openai router; route it
-        // through the universal ServeRouter (converts Anthropic→OpenAI + injects
-        // the grok token). Detected by the router key parsing as a grok credential.
         let router_key = env
             .get("AIVO_ANTHROPIC_TO_OPENAI_ROUTER_API_KEY")
             .cloned()
             .unwrap_or_default();
-        if crate::services::grok_oauth::GrokOAuthCredential::from_json(&router_key).is_ok() {
-            let port = start_grok_serve_router(&env, router_key, session_store).await?;
+        if let Some(port) = start_provider_oauth_router(&env, router_key, session_store).await? {
             set_local_base_url(&mut env, "ANTHROPIC_BASE_URL", port);
         } else {
             let (port, cache, learned) = start_anthropic_to_openai_router(&env).await?;
@@ -112,10 +108,18 @@ pub(crate) async fn prepare_runtime_env(
     }
 
     if tool.is_codex_family() && env.contains_key("AIVO_USE_RESPONSES_TO_CHAT_ROUTER") {
-        let (port, cache, learned) = start_responses_to_chat_router("codex", &env).await?;
-        route_cache = Some(cache);
-        learned_requires_reasoning = Some(learned);
-        set_local_base_url(&mut env, "OPENAI_BASE_URL", port);
+        let router_key = env
+            .get("AIVO_RESPONSES_TO_CHAT_ROUTER_API_KEY")
+            .cloned()
+            .unwrap_or_default();
+        if let Some(port) = start_provider_oauth_router(&env, router_key, session_store).await? {
+            set_local_base_url(&mut env, "OPENAI_BASE_URL", port);
+        } else {
+            let (port, cache, learned) = start_responses_to_chat_router("codex", &env).await?;
+            route_cache = Some(cache);
+            learned_requires_reasoning = Some(learned);
+            set_local_base_url(&mut env, "OPENAI_BASE_URL", port);
+        }
     }
 
     if tool.is_codex_family() && env.contains_key("AIVO_USE_RESPONSES_TO_CHAT_COPILOT_ROUTER") {
@@ -124,10 +128,20 @@ pub(crate) async fn prepare_runtime_env(
     }
 
     if tool == AIToolType::Gemini && env.contains_key("AIVO_USE_GEMINI_ROUTER") {
-        let (port, cache, learned) = start_gemini_router(&env).await?;
-        route_cache = Some(cache);
-        learned_requires_reasoning = Some(learned);
-        set_local_base_url(&mut env, "GOOGLE_GEMINI_BASE_URL", port);
+        // Provider OAuth rides the universal ServeRouter (handles Gemini
+        // `generateContent` inbound); else the static gemini router.
+        let router_key = env
+            .get("AIVO_GEMINI_ROUTER_API_KEY")
+            .cloned()
+            .unwrap_or_default();
+        if let Some(port) = start_provider_oauth_router(&env, router_key, session_store).await? {
+            set_local_base_url(&mut env, "GOOGLE_GEMINI_BASE_URL", port);
+        } else {
+            let (port, cache, learned) = start_gemini_router(&env).await?;
+            route_cache = Some(cache);
+            learned_requires_reasoning = Some(learned);
+            set_local_base_url(&mut env, "GOOGLE_GEMINI_BASE_URL", port);
+        }
         clear_node_proxy_env(&mut env);
     }
 
@@ -143,10 +157,18 @@ pub(crate) async fn prepare_runtime_env(
     }
 
     if tool == AIToolType::Opencode && env.contains_key("AIVO_USE_OPENCODE_ROUTER") {
-        let (port, cache, learned) = start_responses_to_chat_router("opencode", &env).await?;
-        route_cache = Some(cache);
-        learned_requires_reasoning = Some(learned);
-        patch_opencode_config_content(&mut env, port);
+        let router_key = env
+            .get("AIVO_RESPONSES_TO_CHAT_ROUTER_API_KEY")
+            .cloned()
+            .unwrap_or_default();
+        if let Some(port) = start_provider_oauth_router(&env, router_key, session_store).await? {
+            patch_opencode_config_content(&mut env, port);
+        } else {
+            let (port, cache, learned) = start_responses_to_chat_router("opencode", &env).await?;
+            route_cache = Some(cache);
+            learned_requires_reasoning = Some(learned);
+            patch_opencode_config_content(&mut env, port);
+        }
     }
 
     if tool == AIToolType::Pi && env.contains_key("AIVO_SETUP_PI_AGENT_DIR") {
@@ -167,10 +189,18 @@ pub(crate) async fn prepare_runtime_env(
     }
 
     if tool == AIToolType::Pi && env.contains_key("AIVO_USE_PI_ROUTER") {
-        let (port, cache, learned) = start_responses_to_chat_router("pi", &env).await?;
-        route_cache = Some(cache);
-        learned_requires_reasoning = Some(learned);
-        write_pi_agent_dir(&mut env, Some(port)).await?;
+        let router_key = env
+            .get("AIVO_RESPONSES_TO_CHAT_ROUTER_API_KEY")
+            .cloned()
+            .unwrap_or_default();
+        if let Some(port) = start_provider_oauth_router(&env, router_key, session_store).await? {
+            write_pi_agent_dir(&mut env, Some(port)).await?;
+        } else {
+            let (port, cache, learned) = start_responses_to_chat_router("pi", &env).await?;
+            route_cache = Some(cache);
+            learned_requires_reasoning = Some(learned);
+            write_pi_agent_dir(&mut env, Some(port)).await?;
+        }
     }
 
     let pi_agent_dir = env.get("PI_CODING_AGENT_DIR").cloned();
@@ -1031,6 +1061,59 @@ async fn start_grok_serve_router(
     tokio::spawn(async move {
         if let Ok(Err(e)) = handle.await {
             eprintln!("aivo: grok serve router exited unexpectedly: {e}");
+        }
+    });
+    Ok(port)
+}
+
+/// If `router_key` is a provider-OAuth credential (Codex/Grok), starts the
+/// universal ServeRouter and returns its loopback port; `None` otherwise so the
+/// caller falls back to its tool-native static router. Probes codex first — a
+/// codex bundle also parses as the looser grok shape. Shared by every tool
+/// whose upstream is a local loopback router (claude/gemini/opencode/pi/codex).
+async fn start_provider_oauth_router(
+    env: &HashMap<String, String>,
+    router_key: String,
+    session_store: &SessionStore,
+) -> Result<Option<u16>> {
+    if crate::services::codex_oauth::CodexOAuthCredential::from_json(&router_key).is_ok() {
+        Ok(Some(
+            start_codex_serve_router(env, router_key, session_store).await?,
+        ))
+    } else if crate::services::grok_oauth::GrokOAuthCredential::from_json(&router_key).is_ok() {
+        Ok(Some(
+            start_grok_serve_router(env, router_key, session_store).await?,
+        ))
+    } else {
+        Ok(None)
+    }
+}
+
+/// Universal ServeRouter for a codex-oauth credential, so `aivo claude` reaches
+/// Codex via the same path as `aivo code`. Returns the loopback port.
+async fn start_codex_serve_router(
+    env: &HashMap<String, String>,
+    creds_json: String,
+    session_store: &SessionStore,
+) -> Result<u16> {
+    use crate::services::codex_oauth::CODEX_OAUTH_SENTINEL;
+    use crate::services::serve_router::{ServeRouter, ServeRouterConfig};
+
+    let key = ApiKey::new_with_protocol(
+        "codex".to_string(),
+        "codex".to_string(),
+        CODEX_OAUTH_SENTINEL.to_string(),
+        None,
+        creds_json,
+    );
+    let config =
+        ServeRouterConfig::from_key(&key, false, 300, loopback_auth_token(env), HashMap::new());
+    let (handle, _shutdown, port) = ServeRouter::new(config, key, session_store.logs())
+        .start_background_with_addr("127.0.0.1", 0)
+        .await?;
+    tokio::spawn(async move {
+        if let Ok(Err(e)) = handle.await {
+            eprintln!("aivo: codex serve router exited unexpectedly: {e}");
         }
     });
     Ok(port)

@@ -71,7 +71,7 @@ mod tests {
     }
 
     #[test]
-    fn chat_disables_any_oauth() {
+    fn chat_disables_launch_only_oauth_but_allows_provider_oauth() {
         let claude = make_key("claude", CLAUDE_OAUTH_SENTINEL);
         let codex = make_key("codex", CODEX_OAUTH_SENTINEL);
         let gemini = make_key("gemini", GEMINI_OAUTH_SENTINEL);
@@ -79,7 +79,8 @@ mod tests {
 
         let ctx = KeyCompatContext::Chat;
         assert_eq!(ctx.incompat_reason(&claude), Some("needs `aivo claude`"));
-        assert_eq!(ctx.incompat_reason(&codex), Some("needs `aivo codex`"));
+        // Codex is a provider credential — `aivo code` accepts it like grok.
+        assert!(ctx.incompat_reason(&codex).is_none());
         assert_eq!(
             ctx.incompat_reason(&gemini),
             Some("Gemini sign-in removed — re-add with an API key")
@@ -93,9 +94,10 @@ mod tests {
         let codex = make_key("codex", CODEX_OAUTH_SENTINEL);
         let regular = make_key("openrouter", "https://openrouter.ai/api/v1");
 
+        // Codex is a provider credential: usable with any tool.
         let claude_ctx = KeyCompatContext::Tool(AIToolType::Claude);
         assert!(claude_ctx.incompat_reason(&claude).is_none());
-        assert!(claude_ctx.incompat_reason(&codex).is_some());
+        assert!(claude_ctx.incompat_reason(&codex).is_none());
         assert!(claude_ctx.incompat_reason(&regular).is_none());
 
         let codex_ctx = KeyCompatContext::Tool(AIToolType::Codex);
@@ -110,7 +112,7 @@ mod tests {
     }
 
     #[test]
-    fn opencode_pi_and_amp_disable_all_oauth() {
+    fn opencode_and_pi_disable_launch_only_oauth() {
         let claude = make_key("claude", CLAUDE_OAUTH_SENTINEL);
         let codex = make_key("codex", CODEX_OAUTH_SENTINEL);
         let gemini = make_key("gemini", GEMINI_OAUTH_SENTINEL);
@@ -118,7 +120,7 @@ mod tests {
         for tool in [AIToolType::Opencode, AIToolType::Pi] {
             let ctx = KeyCompatContext::Tool(tool);
             assert!(ctx.incompat_reason(&claude).is_some());
-            assert!(ctx.incompat_reason(&codex).is_some());
+            assert!(ctx.incompat_reason(&codex).is_none());
             assert!(ctx.incompat_reason(&gemini).is_some());
         }
     }
@@ -134,14 +136,14 @@ mod tests {
         let ctx = KeyCompatContext::Plugin {
             allow_cursor: false,
         };
-        // OAuth is native-agent-only; Cursor needs the coding-agent router path.
+        // Claude/Gemini OAuth are native-agent-only; codex (provider) is allowed.
         assert!(
             ctx.incompat_reason(&make_key("cl", CLAUDE_OAUTH_SENTINEL))
                 .is_some()
         );
         assert!(
             ctx.incompat_reason(&make_key("cx", CODEX_OAUTH_SENTINEL))
-                .is_some()
+                .is_none()
         );
         assert!(
             ctx.incompat_reason(&make_key("gm", GEMINI_OAUTH_SENTINEL))

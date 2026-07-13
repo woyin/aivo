@@ -319,8 +319,8 @@ impl ModelsCommand {
             },
         };
 
-        // Grok is the exception: its token lists models on the CLI proxy.
-        if key.is_any_oauth() && !key.is_grok_oauth() {
+        // Grok/Codex tokens can enumerate models; other OAuth can't.
+        if key.is_any_oauth() && !key.is_provider_oauth() {
             eprintln!(
                 "{} Key '{}' is an OAuth credential — it doesn't have a model listing API.",
                 style::red("Error:"),
@@ -362,6 +362,11 @@ impl ModelsCommand {
             let mut creds = crate::services::grok_oauth::GrokOAuthCredential::from_json(&key.key)?;
             let ids = crate::services::grok_oauth::fetch_model_ids(&mut creds).await?;
             ids.into_iter().map(ModelInfo::id_only).collect()
+        } else if key.is_codex_oauth() {
+            crate::services::codex_oauth::known_model_ids()
+                .into_iter()
+                .map(ModelInfo::id_only)
+                .collect()
         } else if let Some((ids, meta)) = cached_entry {
             models_from_cache(ids, meta)
         } else {
@@ -1034,6 +1039,10 @@ async fn fetch_models_detailed_filtered(
         SessionStore::decrypt_key_secret(&mut key)?;
         let mut creds = crate::services::grok_oauth::GrokOAuthCredential::from_json(&key.key)?;
         let ids = crate::services::grok_oauth::fetch_model_ids(&mut creds).await?;
+        return Ok(ids.into_iter().map(ModelInfo::id_only).collect());
+    }
+    if key.is_codex_oauth() {
+        let ids = crate::services::codex_oauth::known_model_ids();
         return Ok(ids.into_iter().map(ModelInfo::id_only).collect());
     }
     if key.is_any_oauth() {

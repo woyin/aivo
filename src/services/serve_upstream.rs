@@ -31,6 +31,7 @@ pub(crate) struct UpstreamRequestContext {
     pub(crate) is_starter: bool,
     pub(crate) copilot_tokens: Option<Arc<CopilotTokenManager>>,
     pub(crate) grok_tokens: Option<Arc<crate::services::grok_oauth::GrokTokenManager>>,
+    pub(crate) codex_tokens: Option<Arc<crate::services::codex_oauth::CodexTokenManager>>,
     /// Usage accounting is on — streamed OpenAI requests must ask for the
     /// trailing usage chunk or the sniffer records zero for the turn.
     pub(crate) accounting: bool,
@@ -394,6 +395,185 @@ pub(crate) async fn send_copilot_responses(
         CONTENT_TYPE_JSON,
         serde_json::to_vec(&chat_json)?,
     ))
+}
+
+/// Sends a chat request to the ChatGPT Codex Responses-API backend with the
+/// Codex OAuth token, converting request/response via the wire-format registry.
+/// Cousin of `send_copilot_responses` for the ChatGPT host + auth.
+pub(crate) async fn send_codex_responses(
+    chat_body: &Value,
+    client_wants_stream: bool,
+    context: &UpstreamRequestContext,
+) -> Result<RouterResponse> {
+    use crate::services::codex_oauth;
+
+    let Some(ctm) = context.codex_tokens.as_ref() else {
+        return Ok(RouterResponse::buffered(
+            500,
+            CONTENT_TYPE_JSON,
+            br#"{"error":{"message":"codex token manager missing"}}"#.to_vec(),
+        ));
+    };
+    let auth = ctm.authorize().await?;
+
+    let mut chat_body = chat_body.clone();
+    normalize_codex_request_model(&mut chat_body);
+    strip_non_function_tools(&mut chat_body);
+    let model = chat_body
+        .get("model")
+        .and_then(|m| m.as_str())
+        .unwrap_or(codex_oauth::DEFAULT_CODEX_MODEL)
+        .to_string();
+
+    let mut responses_body = serde_json::to_value(translate_request(
+        &chat_body,
+        &RequestOptions::ChatToResponses,
+    ))?;
+    // Backend requires store:false + streaming, and rejects max_output_tokens.
+    // (`cache_control` is stripped upstream in the Chat→Responses converter.)
+    responses_body["store"] = json!(false);
+    responses_body["stream"] = json!(true);
+    merge_reasoning_include(&mut responses_body);
+    if let Some(obj) = responses_body.as_object_mut() {
+        obj.remove("max_output_tokens");
+    }
+
+    let session_id = codex_oauth::generate_session_id();
+    let mut req = context
+        .client
+        .post(codex_oauth::CHATGPT_RESPONSES_URL)
+        .header("Authorization", format!("Bearer {}", auth.access_token))
+        .header("Content-Type", CONTENT_TYPE_JSON)
+        .header("Accept", "text/event-stream")
+        .header(
+            codex_oauth::OPENAI_BETA_HEADER,
+            codex_oauth::OPENAI_BETA_VALUE,
+        )
+        .header(
+            codex_oauth::ORIGINATOR_HEADER,
+            codex_oauth::ORIGINATOR_VALUE,
+        )
+        .header(codex_oauth::SESSION_ID_HEADER, session_id)
+        .header("User-Agent", codex_oauth::CODEX_USER_AGENT);
+    if let Some(account_id) = auth.account_id.as_deref() {
+        req = req.header(codex_oauth::ACCOUNT_ID_HEADER, account_id);
+    }
+
+    let response = req.json(&responses_body).send_logged().await?;
+    let status = response.status().as_u16();
+    let content_type = http_utils::response_content_type(&response);
+    if status >= 400 {
+        return Ok(RouterResponse::buffered(
+            status,
+            &content_type,
+            response.bytes().await?.to_vec(),
+        ));
+    }
+
+    // Always an SSE stream (we force stream:true), though the backend mislabels
+    // it `application/json` — so don't gate on content-type.
+    if client_wants_stream {
+        return Ok(RouterResponse::Streaming {
+            status: 200,
+            content_type: "text/event-stream".to_string(),
+            body: Box::new(StreamingBody::Converted {
+                upstream: response,
+                adapter: stream_adapter(StreamOptions::ChatToResponses {
+                    model: &model,
+                    include_usage: context.accounting,
+                }),
+            }),
+        });
+    }
+
+    let text = response.text().await?;
+    let responses_json = responses_object_from_body(&text)?;
+    let chat_json = translate_response(&responses_json, &ResponseOptions::ChatToResponses)?;
+    if client_wants_stream {
+        return Ok(RouterResponse::buffered(
+            200,
+            "text/event-stream",
+            convert_openai_chat_response_to_sse(&chat_json)?.into_bytes(),
+        ));
+    }
+    Ok(RouterResponse::buffered(
+        200,
+        CONTENT_TYPE_JSON,
+        serde_json::to_vec(&chat_json)?,
+    ))
+}
+
+/// Passes through `gpt-*` slugs (not bare `gpt-5`, which 400s); maps foreign
+/// slots to the default codex model.
+fn normalize_codex_request_model(body: &mut Value) {
+    let keep = body
+        .get("model")
+        .and_then(|m| m.as_str())
+        .is_some_and(|m| m.starts_with("gpt-") && m != "gpt-5");
+    if !keep {
+        body["model"] = json!(crate::services::codex_oauth::DEFAULT_CODEX_MODEL);
+    }
+}
+
+/// Idempotently adds `reasoning.encrypted_content` to `include` for stateless
+/// multi-turn reasoning continuity.
+fn merge_reasoning_include(body: &mut Value) {
+    const NEEDLE: &str = "reasoning.encrypted_content";
+    let arr = body.as_object_mut().and_then(|o| {
+        o.entry("include")
+            .or_insert_with(|| json!([]))
+            .as_array_mut()
+    });
+    if let Some(arr) = arr
+        && !arr.iter().any(|v| v.as_str() == Some(NEEDLE))
+    {
+        arr.push(json!(NEEDLE));
+    }
+}
+
+/// Reduces a codex SSE stream (or direct JSON) to one Responses object. Under
+/// `store:false` the `response.completed` event's `output` is empty, so rebuild
+/// it from the incremental `response.output_item.done` events.
+fn responses_object_from_body(body: &str) -> Result<Value> {
+    if let Ok(v) = serde_json::from_str::<Value>(body)
+        && (v.get("output").is_some() || v.get("type").is_some())
+    {
+        return Ok(v);
+    }
+    let mut completed: Option<Value> = None;
+    let mut items: Vec<Value> = Vec::new();
+    for line in body.lines() {
+        let Some(data) = line.strip_prefix("data:").map(str::trim) else {
+            continue;
+        };
+        let Ok(event) = serde_json::from_str::<Value>(data) else {
+            continue;
+        };
+        match event.get("type").and_then(|t| t.as_str()) {
+            Some("response.output_item.done") => {
+                if let Some(item) = event.get("item") {
+                    items.push(item.clone());
+                }
+            }
+            Some("response.completed") => {
+                if let Some(response) = event.get("response") {
+                    completed = Some(response.clone());
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut response = completed.ok_or_else(|| {
+        anyhow::anyhow!("codex response stream missing a response.completed event")
+    })?;
+    let output_empty = response
+        .get("output")
+        .and_then(|o| o.as_array())
+        .is_none_or(|a| a.is_empty());
+    if output_empty && !items.is_empty() {
+        response["output"] = Value::Array(items);
+    }
+    Ok(response)
 }
 
 pub(crate) async fn send_openai_embeddings(
@@ -784,6 +964,73 @@ mod tests {
         let mut body = json!({"model": "claude-sonnet-4-6-20250603"});
         normalize_openai_request_model(&mut body, false, true);
         assert_eq!(body["model"], "claude-sonnet-4.6");
+    }
+
+    #[test]
+    fn normalize_codex_model_passes_codex_slugs_defaults_foreign() {
+        let mut body = json!({"model": "gpt-5.5"});
+        normalize_codex_request_model(&mut body);
+        assert_eq!(body["model"], "gpt-5.5");
+
+        let mut body = json!({"model": "gpt-5.4-mini"});
+        normalize_codex_request_model(&mut body);
+        assert_eq!(body["model"], "gpt-5.4-mini");
+
+        // Bare gpt-5 and foreign slots map to the default.
+        let mut body = json!({"model": "gpt-5"});
+        normalize_codex_request_model(&mut body);
+        assert_eq!(
+            body["model"],
+            crate::services::codex_oauth::DEFAULT_CODEX_MODEL
+        );
+
+        let mut body = json!({"model": "claude-sonnet-4-6"});
+        normalize_codex_request_model(&mut body);
+        assert_eq!(
+            body["model"],
+            crate::services::codex_oauth::DEFAULT_CODEX_MODEL
+        );
+    }
+
+    #[test]
+    fn merge_reasoning_include_is_idempotent() {
+        let mut body = json!({"model": "gpt-5.5"});
+        merge_reasoning_include(&mut body);
+        merge_reasoning_include(&mut body);
+        assert_eq!(body["include"], json!(["reasoning.encrypted_content"]));
+
+        let mut body = json!({"include": ["file_search_call.results"]});
+        merge_reasoning_include(&mut body);
+        assert_eq!(
+            body["include"],
+            json!(["file_search_call.results", "reasoning.encrypted_content"])
+        );
+    }
+
+    #[test]
+    fn responses_object_from_body_rebuilds_output_from_item_done_events() {
+        // The ChatGPT backend leaves `response.completed.output` empty under
+        // `store:false`; the object must be rebuilt from `output_item.done`.
+        let sse = "event: response.output_item.done\n\
+             data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"pong\"}]}}\n\n\
+             event: response.completed\n\
+             data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"model\":\"gpt-5.5\",\"output\":[]}}\n\n";
+        let obj = responses_object_from_body(sse).unwrap();
+        assert_eq!(obj["id"], "resp_1");
+        assert_eq!(obj["output"][0]["type"], "message");
+        assert_eq!(obj["output"][0]["content"][0]["text"], "pong");
+
+        // A non-empty completed `output`, and a direct JSON object, pass through.
+        let sse2 = "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"r2\",\"output\":[{\"type\":\"message\"}]}}\n\n";
+        assert_eq!(
+            responses_object_from_body(sse2).unwrap()["output"][0]["type"],
+            "message"
+        );
+
+        let direct = r#"{"id":"resp_2","output":[]}"#;
+        assert_eq!(responses_object_from_body(direct).unwrap()["id"], "resp_2");
+
+        assert!(responses_object_from_body("data: {}\n").is_err());
     }
 
     #[test]
