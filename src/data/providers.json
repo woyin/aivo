@@ -1,57 +1,282 @@
 [
-  {"id":"openrouter","name":"OpenRouter","base_url":"https://openrouter.ai/api/v1"},
-  {"id":"vercel", "name": "Vercel AI Gateway", "base_url": "https://ai-gateway.vercel.sh/v1"},
-  {"id":"anthropic","name": "Anthropic", "base_url": "https://api.anthropic.com"},
-  {"id":"openai","name": "OpenAI", "base_url": "https://api.openai.com"},
-  {"id":"google-ai-studio","name": "Google AI Studio", "base_url":"https://generativelanguage.googleapis.com"},
-  {"id":"fireworks-ai","name":"Fireworks AI","base_url":"https://api.fireworks.ai/inference/v1/"},
-  {"id":"deepseek","name":"DeepSeek","base_url":"https://api.deepseek.com/v1"},
-  {"id":"xai","name": "xai", "base_url": "https://api.x.ai/v1"},
-  {"id":"groq","name": "groq", "base_url": "https://api.groq.com/openai/v1"},
-  {"id":"huggingface","name":"Hugging Face","base_url":"https://router.huggingface.co/v1"},
-  {"id":"mistral","name": "mistral", "base_url": "https://api.mistral.ai/v1"},
-  {"id":"moonshotai","name":"Moonshot AI","base_url":"https://api.moonshot.ai/v1"},
-  {"id":"moonshotai-cn","name":"Moonshot AI (China)","base_url":"https://api.moonshot.cn/v1"},
-  {"id":"kimi-for-coding","name":"Kimi For Coding","base_url":"https://api.kimi.com/coding/v1"},
-  {"id":"zai-coding-plan","name":"Z.AI Coding Plan","base_url":"https://api.z.ai/api/coding/paas/v4"},
-  {"id":"zai","name":"Z.AI","base_url":"https://api.z.ai/api/paas/v4"},
-  {"id":"zhipuai","name":"Zhipu AI","base_url":"https://open.bigmodel.cn/api/paas/v4"},
-  {"id":"zhipuai-coding-plan","name":"Zhipu AI Coding Plan","base_url":"https://open.bigmodel.cn/api/coding/paas/v4"},
-  {"id":"minimax","name":"MiniMax","base_url":"https://api.minimax.io"},
-  {"id":"minimax-cn","name":"MiniMax (China)","base_url":"https://api.minimax.com"},
-  {"id":"alibaba","name":"Alibaba","base_url":"https://dashscope-intl.aliyuncs.com/compatible-mode/v1"},
-  {"id":"alibaba-cn","name":"Alibaba (China)","base_url":"https://dashscope.aliyuncs.com/compatible-mode/v1"},
-  {"id":"alibaba-coding-plan","name":"Alibaba Coding Plan","base_url":"https://coding-intl.dashscope.aliyuncs.com/v1"},
-  {"id":"alibaba-coding-plan-cn","name":"Alibaba Coding Plan (China)","base_url":"https://coding.dashscope.aliyuncs.com/v1"},
-  {"id":"xiaomi","name":"Xiaomi","base_url":"https://api.xiaomimimo.com/v1"},
-  {"id":"tencent-coding-plan","name":"Tencent Coding Plan (China)","base_url":"https://api.lkeap.cloud.tencent.com/coding/v3"},
-  {"id":"nvidia","name":"Nvidia","base_url":"https://integrate.api.nvidia.com/v1"},
-  {"id":"opencode-zen","name":"OpenCode Zen","base_url":"https://opencode.ai/zen/v1"},
-  {"id":"opencode-go","name":"OpenCode Go","base_url":"https://opencode.ai/zen/go/v1"},
-  {"id":"commandcode","name":"Command Code","base_url":"https://api.commandcode.ai/provider/v1"},
-  {"id":"kilo","name":"Kilo Gateway","base_url":"https://api.kilo.ai/api/gateway"},
-  {"id":"nova","name":"Nova","base_url":"https://api.nova.amazon.com/v1"},
-  {"id":"poe","name":"Poe","base_url":"https://api.poe.com/v1"},
-  {"id":"berget","name":"Berget.AI","base_url":"https://api.berget.ai/v1"},
-  {"id":"together-ai","name": "Together.ai", "base_url": "https://api.together.xyz/v1"},
-  {"id":"inception","name":"Inception","base_url":"https://api.inceptionlabs.ai/v1/"},
-  {"id":"poolside","name":"Poolside","base_url":"https://inference.poolside.ai/v1"},
-  {"id":"cloudflare-workers-ai","name":"Cloudflare Workers AI","base_url":"https://api.cloudflare.com/client/v4/accounts/${CLOUDFLARE_ACCOUNT_ID}/ai/v1"},
-  {"id":"bedrock","name":"Amazon Bedrock","base_url":"https://bedrock-mantle.${AWS_REGION}.api.aws/v1"},
-  {"id":"publicai","name":"Public AI","base_url":"https://api.publicai.co/v1"},
-  {"id":"sakana","name":"Sakana AI","base_url":"https://api.sakana.ai"},
-  {"id":"stepfun","name":"StepFun","base_url":"https://api.stepfun.com/v1"},
-  {"id":"upstage","name":"Upstage","base_url":"https://api.upstage.ai/v1/solar"},
-  {"id":"ollama-cloud","name":"Ollama Cloud","base_url":"https://ollama.com/v1"},
-  {"id":"llama","name":"Llama","base_url":"https://api.llama.com/compat/v1/"},
-  {"id":"scaleway","name":"Scaleway","base_url":"https://api.scaleway.ai/v1"},
-  {"id":"modelscope","name":"ModelScope","base_url":"https://api-inference.modelscope.cn/v1"},
-  {"id":"siliconflow","name":"SiliconFlow","base_url":"https://api.siliconflow.com/v1"},
-  {"id":"siliconflow-cn","name":"SiliconFlow (China)","base_url":"https://api.siliconflow.cn/v1"},
-  {"id":"requesty","name":"Requesty","base_url":"https://router.requesty.ai/v1"},
-  {"id":"novita-ai","name":"NovitaAI","base_url":"https://api.novita.ai/openai"},
-  {"id":"nebius","name":"Nebius Token Factory","base_url":"https://api.tokenfactory.nebius.com/v1"},
-  {"id":"friendli","name":"Friendli","base_url":"https://api.friendli.ai/serverless/v1"},
-  {"id":"chutes","name":"Chutes","base_url":"https://llm.chutes.ai/v1"},
-  {"id":"baseten","name":"Baseten","base_url":"https://inference.baseten.co/v1"}
+  {
+    "id": "openrouter",
+    "name": "OpenRouter",
+    "base_url": "https://openrouter.ai/api/v1"
+  },
+  {
+    "id": "vercel",
+    "name": "Vercel AI Gateway",
+    "base_url": "https://ai-gateway.vercel.sh/v1"
+  },
+  {
+    "id": "anthropic",
+    "name": "Anthropic",
+    "base_url": "https://api.anthropic.com"
+  },
+  {
+    "id": "openai",
+    "name": "OpenAI",
+    "base_url": "https://api.openai.com"
+  },
+  {
+    "id": "google-ai-studio",
+    "name": "Google AI Studio",
+    "base_url": "https://generativelanguage.googleapis.com"
+  },
+  {
+    "id": "fireworks-ai",
+    "name": "Fireworks AI",
+    "base_url": "https://api.fireworks.ai/inference/v1/"
+  },
+  {
+    "id": "deepseek",
+    "name": "DeepSeek",
+    "base_url": "https://api.deepseek.com/v1"
+  },
+  {
+    "id": "xai",
+    "name": "xai",
+    "base_url": "https://api.x.ai/v1"
+  },
+  {
+    "id": "groq",
+    "name": "groq",
+    "base_url": "https://api.groq.com/openai/v1"
+  },
+  {
+    "id": "huggingface",
+    "name": "Hugging Face",
+    "base_url": "https://router.huggingface.co/v1"
+  },
+  {
+    "id": "mistral",
+    "name": "mistral",
+    "base_url": "https://api.mistral.ai/v1"
+  },
+  {
+    "id": "moonshotai",
+    "name": "Moonshot AI",
+    "base_url": "https://api.moonshot.ai/v1"
+  },
+  {
+    "id": "moonshotai-cn",
+    "name": "Moonshot AI (China)",
+    "base_url": "https://api.moonshot.cn/v1"
+  },
+  {
+    "id": "kimi-for-coding",
+    "name": "Kimi For Coding",
+    "base_url": "https://api.kimi.com/coding/v1"
+  },
+  {
+    "id": "zai-coding-plan",
+    "name": "Z.AI Coding Plan",
+    "base_url": "https://api.z.ai/api/coding/paas/v4"
+  },
+  {
+    "id": "zai",
+    "name": "Z.AI",
+    "base_url": "https://api.z.ai/api/paas/v4"
+  },
+  {
+    "id": "zhipuai",
+    "name": "Zhipu AI",
+    "base_url": "https://open.bigmodel.cn/api/paas/v4"
+  },
+  {
+    "id": "zhipuai-coding-plan",
+    "name": "Zhipu AI Coding Plan",
+    "base_url": "https://open.bigmodel.cn/api/coding/paas/v4"
+  },
+  {
+    "id": "minimax",
+    "name": "MiniMax",
+    "base_url": "https://api.minimax.io"
+  },
+  {
+    "id": "minimax-cn",
+    "name": "MiniMax (China)",
+    "base_url": "https://api.minimax.com"
+  },
+  {
+    "id": "alibaba",
+    "name": "Alibaba",
+    "base_url": "https://dashscope-intl.aliyuncs.com/compatible-mode/v1"
+  },
+  {
+    "id": "alibaba-cn",
+    "name": "Alibaba (China)",
+    "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1"
+  },
+  {
+    "id": "alibaba-coding-plan",
+    "name": "Alibaba Coding Plan",
+    "base_url": "https://coding-intl.dashscope.aliyuncs.com/v1"
+  },
+  {
+    "id": "alibaba-coding-plan-cn",
+    "name": "Alibaba Coding Plan (China)",
+    "base_url": "https://coding.dashscope.aliyuncs.com/v1"
+  },
+  {
+    "id": "xiaomi",
+    "name": "Xiaomi",
+    "base_url": "https://api.xiaomimimo.com/v1"
+  },
+  {
+    "id": "tencent-coding-plan",
+    "name": "Tencent Coding Plan (China)",
+    "base_url": "https://api.lkeap.cloud.tencent.com/coding/v3"
+  },
+  {
+    "id": "nvidia",
+    "name": "Nvidia",
+    "base_url": "https://integrate.api.nvidia.com/v1"
+  },
+  {
+    "id": "opencode-zen",
+    "name": "OpenCode Zen",
+    "base_url": "https://opencode.ai/zen/v1"
+  },
+  {
+    "id": "opencode-go",
+    "name": "OpenCode Go",
+    "base_url": "https://opencode.ai/zen/go/v1"
+  },
+  {
+    "id": "commandcode",
+    "name": "Command Code",
+    "base_url": "https://api.commandcode.ai/provider/v1"
+  },
+  {
+    "id": "kilo",
+    "name": "Kilo Gateway",
+    "base_url": "https://api.kilo.ai/api/gateway"
+  },
+  {
+    "id": "nova",
+    "name": "Nova",
+    "base_url": "https://api.nova.amazon.com/v1"
+  },
+  {
+    "id": "poe",
+    "name": "Poe",
+    "base_url": "https://api.poe.com/v1"
+  },
+  {
+    "id": "berget",
+    "name": "Berget.AI",
+    "base_url": "https://api.berget.ai/v1"
+  },
+  {
+    "id": "together-ai",
+    "name": "Together.ai",
+    "base_url": "https://api.together.xyz/v1"
+  },
+  {
+    "id": "inception",
+    "name": "Inception",
+    "base_url": "https://api.inceptionlabs.ai/v1/"
+  },
+  {
+    "id": "poolside",
+    "name": "Poolside",
+    "base_url": "https://inference.poolside.ai/v1"
+  },
+  {
+    "id": "cloudflare-workers-ai",
+    "name": "Cloudflare Workers AI",
+    "base_url": "https://api.cloudflare.com/client/v4/accounts/${CLOUDFLARE_ACCOUNT_ID}/ai/v1"
+  },
+  {
+    "id": "bedrock",
+    "name": "Amazon Bedrock",
+    "base_url": "https://bedrock-mantle.${AWS_REGION}.api.aws/v1"
+  },
+  {
+    "id": "publicai",
+    "name": "Public AI",
+    "base_url": "https://api.publicai.co/v1"
+  },
+  {
+    "id": "sakana",
+    "name": "Sakana AI",
+    "base_url": "https://api.sakana.ai"
+  },
+  {
+    "id": "stepfun",
+    "name": "StepFun",
+    "base_url": "https://api.stepfun.com/v1"
+  },
+  {
+    "id": "upstage",
+    "name": "Upstage",
+    "base_url": "https://api.upstage.ai/v1/solar"
+  },
+  {
+    "id": "ollama-cloud",
+    "name": "Ollama Cloud",
+    "base_url": "https://ollama.com/v1"
+  },
+  {
+    "id": "llama",
+    "name": "Llama",
+    "base_url": "https://api.llama.com/compat/v1/"
+  },
+  {
+    "id": "scaleway",
+    "name": "Scaleway",
+    "base_url": "https://api.scaleway.ai/v1"
+  },
+  {
+    "id": "modelscope",
+    "name": "ModelScope",
+    "base_url": "https://api-inference.modelscope.cn/v1"
+  },
+  {
+    "id": "siliconflow",
+    "name": "SiliconFlow",
+    "base_url": "https://api.siliconflow.com/v1"
+  },
+  {
+    "id": "siliconflow-cn",
+    "name": "SiliconFlow (China)",
+    "base_url": "https://api.siliconflow.cn/v1"
+  },
+  {
+    "id": "requesty",
+    "name": "Requesty",
+    "base_url": "https://router.requesty.ai/v1"
+  },
+  {
+    "id": "novita-ai",
+    "name": "NovitaAI",
+    "base_url": "https://api.novita.ai/openai"
+  },
+  {
+    "id": "nebius",
+    "name": "Nebius Token Factory",
+    "base_url": "https://api.tokenfactory.nebius.com/v1"
+  },
+  {
+    "id": "friendli",
+    "name": "Friendli",
+    "base_url": "https://api.friendli.ai/serverless/v1"
+  },
+  {
+    "id": "chutes",
+    "name": "Chutes",
+    "base_url": "https://llm.chutes.ai/v1"
+  },
+  {
+    "id": "baseten",
+    "name": "Baseten",
+    "base_url": "https://inference.baseten.co/v1"
+  },
+  {
+    "id": "joycode",
+    "name": "JoyCode (JD)",
+    "base_url": "https://joycode-api.jd.com"
+  }
 ]

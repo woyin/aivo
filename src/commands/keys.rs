@@ -554,6 +554,10 @@ const CURSOR_INFO: (&str, &str) = (
 );
 const OLLAMA_INFO: (&str, &str) = ("Ollama", "install: ollama.com/download");
 const STARTER_INFO: (&str, &str) = ("aivo starter", "free shared key, no signup needed");
+const JOYCODE_INFO: (&str, &str) = (
+    "JoyCode (JD)",
+    "browser login — credential is captured automatically",
+);
 
 fn format_picker_choice(label: &str, hint: &str) -> String {
     format!(
@@ -2066,6 +2070,7 @@ impl KeysCommand {
             Ollama,
             Starter,
             Custom,
+            JoyCode,
         }
 
         let providers = crate::services::known_providers::all();
@@ -2098,6 +2103,7 @@ impl KeysCommand {
                 ProviderChoice::Cursor => ("Cursor", "cursor-agent login/API key".to_string()),
                 ProviderChoice::Starter => ("aivo starter", "free".to_string()),
                 ProviderChoice::Custom => ("Custom URL", "enter manually".to_string()),
+                ProviderChoice::JoyCode => ("JoyCode (JD)", "QR code login".to_string()),
             }
         };
 
@@ -2112,6 +2118,7 @@ impl KeysCommand {
             choices.push(choice);
         };
 
+        push(&mut choices, &mut labels, ProviderChoice::JoyCode);
         push(&mut choices, &mut labels, ProviderChoice::Custom);
 
         let detected_indices: Vec<usize> = if name.is_empty() {
@@ -2216,7 +2223,79 @@ impl KeysCommand {
             ProviderChoice::Ollama => self.add_ollama_interactive(name).await,
             ProviderChoice::Starter => self.add_starter_interactive(name).await,
             ProviderChoice::Custom => self.add_custom_interactive(name).await,
+            ProviderChoice::JoyCode => self.add_joycode_interactive(name).await,
         }
+    }
+
+    /// JoyCode browser login. JoyCode calls the local port with `pt_key`
+    /// after the browser session completes.
+    async fn add_joycode_interactive(&self, name: &str) -> Result<ExitCode> {
+        keys_ui::provider_info(JOYCODE_INFO.0, JOYCODE_INFO.1);
+        let final_name = if name.is_empty() { "joycode" } else { name };
+        keys_ui::step_header(3, 3, "Browser sign in", "opening JoyCode login page");
+
+        let creds = match crate::services::joycode_auth::browser_login(&|msg| {
+            eprintln!("{} {}", style::dim("·"), msg);
+        })
+        .await
+        {
+            Ok(creds) => creds,
+            Err(err) => {
+                eprintln!("{} JoyCode login failed: {}", style::red("Error:"), err);
+                return Ok(ExitCode::UserError);
+            }
+        };
+
+        let key_json = creds
+            .to_key_json()
+            .map_err(|e| anyhow::anyhow!("serialize credential: {e}"))?;
+        let id = self
+            .session_store
+            .add_key_with_protocol(final_name, "https://joycode-api.jd.com", None, &key_json)
+            .await?;
+
+        self.finalize_add(
+            &id,
+            final_name,
+            &format!("JoyCode user: {}", creds.user_id),
+            Some(("aivo claude", "")),
+        )
+        .await?;
+        Ok(ExitCode::Success)
+    }
+
+    async fn add_joycode_manual(&self, name: &str, pt_key: &str) -> Result<ExitCode> {
+        keys_ui::provider_info(JOYCODE_INFO.0, JOYCODE_INFO.1);
+        self.add_joycode_with_key(name, pt_key).await
+    }
+
+    async fn add_joycode_with_key(&self, name: &str, pt_key: &str) -> Result<ExitCode> {
+        keys_ui::step_header(3, 3, "Validating", "checking ptKey with JoyCode...");
+        let creds = match crate::services::joycode_auth::validate_pt_key(pt_key).await {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("{} ptKey validation failed: {}", style::red("Error:"), e);
+                return Ok(ExitCode::UserError);
+            }
+        };
+
+        let key_json = creds
+            .to_key_json()
+            .map_err(|e| anyhow::anyhow!("serialize credential: {e}"))?;
+
+        let id = self
+            .session_store
+            .add_key_with_protocol(name, "https://joycode-api.jd.com", None, &key_json)
+            .await?;
+
+        self.finalize_add(
+            &id,
+            name,
+            &format!("JoyCode user: {}", creds.user_id),
+            Some(("aivo claude", "")),
+        )
+        .await?;
+        Ok(ExitCode::Success)
     }
 
     async fn add_known_provider(
@@ -2779,6 +2858,17 @@ impl KeysCommand {
             && add_options.key.is_some();
         if is_cursor_shortcut {
             return self.add_cursor_interactive(&name, add_options.key).await;
+        }
+
+        // 'aivo keys add joycode' (no --key) → browser login flow.
+        // 'aivo keys add joycode --key <ptKey>' → manual ptKey validation.
+        let is_joycode_name =
+            name.eq_ignore_ascii_case("joycode") && add_options.base_url.is_none();
+        if is_joycode_name {
+            if let Some(key) = add_options.key {
+                return self.add_joycode_manual(&name, key).await;
+            }
+            return self.add_joycode_interactive(&name).await;
         }
         let interactive =
             add_options.base_url.is_none() && add_options.key.is_none() && !is_starter_name;

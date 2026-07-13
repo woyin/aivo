@@ -51,6 +51,8 @@ pub mod http_debug;
 pub mod http_utils;
 pub mod huggingface;
 pub mod id_compact;
+pub mod joycode_auth;
+pub mod joycode_router;
 pub mod key_compat;
 pub mod known_providers;
 pub mod last_selection;

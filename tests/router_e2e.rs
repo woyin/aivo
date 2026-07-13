@@ -263,6 +263,7 @@ fn serve_config(base_url: String, protocol: ProviderProtocol) -> ServeRouterConf
         is_copilot: false,
         is_openrouter: false,
         is_starter: false,
+        is_joycode: false,
         cors: false,
         timeout: 30,
         auth_token: None,
