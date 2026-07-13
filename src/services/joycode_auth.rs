@@ -29,7 +29,7 @@ pub struct JoyCodeCredential {
 impl JoyCodeCredential {
     /// Serialize to JSON for storage in `ApiKey.key`.
     pub fn to_key_json(&self) -> Result<String> {
-        Ok(serde_json::to_string(self).context("serialize JoyCodeCredential")?)
+        serde_json::to_string(self).context("serialize JoyCodeCredential")
     }
 }
 
@@ -155,8 +155,8 @@ async fn validate_and_resolve(
 
     // Follow redirect URL if provided
     if let Some(redirect_url) = v["url"].as_str() {
-        let follow = if redirect_url.starts_with("http://") {
-            format!("https://{}", &redirect_url[7..])
+        let follow = if let Some(stripped) = redirect_url.strip_prefix("http://") {
+            format!("https://{}", stripped)
         } else {
             redirect_url.to_string()
         };

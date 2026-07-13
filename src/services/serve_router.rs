@@ -1224,7 +1224,6 @@ fn upstream_context(state: &ServeState) -> UpstreamRequestContext {
         is_copilot: state.config.is_copilot,
         is_openrouter: state.config.is_openrouter,
         is_starter: state.config.is_starter,
-        is_joycode: state.config.is_joycode,
         copilot_tokens: state.copilot_tokens.clone(),
         accounting: state.usage_sink.is_some(),
     }

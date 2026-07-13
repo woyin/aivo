@@ -2866,13 +2866,11 @@ impl KeysCommand {
         // 'aivo keys add joycode --key <ptKey>' → manual ptKey validation.
         let is_joycode_name =
             name.eq_ignore_ascii_case("joycode") && add_options.base_url.is_none();
-        if is_joycode_name && add_options.key.is_none() {
+        if is_joycode_name {
+            if let Some(key) = add_options.key {
+                return self.add_joycode_manual(&name, key).await;
+            }
             return self.add_joycode_interactive(&name).await;
-        }
-        if is_joycode_name && add_options.key.is_some() {
-            return self
-                .add_joycode_manual(&name, add_options.key.unwrap())
-                .await;
         }
         let interactive =
             add_options.base_url.is_none() && add_options.key.is_none() && !is_starter_name;

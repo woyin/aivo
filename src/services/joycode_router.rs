@@ -103,18 +103,18 @@ fn request_url(endpoint: &str, color_base_url: &str, master_base_url: &str) -> S
     if let Some(ep) = endpoints.get(endpoint) {
         if !color_base_url.is_empty() {
             // Color gateway mode with HMAC signing
-            if let Ok(parsed) = url::Url::parse(color_base_url) {
-                if !parsed.host_str().unwrap_or("").is_empty() {
-                    let (query, sign) = color_sign(ep.function_id);
-                    return format!(
-                        "{}://{}{}?{}&sign={}",
-                        parsed.scheme(),
-                        parsed.host_str().unwrap(),
-                        COLOR_GATEWAY_PATH,
-                        query,
-                        sign
-                    );
-                }
+            if let Ok(parsed) = url::Url::parse(color_base_url)
+                && !parsed.host_str().unwrap_or("").is_empty()
+            {
+                let (query, sign) = color_sign(ep.function_id);
+                return format!(
+                    "{}://{}{}?{}&sign={}",
+                    parsed.scheme(),
+                    parsed.host_str().unwrap(),
+                    COLOR_GATEWAY_PATH,
+                    query,
+                    sign
+                );
             }
         }
         // Direct v2 mode
@@ -196,6 +196,7 @@ fn joycode_headers(pt_key: &str, login_type: &str) -> reqwest::header::HeaderMap
 }
 
 /// Build Anthropic-compatible headers for JoyCode.
+#[allow(dead_code)]
 fn joycode_anthropic_headers(pt_key: &str, login_type: &str) -> reqwest::header::HeaderMap {
     let mut headers = joycode_headers(pt_key, login_type);
     if login_type.is_empty() {

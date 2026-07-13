@@ -36,7 +36,6 @@ pub(crate) struct UpstreamRequestContext {
     pub(crate) is_copilot: bool,
     pub(crate) is_openrouter: bool,
     pub(crate) is_starter: bool,
-    pub(crate) is_joycode: bool,
     pub(crate) copilot_tokens: Option<Arc<CopilotTokenManager>>,
     /// Usage accounting is on — streamed OpenAI requests must ask for the
     /// trailing usage chunk or the sniffer records zero for the turn.
