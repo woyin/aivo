@@ -554,7 +554,10 @@ const CURSOR_INFO: (&str, &str) = (
 );
 const OLLAMA_INFO: (&str, &str) = ("Ollama", "install: ollama.com/download");
 const STARTER_INFO: (&str, &str) = ("aivo starter", "free shared key, no signup needed");
-const JOYCODE_INFO: (&str, &str) = ("JoyCode (JD)", "scan QR code with JD app to get ptKey");
+const JOYCODE_INFO: (&str, &str) = (
+    "JoyCode (JD)",
+    "browser login — key is obtained automatically",
+);
 
 fn format_picker_choice(label: &str, hint: &str) -> String {
     format!(
@@ -2228,20 +2231,41 @@ impl KeysCommand {
         keys_ui::provider_info(JOYCODE_INFO.0, JOYCODE_INFO.1);
         let final_name = if name.is_empty() { "joycode" } else { name };
 
-        let pt_key = loop {
-            let input = term_read_line(&format!("{} {}: ", style::dim("·"), "ptKey"))
-                .map_err(|e| anyhow::anyhow!("failed to read ptKey: {e}"))?;
-            let trimmed = input.trim().to_string();
-            if !trimmed.is_empty() {
-                break trimmed;
+        keys_ui::step_header(3, 3, "Sign in", "browser will open for JoyCode login");
+
+        let creds = match crate::services::joycode_auth::browser_login(&|msg| {
+            eprintln!("{} {}", style::dim("·"), msg);
+        })
+        .await
+        {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("{} JoyCode login failed: {}", style::red("Error:"), e);
+                eprintln!(
+                    "  {} Use 'aivo keys add joycode --key <ptKey>' to add manually.",
+                    style::dim("hint:"),
+                );
+                return Ok(ExitCode::UserError);
             }
-            eprintln!(
-                "{} ptKey is required (from JoyCode IDE / browser)",
-                style::red("Error:")
-            );
         };
 
-        self.add_joycode_with_key(final_name, &pt_key).await
+        let key_json = creds
+            .to_key_json()
+            .map_err(|e| anyhow::anyhow!("serialize credential: {e}"))?;
+
+        let id = self
+            .session_store
+            .add_key_with_protocol(final_name, "https://joycode-api.jd.com", None, &key_json)
+            .await?;
+
+        self.finalize_add(
+            &id,
+            final_name,
+            &format!("JoyCode user: {}", creds.user_id),
+            Some(("aivo claude", "")),
+        )
+        .await?;
+        Ok(ExitCode::Success)
     }
 
     async fn add_joycode_manual(&self, name: &str, pt_key: &str) -> Result<ExitCode> {
