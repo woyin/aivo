@@ -810,6 +810,35 @@ pub struct ChatToggles {
     /// aivo's hosted web_search (`/config`). Defaults off (opt-in).
     pub web_search_enabled: bool,
     pub agent_tools_enabled: bool,
+    /// Chat TUI color theme (`/config`). `None` = the user has never picked one,
+    /// so startup auto-detects from the terminal background (falling back to dark);
+    /// `Some` = an explicit choice that's always honored.
+    pub theme: Option<ChatTheme>,
+}
+
+/// Persisted chat TUI color theme (`"theme"` in code-prefs.json).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ChatTheme {
+    #[default]
+    Dark,
+    Light,
+}
+
+impl ChatTheme {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Dark => "dark",
+            Self::Light => "light",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "dark" => Some(Self::Dark),
+            "light" => Some(Self::Light),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -2067,7 +2096,22 @@ impl SessionStore {
             thinking_enabled,
             web_search_enabled: bool_or("useWebSearch", false),
             agent_tools_enabled: bool_or("agentTools", true),
+            // Absent or unparseable → None, so startup auto-detects.
+            theme: prefs
+                .get("theme")
+                .and_then(|v| v.as_str())
+                .and_then(ChatTheme::parse),
         }
+    }
+
+    /// Persist the chat TUI color theme (`dark` / `light`).
+    pub async fn set_chat_theme(&self, theme: ChatTheme) -> Result<()> {
+        let mut prefs = self.read_code_prefs().await;
+        prefs.insert(
+            "theme".to_string(),
+            serde_json::Value::String(theme.as_str().to_string()),
+        );
+        self.write_code_prefs(&prefs).await
     }
 
     /// code-prefs.json as a JSON object (empty when absent/unparseable), for a
@@ -2988,6 +3032,29 @@ mod tests {
         assert!(store.get_chat_auto_approve().await);
         store.set_chat_thinking_enabled(true).await.unwrap();
         assert!(store.get_chat_thinking_enabled().await);
+    }
+
+    #[tokio::test]
+    async fn chat_theme_persists_and_defaults_unset() {
+        let temp_dir = TempDir::new().unwrap();
+        let config_path = temp_dir.path().join("config.json");
+        let store = SessionStore::with_path(config_path);
+
+        // Never set → None, so startup auto-detects rather than forcing dark.
+        assert_eq!(store.get_chat_toggles().await.theme, None);
+
+        store.set_chat_theme(ChatTheme::Light).await.unwrap();
+        assert_eq!(store.get_chat_toggles().await.theme, Some(ChatTheme::Light));
+        let prefs: serde_json::Value = serde_json::from_slice(
+            &tokio::fs::read(crate::services::paths::code_prefs(temp_dir.path()))
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(prefs["theme"], serde_json::json!("light"));
+
+        store.set_chat_theme(ChatTheme::Dark).await.unwrap();
+        assert_eq!(store.get_chat_toggles().await.theme, Some(ChatTheme::Dark));
     }
 
     #[tokio::test]

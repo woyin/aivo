@@ -93,7 +93,7 @@ impl CodeTuiApp {
             } else {
                 format!("{} has no reasoning-effort levels", self.model)
             };
-            self.notice = Some((MUTED, msg));
+            self.notice = Some((MUTED(), msg));
             return;
         }
         match arg.map(|s| s.trim().to_ascii_lowercase()) {
@@ -102,7 +102,7 @@ impl CodeTuiApp {
             }
             Some(level) => {
                 self.notice = Some((
-                    ERROR,
+                    ERROR(),
                     format!(
                         "unknown effort '{level}' (choose: {})",
                         self.model_reasoning_efforts.join(", ")
@@ -146,7 +146,7 @@ impl CodeTuiApp {
             && !self.model_reasoning_efforts.contains(&level)
         {
             self.notice = Some((
-                ERROR,
+                ERROR(),
                 format!(
                     "'{level}' isn't a level for {} (choose: {})",
                     self.model,
@@ -163,7 +163,7 @@ impl CodeTuiApp {
         if !self.thinking_enabled {
             self.set_thinking_enabled(true).await;
         }
-        self.notice = Some((MUTED, format!("reasoning effort: {level}")));
+        self.notice = Some((MUTED(), format!("reasoning effort: {level}")));
     }
 
     /// The effort the engine will request: the user's `/effort` choice, else —
@@ -198,7 +198,7 @@ impl CodeTuiApp {
         } else {
             format!("Now using {name}")
         };
-        self.notice = Some((MUTED, msg));
+        self.notice = Some((MUTED(), msg));
         Ok(())
     }
 
@@ -313,7 +313,7 @@ is preserved."
             self.cursor_acp_session = None;
             self.persist_history().await?;
             self.notice = Some((
-                MUTED,
+                MUTED(),
                 format!(
                     "Switched key to {} — session preserved",
                     self.key.display_name()
@@ -380,7 +380,7 @@ is preserved."
     pub(super) async fn open_key_picker(&mut self, query: Option<String>) -> Result<()> {
         let keys = self.session_store.get_keys().await?;
         if keys.is_empty() {
-            self.notice = Some((ERROR, "No saved keys".to_string()));
+            self.notice = Some((ERROR(), "No saved keys".to_string()));
             return Ok(());
         }
 
@@ -428,7 +428,7 @@ is preserved."
             match pick {
                 Some(snapshot) => self.begin_resume_load(snapshot.clone()),
                 None => {
-                    self.notice = Some((MUTED, "No saved session in this directory".to_string()))
+                    self.notice = Some((MUTED(), "No saved session in this directory".to_string()))
                 }
             }
             return Ok(());
@@ -455,7 +455,7 @@ is preserved."
         // Empty scoped list → notice, not an unfilterable empty picker.
         if sessions.is_empty() {
             self.notice = Some((
-                MUTED,
+                MUTED(),
                 "No saved sessions in this directory to resume".to_string(),
             ));
             return Ok(());
@@ -580,6 +580,11 @@ is preserved."
         };
         let items = vec![
             ConfigToggle {
+                setting: ConfigSetting::Theme,
+                label: "Theme",
+                description: "color palette — Enter cycles dark ↔ light",
+            },
+            ConfigToggle {
                 setting: ConfigSetting::Thinking,
                 label: "Thinking",
                 description: thinking_desc,
@@ -610,8 +615,10 @@ is preserved."
 
     /// Whether `setting` is currently on — the single source of truth the `/config`
     /// renderer reads, so a row's checkbox can never drift from the live flag.
+    /// Theme is not a bool; the renderer uses [`Self::theme`] for its value marker.
     pub(super) fn config_setting_enabled(&self, setting: ConfigSetting) -> bool {
         match setting {
+            ConfigSetting::Theme => true,
             ConfigSetting::Thinking => self.thinking_enabled,
             ConfigSetting::AutoApprove => self.agent_auto_approve,
             ConfigSetting::ReviewEdits => self.agent_review_edits,
@@ -631,6 +638,7 @@ is preserved."
             return;
         };
         match setting {
+            ConfigSetting::Theme => self.cycle_theme().await,
             ConfigSetting::Thinking => self.set_thinking_enabled(!self.thinking_enabled).await,
             // Modes are exclusive: turning one on leaves the others.
             ConfigSetting::AutoApprove => {
@@ -661,6 +669,22 @@ is preserved."
                     .await
             }
         }
+    }
+
+    /// Cycle dark ↔ light, apply the palette immediately, and persist (best-effort).
+    /// Bumps `transcript_revision` so memoized spans (which embed resolved colors)
+    /// rebuild against the new palette.
+    pub(super) async fn cycle_theme(&mut self) {
+        let next = self.theme.cycle();
+        self.theme = next;
+        set_ui_theme(next);
+        self.transcript_revision = self.transcript_revision.wrapping_add(1);
+        self.show_toast(format!("Theme: {}", next.label()));
+        let persisted = match next {
+            UiTheme::Dark => crate::services::session_store::ChatTheme::Dark,
+            UiTheme::Light => crate::services::session_store::ChatTheme::Light,
+        };
+        let _ = self.session_store.set_chat_theme(persisted).await;
     }
 
     /// Set the thinking on/off flag and persist it (best-effort). Both transcript
@@ -806,7 +830,7 @@ is preserved."
             }
             _ => {
                 self.notice = Some((
-                    ERROR,
+                    ERROR(),
                     "Usage: /agents [rm <name>] — to create one, just ask (\"make me a code-reviewer subagent\")"
                         .to_string(),
                 ));
@@ -830,12 +854,12 @@ is preserved."
                 .into_iter()
                 .find(|s| s.name == name)
         else {
-            self.notice = Some((ERROR, format!("No sub-agent named “{name}”")));
+            self.notice = Some((ERROR(), format!("No sub-agent named “{name}”")));
             return Ok(());
         };
         if sa.is_builtin() {
             self.notice = Some((
-                ERROR,
+                ERROR(),
                 format!("“{name}” is built into aivo — shadow it with your own {name}.md instead"),
             ));
             return Ok(());
@@ -843,14 +867,14 @@ is preserved."
         let user_root = config_dir.join("agents");
         if !sa.repo_local && !sa.source.starts_with(&user_root) {
             self.notice = Some((
-                ERROR,
+                ERROR(),
                 format!("“{name}” ships with a pack — remove the pack instead (aivo code packs)"),
             ));
             return Ok(());
         }
         match std::fs::remove_file(&sa.source) {
             Ok(()) => {
-                self.notice = Some((MUTED, format!("Removed sub-agent “{name}”")));
+                self.notice = Some((MUTED(), format!("Removed sub-agent “{name}”")));
                 self.request_engine_rebuild();
                 // Refresh the open overlay so the row disappears immediately.
                 if matches!(self.overlay, Overlay::Agents(_)) {
@@ -858,7 +882,7 @@ is preserved."
                 }
             }
             Err(e) => {
-                self.notice = Some((ERROR, format!("Failed to remove “{name}”: {e}")));
+                self.notice = Some((ERROR(), format!("Failed to remove “{name}”: {e}")));
             }
         }
         Ok(())
@@ -889,7 +913,7 @@ is preserved."
         match verb {
             "add" => self.submit_skill_add(rest.to_string()).await,
             "remove" | "rm" if rest.is_empty() => {
-                self.notice = Some((ERROR, "Usage: /skills rm <name>".to_string()));
+                self.notice = Some((ERROR(), "Usage: /skills rm <name>".to_string()));
                 Ok(())
             }
             "remove" | "rm" => self.remove_skill_named(rest).await,
@@ -899,7 +923,7 @@ is preserved."
             }
             _ => {
                 self.notice = Some((
-                    ERROR,
+                    ERROR(),
                     "Usage: /skills [add [-p] <name>|<github:owner/repo> …] [rm <name>] [update [name]]"
                         .to_string(),
                 ));
@@ -956,7 +980,7 @@ is preserved."
         };
         if let Some(flag) = stray_flag {
             self.notice = Some((
-                ERROR,
+                ERROR(),
                 format!(
                     "Unknown option `{flag}` — only -p/--project is supported (at the start or end)"
                 ),
@@ -975,14 +999,14 @@ is preserved."
         let (name, description) = match parse_skill_add_input(&input) {
             Ok(parsed) => parsed,
             Err(msg) => {
-                self.notice = Some((ERROR, msg));
+                self.notice = Some((ERROR(), msg));
                 return Ok(());
             }
         };
         let root = match self.skills_dest_root(project) {
             Ok(root) => root,
             Err(e) => {
-                self.notice = Some((ERROR, format!("Failed to add skill: {e}")));
+                self.notice = Some((ERROR(), format!("Failed to add skill: {e}")));
                 return Ok(());
             }
         };
@@ -996,10 +1020,10 @@ is preserved."
                 if project {
                     notice.push_str(PROJECT_SKILL_NOTE);
                 }
-                self.notice = Some((MUTED, notice));
+                self.notice = Some((MUTED(), notice));
             }
             Err(e) => {
-                self.notice = Some((ERROR, format!("Failed to add skill: {e}")));
+                self.notice = Some((ERROR(), format!("Failed to add skill: {e}")));
                 return Ok(());
             }
         }
@@ -1035,13 +1059,13 @@ is preserved."
         project: bool,
     ) -> Result<()> {
         if self.installing_skill.is_some() {
-            self.notice = Some((WARNING, "A skill install is already running".to_string()));
+            self.notice = Some((WARNING(), "A skill install is already running".to_string()));
             return Ok(());
         }
         let dest_root = match self.skills_dest_root(project) {
             Ok(root) => root,
             Err(e) => {
-                self.notice = Some((ERROR, format!("Failed to install skill: {e}")));
+                self.notice = Some((ERROR(), format!("Failed to install skill: {e}")));
                 return Ok(());
             }
         };
@@ -1115,7 +1139,7 @@ is preserved."
                 }
                 self.notice = Some(install_report_notice(&source, project, &report));
             }
-            Err(e) => self.notice = Some((ERROR, format!("Failed to install skill: {e}"))),
+            Err(e) => self.notice = Some((ERROR(), format!("Failed to install skill: {e}"))),
         }
         if matches!(
             self.overlay,
@@ -1140,7 +1164,7 @@ is preserved."
             Overlay::None | Overlay::Skills(_) | Overlay::SkillInstall(_)
         ) {
             self.notice = Some((
-                WARNING,
+                WARNING(),
                 format!(
                     "`{source}` has {} skills — run `/skills add {source}` again to pick",
                     staged.skills.len()
@@ -1151,7 +1175,7 @@ is preserved."
         let dest_root = match self.skills_dest_root(project) {
             Ok(root) => root,
             Err(e) => {
-                self.notice = Some((ERROR, format!("Failed to install skill: {e}")));
+                self.notice = Some((ERROR(), format!("Failed to install skill: {e}")));
                 return Ok(());
             }
         };
@@ -1197,7 +1221,7 @@ is preserved."
         let dest_root = match self.skills_dest_root(project) {
             Ok(root) => root,
             Err(e) => {
-                self.notice = Some((ERROR, format!("Failed to install skill: {e}")));
+                self.notice = Some((ERROR(), format!("Failed to install skill: {e}")));
                 return self.open_skills_overlay().await;
             }
         };
@@ -1234,7 +1258,7 @@ is preserved."
     /// install roots (the repo's `.agents/skills` and the user dir).
     pub(super) async fn update_skills_command(&mut self, name: Option<String>) -> Result<()> {
         if self.installing_skill.is_some() {
-            self.notice = Some((WARNING, "A skill install is already running".to_string()));
+            self.notice = Some((WARNING(), "A skill install is already running".to_string()));
             return Ok(());
         }
         // Project root first, matching discovery precedence: a name shadowed by
@@ -1299,7 +1323,7 @@ is preserved."
             .into_iter()
             .find(|s| s.name == name)
         else {
-            self.notice = Some((MUTED, format!("No skill named `{name}`")));
+            self.notice = Some((MUTED(), format!("No skill named `{name}`")));
             return Ok(());
         };
         let scope = crate::agent::skills::skill_scope(&skill.dir, cwd_path);
@@ -1317,7 +1341,7 @@ is preserved."
     ) -> Result<()> {
         if scope == crate::agent::skills::SkillScope::Project {
             self.notice = Some((
-                WARNING,
+                WARNING(),
                 format!(
                     "`{name}` is a project skill ({}) — delete that folder to remove it",
                     dir.display()
@@ -1330,9 +1354,9 @@ is preserved."
                 // Clear any leftover disabled flag so a re-add isn't stuck off.
                 self.session_store.set_skill_enabled(name, true).await.ok();
                 self.request_engine_rebuild();
-                self.notice = Some((MUTED, format!("Removed skill `{name}`")));
+                self.notice = Some((MUTED(), format!("Removed skill `{name}`")));
             }
-            Err(e) => self.notice = Some((ERROR, format!("Failed to remove skill: {e}"))),
+            Err(e) => self.notice = Some((ERROR(), format!("Failed to remove skill: {e}"))),
         }
         self.open_skills_overlay().await
     }
@@ -1429,7 +1453,7 @@ is preserved."
                 .set_project_mcp_approved(&dir_key, &digest)
                 .await
             {
-                self.notice = Some((ERROR, format!("Couldn't remember the approval: {e}")));
+                self.notice = Some((ERROR(), format!("Couldn't remember the approval: {e}")));
             }
         }
         // Drop the cached client/engine so the reconnect picks up the project
@@ -1524,7 +1548,7 @@ is preserved."
         let (command, args) = match parse_mcp_add_input(&input) {
             Ok(parsed) => parsed,
             Err(msg) => {
-                self.notice = Some((ERROR, msg));
+                self.notice = Some((ERROR(), msg));
                 return Ok(());
             }
         };
@@ -1555,7 +1579,7 @@ is preserved."
             crate::agent::mcp::add_user_server(&name, &command, &args).await
         };
         if let Err(e) = write {
-            self.notice = Some((ERROR, format!("Failed to add MCP server: {e}")));
+            self.notice = Some((ERROR(), format!("Failed to add MCP server: {e}")));
             return Ok(());
         }
         // A freshly added server starts enabled, even if a same-name one had been
@@ -1567,11 +1591,11 @@ is preserved."
         if project {
             self.allow_self_added_project_stdio();
             self.notice = Some((
-                MUTED,
+                MUTED(),
                 format!("Added MCP server `{name}` → ./.mcp.json (project — commit it to share)"),
             ));
         } else {
-            self.notice = Some((MUTED, format!("Added MCP server `{name}`")));
+            self.notice = Some((MUTED(), format!("Added MCP server `{name}`")));
         }
         self.reset_mcp_after_config_change();
         self.open_mcp_overlay().await
@@ -1593,7 +1617,7 @@ is preserved."
         let parsed = match crate::agent::mcp::parse_mcp_json(&input) {
             Ok(p) => p,
             Err(e) => {
-                self.notice = Some((ERROR, format!("Couldn't parse MCP config: {e}")));
+                self.notice = Some((ERROR(), format!("Couldn't parse MCP config: {e}")));
                 return Ok(());
             }
         };
@@ -1633,7 +1657,7 @@ is preserved."
                 crate::agent::mcp::add_user_server_value(&name, &value).await
             };
             if let Err(e) = write {
-                self.notice = Some((ERROR, format!("Failed to add `{name}`: {e}")));
+                self.notice = Some((ERROR(), format!("Failed to add `{name}`: {e}")));
                 self.reset_mcp_after_config_change();
                 return self.open_mcp_overlay().await;
             }
@@ -1664,7 +1688,7 @@ is preserved."
             ""
         };
         self.notice = Some((
-            MUTED,
+            MUTED(),
             format!("Added {label}: {}{suffix}", added.join(", ")),
         ));
         self.reset_mcp_after_config_change();
@@ -1730,7 +1754,7 @@ is preserved."
         };
         if rows.is_empty() {
             self.notice = Some((
-                WARNING,
+                WARNING(),
                 "Nothing marked — Space marks a server to add".to_string(),
             ));
             return Ok(());
@@ -1755,7 +1779,7 @@ is preserved."
                 crate::agent::mcp::add_user_server_value(&row.name, &row.config).await
             };
             if let Err(e) = write {
-                self.notice = Some((ERROR, format!("Failed to add `{}`: {e}", row.name)));
+                self.notice = Some((ERROR(), format!("Failed to add `{}`: {e}", row.name)));
                 self.reset_mcp_after_config_change();
                 return self.open_mcp_overlay().await;
             }
@@ -1790,7 +1814,7 @@ is preserved."
         } else {
             ""
         };
-        self.notice = Some((MUTED, format!("{}{suffix}", parts.join(" · "))));
+        self.notice = Some((MUTED(), format!("{}{suffix}", parts.join(" · "))));
         self.reset_mcp_after_config_change();
         self.open_mcp_overlay().await
     }
@@ -1808,13 +1832,13 @@ is preserved."
         match verb {
             "add" => self.submit_mcp_add(rest.to_string()).await,
             "remove" | "rm" if rest.is_empty() => {
-                self.notice = Some((ERROR, "Usage: /mcp rm <name>".to_string()));
+                self.notice = Some((ERROR(), "Usage: /mcp rm <name>".to_string()));
                 Ok(())
             }
             "remove" | "rm" => self.remove_mcp_server_named(rest).await,
             _ => {
                 self.notice = Some((
-                    ERROR,
+                    ERROR(),
                     "Usage: /mcp [add <command> …] [rm <name>]".to_string(),
                 ));
                 Ok(())
@@ -1846,7 +1870,7 @@ is preserved."
             .find(|s| s.name == name)
             .map(|s| s.scope)
         else {
-            self.notice = Some((MUTED, format!("No MCP server named `{name}`")));
+            self.notice = Some((MUTED(), format!("No MCP server named `{name}`")));
             return Ok(());
         };
         self.remove_scoped_mcp_server(name, scope).await
@@ -1862,14 +1886,14 @@ is preserved."
     ) -> Result<()> {
         if scope == crate::agent::mcp::ServerScope::Project {
             self.notice = Some((
-                WARNING,
+                WARNING(),
                 format!("`{name}` is defined in .mcp.json — edit that file to remove it"),
             ));
             return Ok(());
         }
         if scope == crate::agent::mcp::ServerScope::Pack {
             self.notice = Some((
-                WARNING,
+                WARNING(),
                 format!(
                     "`{name}` is provided by an installed pack — remove it with `aivo code packs rm`"
                 ),
@@ -1883,11 +1907,11 @@ is preserved."
                     .set_mcp_server_enabled(name, true)
                     .await
                     .ok();
-                self.notice = Some((MUTED, format!("Removed MCP server `{name}`")));
+                self.notice = Some((MUTED(), format!("Removed MCP server `{name}`")));
                 self.reset_mcp_after_config_change();
             }
-            Ok(false) => self.notice = Some((MUTED, format!("`{name}` was not in mcp.json"))),
-            Err(e) => self.notice = Some((ERROR, format!("Failed to remove MCP server: {e}"))),
+            Ok(false) => self.notice = Some((MUTED(), format!("`{name}` was not in mcp.json"))),
+            Err(e) => self.notice = Some((ERROR(), format!("Failed to remove MCP server: {e}"))),
         }
         self.open_mcp_overlay().await
     }
@@ -2011,13 +2035,13 @@ is preserved."
             });
         let Some(details) = details else {
             self.notice = Some((
-                WARNING,
+                WARNING(),
                 format!("`{name}` isn't connected — its tools are unknown"),
             ));
             return;
         };
         if details.is_empty() {
-            self.notice = Some((MUTED, format!("`{name}` exposes no tools")));
+            self.notice = Some((MUTED(), format!("`{name}` exposes no tools")));
             return;
         }
         let items: Vec<McpToolRow> = details
@@ -2092,7 +2116,7 @@ is preserved."
             _ => return,
         };
         if !any_failed {
-            self.notice = Some((MUTED, "No failed MCP servers to retry".to_string()));
+            self.notice = Some((MUTED(), "No failed MCP servers to retry".to_string()));
             return;
         }
         self.reconnect_mcp_preserving_for_overlay();
@@ -2257,7 +2281,7 @@ is preserved."
         };
         if !remote {
             self.notice = Some((
-                WARNING,
+                WARNING(),
                 format!("`{name}` is a stdio server — OAuth applies only to HTTP (url) servers"),
             ));
             return Ok(());
@@ -2276,12 +2300,12 @@ is preserved."
         let url = match crate::agent::mcp::expand_env_refs(&url) {
             Ok(u) => u,
             Err(e) => {
-                self.notice = Some((WARNING, format!("`{name}`: {e}")));
+                self.notice = Some((WARNING(), format!("`{name}`: {e}")));
                 return;
             }
         };
         self.notice = Some((
-            MUTED,
+            MUTED(),
             format!("Authorizing `{name}` — a browser window should open…"),
         ));
         let tx = self.tx.clone();
@@ -2314,15 +2338,15 @@ is preserved."
         };
         match crate::services::mcp_token_store::remove(&name).await {
             Ok(true) => {
-                self.notice = Some((MUTED, format!("Signed out of `{name}`")));
+                self.notice = Some((MUTED(), format!("Signed out of `{name}`")));
                 self.reset_mcp_after_config_change();
                 self.restart_mcp_connect_for_overlay();
             }
             Ok(false) => {
-                self.notice = Some((MUTED, format!("`{name}` had no stored credentials")));
+                self.notice = Some((MUTED(), format!("`{name}` had no stored credentials")));
             }
             Err(e) => {
-                self.notice = Some((ERROR, format!("Failed to sign out of `{name}`: {e}")));
+                self.notice = Some((ERROR(), format!("Failed to sign out of `{name}`: {e}")));
             }
         }
         Ok(())
@@ -2359,7 +2383,7 @@ is preserved."
                     } else {
                         format!("Now using {model}")
                     };
-                    self.notice = Some((MUTED, msg));
+                    self.notice = Some((MUTED(), msg));
                 }
                 ModelSelectionTarget::KeySwitch(key) => {
                     self.complete_key_switch(key, model).await?
@@ -2408,7 +2432,7 @@ is preserved."
             .delete_chat_session(&session.session_id)
             .await?;
         if !removed {
-            self.notice = Some((ERROR, "Saved session no longer exists".to_string()));
+            self.notice = Some((ERROR(), "Saved session no longer exists".to_string()));
             return Ok(false);
         }
 
@@ -2425,14 +2449,14 @@ is preserved."
             let filtered_len = picker.filtered_items().len();
             if filtered_len == 0 {
                 self.overlay = Overlay::None;
-                self.notice = Some((MUTED, "Saved session deleted".to_string()));
+                self.notice = Some((MUTED(), "Saved session deleted".to_string()));
                 return Ok(false);
             }
 
             picker.selected = picker.selected.min(filtered_len.saturating_sub(1));
         }
 
-        self.notice = Some((MUTED, "Saved session deleted".to_string()));
+        self.notice = Some((MUTED(), "Saved session deleted".to_string()));
         Ok(false)
     }
 
@@ -2869,11 +2893,11 @@ pub(super) fn install_report_notice(
     let updated = &report.updated;
     let skipped = &report.skipped_existing;
     if installed.is_empty() && updated.is_empty() && skipped.is_empty() {
-        return (WARNING, format!("No skills found in `{source}`"));
+        return (WARNING(), format!("No skills found in `{source}`"));
     }
     if installed.is_empty() && updated.is_empty() {
         return (
-            WARNING,
+            WARNING(),
             format!("Already installed: {}", skipped.join(", ")),
         );
     }
@@ -2903,7 +2927,7 @@ pub(super) fn install_report_notice(
     if project {
         msg.push_str(PROJECT_SKILL_NOTE);
     }
-    (MUTED, msg)
+    (MUTED(), msg)
 }
 
 /// Map a connect-time per-server outcome to the overlay's `(status, health)`

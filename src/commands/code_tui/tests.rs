@@ -149,19 +149,19 @@ fn test_composer_highlights_shell_command_draft() {
     app.draft = "hello".to_string();
     app.cursor = app.draft.len();
     let line = app.render_composer_text().lines[0].clone();
-    assert_eq!(line.spans[1].style.fg, Some(TEXT));
+    assert_eq!(line.spans[1].style.fg, Some(TEXT()));
 
     // A `!cmd` draft is tinted in the magenta shell hue to signal shell mode.
     app.draft = "!ls -la".to_string();
     app.cursor = app.draft.len();
     let line = app.render_composer_text().lines[0].clone();
-    assert_eq!(line.spans[1].style.fg, Some(SHELL));
+    assert_eq!(line.spans[1].style.fg, Some(SHELL()));
 
     // `!!` is the literal-`!` escape (sent to the model), not shell mode.
     app.draft = "!!not a command".to_string();
     app.cursor = app.draft.len();
     let line = app.render_composer_text().lines[0].clone();
-    assert_eq!(line.spans[1].style.fg, Some(TEXT));
+    assert_eq!(line.spans[1].style.fg, Some(TEXT()));
 }
 
 #[test]
@@ -369,7 +369,7 @@ async fn test_account_login_card_flow_and_stale_generation() {
 
     // Stand in for `run_login_command` (no network poll): notice, no card yet.
     app.account_gen = 7;
-    app.notice = Some((MUTED, "Starting sign-in…".to_string()));
+    app.notice = Some((MUTED(), "Starting sign-in…".to_string()));
     assert!(app.account_login.is_none());
 
     // The device code + URL arrive → the card appears, notice cleared.
@@ -1502,6 +1502,7 @@ fn make_test_app(
         thinking_enabled: true,
         web_search_enabled: true,
         agent_tools_enabled: true,
+        theme: UiTheme::Dark,
         model_supports_thinking: true,
         model_image_input: None,
         cursor_effort_label: None,
@@ -1762,22 +1763,22 @@ fn test_composer_empty_lines_align_with_cursor_position() {
     // ratatui WordWrapper producing extra visual rows for whitespace-only Lines.
     let lines = vec![
         Line::from(vec![
-            Span::styled("> ", Style::default().fg(USER)),
-            Span::styled("hello", Style::default().fg(TEXT)),
+            Span::styled("> ", Style::default().fg(USER())),
+            Span::styled("hello", Style::default().fg(TEXT())),
         ]),
         Line::from(vec![
             Span::raw("  "),
-            Span::styled("hel", Style::default().fg(TEXT)),
+            Span::styled("hel", Style::default().fg(TEXT())),
         ]),
         Line::from(vec![
             Span::raw("  "),
-            Span::styled("sadf", Style::default().fg(TEXT)),
+            Span::styled("sadf", Style::default().fg(TEXT())),
         ]),
         Line::from(""),
         Line::from(""),
         Line::from(vec![
             Span::raw("  "),
-            Span::styled("dsf", Style::default().fg(TEXT)),
+            Span::styled("dsf", Style::default().fg(TEXT())),
         ]),
     ];
     let paragraph = Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false });
@@ -2037,7 +2038,7 @@ async fn effort_command_sets_level_enables_thinking_and_validates() {
     // An unknown level errors and leaves the choice unchanged.
     app.run_effort_command(Some("bogus".into())).await;
     assert_eq!(app.reasoning_effort.as_deref(), Some("high"));
-    assert!(matches!(app.notice, Some((ERROR, _))));
+    assert!(app.notice.as_ref().is_some_and(|(c, _)| *c == ERROR()));
 
     // Bare `/effort` opens the picker of the model's levels.
     app.run_effort_command(None).await;
@@ -2057,7 +2058,7 @@ async fn effort_command_noop_when_model_has_no_levels() {
         matches!(app.overlay, Overlay::None),
         "no picker without levels"
     );
-    assert!(matches!(app.notice, Some((MUTED, _))));
+    assert!(app.notice.as_ref().is_some_and(|(c, _)| *c == MUTED()));
 }
 
 #[tokio::test]
@@ -2070,14 +2071,86 @@ async fn test_config_overlay_toggles_thinking() {
     let Overlay::Config(state) = &app.overlay else {
         panic!("expected config overlay");
     };
-    // First row is "Thinking"; its rendered state reads the live flag.
-    assert_eq!(state.items[0].setting, ConfigSetting::Thinking);
+    let idx = state
+        .items
+        .iter()
+        .position(|i| i.setting == ConfigSetting::Thinking)
+        .expect("Thinking row present");
     assert!(app.config_setting_enabled(ConfigSetting::Thinking));
 
     // Toggling it flips the live flag (the renderer derives the checkbox from it).
-    app.toggle_config_setting(0).await;
+    app.toggle_config_setting(idx).await;
     assert!(!app.thinking_enabled);
     assert!(!app.config_setting_enabled(ConfigSetting::Thinking));
+}
+
+#[tokio::test]
+async fn test_config_overlay_cycles_theme() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    assert_eq!(app.theme, UiTheme::Dark);
+    assert_eq!(ui_theme(), UiTheme::Dark);
+    assert_eq!(TEXT(), Palette::DARK.text);
+
+    app.open_config_overlay();
+    let Overlay::Config(state) = &app.overlay else {
+        panic!("expected config overlay");
+    };
+    assert_eq!(state.items[0].setting, ConfigSetting::Theme);
+
+    app.toggle_config_setting(0).await;
+    assert_eq!(app.theme, UiTheme::Light);
+    assert_eq!(ui_theme(), UiTheme::Light);
+    assert_eq!(TEXT(), Palette::LIGHT.text);
+
+    // Light mode paints the warm-paper canvas across the whole screen so dark ink
+    // stays readable even on a dark terminal; dark mode keeps the terminal's own bg.
+    let canvas = Palette::LIGHT.canvas.expect("light theme fills the canvas");
+    assert!(
+        Palette::DARK.canvas.is_none(),
+        "dark theme keeps the terminal bg"
+    );
+    {
+        use ratatui::backend::TestBackend;
+        let mut terminal = Terminal::new(TestBackend::new(60, 12)).unwrap();
+        terminal.draw(|frame| app.render(frame)).unwrap();
+        // The floating transcript/overlay regions are `Clear`ed and must be
+        // repainted with the canvas, not left on the terminal's native bg — so the
+        // paper reaches the interior, not just the uncleared margins. A strong
+        // majority of cells should carry the canvas fill.
+        let cells = terminal.backend().buffer().content();
+        let on_canvas = cells.iter().filter(|c| c.bg == canvas).count();
+        assert!(
+            on_canvas * 2 > cells.len(),
+            "light canvas must fill cleared regions ({on_canvas}/{} cells)",
+            cells.len()
+        );
+    }
+
+    app.toggle_config_setting(0).await;
+    assert_eq!(app.theme, UiTheme::Dark);
+    assert_eq!(ui_theme(), UiTheme::Dark);
+}
+
+#[test]
+fn resolve_startup_theme_prefers_explicit_then_detected() {
+    use crate::services::session_store::ChatTheme;
+    // An explicit stored choice always wins — detection is ignored.
+    assert_eq!(
+        resolve_startup_theme(Some(ChatTheme::Light), Some(UiTheme::Dark)),
+        UiTheme::Light
+    );
+    assert_eq!(
+        resolve_startup_theme(Some(ChatTheme::Dark), Some(UiTheme::Light)),
+        UiTheme::Dark
+    );
+    // Unset (first launch) falls back to the detected terminal background…
+    assert_eq!(
+        resolve_startup_theme(None, Some(UiTheme::Light)),
+        UiTheme::Light
+    );
+    // …and to dark when detection found nothing (unsupported terminal / timeout).
+    assert_eq!(resolve_startup_theme(None, None), UiTheme::Dark);
 }
 
 #[tokio::test]
@@ -2208,7 +2281,7 @@ fn test_thinking_block_has_distinct_bar_color() {
         thinking_bar, None,
         "thinking block is barless so it recedes as ephemeral meta"
     );
-    assert_eq!(answer_bar, Some(ACCENT), "answer uses the accent bar");
+    assert_eq!(answer_bar, Some(ACCENT()), "answer uses the accent bar");
     assert_ne!(thinking_bar, answer_bar);
 }
 
@@ -2474,7 +2547,7 @@ fn test_footer_status_label_is_token_count_without_window() {
     // lives in the transcript, not the footer corner.
     let (label, color) = app.footer_status_label();
     assert_eq!(label, "~5.1k tokens");
-    assert_eq!(color, MUTED);
+    assert_eq!(color, MUTED());
 
     app.sending = true;
     assert_eq!(app.footer_status_label().0, "~5.1k tokens");
@@ -2490,7 +2563,7 @@ fn test_footer_status_label_shows_window_on_pristine_session() {
     // The welcome screen shows the window size, not an empty `0/1M` meter.
     let (label, color) = app.footer_status_label();
     assert_eq!(label, "1M context");
-    assert_eq!(color, MUTED);
+    assert_eq!(color, MUTED());
 
     // The first tokens flip it to the live gauge.
     app.context_tokens = 50_000;
@@ -2509,13 +2582,13 @@ fn test_footer_status_label_shows_context_utilization() {
     // used/window, quiet until it nears the limit.
     let (label, color) = app.footer_status_label();
     assert_eq!(label, "10k/200k");
-    assert_eq!(color, MUTED);
+    assert_eq!(color, MUTED());
 
     // Warms toward the window limit (compaction territory).
     app.context_tokens = 170_000; // 85%
-    assert_eq!(app.footer_status_label().1, WARNING);
+    assert_eq!(app.footer_status_label().1, WARNING());
     app.context_tokens = 195_000; // 97%
-    assert_eq!(app.footer_status_label().1, ERROR);
+    assert_eq!(app.footer_status_label().1, ERROR());
 
     // A measured last-turn total wins over the chars/4 estimate.
     app.last_usage = Some(TokenUsage {
@@ -2617,7 +2690,7 @@ fn test_footer_mcp_label_reflects_aggregate_health() {
     )));
     assert_eq!(
         app.footer_mcp_label().unwrap(),
-        ("mcp:2".to_string(), MUTED)
+        ("mcp:2".to_string(), MUTED())
     );
 
     app.mcp_client = Some(std::sync::Arc::new(McpClient::with_state_for_tests(
@@ -2626,7 +2699,7 @@ fn test_footer_mcp_label_reflects_aggregate_health() {
     )));
     assert_eq!(
         app.footer_mcp_label().unwrap(),
-        ("mcp:2!".to_string(), ERROR)
+        ("mcp:2!".to_string(), ERROR())
     );
 
     // OAuth-pending with nothing failed is WARNING, not ERROR.
@@ -2636,7 +2709,7 @@ fn test_footer_mcp_label_reflects_aggregate_health() {
     )));
     assert_eq!(
         app.footer_mcp_label().unwrap(),
-        ("mcp:2!".to_string(), WARNING)
+        ("mcp:2!".to_string(), WARNING())
     );
 }
 
@@ -3304,13 +3377,16 @@ async fn test_agent_error_notice_uses_error_color() {
         .send(RuntimeEvent::AgentError("LLM error: 429".to_string()))
         .unwrap();
     app.handle_runtime_events().await.unwrap();
-    assert_eq!(app.notice, Some((ERROR, "LLM error: 429".to_string())));
+    assert_eq!(app.notice, Some((ERROR(), "LLM error: 429".to_string())));
     // An ordinary notice stays neutral.
     app.tx
         .send(RuntimeEvent::AgentNotice("compacting context…".to_string()))
         .unwrap();
     app.handle_runtime_events().await.unwrap();
-    assert_eq!(app.notice, Some((MUTED, "compacting context…".to_string())));
+    assert_eq!(
+        app.notice,
+        Some((MUTED(), "compacting context…".to_string()))
+    );
 }
 
 #[tokio::test]
@@ -3384,7 +3460,7 @@ async fn test_sandbox_escalation_notice_clears_on_next_output() {
     app.handle_runtime_events().await.unwrap();
     assert_eq!(
         app.notice,
-        Some((MUTED, SANDBOX_ESCALATION_NOTICE.to_string()))
+        Some((MUTED(), SANDBOX_ESCALATION_NOTICE.to_string()))
     );
     app.tx
         .send(RuntimeEvent::AgentToolCall {
@@ -3432,7 +3508,7 @@ async fn test_sandbox_escalation_notice_clears_on_next_output() {
     app.handle_runtime_events().await.unwrap();
     assert_eq!(
         app.notice,
-        Some((MUTED, "Queued — sends later".to_string())),
+        Some((MUTED(), "Queued — sends later".to_string())),
         "unrelated notice survives"
     );
 }
@@ -3805,15 +3881,15 @@ fn test_key_filter_does_not_match_across_full_url_path() {
 
 #[test]
 fn test_notice_display_prefixes_errors_only() {
-    let error = (ERROR, "boom".to_string());
-    let info = (MUTED, "ok".to_string());
+    let error = (ERROR(), "boom".to_string());
+    let info = (MUTED(), "ok".to_string());
 
     let displayed = notice_display(Some(&error)).unwrap();
-    assert_eq!(displayed.0, ERROR);
+    assert_eq!(displayed.0, ERROR());
     assert_eq!(displayed.1.as_ref(), "Error: boom");
 
     let displayed = notice_display(Some(&info)).unwrap();
-    assert_eq!(displayed.0, MUTED);
+    assert_eq!(displayed.0, MUTED());
     assert_eq!(displayed.1.as_ref(), "ok");
 
     assert!(notice_display(None).is_none());
@@ -4608,7 +4684,7 @@ fn test_streaming_composed_render_matches_full_transcript() {
     app.pending_response =
         "Streaming this answer now, with another long line that should wrap across the pane."
             .to_string();
-    app.notice = Some((MUTED, "compacting context…".to_string()));
+    app.notice = Some((MUTED(), "compacting context…".to_string()));
 
     // Render through the split path; the hitbox carries the full composed row set.
     let mut terminal = Terminal::new(TestBackend::new(40, 24)).unwrap();
@@ -4660,7 +4736,7 @@ fn streaming_reply_cache_invalidates_on_change() {
     let mut terminal = Terminal::new(TestBackend::new(40, 24)).unwrap();
     for (reply, notice) in states {
         app.pending_response = reply.to_string();
-        app.notice = notice.map(|t| (MUTED, t.to_string()));
+        app.notice = notice.map(|t| (MUTED(), t.to_string()));
         terminal
             .draw(|frame| {
                 app.render_main(frame, frame.area());
@@ -4742,10 +4818,10 @@ fn test_wrap_transcript_carries_bar_color_per_row() {
         line: Line::from("alpha beta gamma delta"),
         plain: "alpha beta gamma delta".to_string(),
     }];
-    let wrapped = wrap_transcript(&lines, &[Some(TOOL)], 8);
+    let wrapped = wrap_transcript(&lines, &[Some(TOOL())], 8);
     assert!(wrapped.rows.len() >= 3);
     // Every wrapped row inherits the source line's bar color.
-    assert!(wrapped.bars.iter().all(|b| *b == Some(TOOL)));
+    assert!(wrapped.bars.iter().all(|b| *b == Some(TOOL())));
     assert_eq!(wrapped.rows.len(), wrapped.bars.len());
 }
 
@@ -4757,10 +4833,10 @@ fn test_wrap_transcript_fills_background_to_full_width() {
     let diff = vec![StyledLine {
         line: Line::from(vec![
             Span::styled("  ".to_string(), Style::default()),
-            Span::styled(" + ".to_string(), Style::default().bg(DIFF_ADD_BG)),
+            Span::styled(" + ".to_string(), Style::default().bg(DIFF_ADD_BG())),
             Span::styled(
                 "let very long added line".to_string(),
-                Style::default().bg(DIFF_ADD_BG),
+                Style::default().bg(DIFF_ADD_BG()),
             ),
         ]),
         plain: "   + let very long added line".to_string(),
@@ -4778,14 +4854,14 @@ fn test_wrap_transcript_fills_background_to_full_width() {
     for line in &wrapped.text.lines {
         assert_eq!(
             line.spans.last().and_then(|s| s.style.bg),
-            Some(DIFF_ADD_BG)
+            Some(DIFF_ADD_BG())
         );
     }
 
     // A plain line (no trailing background) is never padded — only opted-in tinted
     // rows gain a background.
     let plain = vec![StyledLine {
-        line: Line::from(Span::styled("hi".to_string(), Style::default().fg(TEXT))),
+        line: Line::from(Span::styled("hi".to_string(), Style::default().fg(TEXT()))),
         plain: "hi".to_string(),
     }];
     let wrapped = wrap_transcript(&plain, &[None], 12);
@@ -4813,10 +4889,14 @@ fn test_edit_diff_rows_carry_add_remove_tints() {
     };
     assert_eq!(
         bg_of("- let x = 1;"),
-        Some(DIFF_DEL_BG),
+        Some(DIFF_DEL_BG()),
         "removed line tint"
     );
-    assert_eq!(bg_of("+ let x = 2;"), Some(DIFF_ADD_BG), "added line tint");
+    assert_eq!(
+        bg_of("+ let x = 2;"),
+        Some(DIFF_ADD_BG()),
+        "added line tint"
+    );
 }
 
 #[test]
@@ -4843,22 +4923,22 @@ fn test_edit_diff_word_highlight_brightens_only_changed_tokens() {
     // run of the line keeps the base tint (the intra-line word diff).
     assert_eq!(
         span_bg("- let x = 1;", "1"),
-        Some(DIFF_DEL_HL_BG),
+        Some(DIFF_DEL_HL_BG()),
         "changed token emphasised on the removed line"
     );
     assert_eq!(
         span_bg("- let x = 1;", "let x = "),
-        Some(DIFF_DEL_BG),
+        Some(DIFF_DEL_BG()),
         "common run stays at the base tint"
     );
     assert_eq!(
         span_bg("+ let x = 2;", "2"),
-        Some(DIFF_ADD_HL_BG),
+        Some(DIFF_ADD_HL_BG()),
         "changed token emphasised on the added line"
     );
     assert_eq!(
         span_bg("+ let x = 2;", "let x = "),
-        Some(DIFF_ADD_BG),
+        Some(DIFF_ADD_BG()),
         "common run stays at the base tint"
     );
 }
@@ -4924,8 +5004,12 @@ fn test_edit_diff_shows_context_only_marks_changed_lines() {
     assert!(find("}").is_some(), "trailing context line missing");
 
     // Only the genuinely changed line is flagged on each side.
-    assert_eq!(bg_of("- "), Some(DIFF_DEL_BG), "old line removed + tinted");
-    assert_eq!(bg_of("+ "), Some(DIFF_ADD_BG), "new line added + tinted");
+    assert_eq!(
+        bg_of("- "),
+        Some(DIFF_DEL_BG()),
+        "old line removed + tinted"
+    );
+    assert_eq!(bg_of("+ "), Some(DIFF_ADD_BG()), "new line added + tinted");
     assert!(find("- ").unwrap().plain.contains("let y = 2;"));
     assert!(find("+ ").unwrap().plain.contains("let y = 20;"));
     // The unchanged lines are NOT duplicated as removed/added.
@@ -5597,14 +5681,14 @@ fn test_failed_tool_result_renders_in_error_hue() {
             .line
             .spans
             .iter()
-            .any(|s| s.style.fg == Some(ERROR))
+            .any(|s| s.style.fg == Some(ERROR()))
     );
     assert!(
         lines[0]
             .line
             .spans
             .iter()
-            .all(|s| s.style.fg != Some(FAINT))
+            .all(|s| s.style.fg != Some(FAINT()))
     );
 
     // A normal multi-line result stays neutral even when a line says "error:".
@@ -5617,8 +5701,8 @@ fn test_failed_tool_result_renders_in_error_hue() {
         None,
         false,
     );
-    assert!(ok[0].line.spans.iter().any(|s| s.style.fg == Some(FAINT)));
-    assert!(ok[0].line.spans.iter().all(|s| s.style.fg != Some(ERROR)));
+    assert!(ok[0].line.spans.iter().any(|s| s.style.fg == Some(FAINT())));
+    assert!(ok[0].line.spans.iter().all(|s| s.style.fg != Some(ERROR())));
 }
 
 #[test]
@@ -5639,7 +5723,7 @@ fn test_failed_bash_result_shows_exit_code_in_error_hue() {
             .line
             .spans
             .iter()
-            .any(|s| s.style.fg == Some(ERROR)),
+            .any(|s| s.style.fg == Some(ERROR())),
         "failed bash summary should carry the error hue"
     );
 
@@ -5653,7 +5737,7 @@ fn test_failed_bash_result_shows_exit_code_in_error_hue() {
     let mut ok = Vec::new();
     render_tool_result(&mut ok, "a\nb\nc", "", Some("run_bash"), None, false);
     assert!(
-        ok[0].line.spans.iter().all(|s| s.style.fg != Some(ERROR)),
+        ok[0].line.spans.iter().all(|s| s.style.fg != Some(ERROR())),
         "clean bash output must not read as a failure"
     );
 }
@@ -6159,8 +6243,8 @@ fn test_build_transcript_renders_tool_steps() {
         .position(|l| l.contains("⎿ ▸ +3 lines"))
         .unwrap();
     assert_eq!(result_idx, call_idx + 1, "result should hug its call");
-    assert_eq!(transcript.bar_colors[call_idx], Some(TOOL));
-    assert_eq!(transcript.bar_colors[result_idx], Some(TOOL));
+    assert_eq!(transcript.bar_colors[call_idx], Some(TOOL()));
+    assert_eq!(transcript.bar_colors[result_idx], Some(TOOL()));
 }
 
 #[test]
@@ -6731,9 +6815,9 @@ fn test_render_main_paints_per_role_accent_gutter() {
         if cell.symbol() != "▌" {
             continue;
         }
-        if cell.fg == USER {
+        if cell.fg == USER() {
             user_bar_rows += 1;
-        } else if cell.fg == ACCENT {
+        } else if cell.fg == ACCENT() {
             assistant_bar_rows += 1;
         }
     }
@@ -7575,7 +7659,7 @@ fn test_highlight_does_not_wash_blank_cells_past_text() {
         let mut washed_cols = Vec::new();
         for x in area.x..area.x + area.width {
             let cell = buffer.cell((x, y)).unwrap();
-            if cell.bg == SELECT_WASH {
+            if cell.bg == SELECT_WASH() {
                 washed_cols.push(x);
                 if !cell.symbol().trim().is_empty() {
                     last_text_col = Some(x);
@@ -7961,7 +8045,7 @@ fn test_empty_state_notice_selects_via_screen_surface() {
         "https://s.getaivo.dev/s/uniqueurlzz",
     ));
     app.notice = Some((
-        LIVE,
+        LIVE(),
         format!("{LIVE_NOTICE_PREFIX}https://s.getaivo.dev/s/uniqueurlzz"),
     ));
     let (_, rows) = render_full_screen(&mut app, 80, 16);
@@ -7991,23 +8075,23 @@ fn test_notice_spans_splits_live_url_from_indicator() {
     // The share notice paints `● Sharing:` red but the URL a calm link color, so
     // the long line doesn't read as an error. Other notices stay a single span.
     let share = (
-        LIVE,
+        LIVE(),
         format!("{LIVE_NOTICE_PREFIX}https://s.getaivo.dev/s/abc"),
     );
     let spans = notice_spans(Some(&share)).unwrap();
     assert_eq!(spans.len(), 2);
     assert_eq!(spans[0].content.as_ref(), LIVE_NOTICE_PREFIX);
-    assert_eq!(spans[0].style.fg, Some(LIVE));
+    assert_eq!(spans[0].style.fg, Some(LIVE()));
     assert_eq!(spans[1].content.as_ref(), "https://s.getaivo.dev/s/abc");
-    assert_eq!(spans[1].style.fg, Some(LINK));
+    assert_eq!(spans[1].style.fg, Some(LINK()));
 
-    let plain = (MUTED, "just a status".to_string());
+    let plain = (MUTED(), "just a status".to_string());
     let spans = notice_spans(Some(&plain)).unwrap();
     assert_eq!(spans.len(), 1);
-    assert_eq!(spans[0].style.fg, Some(MUTED));
+    assert_eq!(spans[0].style.fg, Some(MUTED()));
 
     // ERROR keeps its `Error:` prefix and single span.
-    let err = (ERROR, "boom".to_string());
+    let err = (ERROR(), "boom".to_string());
     let spans = notice_spans(Some(&err)).unwrap();
     assert_eq!(spans.len(), 1);
     assert_eq!(spans[0].content.as_ref(), "Error: boom");
@@ -9136,8 +9220,12 @@ async fn test_plan_badge_on_composer_rule() {
             .find(|s| s.content.contains('─'))
             .and_then(|s| s.style.fg)
     };
-    assert_eq!(dash_color(&on), Some(ACCENT), "plan rule is accent-tinted");
-    assert_eq!(dash_color(&off), Some(FAINT), "default rule is faint");
+    assert_eq!(
+        dash_color(&on),
+        Some(ACCENT()),
+        "plan rule is accent-tinted"
+    );
+    assert_eq!(dash_color(&off), Some(FAINT()), "default rule is faint");
 }
 
 /// `/create-skill` is a first-class built-in command (in `SLASH_COMMANDS` and
@@ -9539,14 +9627,14 @@ async fn test_goal_stops_on_errored_turn() {
         reasoning_content: None,
         attachments: vec![],
     });
-    app.notice = Some((ERROR, "LLM error: insufficient credits".to_string()));
+    app.notice = Some((ERROR(), "LLM error: insufficient credits".to_string()));
 
     app.maybe_continue_goal().await.unwrap();
 
     assert!(app.goal_mode.is_none(), "an errored turn ends the loop");
     assert!(!app.sending, "no continuation was sent");
     let (style, msg) = app.notice.clone().unwrap();
-    assert_eq!(style, ERROR);
+    assert_eq!(style, ERROR());
     assert!(msg.contains("insufficient credits"), "error kept: {msg}");
     assert!(msg.contains("goal mode stopped"), "stop noted: {msg}");
 }
@@ -10792,7 +10880,7 @@ fn test_install_report_notice_wording() {
         },
     );
     assert_eq!(msg, "Already installed: c");
-    assert_eq!(color, WARNING);
+    assert_eq!(color, WARNING());
     let (_, msg) = install_report_notice(
         "src",
         false,
@@ -10819,7 +10907,7 @@ fn test_install_report_notice_wording() {
     );
     assert!(msg.contains("untrusted"), "{msg}");
     let (color, _) = install_report_notice("src", false, &InstallReport::default());
-    assert_eq!(color, WARNING);
+    assert_eq!(color, WARNING());
 }
 
 /// A flag-like token other than `-p/--project` is rejected up front — no
@@ -11658,7 +11746,7 @@ fn test_session_preview_lines_collapses_tool_runs() {
         .iter()
         .position(|l| l.contains("⚙ 3 tool steps"))
         .unwrap();
-    assert_eq!(bars[tool_row], Some(TOOL));
+    assert_eq!(bars[tool_row], Some(TOOL()));
 }
 
 #[tokio::test]
@@ -12932,11 +13020,9 @@ async fn test_submit_draft_keeps_failed_attach_command_and_shows_notice() {
     assert!(!should_exit);
     assert_eq!(app.draft, "/attach ./definitely-missing-file.txt");
     assert!(app.draft_attachments.is_empty());
-    assert!(
-        app.notice.as_ref().is_some_and(
-            |(color, text)| *color == ERROR && text.contains("Failed to read attachment")
-        )
-    );
+    assert!(app.notice.as_ref().is_some_and(
+        |(color, text)| *color == ERROR() && text.contains("Failed to read attachment")
+    ));
 }
 
 #[test]
@@ -12993,7 +13079,7 @@ async fn test_model_command_applies_name_directly() {
     assert_eq!(app.raw_model, "my-model");
     assert!(matches!(app.overlay, Overlay::None));
     let (color, msg) = app.notice.as_ref().expect("a confirmation notice");
-    assert_eq!(*color, MUTED);
+    assert_eq!(*color, MUTED());
     assert!(msg.contains("my-model"), "notice names the model: {msg}");
 }
 
@@ -16278,7 +16364,7 @@ async fn test_preflight_refuses_image_on_known_text_only_model() {
         .unwrap();
 
     let (style, msg) = app.notice.clone().expect("a refusal notice is shown");
-    assert_eq!(style, ERROR);
+    assert_eq!(style, ERROR());
     assert!(msg.contains("can't read images"), "got: {msg}");
     // The draft + attachment survive so the user can switch models and resend;
     // nothing was sent.

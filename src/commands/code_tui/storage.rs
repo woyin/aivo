@@ -269,7 +269,7 @@ pub(super) fn push_resume_metadata_segment(
     color: Color,
 ) {
     if !spans.is_empty() {
-        spans.push(Span::styled(" · ", Style::default().fg(FAINT)));
+        spans.push(Span::styled(" · ", Style::default().fg(FAINT())));
     }
     spans.push(Span::styled(value, Style::default().fg(color)));
 }
@@ -277,10 +277,10 @@ pub(super) fn push_resume_metadata_segment(
 pub(super) fn resume_metadata_spans(preview: &SessionPreview, width: u16) -> Vec<Span<'static>> {
     let (time_value, key_value, model_value) = resume_metadata_values(preview, width);
     let mut spans = Vec::new();
-    push_resume_metadata_segment(&mut spans, time_value, MUTED);
-    push_resume_metadata_segment(&mut spans, key_value, MUTED);
+    push_resume_metadata_segment(&mut spans, time_value, MUTED());
+    push_resume_metadata_segment(&mut spans, key_value, MUTED());
     if let Some(model_value) = model_value {
-        push_resume_metadata_segment(&mut spans, model_value, MUTED);
+        push_resume_metadata_segment(&mut spans, model_value, MUTED());
     }
     spans
 }

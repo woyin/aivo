@@ -34,11 +34,7 @@ fn render_jump_to_bottom(frame: &mut Frame<'_>, area: Rect) -> Option<Rect> {
     if area.height == 0 {
         return None;
     }
-    // A warm off-white chip with dark ink (brand --text-primary on dark) reads
-    // cleanly against the warm-dark transcript.
-    let style = Style::default()
-        .fg(Color::Rgb(26, 23, 18))
-        .bg(Color::Rgb(231, 227, 219));
+    let style = Style::default().fg(palette().jump_fg).bg(palette().jump_bg);
     let label = [" ↓ Jump to bottom ", " ↓ bottom "]
         .into_iter()
         .find(|l| l.chars().count() as u16 + 2 <= area.width)?;
@@ -185,7 +181,7 @@ impl CodeTuiApp {
                     push_styled_line(
                         &mut lines,
                         format!("model → {model}"),
-                        Style::default().fg(MUTED).add_modifier(Modifier::ITALIC),
+                        Style::default().fg(MUTED()).add_modifier(Modifier::ITALIC),
                     );
                     bars.push(None);
                     push_styled_line(&mut lines, String::new(), Style::default());
@@ -360,7 +356,7 @@ impl CodeTuiApp {
                         "✶ Done in {}{note}",
                         format_request_elapsed(std::time::Duration::from_millis(ms))
                     ),
-                    Style::default().fg(MUTED).add_modifier(Modifier::ITALIC),
+                    Style::default().fg(MUTED()).add_modifier(Modifier::ITALIC),
                 );
                 bars.push(None);
             }
@@ -417,7 +413,7 @@ impl CodeTuiApp {
                 }),
                 &self.pending_response,
                 text_width,
-                ACCENT,
+                ACCENT(),
             );
         }
         // A running `!cmd` streams its output here (not into history) so the
@@ -440,7 +436,7 @@ impl CodeTuiApp {
             })
             .to_string();
             render_local_command(&mut block, &content, OutputView::Live);
-            push_block(&mut lines, &mut bars, block, Some(SHELL));
+            push_block(&mut lines, &mut bars, block, Some(SHELL()));
         }
         if let Some((color, _)) = notice_display(self.notice.as_ref()) {
             lines.push(blank_line());
@@ -758,7 +754,7 @@ impl CodeTuiApp {
         if !self.sending {
             return Vec::new();
         }
-        let style = Style::default().fg(MUTED).add_modifier(Modifier::ITALIC);
+        let style = Style::default().fg(MUTED()).add_modifier(Modifier::ITALIC);
         if !self.subagent_rows.is_empty() {
             return self
                 .subagent_rows
@@ -796,7 +792,7 @@ impl CodeTuiApp {
         if !self.sending {
             return Vec::new();
         }
-        let style = Style::default().fg(MUTED);
+        let style = Style::default().fg(MUTED());
         let mut rows: Vec<StyledLine> = self
             .tool_output_tail
             .iter()
@@ -1065,6 +1061,9 @@ impl CodeTuiApp {
         self.refresh_git_branch();
         self.check_live_share_health();
         let outer = frame.area();
+        if let Some(canvas) = palette().canvas {
+            frame.render_widget(Block::default().style(Style::default().bg(canvas)), outer);
+        }
         self.picker_hitbox = None;
         self.transcript_hitbox = None;
         self.screen_region = None;
@@ -1259,9 +1258,9 @@ impl CodeTuiApp {
         };
 
         let wash = if self.selection_flash_until.is_some() {
-            SELECT_FLASH
+            SELECT_FLASH()
         } else {
-            SELECT_WASH
+            SELECT_WASH()
         };
         let (start, end) = normalized_selection(selection);
         let area = surface.area;
@@ -1341,7 +1340,7 @@ impl CodeTuiApp {
 
         let mut lines: Vec<Line<'static>> = vec![Line::from(Span::styled(
             heading,
-            Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
+            Style::default().fg(TEXT()).add_modifier(Modifier::BOLD),
         ))];
         let shown = n.min(list_budget);
         for (name, cmd) in prompt.servers.iter().take(shown) {
@@ -1349,23 +1348,23 @@ impl CodeTuiApp {
             lines.push(Line::from(vec![
                 Span::styled(
                     format!("{name}  "),
-                    Style::default().fg(WARNING).add_modifier(Modifier::BOLD),
+                    Style::default().fg(WARNING()).add_modifier(Modifier::BOLD),
                 ),
                 Span::styled(
                     truncate_for_display_width(cmd, room),
-                    Style::default().fg(TEXT),
+                    Style::default().fg(TEXT()),
                 ),
             ]));
         }
         if shown < n {
             lines.push(Line::from(Span::styled(
                 format!("…and {} more", n - shown),
-                Style::default().fg(MUTED),
+                Style::default().fg(MUTED()),
             )));
         }
         lines.push(Line::from(Span::styled(
             note.to_string(),
-            Style::default().fg(MUTED),
+            Style::default().fg(MUTED()),
         )));
         lines.push(Line::from(""));
         lines.push(keys);
@@ -1378,13 +1377,13 @@ impl CodeTuiApp {
             width,
             height,
         };
-        frame.render_widget(Clear, card);
+        clear_to_canvas(frame, card);
         let block = Block::default()
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(WARNING))
+            .border_style(Style::default().fg(WARNING()))
             .title(Span::styled(
                 " mcp servers ",
-                Style::default().fg(WARNING).add_modifier(Modifier::BOLD),
+                Style::default().fg(WARNING()).add_modifier(Modifier::BOLD),
             ));
         let inner = block.inner(card).inner(ratatui::layout::Margin {
             vertical: 0,
@@ -1406,26 +1405,26 @@ impl CodeTuiApp {
         };
         let lines = vec![
             Line::from(vec![
-                Span::styled("Unlink this device from ", Style::default().fg(TEXT)),
+                Span::styled("Unlink this device from ", Style::default().fg(TEXT())),
                 Span::styled(
                     account.clone(),
-                    Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
+                    Style::default().fg(TEXT()).add_modifier(Modifier::BOLD),
                 ),
-                Span::styled("?", Style::default().fg(TEXT)),
+                Span::styled("?", Style::default().fg(TEXT())),
             ]),
             Line::from(Span::styled(
                 "This device drops to the free tier until you sign in again.",
-                Style::default().fg(MUTED),
+                Style::default().fg(MUTED()),
             )),
             Line::from(""),
-            account_keys_line(&[("y", ASSISTANT, "sign out"), ("n", ERROR, "cancel")]),
+            account_keys_line(&[("y", ASSISTANT(), "sign out"), ("n", ERROR(), "cancel")]),
         ];
         render_account_card(
             frame,
             composer_area,
             frame_area,
             "sign out of aivo",
-            WARNING,
+            WARNING(),
             lines,
         );
     }
@@ -1442,25 +1441,25 @@ impl CodeTuiApp {
         };
         let lines = vec![
             Line::from(vec![
-                Span::styled("Switch to ", Style::default().fg(TEXT)),
+                Span::styled("Switch to ", Style::default().fg(TEXT())),
                 Span::styled(
                     target.display_name().to_string(),
-                    Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
+                    Style::default().fg(TEXT()).add_modifier(Modifier::BOLD),
                 ),
-                Span::styled("?", Style::default().fg(TEXT)),
+                Span::styled("?", Style::default().fg(TEXT())),
             ]),
             Line::from(Span::styled(
                 "It's a different provider, so this starts a new session.",
-                Style::default().fg(MUTED),
+                Style::default().fg(MUTED()),
             )),
             Line::from(Span::styled(
                 "The current session is saved — /resume brings it back.",
-                Style::default().fg(MUTED),
+                Style::default().fg(MUTED()),
             )),
             Line::from(""),
             account_keys_line(&[
-                ("y", ASSISTANT, "new session"),
-                ("n", ERROR, "keep current"),
+                ("y", ASSISTANT(), "new session"),
+                ("n", ERROR(), "keep current"),
             ]),
         ];
         render_account_card(
@@ -1468,7 +1467,7 @@ impl CodeTuiApp {
             composer_area,
             frame_area,
             "switch key",
-            WARNING,
+            WARNING(),
             lines,
         );
     }
@@ -1483,25 +1482,25 @@ impl CodeTuiApp {
             Line::from(vec![
                 Span::styled(
                     "Confirm this code in your browser:  ",
-                    Style::default().fg(TEXT),
+                    Style::default().fg(TEXT()),
                 ),
                 Span::styled(
                     card.user_code.clone(),
-                    Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+                    Style::default().fg(ACCENT()).add_modifier(Modifier::BOLD),
                 ),
             ]),
             Line::from(Span::styled(
                 card.open_url.clone(),
-                Style::default().fg(LINK),
+                Style::default().fg(LINK()),
             )),
             Line::from(Span::styled(
                 "Waiting for approval…",
-                Style::default().fg(MUTED),
+                Style::default().fg(MUTED()),
             )),
             Line::from(""),
             account_keys_line(&[
-                ("Enter", ASSISTANT, "open browser"),
-                ("Esc", ERROR, "cancel"),
+                ("Enter", ASSISTANT(), "open browser"),
+                ("Esc", ERROR(), "cancel"),
             ]),
         ];
         render_account_card(
@@ -1509,7 +1508,7 @@ impl CodeTuiApp {
             composer_area,
             frame_area,
             "sign in to aivo",
-            ACCENT,
+            ACCENT(),
             lines,
         );
     }
@@ -1590,20 +1589,20 @@ impl CodeTuiApp {
 
         let mut lines: Vec<Line<'static>> = vec![Line::from(Span::styled(
             heading,
-            Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
+            Style::default().fg(TEXT()).add_modifier(Modifier::BOLD),
         ))];
         if preview_take > 0 {
             lines.push(Line::from(""));
             for raw in preview.iter().take(preview_take) {
                 let trimmed = raw.trim_start();
                 let style = if trimmed.starts_with("+ ") {
-                    Style::default().fg(ASSISTANT)
+                    Style::default().fg(ASSISTANT())
                 } else if trimmed.starts_with("- ") {
-                    Style::default().fg(ERROR)
+                    Style::default().fg(ERROR())
                 } else if pending.tool == "run_bash" {
-                    Style::default().fg(if destructive { WARNING } else { TEXT })
+                    Style::default().fg(if destructive { WARNING() } else { TEXT() })
                 } else {
-                    Style::default().fg(MUTED)
+                    Style::default().fg(MUTED())
                 };
                 lines.push(Line::from(Span::styled(
                     truncate_for_display_width(raw, inner_width),
@@ -1614,7 +1613,7 @@ impl CodeTuiApp {
         if let Some(flag) = flag_line {
             lines.push(Line::from(Span::styled(
                 flag.to_string(),
-                Style::default().fg(WARNING).add_modifier(Modifier::BOLD),
+                Style::default().fg(WARNING()).add_modifier(Modifier::BOLD),
             )));
         }
         lines.push(Line::from(""));
@@ -1628,13 +1627,13 @@ impl CodeTuiApp {
             width,
             height,
         };
-        frame.render_widget(Clear, card);
+        clear_to_canvas(frame, card);
         let block = Block::default()
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(ACCENT))
+            .border_style(Style::default().fg(ACCENT()))
             .title(Span::styled(
                 " permission ",
-                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+                Style::default().fg(ACCENT()).add_modifier(Modifier::BOLD),
             ));
         let inner = block.inner(card).inner(ratatui::layout::Margin {
             vertical: 0,
@@ -1694,7 +1693,7 @@ impl CodeTuiApp {
         for l in &q_lines {
             lines.push(Line::from(Span::styled(
                 truncate_for_display_width(l, inner_width),
-                Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
+                Style::default().fg(TEXT()).add_modifier(Modifier::BOLD),
             )));
         }
         lines.push(Line::from(""));
@@ -1707,14 +1706,14 @@ impl CodeTuiApp {
         for (i, opt) in ask.options.iter().enumerate().take(shown) {
             let selected = i == ask.selected;
             let marker_style = if selected {
-                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)
+                Style::default().fg(ACCENT()).add_modifier(Modifier::BOLD)
             } else {
-                Style::default().fg(FAINT)
+                Style::default().fg(FAINT())
             };
             let label_style = if selected {
-                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)
+                Style::default().fg(ACCENT()).add_modifier(Modifier::BOLD)
             } else {
-                Style::default().fg(TEXT)
+                Style::default().fg(TEXT())
             };
             let mut spans = vec![Span::styled(
                 if selected { "❯ " } else { "  " },
@@ -1723,9 +1722,9 @@ impl CodeTuiApp {
             if ask.multi_select {
                 let checked = ask.checked.get(i).copied().unwrap_or(false);
                 let box_style = if checked {
-                    Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)
+                    Style::default().fg(ACCENT()).add_modifier(Modifier::BOLD)
                 } else {
-                    Style::default().fg(FAINT)
+                    Style::default().fg(FAINT())
                 };
                 spans.push(Span::styled(
                     if checked { "[✓] " } else { "[ ] " },
@@ -1734,7 +1733,7 @@ impl CodeTuiApp {
             }
             spans.push(Span::styled(
                 format!("{}. ", i + 1),
-                Style::default().fg(MUTED),
+                Style::default().fg(MUTED()),
             ));
             // The description (FAINT) only shows if it still fits after the label.
             let label =
@@ -1749,7 +1748,7 @@ impl CodeTuiApp {
                 let room = inner_width - used - 3;
                 spans.push(Span::styled(
                     format!(" — {}", truncate_for_display_width(desc, room)),
-                    Style::default().fg(FAINT),
+                    Style::default().fg(FAINT()),
                 ));
             }
             lines.push(Line::from(spans));
@@ -1757,7 +1756,7 @@ impl CodeTuiApp {
         if shown < ask.options.len() {
             lines.push(Line::from(Span::styled(
                 format!("  …{} more", ask.options.len() - shown),
-                Style::default().fg(FAINT),
+                Style::default().fg(FAINT()),
             )));
         }
         lines.push(Line::from(""));
@@ -1771,13 +1770,13 @@ impl CodeTuiApp {
             width,
             height,
         };
-        frame.render_widget(Clear, card);
+        clear_to_canvas(frame, card);
         let block = Block::default()
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(ACCENT))
+            .border_style(Style::default().fg(ACCENT()))
             .title(Span::styled(
                 " question ",
-                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+                Style::default().fg(ACCENT()).add_modifier(Modifier::BOLD),
             ));
         let inner = block.inner(card).inner(ratatui::layout::Margin {
             vertical: 0,
@@ -1819,7 +1818,7 @@ impl CodeTuiApp {
         let mut lines: Vec<Line<'static>> = Vec::new();
         lines.push(Line::from(Span::styled(
             truncate_for_display_width(&heading, inner_width),
-            Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
+            Style::default().fg(TEXT()).add_modifier(Modifier::BOLD),
         )));
         lines.push(Line::from(""));
         for line in review.body.iter().skip(scroll).take(visible) {
@@ -1829,12 +1828,12 @@ impl CodeTuiApp {
         if remaining > 0 {
             lines.push(Line::from(Span::styled(
                 format!("  … +{remaining} more (↑↓ scroll)"),
-                Style::default().fg(FAINT),
+                Style::default().fg(FAINT()),
             )));
         } else if overflow {
             lines.push(Line::from(Span::styled(
                 "  … end of diff",
-                Style::default().fg(FAINT),
+                Style::default().fg(FAINT()),
             )));
         }
         lines.push(Line::from(""));
@@ -1848,13 +1847,13 @@ impl CodeTuiApp {
             width: max_width,
             height,
         };
-        frame.render_widget(Clear, card);
+        clear_to_canvas(frame, card);
         let block = Block::default()
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(ACCENT))
+            .border_style(Style::default().fg(ACCENT()))
             .title(Span::styled(
                 " review edits ",
-                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+                Style::default().fg(ACCENT()).add_modifier(Modifier::BOLD),
             ));
         let inner = block.inner(card).inner(ratatui::layout::Margin {
             vertical: 0,
@@ -1892,7 +1891,7 @@ impl CodeTuiApp {
         let mut lines: Vec<Line<'static>> = Vec::new();
         lines.push(Line::from(Span::styled(
             truncate_for_display_width("Implementation plan — ready for review", inner_width),
-            Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
+            Style::default().fg(TEXT()).add_modifier(Modifier::BOLD),
         )));
         lines.push(Line::from(""));
         for line in pending.body.iter().skip(scroll).take(visible) {
@@ -1902,12 +1901,12 @@ impl CodeTuiApp {
         if remaining > 0 {
             lines.push(Line::from(Span::styled(
                 format!("  … +{remaining} more (PgUp/PgDn scroll)"),
-                Style::default().fg(FAINT),
+                Style::default().fg(FAINT()),
             )));
         } else if overflow {
             lines.push(Line::from(Span::styled(
                 "  … end of plan",
-                Style::default().fg(FAINT),
+                Style::default().fg(FAINT()),
             )));
         }
         lines.push(Line::from(""));
@@ -1920,15 +1919,15 @@ impl CodeTuiApp {
             let selected = i == pending.selected;
             let (marker_style, label_style) = if selected {
                 (
-                    Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
-                    Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+                    Style::default().fg(ACCENT()).add_modifier(Modifier::BOLD),
+                    Style::default().fg(ACCENT()).add_modifier(Modifier::BOLD),
                 )
             } else {
-                (Style::default().fg(FAINT), Style::default().fg(TEXT))
+                (Style::default().fg(FAINT()), Style::default().fg(TEXT()))
             };
             lines.push(Line::from(vec![
                 Span::styled(if selected { "❯ " } else { "  " }, marker_style),
-                Span::styled(format!("{}. ", i + 1), Style::default().fg(MUTED)),
+                Span::styled(format!("{}. ", i + 1), Style::default().fg(MUTED())),
                 Span::styled(
                     truncate_for_display_width(opt, inner_width.saturating_sub(5)),
                     label_style,
@@ -1946,13 +1945,13 @@ impl CodeTuiApp {
             width: max_width,
             height,
         };
-        frame.render_widget(Clear, card);
+        clear_to_canvas(frame, card);
         let block = Block::default()
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(ACCENT))
+            .border_style(Style::default().fg(ACCENT()))
             .title(Span::styled(
                 " plan ",
-                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+                Style::default().fg(ACCENT()).add_modifier(Modifier::BOLD),
             ));
         let inner = block.inner(card).inner(ratatui::layout::Margin {
             vertical: 0,
@@ -2130,7 +2129,7 @@ impl CodeTuiApp {
             rows: visual_rows,
         });
 
-        frame.render_widget(Clear, chunks[0]);
+        clear_to_canvas(frame, chunks[0]);
 
         if is_empty {
             // Inset by the accent gutter so the brand banner sits at the same
@@ -2154,7 +2153,7 @@ impl CodeTuiApp {
                 .saturating_add(usize::from(transcript_text_area.height))
                 .min(wrapped_text.lines.len());
             let visible_text = Text::from(wrapped_text.lines[view_start..view_end].to_vec());
-            let transcript_widget = Paragraph::new(visible_text).style(Style::default().fg(TEXT));
+            let transcript_widget = Paragraph::new(visible_text).style(Style::default().fg(TEXT()));
             frame.render_widget(transcript_widget, transcript_text_area);
             self.paint_accent_gutter(
                 frame,
@@ -2193,7 +2192,7 @@ impl CodeTuiApp {
             ])
             .split(composer_outer);
 
-        frame.render_widget(Clear, composer_chunks[0]);
+        clear_to_canvas(frame, composer_chunks[0]);
         frame.render_widget(
             Paragraph::new(self.composer_rule_line(composer_chunks[1].width.max(1))),
             composer_chunks[1],
@@ -2233,24 +2232,24 @@ impl CodeTuiApp {
         // Plan mode from either backend: in-process engine or cursor's ACP mode.
         let plan_mode = self.plan_mode || self.cursor_plan_mode;
         let rule_style = if self.draft_is_shell_command() {
-            Style::default().fg(SHELL)
+            Style::default().fg(SHELL())
         } else if plan_mode {
-            Style::default().fg(ACCENT)
+            Style::default().fg(ACCENT())
         } else {
-            Style::default().fg(FAINT)
+            Style::default().fg(FAINT())
         };
         // The mode badge — one slot, since the four modes are exclusive.
         let (badge, badge_style) = if plan_mode {
             (
                 "◇ plan",
-                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+                Style::default().fg(ACCENT()).add_modifier(Modifier::BOLD),
             )
         } else if self.agent_auto_approve {
-            ("⚡ auto-approve", Style::default().fg(WARNING))
+            ("⚡ auto-approve", Style::default().fg(WARNING()))
         } else if self.agent_review_edits {
-            ("✎ review", Style::default().fg(TOOL))
+            ("✎ review", Style::default().fg(TOOL()))
         } else {
-            ("normal", Style::default().fg(MUTED))
+            ("normal", Style::default().fg(MUTED()))
         };
         const CYCLE_HINT: &str = " (shift+tab)";
         // Left title on the rule. While recalling input history, show
@@ -2264,13 +2263,13 @@ impl CodeTuiApp {
         let (left_text, left_style, left_lead) = if let Some(index) = self.draft_history_index {
             (
                 format!(" History {}/{} ", index + 1, self.draft_history.len()),
-                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+                Style::default().fg(ACCENT()).add_modifier(Modifier::BOLD),
                 2usize,
             )
         } else if let Some(goal) = self.goal_mode.as_ref() {
             (
                 format!(" ◎ goal {}/{} ", goal.iteration, goal.max),
-                Style::default().fg(ACCENT),
+                Style::default().fg(ACCENT()),
                 0usize,
             )
         } else {
@@ -2306,13 +2305,13 @@ impl CodeTuiApp {
             spans.push(Span::styled(left_text, left_style));
         }
         if !jobs_text.is_empty() {
-            spans.push(Span::styled(jobs_text, Style::default().fg(TOOL)));
+            spans.push(Span::styled(jobs_text, Style::default().fg(TOOL())));
         }
         spans.push(Span::styled("─".repeat(fill), rule_style));
         spans.push(Span::styled(format!(" {badge}"), badge_style));
         spans.push(Span::styled(
             format!("{CYCLE_HINT} "),
-            Style::default().fg(FAINT),
+            Style::default().fg(FAINT()),
         ));
         spans.push(Span::styled("─".repeat(trailing), rule_style));
         Line::from(spans)
@@ -2376,11 +2375,11 @@ impl CodeTuiApp {
         if area.height == 0 || lines.is_empty() {
             return;
         }
-        frame.render_widget(Clear, area);
+        clear_to_canvas(frame, area);
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(
                 "─".repeat(usize::from(area.width.max(1))),
-                Style::default().fg(FAINT),
+                Style::default().fg(FAINT()),
             ))),
             Rect {
                 x: area.x,
@@ -2427,7 +2426,7 @@ impl CodeTuiApp {
         if start > 0 {
             lines.push(Line::from(Span::styled(
                 format!("  … +{start} earlier"),
-                Style::default().fg(FAINT),
+                Style::default().fg(FAINT()),
             )));
         }
         for (i, row) in rows.iter().enumerate().take(end).skip(start) {
@@ -2440,9 +2439,9 @@ impl CodeTuiApp {
             };
             let room = usize::from(width).saturating_sub(3 + prefix.chars().count());
             let (marker_style, text_style) = if is_selected {
-                (Style::default().fg(ACCENT), Style::default().fg(TEXT))
+                (Style::default().fg(ACCENT()), Style::default().fg(TEXT()))
             } else {
-                (Style::default().fg(MUTED), Style::default().fg(MUTED))
+                (Style::default().fg(MUTED()), Style::default().fg(MUTED()))
             };
             lines.push(Line::from(vec![
                 Span::styled(marker.to_string(), marker_style),
@@ -2455,13 +2454,13 @@ impl CodeTuiApp {
         if end < rows.len() {
             lines.push(Line::from(Span::styled(
                 format!("  … +{} more", rows.len() - end),
-                Style::default().fg(FAINT),
+                Style::default().fg(FAINT()),
             )));
         }
         if selected.is_some() {
             lines.push(Line::from(Span::styled(
                 "  enter edit · ctrl+d remove · alt+↑↓ move · esc back",
-                Style::default().fg(FAINT),
+                Style::default().fg(FAINT()),
             )));
         }
         lines
@@ -2490,7 +2489,7 @@ impl CodeTuiApp {
         if area.height == 0 || lines.is_empty() {
             return;
         }
-        frame.render_widget(Clear, area);
+        clear_to_canvas(frame, area);
         frame.render_widget(Paragraph::new(Text::from(lines.to_vec())), area);
     }
 
@@ -2592,9 +2591,9 @@ impl CodeTuiApp {
         };
 
         let wash = if self.selection_flash_until.is_some() {
-            SELECT_FLASH
+            SELECT_FLASH()
         } else {
-            SELECT_WASH
+            SELECT_WASH()
         };
         let (start, end) = normalized_selection(selection);
         let visible_start = hitbox.first_row;
@@ -2665,18 +2664,18 @@ impl CodeTuiApp {
             height: 1,
         };
         let color = if now.duration_since(toast.created_at) >= TOAST_FADE_AFTER {
-            FAINT
+            FAINT()
         } else {
-            ACCENT
+            ACCENT()
         };
-        frame.render_widget(Clear, toast_area);
+        clear_to_canvas(frame, toast_area);
         frame.render_widget(
             Paragraph::new(Line::from(vec![
                 Span::raw(" "),
                 Span::styled(&toast.text, Style::default().fg(color)),
                 Span::raw(" "),
             ]))
-            .style(Style::default().bg(Color::Rgb(24, 21, 17))),
+            .style(Style::default().bg(palette().toast_bg)),
             toast_area,
         );
     }
@@ -2697,22 +2696,25 @@ impl CodeTuiApp {
                 Line::from(vec![
                     Span::styled(
                         "Loading",
-                        Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+                        Style::default().fg(ACCENT()).add_modifier(Modifier::BOLD),
                     ),
                     Span::styled(
                         " saved session…",
-                        Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
+                        Style::default().fg(TEXT()).add_modifier(Modifier::BOLD),
                     ),
                 ]),
                 Line::from(Span::styled(
                     loading.preview.title.clone(),
-                    Style::default().fg(TEXT),
+                    Style::default().fg(TEXT()),
                 )),
                 Line::from(resume_metadata_spans(
                     &loading.preview,
                     area.width.max(1).saturating_sub(2),
                 )),
-                Line::from(Span::styled(self.display_cwd(), Style::default().fg(FAINT))),
+                Line::from(Span::styled(
+                    self.display_cwd(),
+                    Style::default().fg(FAINT()),
+                )),
             ]
         } else {
             // `area` is the gutter-inset column, driving the full/narrow choice.
@@ -2765,18 +2767,18 @@ impl CodeTuiApp {
     pub(super) fn welcome_status_lines(&self) -> Vec<StyledLine> {
         let mut lines = vec![blank_line()];
         if let Some(chip) = self.welcome_capabilities_label() {
-            lines.push(line_plain(chip, Style::default().fg(MUTED)));
+            lines.push(line_plain(chip, Style::default().fg(MUTED())));
         }
         let tip = WELCOME_TIPS[self.welcome_tip_index % WELCOME_TIPS.len()];
         lines.push(line_with_plain(vec![
             // MUTED hint (up from FAINT) so the tip reads on dim terminals.
-            Span::styled("✶ Tip  ", Style::default().fg(ACCENT)),
-            Span::styled(tip.to_string(), Style::default().fg(MUTED)),
+            Span::styled("✶ Tip  ", Style::default().fg(ACCENT())),
+            Span::styled(tip.to_string(), Style::default().fg(MUTED())),
         ]));
         // Static essentials a new user needs before any rotating tip matters.
         lines.push(line_plain(
             "       /help commands · Shift+Tab modes · Esc interrupts".to_string(),
-            Style::default().fg(FAINT),
+            Style::default().fg(FAINT()),
         ));
         lines
     }
@@ -2785,30 +2787,33 @@ impl CodeTuiApp {
         let prompt = if self.draft_history_index.is_some() {
             Span::styled(
                 "^ ",
-                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+                Style::default().fg(ACCENT()).add_modifier(Modifier::BOLD),
             )
         } else if self.draft_is_shell_command() {
             // `!cmd` shell mode tints the prompt itself in the magenta shell hue too.
             Span::styled(
                 "> ",
-                Style::default().fg(SHELL).add_modifier(Modifier::BOLD),
+                Style::default().fg(SHELL()).add_modifier(Modifier::BOLD),
             )
         } else {
-            Span::styled("> ", Style::default().fg(USER).add_modifier(Modifier::BOLD))
+            Span::styled(
+                "> ",
+                Style::default().fg(USER()).add_modifier(Modifier::BOLD),
+            )
         };
         let mut lines = composer_attachment_lines(&self.draft_attachments);
         if self.draft.is_empty() {
             let placeholder = if self.loading_resume.is_some() {
-                Span::styled("Resume loading…", Style::default().fg(FAINT))
+                Span::styled("Resume loading…", Style::default().fg(FAINT()))
             } else if self.sending {
                 Span::styled(
                     " Type to queue your next message…",
-                    Style::default().fg(FAINT),
+                    Style::default().fg(FAINT()),
                 )
             } else {
                 Span::styled(
                     " Ask, plan, or build · / for commands",
-                    Style::default().fg(FAINT),
+                    Style::default().fg(FAINT()),
                 )
             };
             lines.push(Line::from(vec![prompt, placeholder]));
@@ -2821,9 +2826,9 @@ impl CodeTuiApp {
         // A `!cmd` draft is tinted in the magenta shell hue, so shell mode reads at
         // a glance — the prompt and its top divider pick up the same magenta color.
         let draft_color = if self.draft_is_shell_command() {
-            SHELL
+            SHELL()
         } else {
-            TEXT
+            TEXT()
         };
         // Pre-wrapped visual rows: row 0 gets the `> ` prompt; every other row
         // gets a matching 2-col hanging indent so wrapped text aligns under the
@@ -2846,7 +2851,10 @@ impl CodeTuiApp {
             if index == last
                 && let Some(hint) = ghost
             {
-                spans.push(Span::styled(format!(" {hint}"), Style::default().fg(FAINT)));
+                spans.push(Span::styled(
+                    format!(" {hint}"),
+                    Style::default().fg(FAINT()),
+                ));
             }
             lines.push(Line::from(spans));
         }
@@ -2903,20 +2911,20 @@ impl CodeTuiApp {
             let short: String = self.session_id.chars().take(8).collect();
             right_spans.push(Span::styled(
                 format!("#{short}"),
-                Style::default().fg(FAINT),
+                Style::default().fg(FAINT()),
             ));
-            right_spans.push(Span::styled(" · ", Style::default().fg(FAINT)));
+            right_spans.push(Span::styled(" · ", Style::default().fg(FAINT())));
         }
         if area.width >= 70
             && let Some((mcp_label, mcp_color)) = self.footer_mcp_label()
         {
             right_spans.push(Span::styled(mcp_label, Style::default().fg(mcp_color)));
-            right_spans.push(Span::styled(" · ", Style::default().fg(FAINT)));
+            right_spans.push(Span::styled(" · ", Style::default().fg(FAINT())));
         }
         right_spans.push(Span::styled(meter_label, Style::default().fg(meter_color)));
         if let Some(effort) = self.footer_effort_label() {
-            right_spans.push(Span::styled(" · ", Style::default().fg(FAINT)));
-            right_spans.push(Span::styled(effort, Style::default().fg(MUTED)));
+            right_spans.push(Span::styled(" · ", Style::default().fg(FAINT())));
+            right_spans.push(Span::styled(effort, Style::default().fg(MUTED())));
         }
         let right_label_width: u16 = right_spans
             .iter()
@@ -2953,21 +2961,21 @@ impl CodeTuiApp {
         let mut spans: Vec<Span<'static>> = Vec::new();
         for (index, segment) in left_text.split(" · ").enumerate() {
             if index > 0 {
-                spans.push(Span::styled(" · ", Style::default().fg(FAINT)));
+                spans.push(Span::styled(" · ", Style::default().fg(FAINT())));
             }
             spans.push(Span::styled(
                 segment.to_string(),
-                Style::default().fg(MUTED),
+                Style::default().fg(MUTED()),
             ));
             // Badges sit right after the model (first segment).
             if index == 0 {
                 if live {
-                    spans.push(Span::styled(" · ", Style::default().fg(FAINT)));
-                    spans.push(Span::styled(LIVE_BADGE, Style::default().fg(LIVE)));
+                    spans.push(Span::styled(" · ", Style::default().fg(FAINT())));
+                    spans.push(Span::styled(LIVE_BADGE, Style::default().fg(LIVE())));
                 }
                 if plain_chat {
-                    spans.push(Span::styled(" · ", Style::default().fg(FAINT)));
-                    spans.push(Span::styled(PLAIN_CODE_BADGE, Style::default().fg(USER)));
+                    spans.push(Span::styled(" · ", Style::default().fg(FAINT())));
+                    spans.push(Span::styled(PLAIN_CODE_BADGE, Style::default().fg(USER())));
                 }
             }
         }
@@ -3004,17 +3012,17 @@ impl CodeTuiApp {
         }
         if let Some(client) = &self.mcp_client {
             if client.any_dead() || !client.errors().is_empty() {
-                return Some((format!("mcp:{n}!"), ERROR));
+                return Some((format!("mcp:{n}!"), ERROR()));
             }
             if client.any_needs_auth() {
-                return Some((format!("mcp:{n}!"), WARNING));
+                return Some((format!("mcp:{n}!"), WARNING()));
             }
-            return Some((format!("mcp:{n}"), MUTED));
+            return Some((format!("mcp:{n}"), MUTED()));
         }
         if self.mcp_connecting {
-            return Some((format!("mcp:{n}…"), FAINT));
+            return Some((format!("mcp:{n}…"), FAINT()));
         }
-        Some((format!("mcp:{n}"), FAINT))
+        Some((format!("mcp:{n}"), FAINT()))
     }
 
     /// Present-tense label for the in-flight tool step (e.g. `running grep`), or
@@ -3093,13 +3101,13 @@ impl CodeTuiApp {
             } else {
                 self.last_usage
             };
-            return (format_token_count(used, usage), MUTED);
+            return (format_token_count(used, usage), MUTED());
         }
         // Fresh session: show the window size, not an empty `0 / 1M` meter.
         if used == 0 {
             return (
                 format!("{} context", format_token_count_value(self.context_window)),
-                MUTED,
+                MUTED(),
             );
         }
         // Percent isn't shown (the used/window pair already implies it) but still
@@ -3218,7 +3226,7 @@ fn render_account_card(
         width,
         height,
     };
-    frame.render_widget(Clear, card);
+    clear_to_canvas(frame, card);
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(border))
@@ -3239,7 +3247,10 @@ fn account_keys_line(keys: &[(&'static str, Color, &'static str)]) -> Line<'stat
     let mut spans = Vec::new();
     for (i, (key, color, label)) in keys.iter().enumerate() {
         if i > 0 {
-            spans.push(Span::styled("    ".to_string(), Style::default().fg(FAINT)));
+            spans.push(Span::styled(
+                "    ".to_string(),
+                Style::default().fg(FAINT()),
+            ));
         }
         spans.push(Span::styled(
             key.to_string(),
@@ -3247,7 +3258,7 @@ fn account_keys_line(keys: &[(&'static str, Color, &'static str)]) -> Line<'stat
         ));
         spans.push(Span::styled(
             format!(" {label}"),
-            Style::default().fg(MUTED),
+            Style::default().fg(MUTED()),
         ));
     }
     Line::from(spans)
@@ -3262,16 +3273,16 @@ fn mcp_consent_keys_line() -> Line<'static> {
             Style::default().fg(color).add_modifier(Modifier::BOLD),
         )
     };
-    let label = |text: &str| Span::styled(text.to_string(), Style::default().fg(MUTED));
-    let gap = || Span::styled("    ".to_string(), Style::default().fg(FAINT));
+    let label = |text: &str| Span::styled(text.to_string(), Style::default().fg(MUTED()));
+    let gap = || Span::styled("    ".to_string(), Style::default().fg(FAINT()));
     Line::from(vec![
-        keycap("y", ASSISTANT),
+        keycap("y", ASSISTANT()),
         label(" run once"),
         gap(),
-        keycap("a", WARNING),
+        keycap("a", WARNING()),
         label(" always (this repo)"),
         gap(),
-        keycap("n", ERROR),
+        keycap("n", ERROR()),
         label(" deny"),
     ])
 }
@@ -3290,16 +3301,16 @@ fn permission_keys_line(tool: &str, composing: bool) -> Line<'static> {
             Style::default().fg(color).add_modifier(Modifier::BOLD),
         )
     };
-    let label = |text: &str| Span::styled(text.to_string(), Style::default().fg(MUTED));
-    let gap = || Span::styled("    ".to_string(), Style::default().fg(FAINT));
+    let label = |text: &str| Span::styled(text.to_string(), Style::default().fg(MUTED()));
+    let gap = || Span::styled("    ".to_string(), Style::default().fg(FAINT()));
     if composing {
         // A draft is in progress, so y/a/n flow into the message, not the card.
         // Only Esc (deny) and Shift+Tab (allow + auto-approve) act on the card.
         return Line::from(vec![
-            keycap("⇧⇥", WARNING),
+            keycap("⇧⇥", WARNING()),
             label(" allow"),
             gap(),
-            keycap("esc", ERROR),
+            keycap("esc", ERROR()),
             label(" deny"),
             gap(),
             label("y/a/n type into your message"),
@@ -3315,13 +3326,13 @@ fn permission_keys_line(tool: &str, composing: bool) -> Line<'static> {
         " always"
     };
     Line::from(vec![
-        keycap("y", ASSISTANT),
+        keycap("y", ASSISTANT()),
         label(" allow once"),
         gap(),
-        keycap("a", WARNING),
+        keycap("a", WARNING()),
         label(always_label),
         gap(),
-        keycap("n", ERROR),
+        keycap("n", ERROR()),
         label(" deny"),
     ])
 }
@@ -3332,11 +3343,11 @@ fn ask_user_keys_line(allow_free_text: bool, multi_select: bool) -> Line<'static
     let keycap = |key: &str| {
         Span::styled(
             key.to_string(),
-            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+            Style::default().fg(ACCENT()).add_modifier(Modifier::BOLD),
         )
     };
-    let label = |text: &str| Span::styled(text.to_string(), Style::default().fg(MUTED));
-    let gap = || Span::styled("    ".to_string(), Style::default().fg(FAINT));
+    let label = |text: &str| Span::styled(text.to_string(), Style::default().fg(MUTED()));
+    let gap = || Span::styled("    ".to_string(), Style::default().fg(FAINT()));
     let mut spans = vec![keycap("↑↓"), label(" move")];
     if multi_select {
         spans.push(gap());
@@ -3365,11 +3376,11 @@ fn plan_approval_keys_line() -> Line<'static> {
     let keycap = |key: &str| {
         Span::styled(
             key.to_string(),
-            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+            Style::default().fg(ACCENT()).add_modifier(Modifier::BOLD),
         )
     };
-    let label = |text: &str| Span::styled(text.to_string(), Style::default().fg(MUTED));
-    let gap = || Span::styled("    ".to_string(), Style::default().fg(FAINT));
+    let label = |text: &str| Span::styled(text.to_string(), Style::default().fg(MUTED()));
+    let gap = || Span::styled("    ".to_string(), Style::default().fg(FAINT()));
     Line::from(vec![
         keycap("↑↓"),
         label(" choose"),
@@ -3392,11 +3403,11 @@ fn review_keys_line() -> Line<'static> {
     let keycap = |key: &str| {
         Span::styled(
             key.to_string(),
-            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+            Style::default().fg(ACCENT()).add_modifier(Modifier::BOLD),
         )
     };
-    let label = |text: &str| Span::styled(text.to_string(), Style::default().fg(MUTED));
-    let gap = || Span::styled("    ".to_string(), Style::default().fg(FAINT));
+    let label = |text: &str| Span::styled(text.to_string(), Style::default().fg(MUTED()));
+    let gap = || Span::styled("    ".to_string(), Style::default().fg(FAINT()));
     Line::from(vec![
         keycap("y"),
         label(" approve"),

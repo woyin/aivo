@@ -151,7 +151,7 @@ impl CodeTuiApp {
         let action = match self.prepare_submit_action() {
             Ok(action) => action,
             Err(err) => {
-                self.notice = Some((ERROR, err.to_string()));
+                self.notice = Some((ERROR(), err.to_string()));
                 return Ok(false);
             }
         };
@@ -163,7 +163,7 @@ impl CodeTuiApp {
         // submissions behind it (esc stops it) rather than overlapping a second.
         if self.local_command.is_some() {
             self.notice = Some((
-                MUTED,
+                MUTED(),
                 "A command is running — press esc to stop it".to_string(),
             ));
             return Ok(false);
@@ -176,7 +176,7 @@ impl CodeTuiApp {
                     // now; it goes out when the current turn finishes.
                     self.queue_message(input);
                 } else if let Err(err) = self.send_user_message(input).await {
-                    self.notice = Some((ERROR, err.to_string()));
+                    self.notice = Some((ERROR(), err.to_string()));
                 }
                 Ok(false)
             }
@@ -204,7 +204,7 @@ impl CodeTuiApp {
                         Ok(should_exit)
                     }
                     Err(err) => {
-                        self.notice = Some((ERROR, err.to_string()));
+                        self.notice = Some((ERROR(), err.to_string()));
                         Ok(false)
                     }
                 }
@@ -214,7 +214,7 @@ impl CodeTuiApp {
                 // (esc) first. Keeps the draft so the command can be retried.
                 if self.sending {
                     self.notice = Some((
-                        MUTED,
+                        MUTED(),
                         "Interrupt the current turn (esc) before running a command".to_string(),
                     ));
                     return Ok(false);
@@ -335,7 +335,7 @@ impl CodeTuiApp {
                 .any(|a| a.mime_type.starts_with("image/"))
         {
             self.notice = Some((
-                ERROR,
+                ERROR(),
                 format!(
                     "{} can't read images — switch to a vision model (e.g. /model) and resend.",
                     self.model
@@ -427,13 +427,13 @@ impl CodeTuiApp {
                 } else {
                     "Attachment sent as plain chat — agent tools are off for this message"
                 };
-                self.notice = Some((MUTED, msg.to_string()));
+                self.notice = Some((MUTED(), msg.to_string()));
             }
             // Plain chat's finish path never auto-continues — a goal falling back
             // here would strand the loop, so disarm it and say why.
             if self.goal_mode.take().is_some() {
                 self.notice = Some((
-                    ERROR,
+                    ERROR(),
                     "Goal mode stopped — this message went out as plain chat (no agent tools)"
                         .to_string(),
                 ));
@@ -457,12 +457,12 @@ impl CodeTuiApp {
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .push(input);
             self.notice = Some((
-                MUTED,
+                MUTED(),
                 "Queued — the agent picks it up after the current tool step".to_string(),
             ));
         } else {
             self.queued_messages.push(input);
-            self.notice = Some((MUTED, self.queued_notice()));
+            self.notice = Some((MUTED(), self.queued_notice()));
         }
         self.draft.clear();
         self.cursor = 0;
@@ -516,7 +516,7 @@ impl CodeTuiApp {
     fn queue_command(&mut self, command: SlashCommand, label: &str) {
         self.queued_commands.push(command);
         self.notice = Some((
-            MUTED,
+            MUTED(),
             format!("{label} queued — runs when the current turn finishes"),
         ));
     }
@@ -528,7 +528,7 @@ impl CodeTuiApp {
         while !self.sending && !self.queued_commands.is_empty() {
             let command = self.queued_commands.remove(0);
             if let Err(err) = self.execute_slash_command(command).await {
-                self.notice = Some((ERROR, err.to_string()));
+                self.notice = Some((ERROR(), err.to_string()));
             }
         }
     }
@@ -841,7 +841,7 @@ impl CodeTuiApp {
         let (base, auth) = match self.start_agent_serve().await {
             Ok(t) => t,
             Err(e) => {
-                self.notice = Some((ERROR, format!("agent serve failed to start: {e}")));
+                self.notice = Some((ERROR(), format!("agent serve failed to start: {e}")));
                 self.sending = false;
                 self.request_started_at = None;
                 self.pending_submit = None;
@@ -889,7 +889,7 @@ impl CodeTuiApp {
             match crate::commands::code_request_builder::build_openai_message(&msg) {
                 Ok(v) => v.get("content").cloned(),
                 Err(e) => {
-                    self.notice = Some((ERROR, format!("couldn't attach image: {e}")));
+                    self.notice = Some((ERROR(), format!("couldn't attach image: {e}")));
                     self.sending = false;
                     self.request_started_at = None;
                     self.pending_submit = None;
@@ -1012,7 +1012,7 @@ impl CodeTuiApp {
             } else {
                 "no live conversation to compact — send a message first, then /compact"
             };
-            self.notice = Some((MUTED, msg.to_string()));
+            self.notice = Some((MUTED(), msg.to_string()));
             return;
         };
         let engine = session.engine.clone();
@@ -1028,7 +1028,10 @@ impl CodeTuiApp {
         let before = {
             let engine = engine.lock().await;
             if !engine.has_compactable_history() {
-                self.notice = Some((MUTED, "already compact — nothing older to fold".to_string()));
+                self.notice = Some((
+                    MUTED(),
+                    "already compact — nothing older to fold".to_string(),
+                ));
                 return;
             }
             engine.estimated_context_tokens()
@@ -1048,7 +1051,7 @@ impl CodeTuiApp {
         let (base, auth) = match self.start_agent_serve().await {
             Ok(t) => t,
             Err(e) => {
-                self.notice = Some((ERROR, format!("compact serve failed to start: {e}")));
+                self.notice = Some((ERROR(), format!("compact serve failed to start: {e}")));
                 return;
             }
         };
@@ -1428,7 +1431,7 @@ impl CodeTuiApp {
         let name = attachment.name.clone();
         let kind = attachment_kind_label(&attachment);
         self.draft_attachments.push(attachment);
-        self.notice = Some((MUTED, format!("Queued {kind}: {name}")));
+        self.notice = Some((MUTED(), format!("Queued {kind}: {name}")));
         Ok(())
     }
 
@@ -1450,7 +1453,7 @@ impl CodeTuiApp {
         }
         let attachment = self.draft_attachments.remove(remove_at);
         let kind = attachment_kind_label(&attachment);
-        self.notice = Some((MUTED, format!("Removed {kind}: {}", attachment.name)));
+        self.notice = Some((MUTED(), format!("Removed {kind}: {}", attachment.name)));
         Ok(())
     }
 
@@ -1663,7 +1666,7 @@ impl CodeTuiApp {
             // form so up-arrow recalls the command.
             self.record_draft_history(&typed);
             self.queued_messages.push(content);
-            self.notice = Some((MUTED, self.queued_notice()));
+            self.notice = Some((MUTED(), self.queued_notice()));
         } else {
             self.send_skill_message(content, typed).await?;
         }
@@ -1700,7 +1703,7 @@ impl CodeTuiApp {
         if self.sending {
             self.record_draft_history(&typed);
             self.queued_messages.push(content);
-            self.notice = Some((MUTED, self.queued_notice()));
+            self.notice = Some((MUTED(), self.queued_notice()));
         } else {
             self.send_skill_message(content, typed).await?;
         }
@@ -1726,7 +1729,7 @@ impl CodeTuiApp {
             .map(|(i, _)| i)
             .collect();
         if user_indices.is_empty() {
-            self.notice = Some((MUTED, "Nothing to rewind to".to_string()));
+            self.notice = Some((MUTED(), "Nothing to rewind to".to_string()));
             return Ok(());
         }
         let turn_count = user_indices.len();
@@ -1800,7 +1803,7 @@ impl CodeTuiApp {
     ) -> Result<()> {
         if self.sending {
             self.notice = Some((
-                MUTED,
+                MUTED(),
                 "Can't rewind while a turn is in progress".to_string(),
             ));
             return Ok(());
@@ -1859,7 +1862,7 @@ impl CodeTuiApp {
         self.context_tokens = self.estimated_context_used().await;
         self.context_is_estimate = true;
         self.last_usage = None;
-        self.notice = Some((MUTED, notice));
+        self.notice = Some((MUTED(), notice));
         self.persist_history().await?;
         Ok(())
     }
@@ -1872,7 +1875,7 @@ impl CodeTuiApp {
     /// events and the run is committed to history on `LocalCommandDone`.
     pub(super) fn start_local_command(&mut self, command: String) {
         if self.local_command.is_some() {
-            self.notice = Some((MUTED, "A command is already running".to_string()));
+            self.notice = Some((MUTED(), "A command is already running".to_string()));
             return;
         }
         let cwd = if self.real_cwd.is_empty() {
@@ -1886,7 +1889,7 @@ impl CodeTuiApp {
         let shell = match spawn_local_shell(&command, std::path::Path::new(&cwd)) {
             Ok(shell) => shell,
             Err(err) => {
-                self.notice = Some((ERROR, format!("Failed to run command: {err}")));
+                self.notice = Some((ERROR(), format!("Failed to run command: {err}")));
                 return;
             }
         };
@@ -1919,7 +1922,7 @@ impl CodeTuiApp {
         let _ = run.killer.kill();
         run.task.abort();
         self.record_local_output(run.command, run.stdout, run.stderr, -1, false, true);
-        self.notice = Some((MUTED, "Command interrupted".to_string()));
+        self.notice = Some((MUTED(), "Command interrupted".to_string()));
         self.persist_history().await?;
         Ok(())
     }
@@ -1953,7 +1956,7 @@ impl CodeTuiApp {
         } else {
             format!("Copied reply #{nth}")
         };
-        self.notice = Some((MUTED, label));
+        self.notice = Some((MUTED(), label));
         Ok(())
     }
 
@@ -1987,7 +1990,7 @@ impl CodeTuiApp {
         let global = crate::agent::memory::load_entries(&global_path);
         if entries.is_empty() && global.is_empty() {
             self.notice = Some((
-                MUTED,
+                MUTED(),
                 "No memory yet — the agent saves durable facts with its `remember` tool"
                     .to_string(),
             ));
@@ -2039,14 +2042,14 @@ impl CodeTuiApp {
         }
         if self.plan_mode {
             self.notice = Some((
-                ERROR,
+                ERROR(),
                 "Plan mode is active — approve the plan or /plan stop before /review".to_string(),
             ));
             return;
         }
         if !self.agent_capable() {
             self.notice = Some((
-                ERROR,
+                ERROR(),
                 "/review needs the native agent (an API key or Copilot — not OAuth or cursor)"
                     .to_string(),
             ));
@@ -2068,7 +2071,7 @@ impl CodeTuiApp {
             .dispatch_user_message_shown(prompt, None, Some(typed))
             .await
         {
-            self.notice = Some((ERROR, e.to_string()));
+            self.notice = Some((ERROR(), e.to_string()));
         }
     }
 
@@ -2093,7 +2096,7 @@ impl CodeTuiApp {
                             .to_string()
                     }
                 };
-                self.notice = Some((MUTED, msg));
+                self.notice = Some((MUTED(), msg));
             }
             Some("stop") | Some("off") | Some("cancel") => {
                 let msg = if self.goal_mode.take().is_some() {
@@ -2101,7 +2104,7 @@ impl CodeTuiApp {
                 } else {
                     "Goal mode wasn't active"
                 };
-                self.notice = Some((MUTED, msg.to_string()));
+                self.notice = Some((MUTED(), msg.to_string()));
             }
             Some(objective) => {
                 if self.sending {
@@ -2110,7 +2113,7 @@ impl CodeTuiApp {
                 }
                 if self.plan_mode {
                     self.notice = Some((
-                        ERROR,
+                        ERROR(),
                         "Plan mode is read-only — approve the plan or /plan stop before /goal"
                             .to_string(),
                     ));
@@ -2118,7 +2121,7 @@ impl CodeTuiApp {
                 }
                 if !self.agent_capable() {
                     self.notice = Some((
-                        ERROR,
+                        ERROR(),
                         "Goal mode needs the native agent (an API key or Copilot — not OAuth or cursor)"
                             .to_string(),
                     ));
@@ -2138,7 +2141,7 @@ impl CodeTuiApp {
                     .await
                 {
                     self.goal_mode = None;
-                    self.notice = Some((ERROR, e.to_string()));
+                    self.notice = Some((ERROR(), e.to_string()));
                     return;
                 }
                 // Dispatch can disarm the goal (plain-chat route) or decline to
@@ -2153,7 +2156,7 @@ impl CodeTuiApp {
                 // `send_user_message` clears the notice; hint about unattended runs after.
                 if !self.agent_auto_approve {
                     self.notice = Some((
-                        MUTED,
+                        MUTED(),
                         "Goal mode on — press Shift+Tab to auto-approve tools so it runs unattended"
                             .to_string(),
                     ));
@@ -2179,12 +2182,12 @@ impl CodeTuiApp {
         if signals_goal_complete(&last_reply) {
             let turns = self.goal_mode.take().map(|g| g.iteration).unwrap_or(0);
             let s = if turns == 1 { "" } else { "s" };
-            self.notice = Some((MUTED, format!("Goal complete (in {turns} turn{s})")));
+            self.notice = Some((MUTED(), format!("Goal complete (in {turns} turn{s})")));
             return Ok(());
         }
         // An errored turn must not auto-repeat — stop and keep the error visible.
         if let Some((color, msg)) = self.notice.as_mut()
-            && *color == ERROR
+            && *color == ERROR()
         {
             msg.push_str(" — goal mode stopped");
             self.goal_mode = None;
@@ -2203,7 +2206,7 @@ impl CodeTuiApp {
             let max = goal.max;
             self.goal_mode = None;
             self.notice = Some((
-                MUTED,
+                MUTED(),
                 format!(
                     "Goal mode stopped at the {max}-turn cap (/goal <objective> to keep going)"
                 ),
@@ -2248,7 +2251,7 @@ pieces and keep going"
             // Propagating would abort the event loop over one bad dispatch.
             Err(e) => {
                 self.goal_mode = None;
-                self.notice = Some((ERROR, format!("{e} — goal mode stopped")));
+                self.notice = Some((ERROR(), format!("{e} — goal mode stopped")));
             }
             // Dispatch declined to send; an armed goal with nothing in flight stalls.
             Ok(()) => {
@@ -2327,7 +2330,7 @@ pieces and keep going"
                 }
                 if self.pending_plan.is_none() {
                     self.notice = Some((
-                        MUTED,
+                        MUTED(),
                         "No plan yet — /plan <objective> to draft one first (or approve on the plan card)"
                             .to_string(),
                     ));
@@ -2348,10 +2351,10 @@ pieces and keep going"
                 self.draft_attachments = attachments;
                 self.sync_command_menu_state();
                 if let Err(e) = sent {
-                    self.notice = Some((ERROR, e.to_string()));
+                    self.notice = Some((ERROR(), e.to_string()));
                     return;
                 }
-                self.notice = Some((MUTED, "Executing the approved plan".to_string()));
+                self.notice = Some((MUTED(), "Executing the approved plan".to_string()));
             }
             "stop" | "cancel" | "discard" | "off" => {
                 if self.sending {
@@ -2366,12 +2369,12 @@ pieces and keep going"
                     (true, false) => "Plan mode off",
                     (false, _) => "Plan mode isn't on",
                 };
-                self.notice = Some((MUTED, msg.to_string()));
+                self.notice = Some((MUTED(), msg.to_string()));
             }
             "" => {
                 if self.plan_mode {
                     self.notice = Some((
-                        MUTED,
+                        MUTED(),
                         if self.pending_plan.is_some() {
                             "Plan mode is on — approve the plan card (or /plan go), or /plan stop to leave"
                         } else {
@@ -2388,7 +2391,7 @@ pieces and keep going"
                 let goal_stopped = self.goal_mode.is_some();
                 if !self.enter_plan_mode().await {
                     self.notice = Some((
-                        ERROR,
+                        ERROR(),
                         "Plan mode needs the native agent (an API key or Copilot — not OAuth or cursor)"
                             .to_string(),
                     ));
@@ -2411,11 +2414,11 @@ pieces and keep going"
                 self.draft_attachments = attachments;
                 self.sync_command_menu_state();
                 if let Err(e) = sent {
-                    self.notice = Some((ERROR, e.to_string()));
+                    self.notice = Some((ERROR(), e.to_string()));
                     return;
                 }
                 self.notice = Some((
-                    MUTED,
+                    MUTED(),
                     if goal_stopped {
                         "Goal mode stopped — plan mode is read-only until you approve the plan"
                     } else {
@@ -2432,7 +2435,7 @@ pieces and keep going"
                 let goal_stopped = self.goal_mode.is_some();
                 if !self.enter_plan_mode().await {
                     self.notice = Some((
-                        ERROR,
+                        ERROR(),
                         "Plan mode needs the native agent (an API key or Copilot — not OAuth or cursor)"
                             .to_string(),
                     ));
@@ -2442,9 +2445,10 @@ pieces and keep going"
                 // record: None keeps it out of ↑/↓ recall. Keep plan mode on the
                 // error path so the flag and engine restriction stay consistent.
                 if let Err(e) = self.dispatch_user_message(arg.to_string(), None).await {
-                    self.notice = Some((ERROR, e.to_string()));
+                    self.notice = Some((ERROR(), e.to_string()));
                 } else if goal_stopped {
-                    self.notice = Some((MUTED, "Goal mode stopped — planning instead".to_string()));
+                    self.notice =
+                        Some((MUTED(), "Goal mode stopped — planning instead".to_string()));
                 }
             }
         }
@@ -2461,12 +2465,12 @@ pieces and keep going"
                     return;
                 }
                 if !self.cursor_plan_mode {
-                    self.notice = Some((MUTED, "Plan mode isn't on".to_string()));
+                    self.notice = Some((MUTED(), "Plan mode isn't on".to_string()));
                     return;
                 }
                 self.set_cursor_mode(false).await;
                 self.notice = Some((
-                    MUTED,
+                    MUTED(),
                     "Plan mode off — cursor is back in agent mode".to_string(),
                 ));
             }
@@ -2478,17 +2482,17 @@ pieces and keep going"
                 self.set_cursor_mode(false).await;
                 if rest.is_empty() {
                     self.notice = Some((
-                        MUTED,
+                        MUTED(),
                         "Back in agent mode — send the go-ahead to execute the plan".to_string(),
                     ));
                 } else if let Err(e) = self.dispatch_user_message(rest.to_string(), None).await {
-                    self.notice = Some((ERROR, e.to_string()));
+                    self.notice = Some((ERROR(), e.to_string()));
                 }
             }
             "" | "on" => {
                 if self.cursor_plan_mode {
                     self.notice = Some((
-                        MUTED,
+                        MUTED(),
                         "Plan mode is on — describe what to plan, or /plan stop to leave"
                             .to_string(),
                     ));
@@ -2500,7 +2504,7 @@ pieces and keep going"
                 }
                 if self.set_cursor_mode(true).await {
                     self.notice = Some((
-                        MUTED,
+                        MUTED(),
                         "Plan mode — cursor plans read-only and asks you to approve".to_string(),
                     ));
                 }
@@ -2514,7 +2518,7 @@ pieces and keep going"
                     return;
                 }
                 if let Err(e) = self.dispatch_user_message(full.to_string(), None).await {
-                    self.notice = Some((ERROR, e.to_string()));
+                    self.notice = Some((ERROR(), e.to_string()));
                 }
             }
         }
@@ -2534,13 +2538,13 @@ pieces and keep going"
             Ok(false) => {
                 self.cursor_plan_mode = false;
                 self.notice = Some((
-                    ERROR,
+                    ERROR(),
                     format!("cursor didn't offer a '{mode}' mode for this session"),
                 ));
                 false
             }
             Err(e) => {
-                self.notice = Some((ERROR, format!("Couldn't switch cursor mode: {e}")));
+                self.notice = Some((ERROR(), format!("Couldn't switch cursor mode: {e}")));
                 true
             }
         }
@@ -2564,7 +2568,7 @@ pieces and keep going"
         self.pending_plan = Some(plan);
         self.plan_card_idx = plan_at;
         self.notice = Some((
-            MUTED,
+            MUTED(),
             "Plan drafted — approve on the card or /plan go; keep refining, or /plan stop to leave"
                 .to_string(),
         ));
@@ -2716,7 +2720,7 @@ pieces and keep going"
         self.pending_finish = None;
         self.pending_reasoning.clear();
         self.follow_output = true;
-        self.notice = Some((MUTED, with_discarded("Request cancelled", discarded)));
+        self.notice = Some((MUTED(), with_discarded("Request cancelled", discarded)));
     }
 
     pub(super) async fn interrupt_inflight_request(&mut self) -> Result<()> {
@@ -2745,7 +2749,7 @@ pieces and keep going"
                 CancelKind::Discard
             });
             if goal_was_active {
-                self.notice = Some((MUTED, "Goal mode stopped".to_string()));
+                self.notice = Some((MUTED(), "Goal mode stopped".to_string()));
             }
             return Ok(());
         }
@@ -2788,7 +2792,7 @@ pieces and keep going"
         self.last_usage = None;
         self.persist_history().await?;
         self.notice = Some((
-            MUTED,
+            MUTED(),
             with_discarded(
                 if goal_was_active {
                     "Response interrupted — goal mode stopped"

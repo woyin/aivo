@@ -38,19 +38,19 @@ impl CodeTuiApp {
     pub(super) fn cancel_account_login(&mut self) {
         let _ = self.begin_account_flow();
         self.account_login = None;
-        self.notice = Some((MUTED, "Sign-in cancelled.".to_string()));
+        self.notice = Some((MUTED(), "Sign-in cancelled.".to_string()));
     }
 
     /// `/login`: starts behind a notice; the card appears once the code arrives.
     pub(super) async fn run_login_command(&mut self) {
         if !self.is_aivo_account_key() {
-            self.notice = Some((MUTED, ACCOUNT_ONLY_HINT.to_string()));
+            self.notice = Some((MUTED(), ACCOUNT_ONLY_HINT.to_string()));
             return;
         }
         let account_gen = self.begin_account_flow();
         self.pending_logout = None;
         self.account_login = None;
-        self.notice = Some((MUTED, "Starting sign-in…".to_string()));
+        self.notice = Some((MUTED(), "Starting sign-in…".to_string()));
         let tx = self.tx.clone();
         let session_store = self.session_store.clone();
         let label = device_label();
@@ -62,11 +62,11 @@ impl CodeTuiApp {
     /// `/logout`: raise the y/n confirm card ("who" comes from the local cache).
     pub(super) async fn run_logout_command(&mut self) {
         if !self.is_aivo_account_key() {
-            self.notice = Some((MUTED, ACCOUNT_ONLY_HINT.to_string()));
+            self.notice = Some((MUTED(), ACCOUNT_ONLY_HINT.to_string()));
             return;
         }
         let Some(account) = account_store::load() else {
-            self.notice = Some((MUTED, "Not logged in.".to_string()));
+            self.notice = Some((MUTED(), "Not logged in.".to_string()));
             return;
         };
         if self.account_login.is_some() {
@@ -90,7 +90,7 @@ impl CodeTuiApp {
             self.show_toast("Sign-out cancelled");
             return;
         }
-        self.notice = Some((MUTED, "Signing out…".to_string()));
+        self.notice = Some((MUTED(), "Signing out…".to_string()));
         let account_gen = self.begin_account_flow();
         let tx = self.tx.clone();
         self.account_task = Some(tokio::spawn(async move {
@@ -125,7 +125,7 @@ impl CodeTuiApp {
                 };
                 if crate::services::browser_open::open_url(&url).is_err() {
                     self.notice = Some((
-                        MUTED,
+                        MUTED(),
                         "Couldn't open a browser — visit the URL shown.".to_string(),
                     ));
                 }
@@ -143,7 +143,7 @@ impl CodeTuiApp {
     /// (the PTY reader strips its colors/spinner to plain text).
     pub(super) async fn run_usage_command(&mut self) {
         if !self.is_aivo_account_key() {
-            self.notice = Some((MUTED, ACCOUNT_ONLY_HINT.to_string()));
+            self.notice = Some((MUTED(), ACCOUNT_ONLY_HINT.to_string()));
             return;
         }
         self.start_local_command("aivo account usage".to_string());
@@ -168,7 +168,7 @@ impl CodeTuiApp {
             }
             Err(msg) => {
                 self.account_login = None;
-                self.notice = Some((ERROR, msg));
+                self.notice = Some((ERROR(), msg));
             }
         }
     }
@@ -190,9 +190,9 @@ impl CodeTuiApp {
                 // the flow cleared — drop the old plan's catalog here too.
                 self.cache.clear_starter().await;
                 self.refresh_context_window().await;
-                self.notice = Some((ACCENT, msg));
+                self.notice = Some((ACCENT(), msg));
             }
-            Err(msg) => self.notice = Some((ERROR, msg)),
+            Err(msg) => self.notice = Some((ERROR(), msg)),
         }
     }
 
@@ -212,11 +212,11 @@ impl CodeTuiApp {
                 self.cache.clear_starter().await;
                 self.refresh_context_window().await;
                 self.notice = Some((
-                    MUTED,
+                    MUTED(),
                     "Logged out — this device is no longer linked.".to_string(),
                 ));
             }
-            Err(msg) => self.notice = Some((ERROR, format!("Couldn't sign out: {msg}"))),
+            Err(msg) => self.notice = Some((ERROR(), format!("Couldn't sign out: {msg}"))),
         }
     }
 }

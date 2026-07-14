@@ -519,7 +519,7 @@ impl CodeTuiApp {
         match read_system_clipboard()? {
             ClipboardPayload::Text(text) => {
                 if text.is_empty() {
-                    self.notice = Some((MUTED, "Clipboard is empty".to_string()));
+                    self.notice = Some((MUTED(), "Clipboard is empty".to_string()));
                 } else {
                     self.insert_pasted_text(&text);
                 }
@@ -528,10 +528,10 @@ impl CodeTuiApp {
                 let kind = attachment_kind_label(&attachment);
                 let name = attachment.name.clone();
                 self.draft_attachments.push(attachment);
-                self.notice = Some((MUTED, format!("Pasted {kind}: {name}")));
+                self.notice = Some((MUTED(), format!("Pasted {kind}: {name}")));
             }
             ClipboardPayload::Empty => {
-                self.notice = Some((MUTED, "Clipboard is empty".to_string()));
+                self.notice = Some((MUTED(), "Clipboard is empty".to_string()));
             }
         }
         Ok(())

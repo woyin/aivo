@@ -241,12 +241,12 @@ fn fill_trailing_background(mut row: StyledLine, width: usize) -> StyledLine {
 /// everything else = muted.
 pub(super) fn role_bar_color(role: &str) -> Color {
     match role {
-        "user" => USER,
-        "assistant" => ACCENT,
-        "local_command" => SHELL,
-        "tool_call" | "tool_result" | "plan" => TOOL,
-        "error" => ERROR,
-        _ => MUTED,
+        "user" => USER(),
+        "assistant" => ACCENT(),
+        "local_command" => SHELL(),
+        "tool_call" | "tool_result" | "plan" => TOOL(),
+        "error" => ERROR(),
+        _ => MUTED(),
     }
 }
 
@@ -256,7 +256,7 @@ pub(super) fn render_error_message(lines: &mut Vec<StyledLine>, content: &str) {
         let prefix = if i == 0 { "✗ " } else { "  " };
         lines.push(line_with_plain(vec![Span::styled(
             format!("{prefix}{line}"),
-            Style::default().fg(ERROR),
+            Style::default().fg(ERROR()),
         )]));
     }
 }
@@ -468,14 +468,14 @@ fn brand_wordmark_for(width: u16) -> (&'static [&'static str; 2], u16) {
 /// fits. Shared by the empty state and transcript intro so both start at the
 /// same column (see `test_intro_column_stable_*`); `width` is the inset column.
 pub(super) fn brand_wordmark_lines(width: u16) -> Vec<StyledLine> {
-    let mark_style = Style::default().fg(ACCENT).add_modifier(Modifier::BOLD);
+    let mark_style = Style::default().fg(ACCENT()).add_modifier(Modifier::BOLD);
     let (mark, mark_width) = brand_wordmark_for(width);
     // Shares the baseline row, so the banner stays two lines tall either way.
     let version = format!("  v{}", crate::version::VERSION);
     let bottom = if width >= mark_width + version.chars().count() as u16 {
         line_with_plain(vec![
             Span::styled(mark[1].to_string(), mark_style),
-            Span::styled(version, Style::default().fg(FAINT)),
+            Span::styled(version, Style::default().fg(FAINT())),
         ])
     } else {
         line_plain(mark[1].to_string(), mark_style)
@@ -532,7 +532,7 @@ pub(super) fn render_user_attachment_lines(
                 attachment_kind_label(attachment),
                 attachment.name
             ),
-            Style::default().fg(MUTED),
+            Style::default().fg(MUTED()),
         );
     }
 }
@@ -543,7 +543,7 @@ pub(super) fn composer_attachment_lines(attachments: &[MessageAttachment]) -> Ve
         .enumerate()
         .map(|(index, attachment)| {
             Line::from(vec![
-                Span::styled("· ", Style::default().fg(ACCENT)),
+                Span::styled("· ", Style::default().fg(ACCENT())),
                 Span::styled(
                     format!(
                         "{}. [{}] {}",
@@ -551,7 +551,7 @@ pub(super) fn composer_attachment_lines(attachments: &[MessageAttachment]) -> Ve
                         attachment_kind_label(attachment),
                         attachment.name
                     ),
-                    Style::default().fg(MUTED),
+                    Style::default().fg(MUTED()),
                 ),
             ])
         })
@@ -582,7 +582,7 @@ pub(super) fn session_preview_lines(
     if truncated {
         lines.push(line_plain(
             "· earlier messages not shown ·".to_string(),
-            Style::default().fg(FAINT),
+            Style::default().fg(FAINT()),
         ));
         bars.push(None);
     }
@@ -605,9 +605,9 @@ pub(super) fn session_preview_lines(
                     &mut bars,
                     vec![line_plain(
                         format!("⚙ {steps} tool step{}", if steps == 1 { "" } else { "s" }),
-                        Style::default().fg(MUTED),
+                        Style::default().fg(MUTED()),
                     )],
-                    Some(TOOL),
+                    Some(TOOL()),
                 );
                 prev_role = Some("tool_result");
             }
@@ -615,7 +615,7 @@ pub(super) fn session_preview_lines(
                 spacing(&mut lines, &mut bars, prev_role, "user");
                 let mut block = Vec::new();
                 render_user_message(&mut block, &message.content, &message.attachments);
-                push_block(&mut lines, &mut bars, block, Some(USER));
+                push_block(&mut lines, &mut bars, block, Some(USER()));
                 prev_role = Some("user");
                 index += 1;
             }
@@ -623,7 +623,7 @@ pub(super) fn session_preview_lines(
                 spacing(&mut lines, &mut bars, prev_role, "assistant");
                 let mut block = Vec::new();
                 render_assistant_message(&mut block, None, &message.content, width);
-                push_block(&mut lines, &mut bars, block, Some(ACCENT));
+                push_block(&mut lines, &mut bars, block, Some(ACCENT()));
                 prev_role = Some("assistant");
                 index += 1;
             }
@@ -644,11 +644,11 @@ pub(super) fn render_user_message(
     // entirely by the lavender gutter bar, so a user turn reads as clean prose.
     let mut had_line = false;
     for raw_line in content.lines() {
-        push_styled_line(lines, raw_line.to_string(), Style::default().fg(TEXT));
+        push_styled_line(lines, raw_line.to_string(), Style::default().fg(TEXT()));
         had_line = true;
     }
     if !had_line {
-        push_styled_line(lines, String::new(), Style::default().fg(TEXT));
+        push_styled_line(lines, String::new(), Style::default().fg(TEXT()));
     }
     render_user_attachment_lines(lines, attachments);
 }
@@ -704,11 +704,11 @@ fn push_reasoning_line(lines: &mut Vec<StyledLine>, text: &str, marker: Option<&
                 Some(m) => format!("{m} "),
                 None => "  ".to_string(),
             },
-            Style::default().fg(MUTED),
+            Style::default().fg(MUTED()),
         ),
         Span::styled(
             text.to_string(),
-            Style::default().fg(MUTED).add_modifier(Modifier::ITALIC),
+            Style::default().fg(MUTED()).add_modifier(Modifier::ITALIC),
         ),
     ]));
 }
@@ -842,7 +842,7 @@ pub(super) fn render_pending_status(
     push_styled_line(
         lines,
         text,
-        Style::default().fg(MUTED).add_modifier(Modifier::ITALIC),
+        Style::default().fg(MUTED()).add_modifier(Modifier::ITALIC),
     );
 }
 
@@ -927,11 +927,11 @@ pub(super) fn parallel_call_row_text(
 /// model's window limit (compaction territory) before it's hit.
 pub(super) fn context_fill_color(pct: u64) -> Color {
     if pct >= 95 {
-        ERROR
+        ERROR()
     } else if pct >= 80 {
-        WARNING
+        WARNING()
     } else {
-        MUTED
+        MUTED()
     }
 }
 
@@ -944,7 +944,7 @@ pub(super) fn spinner_frame_indexed(frame_tick: usize, reduce_motion: bool) -> &
 
 pub(super) fn notice_display(notice: Option<&(Color, String)>) -> Option<(Color, Cow<'_, str>)> {
     notice.map(|(color, text)| {
-        let formatted = if *color == ERROR {
+        let formatted = if *color == ERROR() {
             Cow::Owned(format!("Error: {text}"))
         } else {
             Cow::Borrowed(text.as_str())
@@ -960,8 +960,8 @@ pub(super) fn notice_spans(notice: Option<&(Color, String)>) -> Option<Vec<Span<
     let (color, text) = notice_display(notice)?;
     if let Some(url) = text.strip_prefix(LIVE_NOTICE_PREFIX) {
         return Some(vec![
-            Span::styled(LIVE_NOTICE_PREFIX, Style::default().fg(LIVE)),
-            Span::styled(url.to_string(), Style::default().fg(LINK)),
+            Span::styled(LIVE_NOTICE_PREFIX, Style::default().fg(LIVE())),
+            Span::styled(url.to_string(), Style::default().fg(LINK())),
         ]);
     }
     Some(vec![Span::styled(
@@ -987,7 +987,7 @@ pub(super) fn render_system_message(
     push_styled_line(
         lines,
         role.to_string(),
-        Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+        Style::default().fg(ACCENT()).add_modifier(Modifier::BOLD),
     );
     if !content.is_empty() {
         extend_without_leading_blank(lines, render_markdown_lines(content, width));
@@ -1013,11 +1013,11 @@ pub(super) fn render_tool_call(
     let name = canonical_tool_name(name);
     let summary = tool_arg_summary(name, args, cwd);
     let verb_style = if crate::agent::tools::is_mutating(name) {
-        Style::default().fg(WARNING)
+        Style::default().fg(WARNING())
     } else {
-        Style::default().fg(MUTED)
+        Style::default().fg(MUTED())
     };
-    let mut spans = vec![Span::styled("→ ".to_string(), Style::default().fg(TOOL))];
+    let mut spans = vec![Span::styled("→ ".to_string(), Style::default().fg(TOOL()))];
     if name == "subagent" {
         // A delegated task reads as the task itself — "subagent" is jargon and the
         // arrow already marks it as a step. Show the task in place of the verb.
@@ -1034,7 +1034,7 @@ pub(super) fn render_tool_call(
         if !summary.is_empty() {
             spans.push(Span::styled(
                 format!("({summary})"),
-                Style::default().fg(MUTED),
+                Style::default().fg(MUTED()),
             ));
         }
     }
@@ -1048,16 +1048,16 @@ pub(super) fn render_tool_call(
     // in the error hue when the tool failed.
     if failed {
         lines.push(line_with_plain(vec![
-            Span::styled("  ⎿ ".to_string(), Style::default().fg(ERROR)),
+            Span::styled("  ⎿ ".to_string(), Style::default().fg(ERROR())),
             Span::styled(
                 result.unwrap_or("failed").to_string(),
-                Style::default().fg(ERROR),
+                Style::default().fg(ERROR()),
             ),
         ]));
     } else if let Some(result) = result.filter(|r| !r.is_empty()) {
         lines.push(line_with_plain(vec![
-            Span::styled("  ⎿ ".to_string(), Style::default().fg(FAINT)),
-            Span::styled(result.to_string(), Style::default().fg(FAINT)),
+            Span::styled("  ⎿ ".to_string(), Style::default().fg(FAINT())),
+            Span::styled(result.to_string(), Style::default().fg(FAINT())),
         ]));
     }
 }
@@ -1143,25 +1143,25 @@ pub(super) fn render_tool_call_group(
         _ => format!("{} ×{n}", tool_display_name(name)),
     };
     let verb_style = if crate::agent::tools::is_mutating(name) {
-        Style::default().fg(WARNING)
+        Style::default().fg(WARNING())
     } else {
-        Style::default().fg(MUTED)
+        Style::default().fg(MUTED())
     };
     let mut spans = vec![
-        Span::styled("→ ".to_string(), Style::default().fg(TOOL)),
+        Span::styled("→ ".to_string(), Style::default().fg(TOOL())),
         Span::styled(head, verb_style),
     ];
     let list = join_targets(targets, 56);
     if !list.is_empty() {
         spans.push(Span::styled(
             format!(": {list}"),
-            Style::default().fg(MUTED),
+            Style::default().fg(MUTED()),
         ));
     }
     if failed > 0 {
         spans.push(Span::styled(
             format!(" · {failed} failed"),
-            Style::default().fg(ERROR),
+            Style::default().fg(ERROR()),
         ));
     }
     lines.push(line_with_plain(spans));
@@ -1487,9 +1487,9 @@ pub(super) fn render_local_command(
     lines.push(line_with_plain(vec![
         Span::styled(
             "! ".to_string(),
-            Style::default().fg(SHELL).add_modifier(Modifier::BOLD),
+            Style::default().fg(SHELL()).add_modifier(Modifier::BOLD),
         ),
-        Span::styled(command.to_string(), Style::default().fg(TEXT)),
+        Span::styled(command.to_string(), Style::default().fg(TEXT())),
     ]));
 
     // A committed run stores only a bounded preview but carries the true line count
@@ -1514,8 +1514,8 @@ pub(super) fn render_local_command(
     let mut shown = 0usize;
     for (text, color) in stdout
         .lines()
-        .map(|l| (l, FAINT))
-        .chain(stderr.lines().map(|l| (l, WARNING)))
+        .map(|l| (l, FAINT()))
+        .chain(stderr.lines().map(|l| (l, WARNING())))
     {
         if shown >= cap {
             break;
@@ -1529,7 +1529,7 @@ pub(super) fn render_local_command(
     let mut faint = |text: String| {
         lines.push(line_with_plain(vec![Span::styled(
             text,
-            Style::default().fg(FAINT),
+            Style::default().fg(FAINT()),
         )]));
     };
     match view {
@@ -1551,7 +1551,7 @@ pub(super) fn render_local_command(
                         "  {OUTPUT_COLLAPSED_PREFIX}{} more lines{suffix}",
                         total - shown
                     ),
-                    Style::default().fg(MUTED),
+                    Style::default().fg(MUTED()),
                 )]));
             } else if truncated {
                 faint("  … (output truncated)".to_string());
@@ -1575,25 +1575,25 @@ pub(super) fn render_local_command(
             }
             lines.push(line_with_plain(vec![Span::styled(
                 format!("  {OUTPUT_EXPANDED_PREFIX}"),
-                Style::default().fg(MUTED),
+                Style::default().fg(MUTED()),
             )]));
         }
     }
     if running {
         lines.push(line_with_plain(vec![Span::styled(
             "  (running…)".to_string(),
-            Style::default().fg(FAINT),
+            Style::default().fg(FAINT()),
         )]));
     } else if total == 0 && exit_code == 0 && !interrupted {
         lines.push(line_with_plain(vec![Span::styled(
             "  (no output)".to_string(),
-            Style::default().fg(FAINT),
+            Style::default().fg(FAINT()),
         )]));
     }
     if interrupted {
         lines.push(line_with_plain(vec![Span::styled(
             "  [interrupted]".to_string(),
-            Style::default().fg(ERROR),
+            Style::default().fg(ERROR()),
         )]));
     } else if !running && !truncated && exit_code != 0 {
         // A truncated run was killed by us (cap/timeout), so its non-zero status is
@@ -1601,7 +1601,7 @@ pub(super) fn render_local_command(
         // so don't add a misleading `[exited -1]`.
         lines.push(line_with_plain(vec![Span::styled(
             format!("  [exited {exit_code}]"),
-            Style::default().fg(ERROR),
+            Style::default().fg(ERROR()),
         )]));
     }
 }
@@ -1637,7 +1637,7 @@ pub(super) fn render_tool_result(
     // Multi-line "error:" text stays neutral — only a single-line `error: …`
     // (see `ChatAgentUi`) or a nonzero exit is a real failure.
     let failed = exit.is_some() || (count <= 1 && result.trim_start().starts_with("error:"));
-    let summary_color = if failed { ERROR } else { FAINT };
+    let summary_color = if failed { ERROR() } else { FAINT() };
     let mut spans = vec![Span::styled(
         "  ⎿ ".to_string(),
         Style::default().fg(summary_color),
@@ -1652,18 +1652,18 @@ pub(super) fn render_tool_result(
         };
         spans.push(Span::styled(
             summary,
-            Style::default().fg(if failed { ERROR } else { MUTED }),
+            Style::default().fg(if failed { ERROR() } else { MUTED() }),
         ));
         if let Some(code) = exit {
             spans.push(Span::styled(
                 format!(" · exited {code}"),
-                Style::default().fg(ERROR),
+                Style::default().fg(ERROR()),
             ));
         }
         if let Some(label) = label.filter(|l| !l.is_empty()) {
             spans.push(Span::styled(
                 format!(" · {}", truncate_chars(label, 40)),
-                Style::default().fg(MUTED),
+                Style::default().fg(MUTED()),
             ));
         }
         // A search's or subagent's first line is the payoff — preview it.
@@ -1684,20 +1684,20 @@ pub(super) fn render_tool_result(
                 let is_exit_line = line.trim().starts_with("[exit ");
                 lines.push(line_with_plain(vec![Span::styled(
                     format!("    {}", strip_ansi_and_controls(line)),
-                    Style::default().fg(if is_exit_line { ERROR } else { FAINT }),
+                    Style::default().fg(if is_exit_line { ERROR() } else { FAINT() }),
                 )]));
             }
             if count > MAX_EXPANDED_OUTPUT_LINES {
                 lines.push(line_with_plain(vec![Span::styled(
                     format!("    … (+{} more lines)", count - MAX_EXPANDED_OUTPUT_LINES),
-                    Style::default().fg(FAINT),
+                    Style::default().fg(FAINT()),
                 )]));
             }
             // A long block also folds from its far end.
             if count > MAX_OUTPUT_LINES {
                 lines.push(line_with_plain(vec![Span::styled(
                     format!("  {OUTPUT_EXPANDED_PREFIX}"),
-                    Style::default().fg(MUTED),
+                    Style::default().fg(MUTED()),
                 )]));
             }
         } else if tool == Some("run_bash") {
@@ -1705,7 +1705,7 @@ pub(super) fn render_tool_result(
                 let is_exit_line = line.trim().starts_with("[exit ");
                 lines.push(line_with_plain(vec![Span::styled(
                     tool_tail_row_text(&strip_ansi_and_controls(line)),
-                    Style::default().fg(if is_exit_line { ERROR } else { FAINT }),
+                    Style::default().fg(if is_exit_line { ERROR() } else { FAINT() }),
                 )]));
             }
         }
@@ -1714,7 +1714,7 @@ pub(super) fn render_tool_result(
     if let Some(label) = label.filter(|l| !l.is_empty()) {
         spans.push(Span::styled(
             format!("{} · ", truncate_chars(label, 40)),
-            Style::default().fg(MUTED),
+            Style::default().fg(MUTED()),
         ));
     }
     spans.push(Span::styled(
@@ -2015,13 +2015,13 @@ pub(super) fn review_body_lines(
         for d in &diffs {
             out.push(Line::from(Span::styled(
                 format!("  {}", d.path),
-                Style::default().fg(TOOL).add_modifier(Modifier::BOLD),
+                Style::default().fg(TOOL()).add_modifier(Modifier::BOLD),
             )));
             let rows = build_hunk(&d.old, &d.new, None, CONTEXT);
             if rows.is_empty() {
                 out.push(Line::from(Span::styled(
                     "    (no textual change)".to_string(),
-                    Style::default().fg(FAINT),
+                    Style::default().fg(FAINT()),
                 )));
                 continue;
             }
@@ -2161,7 +2161,7 @@ fn render_diff_row(row: &DiffRow, numw: usize) -> StyledLine {
                 Some(n) => format!("{n:>numw$}"),
                 None => " ".repeat(numw),
             };
-            Span::styled(text, Style::default().fg(FAINT))
+            Span::styled(text, Style::default().fg(FAINT()))
         })
     };
     match row {
@@ -2170,7 +2170,7 @@ fn render_diff_row(row: &DiffRow, numw: usize) -> StyledLine {
             spans.extend(num_span(*num));
             spans.push(Span::styled(
                 format!("   {text}"),
-                Style::default().fg(MUTED),
+                Style::default().fg(MUTED()),
             ));
             line_with_plain(spans)
         }
@@ -2178,24 +2178,27 @@ fn render_diff_row(row: &DiffRow, numw: usize) -> StyledLine {
             num_span(*num),
             '-',
             segs,
-            DIFF_DEL_BG,
-            DIFF_DEL_HL_BG,
-            DIFF_DEL_FG,
-            DIFF_DEL_SIGN,
+            DIFF_DEL_BG(),
+            DIFF_DEL_HL_BG(),
+            DIFF_DEL_FG(),
+            DIFF_DEL_SIGN(),
         ),
         DiffRow::Ins { num, segs } => render_change_row(
             num_span(*num),
             '+',
             segs,
-            DIFF_ADD_BG,
-            DIFF_ADD_HL_BG,
-            DIFF_ADD_FG,
-            DIFF_ADD_SIGN,
+            DIFF_ADD_BG(),
+            DIFF_ADD_HL_BG(),
+            DIFF_ADD_FG(),
+            DIFF_ADD_SIGN(),
         ),
         DiffRow::Gap => {
             let mut spans = Vec::new();
             spans.extend(num_span(None));
-            spans.push(Span::styled("   ⋯".to_string(), Style::default().fg(FAINT)));
+            spans.push(Span::styled(
+                "   ⋯".to_string(),
+                Style::default().fg(FAINT()),
+            ));
             line_with_plain(spans)
         }
     }
@@ -2292,7 +2295,7 @@ fn render_edit_diff(
     if rows.len() > MAX_DIFF_LINES {
         lines.push(line_with_plain(vec![Span::styled(
             format!("    … (+{} more)", rows.len() - MAX_DIFF_LINES),
-            Style::default().fg(FAINT),
+            Style::default().fg(FAINT()),
         )]));
     }
 }
@@ -2336,7 +2339,7 @@ fn render_patch_diff(
         lines.push(match item {
             Item::Header(path) => line_with_plain(vec![Span::styled(
                 format!("  {path}"),
-                Style::default().fg(TOOL),
+                Style::default().fg(TOOL()),
             )]),
             Item::Row(row) => render_diff_row(row, numw),
         });
@@ -2344,7 +2347,7 @@ fn render_patch_diff(
     if items.len() > MAX_LINES {
         lines.push(line_with_plain(vec![Span::styled(
             format!("    … (+{} more)", items.len() - MAX_LINES),
-            Style::default().fg(FAINT),
+            Style::default().fg(FAINT()),
         )]));
     }
 }
@@ -2362,13 +2365,13 @@ pub(super) fn push_plan_card(
     push_styled_line(
         lines,
         "Implementation plan",
-        Style::default().fg(TOOL).add_modifier(Modifier::BOLD),
+        Style::default().fg(TOOL()).add_modifier(Modifier::BOLD),
     );
-    bars.push(Some(TOOL));
-    push_assistant_blocks(lines, bars, reasoning, content, width, TOOL);
+    bars.push(Some(TOOL()));
+    push_assistant_blocks(lines, bars, reasoning, content, width, TOOL());
     if let Some(footer) = footer {
-        push_styled_line(lines, footer, Style::default().fg(FAINT));
-        bars.push(Some(TOOL));
+        push_styled_line(lines, footer, Style::default().fg(FAINT()));
+        bars.push(Some(TOOL()));
     }
 }
 
@@ -2401,7 +2404,7 @@ fn plan_window(items: &[serde_json::Value], max: usize) -> (usize, usize) {
 fn plan_more_line(n: usize) -> StyledLine {
     line_with_plain(vec![Span::styled(
         format!("  … {n} more"),
-        Style::default().fg(FAINT),
+        Style::default().fg(FAINT()),
     )])
 }
 
@@ -2425,11 +2428,11 @@ pub(super) fn render_plan(lines: &mut Vec<StyledLine>, content: &str) {
     lines.push(line_with_plain(vec![
         Span::styled(
             "Plan".to_string(),
-            Style::default().fg(TOOL).add_modifier(Modifier::BOLD),
+            Style::default().fg(TOOL()).add_modifier(Modifier::BOLD),
         ),
         Span::styled(
             format!("  {done}/{} done", items.len()),
-            Style::default().fg(FAINT),
+            Style::default().fg(FAINT()),
         ),
     ]));
     let (start, end) = plan_window(&items, PLAN_MAX_VISIBLE);
@@ -2441,17 +2444,17 @@ pub(super) fn render_plan(lines: &mut Vec<StyledLine>, content: &str) {
         let (glyph, glyph_color, text_style) = match plan_status(item) {
             "completed" => (
                 "✔",
-                ASSISTANT,
+                ASSISTANT(),
                 Style::default()
-                    .fg(FAINT)
+                    .fg(FAINT())
                     .add_modifier(Modifier::CROSSED_OUT),
             ),
             "in_progress" => (
                 "▸",
-                TOOL,
-                Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
+                TOOL(),
+                Style::default().fg(TEXT()).add_modifier(Modifier::BOLD),
             ),
-            _ => ("○", MUTED, Style::default().fg(MUTED)),
+            _ => ("○", MUTED(), Style::default().fg(MUTED())),
         };
         lines.push(line_with_plain(vec![
             Span::styled(format!("  {glyph} "), Style::default().fg(glyph_color)),
@@ -3083,7 +3086,7 @@ impl MarkdownRenderer {
                 self.flush_line();
                 self.lines.push(line_plain(
                     "────────────────────────────────".to_string(),
-                    Style::default().fg(FAINT),
+                    Style::default().fg(FAINT()),
                 ));
             }
             MdEvent::Html(text) | MdEvent::InlineHtml(text) => self.push_text(text.as_ref()),
@@ -3091,7 +3094,7 @@ impl MarkdownRenderer {
             MdEvent::TaskListMarker(checked) => {
                 self.ensure_prefix();
                 let marker = if checked { "☑ " } else { "☐ " };
-                self.push_span(marker.to_string(), Style::default().fg(ACCENT));
+                self.push_span(marker.to_string(), Style::default().fg(ACCENT()));
             }
             _ => {}
         }
@@ -3218,7 +3221,7 @@ impl MarkdownRenderer {
         };
         self.lines.push(line_plain(
             format!("  {label}"),
-            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+            Style::default().fg(ACCENT()).add_modifier(Modifier::BOLD),
         ));
 
         let content = if block.content.is_empty() {
@@ -3229,12 +3232,12 @@ impl MarkdownRenderer {
         for raw_line in content.lines() {
             self.lines.push(line_plain(
                 format!("  {raw_line}"),
-                Style::default().fg(TEXT),
+                Style::default().fg(TEXT()),
             ));
         }
         if content.is_empty() || content.ends_with('\n') {
             self.lines
-                .push(line_plain("  ".to_string(), Style::default().fg(TEXT)));
+                .push(line_plain("  ".to_string(), Style::default().fg(TEXT())));
         }
     }
 
@@ -3274,7 +3277,7 @@ impl MarkdownRenderer {
         }
         let widths = fit_column_widths(&natural, &min_word, budget);
 
-        let border = Style::default().fg(FAINT);
+        let border = Style::default().fg(FAINT());
         let rule = |left: &str, mid: &str, right: &str| -> StyledLine {
             let segs: Vec<String> = widths.iter().map(|w| "─".repeat(w + 2)).collect();
             line_plain(format!("{left}{}{right}", segs.join(mid)), border)
@@ -3290,9 +3293,9 @@ impl MarkdownRenderer {
                 .collect();
             let height = cells.iter().map(Vec::len).max().unwrap_or(1).max(1);
             let cell_style = if header {
-                Style::default().fg(TEXT).add_modifier(Modifier::BOLD)
+                Style::default().fg(TEXT()).add_modifier(Modifier::BOLD)
             } else {
-                Style::default().fg(TEXT)
+                Style::default().fg(TEXT())
             };
             for k in 0..height {
                 let mut spans: Vec<Span<'static>> = vec![Span::styled("│", border)];
@@ -3329,8 +3332,8 @@ impl MarkdownRenderer {
     fn emit_table_stacked(&mut self, rows: &[Vec<String>], ncols: usize) {
         let width = self.table_width.max(8);
         let headers = &rows[0];
-        let label_style = Style::default().fg(TEXT).add_modifier(Modifier::BOLD);
-        let value_style = Style::default().fg(TEXT);
+        let label_style = Style::default().fg(TEXT()).add_modifier(Modifier::BOLD);
+        let value_style = Style::default().fg(TEXT());
         let mut first = true;
         for row in &rows[1..] {
             if row.iter().all(|c| c.trim().is_empty()) {
@@ -3339,7 +3342,7 @@ impl MarkdownRenderer {
             if !first {
                 let rule = "─".repeat(width.min(40));
                 self.lines
-                    .push(line_plain(rule, Style::default().fg(FAINT)));
+                    .push(line_plain(rule, Style::default().fg(FAINT())));
             }
             first = false;
             for i in 0..ncols {
@@ -3408,12 +3411,12 @@ impl MarkdownRenderer {
         // and the accent color marks the span; padding caused double spaces.
         self.push_span(
             text.to_string(),
-            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+            Style::default().fg(ACCENT()).add_modifier(Modifier::BOLD),
         );
     }
 
     fn current_style(&self) -> Style {
-        let mut style = Style::default().fg(TEXT);
+        let mut style = Style::default().fg(TEXT());
         if self.inline_style.emphasis > 0 {
             style = style.add_modifier(Modifier::ITALIC);
         }
@@ -3424,7 +3427,7 @@ impl MarkdownRenderer {
             style = style.add_modifier(Modifier::CROSSED_OUT);
         }
         if self.inline_style.link > 0 {
-            style = style.fg(LINK).add_modifier(Modifier::UNDERLINED);
+            style = style.fg(LINK()).add_modifier(Modifier::UNDERLINED);
         }
         if let Some(level) = self.heading {
             style = heading_style(level);
@@ -3438,10 +3441,10 @@ impl MarkdownRenderer {
         }
         if self.quote_depth > 0 {
             let prefix = format!("{} ", "▎".repeat(self.quote_depth));
-            self.push_span(prefix, Style::default().fg(QUOTE));
+            self.push_span(prefix, Style::default().fg(QUOTE()));
         }
         if let Some(prefix) = self.item_prefix.take() {
-            self.push_span(prefix, Style::default().fg(ACCENT));
+            self.push_span(prefix, Style::default().fg(ACCENT()));
         }
     }
 
@@ -3528,11 +3531,13 @@ impl CodeFence {
 pub(super) fn heading_style(level: HeadingLevel) -> Style {
     match level {
         HeadingLevel::H1 => Style::default()
-            .fg(ACCENT)
+            .fg(ACCENT())
             .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
-        HeadingLevel::H2 => Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
-        HeadingLevel::H3 => Style::default().fg(ASSISTANT).add_modifier(Modifier::BOLD),
-        _ => Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
+        HeadingLevel::H2 => Style::default().fg(ACCENT()).add_modifier(Modifier::BOLD),
+        HeadingLevel::H3 => Style::default()
+            .fg(ASSISTANT())
+            .add_modifier(Modifier::BOLD),
+        _ => Style::default().fg(TEXT()).add_modifier(Modifier::BOLD),
     }
 }
 

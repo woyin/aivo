@@ -7,10 +7,10 @@ impl CodeTuiApp {
         area: Rect,
         menu: &VisibleCommandMenu,
     ) {
-        frame.render_widget(Clear, area);
+        clear_to_canvas(frame, area);
         let shell = Block::default()
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(FAINT));
+            .border_style(Style::default().fg(FAINT()));
         frame.render_widget(shell, area);
 
         let inner = area.inner(ratatui::layout::Margin {
@@ -34,7 +34,7 @@ impl CodeTuiApp {
         let lines = render_command_menu_rows(menu, rows_area.width);
         frame.render_widget(
             Paragraph::new(Text::from(lines))
-                .style(Style::default().fg(TEXT))
+                .style(Style::default().fg(TEXT()))
                 .wrap(Wrap { trim: false }),
             rows_area,
         );
@@ -47,7 +47,7 @@ impl CodeTuiApp {
             "Esc close · Enter run · Tab insert · ↑/↓ navigate"
         };
         frame.render_widget(
-            Paragraph::new(footer_text).style(Style::default().fg(MUTED)),
+            Paragraph::new(footer_text).style(Style::default().fg(MUTED())),
             footer_area,
         );
     }
@@ -63,11 +63,11 @@ impl CodeTuiApp {
             return self.render_session_picker(frame, area, picker, split);
         }
 
-        frame.render_widget(Clear, area);
+        clear_to_canvas(frame, area);
         let shell = Block::default()
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(FAINT));
+            .border_style(Style::default().fg(FAINT()));
         frame.render_widget(shell, area);
 
         let inner = area.inner(ratatui::layout::Margin {
@@ -106,10 +106,10 @@ impl CodeTuiApp {
         let header = Line::from(vec![
             Span::styled(
                 picker.title,
-                Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
+                Style::default().fg(TEXT()).add_modifier(Modifier::BOLD),
             ),
             Span::raw(" ".repeat(usize::from(middle_padding))),
-            Span::styled(status_label, Style::default().fg(MUTED)),
+            Span::styled(status_label, Style::default().fg(MUTED())),
         ]);
         frame.render_widget(
             Paragraph::new(header),
@@ -117,18 +117,18 @@ impl CodeTuiApp {
         );
         let search_line = if picker.query.is_empty() {
             Line::from(vec![
-                Span::styled("/ ", Style::default().fg(MUTED)),
+                Span::styled("/ ", Style::default().fg(MUTED())),
                 Span::styled(
                     picker_search_placeholder(&picker.kind),
-                    Style::default().fg(MUTED).add_modifier(Modifier::ITALIC),
+                    Style::default().fg(MUTED()).add_modifier(Modifier::ITALIC),
                 ),
             ])
         } else {
             Line::from(vec![
-                Span::styled("/ ", Style::default().fg(MUTED)),
+                Span::styled("/ ", Style::default().fg(MUTED())),
                 Span::styled(
                     picker.query.clone(),
-                    Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
+                    Style::default().fg(TEXT()).add_modifier(Modifier::BOLD),
                 ),
             ])
         };
@@ -139,7 +139,7 @@ impl CodeTuiApp {
 
         if picker.loading {
             frame.render_widget(
-                Paragraph::new("Loading available models…").style(Style::default().fg(MUTED)),
+                Paragraph::new("Loading available models…").style(Style::default().fg(MUTED())),
                 chunks[1],
             );
             return OverlayRenderOut::default();
@@ -150,7 +150,7 @@ impl CodeTuiApp {
             (
                 vec![Line::from(Span::styled(
                     "No matches",
-                    Style::default().fg(MUTED),
+                    Style::default().fg(MUTED()),
                 ))],
                 Vec::new(),
             )
@@ -176,13 +176,13 @@ impl CodeTuiApp {
 
         frame.render_widget(
             Paragraph::new(Text::from(lines))
-                .style(Style::default().fg(TEXT))
+                .style(Style::default().fg(TEXT()))
                 .wrap(Wrap { trim: false }),
             chunks[1],
         );
         frame.render_widget(
             Paragraph::new("Type to filter · Up/Down wrap · Enter open · Esc close")
-                .style(Style::default().fg(MUTED)),
+                .style(Style::default().fg(MUTED())),
             chunks[2],
         );
         OverlayRenderOut::default()
@@ -200,7 +200,7 @@ impl CodeTuiApp {
             "{} · esc",
             format_session_match_count(picker.filtered_items().len(), picker.items.len())
         );
-        let inner = overlay_shell(frame, area, "Sessions", Some((badge, MUTED)));
+        let inner = overlay_shell(frame, area, "Sessions", Some((badge, MUTED())));
         if inner.height == 0 {
             return OverlayRenderOut::default();
         }
@@ -267,7 +267,7 @@ impl CodeTuiApp {
 
         frame.render_widget(
             Paragraph::new(Text::from(lines))
-                .style(Style::default().fg(TEXT))
+                .style(Style::default().fg(TEXT()))
                 .wrap(Wrap { trim: false }),
             chunks[2],
         );
@@ -279,7 +279,7 @@ impl CodeTuiApp {
             "Type to filter · Up/Down wrap · Enter open · Ctrl+D delete"
         };
         frame.render_widget(
-            Paragraph::new(footer_text).style(Style::default().fg(MUTED)),
+            Paragraph::new(footer_text).style(Style::default().fg(MUTED())),
             footer_rect,
         );
 
@@ -298,7 +298,7 @@ impl CodeTuiApp {
             frame.render_widget(
                 Paragraph::new(Span::styled(
                     "no session selected",
-                    Style::default().fg(MUTED),
+                    Style::default().fg(MUTED()),
                 )),
                 right,
             );
@@ -339,14 +339,14 @@ impl CodeTuiApp {
         area: Rect,
         scroll: u16,
     ) -> u16 {
-        frame.render_widget(Clear, area);
+        clear_to_canvas(frame, area);
         let shell = Block::default()
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(FAINT))
+            .border_style(Style::default().fg(FAINT()))
             .title(Span::styled(
                 "Help",
-                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+                Style::default().fg(ACCENT()).add_modifier(Modifier::BOLD),
             ));
         frame.render_widget(shell, area);
 
@@ -355,17 +355,19 @@ impl CodeTuiApp {
             horizontal: 2,
         });
 
-        let cmd_style = Style::default().fg(ASSISTANT).add_modifier(Modifier::BOLD);
-        let key_style = Style::default().fg(ACCENT).add_modifier(Modifier::BOLD);
-        let section_style = Style::default().fg(MUTED).add_modifier(Modifier::BOLD);
-        let group_style = Style::default().fg(FAINT);
+        let cmd_style = Style::default()
+            .fg(ASSISTANT())
+            .add_modifier(Modifier::BOLD);
+        let key_style = Style::default().fg(ACCENT()).add_modifier(Modifier::BOLD);
+        let section_style = Style::default().fg(MUTED()).add_modifier(Modifier::BOLD);
+        let group_style = Style::default().fg(FAINT());
 
         let mut lines: Vec<Line> = Vec::new();
 
         // Intro — what the surface is, in one line (the footer already notes Esc).
         lines.push(Line::from(Span::styled(
             "Message the model, or type a command. Enter sends.",
-            Style::default().fg(TEXT),
+            Style::default().fg(TEXT()),
         )));
 
         // --- Slash commands, grouped by purpose. ---
@@ -446,7 +448,7 @@ impl CodeTuiApp {
         ] {
             lines.push(Line::from(Span::styled(
                 format!("  {note}"),
-                Style::default().fg(MUTED),
+                Style::default().fg(MUTED()),
             )));
         }
 
@@ -462,14 +464,14 @@ impl CodeTuiApp {
         report: &crate::agent::engine::ContextReport,
         scroll: u16,
     ) -> u16 {
-        frame.render_widget(Clear, area);
+        clear_to_canvas(frame, area);
         let shell = Block::default()
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(FAINT))
+            .border_style(Style::default().fg(FAINT()))
             .title(Span::styled(
                 "Context",
-                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+                Style::default().fg(ACCENT()).add_modifier(Modifier::BOLD),
             ));
         frame.render_widget(shell, area);
 
@@ -493,15 +495,23 @@ impl CodeTuiApp {
 
         // Injected sits next to the system prompt it's folded into.
         let mut segs: Vec<(String, u64, Color)> = Vec::new();
-        segs.push(("System prompt".to_string(), report.system_prompt, ASSISTANT));
+        segs.push((
+            "System prompt".to_string(),
+            report.system_prompt,
+            ASSISTANT(),
+        ));
         if report.injected_context > 0 {
             segs.push((
                 "Injected context".to_string(),
                 report.injected_context,
-                WARNING,
+                WARNING(),
             ));
         }
-        segs.push((format!("Tools · {}", report.tool_count), report.tools, TOOL));
+        segs.push((
+            format!("Tools · {}", report.tool_count),
+            report.tools,
+            TOOL(),
+        ));
         if report.mcp_tool_count > 0 || report.mcp_deferred_count > 0 {
             let label = if report.mcp_deferred_count > 0 {
                 format!(
@@ -511,18 +521,18 @@ impl CodeTuiApp {
             } else {
                 format!("MCP tools · {}", report.mcp_tool_count)
             };
-            segs.push((label, report.mcp_tools, USER));
+            segs.push((label, report.mcp_tools, USER()));
         }
         segs.push((
             format!("Messages · {}", report.message_count),
             report.messages,
-            ACCENT,
+            ACCENT(),
         ));
 
         let mut lines: Vec<Line> = Vec::new();
         lines.push(Line::from(Span::styled(
             self.raw_model.clone(),
-            Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
+            Style::default().fg(TEXT()).add_modifier(Modifier::BOLD),
         )));
         lines.push(Line::from(""));
 
@@ -545,7 +555,7 @@ impl CodeTuiApp {
                     "{} tokens · context window unknown",
                     format_token_count_value(used)
                 ),
-                Style::default().fg(MUTED).add_modifier(Modifier::BOLD),
+                Style::default().fg(MUTED()).add_modifier(Modifier::BOLD),
             )));
         }
 
@@ -586,7 +596,7 @@ impl CodeTuiApp {
                 "Free",
                 free,
                 &pct_of(free),
-                FAINT,
+                FAINT(),
                 label_w,
             ));
         }
@@ -597,27 +607,27 @@ impl CodeTuiApp {
         } else {
             "Total is the last measured prompt; the split is a chars/4 estimate."
         };
-        lines.push(Line::from(Span::styled(note, Style::default().fg(FAINT))));
+        lines.push(Line::from(Span::styled(note, Style::default().fg(FAINT()))));
 
         if let Some(text) = self.injected_context.as_deref() {
             lines.push(Line::from(""));
             lines.push(Line::from(Span::styled(
                 "─".repeat(width),
-                Style::default().fg(FAINT),
+                Style::default().fg(FAINT()),
             )));
             lines.push(Line::from(Span::styled(
                 "Injected context",
-                Style::default().fg(WARNING).add_modifier(Modifier::BOLD),
+                Style::default().fg(WARNING()).add_modifier(Modifier::BOLD),
             )));
             if let Some(summary) = &self.injected_context_summary {
                 lines.push(Line::from(Span::styled(
                     summary.clone(),
-                    Style::default().fg(MUTED),
+                    Style::default().fg(MUTED()),
                 )));
             }
             lines.push(Line::from(Span::styled(
                 "Background awareness only — the model won't reference this unless it's relevant.",
-                Style::default().fg(FAINT),
+                Style::default().fg(FAINT()),
             )));
             lines.push(Line::from(""));
             for raw in text.split('\n') {
@@ -626,7 +636,10 @@ impl CodeTuiApp {
                     continue;
                 }
                 for wrapped in wrap_chars(raw, width) {
-                    lines.push(Line::from(Span::styled(wrapped, Style::default().fg(TEXT))));
+                    lines.push(Line::from(Span::styled(
+                        wrapped,
+                        Style::default().fg(TEXT()),
+                    )));
                 }
             }
         }
@@ -679,7 +692,7 @@ impl CodeTuiApp {
         {
             Line::from(Span::styled(
                 format!("Delete “{name}”?  ^D confirm · Esc cancel"),
-                Style::default().fg(WARNING).add_modifier(Modifier::BOLD),
+                Style::default().fg(WARNING()).add_modifier(Modifier::BOLD),
             ))
         } else {
             search_input_line(&state.query, "filter skills")
@@ -719,22 +732,22 @@ impl CodeTuiApp {
             rows.extend([
                 Line::from(Span::styled(
                     "name [description], or github:owner/repo · GitHub URL · path to install",
-                    Style::default().fg(MUTED),
+                    Style::default().fg(MUTED()),
                 )),
                 Line::from(Span::styled(
                     "e.g.  changelog Summarize the git log   ·   github:anthropics/skills",
-                    Style::default().fg(FAINT),
+                    Style::default().fg(FAINT()),
                 )),
                 Line::from(Span::styled(
                     "-p / --project installs into ./.agents/skills (shared via the repo)",
-                    Style::default().fg(FAINT),
+                    Style::default().fg(FAINT()),
                 )),
             ]);
             footer = vec![("Enter", "save"), ("Esc", "cancel")];
         } else if state.items.is_empty() {
             rows.push(Line::from(Span::styled(
                 "No skills yet — add one with ^A, or drop a <name>/SKILL.md folder in:",
-                Style::default().fg(MUTED),
+                Style::default().fg(MUTED()),
             )));
             for path in [
                 "~/.config/aivo/skills",
@@ -744,14 +757,14 @@ impl CodeTuiApp {
             ] {
                 rows.push(Line::from(Span::styled(
                     format!("  {path}"),
-                    Style::default().fg(FAINT),
+                    Style::default().fg(FAINT()),
                 )));
             }
             footer = vec![("^A", "add"), ("Esc", "close")];
         } else if filtered.is_empty() {
             rows.push(Line::from(Span::styled(
                 format!("No skills match “{}”", state.query),
-                Style::default().fg(MUTED),
+                Style::default().fg(MUTED()),
             )));
             footer = vec![("Esc", "close")];
         } else {
@@ -772,7 +785,7 @@ impl CodeTuiApp {
                     item.enabled,
                     &item.name,
                     &desc,
-                    MUTED,
+                    MUTED(),
                     i == state.selected,
                     inner_width,
                 ));
@@ -793,7 +806,7 @@ impl CodeTuiApp {
             rows.push(Line::from(""));
             rows.push(Line::from(Span::styled(
                 "Skills run with the native agent (plain API keys); this key uses a different backend.",
-                Style::default().fg(MUTED),
+                Style::default().fg(MUTED()),
             )));
         }
 
@@ -804,7 +817,7 @@ impl CodeTuiApp {
                 0,
                 Line::from(Span::styled(
                     format!("{spinner} {}", progress.status_text()),
-                    Style::default().fg(ACCENT),
+                    Style::default().fg(ACCENT()),
                 )),
             );
             selected_pos += 1; // the inserted row shifts the scroll anchor down one
@@ -816,7 +829,7 @@ impl CodeTuiApp {
             .filter(|_| state.adding.is_none() && filtered.contains(&state.selected));
         // One-line detail only in narrow — the split's right pane carries the full version.
         let detail = if split_panes.is_none() {
-            selected_item.map(|item| (self.skill_detail_text(item), MUTED))
+            selected_item.map(|item| (self.skill_detail_text(item), MUTED()))
         } else {
             None
         };
@@ -869,7 +882,7 @@ impl CodeTuiApp {
                 frame.render_widget(
                     Paragraph::new(Span::styled(
                         "no skill selected",
-                        Style::default().fg(MUTED),
+                        Style::default().fg(MUTED()),
                     )),
                     right,
                 );
@@ -918,7 +931,7 @@ impl CodeTuiApp {
         let filtered = state.filtered_indices();
         let marked = state.items.iter().filter(|i| i.checked).count();
         let badge = (!state.items.is_empty()).then(|| {
-            let color = if marked > 0 { ASSISTANT } else { MUTED };
+            let color = if marked > 0 { ASSISTANT() } else { MUTED() };
             (format!("{marked}/{} marked", state.items.len()), color)
         });
         let inner = overlay_shell(frame, area, "Install skills", badge);
@@ -951,14 +964,14 @@ impl CodeTuiApp {
         if !state.source.is_empty() {
             rows.push(Line::from(Span::styled(
                 truncate_for_display_width(&format!("from {}", state.source), inner_width),
-                Style::default().fg(FAINT),
+                Style::default().fg(FAINT()),
             )));
             let dest = if state.project {
                 "into ./.agents/skills (project)"
             } else {
                 "into ~/.config/aivo/skills (user)"
             };
-            rows.push(Line::from(Span::styled(dest, Style::default().fg(FAINT))));
+            rows.push(Line::from(Span::styled(dest, Style::default().fg(FAINT()))));
             rows.push(Line::from(""));
         }
         let mut selected_pos = 0usize;
@@ -968,24 +981,24 @@ impl CodeTuiApp {
                 let spinner = spinner_frame_indexed(self.frame_tick, self.reduce_motion);
                 rows.push(Line::from(Span::styled(
                     format!("{spinner} {}", progress.status_text()),
-                    Style::default().fg(ACCENT),
+                    Style::default().fg(ACCENT()),
                 )));
                 rows.push(Line::from(""));
                 rows.push(Line::from(Span::styled(
                     "Skills found in the source will appear here to pick from.",
-                    Style::default().fg(MUTED),
+                    Style::default().fg(MUTED()),
                 )));
             } else {
                 rows.push(Line::from(Span::styled(
                     "Nothing to install.",
-                    Style::default().fg(MUTED),
+                    Style::default().fg(MUTED()),
                 )));
             }
             footer = vec![("Esc", "cancel")];
         } else if filtered.is_empty() {
             rows.push(Line::from(Span::styled(
                 format!("No skills match “{}”", state.query),
-                Style::default().fg(MUTED),
+                Style::default().fg(MUTED()),
             )));
             footer = vec![("Esc", "cancel")];
         } else {
@@ -993,11 +1006,11 @@ impl CodeTuiApp {
                 let item = &state.items[i];
                 let advert = crate::agent::skills::advert_description(&item.description);
                 let (desc, desc_color) = if item.installed && item.checked {
-                    (format!("will update · {advert}"), ACCENT)
+                    (format!("will update · {advert}"), ACCENT())
                 } else if item.installed {
-                    (format!("installed — Space to update · {advert}"), FAINT)
+                    (format!("installed — Space to update · {advert}"), FAINT())
                 } else {
-                    (advert, MUTED)
+                    (advert, MUTED())
                 };
                 let desc = truncate_for_display_width(&desc, toggle_detail_room(inner_width));
                 if i == state.selected {
@@ -1037,12 +1050,12 @@ impl CodeTuiApp {
                 if item.installed && !item.checked {
                     (
                         "already installed — Space marks it for update".to_string(),
-                        FAINT,
+                        FAINT(),
                     )
                 } else if marked > 0 {
-                    (format!("Enter applies the {marked} marked"), MUTED)
+                    (format!("Enter applies the {marked} marked"), MUTED())
                 } else {
-                    ("Enter installs the highlighted skill".to_string(), MUTED)
+                    ("Enter installs the highlighted skill".to_string(), MUTED())
                 }
             })
         } else {
@@ -1097,7 +1110,7 @@ impl CodeTuiApp {
                 frame.render_widget(
                     Paragraph::new(Span::styled(
                         "no skill selected",
-                        Style::default().fg(MUTED),
+                        Style::default().fg(MUTED()),
                     )),
                     right,
                 );
@@ -1121,14 +1134,19 @@ impl CodeTuiApp {
         area: Rect,
         state: &ConfigOverlay,
     ) {
-        let on = state
+        // Theme is not a bool toggle — exclude it from the on/total badge.
+        let bool_items: Vec<_> = state
             .items
+            .iter()
+            .filter(|i| i.setting != ConfigSetting::Theme)
+            .collect();
+        let on = bool_items
             .iter()
             .filter(|i| self.config_setting_enabled(i.setting))
             .count();
         let input_line = Line::from(Span::styled(
             "Settings — remembered across sessions",
-            Style::default().fg(MUTED),
+            Style::default().fg(MUTED()),
         ));
 
         let inner_width = usize::from(area.width).saturating_sub(6).max(1);
@@ -1140,14 +1158,25 @@ impl CodeTuiApp {
             if pos == state.selected {
                 selected_pos = rows.len() + 1;
             }
-            rows.extend(toggle_list_rows(
-                self.config_setting_enabled(item.setting),
-                item.label,
-                &desc,
-                MUTED,
-                pos == state.selected,
-                inner_width,
-            ));
+            if item.setting == ConfigSetting::Theme {
+                rows.extend(choice_list_rows(
+                    self.theme.label(),
+                    item.label,
+                    &desc,
+                    MUTED(),
+                    pos == state.selected,
+                    inner_width,
+                ));
+            } else {
+                rows.extend(toggle_list_rows(
+                    self.config_setting_enabled(item.setting),
+                    item.label,
+                    &desc,
+                    MUTED(),
+                    pos == state.selected,
+                    inner_width,
+                ));
+            }
             if pos + 1 < state.items.len() {
                 rows.push(Line::from(""));
             }
@@ -1158,7 +1187,7 @@ impl CodeTuiApp {
             area,
             ToggleListView {
                 title: "Config",
-                badge: count_badge(true, on, state.items.len()),
+                badge: count_badge(true, on, bool_items.len()),
                 input_line,
                 rows,
                 selected_pos,
@@ -1189,7 +1218,7 @@ impl CodeTuiApp {
                 } else {
                     format!("No tools match \"{}\".", state.query)
                 },
-                Style::default().fg(MUTED),
+                Style::default().fg(MUTED()),
             )));
         }
         for (pos, &i) in filtered.iter().enumerate() {
@@ -1207,7 +1236,7 @@ impl CodeTuiApp {
                 item.enabled,
                 &item.name,
                 &desc,
-                MUTED,
+                MUTED(),
                 i == state.selected,
                 inner_width,
             ));
@@ -1248,7 +1277,7 @@ impl CodeTuiApp {
         if filtered.is_empty() {
             rows.push(Line::from(Span::styled(
                 format!("No servers match \"{}\".", state.query),
-                Style::default().fg(MUTED),
+                Style::default().fg(MUTED()),
             )));
         }
         for (pos, &i) in filtered.iter().enumerate() {
@@ -1266,7 +1295,7 @@ impl CodeTuiApp {
                 item.checked,
                 &item.name,
                 &detail,
-                if item.exists { ACCENT } else { MUTED },
+                if item.exists { ACCENT() } else { MUTED() },
                 i == state.selected,
                 inner_width,
             ));
@@ -1286,7 +1315,7 @@ impl CodeTuiApp {
                 title,
                 badge: Some((
                     format!("{marked}/{} marked", state.items.len()),
-                    if marked > 0 { ACCENT } else { MUTED },
+                    if marked > 0 { ACCENT() } else { MUTED() },
                 )),
                 input_line,
                 rows,
@@ -1347,7 +1376,7 @@ impl CodeTuiApp {
         {
             Line::from(Span::styled(
                 format!("Delete \u{201c}{name}\u{201d}?  ^D confirm \u{b7} Esc cancel"),
-                Style::default().fg(WARNING).add_modifier(Modifier::BOLD),
+                Style::default().fg(WARNING()).add_modifier(Modifier::BOLD),
             ))
         } else {
             search_input_line(&state.query, "filter sub-agents")
@@ -1383,7 +1412,7 @@ impl CodeTuiApp {
             // pane width — it must read intact down to ~40-col terminals.
             let intro_width = usize::from(list_pane.width).saturating_sub(2).max(20);
             for line in wrap_words("No sub-agents yet \u{2014} just ask:", intro_width) {
-                rows.push(Line::from(Span::styled(line, Style::default().fg(MUTED))));
+                rows.push(Line::from(Span::styled(line, Style::default().fg(MUTED()))));
             }
             for line in wrap_words(
                 "\u{201c}make me a code-reviewer subagent\u{201d}",
@@ -1391,23 +1420,23 @@ impl CodeTuiApp {
             ) {
                 rows.push(Line::from(Span::styled(
                     format!("  {line}"),
-                    Style::default().fg(FAINT),
+                    Style::default().fg(FAINT()),
                 )));
             }
             for line in wrap_words("or drop a <name>.md profile in:", intro_width) {
-                rows.push(Line::from(Span::styled(line, Style::default().fg(MUTED))));
+                rows.push(Line::from(Span::styled(line, Style::default().fg(MUTED()))));
             }
             for path in ["~/.config/aivo/agents", ".aivo/agents", ".claude/agents"] {
                 rows.push(Line::from(Span::styled(
                     format!("  {path}"),
-                    Style::default().fg(FAINT),
+                    Style::default().fg(FAINT()),
                 )));
             }
             footer = vec![("Esc", "close")];
         } else if filtered.is_empty() {
             rows.push(Line::from(Span::styled(
                 format!("No sub-agents match \u{201c}{}\u{201d}", state.query),
-                Style::default().fg(MUTED),
+                Style::default().fg(MUTED()),
             )));
             footer = vec![("Esc", "close")];
         } else {
@@ -1425,7 +1454,7 @@ impl CodeTuiApp {
                     true,
                     &item.name,
                     &desc,
-                    MUTED,
+                    MUTED(),
                     i == state.selected,
                     inner_width,
                 ));
@@ -1446,7 +1475,7 @@ impl CodeTuiApp {
             .filter(|_| filtered.contains(&state.selected));
         // One-line detail only in narrow \u{2014} the split's right pane carries the full version.
         let detail = if split_panes.is_none() {
-            selected_item.map(|item| (self.agent_detail_text(item), MUTED))
+            selected_item.map(|item| (self.agent_detail_text(item), MUTED()))
         } else {
             None
         };
@@ -1498,7 +1527,7 @@ impl CodeTuiApp {
                 frame.render_widget(
                     Paragraph::new(Span::styled(
                         "no sub-agent selected",
-                        Style::default().fg(MUTED),
+                        Style::default().fg(MUTED()),
                     )),
                     right,
                 );
@@ -1623,7 +1652,7 @@ impl CodeTuiApp {
         {
             Line::from(Span::styled(
                 format!("Delete “{name}”?  ^D confirm · Esc cancel"),
-                Style::default().fg(WARNING).add_modifier(Modifier::BOLD),
+                Style::default().fg(WARNING()).add_modifier(Modifier::BOLD),
             ))
         } else {
             search_input_line(&state.query, "filter servers")
@@ -1663,30 +1692,30 @@ impl CodeTuiApp {
             rows.extend([
                 Line::from(Span::styled(
                     "command args… or a https:// URL (name derived), or Ctrl+V a JSON block · -p → project .mcp.json",
-                    Style::default().fg(MUTED),
+                    Style::default().fg(MUTED()),
                 )),
                 Line::from(Span::styled(
                     "e.g.  npx -y @modelcontextprotocol/server-filesystem ~",
-                    Style::default().fg(FAINT),
+                    Style::default().fg(FAINT()),
                 )),
             ]);
             footer = vec![("Enter", "save"), ("Esc", "cancel")];
         } else if state.items.is_empty() {
             rows.push(Line::from(Span::styled(
                 "No servers yet — add one with ^A, or drop an \"mcpServers\" entry in:",
-                Style::default().fg(MUTED),
+                Style::default().fg(MUTED()),
             )));
             for path in ["~/.config/aivo/mcp.json", ".mcp.json"] {
                 rows.push(Line::from(Span::styled(
                     format!("  {path}"),
-                    Style::default().fg(FAINT),
+                    Style::default().fg(FAINT()),
                 )));
             }
             footer = vec![("^A", "add"), ("Esc", "close")];
         } else if filtered.is_empty() {
             rows.push(Line::from(Span::styled(
                 format!("No servers match “{}”", state.query),
-                Style::default().fg(MUTED),
+                Style::default().fg(MUTED()),
             )));
             footer = vec![("Esc", "close")];
         } else {
@@ -1726,7 +1755,7 @@ impl CodeTuiApp {
             rows.push(Line::from(""));
             rows.push(Line::from(Span::styled(
                 "MCP tools run with the native agent (plain API keys); this key uses a different backend.",
-                Style::default().fg(MUTED),
+                Style::default().fg(MUTED()),
             )));
         }
 
@@ -1789,7 +1818,7 @@ impl CodeTuiApp {
                 frame.render_widget(
                     Paragraph::new(Span::styled(
                         "no server selected",
-                        Style::default().fg(MUTED),
+                        Style::default().fg(MUTED()),
                     )),
                     right,
                 );
@@ -1856,15 +1885,18 @@ impl CodeTuiApp {
         let mut lines = vec![Line::from(vec![
             Span::styled(
                 row.name.clone(),
-                Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
+                Style::default().fg(TEXT()).add_modifier(Modifier::BOLD),
             ),
-            Span::styled(format!("  [{scope}]"), Style::default().fg(MUTED)),
+            Span::styled(format!("  [{scope}]"), Style::default().fg(MUTED())),
         ])];
         // `row.command` holds the launch command line for stdio servers and the
         // endpoint URL for HTTP ones; the transport kind rides on the row.
         let label = if row.remote { "url" } else { "command" };
         for chunk in wrap_chars(&format!("{label}: {}", row.command), width) {
-            lines.push(Line::from(Span::styled(chunk, Style::default().fg(MUTED))));
+            lines.push(Line::from(Span::styled(
+                chunk,
+                Style::default().fg(MUTED()),
+            )));
         }
         lines.push(Line::from(Span::styled(
             truncate_for_display_width(&format!("status: {}", row.status), width),
@@ -1879,7 +1911,7 @@ impl CodeTuiApp {
             if tools.is_empty() {
                 lines.push(Line::from(Span::styled(
                     "Connected, but this server exposes no tools.",
-                    Style::default().fg(MUTED),
+                    Style::default().fg(MUTED()),
                 )));
             } else {
                 let tools: Vec<(&str, &str, bool)> = tools
@@ -1906,7 +1938,7 @@ impl CodeTuiApp {
                 };
                 lines.push(Line::from(Span::styled(
                     format!("Tools ({counts}){cost}:"),
-                    Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
+                    Style::default().fg(TEXT()).add_modifier(Modifier::BOLD),
                 )));
                 lines.push(Line::from(""));
                 lines.extend(mcp_tool_lines(&tools, width));
@@ -1918,20 +1950,23 @@ impl CodeTuiApp {
         {
             lines.push(Line::from(Span::styled(
                 "Failed to connect:",
-                Style::default().fg(ERROR).add_modifier(Modifier::BOLD),
+                Style::default().fg(ERROR()).add_modifier(Modifier::BOLD),
             )));
             for chunk in wrap_chars(err, width) {
-                lines.push(Line::from(Span::styled(chunk, Style::default().fg(ERROR))));
+                lines.push(Line::from(Span::styled(
+                    chunk,
+                    Style::default().fg(ERROR()),
+                )));
             }
         } else if !row.enabled {
             lines.push(Line::from(Span::styled(
                 "Disabled — Space in the list to enable.",
-                Style::default().fg(MUTED),
+                Style::default().fg(MUTED()),
             )));
         } else {
             lines.push(Line::from(Span::styled(
                 "Connecting… tools appear here once the handshake completes.",
-                Style::default().fg(MUTED),
+                Style::default().fg(MUTED()),
             )));
         }
         render_detail_lines(frame, area, lines, scroll, esc_label)
@@ -2019,33 +2054,36 @@ impl CodeTuiApp {
     ) -> u16 {
         let mut title = vec![Span::styled(
             name.to_string(),
-            Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
+            Style::default().fg(TEXT()).add_modifier(Modifier::BOLD),
         )];
         if !tag.is_empty() {
-            title.push(Span::styled(format!("  {tag}"), Style::default().fg(MUTED)));
+            title.push(Span::styled(
+                format!("  {tag}"),
+                Style::default().fg(MUTED()),
+            ));
         }
         let mut lines = vec![
             Line::from(title),
             Line::from(Span::styled(
                 truncate_for_display_width(location, width),
-                Style::default().fg(MUTED),
+                Style::default().fg(MUTED()),
             )),
             Line::from(""),
         ];
         if !description.is_empty() {
             for chunk in wrap_chars(description, width) {
-                lines.push(Line::from(Span::styled(chunk, Style::default().fg(TEXT))));
+                lines.push(Line::from(Span::styled(chunk, Style::default().fg(TEXT()))));
             }
             lines.push(Line::from(""));
         }
         lines.push(Line::from(Span::styled(
             "Instructions:",
-            Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
+            Style::default().fg(TEXT()).add_modifier(Modifier::BOLD),
         )));
         if body.trim().is_empty() {
             lines.push(Line::from(Span::styled(
                 "  (empty — edit SKILL.md to add instructions)",
-                Style::default().fg(FAINT),
+                Style::default().fg(FAINT()),
             )));
         } else {
             // The body IS markdown — render it like the transcript, not dim raw lines.
@@ -2105,14 +2143,14 @@ fn overlay_shell(
     title: &str,
     badge: Option<(String, Color)>,
 ) -> Rect {
-    frame.render_widget(Clear, area);
+    clear_to_canvas(frame, area);
     let mut block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(FAINT))
+        .border_style(Style::default().fg(FAINT()))
         .title_top(Line::from(Span::styled(
             format!(" {title} "),
-            Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
+            Style::default().fg(TEXT()).add_modifier(Modifier::BOLD),
         )));
     if let Some((label, color)) = badge {
         block = block.title_top(
@@ -2202,7 +2240,7 @@ fn render_vertical_rule(frame: &mut Frame<'_>, area: Rect) {
         return;
     }
     let lines: Vec<Line> = (0..area.height)
-        .map(|_| Line::from(Span::styled("│", Style::default().fg(FAINT))))
+        .map(|_| Line::from(Span::styled("│", Style::default().fg(FAINT()))))
         .collect();
     frame.render_widget(
         Paragraph::new(Text::from(lines)),
@@ -2217,7 +2255,7 @@ fn render_vertical_rule(frame: &mut Frame<'_>, area: Rect) {
 /// The two lines for one toggle-list item: a `[✓]`/`[ ]` checkbox plus the bold
 /// name on the first line, and the indented detail (a skill's description or a
 /// server's status, already truncated to one line) on the second. `detail_color`
-/// applies when enabled; a disabled item dims to `FAINT`; the selected item gets
+/// applies when enabled; a disabled item dims to `FAINT()`; the selected item gets
 /// a full-width highlight across both lines.
 fn toggle_list_rows(
     enabled: bool,
@@ -2231,28 +2269,31 @@ fn toggle_list_rows(
     let indent = " ".repeat(TOGGLE_CHECKBOX_WIDTH);
     if selected {
         // Keep hierarchy on the bar: bold name, softer description, accent ✓ survives.
-        let bar = Style::default().bg(SELECT_BG);
+        let bar = Style::default().bg(SELECT_BG());
         vec![
             Line::from(vec![
-                Span::styled(check, bar.fg(if enabled { ACCENT } else { SELECT_ACCENT })),
+                Span::styled(
+                    check,
+                    bar.fg(if enabled { ACCENT() } else { SELECT_ACCENT() }),
+                ),
                 Span::styled(
                     pad_to_width(name, width.saturating_sub(TOGGLE_CHECKBOX_WIDTH)),
-                    bar.fg(SELECT_TEXT).add_modifier(Modifier::BOLD),
+                    bar.fg(SELECT_TEXT()).add_modifier(Modifier::BOLD),
                 ),
             ]),
             Line::from(Span::styled(
                 pad_to_width(&format!("{indent}{detail}"), width),
-                bar.fg(SELECT_ACCENT),
+                bar.fg(SELECT_ACCENT()),
             )),
         ]
     } else if enabled {
         vec![
             Line::from(vec![
-                Span::styled(check, Style::default().fg(ACCENT)),
+                Span::styled(check, Style::default().fg(ACCENT())),
                 // Neutral name: the accent checkmark alone carries "enabled".
                 Span::styled(
                     name.to_string(),
-                    Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
+                    Style::default().fg(TEXT()).add_modifier(Modifier::BOLD),
                 ),
             ]),
             Line::from(Span::styled(
@@ -2264,12 +2305,57 @@ fn toggle_list_rows(
         // Name a step above the description so a long disabled tail stays scannable.
         vec![
             Line::from(vec![
-                Span::styled(check, Style::default().fg(FAINT)),
-                Span::styled(name.to_string(), Style::default().fg(MUTED)),
+                Span::styled(check, Style::default().fg(FAINT())),
+                Span::styled(name.to_string(), Style::default().fg(MUTED())),
             ]),
             Line::from(Span::styled(
                 format!("{indent}{detail}"),
-                Style::default().fg(FAINT),
+                Style::default().fg(FAINT()),
+            )),
+        ]
+    }
+}
+
+/// Like [`toggle_list_rows`], but the leading marker shows a choice value
+/// (e.g. `[dark]` / `[light]`) instead of a checkbox.
+fn choice_list_rows(
+    value: &str,
+    name: &str,
+    detail: &str,
+    detail_color: Color,
+    selected: bool,
+    width: usize,
+) -> Vec<Line<'static>> {
+    let marker = format!("[{value}] ");
+    let marker_w = display_width(&marker).max(TOGGLE_CHECKBOX_WIDTH);
+    let indent = " ".repeat(marker_w);
+    if selected {
+        let bar = Style::default().bg(SELECT_BG());
+        vec![
+            Line::from(vec![
+                Span::styled(marker, bar.fg(ACCENT())),
+                Span::styled(
+                    pad_to_width(name, width.saturating_sub(marker_w)),
+                    bar.fg(SELECT_TEXT()).add_modifier(Modifier::BOLD),
+                ),
+            ]),
+            Line::from(Span::styled(
+                pad_to_width(&format!("{indent}{detail}"), width),
+                bar.fg(SELECT_ACCENT()),
+            )),
+        ]
+    } else {
+        vec![
+            Line::from(vec![
+                Span::styled(marker, Style::default().fg(ACCENT())),
+                Span::styled(
+                    name.to_string(),
+                    Style::default().fg(TEXT()).add_modifier(Modifier::BOLD),
+                ),
+            ]),
+            Line::from(Span::styled(
+                format!("{indent}{detail}"),
+                Style::default().fg(detail_color),
             )),
         ]
     }
@@ -2290,20 +2376,20 @@ fn agent_source_text(source: &std::path::Path) -> String {
 fn search_input_line(query: &str, placeholder: &str) -> Line<'static> {
     if query.is_empty() {
         Line::from(vec![
-            Span::styled("/ ", Style::default().fg(MUTED)),
+            Span::styled("/ ", Style::default().fg(MUTED())),
             Span::styled(
                 placeholder.to_string(),
-                Style::default().fg(MUTED).add_modifier(Modifier::ITALIC),
+                Style::default().fg(MUTED()).add_modifier(Modifier::ITALIC),
             ),
         ])
     } else {
         Line::from(vec![
-            Span::styled("/ ", Style::default().fg(MUTED)),
+            Span::styled("/ ", Style::default().fg(MUTED())),
             Span::styled(
                 query.to_string(),
-                Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
+                Style::default().fg(TEXT()).add_modifier(Modifier::BOLD),
             ),
-            Span::styled("▏", Style::default().fg(ACCENT)),
+            Span::styled("▏", Style::default().fg(ACCENT())),
         ])
     }
 }
@@ -2313,10 +2399,10 @@ fn add_input_line(buffer: &str) -> Line<'static> {
     Line::from(vec![
         Span::styled(
             "+ ",
-            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+            Style::default().fg(ACCENT()).add_modifier(Modifier::BOLD),
         ),
-        Span::styled(buffer.to_string(), Style::default().fg(TEXT)),
-        Span::styled("▏", Style::default().fg(ACCENT)),
+        Span::styled(buffer.to_string(), Style::default().fg(TEXT())),
+        Span::styled("▏", Style::default().fg(ACCENT())),
     ])
 }
 
@@ -2325,7 +2411,7 @@ fn count_badge(show: bool, on: usize, total: usize) -> Option<(String, Color)> {
     if !show || total == 0 {
         return None;
     }
-    let color = if on > 0 { ASSISTANT } else { MUTED };
+    let color = if on > 0 { ASSISTANT() } else { MUTED() };
     Some((format!("{on}/{total} on"), color))
 }
 
@@ -2338,11 +2424,11 @@ fn footer_hints(hints: &[(&str, &str)]) -> Line<'static> {
         }
         spans.push(Span::styled(
             key.to_string(),
-            Style::default().fg(MUTED).add_modifier(Modifier::BOLD),
+            Style::default().fg(MUTED()).add_modifier(Modifier::BOLD),
         ));
         spans.push(Span::styled(
             format!(" {label}"),
-            Style::default().fg(FAINT),
+            Style::default().fg(FAINT()),
         ));
     }
     Line::from(spans)
@@ -2449,7 +2535,7 @@ fn help_kv_row(label: &str, desc: &str, col: usize, label_style: Style) -> Line<
         Span::styled(format!("  {label}"), label_style),
         Span::styled(
             format!("{}{}", " ".repeat(pad), desc),
-            Style::default().fg(TEXT),
+            Style::default().fg(TEXT()),
         ),
     ])
 }
@@ -2475,10 +2561,13 @@ fn render_session_preview_pane(
     let header = vec![
         Line::from(Span::styled(
             truncate_for_display_width(title, width),
-            Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
+            Style::default().fg(TEXT()).add_modifier(Modifier::BOLD),
         )),
         Line::from(resume_metadata_spans(preview, area.width)),
-        Line::from(Span::styled("─".repeat(width), Style::default().fg(FAINT))),
+        Line::from(Span::styled(
+            "─".repeat(width),
+            Style::default().fg(FAINT()),
+        )),
     ];
     let header_h = (header.len() as u16).min(area.height);
     frame.render_widget(
@@ -2499,7 +2588,10 @@ fn render_session_preview_pane(
 
     let Some(entry) = entry else {
         frame.render_widget(
-            Paragraph::new(Span::styled("Loading preview…", Style::default().fg(MUTED))),
+            Paragraph::new(Span::styled(
+                "Loading preview…",
+                Style::default().fg(MUTED()),
+            )),
             body,
         );
         return 0;
@@ -2507,14 +2599,17 @@ fn render_session_preview_pane(
     if let Some(err) = &entry.error {
         let lines: Vec<Line> = wrap_chars(&format!("Couldn't load session: {err}"), width)
             .into_iter()
-            .map(|chunk| Line::from(Span::styled(chunk, Style::default().fg(ERROR))))
+            .map(|chunk| Line::from(Span::styled(chunk, Style::default().fg(ERROR()))))
             .collect();
         frame.render_widget(Paragraph::new(Text::from(lines)), body);
         return 0;
     }
     if entry.messages.is_empty() {
         frame.render_widget(
-            Paragraph::new(Span::styled("No messages yet", Style::default().fg(MUTED))),
+            Paragraph::new(Span::styled(
+                "No messages yet",
+                Style::default().fg(MUTED()),
+            )),
             body,
         );
         return 0;
@@ -2559,9 +2654,9 @@ fn render_session_preview_pane(
             Paragraph::new(Line::from(vec![
                 Span::styled(
                     format!("{first}–{last}/{total}"),
-                    Style::default().fg(MUTED),
+                    Style::default().fg(MUTED()),
                 ),
-                Span::styled("   PgUp older", Style::default().fg(FAINT)),
+                Span::styled("   PgUp older", Style::default().fg(FAINT())),
             ])),
             Rect {
                 y: body.y + body.height - 1,
@@ -2596,17 +2691,17 @@ fn render_detail_lines(
     let footer_line = if max_scroll == 0 {
         Line::from(Span::styled(
             esc_label.to_string(),
-            Style::default().fg(MUTED),
+            Style::default().fg(MUTED()),
         ))
     } else {
         let first = usize::from(scroll) + 1;
         let last = (usize::from(scroll) + body_h).min(total);
         Line::from(vec![
-            Span::styled(esc_label.to_string(), Style::default().fg(MUTED)),
-            Span::styled("   ↑↓ scroll   ", Style::default().fg(FAINT)),
+            Span::styled(esc_label.to_string(), Style::default().fg(MUTED())),
+            Span::styled("   ↑↓ scroll   ", Style::default().fg(FAINT())),
             Span::styled(
                 format!("{first}–{last}/{total}"),
-                Style::default().fg(MUTED),
+                Style::default().fg(MUTED()),
             ),
         ])
     };
@@ -2672,24 +2767,24 @@ pub(super) fn mcp_tool_lines(tools: &[(&str, &str, bool)], width: usize) -> Vec<
         }
         if *on {
             lines.push(Line::from(vec![
-                Span::styled("  • ", Style::default().fg(TOOL)),
+                Span::styled("  • ", Style::default().fg(TOOL())),
                 Span::styled(
                     (*tname).to_string(),
-                    Style::default().fg(TOOL).add_modifier(Modifier::BOLD),
+                    Style::default().fg(TOOL()).add_modifier(Modifier::BOLD),
                 ),
             ]));
         } else {
             lines.push(Line::from(vec![
-                Span::styled("  • ", Style::default().fg(FAINT)),
-                Span::styled((*tname).to_string(), Style::default().fg(FAINT)),
-                Span::styled(" · off", Style::default().fg(FAINT)),
+                Span::styled("  • ", Style::default().fg(FAINT())),
+                Span::styled((*tname).to_string(), Style::default().fg(FAINT())),
+                Span::styled(" · off", Style::default().fg(FAINT())),
             ]));
         }
         let desc = tdesc.split_whitespace().collect::<Vec<_>>().join(" ");
         for chunk in wrap_chars(&desc, width.saturating_sub(4)) {
             lines.push(Line::from(Span::styled(
                 format!("    {chunk}"),
-                Style::default().fg(if *on { MUTED } else { FAINT }),
+                Style::default().fg(if *on { MUTED() } else { FAINT() }),
             )));
         }
     }
@@ -2711,11 +2806,11 @@ fn abbreviate_home_path(dir: &std::path::Path) -> String {
 /// Status color for one MCP server's health.
 fn mcp_health_color(health: McpHealth) -> Color {
     match health {
-        McpHealth::Connected => ASSISTANT,
-        McpHealth::Failed => ERROR,
-        McpHealth::NeedsAuth => WARNING,
-        McpHealth::Idle => MUTED,
-        McpHealth::Disabled => FAINT,
+        McpHealth::Connected => ASSISTANT(),
+        McpHealth::Failed => ERROR(),
+        McpHealth::NeedsAuth => WARNING(),
+        McpHealth::Idle => MUTED(),
+        McpHealth::Disabled => FAINT(),
     }
 }
 
@@ -2744,7 +2839,7 @@ fn context_fill_bar(
     }
     let free = bar_w.saturating_sub(cells);
     if free > 0 {
-        spans.push(Span::styled("░".repeat(free), Style::default().fg(FAINT)));
+        spans.push(Span::styled("░".repeat(free), Style::default().fg(FAINT())));
     }
     Line::from(spans)
 }
@@ -2761,12 +2856,12 @@ fn context_legend_row(
     Line::from(vec![
         Span::styled("  ".to_string(), Style::default()),
         Span::styled(format!("{marker} "), Style::default().fg(color)),
-        Span::styled(pad_to_width(label, label_w), Style::default().fg(TEXT)),
+        Span::styled(pad_to_width(label, label_w), Style::default().fg(TEXT())),
         Span::styled(
             format!("  {:>7}", format_token_count_value(tokens)),
-            Style::default().fg(MUTED),
+            Style::default().fg(MUTED()),
         ),
-        Span::styled(format!("  {pct:>4}"), Style::default().fg(FAINT)),
+        Span::styled(format!("  {pct:>4}"), Style::default().fg(FAINT())),
     ])
 }
 

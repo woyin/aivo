@@ -1,51 +1,324 @@
 use super::*;
 
-// Warm-night palette mirroring getaivo.dev's dark theme (aivo-website
-// global.css): warm off-white ink on warm near-black, brand yellow accent, role
-// hues borrowed from the site's syntax tokens so the CLI and the web read as one
-// product. Everything stays muted — accents mark, they don't shout.
-pub(super) const TEXT: Color = Color::Rgb(237, 233, 226); // --text-primary
-pub(super) const MUTED: Color = Color::Rgb(158, 152, 140); // warm secondary ink
-pub(super) const FAINT: Color = Color::Rgb(109, 103, 93); // --text-muted
-// getaivo.dev brand yellow (#DEFC09), toned down for the muted dark palette so
-// it reads as the brand accent without the full neon punch of the raw web color.
-pub(super) const ACCENT: Color = Color::Rgb(206, 226, 70);
-// Assistant = warm jade (site --code-op), pulled clearly off the lime accent.
-pub(super) const ASSISTANT: Color = Color::Rgb(140, 190, 176);
-// User = lavender (site --code-var), the brand's complement to the yellow accent.
-pub(super) const USER: Color = Color::Rgb(181, 164, 235);
-// Agent tool steps (call/result) — a steel cyan distinct from user lavender,
-// assistant jade, and link blue.
-pub(super) const TOOL: Color = Color::Rgb(110, 170, 188);
-// `!cmd` local shell runs — a muted magenta so a user-run shell command reads
-// apart from agent tool steps (cyan) and the brand accent (lime).
-pub(super) const SHELL: Color = Color::Rgb(204, 112, 176);
-pub(super) const LINK: Color = Color::Rgb(143, 178, 222);
-pub(super) const QUOTE: Color = Color::Rgb(150, 150, 128); // warm olive aside
-pub(super) const ERROR: Color = Color::Rgb(228, 128, 114); // warm coral
-pub(super) const WARNING: Color = Color::Rgb(224, 180, 104); // brand gold (--code-string)
-pub(super) const LIVE: Color = Color::Rgb(232, 96, 92); // share "recording" red
+use std::sync::atomic::{AtomicU8, Ordering};
+
+/// Chat TUI color theme. Persisted in `code-prefs.json` as `"theme": "dark"|"light"`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum UiTheme {
+    Dark = 0,
+    Light = 1,
+}
+
+impl UiTheme {
+    pub(super) fn as_str(self) -> &'static str {
+        match self {
+            Self::Dark => "dark",
+            Self::Light => "light",
+        }
+    }
+
+    pub(super) fn cycle(self) -> Self {
+        match self {
+            Self::Dark => Self::Light,
+            Self::Light => Self::Dark,
+        }
+    }
+
+    pub(super) fn label(self) -> &'static str {
+        self.as_str()
+    }
+}
+
+static CURRENT_THEME: AtomicU8 = AtomicU8::new(UiTheme::Dark as u8);
+
+/// Install the active theme for color accessors. Call at startup and whenever
+/// `/config` cycles the theme so render paths pick up the new palette.
+pub(super) fn set_ui_theme(theme: UiTheme) {
+    CURRENT_THEME.store(theme as u8, Ordering::Relaxed);
+}
+
+pub(super) fn ui_theme() -> UiTheme {
+    match CURRENT_THEME.load(Ordering::Relaxed) {
+        x if x == UiTheme::Light as u8 => UiTheme::Light,
+        _ => UiTheme::Dark,
+    }
+}
+
+/// Semantic colors for the chat TUI. Dark mirrors getaivo.dev's warm-night
+/// tokens; light mirrors the site's light theme so CLI and web read as one product.
+#[derive(Clone, Copy)]
+pub(super) struct Palette {
+    pub text: Color,
+    pub muted: Color,
+    pub faint: Color,
+    pub accent: Color,
+    pub assistant: Color,
+    pub user: Color,
+    pub tool: Color,
+    pub shell: Color,
+    pub link: Color,
+    pub quote: Color,
+    pub error: Color,
+    pub warning: Color,
+    pub live: Color,
+    pub diff_add_bg: Color,
+    pub diff_del_bg: Color,
+    pub diff_add_fg: Color,
+    pub diff_del_fg: Color,
+    pub diff_add_sign: Color,
+    pub diff_del_sign: Color,
+    pub diff_add_hl_bg: Color,
+    pub diff_del_hl_bg: Color,
+    pub select_bg: Color,
+    pub select_text: Color,
+    pub select_accent: Color,
+    pub select_wash: Color,
+    pub select_flash: Color,
+    /// Full-screen canvas fill. `None` keeps the terminal's default background
+    /// (dark theme); light paints the brand warm paper so dark ink stays readable
+    /// even on a dark terminal.
+    pub canvas: Option<Color>,
+    pub toast_bg: Color,
+    pub jump_fg: Color,
+    pub jump_bg: Color,
+}
+
+impl Palette {
+    /// Warm-night: warm off-white ink on warm near-black, brand yellow accent.
+    pub const DARK: Self = Self {
+        text: Color::Rgb(237, 233, 226),
+        muted: Color::Rgb(158, 152, 140),
+        faint: Color::Rgb(109, 103, 93),
+        // Brand yellow (#DEFC09), toned down so it marks without the neon punch.
+        accent: Color::Rgb(206, 226, 70),
+        assistant: Color::Rgb(140, 190, 176),
+        user: Color::Rgb(181, 164, 235),
+        tool: Color::Rgb(110, 170, 188),
+        shell: Color::Rgb(204, 112, 176),
+        link: Color::Rgb(143, 178, 222),
+        quote: Color::Rgb(150, 150, 128),
+        error: Color::Rgb(228, 128, 114),
+        warning: Color::Rgb(224, 180, 104),
+        live: Color::Rgb(232, 96, 92),
+        diff_add_bg: Color::Rgb(26, 42, 32),
+        diff_del_bg: Color::Rgb(48, 30, 30),
+        diff_add_fg: Color::Rgb(168, 204, 182),
+        diff_del_fg: Color::Rgb(224, 162, 154),
+        diff_add_sign: Color::Rgb(120, 190, 150),
+        diff_del_sign: Color::Rgb(230, 120, 112),
+        diff_add_hl_bg: Color::Rgb(33, 84, 50),
+        diff_del_hl_bg: Color::Rgb(92, 38, 38),
+        select_bg: Color::Rgb(58, 62, 76),
+        select_text: Color::Rgb(242, 243, 246),
+        select_accent: Color::Rgb(196, 200, 210),
+        select_wash: Color::Rgb(48, 52, 64),
+        select_flash: Color::Rgb(86, 92, 110),
+        canvas: None,
+        toast_bg: Color::Rgb(24, 21, 17),
+        jump_fg: Color::Rgb(26, 23, 18),
+        jump_bg: Color::Rgb(231, 227, 219),
+    };
+
+    /// Light brand paper: site `--text-primary` ink on `--bg-canvas`, role hues
+    /// from light syntax tokens (`--code-op`, `--code-var`, …).
+    pub const LIGHT: Self = Self {
+        text: Color::Rgb(22, 20, 26),        // --text-primary #16141A
+        muted: Color::Rgb(74, 70, 81),       // --text-secondary
+        faint: Color::Rgb(117, 112, 123),    // --text-muted
+        accent: Color::Rgb(140, 155, 20),    // brand lime, darkened for light bg
+        assistant: Color::Rgb(44, 110, 104), // --code-op
+        user: Color::Rgb(90, 63, 160),       // --code-var
+        tool: Color::Rgb(40, 120, 140),
+        shell: Color::Rgb(160, 60, 130),
+        link: Color::Rgb(60, 110, 180),
+        quote: Color::Rgb(120, 120, 100),
+        error: Color::Rgb(185, 72, 46),   // --code-flag
+        warning: Color::Rgb(122, 90, 30), // --code-string
+        live: Color::Rgb(200, 60, 55),
+        diff_add_bg: Color::Rgb(220, 240, 225),
+        diff_del_bg: Color::Rgb(250, 230, 228),
+        diff_add_fg: Color::Rgb(40, 100, 70),
+        diff_del_fg: Color::Rgb(160, 60, 50),
+        diff_add_sign: Color::Rgb(30, 130, 80),
+        diff_del_sign: Color::Rgb(180, 50, 45),
+        diff_add_hl_bg: Color::Rgb(190, 230, 200),
+        diff_del_hl_bg: Color::Rgb(240, 200, 195),
+        select_bg: Color::Rgb(230, 228, 222),
+        select_text: Color::Rgb(22, 20, 26),
+        select_accent: Color::Rgb(74, 70, 81),
+        select_wash: Color::Rgb(220, 218, 212),
+        select_flash: Color::Rgb(200, 198, 190),
+        canvas: Some(Color::Rgb(251, 250, 247)), // --bg-canvas #FBFAF7
+        toast_bg: Color::Rgb(255, 255, 255),
+        jump_fg: Color::Rgb(251, 250, 247),
+        jump_bg: Color::Rgb(22, 20, 26),
+    };
+
+    pub(super) fn current() -> &'static Self {
+        match ui_theme() {
+            UiTheme::Light => &Self::LIGHT,
+            UiTheme::Dark => &Self::DARK,
+        }
+    }
+}
+
+#[inline]
+pub(super) fn palette() -> &'static Palette {
+    Palette::current()
+}
+
+/// Clear a floating region (overlay, card, toast), then repaint the theme canvas
+/// under it. `Clear` resets cells to the terminal's own background; dark theme has
+/// no canvas so the element floats on that background as before, but light theme
+/// must repaint the paper fill `Clear` wiped or the modal would expose the raw
+/// terminal bg — dark ink on a dark terminal, unreadable. Widgets that paint their
+/// own background (e.g. a selected row) still draw on top of this.
+pub(super) fn clear_to_canvas(frame: &mut Frame<'_>, area: Rect) {
+    frame.render_widget(Clear, area);
+    if let Some(canvas) = palette().canvas {
+        frame.render_widget(Block::default().style(Style::default().bg(canvas)), area);
+    }
+}
+
+// Accessors keep the historical UPPER_CASE call-site names (`TEXT()`, `MUTED()`, …)
+// as zero-arg functions so a theme switch updates every render path at once.
+#[allow(non_snake_case)]
+#[inline]
+pub(super) fn TEXT() -> Color {
+    palette().text
+}
+#[allow(non_snake_case)]
+#[inline]
+pub(super) fn MUTED() -> Color {
+    palette().muted
+}
+#[allow(non_snake_case)]
+#[inline]
+pub(super) fn FAINT() -> Color {
+    palette().faint
+}
+#[allow(non_snake_case)]
+#[inline]
+pub(super) fn ACCENT() -> Color {
+    palette().accent
+}
+#[allow(non_snake_case)]
+#[inline]
+pub(super) fn ASSISTANT() -> Color {
+    palette().assistant
+}
+#[allow(non_snake_case)]
+#[inline]
+pub(super) fn USER() -> Color {
+    palette().user
+}
+#[allow(non_snake_case)]
+#[inline]
+pub(super) fn TOOL() -> Color {
+    palette().tool
+}
+#[allow(non_snake_case)]
+#[inline]
+pub(super) fn SHELL() -> Color {
+    palette().shell
+}
+#[allow(non_snake_case)]
+#[inline]
+pub(super) fn LINK() -> Color {
+    palette().link
+}
+#[allow(non_snake_case)]
+#[inline]
+pub(super) fn QUOTE() -> Color {
+    palette().quote
+}
+#[allow(non_snake_case)]
+#[inline]
+pub(super) fn ERROR() -> Color {
+    palette().error
+}
+#[allow(non_snake_case)]
+#[inline]
+pub(super) fn WARNING() -> Color {
+    palette().warning
+}
+#[allow(non_snake_case)]
+#[inline]
+pub(super) fn LIVE() -> Color {
+    palette().live
+}
+#[allow(non_snake_case)]
+#[inline]
+pub(super) fn DIFF_ADD_BG() -> Color {
+    palette().diff_add_bg
+}
+#[allow(non_snake_case)]
+#[inline]
+pub(super) fn DIFF_DEL_BG() -> Color {
+    palette().diff_del_bg
+}
+#[allow(non_snake_case)]
+#[inline]
+pub(super) fn DIFF_ADD_FG() -> Color {
+    palette().diff_add_fg
+}
+#[allow(non_snake_case)]
+#[inline]
+pub(super) fn DIFF_DEL_FG() -> Color {
+    palette().diff_del_fg
+}
+#[allow(non_snake_case)]
+#[inline]
+pub(super) fn DIFF_ADD_SIGN() -> Color {
+    palette().diff_add_sign
+}
+#[allow(non_snake_case)]
+#[inline]
+pub(super) fn DIFF_DEL_SIGN() -> Color {
+    palette().diff_del_sign
+}
+#[allow(non_snake_case)]
+#[inline]
+pub(super) fn DIFF_ADD_HL_BG() -> Color {
+    palette().diff_add_hl_bg
+}
+#[allow(non_snake_case)]
+#[inline]
+pub(super) fn DIFF_DEL_HL_BG() -> Color {
+    palette().diff_del_hl_bg
+}
+#[allow(non_snake_case)]
+#[inline]
+pub(super) fn SELECT_BG() -> Color {
+    palette().select_bg
+}
+#[allow(non_snake_case)]
+#[inline]
+pub(super) fn SELECT_TEXT() -> Color {
+    palette().select_text
+}
+#[allow(non_snake_case)]
+#[inline]
+pub(super) fn SELECT_ACCENT() -> Color {
+    palette().select_accent
+}
+#[allow(non_snake_case)]
+#[inline]
+pub(super) fn SELECT_WASH() -> Color {
+    palette().select_wash
+}
+#[allow(non_snake_case)]
+#[inline]
+pub(super) fn SELECT_FLASH() -> Color {
+    palette().select_flash
+}
+
 /// Share URL notice prefix; `notice_spans` matches it to color the line.
 pub(super) const LIVE_NOTICE_PREFIX: &str = "● Sharing: ";
 /// Footer badge shown while sharing.
 pub(super) const LIVE_BADGE: &str = "● sharing";
 /// Footer badge shown when `/config` "Agent tools" is off (plain-chat mode).
 pub(super) const PLAIN_CODE_BADGE: &str = "plain chat";
-// Inline-diff palette for the compact edit preview under a tool call. The
-// changed line gets a subtle dark tint (not a saturated terminal-diff fill) that
-// fills the full row width (see `fill_trailing_background`) so a wrapped line
-// still reads as one contiguous block; the gutter `+`/`-` is brighter than the
-// code text so the eye lands on the sign. Greens echo ASSISTANT jade, reds ERROR
-// coral, so the diff sits inside the warm palette.
-pub(super) const DIFF_ADD_BG: Color = Color::Rgb(26, 42, 32);
-pub(super) const DIFF_DEL_BG: Color = Color::Rgb(48, 30, 30);
-pub(super) const DIFF_ADD_FG: Color = Color::Rgb(168, 204, 182);
-pub(super) const DIFF_DEL_FG: Color = Color::Rgb(224, 162, 154);
-pub(super) const DIFF_ADD_SIGN: Color = Color::Rgb(120, 190, 150);
-pub(super) const DIFF_DEL_SIGN: Color = Color::Rgb(230, 120, 112);
-// Emphasis tints for the changed tokens in a word-diff line (see `word_segments`).
-pub(super) const DIFF_ADD_HL_BG: Color = Color::Rgb(33, 84, 50);
-pub(super) const DIFF_DEL_HL_BG: Color = Color::Rgb(92, 38, 38);
 pub(super) const EMPTY_STATE_TOP_GAP: u16 = 1;
 /// Max visible rows in the queued-input panel.
 pub(super) const QUEUE_PANEL_MAX_ROWS: usize = 5;
@@ -67,7 +340,7 @@ pub(super) const WELCOME_TIPS: &[&str] = &[
     "/compact summarizes older turns to free up context",
     "/plan plans read-only — approve the plan and it builds",
     "/model switches models without losing the thread",
-    "/config toggles thinking and tool auto-approve",
+    "/config switches theme and toggles thinking / auto-approve",
     "/copy grabs a past reply to your clipboard",
     "Ctrl+O expands the last collapsed output — clicking ▸ works too",
     "type while the agent works to queue your next message",
@@ -131,12 +404,6 @@ pub(super) const PREVIEW_DEBOUNCE: Duration = Duration::from_millis(100);
 pub(super) const PREVIEW_MAX_MESSAGES: usize = 60;
 /// Preview-cache cap; beyond it the cache is cleared (rebuilt on demand).
 pub(super) const PREVIEW_CACHE_CAP: usize = 64;
-// Drag-copy wash: a cool slate a shade under the picker SELECT_BG, so a
-// selection reads as a quiet block in the same temperature as the bar.
-pub(super) const SELECT_WASH: Color = Color::Rgb(48, 52, 64);
-/// Brighter selection wash shown for the brief post-copy flash.
-pub(super) const SELECT_FLASH: Color = Color::Rgb(86, 92, 110);
-
 #[derive(Clone, Copy)]
 pub(super) struct SlashCommandSpec {
     pub(super) name: &'static str,
@@ -261,7 +528,7 @@ pub(super) const SLASH_COMMANDS: &[SlashCommandSpec] = &[
     SlashCommandSpec {
         name: "config",
         help_label: "/config",
-        description: "toggle session settings (thinking, auto-approve)",
+        description: "toggle session settings (theme, thinking, auto-approve)",
         takes_argument: false,
     },
     SlashCommandSpec {
@@ -364,10 +631,10 @@ pub(super) fn humanize_count(n: usize) -> String {
 /// "summarized older turns").
 pub(super) fn freed_notice(freed: usize, kind: &str) -> (Color, String) {
     if freed == 0 {
-        (MUTED, "already compact — nothing to free".to_string())
+        (MUTED(), "already compact — nothing to free".to_string())
     } else {
         (
-            MUTED,
+            MUTED(),
             format!("freed ~{} tokens — {kind}", humanize_count(freed)),
         )
     }
@@ -973,6 +1240,8 @@ impl McpPasteOverlay {
 /// flip (and where to persist it) without matching on the row's label text.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum ConfigSetting {
+    /// Color theme (`dark` / `light`); Enter cycles rather than toggles a bool.
+    Theme,
     /// Whether the model reasons before answering (off stops it entirely).
     Thinking,
     /// Run the agent's tools without asking (mirrors the Shift+Tab toggle).
@@ -2507,6 +2776,8 @@ pub(super) struct CodeTuiApp {
     /// aivo's hosted web_search; `/config` toggle, applied to the engine each turn.
     pub(super) web_search_enabled: bool,
     pub(super) agent_tools_enabled: bool,
+    /// Chat TUI color theme (`/config`); remembered across sessions.
+    pub(super) theme: UiTheme,
     /// Whether the current model is known to support reasoning/thinking (from the
     /// model-limits snapshot). Cached on each model resolve (see
     /// `refresh_context_window`); gates the footer effort badge so it only shows

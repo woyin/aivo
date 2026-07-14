@@ -11,13 +11,13 @@ impl CodeTuiApp {
         match arg.as_deref().map(str::trim) {
             Some("stop") | Some("off") | Some("end") => {
                 if self.stop_live_share() {
-                    self.notice = Some((MUTED, "Sharing stopped.".to_string()));
+                    self.notice = Some((MUTED(), "Sharing stopped.".to_string()));
                 } else {
-                    self.notice = Some((MUTED, "Not currently sharing.".to_string()));
+                    self.notice = Some((MUTED(), "Not currently sharing.".to_string()));
                 }
             }
             Some(other) if !other.is_empty() && other != "start" && other != "on" => {
-                self.notice = Some((ERROR, format!("Usage: /share [stop]  (got '{other}')")));
+                self.notice = Some((ERROR(), format!("Usage: /share [stop]  (got '{other}')")));
             }
             _ => self.begin_live_share().await,
         }
@@ -49,17 +49,17 @@ impl CodeTuiApp {
             return;
         }
         if self.live_share_starting {
-            self.notice = Some((MUTED, "Share is already starting…".to_string()));
+            self.notice = Some((MUTED(), "Share is already starting…".to_string()));
             return;
         }
         // Persist first so the resolver can read this chat — even an empty one.
         if let Err(e) = self.persist_history().await {
-            self.notice = Some((ERROR, format!("Couldn't start share: {e:#}")));
+            self.notice = Some((ERROR(), format!("Couldn't start share: {e:#}")));
             return;
         }
 
         self.live_share_starting = true;
-        self.notice = Some((MUTED, "Starting share…".to_string()));
+        self.notice = Some((MUTED(), "Starting share…".to_string()));
 
         let tx = self.tx.clone();
         let session_store = self.session_store.clone();
@@ -104,7 +104,7 @@ impl CodeTuiApp {
     /// clipboard).
     fn announce_live_url(&mut self, url: &str) {
         // `notice_spans` paints the `LIVE_NOTICE_PREFIX` red and the URL a link color.
-        self.notice = Some((LIVE, format!("{LIVE_NOTICE_PREFIX}{url}")));
+        self.notice = Some((LIVE(), format!("{LIVE_NOTICE_PREFIX}{url}")));
         #[cfg(not(test))]
         {
             if write_system_clipboard(url).is_ok() {
@@ -146,7 +146,7 @@ impl CodeTuiApp {
                 self.live_share = Some(handle);
                 self.announce_live_url(&url);
             }
-            Err(msg) => self.notice = Some((ERROR, msg)),
+            Err(msg) => self.notice = Some((ERROR(), msg)),
         }
     }
 
@@ -156,7 +156,7 @@ impl CodeTuiApp {
         if self.live_share.as_ref().is_some_and(|h| h.is_dead()) {
             self.stop_live_share();
             self.notice = Some((
-                ERROR,
+                ERROR(),
                 "Share disconnected — /share to start a new one".to_string(),
             ));
         }

@@ -104,7 +104,7 @@ impl CodeTuiApp {
             (None, Some(warn)) => Some(warn.to_string()),
             (m, None) => m,
         };
-        let startup_notice = startup_message.map(|message| (MUTED, message));
+        let startup_notice = startup_message.map(|message| (MUTED(), message));
 
         let initial_format = seeded_chat_format(&params.key, &params.raw_model);
         // Remembered across sessions (the user picked "remember last choice");
@@ -116,7 +116,22 @@ impl CodeTuiApp {
             thinking_enabled,
             web_search_enabled,
             agent_tools_enabled,
+            theme: chat_theme,
         } = params.session_store.get_chat_toggles().await;
+        // First launch (no stored choice) auto-detects the terminal background;
+        // once the user picks in /config it's persisted and always honored, so the
+        // probe never runs again. Detection is bounded and off-thread — see
+        // `detect_terminal_theme`.
+        let detected = if chat_theme.is_none() {
+            tokio::task::spawn_blocking(detect_terminal_theme)
+                .await
+                .ok()
+                .flatten()
+        } else {
+            None
+        };
+        let theme = resolve_startup_theme(chat_theme, detected);
+        set_ui_theme(theme);
         // Move any pre-existing `/skills` + `/mcp` opt-outs out of config.json (where
         // a routine key/route/selection write — or an older aivo binary — can drop
         // them) into code-prefs.json, before the chat flow writes config.json.
@@ -291,6 +306,7 @@ impl CodeTuiApp {
             thinking_enabled,
             web_search_enabled,
             agent_tools_enabled,
+            theme,
             // Set by `refresh_context_window` (called right after construction and
             // on every model switch); false until the first resolve.
             model_supports_thinking: false,
@@ -376,7 +392,7 @@ pub(super) async fn run_chat_tui(params: CodeTuiParams) -> Result<()> {
     if let Some(query) = initial_resume {
         let query = (!query.is_empty()).then_some(query);
         if let Err(err) = app.open_resume_picker(query).await {
-            app.notice = Some((ERROR, format!("Resume failed: {err:#}")));
+            app.notice = Some((ERROR(), format!("Resume failed: {err:#}")));
         }
     }
     // Positional `aivo code "<text>"`: first turn starts now, streams in once
@@ -384,7 +400,7 @@ pub(super) async fn run_chat_tui(params: CodeTuiParams) -> Result<()> {
     if let Some(prompt) = initial_prompt
         && let Err(err) = app.send_user_message(prompt).await
     {
-        app.notice = Some((ERROR, format!("Failed to send: {err:#}")));
+        app.notice = Some((ERROR(), format!("Failed to send: {err:#}")));
     }
     // The event loop starts the share once the session settles (an async
     // `--resume` could still be loading a different session id here).
@@ -415,6 +431,40 @@ pub(super) async fn run_chat_tui(params: CodeTuiParams) -> Result<()> {
         );
     }
     result
+}
+
+/// First-launch theme resolution: an explicit stored choice always wins; with
+/// none, use the detected terminal background, else dark.
+fn resolve_startup_theme(
+    stored: Option<crate::services::session_store::ChatTheme>,
+    detected: Option<UiTheme>,
+) -> UiTheme {
+    use crate::services::session_store::ChatTheme;
+    match stored {
+        Some(ChatTheme::Light) => UiTheme::Light,
+        Some(ChatTheme::Dark) => UiTheme::Dark,
+        None => detected.unwrap_or(UiTheme::Dark),
+    }
+}
+
+/// Best-effort terminal-background probe (OSC 11) run once on first launch, before
+/// the user has chosen a theme. Bounded and self-restoring: colorsaurus queries
+/// `/dev/tty` directly, feature-detects terminals that don't support the query,
+/// and times out otherwise — every failure path yields `None` so the caller
+/// defaults to dark. It never blocks or hangs startup. Called before we enter raw
+/// mode / the alternate screen, and off the reactor via `spawn_blocking`.
+fn detect_terminal_theme() -> Option<UiTheme> {
+    use terminal_colorsaurus::{QueryOptions, ThemeMode, theme_mode};
+    // DA1 feature-detection means real terminals answer within a round-trip, so a
+    // short ceiling covers local + typical SSH latency while bounding the rare
+    // no-response case; a miss just falls back to dark (recoverable via /config).
+    let mut opts = QueryOptions::default();
+    opts.timeout = std::time::Duration::from_millis(200);
+    match theme_mode(opts) {
+        Ok(ThemeMode::Light) => Some(UiTheme::Light),
+        Ok(ThemeMode::Dark) => Some(UiTheme::Dark),
+        Err(_) => None,
+    }
 }
 
 fn setup_terminal(mouse_enabled: bool) -> Result<Terminal<CrosstermBackend<Stdout>>> {

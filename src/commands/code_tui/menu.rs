@@ -1,15 +1,5 @@
 use super::*;
 
-// Selected-row background: a cool slate — neutral but on the cold side, so it
-// reads as a clean raised surface on the dark terminals it sits on (a warm gray
-// here turns muddy against a navy/black background).
-pub(super) const SELECT_BG: Color = Color::Rgb(58, 62, 76);
-// Primary text + chevron on the bar: near-white, bold — crisp on the slate.
-pub(super) const SELECT_TEXT: Color = Color::Rgb(242, 243, 246);
-// Secondary text on the bar (endpoint URL, session time, toggle description): a
-// soft cool gray, clearly readable but under the bold-white primary label.
-pub(super) const SELECT_ACCENT: Color = Color::Rgb(196, 200, 210);
-
 fn picker_content_width(width: u16) -> usize {
     usize::from(width.max(1))
         .saturating_sub(PICKER_ROW_PREFIX_WIDTH)
@@ -162,9 +152,9 @@ pub(super) fn command_menu_item_line(
     width: u16,
     label_column_width: usize,
 ) -> Line<'static> {
-    // The selected-row chevron sits on the dark transcript, not on SELECT_BG, so
+    // The selected-row chevron sits on the transcript canvas, not on SELECT_BG, so
     // it uses a visible gray rather than the dim SELECT_WASH color.
-    const SELECT_TEXT: Color = MUTED;
+    let select_text = MUTED();
     const COLUMN_GAP: usize = 2;
 
     let content_width = picker_content_width(width);
@@ -194,20 +184,22 @@ pub(super) fn command_menu_item_line(
 
     let prefix_style = if selected {
         Style::default()
-            .fg(SELECT_TEXT)
+            .fg(select_text)
             .add_modifier(Modifier::BOLD)
     } else {
-        Style::default().fg(FAINT)
+        Style::default().fg(FAINT())
     };
     let label_style = if selected {
-        Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)
+        Style::default().fg(ACCENT()).add_modifier(Modifier::BOLD)
     } else {
-        Style::default().fg(ASSISTANT).add_modifier(Modifier::BOLD)
+        Style::default()
+            .fg(ASSISTANT())
+            .add_modifier(Modifier::BOLD)
     };
     let description_style = if selected {
-        Style::default().fg(TEXT)
+        Style::default().fg(TEXT())
     } else {
-        Style::default().fg(MUTED)
+        Style::default().fg(MUTED())
     };
 
     let mut spans = vec![Span::styled(
@@ -241,7 +233,7 @@ pub(super) fn render_command_menu_rows(
                 MenuKind::AttachPath => "No matching path",
                 MenuKind::Mention => "No matching sub-agent",
             },
-            Style::default().fg(MUTED),
+            Style::default().fg(MUTED()),
         ))];
     }
 
@@ -352,27 +344,27 @@ pub(super) fn key_picker_item_line(key: &ApiKey, selected: bool, width: u16) -> 
     let fill_width = content_width.saturating_sub(display_width(&plain));
 
     let fill_style = if selected {
-        Style::default().bg(SELECT_BG)
+        Style::default().bg(SELECT_BG())
     } else {
         Style::default()
     };
     let prefix_style = if selected {
-        fill_style.fg(SELECT_TEXT).add_modifier(Modifier::BOLD)
+        fill_style.fg(SELECT_TEXT()).add_modifier(Modifier::BOLD)
     } else {
         fill_style
     };
     let name_style = if selected {
         Style::default()
-            .fg(SELECT_TEXT)
-            .bg(SELECT_BG)
+            .fg(SELECT_TEXT())
+            .bg(SELECT_BG())
             .add_modifier(Modifier::BOLD)
     } else {
-        Style::default().fg(TEXT).add_modifier(Modifier::BOLD)
+        Style::default().fg(TEXT()).add_modifier(Modifier::BOLD)
     };
     let endpoint_style = if selected {
-        Style::default().fg(SELECT_ACCENT).bg(SELECT_BG)
+        Style::default().fg(SELECT_ACCENT()).bg(SELECT_BG())
     } else {
-        Style::default().fg(MUTED)
+        Style::default().fg(MUTED())
     };
 
     let mut spans = vec![Span::styled(
@@ -394,7 +386,7 @@ pub(super) fn session_picker_item_lines(
     armed_delete: bool,
     width: u16,
 ) -> Vec<Line<'static>> {
-    const SELECT_TIME: Color = SELECT_ACCENT;
+    let select_time = SELECT_ACCENT();
     const DELETE_BG: Color = Color::Rgb(102, 58, 52);
     const DELETE_TEXT: Color = Color::Rgb(255, 240, 230);
     const DELETE_TIME: Color = Color::Rgb(255, 194, 170);
@@ -419,7 +411,7 @@ pub(super) fn session_picker_item_lines(
     let (active_bg, active_text, active_time) = if armed_delete {
         (DELETE_BG, DELETE_TEXT, DELETE_TIME)
     } else {
-        (SELECT_BG, SELECT_TEXT, SELECT_TIME)
+        (SELECT_BG(), SELECT_TEXT(), select_time)
     };
 
     let line_style = if selected {
@@ -428,7 +420,7 @@ pub(super) fn session_picker_item_lines(
             .bg(active_bg)
             .add_modifier(Modifier::BOLD)
     } else {
-        Style::default().fg(TEXT)
+        Style::default().fg(TEXT())
     };
     let time_style = if selected {
         Style::default()
@@ -436,7 +428,7 @@ pub(super) fn session_picker_item_lines(
             .bg(active_bg)
             .add_modifier(Modifier::BOLD)
     } else {
-        Style::default().fg(MUTED)
+        Style::default().fg(MUTED())
     };
     let fill_style = if selected {
         Style::default().bg(active_bg)
@@ -478,7 +470,7 @@ pub(super) fn render_session_picker_rows(
             "No matches"
         };
         return (
-            vec![Line::from(Span::styled(msg, Style::default().fg(MUTED)))],
+            vec![Line::from(Span::styled(msg, Style::default().fg(MUTED())))],
             Vec::new(),
         );
     }
@@ -497,7 +489,7 @@ pub(super) fn render_session_picker_rows(
             all_rows.push((
                 Line::from(Span::styled(
                     group.clone(),
-                    Style::default().fg(MUTED).add_modifier(Modifier::BOLD),
+                    Style::default().fg(MUTED()).add_modifier(Modifier::BOLD),
                 )),
                 Some(filtered_index),
                 false,
@@ -564,22 +556,22 @@ pub(super) fn picker_entry_lines(
             let label = truncate_for_display_width(&item.label, content_width);
             let fill_width = content_width.saturating_sub(display_width(&label));
             let fill_style = if selected {
-                Style::default().bg(SELECT_BG)
+                Style::default().bg(SELECT_BG())
             } else {
                 Style::default()
             };
             let prefix_style = if selected {
-                fill_style.fg(SELECT_TEXT).add_modifier(Modifier::BOLD)
+                fill_style.fg(SELECT_TEXT()).add_modifier(Modifier::BOLD)
             } else {
                 fill_style
             };
             let label_style = if selected {
                 Style::default()
-                    .fg(SELECT_TEXT)
-                    .bg(SELECT_BG)
+                    .fg(SELECT_TEXT())
+                    .bg(SELECT_BG())
                     .add_modifier(Modifier::BOLD)
             } else {
-                Style::default().fg(TEXT)
+                Style::default().fg(TEXT())
             };
             vec![Line::from(vec![
                 Span::styled(if selected { "> " } else { "  " }, prefix_style),

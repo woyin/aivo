@@ -45,7 +45,7 @@ impl CodeTuiApp {
             // Mid-turn, a reflexive Ctrl+C usually means "stop the agent" — point
             // at esc before the second press tears down the TUI.
             self.notice = Some((
-                WARNING,
+                WARNING(),
                 if self.sending {
                     "esc stops the agent's turn — Ctrl+C again exits aivo".to_string()
                 } else {
@@ -1366,12 +1366,12 @@ impl CodeTuiApp {
                     self.sync_command_menu_state();
                 }
                 None => {
-                    self.notice = Some((MUTED, QUEUE_ROW_GONE_NOTICE.to_string()));
+                    self.notice = Some((MUTED(), QUEUE_ROW_GONE_NOTICE.to_string()));
                 }
             },
             KeyCode::Backspace | KeyCode::Delete => {
                 if !self.queue_row_remove(&rows[selected]) {
-                    self.notice = Some((MUTED, QUEUE_ROW_GONE_NOTICE.to_string()));
+                    self.notice = Some((MUTED(), QUEUE_ROW_GONE_NOTICE.to_string()));
                 }
                 match self.queued_rows().len() {
                     0 => self.queue_focus = None,
@@ -1380,7 +1380,7 @@ impl CodeTuiApp {
             }
             KeyCode::Char('d') if ctrl => {
                 if !self.queue_row_remove(&rows[selected]) {
-                    self.notice = Some((MUTED, QUEUE_ROW_GONE_NOTICE.to_string()));
+                    self.notice = Some((MUTED(), QUEUE_ROW_GONE_NOTICE.to_string()));
                 }
                 match self.queued_rows().len() {
                     0 => self.queue_focus = None,
@@ -1425,7 +1425,7 @@ impl CodeTuiApp {
                 // tear down the loop; a second consecutive Esc interrupts + stops it.
                 if self.goal_mode.is_some() && !self.goal_stop_confirm_pending {
                     self.goal_stop_confirm_pending = true;
-                    self.notice = Some((WARNING, GOAL_STOP_CONFIRM_NOTICE.to_string()));
+                    self.notice = Some((WARNING(), GOAL_STOP_CONFIRM_NOTICE.to_string()));
                 } else {
                     self.goal_stop_confirm_pending = false;
                     self.interrupt_inflight_request().await?;
@@ -1447,7 +1447,7 @@ impl CodeTuiApp {
             // Keyboard path to the `▸ +N lines` fold toggle.
             KeyCode::Char('o') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 if !self.toggle_latest_output() {
-                    self.notice = Some((MUTED, "no collapsed output to expand".to_string()));
+                    self.notice = Some((MUTED(), "no collapsed output to expand".to_string()));
                 }
                 true
             }
@@ -1544,7 +1544,7 @@ impl CodeTuiApp {
             }
             KeyCode::Char('v') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 if let Err(err) = self.paste_system_clipboard() {
-                    self.notice = Some((ERROR, err.to_string()));
+                    self.notice = Some((ERROR(), err.to_string()));
                 }
             }
             KeyCode::Char('l') if key.modifiers.contains(KeyModifiers::CONTROL) => {

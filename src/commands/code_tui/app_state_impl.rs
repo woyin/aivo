@@ -172,7 +172,7 @@ impl CodeTuiApp {
         if let Some(state) = self.resume_restore_state.take() {
             self.restore_resume_state(state);
         }
-        self.notice = Some((MUTED, "Resume cancelled".to_string()));
+        self.notice = Some((MUTED(), "Resume cancelled".to_string()));
     }
 
     pub(super) fn clear_for_resume_loading(&mut self) {

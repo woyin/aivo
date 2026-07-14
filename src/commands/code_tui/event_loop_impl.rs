@@ -130,12 +130,13 @@ impl CodeTuiApp {
                 }
             }
             RuntimeEvent::McpAuthorizeUrl { url } => {
-                self.notice = Some((MUTED, format!("Authorize in your browser: {url}")));
+                self.notice = Some((MUTED(), format!("Authorize in your browser: {url}")));
             }
             RuntimeEvent::McpAuthorized { name, result } => match result {
                 Ok(cred) => match crate::services::mcp_token_store::save(&name, &cred).await {
                     Ok(()) => {
-                        self.notice = Some((MUTED, format!("Authorized `{name}` — reconnecting…")));
+                        self.notice =
+                            Some((MUTED(), format!("Authorized `{name}` — reconnecting…")));
                         // Reconnect so the now-authorized server's tools appear
                         // (live if the /mcp overlay is open, else next turn).
                         self.reset_mcp_after_config_change();
@@ -143,20 +144,21 @@ impl CodeTuiApp {
                     }
                     Err(e) => {
                         self.notice = Some((
-                            ERROR,
+                            ERROR(),
                             format!("Authorized `{name}` but couldn't save the token: {e}"),
                         ));
                     }
                 },
                 Err(e) => {
-                    self.notice = Some((ERROR, format!("Authorization for `{name}` failed: {e}")));
+                    self.notice =
+                        Some((ERROR(), format!("Authorization for `{name}` failed: {e}")));
                 }
             },
             RuntimeEvent::AgentPlan(items) => self.apply_agent_plan(items),
             RuntimeEvent::AgentNotice(text) => {
                 // A connection-retry notice means we're recovering, not thinking.
                 self.retrying = text.contains("retrying");
-                self.notice = Some((MUTED, text));
+                self.notice = Some((MUTED(), text));
             }
             // Typed early-stop (guard stop / step limit) — remembered for /goal steering.
             RuntimeEvent::AgentTurnStop(stop) => self.goal_guard_stop = Some(stop),
@@ -321,7 +323,7 @@ impl CodeTuiApp {
         );
         if truncated {
             self.notice = Some((
-                MUTED,
+                MUTED(),
                 format!("Output truncated at the capture cap ({total} lines)"),
             ));
         }
@@ -620,7 +622,7 @@ impl CodeTuiApp {
         let name = row.name.clone();
         row.denied = Some(tool.clone());
         self.notice = Some((
-            WARNING,
+            WARNING(),
             format!(
                 "{name}: `{tool}` auto-denied — parallel delegates can't prompt; run it solo to approve"
             ),
@@ -741,7 +743,7 @@ impl CodeTuiApp {
                     hard_errors.len()
                 )
             };
-            self.notice = Some((WARNING, msg));
+            self.notice = Some((WARNING(), msg));
         }
         let has_tools = client.has_tools();
         self.mcp_client = Some(client);
@@ -794,7 +796,7 @@ impl CodeTuiApp {
     /// after scrolling or resume. Display-only; `agent_seed_turns` skips it.
     pub(super) fn apply_agent_error(&mut self, text: String) {
         self.flush_pending_assistant();
-        self.notice = Some((ERROR, text.clone()));
+        self.notice = Some((ERROR(), text.clone()));
         self.history.push(ChatMessage {
             model: None,
             role: "error".to_string(),
@@ -859,7 +861,7 @@ impl CodeTuiApp {
             reasoning_content: None,
             attachments: vec![],
         });
-        self.notice = Some((MUTED, "Interjection delivered".to_string()));
+        self.notice = Some((MUTED(), "Interjection delivered".to_string()));
     }
 
     /// Render an `update_plan` call as a SINGLE checklist card. The model resends
@@ -914,7 +916,7 @@ impl CodeTuiApp {
             // `✶ Done in …` marker — skipped under 1s and on an errored turn. Attach
             // to the last VISIBLE entry: a trailing plan renders in its own panel, so
             // stamping it there hides/misplaces the marker once the plan clears.
-            let errored = self.notice.as_ref().is_some_and(|(c, _)| *c == ERROR);
+            let errored = self.notice.as_ref().is_some_and(|(c, _)| *c == ERROR());
             if let Some(started) = self.request_started_at
                 && !errored
             {
@@ -1211,7 +1213,7 @@ impl CodeTuiApp {
         if goal_stopped {
             msg.push_str(" — goal mode stopped");
         }
-        self.notice = Some((ERROR, msg));
+        self.notice = Some((ERROR(), msg));
         if !self.history.is_empty() {
             let _ = self.persist_history().await;
         }
@@ -1422,7 +1424,7 @@ impl CodeTuiApp {
             &mut self.draft_attachments,
             &mut self.pending_submit,
         );
-        self.notice = Some((ERROR, reframe_image_input_error(err, &self.model)));
+        self.notice = Some((ERROR(), reframe_image_input_error(err, &self.model)));
     }
 
     async fn apply_loaded_models(
@@ -1437,7 +1439,7 @@ impl CodeTuiApp {
             }
             Err(err) => {
                 self.overlay = Overlay::None;
-                self.notice = Some((ERROR, err));
+                self.notice = Some((ERROR(), err));
             }
         }
         Ok(())
@@ -1489,7 +1491,7 @@ impl CodeTuiApp {
                 if let Some(state) = self.resume_restore_state.take() {
                     self.restore_resume_state(state);
                 }
-                self.notice = Some((ERROR, err));
+                self.notice = Some((ERROR(), err));
             }
         }
 
@@ -1850,7 +1852,7 @@ impl CodeTuiApp {
         let _ = terminal.clear();
 
         if let Err(err) = result {
-            self.notice = Some((ERROR, format!("External edit failed: {err:#}")));
+            self.notice = Some((ERROR(), format!("External edit failed: {err:#}")));
         }
     }
 
@@ -2366,7 +2368,7 @@ impl CodeTuiApp {
                     self.selection_flash_until = Some(Instant::now() + SELECTION_FLASH_DURATION);
                 }
                 Err(err) => {
-                    self.notice = Some((ERROR, format!("Copy failed: {err}")));
+                    self.notice = Some((ERROR(), format!("Copy failed: {err}")));
                 }
             },
             None => {
