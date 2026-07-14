@@ -649,6 +649,19 @@ pub(super) fn centered_rect(width_pct: u16, height_pct: u16, area: Rect) -> Rect
         .split(vertical[1])[1]
 }
 
+/// [`centered_rect`] with absolute `width`/`height` (clamped to `area`) — for
+/// content-sized modals that shouldn't stretch to fill the screen.
+pub(super) fn centered_rect_fixed(width: u16, height: u16, area: Rect) -> Rect {
+    let width = width.min(area.width);
+    let height = height.min(area.height);
+    Rect {
+        x: area.x + area.width.saturating_sub(width) / 2,
+        y: area.y + area.height.saturating_sub(height) / 2,
+        width,
+        height,
+    }
+}
+
 /// Wrap the composer `draft` into visual rows, soft-wrapping each logical line
 /// (split on `\n`) at `text_width` display columns. Returns each row's
 /// `[start, end)` byte range into `draft`. Every visual row carries the same

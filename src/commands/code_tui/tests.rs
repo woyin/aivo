@@ -2076,12 +2076,13 @@ async fn test_config_overlay_toggles_thinking() {
         .iter()
         .position(|i| i.setting == ConfigSetting::Thinking)
         .expect("Thinking row present");
-    assert!(app.config_setting_enabled(ConfigSetting::Thinking));
+    // `on` is segment 0 — the renderer derives the highlighted pill from this.
+    assert_eq!(app.config_segments(ConfigSetting::Thinking).active, 0);
 
-    // Toggling it flips the live flag (the renderer derives the checkbox from it).
-    app.toggle_config_setting(idx).await;
+    // Advancing the switch flips the live flag (off is segment 1).
+    app.cycle_config_setting(idx).await;
     assert!(!app.thinking_enabled);
-    assert!(!app.config_setting_enabled(ConfigSetting::Thinking));
+    assert_eq!(app.config_segments(ConfigSetting::Thinking).active, 1);
 }
 
 #[tokio::test]
@@ -2098,7 +2099,7 @@ async fn test_config_overlay_cycles_theme() {
     };
     assert_eq!(state.items[0].setting, ConfigSetting::Theme);
 
-    app.toggle_config_setting(0).await;
+    app.cycle_config_setting(0).await;
     assert_eq!(app.theme, UiTheme::Light);
     assert_eq!(ui_theme(), UiTheme::Light);
     assert_eq!(TEXT(), Palette::LIGHT.text);
@@ -2127,7 +2128,7 @@ async fn test_config_overlay_cycles_theme() {
         );
     }
 
-    app.toggle_config_setting(0).await;
+    app.cycle_config_setting(0).await;
     assert_eq!(app.theme, UiTheme::Dark);
     assert_eq!(ui_theme(), UiTheme::Dark);
 }
@@ -2168,11 +2169,79 @@ async fn test_config_overlay_toggles_agent_tools() {
         .iter()
         .position(|i| i.setting == ConfigSetting::AgentTools)
         .expect("Agent tools row present");
-    assert!(app.config_setting_enabled(ConfigSetting::AgentTools));
+    assert_eq!(app.config_segments(ConfigSetting::AgentTools).active, 0);
 
-    app.toggle_config_setting(idx).await;
+    app.cycle_config_setting(idx).await;
     assert!(!app.agent_tools_enabled);
-    assert!(!app.config_setting_enabled(ConfigSetting::AgentTools));
+    assert_eq!(app.config_segments(ConfigSetting::AgentTools).active, 1);
+}
+
+#[tokio::test]
+async fn test_config_approval_radio_is_mutually_exclusive() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    // Three standing modes; plan is a transient state, not a segment here.
+    assert_eq!(
+        app.config_segments(ConfigSetting::Approval).options,
+        &["normal", "auto-approve", "review"]
+    );
+
+    // Fresh session: normal mode — segment 0 is live.
+    assert!(!app.agent_auto_approve && !app.agent_review_edits && !app.plan_mode);
+    assert_eq!(app.config_segments(ConfigSetting::Approval).active, 0);
+
+    // Auto-approve sets exactly one flag.
+    app.set_approval_mode("auto-approve").await;
+    assert!(app.agent_auto_approve && !app.agent_review_edits);
+    assert_eq!(app.config_segments(ConfigSetting::Approval).active, 1);
+
+    // Switching to Review clears auto-approve — the fold's whole point.
+    app.set_approval_mode("review").await;
+    assert!(app.agent_review_edits && !app.agent_auto_approve);
+    assert_eq!(app.config_segments(ConfigSetting::Approval).active, 2);
+
+    // Back to Normal leaves every mode off.
+    app.set_approval_mode("normal").await;
+    assert!(!app.agent_auto_approve && !app.agent_review_edits && !app.plan_mode);
+    assert_eq!(app.config_segments(ConfigSetting::Approval).active, 0);
+}
+
+#[tokio::test]
+async fn config_overlay_renders_segmented_switches() {
+    use ratatui::backend::TestBackend;
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.open_config_overlay();
+
+    let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+    terminal.draw(|frame| app.render(frame)).unwrap();
+    let buffer = terminal.backend().buffer();
+    let text: String = (0..buffer.area.height)
+        .map(|y| {
+            (0..buffer.area.width)
+                .map(|x| buffer.cell((x, y)).map_or(" ", |c| c.symbol()))
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    // Every segment of every switch is visible inline — not just the active value.
+    for label in [
+        "dark",
+        "light",
+        "on",
+        "off",
+        "normal",
+        "auto-approve",
+        "review",
+    ] {
+        assert!(text.contains(label), "segment {label:?} missing:\n{text}");
+    }
+    // The footer advertises ←→ as the way to change a value.
+    assert!(
+        text.contains("change"),
+        "footer missing change hint:\n{text}"
+    );
 }
 
 #[test]

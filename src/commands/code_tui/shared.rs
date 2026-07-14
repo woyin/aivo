@@ -17,13 +17,6 @@ impl UiTheme {
         }
     }
 
-    pub(super) fn cycle(self) -> Self {
-        match self {
-            Self::Dark => Self::Light,
-            Self::Light => Self::Dark,
-        }
-    }
-
     pub(super) fn label(self) -> &'static str {
         self.as_str()
     }
@@ -1236,39 +1229,42 @@ impl McpPasteOverlay {
     }
 }
 
-/// One toggleable chat preference, identified so the handler knows which flag to
-/// flip (and where to persist it) without matching on the row's label text.
+/// One `/config` preference, keyed so the handler routes to the right live state
+/// without matching label text. Each is a segmented switch, so booleans and
+/// multi-value settings share one control.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum ConfigSetting {
-    /// Color theme (`dark` / `light`); Enter cycles rather than toggles a bool.
     Theme,
-    /// Whether the model reasons before answering (off stops it entirely).
     Thinking,
-    /// Run the agent's tools without asking (mirrors the Shift+Tab toggle).
-    AutoApprove,
-    /// Show an edit-review card before edits are written (opt-in).
-    ReviewEdits,
-    /// Whether the agent may use aivo's hosted web_search (`/v1/search`).
+    /// Standing permission mode (`normal` / `auto-approve` / `review`), folding the
+    /// two former checkboxes into one radio.
+    Approval,
     UseWebSearch,
     AgentTools,
 }
 
-/// One row in the `/config` overlay: a boolean preference with a label and a
-/// one-line description. The current value is read live from the app (see
-/// `config_setting_enabled`), not cached here, so the row can't drift.
+/// The segmented values a `/config` row can hold and which one is live. Read live
+/// (see `config_segments`) so a row can't drift from the flag it mirrors.
+pub(super) struct ConfigSegments {
+    pub(super) options: &'static [&'static str],
+    pub(super) active: usize,
+    /// A plain on/off switch — the only rows counted in the header badge.
+    pub(super) is_switch: bool,
+}
+
+/// One `/config` row: a labelled preference with a one-line description.
 #[derive(Clone, Debug)]
-pub(super) struct ConfigToggle {
+pub(super) struct ConfigRow {
     pub(super) setting: ConfigSetting,
     pub(super) label: &'static str,
     pub(super) description: &'static str,
 }
 
-/// The interactive `/config` overlay: a small *fixed* toggle list. Unlike
-/// `/skills` and `/mcp` there's nothing to filter, add, or remove — so it's just
-/// a navigable list whose rows flip on Enter/Space. `selected` indexes `items`.
+/// The `/config` overlay: a fixed list of segmented switches. ↑/↓ move rows, ←/→
+/// (or Enter/Space) change the selected value; `selected` indexes `items`.
 #[derive(Clone, Debug, Default)]
 pub(super) struct ConfigOverlay {
-    pub(super) items: Vec<ConfigToggle>,
+    pub(super) items: Vec<ConfigRow>,
     pub(super) selected: usize,
 }
 
@@ -2063,7 +2059,7 @@ pub(super) enum SlashCommand {
     /// Open the rewind picker: jump back to an earlier turn, reverting the file
     /// edits made since and restoring that turn's prompt to the composer.
     Rewind,
-    /// Open the `/config` overlay: a toggle list of chat preferences.
+    /// Open the `/config` overlay of chat preferences.
     Config,
     /// `/compact` folds older turns via the LLM; `fast` clears stale tool output only.
     Compact {

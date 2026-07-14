@@ -20,7 +20,9 @@ enum OverlayKeyAction {
     OpenMcpTools(usize),
     ToggleMcpTool(usize),
     ApplyMcpPaste,
-    ToggleConfigSetting(usize),
+    /// `/config` row, direction −1/+1.
+    StepConfigSetting(usize, i32),
+    CycleConfigSetting(usize),
 }
 
 const GOAL_STOP_CONFIRM_NOTICE: &str = "Press Esc again to stop goal mode";
@@ -662,16 +664,6 @@ impl CodeTuiApp {
         });
     }
 
-    /// Set edit-review and mirror it to the live flag, with a toast (cf. `set_auto_approve`).
-    pub(super) fn set_review_edits(&mut self, on: bool) {
-        self.set_review_quiet(on);
-        self.show_toast(if on {
-            "Review mode — approve each edit"
-        } else {
-            "Review edits off — in-cwd edits apply without a review card"
-        });
-    }
-
     async fn handle_overlay_key(&mut self, key: KeyEvent) -> Result<Option<bool>> {
         match self.apply_overlay_key(key) {
             OverlayKeyAction::NotOpen => Ok(None),
@@ -742,8 +734,12 @@ impl CodeTuiApp {
                 self.apply_mcp_paste().await?;
                 Ok(Some(false))
             }
-            OverlayKeyAction::ToggleConfigSetting(index) => {
-                self.toggle_config_setting(index).await;
+            OverlayKeyAction::StepConfigSetting(row, dir) => {
+                self.step_config_setting(row, dir).await;
+                Ok(Some(false))
+            }
+            OverlayKeyAction::CycleConfigSetting(row) => {
+                self.cycle_config_setting(row).await;
                 Ok(Some(false))
             }
         }
@@ -832,19 +828,24 @@ impl CodeTuiApp {
                 OverlayKeyAction::Handled
             }
             Overlay::Config(state) => {
-                // A small fixed toggle list: ↑/↓ (or Ctrl+P/N) move, Enter/Space/Tab
-                // flip the row, Esc closes. No filter/add/remove.
+                // ↑/↓ (Ctrl+P/N) move rows, ←/→ change the value, Enter/Space/Tab
+                // advance it (wrapping), Esc closes.
                 let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+                let has_rows = !state.items.is_empty();
                 match key.code {
                     KeyCode::Esc => self.overlay = Overlay::None,
                     KeyCode::Up => state.select_prev(),
                     KeyCode::Char('p') if ctrl => state.select_prev(),
                     KeyCode::Down => state.select_next(),
                     KeyCode::Char('n') if ctrl => state.select_next(),
-                    KeyCode::Enter | KeyCode::Char(' ') | KeyCode::Tab
-                        if !state.items.is_empty() =>
-                    {
-                        return OverlayKeyAction::ToggleConfigSetting(state.selected);
+                    KeyCode::Left if has_rows => {
+                        return OverlayKeyAction::StepConfigSetting(state.selected, -1);
+                    }
+                    KeyCode::Right if has_rows => {
+                        return OverlayKeyAction::StepConfigSetting(state.selected, 1);
+                    }
+                    KeyCode::Enter | KeyCode::Char(' ') | KeyCode::Tab if has_rows => {
+                        return OverlayKeyAction::CycleConfigSetting(state.selected);
                     }
                     _ => {}
                 }

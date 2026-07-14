@@ -1124,26 +1124,22 @@ impl CodeTuiApp {
         }
     }
 
-    /// `/config` overlay: a small fixed toggle list of chat preferences, sharing
-    /// the `/skills` and `/mcp` chrome via [`render_toggle_list`] so all three feel
-    /// the same. No filter/add/remove — the top row is a static heading instead of
-    /// a search field.
+    /// `/config`: one line per setting (name left, switch flush right) with a blank
+    /// between rows and the focused row's description below; shares the `/skills` /
+    /// `/mcp` chrome via [`render_toggle_list`]. Badge counts only on/off switches.
     pub(super) fn render_config_overlay(
         &self,
         frame: &mut Frame<'_>,
         area: Rect,
         state: &ConfigOverlay,
     ) {
-        // Theme is not a bool toggle — exclude it from the on/total badge.
-        let bool_items: Vec<_> = state
+        let switches: Vec<ConfigSegments> = state
             .items
             .iter()
-            .filter(|i| i.setting != ConfigSetting::Theme)
+            .map(|i| self.config_segments(i.setting))
+            .filter(|s| s.is_switch)
             .collect();
-        let on = bool_items
-            .iter()
-            .filter(|i| self.config_setting_enabled(i.setting))
-            .count();
+        let on = switches.iter().filter(|s| s.active == 0).count();
         let input_line = Line::from(Span::styled(
             "Settings — remembered across sessions",
             Style::default().fg(MUTED()),
@@ -1153,46 +1149,37 @@ impl CodeTuiApp {
         let mut rows: Vec<Line> = Vec::new();
         let mut selected_pos = 0usize;
         for (pos, item) in state.items.iter().enumerate() {
-            let desc =
-                truncate_for_display_width(item.description, toggle_detail_room(inner_width));
             if pos == state.selected {
-                selected_pos = rows.len() + 1;
+                selected_pos = rows.len();
             }
-            if item.setting == ConfigSetting::Theme {
-                rows.extend(choice_list_rows(
-                    self.theme.label(),
-                    item.label,
-                    &desc,
-                    MUTED(),
-                    pos == state.selected,
-                    inner_width,
-                ));
-            } else {
-                rows.extend(toggle_list_rows(
-                    self.config_setting_enabled(item.setting),
-                    item.label,
-                    &desc,
-                    MUTED(),
-                    pos == state.selected,
-                    inner_width,
-                ));
-            }
+            let segs = self.config_segments(item.setting);
+            rows.push(segment_switch_line(
+                item.label,
+                segs.options,
+                segs.active,
+                pos == state.selected,
+                inner_width,
+            ));
             if pos + 1 < state.items.len() {
                 rows.push(Line::from(""));
             }
         }
+        let detail = state
+            .items
+            .get(state.selected)
+            .map(|i| (i.description.to_string(), MUTED()));
 
         render_toggle_list(
             frame,
             area,
             ToggleListView {
                 title: "Config",
-                badge: count_badge(true, on, bool_items.len()),
+                badge: count_badge(true, on, switches.len()),
                 input_line,
                 rows,
                 selected_pos,
-                detail: None,
-                footer: vec![("↑↓", "move"), ("Enter/Space", "toggle"), ("Esc", "close")],
+                detail,
+                footer: vec![("↑↓", "move"), ("←→", "change"), ("Esc", "close")],
             },
         );
     }
@@ -2316,49 +2303,59 @@ fn toggle_list_rows(
     }
 }
 
-/// Like [`toggle_list_rows`], but the leading marker shows a choice value
-/// (e.g. `[dark]` / `[light]`) instead of a checkbox.
-fn choice_list_rows(
-    value: &str,
+/// The segmented switch for one `/config` row: `active` in bold accent, the rest
+/// muted. Only the focused row carries a background (the selection bar).
+fn segment_strip(options: &[&str], active: usize, selected: bool) -> Vec<Span<'static>> {
+    options
+        .iter()
+        .enumerate()
+        .map(|(i, opt)| {
+            let style = if selected {
+                let base = Style::default().bg(SELECT_BG());
+                if i == active {
+                    base.fg(ACCENT()).add_modifier(Modifier::BOLD)
+                } else {
+                    base.fg(SELECT_ACCENT())
+                }
+            } else if i == active {
+                Style::default().fg(ACCENT()).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(MUTED())
+            };
+            Span::styled(format!(" {opt} "), style)
+        })
+        .collect()
+}
+
+/// One `/config` line: bold name left, switch flush right, the filled gap
+/// carrying the selection bar on the focused row.
+fn segment_switch_line(
     name: &str,
-    detail: &str,
-    detail_color: Color,
+    options: &[&str],
+    active: usize,
     selected: bool,
     width: usize,
-) -> Vec<Line<'static>> {
-    let marker = format!("[{value}] ");
-    let marker_w = display_width(&marker).max(TOGGLE_CHECKBOX_WIDTH);
-    let indent = " ".repeat(marker_w);
-    if selected {
+) -> Line<'static> {
+    let strip = segment_strip(options, active, selected);
+    let strip_w: usize = options.iter().map(|o| display_width(o) + 2).sum();
+    let (name_style, bar) = if selected {
         let bar = Style::default().bg(SELECT_BG());
-        vec![
-            Line::from(vec![
-                Span::styled(marker, bar.fg(ACCENT())),
-                Span::styled(
-                    pad_to_width(name, width.saturating_sub(marker_w)),
-                    bar.fg(SELECT_TEXT()).add_modifier(Modifier::BOLD),
-                ),
-            ]),
-            Line::from(Span::styled(
-                pad_to_width(&format!("{indent}{detail}"), width),
-                bar.fg(SELECT_ACCENT()),
-            )),
-        ]
+        (bar.fg(SELECT_TEXT()).add_modifier(Modifier::BOLD), bar)
     } else {
-        vec![
-            Line::from(vec![
-                Span::styled(marker, Style::default().fg(ACCENT())),
-                Span::styled(
-                    name.to_string(),
-                    Style::default().fg(TEXT()).add_modifier(Modifier::BOLD),
-                ),
-            ]),
-            Line::from(Span::styled(
-                format!("{indent}{detail}"),
-                Style::default().fg(detail_color),
-            )),
-        ]
+        (
+            Style::default().fg(TEXT()).add_modifier(Modifier::BOLD),
+            Style::default(),
+        )
+    };
+    let name_room = width.saturating_sub(strip_w + 1).max(1);
+    let name_disp = truncate_for_display_width(name, name_room);
+    let pad = width.saturating_sub(display_width(&name_disp) + strip_w);
+    let mut spans = vec![Span::styled(name_disp, name_style)];
+    if pad > 0 {
+        spans.push(Span::styled(" ".repeat(pad), bar));
     }
+    spans.extend(strip);
+    Line::from(spans)
 }
 
 /// A sub-agent's displayable source: the abbreviated file path, or a marker

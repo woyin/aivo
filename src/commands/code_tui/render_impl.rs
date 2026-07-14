@@ -1180,7 +1180,16 @@ impl CodeTuiApp {
                 self.render_mcp_paste_overlay(frame, area, &paste);
             }
             Overlay::Config(config) => {
-                let area = centered_rect(64, 80, body);
+                // Content-sized box; width capped, not a percentage, so a wide
+                // terminal doesn't fling the right-aligned switches off to the edge.
+                let n = config.items.len() as u16;
+                let width = body
+                    .width
+                    .saturating_mul(7)
+                    .saturating_div(10)
+                    .clamp(48, 56);
+                let height = n.saturating_mul(2) + 6;
+                let area = centered_rect_fixed(width, height, body);
                 self.screen_region = Some(overlay_content_rect(area));
                 self.render_config_overlay(frame, area, &config);
             }

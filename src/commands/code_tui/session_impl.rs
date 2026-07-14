@@ -567,44 +567,35 @@ is preserved."
         self.compute_context_report().await.used()
     }
 
-    /// `/config`: a small toggle list of chat preferences, seeded from the live
-    /// state. The list is fixed (no filter/add/remove) and each row flips on
-    /// Enter/Space.
+    /// `/config`: a fixed list of chat-preference segmented switches, seeded live.
     pub(super) fn open_config_overlay(&mut self) {
-        // Description varies by model capability — the toggle still persists for the
-        // next thinking-capable model even when this one can't think.
         let thinking_desc = if self.model_supports_thinking {
             "let the model reason before answering (shown folded)"
         } else {
             "let the model reason (this model has no thinking)"
         };
         let items = vec![
-            ConfigToggle {
+            ConfigRow {
                 setting: ConfigSetting::Theme,
                 label: "Theme",
-                description: "color palette — Enter cycles dark ↔ light",
+                description: "color palette for the whole TUI",
             },
-            ConfigToggle {
+            ConfigRow {
                 setting: ConfigSetting::Thinking,
                 label: "Thinking",
                 description: thinking_desc,
             },
-            ConfigToggle {
-                setting: ConfigSetting::AutoApprove,
-                label: "Auto-approve tools",
-                description: "run write/edit/bash without asking (Shift+Tab cycles modes)",
+            ConfigRow {
+                setting: ConfigSetting::Approval,
+                label: "Mode",
+                description: "auto-approve runs unattended · review each edit",
             },
-            ConfigToggle {
-                setting: ConfigSetting::ReviewEdits,
-                label: "Review edits",
-                description: "show edits for approval before they're written",
-            },
-            ConfigToggle {
+            ConfigRow {
                 setting: ConfigSetting::UseWebSearch,
-                label: "aivo web search",
+                label: "Web search",
                 description: "let the agent search the web via aivo (daily quota)",
             },
-            ConfigToggle {
+            ConfigRow {
                 setting: ConfigSetting::AgentTools,
                 label: "Agent tools",
                 description: "off = plain chat: no tools, no system prompt",
@@ -613,69 +604,137 @@ is preserved."
         self.overlay = Overlay::Config(ConfigOverlay { items, selected: 0 });
     }
 
-    /// Whether `setting` is currently on — the single source of truth the `/config`
-    /// renderer reads, so a row's checkbox can never drift from the live flag.
-    /// Theme is not a bool; the renderer uses [`Self::theme`] for its value marker.
-    pub(super) fn config_setting_enabled(&self, setting: ConfigSetting) -> bool {
-        match setting {
-            ConfigSetting::Theme => true,
-            ConfigSetting::Thinking => self.thinking_enabled,
-            ConfigSetting::AutoApprove => self.agent_auto_approve,
-            ConfigSetting::ReviewEdits => self.agent_review_edits,
-            ConfigSetting::UseWebSearch => self.web_search_enabled,
-            ConfigSetting::AgentTools => self.agent_tools_enabled,
-        }
-    }
-
-    /// Flip the preference for the `/config` row at `index`, applying it live and
-    /// persisting it (best-effort). The renderer derives each row's state from the
-    /// live flag, so there's no per-row copy to write back.
-    pub(super) async fn toggle_config_setting(&mut self, index: usize) {
-        let Some(setting) = (match &self.overlay {
-            Overlay::Config(state) => state.items.get(index).map(|item| item.setting),
-            _ => None,
-        }) else {
-            return;
+    /// Segmented values for `setting` and which is live — read fresh so the
+    /// rendered row can't drift from its flag.
+    pub(super) fn config_segments(&self, setting: ConfigSetting) -> ConfigSegments {
+        const ON_OFF: &[&str] = &["on", "off"];
+        let switch = |on: bool| ConfigSegments {
+            options: ON_OFF,
+            active: if on { 0 } else { 1 },
+            is_switch: true,
         };
         match setting {
-            ConfigSetting::Theme => self.cycle_theme().await,
-            ConfigSetting::Thinking => self.set_thinking_enabled(!self.thinking_enabled).await,
-            // Modes are exclusive: turning one on leaves the others.
-            ConfigSetting::AutoApprove => {
-                let on = !self.agent_auto_approve;
-                if on {
-                    if self.plan_mode {
-                        self.leave_plan_mode(false).await;
-                    }
-                    self.set_review_quiet(false);
+            ConfigSetting::Theme => ConfigSegments {
+                options: &["dark", "light"],
+                active: match self.theme {
+                    UiTheme::Dark => 0,
+                    UiTheme::Light => 1,
+                },
+                is_switch: false,
+            },
+            ConfigSetting::Thinking => switch(self.thinking_enabled),
+            ConfigSetting::Approval => {
+                // Plan mode is transient (via /plan / Shift+Tab), not a standing mode.
+                const OPTIONS: &[&str] = &["normal", "auto-approve", "review"];
+                let label = self.approval_mode_label();
+                ConfigSegments {
+                    options: OPTIONS,
+                    active: OPTIONS.iter().position(|o| *o == label).unwrap_or(0),
+                    is_switch: false,
                 }
-                self.set_auto_approve(on)
             }
-            ConfigSetting::ReviewEdits => {
-                let on = !self.agent_review_edits;
-                if on {
-                    if self.plan_mode {
-                        self.leave_plan_mode(false).await;
-                    }
-                    self.set_auto_quiet(false);
-                }
-                self.set_review_edits(on)
+            ConfigSetting::UseWebSearch => switch(self.web_search_enabled),
+            ConfigSetting::AgentTools => switch(self.agent_tools_enabled),
+        }
+    }
+
+    /// The live standing mode as an Approval label; plan mode clears both flags → `normal`.
+    fn approval_mode_label(&self) -> &'static str {
+        if self.agent_auto_approve {
+            "auto-approve"
+        } else if self.agent_review_edits {
+            "review"
+        } else {
+            "normal"
+        }
+    }
+
+    fn config_row_setting(&self, row: usize) -> Option<ConfigSetting> {
+        match &self.overlay {
+            Overlay::Config(state) => state.items.get(row).map(|item| item.setting),
+            _ => None,
+        }
+    }
+
+    /// ←/→: move the active segment by `dir`, clamped to the ends.
+    pub(super) async fn step_config_setting(&mut self, row: usize, dir: i32) {
+        let Some(setting) = self.config_row_setting(row) else {
+            return;
+        };
+        let segs = self.config_segments(setting);
+        let last = segs.options.len().saturating_sub(1) as i32;
+        let next = (segs.active as i32 + dir).clamp(0, last) as usize;
+        self.set_config_segment(setting, next).await;
+    }
+
+    /// Enter/Space: advance to the next segment, wrapping.
+    pub(super) async fn cycle_config_setting(&mut self, row: usize) {
+        let Some(setting) = self.config_row_setting(row) else {
+            return;
+        };
+        let segs = self.config_segments(setting);
+        if segs.options.is_empty() {
+            return;
+        }
+        let next = (segs.active + 1) % segs.options.len();
+        self.set_config_segment(setting, next).await;
+    }
+
+    /// Apply `setting`'s `target` segment live (+persist); no-op if already active.
+    async fn set_config_segment(&mut self, setting: ConfigSetting, target: usize) {
+        let segs = self.config_segments(setting);
+        if segs.active == target {
+            return;
+        }
+        match setting {
+            ConfigSetting::Theme => {
+                let next = if target == 1 {
+                    UiTheme::Light
+                } else {
+                    UiTheme::Dark
+                };
+                self.set_theme(next).await;
             }
-            ConfigSetting::UseWebSearch => {
-                self.set_web_search_enabled(!self.web_search_enabled).await
+            ConfigSetting::Thinking => self.set_thinking_enabled(target == 0).await,
+            ConfigSetting::Approval => {
+                let mode = segs.options.get(target).copied().unwrap_or("normal");
+                self.set_approval_mode(mode).await;
             }
-            ConfigSetting::AgentTools => {
-                self.set_agent_tools_enabled(!self.agent_tools_enabled)
-                    .await
+            ConfigSetting::UseWebSearch => self.set_web_search_enabled(target == 0).await,
+            ConfigSetting::AgentTools => self.set_agent_tools_enabled(target == 0).await,
+        }
+    }
+
+    /// Set the standing mode by label (`normal`/`auto-approve`/`review`); leaves plan mode first.
+    pub(super) async fn set_approval_mode(&mut self, mode: &str) {
+        if self.plan_mode {
+            self.leave_plan_mode(false).await;
+        }
+        match mode {
+            "auto-approve" => {
+                self.set_review_quiet(false);
+                self.set_auto_quiet(true);
+                self.show_toast("Auto-approve mode — tools run without asking");
+            }
+            "review" => {
+                self.set_auto_quiet(false);
+                self.set_review_quiet(true);
+                self.show_toast("Review mode — approve each edit");
+            }
+            _ => {
+                self.set_auto_quiet(false);
+                self.set_review_quiet(false);
+                self.show_toast("Normal mode — risky actions ask first");
             }
         }
     }
 
-    /// Cycle dark ↔ light, apply the palette immediately, and persist (best-effort).
-    /// Bumps `transcript_revision` so memoized spans (which embed resolved colors)
-    /// rebuild against the new palette.
-    pub(super) async fn cycle_theme(&mut self) {
-        let next = self.theme.cycle();
+    /// Set + persist the theme (idempotent). Bumps `transcript_revision` so
+    /// color-memoized spans rebuild against the new palette.
+    pub(super) async fn set_theme(&mut self, next: UiTheme) {
+        if self.theme == next {
+            return;
+        }
         self.theme = next;
         set_ui_theme(next);
         self.transcript_revision = self.transcript_revision.wrapping_add(1);
