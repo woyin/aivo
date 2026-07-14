@@ -1056,6 +1056,7 @@ async fn start_grok_serve_router(
         ServeRouterConfig::from_key(&key, false, 300, loopback_auth_token(env), HashMap::new())
             .with_grok_fallback(fallback);
     let (handle, _shutdown, port) = ServeRouter::new(config, key, session_store.logs())
+        .with_oauth_persist(session_store.clone())
         .start_background_with_addr("127.0.0.1", 0)
         .await?;
     tokio::spawn(async move {

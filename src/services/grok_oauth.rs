@@ -232,9 +232,59 @@ pub async fn ensure_fresh(creds: &mut GrokOAuthCredential, skew_secs: i64) -> Re
     }
 }
 
-/// Lists model ids via the CLI proxy's `/v1/models`.
-pub async fn fetch_model_ids(creds: &mut GrokOAuthCredential) -> Result<Vec<String>> {
-    ensure_fresh(creds, REFRESH_SKEW_SECS).await?;
+/// Writes a rotated credential back to the store. xAI revokes the prior
+/// refresh_token on every refresh, so a rotation left in memory orphans the
+/// on-disk token and the next process fails `invalid_grant`. Best-effort;
+/// matches the grok-oauth entry by base_url, then by pre-rotation token.
+pub async fn persist_rotated_credential(
+    store: &crate::services::session_store::SessionStore,
+    prev_refresh_token: &str,
+    creds: &GrokOAuthCredential,
+) {
+    use crate::services::session_store::SessionStore;
+    let Ok(json) = creds.to_json() else {
+        return;
+    };
+    let Ok(keys) = store.get_keys().await else {
+        return;
+    };
+    let mut candidates: Vec<_> = keys.into_iter().filter(|k| k.is_grok_oauth()).collect();
+    let target = match candidates.len() {
+        0 => return,
+        1 => candidates.pop(),
+        _ => candidates.into_iter().find(|k| {
+            let mut probe = k.clone();
+            SessionStore::decrypt_key_secret(&mut probe).is_ok()
+                && GrokOAuthCredential::from_json(&probe.key)
+                    .map(|c| c.refresh_token == prev_refresh_token)
+                    .unwrap_or(false)
+        }),
+    };
+    if let Some(existing) = target {
+        let _ = store
+            .update_key(
+                &existing.id,
+                &existing.name,
+                &existing.base_url,
+                existing.claude_protocol,
+                &json,
+            )
+            .await;
+    }
+}
+
+/// Lists model ids via the CLI proxy. Refreshes only with a `store` to persist
+/// the rotation into; storeless callers use the current token as-is.
+pub async fn fetch_model_ids(
+    creds: &mut GrokOAuthCredential,
+    persist: Option<&crate::services::session_store::SessionStore>,
+) -> Result<Vec<String>> {
+    if let Some(store) = persist {
+        let prev_refresh = creds.refresh_token.clone();
+        if ensure_fresh(creds, REFRESH_SKEW_SECS).await? {
+            persist_rotated_credential(store, &prev_refresh, creds).await;
+        }
+    }
     let url = format!("{}/models", INFERENCE_BASE_URL.trim_end_matches('/'));
     let resp = client()
         .get(&url)
@@ -376,6 +426,9 @@ pub struct GrokTokenManager {
     creds: Arc<RwLock<GrokOAuthCredential>>,
     fallback_api_key: Option<String>,
     gated: Arc<RwLock<bool>>,
+    /// When set, a refresh persists the rotated credential (see
+    /// `persist_rotated_credential`).
+    persist_store: Option<crate::services::session_store::SessionStore>,
 }
 
 impl GrokTokenManager {
@@ -384,7 +437,17 @@ impl GrokTokenManager {
             creds: Arc::new(RwLock::new(creds)),
             fallback_api_key,
             gated: Arc::new(RwLock::new(false)),
+            persist_store: None,
         }
+    }
+
+    /// Persist rotations to `store` so they survive process exit.
+    pub fn with_persist_store(
+        mut self,
+        store: crate::services::session_store::SessionStore,
+    ) -> Self {
+        self.persist_store = Some(store);
+        self
     }
 
     /// Resolves auth, refreshing on expiry; the fallback path once gated.
@@ -401,7 +464,11 @@ impl GrokTokenManager {
 
         let mut creds = self.creds.write().await;
         if creds.is_expired(REFRESH_SKEW_SECS) {
+            let prev_refresh = creds.refresh_token.clone();
             refresh(&mut creds).await?;
+            if let Some(store) = &self.persist_store {
+                persist_rotated_credential(store, &prev_refresh, &creds).await;
+            }
         }
         Ok(GrokAuth {
             base_url: INFERENCE_BASE_URL.to_string(),
@@ -499,6 +566,44 @@ mod tests {
         assert_eq!(auth.base_url, FALLBACK_API_BASE_URL);
         assert_eq!(auth.bearer, "xai-key");
         assert!(auth.is_api_key);
+    }
+
+    #[tokio::test]
+    async fn persist_rotated_credential_writes_back_new_refresh_token() {
+        use crate::services::session_store::SessionStore;
+
+        let temp = tempfile::tempdir().unwrap();
+        let store = SessionStore::with_path(temp.path().join("config.json"));
+        let original = GrokOAuthCredential {
+            access_token: "at0".into(),
+            refresh_token: "rt0".into(),
+            account_label: None,
+            expires_at: Utc::now(),
+            last_refresh: Utc::now(),
+        };
+        store
+            .add_key_with_protocol(
+                "grok",
+                GROK_OAUTH_SENTINEL,
+                None,
+                &original.to_json().unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let rotated = GrokOAuthCredential {
+            access_token: "at1".into(),
+            refresh_token: "rt1".into(),
+            ..original.clone()
+        };
+        persist_rotated_credential(&store, &original.refresh_token, &rotated).await;
+
+        let keys = store.get_keys().await.unwrap();
+        let mut stored = keys.into_iter().find(|k| k.is_grok_oauth()).unwrap();
+        SessionStore::decrypt_key_secret(&mut stored).unwrap();
+        let reloaded = GrokOAuthCredential::from_json(&stored.key).unwrap();
+        assert_eq!(reloaded.refresh_token, "rt1");
+        assert_eq!(reloaded.access_token, "at1");
     }
 
     #[tokio::test]

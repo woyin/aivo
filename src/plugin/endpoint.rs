@@ -1171,6 +1171,7 @@ async fn start_loopback_endpoint(
     let token = random_auth_token();
     let config = ServeRouterConfig::from_key(key, false, 300, Some(token.clone()), HashMap::new());
     let mut router = ServeRouter::new(config, key.clone(), log_store)
+        .with_oauth_persist(usage.clone())
         .with_usage_accounting(usage, tool.to_string())
         .with_run_tally(run_tally);
     if let Some(path) = &debug_log

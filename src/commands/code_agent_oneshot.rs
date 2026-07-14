@@ -344,6 +344,7 @@ async fn run_agent_captured(
         )
         .with_grok_fallback(grok_fallback);
         let router = ServeRouter::new(config, key.clone(), session_store.logs())
+            .with_oauth_persist(session_store.clone())
             .with_usage_accounting(session_store.clone(), "code".to_string())
             .quiet(true);
         let (handle, shutdown, port) = router.start_background_with_addr("127.0.0.1", 0).await?;

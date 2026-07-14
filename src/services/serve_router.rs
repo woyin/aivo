@@ -156,6 +156,8 @@ pub struct ServeRouter {
     /// protocol and read confirmed routes back. `aivo code` shares one across its
     /// per-turn serves.
     seed_route_cache: Option<Arc<RouteCache>>,
+    /// Persists grok refresh-token rotations; ignored for non-grok upstreams.
+    oauth_persist_store: Option<SessionStore>,
 }
 
 struct ServeState {
@@ -205,7 +207,14 @@ impl ServeRouter {
             run_tally: None,
             quiet: false,
             seed_route_cache: None,
+            oauth_persist_store: None,
         }
+    }
+
+    /// Persist grok refresh-token rotations. No-op for non-grok upstreams.
+    pub fn with_oauth_persist(mut self, store: SessionStore) -> Self {
+        self.oauth_persist_store = Some(store);
+        self
     }
 
     /// Use a caller-owned route cache so the learned protocol can be seeded and
@@ -297,7 +306,7 @@ impl ServeRouter {
         } else {
             None
         };
-        let grok_tokens = build_grok_tokens(&self.config);
+        let grok_tokens = build_grok_tokens(&self.config, self.oauth_persist_store.clone());
         let codex_tokens = build_codex_tokens(&self.config);
 
         let initial_protocol = self.config.upstream_protocol;
@@ -1637,16 +1646,20 @@ pub(crate) async fn resolve_grok_fallback(session_store: &SessionStore) -> Optio
 /// configs or an unparseable credential.
 fn build_grok_tokens(
     config: &ServeRouterConfig,
+    persist_store: Option<SessionStore>,
 ) -> Option<Arc<crate::services::grok_oauth::GrokTokenManager>> {
     use crate::services::grok_oauth::{GrokOAuthCredential, GrokTokenManager};
     if !config.is_grok {
         return None;
     }
     match GrokOAuthCredential::from_json(&config.upstream_api_key) {
-        Ok(creds) => Some(Arc::new(GrokTokenManager::new(
-            creds,
-            config.grok_fallback_api_key.clone(),
-        ))),
+        Ok(creds) => {
+            let mut mgr = GrokTokenManager::new(creds, config.grok_fallback_api_key.clone());
+            if let Some(store) = persist_store {
+                mgr = mgr.with_persist_store(store);
+            }
+            Some(Arc::new(mgr))
+        }
         Err(_) => None,
     }
 }

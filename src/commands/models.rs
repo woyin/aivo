@@ -360,7 +360,9 @@ impl ModelsCommand {
             // enrichment below fills limits.
             SessionStore::decrypt_key_secret(&mut key)?;
             let mut creds = crate::services::grok_oauth::GrokOAuthCredential::from_json(&key.key)?;
-            let ids = crate::services::grok_oauth::fetch_model_ids(&mut creds).await?;
+            let ids =
+                crate::services::grok_oauth::fetch_model_ids(&mut creds, Some(&self.session_store))
+                    .await?;
             ids.into_iter().map(ModelInfo::id_only).collect()
         } else if key.is_codex_oauth() {
             crate::services::codex_oauth::known_model_ids()
@@ -1038,7 +1040,7 @@ async fn fetch_models_detailed_filtered(
         let mut key = key.clone();
         SessionStore::decrypt_key_secret(&mut key)?;
         let mut creds = crate::services::grok_oauth::GrokOAuthCredential::from_json(&key.key)?;
-        let ids = crate::services::grok_oauth::fetch_model_ids(&mut creds).await?;
+        let ids = crate::services::grok_oauth::fetch_model_ids(&mut creds, None).await?;
         return Ok(ids.into_iter().map(ModelInfo::id_only).collect());
     }
     if key.is_codex_oauth() {

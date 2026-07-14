@@ -986,6 +986,7 @@ impl CodeTuiApp {
         // `.quiet` keeps router stderr off the raw-mode prompt.
         let router = ServeRouter::new(config, self.key.clone(), self.session_store.logs())
             .with_route_cache(self.agent_route_cache())
+            .with_oauth_persist(self.session_store.clone())
             .with_usage_accounting(self.session_store.clone(), "code".to_string())
             .quiet(true);
         let (handle, shutdown, port) = router.start_background_with_addr("127.0.0.1", 0).await?;
