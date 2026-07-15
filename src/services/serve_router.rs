@@ -17,6 +17,7 @@ use crate::services::copilot_auth::CopilotTokenManager;
 use crate::services::http_utils::{self, router_http_client_with_timeout};
 use crate::services::log_store::{LogEvent, LogStore};
 use crate::services::model_list_response;
+use crate::services::model_names::strip_context_suffix;
 use crate::services::openai_anthropic_bridge::convert_openai_chat_response_to_sse;
 use crate::services::openai_gemini_bridge::convert_openai_chat_to_gemini_sse;
 use crate::services::protocol_fallback::{
@@ -137,6 +138,9 @@ pub struct ServeRouter {
     log_store: LogStore,
     logger: Option<RequestLogger>,
     failover_keys: Vec<ApiKey>,
+    /// Per-model upstream keys `(model, key)`; each becomes a routable upstream
+    /// at startup. Powers per-tier routing.
+    model_upstreams: Vec<(String, ApiKey)>,
     /// When set, buffered 2xx responses have their token usage recorded against
     /// `key` in stats. Off by default (plain `aivo serve` doesn't account); the
     /// plugin endpoint opts in via `with_usage_accounting`.
@@ -175,6 +179,9 @@ struct ServeState {
     log_store: LogStore,
     logger: Option<RequestLogger>,
     failover_keys: Arc<Vec<FailoverEntry>>,
+    /// Per-model upstreams keyed by (suffix-stripped) model name. A matching
+    /// `body["model"]` swaps the request to that upstream. Empty for single-key.
+    model_upstreams: Arc<HashMap<String, Arc<FailoverEntry>>>,
     shutdown: Arc<tokio::sync::Notify>,
     usage_sink: Option<SessionStore>,
     usage_tool: Option<String>,
@@ -202,6 +209,7 @@ impl ServeRouter {
             log_store,
             logger: None,
             failover_keys: Vec::new(),
+            model_upstreams: Vec::new(),
             usage_sink: None,
             usage_tool: None,
             run_tally: None,
@@ -238,6 +246,13 @@ impl ServeRouter {
 
     pub fn with_failover_keys(mut self, keys: Vec<ApiKey>) -> Self {
         self.failover_keys = keys;
+        self
+    }
+
+    /// Route requests naming `model` to `key` instead of the base (per-tier
+    /// routing). Model matched with its `[1m]`/`[2m]` suffix stripped.
+    pub fn with_model_upstreams(mut self, upstreams: Vec<(String, ApiKey)>) -> Self {
+        self.model_upstreams = upstreams;
         self
     }
 
@@ -373,6 +388,16 @@ impl ServeRouter {
             })
             .collect();
 
+        // Each tier key → a full upstream context, keyed by suffix-stripped model.
+        let model_upstreams: HashMap<String, Arc<FailoverEntry>> = self
+            .model_upstreams
+            .into_iter()
+            .map(|(model, key)| {
+                let entry = build_upstream_entry(key, timeout, self.oauth_persist_store.as_ref());
+                (strip_context_suffix(&model).to_string(), Arc::new(entry))
+            })
+            .collect();
+
         let shutdown = Arc::new(tokio::sync::Notify::new());
 
         let state = Arc::new(ServeState {
@@ -386,6 +411,7 @@ impl ServeRouter {
             log_store: self.log_store,
             logger: self.logger,
             failover_keys: Arc::new(failover_entries),
+            model_upstreams: Arc::new(model_upstreams),
             shutdown: shutdown.clone(),
             usage_sink: self.usage_sink,
             usage_tool: self.usage_tool,
@@ -513,6 +539,10 @@ async fn run_accept_loop(listener: tokio::net::TcpListener, state: Arc<ServeStat
                 .and_then(|body| serde_json::from_str::<Value>(body).ok())
                 .and_then(|v| v.get("model").and_then(|m| m.as_str()).map(String::from));
 
+            let model_state = select_model_upstream(&state, log_model.as_deref())
+                .map(|entry| failover_state(entry, &state.client, &state.log_store, state.quiet));
+            let active = model_state.as_ref().unwrap_or(&state);
+
             let result = match path_no_query {
                 "/health" => Ok(RouterResponse::buffered(
                     200,
@@ -528,7 +558,7 @@ async fn run_accept_loop(listener: tokio::net::TcpListener, state: Arc<ServeStat
                             br#"{"error":{"message":"Method not allowed"}}"#.to_vec(),
                         ))
                     } else {
-                        handle_chat_with_failover(&request, &state).await
+                        handle_chat_with_failover(&request, active).await
                     }
                 }
                 "/v1/responses" | "/responses" => {
@@ -539,7 +569,7 @@ async fn run_accept_loop(listener: tokio::net::TcpListener, state: Arc<ServeStat
                             br#"{"error":{"message":"Method not allowed"}}"#.to_vec(),
                         ))
                     } else {
-                        handle_responses_with_failover(&request, &state).await
+                        handle_responses_with_failover(&request, active).await
                     }
                 }
                 "/v1/messages" | "/messages" => {
@@ -550,7 +580,7 @@ async fn run_accept_loop(listener: tokio::net::TcpListener, state: Arc<ServeStat
                             br#"{"error":{"message":"Method not allowed"}}"#.to_vec(),
                         ))
                     } else {
-                        handle_messages_with_failover(&request, &state).await
+                        handle_messages_with_failover(&request, active).await
                     }
                 }
                 p if gemini_generate_target(p).is_some() => {
@@ -561,7 +591,7 @@ async fn run_accept_loop(listener: tokio::net::TcpListener, state: Arc<ServeStat
                             br#"{"error":{"message":"Method not allowed"}}"#.to_vec(),
                         ))
                     } else {
-                        handle_gemini_with_failover(&request, &state).await
+                        handle_gemini_with_failover(&request, active).await
                     }
                 }
                 "/v1/embeddings" => {
@@ -572,7 +602,7 @@ async fn run_accept_loop(listener: tokio::net::TcpListener, state: Arc<ServeStat
                             br#"{"error":{"message":"Method not allowed"}}"#.to_vec(),
                         ))
                     } else {
-                        handle_embeddings_with_failover(&request, &state).await
+                        handle_embeddings_with_failover(&request, active).await
                     }
                 }
                 _ => Ok(RouterResponse::buffered(
@@ -622,7 +652,8 @@ async fn run_accept_loop(listener: tokio::net::TcpListener, state: Arc<ServeStat
             if let (Some(store), Some(u)) = (&state.usage_sink, &usage) {
                 let _ = store
                     .record_tokens(
-                        &state.key.id,
+                        // Attribute to the upstream that served (tier or base).
+                        &active.key.id,
                         state.usage_tool.as_deref(),
                         log_model.as_deref(),
                         u.prompt,
@@ -665,9 +696,9 @@ async fn run_accept_loop(listener: tokio::net::TcpListener, state: Arc<ServeStat
                 .append(LogEvent {
                     source: "serve".to_string(),
                     kind: "serve_request".to_string(),
-                    key_id: Some(state.key.id.clone()),
-                    key_name: Some(state.key.display_name().to_string()),
-                    base_url: Some(state.key.base_url.clone()),
+                    key_id: Some(active.key.id.clone()),
+                    key_name: Some(active.key.display_name().to_string()),
+                    base_url: Some(active.key.base_url.clone()),
                     tool: Some(
                         state
                             .usage_tool
@@ -1357,12 +1388,61 @@ fn failover_state(
         log_store: log_store.clone(),
         logger: None,
         failover_keys: Arc::new(Vec::new()),
+        model_upstreams: Arc::new(HashMap::new()),
         shutdown: Arc::new(tokio::sync::Notify::new()),
         usage_sink: None,
         usage_tool: None,
         run_tally: None,
         quiet,
     }
+}
+
+/// Builds a full upstream context (config/key/tokens/route-cache) from a key,
+/// for a per-model tier upstream. `from_key` handles any provider.
+fn build_upstream_entry(
+    key: ApiKey,
+    timeout: u64,
+    oauth_persist: Option<&SessionStore>,
+) -> FailoverEntry {
+    let config = ServeRouterConfig::from_key(&key, false, timeout, None, HashMap::new());
+    let copilot_tokens = if config.is_copilot {
+        Some(Arc::new(CopilotTokenManager::new(
+            config.upstream_api_key.clone(),
+        )))
+    } else {
+        None
+    };
+    let grok_tokens = build_grok_tokens(&config, oauth_persist.cloned());
+    let codex_tokens = build_codex_tokens(&config);
+    let route_cache = Arc::new(RouteCache::new(
+        "serve",
+        config.upstream_protocol,
+        std::collections::BTreeMap::new(),
+    ));
+    FailoverEntry {
+        config: Arc::new(config),
+        key,
+        copilot_tokens,
+        grok_tokens,
+        codex_tokens,
+        route_cache,
+    }
+}
+
+/// The per-model upstream for a request's (suffix-stripped) model, if any;
+/// `None` → base upstream.
+fn select_model_upstream<'a>(
+    state: &'a ServeState,
+    model: Option<&str>,
+) -> Option<&'a Arc<FailoverEntry>> {
+    if state.model_upstreams.is_empty() {
+        return None;
+    }
+    let model = model?;
+    state
+        .model_upstreams
+        .get(strip_context_suffix(model))
+        .or_else(|| state.model_upstreams.get(model))
 }
 
 /// Generates a failover wrapper around a handler function.
@@ -1928,12 +2008,38 @@ mod tests {
             log_store: LogStore::new(std::env::temp_dir()),
             logger: None,
             failover_keys: Arc::new(Vec::new()),
+            model_upstreams: Arc::new(HashMap::new()),
             shutdown: Arc::new(tokio::sync::Notify::new()),
             usage_sink: None,
             usage_tool: None,
             run_tally: None,
             quiet: false,
         }
+    }
+
+    #[test]
+    fn select_model_upstream_matches_by_name_and_suffix() {
+        let mut state = test_state(ProviderProtocol::Openai);
+        assert!(select_model_upstream(&state, Some("glm-4.6")).is_none());
+
+        let tier_key = ApiKey::new_with_protocol(
+            "tierid".to_string(),
+            "tier".to_string(),
+            "https://openrouter.ai/api/v1".to_string(),
+            None,
+            "sk-tier".to_string(),
+        );
+        let entry = Arc::new(build_upstream_entry(tier_key, 300, None));
+        let mut map = HashMap::new();
+        map.insert("glm-4.6".to_string(), entry);
+        state.model_upstreams = Arc::new(map);
+
+        let hit = select_model_upstream(&state, Some("glm-4.6")).expect("mapped");
+        assert_eq!(hit.config.upstream_base_url, "https://openrouter.ai/api/v1");
+        assert_eq!(hit.key.id, "tierid");
+        assert!(select_model_upstream(&state, Some("glm-4.6[1m]")).is_some());
+        assert!(select_model_upstream(&state, Some("gpt-4o")).is_none());
+        assert!(select_model_upstream(&state, None).is_none());
     }
 
     fn mock_reqwest_response(
@@ -2080,6 +2186,7 @@ mod tests {
             log_store: LogStore::new(std::env::temp_dir()),
             logger: None,
             failover_keys: Arc::new(Vec::new()),
+            model_upstreams: Arc::new(HashMap::new()),
             shutdown: Arc::new(tokio::sync::Notify::new()),
             usage_sink: None,
             usage_tool: None,

@@ -664,8 +664,8 @@ pub struct RunArgs {
     )]
     pub tool: Option<String>,
 
-    /// Specify AI model to use
-    #[arg(short, long, value_name = "MODEL", num_args = 0..=1, default_missing_value = "")]
+    /// AI model to use. `<key>::<model>` also picks the provider/key inline.
+    #[arg(short, long, value_name = "[KEY::]MODEL", num_args = 0..=1, default_missing_value = "")]
     pub model: Option<String>,
 
     /// Claude only: override the reasoning/thinking model slot
@@ -680,8 +680,8 @@ pub struct RunArgs {
 
     /// Claude only: override the Haiku family-default slot
     /// (ANTHROPIC_DEFAULT_HAIKU_MODEL) — what Claude's `/model haiku` resolves to.
-    /// Bare flag opens a picker.
-    #[arg(long = "haiku-model", value_name = "MODEL", num_args = 0..=1, default_missing_value = "")]
+    /// Bare flag opens a picker; `<key>::<model>` routes this tier to another key.
+    #[arg(long = "haiku-model", value_name = "[KEY::]MODEL", num_args = 0..=1, default_missing_value = "")]
     pub haiku_model: Option<String>,
 
     /// Claude only: override the Sonnet family-default slot

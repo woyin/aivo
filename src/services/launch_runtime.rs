@@ -64,7 +64,12 @@ pub(crate) async fn prepare_runtime_env(
             .get("AIVO_ANTHROPIC_TO_OPENAI_ROUTER_API_KEY")
             .cloned()
             .unwrap_or_default();
-        if let Some(port) = start_provider_oauth_router(&env, router_key, session_store).await? {
+        if env.contains_key("AIVO_ANTHROPIC_TO_OPENAI_ROUTER_TIERS_JSON") {
+            let port = start_multi_upstream_serve_router(&env, session_store).await?;
+            set_local_base_url(&mut env, "ANTHROPIC_BASE_URL", port);
+        } else if let Some(port) =
+            start_provider_oauth_router(&env, router_key, session_store).await?
+        {
             set_local_base_url(&mut env, "ANTHROPIC_BASE_URL", port);
         } else {
             let (port, cache, learned) = start_anthropic_to_openai_router(&env).await?;
@@ -239,6 +244,8 @@ pub(crate) async fn prepare_runtime_env(
     for var in [
         "AIVO_ROUTER_API_KEY",
         "AIVO_ANTHROPIC_TO_OPENAI_ROUTER_API_KEY",
+        "AIVO_ANTHROPIC_TO_OPENAI_ROUTER_TIERS_JSON",
+        "AIVO_ANTHROPIC_TO_OPENAI_ROUTER_MAIN_KEY_ID",
         "AIVO_RESPONSES_TO_CHAT_ROUTER_API_KEY",
         "AIVO_GEMINI_ROUTER_API_KEY",
         "AIVO_COPILOT_GITHUB_TOKEN",
@@ -1115,6 +1122,74 @@ async fn start_codex_serve_router(
     tokio::spawn(async move {
         if let Ok(Err(e)) = handle.await {
             eprintln!("aivo: codex serve router exited unexpectedly: {e}");
+        }
+    });
+    Ok(port)
+}
+
+/// Multi-upstream ServeRouter for `aivo claude` per-tier routing: base = main
+/// key, each tier model → its own key. Key ids come from env; keys are resolved
+/// from the store (secrets never travel in env). Returns the loopback port.
+async fn start_multi_upstream_serve_router(
+    env: &HashMap<String, String>,
+    session_store: &SessionStore,
+) -> Result<u16> {
+    use crate::services::environment_injector::TierUpstream;
+    use crate::services::serve_router::{ServeRouter, ServeRouterConfig, resolve_grok_fallback};
+
+    // Load once; per-key `get_key_by_id` would re-read config.json each time.
+    // `get_keys` returns secrets encrypted, so decrypt only what we reference.
+    let all_keys = session_store.get_keys().await?;
+    let lookup = |id: &str| all_keys.iter().find(|k| k.id == id).cloned();
+
+    let main_id = env
+        .get("AIVO_ANTHROPIC_TO_OPENAI_ROUTER_MAIN_KEY_ID")
+        .cloned()
+        .unwrap_or_default();
+    let mut main_key = lookup(&main_id)
+        .ok_or_else(|| anyhow::anyhow!("per-tier routing: main key '{main_id}' not found"))?;
+    SessionStore::decrypt_key_secret(&mut main_key)?;
+
+    // Hard error rather than silently fall through to base-only routing.
+    let tiers: Vec<TierUpstream> = match env.get("AIVO_ANTHROPIC_TO_OPENAI_ROUTER_TIERS_JSON") {
+        Some(s) => serde_json::from_str(s)
+            .map_err(|e| anyhow::anyhow!("per-tier routing: invalid tiers spec: {e}"))?,
+        None => Vec::new(),
+    };
+    let mut model_upstreams: Vec<(String, ApiKey)> = Vec::with_capacity(tiers.len());
+    for tier in tiers {
+        let mut key = lookup(&tier.key_id).ok_or_else(|| {
+            anyhow::anyhow!(
+                "per-tier routing: key '{}' for model '{}' not found",
+                tier.key_id,
+                tier.model
+            )
+        })?;
+        SessionStore::decrypt_key_secret(&mut key)?;
+        model_upstreams.push((tier.model, key));
+    }
+
+    let fallback = if main_key.is_grok_oauth() {
+        resolve_grok_fallback(session_store).await
+    } else {
+        None
+    };
+    let config = ServeRouterConfig::from_key(
+        &main_key,
+        false,
+        300,
+        loopback_auth_token(env),
+        HashMap::new(),
+    )
+    .with_grok_fallback(fallback);
+    let (handle, _shutdown, port) = ServeRouter::new(config, main_key, session_store.logs())
+        .with_oauth_persist(session_store.clone())
+        .with_model_upstreams(model_upstreams)
+        .start_background_with_addr("127.0.0.1", 0)
+        .await?;
+    tokio::spawn(async move {
+        if let Ok(Err(e)) = handle.await {
+            eprintln!("aivo: multi-upstream serve router exited unexpectedly: {e}");
         }
     });
     Ok(port)

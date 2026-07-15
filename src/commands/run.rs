@@ -13,7 +13,7 @@ use crate::services::context_ingest::{
     IngestOptions, code_threads_by_id_global, ingest_project_with_code,
 };
 use crate::services::context_render::{RenderedContext, render_single_session};
-use crate::services::environment_injector::{ClaudeModelOverrides, ClaudeSlotFlags};
+use crate::services::environment_injector::{ClaudeModelOverrides, ClaudeSlotFlags, TierUpstream};
 use crate::services::http_utils;
 use crate::services::huggingface;
 use crate::services::models_cache::ModelsCache;
@@ -69,16 +69,17 @@ impl RunCommand {
         .await
     }
 
-    /// Walks the per-slot Claude model flags. For each slot: leave unset,
-    /// take the explicit value as-is, or open a sequential picker (with a
-    /// `Step N of M — <slot>` header) for bare flags. ESC at any picker step
-    /// aborts the launch (parity with `-m`).
+    /// Resolves each per-slot Claude model flag, honoring a `<keyRef>::<model>`
+    /// per-tier provider (see `split_tier_spec`). Slots whose key differs from
+    /// the main `key` become `tier_upstreams`. `main_model` is the resolved `-m`
+    /// model, used to reject a tier that would shadow it.
     async fn resolve_claude_overrides(
         &self,
         client: &Client,
         key: &ApiKey,
         flags: ClaudeSlotFlags,
         refresh: bool,
+        main_model: Option<&str>,
     ) -> Result<Option<ClaudeModelOverrides>> {
         let slots = [
             ("reasoning model", flags.reasoning),
@@ -87,37 +88,121 @@ impl RunCommand {
             ("sonnet family model", flags.sonnet),
             ("opus family model", flags.opus),
         ];
-        let total_pickers = slots
-            .iter()
-            .filter(|(_, v)| matches!(v, Some(s) if s.is_empty()))
-            .count();
+
+        let aliases = self.session_store.get_aliases().await.unwrap_or_default();
+        let all_keys = self.session_store.get_keys().await.unwrap_or_default();
 
         let mut resolved: [Option<String>; 5] = [None, None, None, None, None];
-        let mut step = 0usize;
+        let mut tier_upstreams: Vec<TierUpstream> = Vec::new();
+        // (model, key_id) per slot, for the ambiguity check below.
+        let mut slot_routes: Vec<(String, String)> = Vec::new();
         for (idx, (label, value)) in slots.into_iter().enumerate() {
-            let prompt = if matches!(value, Some(ref s) if s.is_empty()) {
-                step += 1;
-                format!("Step {step} of {total_pickers} — {label}")
+            let Some(raw) = value else { continue };
+            let (key_ref, model_part) = crate::cli_args::split_tier_spec(&raw);
+
+            let tier_key: ApiKey = if let Some(kr) = key_ref {
+                match self.session_store.resolve_key_by_id_or_name(&kr).await {
+                    Ok(k) => k,
+                    Err(e) => anyhow::bail!("{label} key '{kr}': {e}"),
+                }
+            } else if model_part.is_empty() {
+                let annotations = vec![None; all_keys.len()];
+                let prompt = format!("Select provider for {label}");
+                match crate::commands::keys::prompt_pick_key_without_activation(
+                    &all_keys,
+                    &annotations,
+                    &prompt,
+                    0,
+                )? {
+                    Some(k) => k,
+                    None => return Ok(None),
+                }
+            } else {
+                key.clone()
+            };
+
+            // A Claude subscription tier hits the native backend, not the loopback.
+            if tier_key.is_claude_oauth() && tier_key.id != key.id {
+                anyhow::bail!(
+                    "per-tier routing can't use Claude subscription key '{}' for {label} — pick an API key",
+                    tier_key.display_name()
+                );
+            }
+
+            let model_empty = model_part.is_empty();
+            // Empty passes through unchanged → picker trigger.
+            let flag_model = crate::cli_args::resolve_alias_in_memory(&aliases, Some(model_part));
+            let prompt = if model_empty {
+                format!("Select {label} ({})", tier_key.display_name())
             } else {
                 String::new()
             };
             let outcome = self
                 .resolve_model(
                     client,
-                    key,
-                    value,
+                    &tier_key,
+                    flag_model,
                     true,
                     refresh,
                     AIToolType::Claude,
                     &prompt,
                 )
                 .await?;
-            match outcome {
+            let model = match outcome {
                 ModelOutcome::Cancelled => return Ok(None),
-                ModelOutcome::Model(m) => resolved[idx] = Some(m),
-                ModelOutcome::UseDefault => {}
+                ModelOutcome::UseDefault => continue,
+                ModelOutcome::Model(m) => m,
+            };
+            resolved[idx] = Some(model.clone());
+            slot_routes.push((model.clone(), tier_key.id.clone()));
+
+            if tier_key.id != key.id {
+                tier_upstreams.push(TierUpstream {
+                    model,
+                    key_id: tier_key.id.clone(),
+                });
             }
         }
+
+        if !tier_upstreams.is_empty() {
+            // A Claude subscription main launches natively — no loopback to route.
+            if key.is_claude_oauth() {
+                anyhow::bail!(
+                    "per-tier routing isn't supported with a Claude subscription main key — relaunch with an API key via -k"
+                );
+            }
+            // The `ollama` base-URL sentinel isn't resolvable by the router.
+            if crate::services::provider_profile::provider_profile_for_key(key).kind
+                == crate::services::provider_profile::ProviderKind::Ollama
+            {
+                anyhow::bail!(
+                    "per-tier routing isn't supported with an Ollama main key — use an API-key provider as the main (-k)"
+                );
+            }
+        }
+
+        // The router dispatches by suffix-stripped model name, so a name must
+        // resolve to one key; same name + same key dedupes and is fine.
+        let mut routed: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
+        if let Some(mm) = main_model {
+            routed.insert(
+                crate::services::model_names::strip_context_suffix(mm).to_string(),
+                key.id.clone(),
+            );
+        }
+        for (model, key_id) in &slot_routes {
+            let name = crate::services::model_names::strip_context_suffix(model).to_string();
+            if let Some(existing) = routed.get(&name)
+                && existing != key_id
+            {
+                anyhow::bail!(
+                    "per-tier routing needs a distinct model name per provider; '{name}' would route to two different keys"
+                );
+            }
+            routed.insert(name, key_id.clone());
+        }
+
         let [reasoning, subagent, haiku, sonnet, opus] = resolved;
         Ok(Some(ClaudeModelOverrides {
             reasoning,
@@ -126,6 +211,7 @@ impl RunCommand {
             sonnet,
             opus,
             max_context: None,
+            tier_upstreams,
         }))
     }
 
@@ -313,7 +399,13 @@ impl RunCommand {
                     .as_ref()
                     .expect("key_override is required (validated above)");
                 match self
-                    .resolve_claude_overrides(&client, key, slots, refresh)
+                    .resolve_claude_overrides(
+                        &client,
+                        key,
+                        slots,
+                        refresh,
+                        resolved_model.as_deref(),
+                    )
                     .await?
                 {
                     Some(o) => o,
@@ -503,7 +595,10 @@ impl RunCommand {
         };
 
         section("Model:");
-        print_opt("-m, --model <model>", "Specify AI model to use");
+        print_opt(
+            "-m, --model [key::]model",
+            "AI model; `key::model` also sets the provider inline",
+        );
         if is("claude") {
             print_opt(
                 "--reasoning-model <m>",
@@ -516,6 +611,12 @@ impl RunCommand {
             print_opt(
                 "--haiku|sonnet|opus-model",
                 &label("Claude only: what `/model <name>` resolves to (bare = picker)"),
+            );
+            print_opt(
+                "  <slot> <key>::<model>",
+                &label(
+                    "Claude only: route that tier to another provider/key (e.g. --haiku-model alt::glm-4.6)",
+                ),
             );
         }
 

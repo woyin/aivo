@@ -83,6 +83,18 @@ pub struct ClaudeModelOverrides {
     pub sonnet: Option<String>,
     pub opus: Option<String>,
     pub max_context: Option<String>,
+    /// Per-tier routing: binds slot model names to other saved keys. Non-empty
+    /// forces Routed mode and seeds the router's per-model upstream map.
+    pub tier_upstreams: Vec<TierUpstream>,
+}
+
+/// A slot model bound to a saved key id. Serialized to env; the launch runtime
+/// re-resolves the key from the store, so credentials never ride in env.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct TierUpstream {
+    pub model: String,
+    #[serde(rename = "keyId")]
+    pub key_id: String,
 }
 
 /// Internal aivo carrier: comma-separated names of env vars that
@@ -464,7 +476,14 @@ impl EnvironmentInjector {
         }
 
         let profile = provider_profile_for_key(key);
-        let mode = router_selection::claude_connection_mode(key, &profile);
+        // Per-tier routing needs the loopback router; Direct can't dispatch by model.
+        let mode = if overrides.tier_upstreams.is_empty() {
+            router_selection::claude_connection_mode(key, &profile)
+        } else {
+            ConnectionMode::Routed {
+                protocol: router_selection::routed_protocol_for_claude(key),
+            }
+        };
 
         let cfg = ToolEnvConfig {
             base_url_env: "ANTHROPIC_BASE_URL",
@@ -482,6 +501,19 @@ impl EnvironmentInjector {
             env.insert(
                 "AIVO_ANTHROPIC_TO_OPENAI_ROUTER_PATH_VARIANT".to_string(),
                 variant.to_string(),
+            );
+        }
+        // Seed for the multi-upstream router: model→keyId map + main key id.
+        if !overrides.tier_upstreams.is_empty()
+            && let Ok(json) = serde_json::to_string(&overrides.tier_upstreams)
+        {
+            env.insert(
+                "AIVO_ANTHROPIC_TO_OPENAI_ROUTER_TIERS_JSON".to_string(),
+                json,
+            );
+            env.insert(
+                "AIVO_ANTHROPIC_TO_OPENAI_ROUTER_MAIN_KEY_ID".to_string(),
+                key.id.clone(),
             );
         }
         env.insert("ANTHROPIC_API_KEY".to_string(), String::new());
@@ -523,8 +555,12 @@ impl EnvironmentInjector {
                 );
             }
         }
+        // Native-Anthropic upstreams need canonical ids (claude-sonnet-4.6 →
+        // -4-6) — in Direct mode and when tiers force Routed on an Anthropic key.
+        let base_is_native_anthropic =
+            crate::services::provider_protocol::is_anthropic_endpoint(&key.base_url);
         if let Some(model) = model {
-            let normalized = if matches!(mode, ConnectionMode::Direct { .. }) {
+            let normalized = if base_is_native_anthropic {
                 anthropic_native_model_name(model)
             } else {
                 model.to_string()
@@ -554,8 +590,14 @@ impl EnvironmentInjector {
         // normalized through the same anthropic_native_model_name() pass when
         // talking to a native Anthropic endpoint so e.g. `claude-sonnet-4.6`
         // becomes `claude-sonnet-4-6`.
+        // Tier slots go elsewhere — don't Anthropic-normalize their ids.
+        let tier_models: std::collections::HashSet<&str> = overrides
+            .tier_upstreams
+            .iter()
+            .map(|t| t.model.as_str())
+            .collect();
         let normalize = |v: &str| {
-            if matches!(mode, ConnectionMode::Direct { .. }) {
+            if base_is_native_anthropic && !tier_models.contains(v) {
                 anthropic_native_model_name(v)
             } else {
                 v.to_string()
@@ -1608,6 +1650,114 @@ mod tests {
             env.get("CLAUDE_CODE_SUBAGENT_MODEL"),
             Some(&"claude-haiku-4-5".to_string()),
         );
+    }
+
+    #[test]
+    fn for_claude_tier_upstreams_force_routed_and_emit_seed() {
+        let key = ApiKey::new_with_protocol(
+            "mainid".into(),
+            "main".into(),
+            "https://api.anthropic.com".into(),
+            None,
+            "sk-ant-main".into(),
+        );
+        let overrides = ClaudeModelOverrides {
+            haiku: Some("glm-4.6".into()),
+            tier_upstreams: vec![TierUpstream {
+                model: "glm-4.6".into(),
+                key_id: "tierid".into(),
+            }],
+            ..Default::default()
+        };
+        let env = EnvironmentInjector::new().for_claude_with_overrides(
+            &key,
+            Some("claude-opus-4-6"),
+            &overrides,
+        );
+
+        assert_eq!(
+            env.get("AIVO_USE_ANTHROPIC_TO_OPENAI_ROUTER"),
+            Some(&"1".to_string())
+        );
+        assert_eq!(
+            env.get("ANTHROPIC_BASE_URL"),
+            Some(&PLACEHOLDER_LOOPBACK_URL.to_string())
+        );
+        assert_eq!(
+            env.get("AIVO_ANTHROPIC_TO_OPENAI_ROUTER_MAIN_KEY_ID"),
+            Some(&"mainid".to_string())
+        );
+        let tiers = env
+            .get("AIVO_ANTHROPIC_TO_OPENAI_ROUTER_TIERS_JSON")
+            .expect("tiers json present");
+        assert!(tiers.contains("\"model\":\"glm-4.6\""));
+        assert!(tiers.contains("\"keyId\":\"tierid\""));
+        assert_eq!(
+            env.get("ANTHROPIC_DEFAULT_HAIKU_MODEL"),
+            Some(&"glm-4.6".to_string())
+        );
+    }
+
+    #[test]
+    fn for_claude_tier_normalizes_base_not_tier_on_native_anthropic() {
+        let key = ApiKey::new_with_protocol(
+            "mainid".into(),
+            "main".into(),
+            "https://api.anthropic.com".into(),
+            None,
+            "sk-ant".into(),
+        );
+        let overrides = ClaudeModelOverrides {
+            opus: Some("claude-opus-4.6".into()),
+            haiku: Some("glm-4.6".into()),
+            tier_upstreams: vec![TierUpstream {
+                model: "glm-4.6".into(),
+                key_id: "tierid".into(),
+            }],
+            ..Default::default()
+        };
+        let env = EnvironmentInjector::new().for_claude_with_overrides(
+            &key,
+            Some("claude-sonnet-4.6"),
+            &overrides,
+        );
+        assert_eq!(
+            env.get("ANTHROPIC_MODEL"),
+            Some(&"claude-sonnet-4-6".to_string()),
+            "base model normalizes under forced Routed"
+        );
+        assert_eq!(
+            env.get("ANTHROPIC_DEFAULT_OPUS_MODEL"),
+            Some(&"claude-opus-4-6".to_string()),
+            "base-key slot normalizes"
+        );
+        assert_eq!(
+            env.get("ANTHROPIC_DEFAULT_HAIKU_MODEL"),
+            Some(&"glm-4.6".to_string()),
+            "tier model stays verbatim"
+        );
+    }
+
+    #[test]
+    fn for_claude_no_tier_upstreams_stays_direct_on_native_anthropic() {
+        let _guard = crate::services::http_debug::DEBUG_TEST_MUTEX
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::services::http_debug::set_test_debug_active(false);
+        let key = ApiKey::new_with_protocol(
+            "mainid".into(),
+            "main".into(),
+            "https://api.anthropic.com".into(),
+            None,
+            "sk-ant-main".into(),
+        );
+        let env = EnvironmentInjector::new().for_claude_with_overrides(
+            &key,
+            Some("claude-opus-4-6"),
+            &ClaudeModelOverrides::default(),
+        );
+        assert_eq!(env.get("AIVO_USE_ANTHROPIC_TO_OPENAI_ROUTER"), None);
+        assert_eq!(env.get("AIVO_ANTHROPIC_TO_OPENAI_ROUTER_TIERS_JSON"), None);
     }
 
     #[test]

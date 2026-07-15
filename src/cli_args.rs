@@ -245,6 +245,19 @@ pub(crate) fn resolve_alias_in_memory(
     Some(current)
 }
 
+/// Splits a slot value into `(<keyRef>, model)` on the first `::`, so single
+/// `:` / `/` / `@` in model ids survive. Empty/absent key ref → `None`.
+pub(crate) fn split_tier_spec(value: &str) -> (Option<String>, String) {
+    match value.split_once("::") {
+        Some((key_ref, model)) => {
+            let key_ref = key_ref.trim();
+            let key_ref = (!key_ref.is_empty()).then(|| key_ref.to_string());
+            (key_ref, model.to_string())
+        }
+        None => (None, value.to_string()),
+    }
+}
+
 /// Result of extracting aivo-specific flags from clap's trailing passthrough args.
 pub(crate) struct ExtractedFlags {
     pub(crate) model: Option<String>,
@@ -573,6 +586,41 @@ mod tests {
 
     fn args(v: &[&str]) -> Vec<String> {
         v.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn split_tier_spec_forms() {
+        assert_eq!(split_tier_spec("gpt-4o"), (None, "gpt-4o".to_string()));
+        assert_eq!(
+            split_tier_spec("openrouter::glm-4.6"),
+            (Some("openrouter".to_string()), "glm-4.6".to_string())
+        );
+        assert_eq!(
+            split_tier_spec("openrouter::"),
+            (Some("openrouter".to_string()), String::new())
+        );
+        assert_eq!(split_tier_spec("::glm"), (None, "glm".to_string()));
+        assert_eq!(split_tier_spec(""), (None, String::new()));
+    }
+
+    #[test]
+    fn split_tier_spec_preserves_colons_slashes_ats_in_model() {
+        assert_eq!(
+            split_tier_spec("ollama::llama3:8b"),
+            (Some("ollama".to_string()), "llama3:8b".to_string())
+        );
+        assert_eq!(
+            split_tier_spec("cf::@cf/meta/llama-3.1-8b"),
+            (Some("cf".to_string()), "@cf/meta/llama-3.1-8b".to_string())
+        );
+        assert_eq!(
+            split_tier_spec("or::anthropic/claude-haiku"),
+            (Some("or".to_string()), "anthropic/claude-haiku".to_string())
+        );
+        assert_eq!(
+            split_tier_spec("llama3:8b"),
+            (None, "llama3:8b".to_string())
+        );
     }
 
     #[test]

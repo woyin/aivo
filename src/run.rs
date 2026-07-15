@@ -508,14 +508,19 @@ pub async fn run() -> ! {
             // read per call (worst case 7).
             let aliases = session_store.get_aliases().await.unwrap_or_default();
             let resolve = |m: Option<String>| resolve_alias_in_memory(&aliases, m);
-            let resolved_model = resolve(extracted.model);
-            let slots = ClaudeSlotFlags {
-                reasoning: resolve(extracted.slots.reasoning),
-                subagent: resolve(extracted.slots.subagent),
-                haiku: resolve(extracted.slots.haiku),
-                sonnet: resolve(extracted.slots.sonnet),
-                opus: resolve(extracted.slots.opus),
+            // `-m <keyRef>::<model>`: split before alias resolution (alias applies
+            // to the model half); the key ref feeds key selection below.
+            let (main_key_ref, main_model) = match extracted.model {
+                Some(v) => {
+                    let (key_ref, model) = crate::cli_args::split_tier_spec(&v);
+                    (key_ref, Some(model))
+                }
+                None => (None, None),
             };
+            let resolved_model = resolve(main_model);
+            // Raw: `resolve_claude_overrides` splits the `<key>::` prefix and
+            // alias-resolves the model half itself.
+            let slots = extracted.slots;
             // Normalize `-m foo[1m]`/`-m foo[2m]` (and any alias that expands
             // to one) into the same internal state as `-m foo --1m`/`--2m`.
             // Without this, mixing the two — `-m foo[1m] --1m` — would
@@ -557,7 +562,17 @@ pub async fn run() -> ! {
                 }
                 None => None,
             };
-            let key_flag = extracted.key_flag;
+            // `-k` wins; a conflicting `-m <key>::` is a user error, not a silent drop.
+            if let (Some(k), Some(kr)) = (extracted.key_flag.as_deref(), main_key_ref.as_deref())
+                && k != kr
+            {
+                eprintln!(
+                    "{} -k '{k}' conflicts with the provider in -m '{kr}::…' — set the default model's provider once.",
+                    style::red("Error:")
+                );
+                process::exit(ExitCode::UserError.code());
+            }
+            let key_flag = extracted.key_flag.or(main_key_ref);
             let dry_run = extracted.dry_run;
             let refresh = extracted.refresh;
             let relogin = extracted.relogin;

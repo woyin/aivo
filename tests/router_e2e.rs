@@ -1171,3 +1171,66 @@ async fn copilot_router_enforces_loopback_token() {
     assert_eq!(response_status(&resp), 401, "{resp}");
     handle.abort();
 }
+
+// ── per-tier provider/key routing (aivo claude tiers) ────────────────────
+
+/// A `/v1/messages` tier model reaches its own provider/key; other models stay
+/// on the base upstream.
+#[tokio::test]
+async fn serve_router_dispatches_per_model_to_tier_upstream() {
+    no_proxy();
+    let base = spawn_fake(&[(Endpoint::Chat, Mode::Ok)]);
+    let tier = spawn_fake(&[(Endpoint::Chat, Mode::Ok)]);
+
+    let tmp = tempfile::tempdir().unwrap();
+    let log_store = LogStore::new(tmp.path().to_path_buf());
+    std::mem::forget(tmp);
+
+    let router = ServeRouter::new(
+        serve_config(base.base_url(), ProviderProtocol::Openai),
+        test_key(&base.base_url()),
+        log_store,
+    )
+    .with_model_upstreams(vec![("model-tier".to_string(), test_key(&tier.base_url()))]);
+    let (_handle, _shutdown, port) = router
+        .start_background_with_addr("127.0.0.1", 0)
+        .await
+        .unwrap();
+
+    let body = |model: &str| {
+        format!(
+            r#"{{"model":"{model}","max_tokens":128,"messages":[{{"role":"user","content":"hi"}}]}}"#
+        )
+    };
+
+    let r = raw_post(port, "/v1/messages", &body("model-main")).await;
+    assert_eq!(response_status(&r), 200, "{r}");
+    assert_eq!(base.hit_count(Endpoint::Chat), 1, "base model hits base");
+    assert_eq!(
+        tier.hit_count(Endpoint::Chat),
+        0,
+        "base model must not hit tier"
+    );
+
+    let r = raw_post(port, "/v1/messages", &body("model-tier")).await;
+    assert_eq!(response_status(&r), 200, "{r}");
+    assert_eq!(tier.hit_count(Endpoint::Chat), 1, "tier model hits tier");
+    assert_eq!(
+        base.hit_count(Endpoint::Chat),
+        1,
+        "tier model must not add a base hit"
+    );
+
+    let r = raw_post(port, "/v1/messages", &body("model-tier[1m]")).await;
+    assert_eq!(response_status(&r), 200, "{r}");
+    assert_eq!(
+        tier.hit_count(Endpoint::Chat),
+        2,
+        "suffixed tier model hits tier"
+    );
+    assert_eq!(
+        base.hit_count(Endpoint::Chat),
+        1,
+        "suffixed tier model must not hit base"
+    );
+}
