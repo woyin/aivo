@@ -1022,6 +1022,10 @@ impl CodeCommand {
         print_opt("-m, --model <model>", "Model to use (saved for next time)");
         print_opt("-k, --key <id|name>", "API key by id/name (bare = picker)");
         print_opt(
+            "key::model",
+            "Shorthand for -k key -m model (as -m value or bare arg)",
+        );
+        print_opt(
             "-p, --prompt [prompt]",
             "One prompt, plain reply, exit (no tools)",
         );

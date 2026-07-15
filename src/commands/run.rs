@@ -616,6 +616,10 @@ impl RunCommand {
             "-m, --model [key::]model",
             "AI model; `key::model` also sets the provider inline",
         );
+        print_opt(
+            "key::model",
+            "Same, as a bare first arg (only if `key` names a saved key)",
+        );
         if is("claude") {
             print_opt(
                 "--haiku-model [key::]m",

@@ -85,6 +85,7 @@ pub(crate) fn rewrite_cli_args(
     // failed, a top-level non-flag arg is interpreted as input to `code`:
     //   `aivo hf:Qwen/...` / `aivo https://...`      → `aivo code <ref>`
     //     (code's positional REF; opens TUI with that model)
+    //   `aivo alt::gpt-4o` / `aivo alt::`            → `aivo code <ref>` (key::model)
     //   `aivo "tell me a story"` / `aivo 你好` / `aivo hi?` → `aivo code -p <text>`
     //     (one-shot prompt; trailing args pass through to code)
     // A bare `[a-z0-9-]` word is never a prompt: it falls through to clap's
@@ -98,7 +99,11 @@ pub(crate) fn rewrite_cli_args(
     if first.starts_with('-') || is_subcommand_shaped(first) {
         return raw_args;
     }
-    if first.starts_with("hf:") || first.starts_with("http://") || first.starts_with("https://") {
+    let is_model_spec = first.starts_with("hf:")
+        || first.starts_with("http://")
+        || first.starts_with("https://")
+        || looks_like_key_model_spec(first);
+    if is_model_spec {
         let mut rewritten = vec![raw_args[0].clone(), "code".to_string()];
         rewritten.extend_from_slice(&raw_args[1..]);
         return rewritten;
@@ -223,9 +228,10 @@ pub(crate) fn needs_bundle_lookup(raw_args: &[String]) -> bool {
     !RESERVED_ALIAS_NAMES.contains(&arg1.as_str())
 }
 
-/// Like `resolve_model_alias` but resolves against a pre-loaded alias map so
-/// callers with many lookups (the run command resolves up to 7 model fields)
-/// don't pay one disk read per call. Falls back to the input on any error.
+/// Resolves a model alias against a pre-loaded alias map (following alias
+/// chains to a fixed point) so callers with many lookups (the run command
+/// resolves up to 7 model fields) don't pay one disk read per call. Falls
+/// back to the input on any error.
 pub(crate) fn resolve_alias_in_memory(
     aliases: &HashMap<String, String>,
     model: Option<String>,
@@ -243,6 +249,11 @@ pub(crate) fn resolve_alias_in_memory(
         current = target.clone();
     }
     Some(current)
+}
+
+/// True when `s` is `<key>::<model>`-shaped: contains `::`, no whitespace.
+pub(crate) fn looks_like_key_model_spec(s: &str) -> bool {
+    s.contains("::") && !s.contains(char::is_whitespace)
 }
 
 /// Splits a slot value into `(<keyRef>, model)` on the first `::`, so single
@@ -603,6 +614,17 @@ mod tests {
 
     fn args(v: &[&str]) -> Vec<String> {
         v.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn looks_like_key_model_spec_shape() {
+        assert!(looks_like_key_model_spec("alt::gpt-4o"));
+        assert!(looks_like_key_model_spec("aivo::"));
+        assert!(looks_like_key_model_spec("ollama::llama3:8b"));
+        assert!(!looks_like_key_model_spec("gpt-4o"));
+        assert!(!looks_like_key_model_spec("hf:Qwen/Qwen2.5"));
+        assert!(!looks_like_key_model_spec("openrouter/glm-4.6"));
+        assert!(!looks_like_key_model_spec("a::b is a thing")); // whitespace → prompt
     }
 
     #[test]
@@ -1499,6 +1521,23 @@ mod tests {
         assert_eq!(
             rewrite_cli_args(args(&["aivo", "http://example.com/m"]), &no_bundles()),
             args(&["aivo", "code", "http://example.com/m"])
+        );
+    }
+
+    #[test]
+    fn rewrite_treats_key_model_spec_as_code_positional() {
+        assert_eq!(
+            rewrite_cli_args(args(&["aivo", "alt::gpt-4o"]), &no_bundles()),
+            args(&["aivo", "code", "alt::gpt-4o"])
+        );
+        assert_eq!(
+            rewrite_cli_args(args(&["aivo", "alt::"]), &no_bundles()),
+            args(&["aivo", "code", "alt::"])
+        );
+        // A `::`-containing phrase with whitespace is still a prompt.
+        assert_eq!(
+            rewrite_cli_args(args(&["aivo", "a::b is a thing"]), &no_bundles()),
+            args(&["aivo", "code", "-p", "a::b is a thing"])
         );
     }
 

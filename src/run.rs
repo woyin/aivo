@@ -90,6 +90,10 @@ fn take_code_initial_prompt(args: &mut CodeArgs) -> Result<Option<String>, CodeP
     if is_hf_takeover(Some(raw.as_str())) {
         return Ok(None);
     }
+    // A `<key>::<model>` spec is a model ref, not prompt text (coexists with -p).
+    if raw.contains("::") {
+        return Ok(None);
+    }
     if raw == "-" {
         args.prompt.get_or_insert(String::new());
         args.reference = None;
@@ -405,24 +409,41 @@ pub async fn run() -> ! {
                 .clone()
                 .or_else(|| code_args.reference.clone());
             let have_model_input = model_input.is_some();
-            // Expand alias before the HF check so `-m <alias-to-hf-ref>`
-            // takes the HF path. `run`'s flow does the same.
-            let expanded_model = resolve_model_alias(&session_store, model_input).await;
+            // Split `[key::]model`; the model half is alias-expanded (may itself
+            // carry `key::`). Empty half (`aivo::`) is key-only → picker.
+            let (model_key_ref, model_half) = match model_input {
+                Some(v) => {
+                    let aliases = session_store.get_aliases().await.unwrap_or_default();
+                    let (key_ref, model) = crate::cli_args::split_tier_spec(&v);
+                    crate::cli_args::resolve_alias_with_tier(&aliases, key_ref, model)
+                }
+                None => (None, String::new()),
+            };
+            if let (Some(k), Some(kr)) = (code_args.key.as_deref(), model_key_ref.as_deref())
+                && k != kr
+            {
+                eprintln!(
+                    "{} -k '{k}' conflicts with the provider in '{kr}::…' — pass just one.",
+                    style::red("Error:")
+                );
+                process::exit(ExitCode::UserError.code());
+            }
+            let effective_key = code_args.key.clone().or(model_key_ref);
+            let expanded_model = have_model_input.then_some(model_half);
             let key_override = if is_hf_takeover(expanded_model.as_deref()) {
                 None
             } else {
                 key_or_exit(
                     resolve_key_override(
                         &session_store,
-                        code_args.key.as_deref(),
+                        effective_key.as_deref(),
                         KeyLookupMode::RequireActiveOrPrompt,
                         KeyCompatContext::Chat,
                     )
                     .await,
                 )
             };
-            // When -k is used without -m, force the model picker (same as
-            // run/start). A resolved -m / positional takes the concrete path.
+            // -k (or a `key::` prefix) without a model forces the picker.
             let model = if have_model_input {
                 expanded_model
             } else if key_explicit {
@@ -471,7 +492,7 @@ pub async fn run() -> ! {
             // Re-extract aivo flags from passthrough args that clap's trailing_var_arg
             // may have swallowed (e.g. `aivo run claude --agent-name foo --model opus`
             // puts --model into args instead of parsing it as an aivo flag).
-            let extracted = extract_aivo_flags(
+            let mut extracted = extract_aivo_flags(
                 run_args.model,
                 ClaudeSlotFlags {
                     fable: run_args.fable_model,
@@ -503,6 +524,41 @@ pub async fn run() -> ! {
             // After extract_aivo_flags so `--debug` after the tool name
             // (recovered from passthrough) activates the logger too.
             maybe_init_http_debug(&extracted.debug).await;
+            // A bare leading `<key>::<model>` acts like `-m` — but only if `key`
+            // names a stored key, else it's left as passthrough for the tool.
+            if extracted.model.is_none()
+                && extracted
+                    .remaining_args
+                    .first()
+                    .is_some_and(|a| crate::cli_args::looks_like_key_model_spec(a))
+            {
+                let (key_ref, _) = crate::cli_args::split_tier_spec(&extracted.remaining_args[0]);
+                let key_is_real = match &key_ref {
+                    Some(kr) => session_store
+                        .find_keys_by_id_or_name_info(kr)
+                        .await
+                        .map(|m| !m.is_empty())
+                        .unwrap_or(false),
+                    None => false,
+                };
+                if key_is_real {
+                    extracted.model = Some(extracted.remaining_args.remove(0));
+                } else if let Some(kr) = key_ref {
+                    // Passed through, but flag it — a silent forward reads as "it worked".
+                    let tool = run_args.tool.as_deref().unwrap_or("the tool");
+                    eprintln!(
+                        "{} '{kr}' isn't a known key — forwarding {:?} to {tool} as a plain argument.",
+                        style::yellow("Note:"),
+                        extracted.remaining_args[0],
+                    );
+                    eprintln!(
+                        "  {}",
+                        style::dim(
+                            "For a <key>::<model> spec use a real key; run `aivo keys` to list them."
+                        )
+                    );
+                }
+            }
             // Resolve aliases for main + 6 slot models against a single
             // in-memory snapshot of the alias map, instead of paying one disk
             // read per call (worst case 7).
@@ -1095,14 +1151,20 @@ fn print_help() {
         ("share", "logs share", "aivo logs share --help"),
         ("hf:/url", "code <ref>", "open code with a local HF model"),
         (
+            "key::model",
+            "-k key -m model",
+            "pick key + model in one token",
+        ),
+        (
             "<tool>",
             "run <tool>",
             "claude/codex/gemini/opencode/pi/grok",
         ),
     ];
+    let alias_width = shortcuts.iter().map(|(a, _, _)| a.len()).max().unwrap_or(0);
     let expansion_width = shortcuts.iter().map(|(_, e, _)| e.len()).max().unwrap_or(0);
     for (alias, expansion, hint) in shortcuts {
-        let alias_col = style::cyan(format!("{alias:<8}"));
+        let alias_col = style::cyan(format!("{alias:<alias_width$}"));
         let hint_col = style::dim(format!("({hint})"));
         println!("  {alias_col}  {expansion:<expansion_width$}  {hint_col}");
     }
@@ -1325,21 +1387,6 @@ fn print_version() {
     );
 }
 
-/// Resolves a model alias if the model is a non-empty Some value.
-/// Returns the original value unchanged if resolution fails or if it's None/empty (picker).
-async fn resolve_model_alias(
-    session_store: &SessionStore,
-    model: Option<String>,
-) -> Option<String> {
-    match model {
-        Some(ref m) if !m.is_empty() => match session_store.resolve_alias(m).await {
-            Ok(resolved) => Some(resolved),
-            Err(_) => model,
-        },
-        other => other,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1382,6 +1429,22 @@ mod tests {
             Some("hf:Qwen/Qwen2.5-0.5B-Instruct-GGUF")
         );
         assert_eq!(a.prompt, None);
+    }
+
+    #[test]
+    fn key_model_positional_stays_a_model_ref_even_with_prompt() {
+        // The spec lifts into the model slot, so it coexists with -p.
+        let mut a = code_args(&["aivo", "chat", "alt::gpt-4o", "-p", "hello"]);
+        assert_eq!(take_code_initial_prompt(&mut a), Ok(None));
+        assert_eq!(a.reference.as_deref(), Some("alt::gpt-4o"));
+        assert_eq!(a.prompt.as_deref(), Some("hello"));
+    }
+
+    #[test]
+    fn key_only_positional_stays_a_model_ref() {
+        let mut a = code_args(&["aivo", "chat", "alt::"]);
+        assert_eq!(take_code_initial_prompt(&mut a), Ok(None));
+        assert_eq!(a.reference.as_deref(), Some("alt::"));
     }
 
     #[test]
