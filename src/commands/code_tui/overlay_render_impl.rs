@@ -647,6 +647,83 @@ impl CodeTuiApp {
         render_detail_lines(frame, inner, lines, scroll, "Esc close")
     }
 
+    /// `/session` detail: the full id (the footer only had room for a handle), the
+    /// session's provenance (native, or forked from another agent), and the
+    /// key/model/dir plus the resume command.
+    pub(super) fn render_session_overlay(
+        &self,
+        frame: &mut Frame<'_>,
+        area: Rect,
+        scroll: u16,
+    ) -> u16 {
+        clear_to_canvas(frame, area);
+        let shell = Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(FAINT()))
+            .title(Span::styled(
+                "Session",
+                Style::default().fg(ACCENT()).add_modifier(Modifier::BOLD),
+            ));
+        frame.render_widget(shell, area);
+
+        let inner = area.inner(ratatui::layout::Margin {
+            vertical: 1,
+            horizontal: 2,
+        });
+        let width = usize::from(inner.width).max(1);
+
+        // Provenance: a fork names its source agent; a native session says so.
+        let source = match crate::services::session_import::import_source_label(&self.session_id) {
+            Some(label) => format!("{label} (forked)"),
+            None => "aivo (native)".to_string(),
+        };
+        let host = footer_host_label(&self.key.base_url);
+        let key_label = if self.key.name.trim().is_empty() {
+            host
+        } else {
+            format!("{} · {host}", self.key.name.trim())
+        };
+
+        let mut rows: Vec<(&str, String)> = vec![
+            ("Source", source),
+            ("Model", self.raw_model.clone()),
+            ("Key", key_label),
+            ("Directory", self.display_cwd().to_string()),
+            ("Messages", self.history.len().to_string()),
+        ];
+        if let Some(branch) = self.git_branch.as_deref().filter(|b| !b.is_empty()) {
+            rows.push(("Branch", branch.to_string()));
+        }
+        let label_w = rows.iter().map(|(l, _)| l.len()).max().unwrap_or(9);
+
+        let mut lines: Vec<Line> = Vec::new();
+        lines.push(Line::from(Span::styled(
+            self.session_id.clone(),
+            Style::default().fg(TEXT()).add_modifier(Modifier::BOLD),
+        )));
+        lines.push(Line::from(""));
+        for (label, value) in &rows {
+            lines.push(Line::from(vec![
+                Span::styled(format!("{label:<label_w$}  "), Style::default().fg(MUTED())),
+                Span::styled(value.clone(), Style::default().fg(TEXT())),
+            ]));
+        }
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "Resume",
+            Style::default().fg(MUTED()),
+        )));
+        for wrapped in wrap_chars(&format!("aivo code --resume {}", self.session_id), width) {
+            lines.push(Line::from(Span::styled(
+                wrapped,
+                Style::default().fg(ACCENT()),
+            )));
+        }
+
+        render_detail_lines(frame, inner, lines, scroll, "Esc close")
+    }
+
     /// `/skills` overlay: a checkbox toggle list of the discovered skills. Split
     /// shows the highlighted skill's full text in the right pane; narrow keeps
     /// the Tab drill-in. Chrome shared with `/mcp`.
@@ -2439,7 +2516,8 @@ const HELP_COMMAND_GROUPS: &[(&str, &[&str])] = &[
     (
         "Session",
         &[
-            "new", "resume", "rewind", "copy", "config", "effort", "share", "help", "exit",
+            "new", "resume", "session", "rewind", "copy", "config", "effort", "share", "help",
+            "exit",
         ],
     ),
     ("Model & key", &["model", "key"]),

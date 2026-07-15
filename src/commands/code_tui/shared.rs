@@ -537,6 +537,12 @@ pub(super) const SLASH_COMMANDS: &[SlashCommandSpec] = &[
         takes_argument: false,
     },
     SlashCommandSpec {
+        name: "session",
+        help_label: "/session",
+        description: "show this session's id, source, and resume command",
+        takes_argument: false,
+    },
+    SlashCommandSpec {
         name: "memory",
         help_label: "/memory",
         description: "show this project's persistent memory (facts saved via `remember`)",
@@ -673,6 +679,10 @@ pub(super) struct SessionPreview {
     pub(super) updated_at: String,
     pub(super) title: String,
     pub(super) preview_text: String,
+    /// `Some` for a foreign coding-agent session (Claude Code / Codex) that
+    /// imports on select; `None` for a native aivo session. When set,
+    /// `session_id` is the deterministic id it imports to.
+    pub(super) origin: Option<crate::services::session_import::SessionOrigin>,
 }
 
 pub(super) fn to_chat_messages(
@@ -704,7 +714,46 @@ impl SessionPreview {
             updated_at: entry.updated_at,
             title: entry.title,
             preview_text: entry.preview,
+            origin: None,
         }
+    }
+
+    /// A picker row for a foreign session (Claude Code / Codex) not yet imported.
+    /// `key_name` doubles as the source badge; `session_id` is the id it will
+    /// import to, so it dedupes against an already-imported native row.
+    pub(super) fn from_importable(imp: crate::services::session_import::ImportableSession) -> Self {
+        let label = crate::services::session_import::source_label(&imp.origin.cli);
+        Self {
+            key_id: String::new(),
+            key_name: label.to_string(),
+            base_url: String::new(),
+            session_id: imp.aivo_id,
+            raw_model: String::new(),
+            updated_at: imp.updated_at.to_rfc3339(),
+            preview_text: imp.title.clone(),
+            title: imp.title,
+            origin: Some(imp.origin),
+        }
+    }
+
+    /// An imported foreign session that's been continued in aivo — a fork of the
+    /// (never-modified) original. Because a foreign session persists only after a
+    /// real turn (see `pristine_import_len`), any persisted row with a source-tool
+    /// id is a genuine fork. A not-yet-opened foreign row (`origin` set) isn't one.
+    pub(super) fn is_fork(&self) -> bool {
+        self.origin.is_none()
+            && crate::services::session_import::import_source_label(&self.session_id).is_some()
+    }
+
+    /// Source tag shown as the picker-row prefix: `aivo` for a native session,
+    /// `Claude`/`Codex` for an importable foreign one. A foreign session keeps
+    /// its tag after import via its deterministic `import-<cli>-…` id, so
+    /// continuing it in aivo never silently relabels it `[aivo]`.
+    pub(super) fn source_tag(&self) -> &'static str {
+        if let Some(origin) = &self.origin {
+            return crate::services::session_import::source_label(&origin.cli);
+        }
+        crate::services::session_import::import_source_label(&self.session_id).unwrap_or("aivo")
     }
 
     pub(super) fn search_text(&self) -> String {
@@ -730,6 +779,10 @@ pub(super) struct LoadedSession {
     /// tool_calls + results), restored verbatim into the engine on resume for
     /// exact tool history. `None` for non-agent or pre-feature sessions.
     pub(super) engine_messages: Option<Vec<serde_json::Value>>,
+    /// True for a foreign session resumed IN MEMORY (not yet persisted): merely
+    /// viewing a Claude/Codex session shouldn't create an aivo copy. It persists
+    /// (as a fork) only when a real turn grows the transcript past this baseline.
+    pub(super) pristine_import: bool,
 }
 
 impl LoadedSession {
@@ -740,6 +793,7 @@ impl LoadedSession {
             raw_model: state.model,
             messages: to_chat_messages(state.messages),
             engine_messages: state.engine_messages,
+            pristine_import: false,
         }
     }
 }
@@ -1400,6 +1454,11 @@ pub(super) enum Overlay {
     /// `/context` — the context-window breakdown, over the injected `-c` text.
     Context {
         report: Box<crate::agent::engine::ContextReport>,
+        scroll: u16,
+    },
+    /// `/session` (or clicking the footer id) — this session's id, provenance,
+    /// model, key, and resume command. `scroll` for tiny terminals.
+    Session {
         scroll: u16,
     },
     Picker(Box<PickerState>),
@@ -2067,6 +2126,8 @@ pub(super) enum SlashCommand {
     },
     /// `/context` — read-only viewer of the injected `-c` block.
     Context,
+    /// `/session` — this session's id, provenance, model, key, and resume command.
+    Session,
     /// Share this chat: bare/`start` opens a viewer URL (re-shown if already
     /// live); `stop` ends it.
     Share(Option<String>),
@@ -2588,6 +2649,10 @@ pub(super) struct CodeTuiApp {
     /// Click region of the "jump to bottom" pill from the last render; `None` when
     /// it isn't shown (transcript pinned to the bottom, or no overflow).
     pub(super) jump_to_bottom_hit: Option<Rect>,
+    /// Click region of the footer session id from the last render; clicking it
+    /// opens the session-detail overlay. `None` when the id isn't shown (narrow
+    /// terminal or empty id).
+    pub(super) session_id_hit: Option<Rect>,
     /// The composer text region from the last render, for mouse cursor-placement
     /// and the key-handler's wrap math (it needs the width before the next frame).
     /// `None` until the first render.
@@ -2674,6 +2739,12 @@ pub(super) struct CodeTuiApp {
     /// tool_calls + results), awaiting the next engine build to be restored
     /// verbatim (exact tool history). Consumed (`take`) on build; `None` otherwise.
     pub(super) pending_agent_messages: Option<Vec<serde_json::Value>>,
+    /// `Some(baseline)` when the current session is a foreign import resumed in
+    /// memory but not yet persisted — the history length at resume. Persistence
+    /// is skipped while `history.len() <= baseline` so merely viewing a
+    /// Claude/Codex session creates no aivo copy; the first real turn grows it
+    /// past the baseline and it persists as a fork. `None` for every other session.
+    pub(super) pristine_import_len: Option<usize>,
     /// Active `/goal` autonomous loop, or `None`. Drives auto-continuation between
     /// agent turns; cleared on completion, the iteration cap, `/goal stop`, an
     /// interrupt, `/new`, resume, or a key/model switch.
@@ -2877,7 +2948,4 @@ pub(super) struct CodeTuiApp {
     pub(super) account_login: Option<AccountLoginCard>,
     /// `/logout` awaiting its y/n confirm; the account display name.
     pub(super) pending_logout: Option<String>,
-    /// A `/key` provider switch (resets the chat) awaiting its y/n confirm; the
-    /// decrypted target key. Same-provider swaps skip this and apply directly.
-    pub(super) pending_key_switch: Option<ApiKey>,
 }

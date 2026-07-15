@@ -399,13 +399,18 @@ pub(super) fn session_picker_item_lines(
         format_session_time(&preview.updated_at)
     };
     let time_width = display_width(&time);
+    // Every row is prefixed with its source tag ([aivo] / [Claude] / [Codex]);
+    // a fork (an imported session continued in aivo) gets a ↳ marker.
+    let fork = if preview.is_fork() { " ↳" } else { "" };
+    let tag = format!("[{}{}] ", preview.source_tag(), fork);
+    let tag_width = display_width(&tag);
     let preview_width = content_width
-        .saturating_sub(time_width.saturating_add(2))
+        .saturating_sub(time_width.saturating_add(2).saturating_add(tag_width))
         .max(1);
     let summary = truncate_for_display_width(&preview.preview_text, preview_width);
     let summary_width = display_width(&summary);
     let gap_width = content_width
-        .saturating_sub(summary_width + time_width)
+        .saturating_sub(tag_width + summary_width + time_width)
         .max(1);
 
     let (active_bg, active_text, active_time) = if armed_delete {
@@ -435,6 +440,13 @@ pub(super) fn session_picker_item_lines(
     } else {
         Style::default()
     };
+    // The tag sits between the summary and the time on selection contrast;
+    // muted when idle so it reads as a label, not content.
+    let tag_style = if selected {
+        Style::default().fg(active_time).bg(active_bg)
+    } else {
+        Style::default().fg(MUTED())
+    };
 
     vec![Line::from(vec![
         Span::styled(
@@ -451,6 +463,7 @@ pub(super) fn session_picker_item_lines(
                 fill_style
             },
         ),
+        Span::styled(tag, tag_style),
         Span::styled(summary, line_style),
         Span::styled(" ".repeat(gap_width), fill_style),
         Span::styled(time, time_style),

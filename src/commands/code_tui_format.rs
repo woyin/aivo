@@ -156,6 +156,17 @@ pub(super) fn build_footer_text(
         .unwrap_or_else(|| truncate_for_width(model, width))
 }
 
+/// The footer's session-id handle (the full id lives in the `/session` overlay):
+/// a fork keeps its source tag over an 8-char grip (`pi·019f15e1`), a native id
+/// shows its `#`-prefixed prefix. Clicking it opens the overlay.
+pub(super) fn footer_session_label(session_id: &str) -> String {
+    if let Some((cli, id)) = crate::services::session_import::split_fork_id(session_id) {
+        let short: String = id.chars().take(8).collect();
+        return format!("{cli}·{short}");
+    }
+    format!("#{}", session_id.chars().take(8).collect::<String>())
+}
+
 pub(super) fn footer_host_label(base_url: &str) -> String {
     if base_url == "copilot" {
         return "copilot".to_string();
@@ -349,9 +360,10 @@ pub(super) fn truncate_for_width(text: &str, width: u16) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_footer_text, display_width, format_request_elapsed, format_session_match_count,
-        format_time_ago_short, format_token_count, format_token_count_value, format_usd,
-        git_branch_for, truncate_for_display_width, truncate_for_width,
+        build_footer_text, display_width, footer_session_label, format_request_elapsed,
+        format_session_match_count, format_time_ago_short, format_token_count,
+        format_token_count_value, format_usd, git_branch_for, truncate_for_display_width,
+        truncate_for_width,
     };
     use crate::commands::code::TokenUsage;
     use chrono::{Duration as ChronoDuration, Utc};
@@ -371,6 +383,24 @@ mod tests {
     fn test_truncate_for_width() {
         assert_eq!(truncate_for_width("hello", 10), "hello");
         assert_eq!(truncate_for_width("hello world", 6), "hello…");
+    }
+
+    #[test]
+    fn footer_session_label_forms() {
+        // A native id shows its short `#` handle.
+        assert_eq!(
+            footer_session_label("abcdef12-3456-7890-abcd-ef1234567890"),
+            "#abcdef12"
+        );
+        // A fork keeps its source tag over an 8-char handle (new `<cli>-<8 hex>` ids).
+        assert_eq!(footer_session_label("claude-a1b2c3d4"), "claude·a1b2c3d4");
+        assert_eq!(footer_session_label("codex-deadbeef"), "codex·deadbeef");
+        assert_eq!(footer_session_label("pi-019f15e1"), "pi·019f15e1");
+        // Legacy `import-` forks (full UUID) clamp the same, not trailed in full.
+        assert_eq!(
+            footer_session_label("import-pi-019f15e1-a4bd-70e4-abcc-7fd70a5c4ca9"),
+            "pi·019f15e1"
+        );
     }
 
     #[test]

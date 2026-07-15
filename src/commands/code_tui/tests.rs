@@ -1435,6 +1435,7 @@ fn make_test_app(
         last_max_scroll: None,
         transcript_hitbox: None,
         jump_to_bottom_hit: None,
+        session_id_hit: None,
         composer_text_area: None,
         composer_scroll: 0,
         transcript_cache: None,
@@ -1474,6 +1475,7 @@ fn make_test_app(
         cursor_prewarm: None,
         cursor_plan_mode: false,
         pending_agent_messages: None,
+        pristine_import_len: None,
         goal_mode: None,
         goal_guard_stop: None,
         plan_mode: false,
@@ -1536,7 +1538,6 @@ fn make_test_app(
         account_task: None,
         account_login: None,
         pending_logout: None,
-        pending_key_switch: None,
     }
 }
 
@@ -2696,7 +2697,7 @@ fn test_footer_shows_plain_chat_badge_when_agent_tools_off() {
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
 
-    fn footer_text(app: &CodeTuiApp) -> String {
+    fn footer_text(app: &mut CodeTuiApp) -> String {
         let mut terminal = Terminal::new(TestBackend::new(80, 1)).unwrap();
         terminal
             .draw(|frame| app.render_footer(frame, frame.area()))
@@ -2712,11 +2713,11 @@ fn test_footer_shows_plain_chat_badge_when_agent_tools_off() {
 
     // On (default): no badge.
     app.agent_tools_enabled = true;
-    assert!(!footer_text(&app).contains("plain chat"));
+    assert!(!footer_text(&mut app).contains("plain chat"));
 
     // Off: the badge marks plain-chat mode in the footer.
     app.agent_tools_enabled = false;
-    assert!(footer_text(&app).contains("plain chat"));
+    assert!(footer_text(&mut app).contains("plain chat"));
 }
 
 #[test]
@@ -2787,7 +2788,7 @@ fn test_footer_shows_short_session_id_only_on_wide_terminals() {
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
 
-    fn footer_text(app: &CodeTuiApp, width: u16) -> String {
+    fn footer_text(app: &mut CodeTuiApp, width: u16) -> String {
         let mut terminal = Terminal::new(TestBackend::new(width, 1)).unwrap();
         terminal
             .draw(|frame| app.render_footer(frame, frame.area()))
@@ -2802,8 +2803,8 @@ fn test_footer_shows_short_session_id_only_on_wide_terminals() {
     let mut app = make_test_app(tx, rx);
     app.session_id = "abcdef12-3456-7890-abcd-ef1234567890".to_string();
 
-    assert!(footer_text(&app, 100).contains("#abcdef12"));
-    assert!(!footer_text(&app, 80).contains("#abcdef12"));
+    assert!(footer_text(&mut app, 100).contains("#abcdef12"));
+    assert!(!footer_text(&mut app, 80).contains("#abcdef12"));
 }
 
 #[test]
@@ -2820,6 +2821,127 @@ fn test_welcome_status_lines_include_static_essentials_hint() {
             .iter()
             .any(|l| l.contains("/help commands") && l.contains("Esc interrupts")),
         "essentials hint missing from welcome: {plain:?}"
+    );
+}
+
+#[test]
+fn test_fork_shows_provenance_line_in_welcome() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+
+    // Native session: no provenance line.
+    app.session_id = "abcdef12-3456-7890-abcd-ef1234567890".to_string();
+    let native: Vec<String> = app
+        .welcome_status_lines()
+        .into_iter()
+        .map(|sl| sl.plain)
+        .collect();
+    assert!(
+        !native.iter().any(|l| l.contains("Forked from")),
+        "native session should have no provenance line: {native:?}"
+    );
+
+    // A fork (imported Claude session) names its source.
+    app.session_id = "import-claude-a1b2c3d4".to_string();
+    let fork: Vec<String> = app
+        .welcome_status_lines()
+        .into_iter()
+        .map(|sl| sl.plain)
+        .collect();
+    assert!(
+        fork.iter()
+            .any(|l| l.contains("Forked from a Claude session")),
+        "fork provenance line missing: {fork:?}"
+    );
+}
+
+#[test]
+fn test_footer_fork_id_is_labeled_and_clickable() {
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.session_id = "import-claude-a1b2c3d4".to_string();
+
+    let mut terminal = Terminal::new(TestBackend::new(100, 1)).unwrap();
+    terminal
+        .draw(|frame| app.render_footer(frame, frame.area()))
+        .unwrap();
+    let buf = terminal.backend().buffer();
+    let row: String = (0..buf.area.width)
+        .map(|x| buf.cell((x, 0)).unwrap().symbol().to_string())
+        .collect();
+    // The fork's source stays in view; the `import-` noise is gone.
+    assert!(row.contains("claude·a1b2c3d4"), "footer row: {row:?}");
+    assert!(!row.contains("import-"), "footer row: {row:?}");
+    // The id is recorded as a click target for the detail overlay.
+    let hit = app.session_id_hit.expect("session id click rect recorded");
+    // The label the click rect covers actually holds the id (not the meter).
+    let covered: String = (hit.x..hit.x + hit.width)
+        .map(|x| buf.cell((x, hit.y)).unwrap().symbol().to_string())
+        .collect();
+    assert_eq!(covered, "claude·a1b2c3d4", "click rect misaligned: {row:?}");
+}
+
+#[tokio::test]
+async fn test_clicking_footer_session_id_opens_overlay() {
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.session_id = "import-claude-a1b2c3d4".to_string();
+
+    // Render the footer so the id's click rect is recorded.
+    let mut terminal = Terminal::new(TestBackend::new(100, 1)).unwrap();
+    terminal
+        .draw(|frame| app.render_footer(frame, frame.area()))
+        .unwrap();
+    let hit = app.session_id_hit.expect("session id click rect recorded");
+
+    // A click inside that rect opens the detail overlay.
+    app.handle_mouse(MouseEvent {
+        kind: MouseEventKind::Down(MouseButton::Left),
+        column: hit.x,
+        row: hit.y,
+        modifiers: KeyModifiers::NONE,
+    })
+    .await
+    .unwrap();
+    assert!(matches!(app.overlay, Overlay::Session { .. }));
+}
+
+#[test]
+fn test_session_overlay_shows_full_id_and_provenance() {
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.session_id = "import-claude-a1b2c3d4".to_string();
+    app.open_session_overlay();
+    assert!(matches!(app.overlay, Overlay::Session { .. }));
+
+    // Tall + wide enough that the whole (short) detail box shows without scrolling
+    // and the resume command doesn't wrap.
+    let mut terminal = Terminal::new(TestBackend::new(100, 40)).unwrap();
+    terminal.draw(|frame| app.render(frame)).unwrap();
+    let buf = terminal.backend().buffer().clone();
+    let mut text = String::new();
+    for y in 0..buf.area.height {
+        for x in 0..buf.area.width {
+            text.push_str(buf[(x, y)].symbol());
+        }
+        text.push('\n');
+    }
+    // Full id (the footer only had room for a handle), plus the fork provenance
+    // and the resume command.
+    assert!(text.contains("import-claude-a1b2c3d4"), "overlay:\n{text}");
+    assert!(text.contains("Claude (forked)"), "overlay:\n{text}");
+    assert!(
+        text.contains("aivo code --resume import-claude-a1b2c3d4"),
+        "overlay:\n{text}"
     );
 }
 
@@ -3897,6 +4019,7 @@ fn test_session_picker_item_line_fits_mixed_width_preview() {
         title: "hi".to_string(),
         preview_text: "hi · Hi there! ✨ 想聊点什么？还是需要我帮忙呢？ 我随时待命～ 😊🌟"
             .to_string(),
+        origin: None,
     };
 
     let line = session_picker_item_lines(&preview, true, false, 64)
@@ -4018,6 +4141,127 @@ fn test_picker_navigation_wraps() {
 }
 
 #[test]
+fn foreign_import_preview_renders_source_badge_no_model() {
+    use crate::services::session_import::{ImportableSession, SessionOrigin};
+    let imp = ImportableSession {
+        origin: SessionOrigin {
+            cli: "claude".to_string(),
+            foreign_id: "abc-123".to_string(),
+            source_path: "/x/abc-123.jsonl".to_string(),
+        },
+        title: "fix the login bug".to_string(),
+        updated_at: Utc::now(),
+        aivo_id: "import-claude-abc-123".to_string(),
+    };
+    let preview = SessionPreview::from_importable(imp);
+    assert_eq!(preview.session_id, "import-claude-abc-123");
+    assert!(preview.origin.is_some());
+
+    // The row is prefixed with the source tag; the topic follows.
+    let render = |p: &SessionPreview| -> String {
+        session_picker_item_lines(p, false, false, 80)
+            .iter()
+            .flat_map(|l| l.spans.iter())
+            .map(|s| s.content.as_ref().to_string())
+            .collect()
+    };
+    // A not-yet-opened foreign row is [Claude], not a fork.
+    let text = render(&preview);
+    assert!(!preview.is_fork());
+    assert!(text.contains("[Claude]"), "row: {text:?}");
+    assert!(!text.contains('↳'), "row: {text:?}");
+    assert!(text.contains("fix the login bug"), "row: {text:?}");
+
+    // A keyless foreign row omits the model metadata segment.
+    let (_, key_value, model) = super::storage::resume_metadata_values(&preview, 80);
+    assert_eq!(key_value, "Claude");
+    assert!(model.is_none());
+
+    // A native session is tagged too — [aivo], not [Claude]/[Codex].
+    let mut native = preview.clone();
+    native.origin = None;
+    native.session_id = "9f8e-native".to_string();
+    native.preview_text = "deploy the gateway".to_string();
+    let native_text = render(&native);
+    assert!(!native.is_fork());
+    assert!(native_text.contains("[aivo]"), "row: {native_text:?}");
+    assert!(!native_text.contains("[Claude]"), "row: {native_text:?}");
+
+    // A persisted import (native row, origin dropped) is always a fork under
+    // lazy import — it only got persisted because a real turn was taken.
+    let mut imported = preview.clone();
+    imported.origin = None;
+    assert_eq!(imported.session_id, "import-claude-abc-123");
+    assert!(imported.is_fork());
+    assert!(render(&imported).contains("[Claude ↳]"));
+}
+
+#[tokio::test]
+async fn foreign_row_previews_from_transcript_without_error() {
+    use crate::services::session_import::{ImportableSession, SessionOrigin};
+    let dir = tempfile::tempdir().unwrap();
+    let jsonl = "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"hello there friend\"}}\n{\"type\":\"assistant\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"hi back\"}]}}\n";
+    let src = dir.path().join("f.jsonl");
+    std::fs::write(&src, jsonl).unwrap();
+    let preview = SessionPreview::from_importable(ImportableSession {
+        origin: SessionOrigin {
+            cli: "claude".to_string(),
+            foreign_id: "zzz".to_string(),
+            source_path: src.to_string_lossy().to_string(),
+        },
+        title: "hello there friend".to_string(),
+        updated_at: Utc::now(),
+        aivo_id: "import-claude-zzz".to_string(),
+    });
+    // The aivo session doesn't exist yet — highlighting must preview from the
+    // source transcript, not raise "Saved session is no longer available".
+    let store =
+        crate::services::session_store::SessionStore::with_path(dir.path().join("config.json"));
+    let (messages, _truncated) = super::storage::load_preview_for(&store, &preview, 10)
+        .await
+        .expect("foreign preview should not error");
+    assert!(messages.iter().any(|m| m.role == "user"));
+    assert!(messages.iter().any(|m| m.role == "assistant"));
+}
+
+#[tokio::test]
+async fn opening_foreign_session_resumes_in_memory_without_persisting() {
+    use crate::services::session_import::{ImportableSession, SessionOrigin};
+    let dir = tempfile::tempdir().unwrap();
+    let jsonl = "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"hello there friend\"}}\n{\"type\":\"assistant\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"hi back\"}]}}\n";
+    let src = dir.path().join("f.jsonl");
+    std::fs::write(&src, jsonl).unwrap();
+    let preview = SessionPreview::from_importable(ImportableSession {
+        origin: SessionOrigin {
+            cli: "claude".to_string(),
+            foreign_id: "zzz".to_string(),
+            source_path: src.to_string_lossy().to_string(),
+        },
+        title: "hello there friend".to_string(),
+        updated_at: Utc::now(),
+        aivo_id: "import-claude-zzz".to_string(),
+    });
+    let store =
+        crate::services::session_store::SessionStore::with_path(dir.path().join("config.json"));
+
+    let loaded = super::storage::load_or_import_resume_session(&store, &preview, "key-1", "gpt-x")
+        .await
+        .expect("foreign resume should reconstruct in memory");
+    // Reconstructed in memory, flagged pristine, and NOT written to the store —
+    // merely opening a Claude session creates no aivo copy.
+    assert!(loaded.pristine_import);
+    // The fork's id is the deterministic digest of the source id (recomputed from
+    // origin), not the picker row's hand-set value.
+    assert_eq!(
+        loaded.session_id,
+        crate::services::session_import::import_session_id("claude", "zzz")
+    );
+    assert!(loaded.messages.iter().any(|m| m.role == "user"));
+    assert!(loaded.engine_messages.is_some());
+    assert_eq!(store.count_chat_sessions().await, 0);
+}
+
+#[test]
 fn test_picker_visible_items_respect_single_line_session_rows() {
     let preview = SessionPreview {
         key_id: "key-1".to_string(),
@@ -4028,6 +4272,7 @@ fn test_picker_visible_items_respect_single_line_session_rows() {
         updated_at: (Utc::now() - ChronoDuration::hours(2)).to_rfc3339(),
         title: "Deploy status".to_string(),
         preview_text: "Deploy status for api gateway after rollout".to_string(),
+        origin: None,
     };
     let picker = PickerState {
         title: "Resume",
@@ -4074,6 +4319,7 @@ fn test_session_picker_header_targets_newest_session() {
         updated_at: Utc::now().to_rfc3339(),
         title: "Newest".to_string(),
         preview_text: "Newest chat".to_string(),
+        origin: None,
     };
     let older = SessionPreview {
         key_id: "key-1".to_string(),
@@ -4084,6 +4330,7 @@ fn test_session_picker_header_targets_newest_session() {
         updated_at: (Utc::now() - ChronoDuration::days(2)).to_rfc3339(),
         title: "Older".to_string(),
         preview_text: "Older chat".to_string(),
+        origin: None,
     };
     let picker = PickerState::ready(
         "Sessions",
@@ -4122,6 +4369,7 @@ fn test_grouped_session_picker_short_view_shows_selected_session_row() {
         updated_at: Utc::now().to_rfc3339(),
         title: "Newest".to_string(),
         preview_text: "Newest chat".to_string(),
+        origin: None,
     };
     let older = SessionPreview {
         key_id: "key-1".to_string(),
@@ -4132,6 +4380,7 @@ fn test_grouped_session_picker_short_view_shows_selected_session_row() {
         updated_at: (Utc::now() - ChronoDuration::days(2)).to_rfc3339(),
         title: "Older".to_string(),
         preview_text: "Older chat".to_string(),
+        origin: None,
     };
     let picker = PickerState::ready(
         "Sessions",
@@ -7854,6 +8103,14 @@ fn test_parse_slash_context() {
     );
 }
 
+#[test]
+fn test_parse_slash_session() {
+    assert_eq!(
+        parse_slash_command("session").unwrap(),
+        SlashCommand::Session
+    );
+}
+
 /// `/context` always opens the breakdown, folding in the injected `-c` section when present.
 #[tokio::test]
 async fn test_context_overlay_shows_breakdown() {
@@ -8084,6 +8341,7 @@ async fn test_maybe_start_live_share_defers_until_session_settles() {
             updated_at: "t".into(),
             title: "t".into(),
             preview_text: "p".into(),
+            origin: None,
         },
     });
     assert!(!app.maybe_start_live_share().await);
@@ -10167,6 +10425,7 @@ async fn test_resume_resets_plan_and_goal_state() {
         raw_model: "claude".to_string(),
         messages: vec![],
         engine_messages: None,
+        pristine_import: false,
     };
     app.apply_loaded_session(session).await.unwrap();
 
@@ -11633,6 +11892,7 @@ fn session_picker_fixture() -> (PickerState, SessionPreview) {
         updated_at: Utc::now().to_rfc3339(),
         title: "Newest".to_string(),
         preview_text: "Newest chat".to_string(),
+        origin: None,
     };
     let older = SessionPreview {
         session_id: "sess-old".to_string(),
@@ -13648,6 +13908,7 @@ fn test_session_preview_uses_last_user_message() {
             "claude",
         ),
         preview_text: "What is the deployment status for api gateway?".to_string(),
+        origin: None,
     };
 
     assert_eq!(
@@ -13692,6 +13953,7 @@ fn test_resume_metadata_spans_drop_labels_and_id() {
         updated_at: (Utc::now() - ChronoDuration::hours(2)).to_rfc3339(),
         title: "Deploy status".to_string(),
         preview_text: "Deploy status for api gateway after rollout".to_string(),
+        origin: None,
     };
 
     let plain = plain_text_from_spans(&resume_metadata_spans(&preview, 40));
@@ -13717,6 +13979,7 @@ fn test_session_picker_item_line_shows_two_turn_preview() {
         preview_text:
             "What is the deployment status for api gateway after the canary rollout finished?"
                 .to_string(),
+        origin: None,
     };
 
     let lines = session_picker_item_lines(&preview, false, false, 32);
@@ -13749,6 +14012,7 @@ async fn test_begin_resume_load_clears_transcript_before_result() {
         updated_at: (Utc::now() - ChronoDuration::hours(2)).to_rfc3339(),
         title: "Deploy status".to_string(),
         preview_text: "Deploy status for api gateway after rollout".to_string(),
+        origin: None,
     };
 
     app.begin_resume_load(preview.clone());
@@ -14115,6 +14379,7 @@ async fn test_delete_picker_selection_removes_saved_chat() {
         updated_at: (Utc::now() - ChronoDuration::minutes(5)).to_rfc3339(),
         title: "hello".to_string(),
         preview_text: "hello · hi there".to_string(),
+        origin: None,
     };
 
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
@@ -14189,6 +14454,7 @@ async fn test_ctrl_d_requires_confirmation_before_delete() {
         updated_at: (Utc::now() - ChronoDuration::minutes(5)).to_rfc3339(),
         title: "hello".to_string(),
         preview_text: "hello".to_string(),
+        origin: None,
     };
 
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
@@ -14253,6 +14519,7 @@ async fn test_resume_loaded_failure_restores_previous_state() {
         updated_at: (Utc::now() - ChronoDuration::hours(2)).to_rfc3339(),
         title: "Deploy status".to_string(),
         preview_text: "Deploy status for api gateway after rollout".to_string(),
+        origin: None,
     };
 
     app.begin_resume_load(preview);
@@ -14317,6 +14584,7 @@ async fn test_resume_resets_agent_engine() {
             serde_json::json!({"role": "user", "content": "earlier turn"}),
             serde_json::json!({"role": "assistant", "content": "earlier reply"}),
         ]),
+        pristine_import: false,
     };
     app.apply_loaded_session(session).await.unwrap();
 
@@ -14367,6 +14635,7 @@ async fn test_resume_footer_estimate_uses_durable_transcript() {
             serde_json::json!({"role": "user", "content": "earlier turn"}),
             serde_json::json!({"role": "tool", "tool_call_id": "t1", "content": fat}),
         ]),
+        pristine_import: false,
     };
     app.apply_loaded_session(session).await.unwrap();
 
@@ -14423,6 +14692,7 @@ async fn test_resume_restores_session_cost_and_billed_model() {
         raw_model: "aivo/starter".to_string(),
         messages: vec![],
         engine_messages: None,
+        pristine_import: false,
     };
     app.apply_loaded_session(session).await.unwrap();
 
@@ -14459,6 +14729,7 @@ async fn test_resume_does_not_overwrite_persisted_default_model() {
             attachments: vec![],
         }],
         engine_messages: None,
+        pristine_import: false,
     };
     app.apply_loaded_session(session).await.unwrap();
 
@@ -14880,8 +15151,9 @@ async fn test_complete_key_switch_same_provider_preserves_chat() {
 }
 
 #[tokio::test]
-async fn test_complete_key_switch_different_provider_resets_chat() {
-    // Different base_url = different wire format → fresh session.
+async fn test_complete_key_switch_different_provider_keeps_chat() {
+    // A different provider keeps the conversation — it replays on the new
+    // provider (OpenAI-wire transcript bridged by aivo serve), same session.
     let temp_dir = TempDir::new().unwrap();
     let store = SessionStore::with_path(temp_dir.path().join("config.json"));
     let key_a = store
@@ -14907,54 +15179,14 @@ async fn test_complete_key_switch_different_provider_resets_chat() {
         .unwrap();
 
     assert_eq!(app.key.id, key_b_id, "switched to the new key");
-    assert!(
-        app.history.is_empty(),
-        "different-provider switch resets the chat"
-    );
-    assert_ne!(
-        app.session_id, "old-session",
-        "a fresh session id is minted"
-    );
+    assert_eq!(app.history.len(), 4, "conversation preserved");
+    assert_eq!(app.session_id, "old-session", "same session — no reset");
 }
 
 #[tokio::test]
-async fn test_begin_key_switch_confirms_before_provider_reset() {
-    // Different provider + live chat → arm the y/n card, don't switch yet.
-    let temp_dir = TempDir::new().unwrap();
-    let store = SessionStore::with_path(temp_dir.path().join("config.json"));
-    let key_a = store
-        .add_key_with_protocol("a", "https://a.example.com", None, "sk-a")
-        .await
-        .unwrap();
-    let key_b_id = store
-        .add_key_with_protocol("b", "https://b.example.com", None, "sk-b")
-        .await
-        .unwrap();
-    let key_a_full = store.get_key_by_id(&key_a).await.unwrap().unwrap();
-    let key_b_full = store.get_key_by_id(&key_b_id).await.unwrap().unwrap();
-
-    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-    let mut app = make_test_app(tx, rx);
-    app.session_store = store.clone();
-    app.key = key_a_full;
-    app.session_id = "old-session".to_string();
-    seed_two_exchanges(&mut app);
-
-    app.begin_key_switch(key_b_full).await.unwrap();
-
-    assert!(
-        app.pending_key_switch.is_some(),
-        "the switch is armed, not applied"
-    );
-    assert_eq!(
-        app.key.id, key_a,
-        "still on the original key until confirmed"
-    );
-    assert_eq!(app.history.len(), 4, "conversation untouched while armed");
-}
-
-#[tokio::test]
-async fn test_key_switch_confirm_yes_resets_chat() {
+async fn test_cross_provider_switch_keeps_conversation() {
+    // Switching to a different-provider key applies directly and keeps the
+    // conversation — no reset, no confirm. It replays on the new provider.
     let temp_dir = TempDir::new().unwrap();
     let store = SessionStore::with_path(temp_dir.path().join("config.json"));
     let key_a = store
@@ -14973,54 +15205,18 @@ async fn test_key_switch_confirm_yes_resets_chat() {
     let mut app = make_test_app(tx, rx);
     app.session_store = store.clone();
     app.key = key_a_full;
-    app.session_id = "old-session".to_string();
+    app.session_id = "keep-me".to_string();
     seed_two_exchanges(&mut app);
 
     app.begin_key_switch(key_b_full).await.unwrap();
-    app.handle_key_switch_confirm_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE))
-        .await
-        .unwrap();
 
-    assert!(app.pending_key_switch.is_none(), "card cleared");
-    assert_eq!(app.key.id, key_b_id, "confirm applies the switch");
-    assert!(app.history.is_empty(), "confirm resets the chat");
-    assert_ne!(app.session_id, "old-session", "fresh session id");
-}
-
-#[tokio::test]
-async fn test_key_switch_confirm_no_keeps_chat() {
-    let temp_dir = TempDir::new().unwrap();
-    let store = SessionStore::with_path(temp_dir.path().join("config.json"));
-    let key_a = store
-        .add_key_with_protocol("a", "https://a.example.com", None, "sk-a")
-        .await
-        .unwrap();
-    let key_b_id = store
-        .add_key_with_protocol("b", "https://b.example.com", None, "sk-b")
-        .await
-        .unwrap();
-    let key_a_full = store.get_key_by_id(&key_a).await.unwrap().unwrap();
-    let key_b_full = store.get_key_by_id(&key_b_id).await.unwrap().unwrap();
-
-    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-    let mut app = make_test_app(tx, rx);
-    app.session_store = store.clone();
-    app.key = key_a_full;
-    app.session_id = "old-session".to_string();
-    seed_two_exchanges(&mut app);
-
-    app.begin_key_switch(key_b_full).await.unwrap();
-    app.handle_key_switch_confirm_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE))
-        .await
-        .unwrap();
-
-    assert!(
-        app.pending_key_switch.is_none(),
-        "declining clears the card"
+    assert_eq!(app.key.id, key_b_id, "switch applied directly, no confirm");
+    assert_eq!(
+        app.history.len(),
+        4,
+        "conversation preserved across providers"
     );
-    assert_eq!(app.key.id, key_a, "declining keeps the current key");
-    assert_eq!(app.history.len(), 4, "declining preserves the conversation");
-    assert_eq!(app.session_id, "old-session", "same session id");
+    assert_eq!(app.session_id, "keep-me", "same session — no reset");
 }
 
 #[tokio::test]
@@ -15049,10 +15245,6 @@ async fn test_begin_key_switch_same_provider_skips_confirm() {
 
     app.begin_key_switch(key_b_full).await.unwrap();
 
-    assert!(
-        app.pending_key_switch.is_none(),
-        "same-provider switch needs no confirm"
-    );
     assert_eq!(app.key.id, key_b_id, "applied directly");
     assert_eq!(app.session_id, "keep-me", "chat preserved");
     assert_eq!(app.history.len(), 4);

@@ -294,9 +294,7 @@ is preserved."
         key: ApiKey,
         raw_model: String,
     ) -> Result<()> {
-        // Same provider = credential/model swap → keep the chat like `/model`; a
-        // different provider changes the wire format, so replaying it is unsafe → reset.
-        let same_provider = same_wire_provider(&self.key.base_url, &key.base_url);
+        let cross_provider = !same_wire_provider(&self.key.base_url, &key.base_url);
 
         self.key = key;
         self.raw_model = raw_model.clone();
@@ -306,22 +304,34 @@ is preserved."
         self.persist_model_selection(&raw_model).await?;
         self.refresh_context_window().await;
 
-        if same_provider && !self.history.is_empty() {
-            // Carry the transcript across the rebuild; drop the cursor session (auth changed).
-            self.format = seeded_chat_format(&self.key, &raw_model);
-            self.reset_engine_preserving_conversation();
-            self.cursor_acp_session = None;
-            self.persist_history().await?;
-            self.notice = Some((
-                MUTED(),
+        if self.history.is_empty() {
+            self.start_new_chat();
+            return Ok(());
+        }
+
+        // Keep the conversation across the switch — even to a different provider.
+        // The engine's transcript is stored as provider-agnostic OpenAI-wire
+        // messages and replayed on the new provider through aivo serve (the same
+        // path a foreign import resumes on). Carry it across the rebuild; drop the
+        // cursor session (auth changed).
+        self.format = seeded_chat_format(&self.key, &raw_model);
+        self.reset_engine_preserving_conversation();
+        self.cursor_acp_session = None;
+        self.persist_history().await?;
+        self.notice = Some((
+            MUTED(),
+            if cross_provider {
+                format!(
+                    "Switched to {} — conversation kept, continues on the new provider",
+                    self.key.display_name()
+                )
+            } else {
                 format!(
                     "Switched key to {} — session preserved",
                     self.key.display_name()
-                ),
-            ));
-        } else {
-            self.start_new_chat();
-        }
+                )
+            },
+        ));
         Ok(())
     }
 
@@ -338,19 +348,11 @@ is preserved."
         self.open_key_picker(None).await
     }
 
+    /// Apply a key switch directly, keeping the conversation (even across
+    /// providers) — no reset, no confirm (see `complete_key_switch`). Uses the
+    /// key's saved model, else opens the model picker.
     pub(super) async fn begin_key_switch(&mut self, mut key: ApiKey) -> Result<()> {
         SessionStore::decrypt_key_secret(&mut key)?;
-        // A different provider resets the chat → confirm first; same-provider preserves it.
-        if !self.history.is_empty() && !same_wire_provider(&self.key.base_url, &key.base_url) {
-            self.overlay = Overlay::None;
-            self.pending_key_switch = Some(key);
-            return Ok(());
-        }
-        self.proceed_key_switch(key).await
-    }
-
-    /// Apply the switch: use the key's saved model, else open the model picker.
-    pub(super) async fn proceed_key_switch(&mut self, key: ApiKey) -> Result<()> {
         if let Some(raw_model) = self.session_store.get_code_model(&key.id).await? {
             self.complete_key_switch(key, raw_model).await?;
         } else {
@@ -358,23 +360,6 @@ is preserved."
             self.open_model_picker(None, ModelSelectionTarget::KeySwitch(key), false);
         }
         Ok(())
-    }
-
-    /// `/key` provider-switch confirm card: y/Enter proceeds, n/Esc cancels.
-    pub(super) async fn handle_key_switch_confirm_key(&mut self, key: KeyEvent) -> Result<()> {
-        let allow = matches!(key.code, KeyCode::Char('y' | 'Y') | KeyCode::Enter);
-        let deny = matches!(key.code, KeyCode::Char('n' | 'N') | KeyCode::Esc);
-        if !allow && !deny {
-            return Ok(());
-        }
-        let Some(target) = self.pending_key_switch.take() else {
-            return Ok(());
-        };
-        if deny {
-            self.show_toast("Key switch cancelled");
-            return Ok(());
-        }
-        self.proceed_key_switch(target).await
     }
 
     pub(super) async fn open_key_picker(&mut self, query: Option<String>) -> Result<()> {
@@ -415,16 +400,31 @@ is preserved."
             sessions = load_resume_snapshots(&self.session_store, scope_cwd.as_deref()).await?;
         }
 
+        // Fold in this dir's importable foreign sessions (Claude Code / Codex /
+        // Pi), skipping any already imported (their id is already a native row).
+        // Not for `--resume last` — it only jumps to a native session, so it need
+        // not pay the foreign-directory scan.
+        if query.as_deref() != Some("last")
+            && let Some(cwd) = scope_cwd.as_deref()
+        {
+            let native: std::collections::HashSet<String> =
+                sessions.iter().map(|s| s.session_id.clone()).collect();
+            for preview in load_importable_previews(cwd).await {
+                if !native.contains(&preview.session_id) {
+                    sessions.push(preview);
+                }
+            }
+            sessions.sort_by(|left, right| right.updated_at.cmp(&left.updated_at));
+        }
+
         // `--resume last`: jump to the most recent session in this dir. In-session
         // the current chat was just persisted and sorts newest, so skip it.
         if query.as_deref() == Some("last") {
-            let pick = if self.history.is_empty() {
-                sessions.first()
-            } else {
-                sessions
-                    .iter()
-                    .find(|session| session.session_id != self.session_id)
-            };
+            // `last` means the most recent aivo session — never silently import a
+            // foreign one (that's an explicit pick in the bare `/resume` picker).
+            let pick = sessions
+                .iter()
+                .find(|session| session.origin.is_none() && session.session_id != self.session_id);
             match pick {
                 Some(snapshot) => self.begin_resume_load(snapshot.clone()),
                 None => {
@@ -481,6 +481,11 @@ is preserved."
 
     pub(super) fn open_help_overlay(&mut self) {
         self.overlay = Overlay::Help { scroll: 0 };
+    }
+
+    /// `/session` (or clicking the footer id): the session-detail overlay.
+    pub(super) fn open_session_overlay(&mut self) {
+        self.overlay = Overlay::Session { scroll: 0 };
     }
 
     /// `/context`: the context-window breakdown viewer.
@@ -2556,6 +2561,14 @@ is preserved."
     }
 
     pub(super) async fn persist_history(&self) -> Result<()> {
+        // A freshly-opened foreign import lives in memory only — don't persist an
+        // aivo copy just for viewing it. Once a real turn grows the history past
+        // the resume baseline, this gate opens and it persists as a fork.
+        if let Some(baseline) = self.pristine_import_len
+            && self.history.len() <= baseline
+        {
+            return Ok(());
+        }
         let stored = to_stored_messages(&self.history);
         let title = session_title_from_messages(&self.history, &self.raw_model);
         let preview = session_preview_text_from_messages(&self.history, &self.raw_model);
@@ -2623,8 +2636,13 @@ is preserved."
 
         let session_store = self.session_store.clone();
         let tx = self.tx.clone();
+        // A foreign (import) row is reconstructed in memory using the live
+        // key/model; it persists as a fork only once a real turn is taken.
+        let key_id = self.key.id.clone();
+        let model = self.raw_model.clone();
         let task = tokio::spawn(async move {
-            let result = load_resume_session(&session_store, &preview).await;
+            let result =
+                load_or_import_resume_session(&session_store, &preview, &key_id, &model).await;
             let _ = tx.send(RuntimeEvent::ResumeLoaded { request_id, result });
         });
         self.resume_task = Some(task);
@@ -2688,6 +2706,9 @@ is preserved."
         // the next engine build instead of the lossy text seed. `None` for
         // non-agent or pre-feature sessions → falls back to the text seed.
         self.pending_agent_messages = session.engine_messages;
+        // A freshly-opened foreign import lives in memory only until a real turn
+        // grows the transcript past this baseline (then it persists as a fork).
+        self.pristine_import_len = session.pristine_import.then_some(self.history.len());
         self.draft.clear();
         self.cursor = 0;
         self.command_menu.reset();

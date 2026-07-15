@@ -1555,18 +1555,18 @@ impl CodeTuiApp {
                     .filtered_items()
                     .get(picker.selected)
                     .and_then(|(_, item)| match &item.value {
-                        PickerValue::Session(preview) => {
-                            Some((preview.session_id.clone(), preview.updated_at.clone()))
-                        }
+                        PickerValue::Session(preview) => Some(preview.clone()),
                         _ => None,
                     })
             }
             _ => None,
         };
-        let Some((session_id, updated_at)) = wanted else {
+        let Some(preview) = wanted else {
             self.session_preview_pending = None;
             return false;
         };
+        let session_id = preview.session_id.clone();
+        let updated_at = preview.updated_at.clone();
         // Valid cache entry (same index updated_at) → nothing to load.
         if self
             .session_preview_cache
@@ -1599,7 +1599,7 @@ impl CodeTuiApp {
         let tx = self.tx.clone();
         let sid = session_id.clone();
         let task = tokio::spawn(async move {
-            let entry = match load_session_preview(&session_store, &sid, PREVIEW_MAX_MESSAGES).await
+            let entry = match load_preview_for(&session_store, &preview, PREVIEW_MAX_MESSAGES).await
             {
                 Ok((messages, truncated)) => PreviewEntry {
                     updated_at,
@@ -2039,6 +2039,14 @@ impl CodeTuiApp {
                     && rect_contains(hit, (mouse.column, mouse.row))
                 {
                     self.scroll_to_bottom();
+                    return Ok(false);
+                }
+                // Clicking the footer session id opens its detail overlay.
+                if !self.overlay.blocks_input()
+                    && let Some(hit) = self.session_id_hit
+                    && rect_contains(hit, (mouse.column, mouse.row))
+                {
+                    self.open_session_overlay();
                     return Ok(false);
                 }
                 // A press in the composer also drops the caret there; a drag still selects.
@@ -2649,6 +2657,14 @@ impl CodeTuiApp {
                 Ok(Some(false))
             }
             (Overlay::Context { .. }, _) => Ok(Some(false)),
+            (Overlay::Session { .. }, MouseEventKind::ScrollUp | MouseEventKind::ScrollDown) => {
+                let up = matches!(mouse.kind, MouseEventKind::ScrollUp);
+                if let Overlay::Session { scroll } = &mut self.overlay {
+                    *scroll = wheel_scroll(*scroll, up);
+                }
+                Ok(Some(false))
+            }
+            (Overlay::Session { .. }, _) => Ok(Some(false)),
             // Wheel: detail scroll in a drill-in or over the split's right pane,
             // else selection move; add-input ignores it.
             (Overlay::Skills(_), MouseEventKind::ScrollUp | MouseEventKind::ScrollDown) => {

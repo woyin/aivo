@@ -30,6 +30,58 @@ pub(super) async fn load_resume_snapshots(
     Ok(sessions)
 }
 
+/// This directory's importable Claude Code / Codex sessions, as picker rows.
+/// Scanned once per `/resume` open (headline reads — see
+/// [`list_importable_sessions`](crate::services::session_import::list_importable_sessions)).
+pub(super) async fn load_importable_previews(cwd: &str) -> Vec<SessionPreview> {
+    crate::services::session_import::list_importable_sessions(std::path::Path::new(cwd))
+        .await
+        .into_iter()
+        .map(SessionPreview::from_importable)
+        .collect()
+}
+
+/// Resume a picker selection. A foreign row (`preview.origin`) that was already
+/// continued in aivo loads its saved fork; one opened for the first time is
+/// resumed IN MEMORY from the source transcript (assigned the live key/model) —
+/// nothing is persisted until a real turn, so merely viewing a Claude/Codex
+/// session never creates an aivo copy. A native row loads directly.
+pub(super) async fn load_or_import_resume_session(
+    session_store: &SessionStore,
+    preview: &SessionPreview,
+    key_id: &str,
+    model: &str,
+) -> std::result::Result<LoadedSession, String> {
+    if let Some(origin) = &preview.origin {
+        let aivo_id =
+            crate::services::session_import::import_session_id(&origin.cli, &origin.foreign_id);
+        // Already forked (continued in aivo before) → load the saved fork.
+        if let Some(state) = session_store
+            .get_code_session(&aivo_id)
+            .await
+            .map_err(|err| err.to_string())?
+        {
+            return Ok(LoadedSession::from_state(state));
+        }
+        // First open → reconstruct in memory; the normal turn-save persists it.
+        let transcript = crate::services::session_import::convert_foreign(origin)
+            .await
+            .map_err(|err| err.to_string())?;
+        if transcript.messages.is_empty() {
+            return Err("nothing to import from this session".to_string());
+        }
+        return Ok(LoadedSession {
+            key_id: key_id.to_string(),
+            session_id: aivo_id,
+            raw_model: model.to_string(),
+            messages: to_chat_messages(transcript.messages),
+            engine_messages: Some(transcript.engine_messages),
+            pristine_import: true,
+        });
+    }
+    load_resume_session(session_store, preview).await
+}
+
 pub(super) async fn load_resume_session(
     session_store: &SessionStore,
     preview: &SessionPreview,
@@ -41,6 +93,35 @@ pub(super) async fn load_resume_session(
         .ok_or_else(|| "Saved session is no longer available".to_string())?;
 
     Ok(LoadedSession::from_state(session))
+}
+
+/// Preview for the highlighted `/resume` row. A foreign (not-yet-imported)
+/// session is previewed straight from its source transcript — its aivo id
+/// doesn't exist on disk until it's selected — so highlighting it never errors.
+pub(super) async fn load_preview_for(
+    session_store: &SessionStore,
+    preview: &SessionPreview,
+    cap: usize,
+) -> std::result::Result<(Vec<ChatMessage>, bool), String> {
+    if let Some(origin) = &preview.origin
+        && session_store
+            .get_code_session(&preview.session_id)
+            .await
+            .ok()
+            .flatten()
+            .is_none()
+    {
+        let transcript = crate::services::session_import::convert_foreign(origin)
+            .await
+            .map_err(|err| err.to_string())?;
+        let mut messages = to_chat_messages(transcript.messages);
+        let truncated = messages.len() > cap;
+        if truncated {
+            messages.drain(..messages.len() - cap);
+        }
+        return Ok((messages, truncated));
+    }
+    load_session_preview(session_store, &preview.session_id, cap).await
 }
 
 /// The last `cap` messages of one session for the `/resume` preview (+ whether
@@ -242,6 +323,11 @@ pub(super) fn resume_metadata_values(
     let time_value = format_time_ago_short(&preview.updated_at);
     let key_value = preview.key_name.clone();
     let available = usize::from(width.max(1));
+
+    // Foreign (import) rows carry no aivo model — omit that segment.
+    if preview.raw_model.is_empty() {
+        return (time_value, key_value, None);
+    }
 
     let mut used = display_width(&time_value) + SEPARATOR_LEN + display_width(&key_value);
     let full_model_len = SEPARATOR_LEN + display_width(&preview.raw_model);

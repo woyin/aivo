@@ -1112,6 +1112,14 @@ impl CodeTuiApp {
                     *scroll = clamped;
                 }
             }
+            Overlay::Session { scroll } => {
+                let area = centered_rect(64, 60, body);
+                self.screen_region = Some(overlay_content_rect(area));
+                let clamped = self.render_session_overlay(frame, area, scroll);
+                if let Overlay::Session { scroll } = &mut self.overlay {
+                    *scroll = clamped;
+                }
+            }
             Overlay::Skills(skills) => {
                 let (area, split) = split_overlay_area(body, 84, 80, 64, 80);
                 self.screen_region = Some(overlay_content_rect(area));
@@ -1200,8 +1208,6 @@ impl CodeTuiApp {
             self.render_mcp_consent_card(frame, composer_area, outer);
         } else if self.pending_logout.is_some() {
             self.render_logout_confirm_card(frame, composer_area, outer);
-        } else if self.pending_key_switch.is_some() {
-            self.render_key_switch_confirm_card(frame, composer_area, outer);
         } else if self.agent_permission.is_some() {
             self.render_permission_card(frame, composer_area, outer);
         } else if self.agent_ask.is_some() {
@@ -1433,49 +1439,6 @@ impl CodeTuiApp {
             composer_area,
             frame_area,
             "sign out of aivo",
-            WARNING(),
-            lines,
-        );
-    }
-
-    /// `/key` provider-switch confirm card.
-    fn render_key_switch_confirm_card(
-        &self,
-        frame: &mut Frame<'_>,
-        composer_area: Rect,
-        frame_area: Rect,
-    ) {
-        let Some(target) = self.pending_key_switch.as_ref() else {
-            return;
-        };
-        let lines = vec![
-            Line::from(vec![
-                Span::styled("Switch to ", Style::default().fg(TEXT())),
-                Span::styled(
-                    target.display_name().to_string(),
-                    Style::default().fg(TEXT()).add_modifier(Modifier::BOLD),
-                ),
-                Span::styled("?", Style::default().fg(TEXT())),
-            ]),
-            Line::from(Span::styled(
-                "It's a different provider, so this starts a new session.",
-                Style::default().fg(MUTED()),
-            )),
-            Line::from(Span::styled(
-                "The current session is saved — /resume brings it back.",
-                Style::default().fg(MUTED()),
-            )),
-            Line::from(""),
-            account_keys_line(&[
-                ("y", ASSISTANT(), "new session"),
-                ("n", ERROR(), "keep current"),
-            ]),
-        ];
-        render_account_card(
-            frame,
-            composer_area,
-            frame_area,
-            "switch key",
             WARNING(),
             lines,
         );
@@ -2775,6 +2738,18 @@ impl CodeTuiApp {
     /// lockstep, measuring the same lines).
     pub(super) fn welcome_status_lines(&self) -> Vec<StyledLine> {
         let mut lines = vec![blank_line()];
+        // A fork of another agent's session carries a provenance line, so it's clear
+        // this thread began in Claude/Codex/Pi (its id also stays `import-<cli>-…`).
+        if let Some(source) = crate::services::session_import::import_source_label(&self.session_id)
+        {
+            lines.push(line_with_plain(vec![
+                Span::styled("↳ ", Style::default().fg(ACCENT())),
+                Span::styled(
+                    format!("Forked from a {source} session · /session for details"),
+                    Style::default().fg(MUTED()),
+                ),
+            ]));
+        }
         if let Some(chip) = self.welcome_capabilities_label() {
             lines.push(line_plain(chip, Style::default().fg(MUTED())));
         }
@@ -2909,19 +2884,23 @@ impl CodeTuiApp {
         Some((x.min(max_x), y.min(max_y)))
     }
 
-    pub(super) fn render_footer(&self, frame: &mut Frame<'_>, area: Rect) {
+    pub(super) fn render_footer(&mut self, frame: &mut Frame<'_>, area: Rect) {
+        // Cleared here so a frame that doesn't draw the id (narrow terminal) leaves
+        // no stale click target; re-armed below when it's shown.
+        self.session_id_hit = None;
         // Right side: the context meter (which warms toward the window limit) and,
         // when thinking is on, the effort tier. The effort is a static setting, so
         // it stays quiet MUTED — only the meter's warning/error warmth draws the eye.
         let (meter_label, meter_color) = self.footer_status_label();
         let mut right_spans: Vec<Span<'static>> = Vec::new();
         // Extras are width-gated so the meter and model win on narrow terminals.
+        let mut session_id_width = 0u16;
         if area.width >= 90 && !self.session_id.is_empty() {
-            let short: String = self.session_id.chars().take(8).collect();
-            right_spans.push(Span::styled(
-                format!("#{short}"),
-                Style::default().fg(FAINT()),
-            ));
+            // A fork keeps its source in view (`claude·a1b2c3d4`); a native id shows
+            // its short handle (`#3f2a1b4c`). Click it for the full detail overlay.
+            let label = footer_session_label(&self.session_id);
+            session_id_width = display_width(&label) as u16;
+            right_spans.push(Span::styled(label, Style::default().fg(FAINT())));
             right_spans.push(Span::styled(" · ", Style::default().fg(FAINT())));
         }
         if area.width >= 70
@@ -2944,6 +2923,16 @@ impl CodeTuiApp {
         } else {
             area.width.saturating_sub(right_label_width + 1)
         };
+        // The session id is the first right span, laid out one column past the
+        // left cluster's fill — record its rect so a click opens the detail overlay.
+        if session_id_width > 0 {
+            self.session_id_hit = Some(Rect {
+                x: area.x + left_width + 1,
+                y: area.y,
+                width: session_id_width,
+                height: area.height.max(1),
+            });
+        }
         // Reserve columns for the model-line badges so the text truncates to fit them.
         let live = self.live_share.is_some();
         let plain_chat = !self.agent_tools_enabled;

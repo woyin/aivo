@@ -718,6 +718,7 @@ pub(super) fn parse_slash_command(input: &str) -> Result<SlashCommand> {
             fast: argument.as_deref() == Some("fast"),
         }),
         "context" => Ok(SlashCommand::Context),
+        "session" => Ok(SlashCommand::Session),
         "share" => Ok(SlashCommand::Share(argument)),
         "login" => Ok(SlashCommand::Login),
         "logout" => Ok(SlashCommand::Logout),

@@ -1554,6 +1554,10 @@ impl CodeTuiApp {
                 self.open_context_overlay().await;
                 Ok(false)
             }
+            SlashCommand::Session => {
+                self.open_session_overlay();
+                Ok(false)
+            }
             SlashCommand::Share(arg) => {
                 self.run_share_command(arg).await;
                 Ok(false)
@@ -2581,6 +2585,7 @@ pieces and keep going"
         self.stop_live_share();
         self.cancel_inflight_request(CancelKind::Discard);
         self.overlay = Overlay::None;
+        self.pristine_import_len = None;
         self.history.clear();
         self.agent_turn_indices.clear();
         self.expanded_thinking.clear();

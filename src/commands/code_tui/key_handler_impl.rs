@@ -90,11 +90,6 @@ impl CodeTuiApp {
             return Ok(false);
         }
 
-        if self.pending_key_switch.is_some() {
-            self.handle_key_switch_confirm_key(key).await?;
-            return Ok(false);
-        }
-
         // A pending tool-permission card owns the decision keys (y/a/n), but only
         // while the composer is empty. If the user is mid-composing a queued
         // message those keystrokes belong to that message — letting them decide
@@ -799,9 +794,11 @@ impl CodeTuiApp {
                 picker.selected = 0;
                 true
             }
-            Overlay::Help { .. } | Overlay::Context { .. } | Overlay::Config(_) | Overlay::None => {
-                false
-            }
+            Overlay::Help { .. }
+            | Overlay::Context { .. }
+            | Overlay::Session { .. }
+            | Overlay::Config(_)
+            | Overlay::None => false,
         }
     }
 
@@ -822,6 +819,15 @@ impl CodeTuiApp {
                 if matches!(key.code, KeyCode::Esc | KeyCode::Enter) {
                     self.overlay = Overlay::None;
                 } else if let Overlay::Context { scroll, .. } = &mut self.overlay {
+                    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+                    apply_detail_scroll(scroll, key, ctrl);
+                }
+                OverlayKeyAction::Handled
+            }
+            Overlay::Session { .. } => {
+                if matches!(key.code, KeyCode::Esc | KeyCode::Enter) {
+                    self.overlay = Overlay::None;
+                } else if let Overlay::Session { scroll } = &mut self.overlay {
                     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
                     apply_detail_scroll(scroll, key, ctrl);
                 }
