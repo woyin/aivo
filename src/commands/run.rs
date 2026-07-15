@@ -82,7 +82,7 @@ impl RunCommand {
         main_model: Option<&str>,
     ) -> Result<Option<ClaudeModelOverrides>> {
         let slots = [
-            ("reasoning model", flags.reasoning),
+            ("fable family model", flags.fable),
             ("subagent model", flags.subagent),
             ("haiku family model", flags.haiku),
             ("sonnet family model", flags.sonnet),
@@ -96,9 +96,13 @@ impl RunCommand {
         let mut tier_upstreams: Vec<TierUpstream> = Vec::new();
         // (model, key_id) per slot, for the ambiguity check below.
         let mut slot_routes: Vec<(String, String)> = Vec::new();
+        // (slot, model, key name, routes off the main key) — for the summary.
+        let mut summary_rows: Vec<(String, String, String, bool)> = Vec::new();
         for (idx, (label, value)) in slots.into_iter().enumerate() {
             let Some(raw) = value else { continue };
             let (key_ref, model_part) = crate::cli_args::split_tier_spec(&raw);
+            let (key_ref, model_part) =
+                crate::cli_args::resolve_alias_with_tier(&aliases, key_ref, model_part);
 
             let tier_key: ApiKey = if let Some(kr) = key_ref {
                 match self.session_store.resolve_key_by_id_or_name(&kr).await {
@@ -107,7 +111,7 @@ impl RunCommand {
                 }
             } else if model_part.is_empty() {
                 let annotations = vec![None; all_keys.len()];
-                let prompt = format!("Select provider for {label}");
+                let prompt = format!("Select provider for {}", highlight_slot_label(label));
                 match crate::commands::keys::prompt_pick_key_without_activation(
                     &all_keys,
                     &annotations,
@@ -129,11 +133,14 @@ impl RunCommand {
                 );
             }
 
-            let model_empty = model_part.is_empty();
-            // Empty passes through unchanged → picker trigger.
-            let flag_model = crate::cli_args::resolve_alias_in_memory(&aliases, Some(model_part));
+            let model_empty = model_part.is_empty(); // empty → picker
+            let flag_model = Some(model_part);
             let prompt = if model_empty {
-                format!("Select {label} ({})", tier_key.display_name())
+                format!(
+                    "Select {} ({})",
+                    highlight_slot_label(label),
+                    tier_key.display_name()
+                )
             } else {
                 String::new()
             };
@@ -155,6 +162,12 @@ impl RunCommand {
             };
             resolved[idx] = Some(model.clone());
             slot_routes.push((model.clone(), tier_key.id.clone()));
+            summary_rows.push((
+                label.split_whitespace().next().unwrap_or(label).to_string(),
+                model.clone(),
+                tier_key.display_name().to_string(),
+                tier_key.id != key.id,
+            ));
 
             if tier_key.id != key.id {
                 tier_upstreams.push(TierUpstream {
@@ -203,9 +216,13 @@ impl RunCommand {
             routed.insert(name, key_id.clone());
         }
 
-        let [reasoning, subagent, haiku, sonnet, opus] = resolved;
+        if !summary_rows.is_empty() {
+            print_routing_summary(key, main_model, &summary_rows);
+        }
+
+        let [fable, subagent, haiku, sonnet, opus] = resolved;
         Ok(Some(ClaudeModelOverrides {
-            reasoning,
+            fable,
             subagent,
             haiku,
             sonnet,
@@ -528,7 +545,7 @@ impl RunCommand {
     /// flags that actually apply to that CLI are listed; bare `aivo run --help`
     /// (no tool) shows the union. Each option's visibility is gated on which
     /// tools the run pipeline actually honors:
-    ///   - Claude slot flags (`--reasoning-model`, `--{haiku,sonnet,opus}-model`,
+    ///   - Claude slot flags (`--fable-model`, `--{haiku,sonnet,opus}-model`,
     ///     `--subagent-model`) → claude
     ///   - `--max-context`/`--1m`/`--2m` → claude
     ///   - `--relogin` → claude, codex/codex-app, gemini (the OAuth-backed keys)
@@ -601,22 +618,28 @@ impl RunCommand {
         );
         if is("claude") {
             print_opt(
-                "--reasoning-model <m>",
-                &label("Claude only: override reasoning slot (bare = picker)"),
+                "--haiku-model [key::]m",
+                &label("Claude only: /model haiku tier (bare = picker)"),
             );
             print_opt(
-                "--subagent-model <m>",
-                &label("Claude only: override subagent slot (bare = picker)"),
+                "--sonnet-model [key::]m",
+                &label("Claude only: /model sonnet tier"),
             );
             print_opt(
-                "--haiku|sonnet|opus-model",
-                &label("Claude only: what `/model <name>` resolves to (bare = picker)"),
+                "--opus-model [key::]m",
+                &label("Claude only: /model opus tier"),
             );
             print_opt(
-                "  <slot> <key>::<model>",
-                &label(
-                    "Claude only: route that tier to another provider/key (e.g. --haiku-model alt::glm-4.6)",
-                ),
+                "--fable-model [key::]m",
+                &label("Claude only: /model fable (best) tier"),
+            );
+            print_opt(
+                "--subagent-model [key::]m",
+                &label("Claude only: subagent tier"),
+            );
+            print_opt(
+                "",
+                &label("Claude only: `key::` on any slot routes that tier to another saved key"),
             );
         }
 
@@ -684,6 +707,10 @@ impl RunCommand {
             Some("claude") => {
                 println!("  {}", style::dim("aivo claude"));
                 println!("  {}", style::dim("aivo claude --model claude-sonnet-4.5"));
+                println!(
+                    "  {}",
+                    style::dim("aivo claude -m deepseek::deepseek-chat --opus-model xai::grok-2")
+                );
                 println!("  {}", style::dim("aivo claude \"fix the login bug\""));
             }
             Some("codex") => {
@@ -722,11 +749,52 @@ impl RunCommand {
     }
 }
 
+/// Prints the resolved per-tier routing to stderr before launch. `rows` =
+/// (slot, model, key name, routes off the main key).
+fn print_routing_summary(
+    main_key: &ApiKey,
+    main_model: Option<&str>,
+    rows: &[(String, String, String, bool)],
+) {
+    let width = rows.iter().map(|(slot, ..)| slot.len()).max().unwrap_or(0);
+    eprintln!();
+    eprintln!(
+        "{}  {} {} {}",
+        style::bold("Routing"),
+        style::cyan(main_key.display_name()),
+        style::dim("·"),
+        main_model.unwrap_or("(tool default)"),
+    );
+    for (slot, model, key, cross) in rows {
+        // Cross-key tier highlights its provider; same-key override dims it.
+        let key = if *cross {
+            style::cyan(key)
+        } else {
+            style::dim(key)
+        };
+        eprintln!(
+            "  {:<width$} {} {} {} {}",
+            slot,
+            style::arrow_symbol(),
+            key,
+            style::dim("·"),
+            model,
+        );
+    }
+}
+
+fn highlight_slot_label(label: &str) -> String {
+    match label.split_once(' ') {
+        Some((keyword, rest)) => format!("{} {}", style::cyan(keyword), style::bold(rest)),
+        None => style::cyan(label),
+    }
+}
+
 /// Emits one stderr line per Claude-only slot flag set when running a
 /// non-Claude tool. Forgiving by design — preserves the launch.
 fn warn_slot_flags_ignored(tool: AIToolType, slots: &ClaudeSlotFlags) {
     for (set, flag) in [
-        (slots.reasoning.is_some(), "--reasoning-model"),
+        (slots.fable.is_some(), "--fable-model"),
         (slots.subagent.is_some(), "--subagent-model"),
         (slots.haiku.is_some(), "--haiku-model"),
         (slots.sonnet.is_some(), "--sonnet-model"),
@@ -1079,6 +1147,19 @@ async fn resolve_max_context(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn highlight_slot_label_colors_keyword_and_rebolds_rest() {
+        assert_eq!(
+            highlight_slot_label("haiku family model"),
+            format!("{} {}", style::cyan("haiku"), style::bold("family model")),
+        );
+        assert_eq!(highlight_slot_label("subagent"), style::cyan("subagent"));
+        assert_eq!(
+            console::strip_ansi_codes(&highlight_slot_label("opus family model")).as_ref(),
+            "opus family model",
+        );
+    }
 
     #[test]
     fn inject_append_system_prompt_puts_flag_first() {

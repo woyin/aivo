@@ -258,6 +258,23 @@ pub(crate) fn split_tier_spec(value: &str) -> (Option<String>, String) {
     }
 }
 
+/// Alias-resolves a model token, re-splitting so an alias that expands to
+/// `key::model` carries a provider (`fast` = `groq::llama`). An explicit
+/// `key_ref` wins; an empty model stays empty (picker trigger).
+pub(crate) fn resolve_alias_with_tier(
+    aliases: &HashMap<String, String>,
+    key_ref: Option<String>,
+    model: String,
+) -> (Option<String>, String) {
+    match resolve_alias_in_memory(aliases, Some(model)) {
+        Some(expanded) if key_ref.is_none() && expanded.contains("::") => {
+            split_tier_spec(&expanded)
+        }
+        Some(other) => (key_ref, other),
+        None => (key_ref, String::new()),
+    }
+}
+
 /// Result of extracting aivo-specific flags from clap's trailing passthrough args.
 pub(crate) struct ExtractedFlags {
     pub(crate) model: Option<String>,
@@ -355,7 +372,7 @@ pub(crate) fn extract_aivo_flags(
     let mut transparent = false;
     let mut env_strings = initial_envs;
     let ClaudeSlotFlags {
-        reasoning: mut reasoning_model,
+        fable: mut fable_model,
         subagent: mut subagent_model,
         haiku: mut haiku_model,
         sonnet: mut sonnet_model,
@@ -384,7 +401,7 @@ pub(crate) fn extract_aivo_flags(
             *slot = Some(String::new());
         }
     };
-    sanitize_slot(&mut reasoning_model);
+    sanitize_slot(&mut fable_model);
     sanitize_slot(&mut subagent_model);
     sanitize_slot(&mut haiku_model);
     sanitize_slot(&mut sonnet_model);
@@ -462,18 +479,18 @@ pub(crate) fn extract_aivo_flags(
         } else if (arg == "--env" || arg == "-e") && i + 1 < passthrough_args.len() {
             env_strings.push(passthrough_args[i + 1].clone());
             i += 1;
-        } else if let Some(value) = arg.strip_prefix("--reasoning-model=") {
-            if !value.is_empty() && reasoning_model.is_none() {
-                reasoning_model = Some(value.to_string());
+        } else if let Some(value) = arg.strip_prefix("--fable-model=") {
+            if !value.is_empty() && fable_model.is_none() {
+                fable_model = Some(value.to_string());
             } else {
                 remaining_args.push(arg.clone());
             }
-        } else if arg == "--reasoning-model" && reasoning_model.is_none() {
+        } else if arg == "--fable-model" && fable_model.is_none() {
             if i + 1 < passthrough_args.len() && !passthrough_args[i + 1].starts_with('-') {
-                reasoning_model = Some(passthrough_args[i + 1].clone());
+                fable_model = Some(passthrough_args[i + 1].clone());
                 i += 1;
             } else {
-                reasoning_model = Some(String::new());
+                fable_model = Some(String::new());
             }
         } else if let Some(value) = arg.strip_prefix("--subagent-model=") {
             if !value.is_empty() && subagent_model.is_none() {
@@ -560,7 +577,7 @@ pub(crate) fn extract_aivo_flags(
     ExtractedFlags {
         model,
         slots: ClaudeSlotFlags {
-            reasoning: reasoning_model,
+            fable: fable_model,
             subagent: subagent_model,
             haiku: haiku_model,
             sonnet: sonnet_model,
@@ -620,6 +637,36 @@ mod tests {
         assert_eq!(
             split_tier_spec("llama3:8b"),
             (None, "llama3:8b".to_string())
+        );
+    }
+
+    #[test]
+    fn resolve_alias_with_tier_lets_aliases_carry_a_provider() {
+        let mut aliases = HashMap::new();
+        aliases.insert("fast".to_string(), "groq::llama-3.1-8b".to_string());
+        aliases.insert("cheap".to_string(), "gpt-4o-mini".to_string());
+
+        // Alias carrying a provider re-splits; plain alias stays put.
+        assert_eq!(
+            resolve_alias_with_tier(&aliases, None, "fast".to_string()),
+            (Some("groq".to_string()), "llama-3.1-8b".to_string())
+        );
+        assert_eq!(
+            resolve_alias_with_tier(&aliases, None, "cheap".to_string()),
+            (None, "gpt-4o-mini".to_string())
+        );
+        // Explicit key wins; empty stays empty; unknown passes through.
+        assert_eq!(
+            resolve_alias_with_tier(&aliases, Some("xai".to_string()), "grok-2".to_string()),
+            (Some("xai".to_string()), "grok-2".to_string())
+        );
+        assert_eq!(
+            resolve_alias_with_tier(&aliases, Some("xai".to_string()), String::new()),
+            (Some("xai".to_string()), String::new())
+        );
+        assert_eq!(
+            resolve_alias_with_tier(&aliases, None, "gpt-5".to_string()),
+            (None, "gpt-5".to_string())
         );
     }
 

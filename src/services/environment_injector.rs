@@ -47,7 +47,7 @@ pub struct EnvironmentInjector;
 /// positions.
 #[derive(Debug, Clone, Default)]
 pub struct ClaudeSlotFlags {
-    pub reasoning: Option<String>,
+    pub fable: Option<String>,
     pub subagent: Option<String>,
     pub haiku: Option<String>,
     pub sonnet: Option<String>,
@@ -56,7 +56,7 @@ pub struct ClaudeSlotFlags {
 
 impl ClaudeSlotFlags {
     pub fn any_set(&self) -> bool {
-        self.reasoning.is_some()
+        self.fable.is_some()
             || self.subagent.is_some()
             || self.haiku.is_some()
             || self.sonnet.is_some()
@@ -77,7 +77,7 @@ impl ClaudeSlotFlags {
 /// the suffix; per-slot overrides stay verbatim.
 #[derive(Debug, Clone, Default)]
 pub struct ClaudeModelOverrides {
-    pub reasoning: Option<String>,
+    pub fable: Option<String>,
     pub subagent: Option<String>,
     pub haiku: Option<String>,
     pub sonnet: Option<String>,
@@ -121,7 +121,7 @@ const CLAUDE_DEFAULT_MODEL_SLOTS: [&str; 6] = [
     "ANTHROPIC_DEFAULT_HAIKU_MODEL",
     "ANTHROPIC_DEFAULT_SONNET_MODEL",
     "ANTHROPIC_DEFAULT_OPUS_MODEL",
-    "ANTHROPIC_REASONING_MODEL",
+    "ANTHROPIC_DEFAULT_FABLE_MODEL",
     "CLAUDE_CODE_SUBAGENT_MODEL",
 ];
 
@@ -459,7 +459,7 @@ impl EnvironmentInjector {
                 }
             }
             for (env_var, value) in [
-                ("ANTHROPIC_REASONING_MODEL", overrides.reasoning.as_deref()),
+                ("ANTHROPIC_DEFAULT_FABLE_MODEL", overrides.fable.as_deref()),
                 ("CLAUDE_CODE_SUBAGENT_MODEL", overrides.subagent.as_deref()),
                 ("ANTHROPIC_DEFAULT_HAIKU_MODEL", overrides.haiku.as_deref()),
                 (
@@ -604,7 +604,7 @@ impl EnvironmentInjector {
             }
         };
         for (env_var, value) in [
-            ("ANTHROPIC_REASONING_MODEL", overrides.reasoning.as_deref()),
+            ("ANTHROPIC_DEFAULT_FABLE_MODEL", overrides.fable.as_deref()),
             ("CLAUDE_CODE_SUBAGENT_MODEL", overrides.subagent.as_deref()),
             ("ANTHROPIC_DEFAULT_HAIKU_MODEL", overrides.haiku.as_deref()),
             (
@@ -1625,7 +1625,7 @@ mod tests {
             opus: Some("claude-opus-4.7".into()),
             sonnet: Some("claude-sonnet-4.6".into()),
             haiku: Some("claude-haiku-4-5".into()),
-            reasoning: Some("claude-opus-4.7".into()),
+            fable: Some("claude-fable-5".into()),
             subagent: Some("claude-haiku-4-5".into()),
             ..Default::default()
         };
@@ -1643,8 +1643,8 @@ mod tests {
             Some(&"claude-haiku-4-5".to_string()),
         );
         assert_eq!(
-            env.get("ANTHROPIC_REASONING_MODEL"),
-            Some(&"claude-opus-4-7".to_string()),
+            env.get("ANTHROPIC_DEFAULT_FABLE_MODEL"),
+            Some(&"claude-fable-5".to_string()),
         );
         assert_eq!(
             env.get("CLAUDE_CODE_SUBAGENT_MODEL"),
@@ -2060,7 +2060,7 @@ mod tests {
             Some(&"claude-3-opus".to_string())
         );
         assert_eq!(
-            env.get("ANTHROPIC_REASONING_MODEL"),
+            env.get("ANTHROPIC_DEFAULT_FABLE_MODEL"),
             Some(&"claude-3-opus".to_string())
         );
     }
@@ -2092,7 +2092,7 @@ mod tests {
         for slot in [
             "ANTHROPIC_DEFAULT_SONNET_MODEL",
             "ANTHROPIC_DEFAULT_OPUS_MODEL",
-            "ANTHROPIC_REASONING_MODEL",
+            "ANTHROPIC_DEFAULT_FABLE_MODEL",
             "CLAUDE_CODE_SUBAGENT_MODEL",
         ] {
             assert_eq!(
@@ -2118,7 +2118,7 @@ mod tests {
         assert!(!env.contains_key("ANTHROPIC_MODEL"));
         assert!(!env.contains_key("ANTHROPIC_DEFAULT_HAIKU_MODEL"));
         assert!(!env.contains_key("ANTHROPIC_DEFAULT_OPUS_MODEL"));
-        assert!(!env.contains_key("ANTHROPIC_REASONING_MODEL"));
+        assert!(!env.contains_key("ANTHROPIC_DEFAULT_FABLE_MODEL"));
         assert!(!env.contains_key("CLAUDE_CODE_SUBAGENT_MODEL"));
         assert!(!env.contains_key("ANTHROPIC_SMALL_FAST_MODEL"));
         assert_eq!(
@@ -2304,19 +2304,19 @@ mod tests {
     fn for_claude_per_slot_overrides_normalize_in_direct_mode() {
         // Direct Anthropic mode normalizes dotted versions like 4.6 → 4-6.
         // Per-slot overrides should pass through the same normalization so a
-        // user passing `--reasoning-model claude-sonnet-4.6` doesn't get a
+        // user passing `--fable-model claude-sonnet-4.6` doesn't get a
         // 404 from the native Anthropic endpoint.
         let injector = EnvironmentInjector::new();
         let key = test_api_key("https://api.anthropic.com"); // → Direct mode.
         let overrides = ClaudeModelOverrides {
-            reasoning: Some("claude-sonnet-4.6".to_string()),
+            fable: Some("claude-sonnet-4.6".to_string()),
             ..Default::default()
         };
 
         let env = injector.for_claude_with_overrides(&key, None, &overrides);
 
         assert_eq!(
-            env.get("ANTHROPIC_REASONING_MODEL"),
+            env.get("ANTHROPIC_DEFAULT_FABLE_MODEL"),
             Some(&"claude-sonnet-4-6".to_string()),
             "dotted version should be normalized for Direct mode",
         );

@@ -11,7 +11,7 @@ use serde_json::{Map, Value, json};
 use crate::cli::{AccountSubcommand, Cli, CodeArgs, Commands};
 use crate::cli_args::{
     extract_aivo_flags, lift_context_suffix, needs_bundle_lookup, parse_context_token,
-    resolve_alias_in_memory, rewrite_cli_args,
+    rewrite_cli_args,
 };
 use crate::commands::{
     self, AccountCommand, AliasCommand, CodeCommand, InfoCommand, KeysCommand, LoginCommand,
@@ -474,7 +474,7 @@ pub async fn run() -> ! {
             let extracted = extract_aivo_flags(
                 run_args.model,
                 ClaudeSlotFlags {
-                    reasoning: run_args.reasoning_model,
+                    fable: run_args.fable_model,
                     subagent: run_args.subagent_model,
                     haiku: run_args.haiku_model,
                     sonnet: run_args.sonnet_model,
@@ -507,17 +507,17 @@ pub async fn run() -> ! {
             // in-memory snapshot of the alias map, instead of paying one disk
             // read per call (worst case 7).
             let aliases = session_store.get_aliases().await.unwrap_or_default();
-            let resolve = |m: Option<String>| resolve_alias_in_memory(&aliases, m);
-            // `-m <keyRef>::<model>`: split before alias resolution (alias applies
-            // to the model half); the key ref feeds key selection below.
-            let (main_key_ref, main_model) = match extracted.model {
+            // `-m <keyRef>::<model>`: split off the provider; the model half
+            // (or an alias expanding to `key::model`) is resolved after.
+            let (main_key_ref, resolved_model) = match extracted.model {
                 Some(v) => {
                     let (key_ref, model) = crate::cli_args::split_tier_spec(&v);
+                    let (key_ref, model) =
+                        crate::cli_args::resolve_alias_with_tier(&aliases, key_ref, model);
                     (key_ref, Some(model))
                 }
                 None => (None, None),
             };
-            let resolved_model = resolve(main_model);
             // Raw: `resolve_claude_overrides` splits the `<key>::` prefix and
             // alias-resolves the model half itself.
             let slots = extracted.slots;
@@ -643,13 +643,24 @@ pub async fn run() -> ! {
                     .and_then(AIToolType::parse)
                     .map(KeyCompatContext::Tool)
                     .unwrap_or(KeyCompatContext::None);
+                // Bare `--model` alongside tier flags picks its provider like
+                // the tiers do, instead of reusing the active key.
+                let force_default_provider = key_flag.is_none()
+                    && slots.any_set()
+                    && matches!(model.as_deref(), Some(""))
+                    && !dry_run;
+                let key_flag = if force_default_provider {
+                    Some("")
+                } else {
+                    key_flag.as_deref()
+                };
                 let key_override = if is_hf_takeover(model.as_deref()) {
                     None
                 } else {
                     key_or_exit(
                         resolve_key_override(
                             &session_store,
-                            key_flag.as_deref(),
+                            key_flag,
                             KeyLookupMode::RequireActiveOrPrompt,
                             compat,
                         )
