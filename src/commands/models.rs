@@ -523,6 +523,20 @@ fn url_origin(url: &str) -> Option<String> {
     Some(origin)
 }
 
+/// Candidate models endpoints in probe order: exact base-URL paths first,
+/// origin as fallback — origin-first broke path-suffixed keys (issue #24).
+fn openai_models_candidates(base: &str) -> Vec<String> {
+    let model_endpoints = |b: &str| [format!("{}/v1/models", b), format!("{}/models", b)];
+    let mut candidates = Vec::new();
+    candidates.extend(model_endpoints(base));
+    if let Some(origin) = url_origin(base)
+        && origin != base
+    {
+        candidates.extend(model_endpoints(&origin));
+    }
+    candidates
+}
+
 /// Returns true if the model is suitable for text chat. Single source of
 /// truth lives in `services::model_compat::text_chat_incompat_reason`; this
 /// is the boolean flip used by upstream filters (Copilot, hoisted
@@ -1233,14 +1247,7 @@ async fn fetch_models_detailed_filtered(
             Ok(models)
         }
         ModelListingStrategy::OpenAiCompatible => {
-            let model_endpoints = |b: &str| [format!("{}/v1/models", b), format!("{}/models", b)];
-            let mut candidates = Vec::new();
-            if let Some(origin) = url_origin(base)
-                && origin != base
-            {
-                candidates.extend(model_endpoints(&origin));
-            }
-            candidates.extend(model_endpoints(base));
+            let candidates = openai_models_candidates(base);
             let auth = format!("Bearer {}", key.key.as_str());
 
             let mut last_err = String::new();
@@ -1525,6 +1532,26 @@ mod tests {
             key: Zeroizing::new("sk-test".to_string()),
             created_at: "2026-01-01".to_string(),
         }
+    }
+
+    #[test]
+    fn openai_models_candidates_probe_base_path_before_origin() {
+        assert_eq!(
+            openai_models_candidates("https://proxy.example.com/stg"),
+            vec![
+                "https://proxy.example.com/stg/v1/models",
+                "https://proxy.example.com/stg/models",
+                "https://proxy.example.com/v1/models",
+                "https://proxy.example.com/models",
+            ]
+        );
+        assert_eq!(
+            openai_models_candidates("https://api.example.com"),
+            vec![
+                "https://api.example.com/v1/models",
+                "https://api.example.com/models",
+            ]
+        );
     }
 
     #[test]
