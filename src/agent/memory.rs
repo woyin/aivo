@@ -746,7 +746,10 @@ mod tests {
         assert_eq!(dream_gate_at(&log, &marker), DreamGate::TooSoon);
         let old = std::time::SystemTime::now()
             - std::time::Duration::from_secs((DREAM_MIN_HOURS + 1) * 3600);
-        std::fs::File::open(&marker)
+        // Windows requires write access on the handle to set file times.
+        std::fs::File::options()
+            .write(true)
+            .open(&marker)
             .unwrap()
             .set_modified(old)
             .unwrap();
