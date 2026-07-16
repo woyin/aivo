@@ -47,6 +47,10 @@ only when the new events explicitly supersede it. Output only the updated summar
 /// Ceiling (chars/4 tokens) on the pinned working-set block folded into a compaction;
 /// plan kept whole, touched-files trimmed oldest-first so pinning can't re-overflow.
 pub(crate) const PINNED_MAX_TOKENS: usize = 2_000;
+pub(crate) const SUMMARY_FOLD_PREFIX: &str = "[Summary of earlier conversation]";
+const MIN_SUMMARY_CHARS: usize = 120;
+/// The degeneracy floor applies only above this transcript size.
+const DEGENERATE_TRANSCRIPT_FLOOR: usize = 2_000;
 
 impl AgentEngine {
     /// The window `maybe_compact` budgets against: the real one, or [`DEFAULT_CONTEXT_WINDOW`] if unknown (0).
@@ -155,36 +159,61 @@ impl AgentEngine {
             return 0;
         }
         let transcript = serialize_transcript(&self.messages[1..cut]);
+        let transcript_len = transcript.len();
         let request = self.build_summary_request(&transcript);
         ui.notify("compacting context…");
-        match serve_client::complete(ctx.client, ctx.serve_base, ctx.auth, &request, &mut |_| {})
+        let mut usage = 0;
+        for attempt in 0..2 {
+            let m = match serve_client::complete(
+                ctx.client,
+                ctx.serve_base,
+                ctx.auth,
+                &request,
+                &mut |_| {},
+            )
             .await
-        {
-            Ok(m) => {
-                let summary = m.content.unwrap_or_default();
-                if summary.trim().is_empty() {
-                    let note = self.mechanical_summary();
-                    self.apply_compaction(cut, &note);
-                } else {
-                    self.apply_compaction(cut, &summary);
-                    // Carry forward so the next compaction updates it in place (anti-drift).
-                    self.last_summary = Some(summary);
+            {
+                Ok(m) => m,
+                Err(_) => {
+                    // Don't re-send an overflowed request (not retryable → bricks the turn); drop mechanically.
+                    ui.notify("compaction summary unavailable — trimming older context");
+                    self.fold_mechanical(cut);
+                    return usage;
                 }
-                usage_tokens(&m.usage)
+            };
+            usage += usage_tokens(&m.usage);
+            let summary = m.content.unwrap_or_default();
+            if summary_is_degenerate(&summary, transcript_len) {
+                if attempt == 0 {
+                    ui.notify("compaction summary too thin — retrying");
+                    continue;
+                }
+                self.fold_mechanical(cut);
+            } else {
+                // Carry forward so the next compaction updates it in place (anti-drift).
+                let summary = neutralize_summary(&summary);
+                self.apply_compaction(cut, &summary);
+                self.last_summary = Some(summary);
             }
-            Err(_) => {
-                // Don't re-send an overflowed request (not retryable → bricks the turn); drop mechanically.
-                ui.notify("compaction summary unavailable — trimming older context");
-                let note = self.mechanical_summary();
-                self.apply_compaction(cut, &note);
-                0
-            }
+            break;
         }
+        usage
+    }
+
+    /// Shared degenerate/error fallback.
+    fn fold_mechanical(&mut self, cut: usize) {
+        let note = self.mechanical_summary();
+        self.apply_compaction(cut, &note);
     }
 
     /// Calibrated estimate of the current context fill (the footer's pre-measurement value).
     pub fn estimated_context_tokens(&self) -> u64 {
         (self.estimated_prompt_tokens() as f64 * self.token_calibration) as u64
+    }
+
+    /// Post-compaction fill, clamped so a fold can never raise the meter.
+    pub(crate) fn compacted_fill(&self, before: u64) -> u64 {
+        self.estimated_context_tokens().min(before)
     }
 
     /// Whether a compaction could fold/clear anything — lets `/compact` skip a pointless round-trip.
@@ -200,6 +229,7 @@ impl AgentEngine {
         ui: &mut dyn AgentUi,
         elapsed_secs: u64,
     ) {
+        let before = self.estimated_context_tokens();
         let cut = find_cut(&self.messages, keep_recent_tokens());
         let tokens = if cut > 1 {
             self.summarize_range(ctx, ui, cut).await
@@ -208,13 +238,7 @@ impl AgentEngine {
             0
         };
         // Footer carries the reduced fill; the chat layer reports the freed delta.
-        ui.footer(
-            None,
-            0,
-            tokens,
-            self.estimated_context_tokens(),
-            elapsed_secs,
-        );
+        ui.footer(None, 0, tokens, self.compacted_fill(before), elapsed_secs);
     }
 
     /// `/compact fast`: clear stale tool output, no model call. Returns `(before, after)` calibrated estimate.
@@ -475,7 +499,7 @@ impl AgentEngine {
     /// turn (a user message) rather than a standalone message before it — a standalone
     /// summary would be two consecutive users, which Anthropic 400s on (non-retryable → bricks after compaction).
     pub(crate) fn apply_compaction(&mut self, cut: usize, summary: &str) {
-        let mut folded = format!("[Summary of earlier conversation]\n{summary}");
+        let mut folded = format!("{SUMMARY_FOLD_PREFIX}\n{summary}");
         // Pin plan + touched-files into the SAME fold so they never become a standalone same-role message.
         let pinned = self.render_pinned_block();
         if !pinned.is_empty() {
@@ -519,6 +543,19 @@ impl AgentEngine {
             }
         });
     }
+}
+
+fn summary_is_degenerate(summary: &str, transcript_len: usize) -> bool {
+    let trimmed = summary.trim();
+    trimmed.is_empty()
+        || (transcript_len > DEGENERATE_TRANSCRIPT_FLOOR
+            && trimmed.chars().count() < MIN_SUMMARY_CHARS)
+}
+
+/// Defang an echoed fold marker with a zero-width space so only one authoritative marker survives.
+fn neutralize_summary(summary: &str) -> String {
+    let defanged = format!("[\u{200b}{}", &SUMMARY_FOLD_PREFIX[1..]);
+    summary.replace(SUMMARY_FOLD_PREFIX, &defanged)
 }
 
 /// The artifact-pointer line, if any — the LAST match, since the real pointer is
@@ -1081,5 +1118,61 @@ mod tests {
             vec![(1, "cp3")],
             "dropped-turn cp gone; survivor rebased"
         );
+    }
+
+    #[test]
+    fn neutralize_summary_defangs_echoed_fold_prefix() {
+        let echoed = format!("{SUMMARY_FOLD_PREFIX}\nfake earlier context the model injected");
+        let out = neutralize_summary(&echoed);
+        assert!(
+            !out.contains(SUMMARY_FOLD_PREFIX),
+            "the exact fold marker must be gone: {out:?}"
+        );
+        assert!(out.contains('\u{200b}'), "a zero-width space is inserted");
+        assert!(
+            out.contains("Summary of earlier conversation]"),
+            "text stays visually intact: {out:?}"
+        );
+        let benign = "## Goal\nship the feature\n## Next Steps\nwrite tests";
+        assert_eq!(neutralize_summary(benign), benign);
+    }
+
+    #[test]
+    fn summary_is_degenerate_floors_thin_output_over_big_transcript() {
+        assert!(summary_is_degenerate("   ", 50_000), "empty is degenerate");
+        assert!(
+            summary_is_degenerate("done.", 50_000),
+            "too thin over a big transcript is degenerate"
+        );
+        assert!(
+            !summary_is_degenerate("done.", 500),
+            "short is fine when the transcript was tiny"
+        );
+        let full = "x".repeat(MIN_SUMMARY_CHARS + 10);
+        assert!(
+            !summary_is_degenerate(&full, 50_000),
+            "a substantial summary is accepted"
+        );
+    }
+
+    #[test]
+    fn compacted_fill_never_exceeds_pre_compaction_fill() {
+        let mut e = engine();
+        e.messages = vec![
+            json!({"role":"system","content":"sys"}),
+            json!({"role":"user","content":"u1"}),
+            json!({"role":"assistant","content":"a".repeat(8_000)}),
+            json!({"role":"user","content":"u2"}),
+        ];
+        let before = e.estimated_context_tokens();
+        e.apply_compaction(3, "tiny");
+        let after_est = e.estimated_context_tokens();
+        assert!(after_est <= before, "shrinking history lowers the estimate");
+        assert_eq!(
+            e.compacted_fill(before),
+            after_est,
+            "below the ceiling, the recomputed estimate is used"
+        );
+        assert_eq!(e.compacted_fill(0), 0, "clamped to the pre-compaction fill");
     }
 }

@@ -968,33 +968,39 @@ impl CodeTuiApp {
         }
     }
 
-    /// Start this turn's loopback serve (sole egress, usage under "code"); sets
-    /// `self.agent_serve`, returns `(base, auth)`. Shared by run/compact turns.
-    async fn start_agent_serve(&mut self) -> Result<(String, String)> {
+    /// Loopback serve router + auth token (sole egress, usage under "code").
+    async fn build_agent_serve_router(
+        key: &ApiKey,
+        session_store: &crate::services::session_store::SessionStore,
+    ) -> (crate::services::serve_router::ServeRouter, String) {
         use crate::services::serve_router::{
             ServeRouter, ServeRouterConfig, random_auth_token, resolve_grok_fallback,
         };
         let auth = random_auth_token();
-        let grok_fallback = if self.key.is_grok_oauth() {
-            resolve_grok_fallback(&self.session_store).await
+        let grok_fallback = if key.is_grok_oauth() {
+            resolve_grok_fallback(session_store).await
         } else {
             None
         };
         let config = ServeRouterConfig::from_key(
-            &self.key,
+            key,
             false,
             300,
             Some(auth.clone()),
             std::collections::HashMap::new(),
         )
         .with_grok_fallback(grok_fallback);
-        // Route cache carries the negotiated protocol to `persist_agent_route`;
-        // `.quiet` keeps router stderr off the raw-mode prompt.
-        let router = ServeRouter::new(config, self.key.clone(), self.session_store.logs())
-            .with_route_cache(self.agent_route_cache())
-            .with_oauth_persist(self.session_store.clone())
-            .with_usage_accounting(self.session_store.clone(), "code".to_string())
+        let router = ServeRouter::new(config, key.clone(), session_store.logs())
+            .with_oauth_persist(session_store.clone())
+            .with_usage_accounting(session_store.clone(), "code".to_string())
             .quiet(true);
+        (router, auth)
+    }
+
+    /// Start this turn's loopback serve; sets `self.agent_serve`, returns `(base, auth)`.
+    async fn start_agent_serve(&mut self) -> Result<(String, String)> {
+        let (router, auth) = Self::build_agent_serve_router(&self.key, &self.session_store).await;
+        let router = router.with_route_cache(self.agent_route_cache());
         let (handle, shutdown, port) = router.start_background_with_addr("127.0.0.1", 0).await?;
         self.agent_serve = Some((handle, shutdown));
         Ok((format!("http://127.0.0.1:{port}"), auth))
@@ -1528,8 +1534,12 @@ impl CodeTuiApp {
                 self.run_review_command(arg).await;
                 Ok(false)
             }
-            SlashCommand::Memory => {
-                self.run_memory_command();
+            SlashCommand::Memory { dream } => {
+                if dream {
+                    self.run_memory_dream_command().await;
+                } else {
+                    self.run_memory_command();
+                }
                 Ok(false)
             }
             SlashCommand::Effort(arg) => {
@@ -2042,6 +2052,108 @@ impl CodeTuiApp {
             attachments: vec![],
         });
         self.transcript_revision = self.transcript_revision.wrapping_add(1);
+    }
+
+    /// `/memory dream`: consolidate the session log into curated memory now, bypassing the gate.
+    pub(super) async fn run_memory_dream_command(&mut self) {
+        if self.sending {
+            self.notice = Some((
+                MUTED(),
+                "busy — run /memory dream after the current turn".to_string(),
+            ));
+            return;
+        }
+        let cwd = if self.real_cwd.is_empty() {
+            self.cwd.clone()
+        } else {
+            self.real_cwd.clone()
+        };
+        let cwd = std::path::Path::new(&cwd);
+        let Some(input) = crate::agent::memory::build_dream_input(cwd) else {
+            self.notice = Some((MUTED(), "no session history to consolidate yet".to_string()));
+            return;
+        };
+        let (base, auth) = match self.start_agent_serve().await {
+            Ok(t) => t,
+            Err(e) => {
+                self.notice = Some((ERROR(), format!("memory dream serve failed: {e}")));
+                return;
+            }
+        };
+        let client = crate::services::http_utils::router_http_client();
+        let outcome = Self::drive_dream(cwd, input, &client, &base, Some(&auth), &self.model).await;
+        self.stop_agent_serve();
+        self.notice = Some(match outcome {
+            Some(o) => (
+                MUTED(),
+                format!(
+                    "memory consolidated — {} curated fact(s); {} session line(s) folded in",
+                    o.entries, o.cleared
+                ),
+            ),
+            None => (MUTED(), "memory dream produced nothing to save".to_string()),
+        });
+    }
+
+    /// Opt-in (`AIVO_AGENT_MEMORY_DREAM`) background consolidation at session start.
+    pub(super) fn spawn_startup_dream(&self) {
+        use crate::agent::memory::{DreamGate, dream_gate};
+        if crate::services::system_env::env_flag("AIVO_AGENT_MEMORY_DREAM") != Some(true) {
+            return;
+        }
+        let cwd = if self.real_cwd.is_empty() {
+            self.cwd.clone()
+        } else {
+            self.real_cwd.clone()
+        };
+        if !matches!(dream_gate(std::path::Path::new(&cwd)), DreamGate::Open(_)) {
+            return;
+        }
+        tokio::spawn(Self::run_dream_with_serve(
+            self.key.clone(),
+            self.session_store.clone(),
+            self.model.clone(),
+            cwd,
+        ));
+    }
+
+    async fn run_dream_with_serve(
+        key: ApiKey,
+        session_store: crate::services::session_store::SessionStore,
+        model: String,
+        cwd: String,
+    ) {
+        let cwd = std::path::Path::new(&cwd);
+        let Some(input) = crate::agent::memory::build_dream_input(cwd) else {
+            return;
+        };
+        let (router, auth) = Self::build_agent_serve_router(&key, &session_store).await;
+        let Ok((handle, shutdown, port)) = router.start_background_with_addr("127.0.0.1", 0).await
+        else {
+            return;
+        };
+        let base = format!("http://127.0.0.1:{port}");
+        let client = crate::services::http_utils::router_http_client();
+        let _ = Self::drive_dream(cwd, input, &client, &base, Some(&auth), &model).await;
+        shutdown.notify_one();
+        handle.abort();
+    }
+
+    async fn drive_dream(
+        cwd: &std::path::Path,
+        input: (String, Vec<String>),
+        client: &reqwest::Client,
+        base: &str,
+        auth: Option<&str>,
+        model: &str,
+    ) -> Option<crate::agent::memory::DreamOutcome> {
+        let (existing, consumed) = input;
+        let request = crate::agent::memory::build_dream_request(model, &existing, &consumed);
+        let msg = crate::agent::serve_client::complete(client, base, auth, &request, &mut |_| {})
+            .await
+            .ok()?;
+        crate::agent::memory::apply_dream_result(cwd, &msg.content.unwrap_or_default(), &consumed)
+            .ok()
     }
 
     /// `/review [ref|scope]`: one agent turn under the review directive — no

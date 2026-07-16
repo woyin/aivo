@@ -271,13 +271,24 @@ fn strip_angle_brackets(s: &str) -> String {
 /// why isolation is unavailable — callers fall back to the shared workspace. Roots
 /// at the repo top level; [`worktree_cwd`] mirrors the parent's subdir inside it.
 pub fn create_worktree(parent: &Path) -> Result<PathBuf, String> {
+    if let Some(dir) = create_worktree_cow(parent) {
+        return Ok(dir);
+    }
+    create_worktree_checkout(parent)
+}
+
+fn worktree_slug() -> String {
     use std::sync::atomic::{AtomicU64, Ordering};
     static SEQ: AtomicU64 = AtomicU64::new(0);
-    let dir = std::env::temp_dir().join(format!(
+    format!(
         "aivo-worktree-{}-{}",
         std::process::id(),
         SEQ.fetch_add(1, Ordering::Relaxed)
-    ));
+    )
+}
+
+fn create_worktree_checkout(parent: &Path) -> Result<PathBuf, String> {
+    let dir = std::env::temp_dir().join(worktree_slug());
     let out = std::process::Command::new("git")
         .args([
             "-C",
@@ -295,11 +306,8 @@ pub fn create_worktree(parent: &Path) -> Result<PathBuf, String> {
     Ok(dir)
 }
 
-/// The dir in worktree root `wt` mirroring `parent`'s position in its repo, so a
-/// delegate from `repo/crates/app` works on the worktree's `crates/app`, not the
-/// root. Falls back to `wt` when unresolvable.
-pub fn worktree_cwd(parent: &Path, wt: &Path) -> PathBuf {
-    let toplevel = std::process::Command::new("git")
+fn git_toplevel(parent: &Path) -> Option<PathBuf> {
+    let out = std::process::Command::new("git")
         .args([
             "-C",
             &parent.display().to_string(),
@@ -307,10 +315,115 @@ pub fn worktree_cwd(parent: &Path, wt: &Path) -> PathBuf {
             "--show-toplevel",
         ])
         .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .map(|o| PathBuf::from(String::from_utf8_lossy(&o.stdout).trim()));
-    if let Some(top) = toplevel {
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let top = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (!top.is_empty()).then(|| PathBuf::from(top))
+}
+
+/// Reflink-clone a clean repo into a sibling linked worktree; `None` → plain-checkout fallback.
+#[cfg(unix)]
+fn create_worktree_cow(parent: &Path) -> Option<PathBuf> {
+    use std::os::unix::fs::MetadataExt;
+    // A dirty tree would defeat finalize's "changed == the sub-agent's edits" contract.
+    let status = std::process::Command::new("git")
+        .args(["-C", &parent.display().to_string(), "status", "--porcelain"])
+        .output()
+        .ok()?;
+    if !status.status.success() || !status.stdout.is_empty() {
+        return None;
+    }
+    let toplevel = git_toplevel(parent)?;
+    let dest_parent = toplevel.parent()?;
+    // reflink needs the clone on the repo's filesystem.
+    if std::fs::metadata(dest_parent).ok()?.dev() != std::fs::metadata(&toplevel).ok()?.dev() {
+        return None;
+    }
+    let dir = dest_parent.join(format!(".{}", worktree_slug()));
+    let add = std::process::Command::new("git")
+        .args([
+            "-C",
+            &parent.display().to_string(),
+            "worktree",
+            "add",
+            "--no-checkout",
+            "--detach",
+        ])
+        .arg(&dir)
+        .output()
+        .ok()?;
+    if !add.status.success() {
+        return None;
+    }
+    if reflink_tree(&toplevel, &dir).is_err() {
+        prune_worktree(parent, &dir);
+        return None;
+    }
+    // `--no-checkout` leaves a stale index; reset so the clean clone doesn't read as D/??.
+    let reset = std::process::Command::new("git")
+        .args(["-C", &dir.display().to_string(), "reset", "-q", "HEAD"])
+        .output();
+    if !matches!(reset, Ok(o) if o.status.success()) {
+        prune_worktree(parent, &dir);
+        return None;
+    }
+    Some(dir)
+}
+
+#[cfg(not(unix))]
+fn create_worktree_cow(_parent: &Path) -> Option<PathBuf> {
+    None
+}
+
+/// Strict reflink of `src` into `dst` (skips VCS/build junk); non-CoW filesystems error out fast.
+#[cfg(unix)]
+fn reflink_tree(src: &Path, dst: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dst)?;
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        if matches!(
+            name.to_str(),
+            Some(".git" | "node_modules" | "target" | ".DS_Store")
+        ) {
+            continue;
+        }
+        let from = entry.path();
+        let to = dst.join(&name);
+        let ty = entry.file_type()?;
+        if ty.is_dir() {
+            reflink_tree(&from, &to)?;
+        } else if ty.is_symlink() {
+            std::os::unix::fs::symlink(std::fs::read_link(&from)?, &to)?;
+        } else if ty.is_file() {
+            reflink_copy::reflink(&from, &to)?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn prune_worktree(parent: &Path, dir: &Path) {
+    let _ = std::process::Command::new("git")
+        .args([
+            "-C",
+            &parent.display().to_string(),
+            "worktree",
+            "remove",
+            "--force",
+        ])
+        .arg(dir)
+        .output();
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// The dir in worktree root `wt` mirroring `parent`'s position in its repo, so a
+/// delegate from `repo/crates/app` works on the worktree's `crates/app`, not the
+/// root. Falls back to `wt` when unresolvable.
+pub fn worktree_cwd(parent: &Path, wt: &Path) -> PathBuf {
+    if let Some(top) = git_toplevel(parent) {
         let parent_canon = std::fs::canonicalize(parent).unwrap_or_else(|_| parent.to_path_buf());
         if let Ok(rel) = parent_canon.strip_prefix(&top) {
             let mirrored = wt.join(rel);
@@ -725,6 +838,87 @@ mod tests {
         assert!(!repo.join("b.txt").exists(), "parent tree untouched");
         // Not a repo → Err (callers fall back to the shared workspace).
         assert!(create_worktree(&tmp()).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn create_worktree_cow_declines_a_dirty_repo() {
+        let repo = tmp();
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&repo)
+                .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?}");
+        };
+        git(&["init", "-q"]);
+        std::fs::write(repo.join("a.txt"), "one").unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-qm", "init"]);
+        std::fs::write(repo.join("a.txt"), "two").unwrap();
+        assert!(
+            create_worktree_cow(&repo).is_none(),
+            "dirty repo must decline the CoW path"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn create_worktree_cow_clean_repo_reads_clean_and_detects_edits() {
+        let repo = tmp();
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&repo)
+                .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?}");
+        };
+        git(&["init", "-q"]);
+        std::fs::create_dir_all(repo.join("sub")).unwrap();
+        std::fs::write(repo.join("a.txt"), "one").unwrap();
+        std::fs::write(repo.join("sub/b.txt"), "two").unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-qm", "init"]);
+
+        let Some(wt) = create_worktree_cow(&repo) else {
+            return; // no reflink on this filesystem (e.g. ext4)
+        };
+        assert!(
+            wt.join("a.txt").is_file() && wt.join("sub/b.txt").is_file(),
+            "the working tree was cloned in"
+        );
+        let porcelain = |dir: &Path| {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(dir)
+                .args(["status", "--porcelain"])
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        assert_eq!(
+            porcelain(&wt),
+            "",
+            "a freshly-cloned clean repo reads clean"
+        );
+        std::fs::write(wt.join("a.txt"), "edited").unwrap();
+        assert!(
+            !porcelain(&wt).is_empty(),
+            "a sub-agent edit shows up in status"
+        );
+        assert_eq!(
+            std::fs::read_to_string(repo.join("a.txt")).unwrap(),
+            "one",
+            "the parent tree is untouched by the worktree edit"
+        );
+        prune_worktree(&repo, &wt);
+        assert!(!wt.exists(), "prune removes the linked worktree");
     }
 
     #[test]

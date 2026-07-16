@@ -2,8 +2,8 @@
 //! per-project file under the config dir (never in the repo), injected into
 //! future sessions via the guide inlining in `system_prompt`.
 
-use crate::agent::protocol::ToolSpec;
-use serde_json::json;
+use crate::agent::protocol::{ChatRequest, ToolSpec};
+use serde_json::{Map, json};
 use std::path::{Path, PathBuf};
 
 const MAX_ENTRIES: usize = 100;
@@ -178,20 +178,7 @@ fn append_fact(
     {
         entries.remove(0);
     }
-    if let Some(dir) = path.parent() {
-        crate::services::atomic_write::ensure_private_dir_blocking(dir)
-            .map_err(|e| format!("create memory dir: {e}"))?;
-    }
-    let mut out = String::with_capacity(header.len() + 64 * entries.len());
-    out.push_str(header);
-    out.push('\n');
-    for e in &entries {
-        out.push_str("- ");
-        out.push_str(e);
-        out.push('\n');
-    }
-    crate::services::atomic_write::atomic_write_secure_blocking(path, out.as_bytes())
-        .map_err(|e| format!("write memory file: {e}"))?;
+    write_bullet_file(path, header, &entries)?;
     Ok(if refreshed {
         RememberOutcome::Refreshed
     } else {
@@ -384,6 +371,205 @@ pub fn search_result_text(cwd: &Path, query: &str) -> String {
     out
 }
 
+// ── dream: LLM consolidation of the session log into curated memory ────────────
+
+const DREAM_MIN_HOURS: u64 = 24;
+const DREAM_MIN_SESSIONS: usize = 5;
+const MAX_DREAM_INPUT_CHARS: usize = 32_000;
+const MIN_DREAM_CHARS: usize = 40;
+
+const DREAM_SYSTEM_PROMPT: &str = "You are consolidating a coding agent's cross-session memory for one \
+project — a reflective \"dream\" pass over what it has learned. You are given the CURRENT curated \
+memory (durable facts, one `- ` bullet each) followed by recent SESSION LOG lines (dated one-line \
+topics). Produce the UPDATED curated memory:\n\
+- Merge related facts; keep each as one concise `- ` bullet.\n\
+- Resolve contradictions in favour of the most recent truth; drop anything a later session disproved.\n\
+- Convert relative dates (\"today\", \"last week\") to absolute dates.\n\
+- Discard ephemera: greetings, tool-output noise, transient progress, \"next steps\".\n\
+- Preserve decisions and their rationale, user preferences and corrections, non-obvious constraints and gotchas.\n\
+Output ONLY the `- ` bullets, no headings or preamble. If nothing is worth persisting, reply exactly NO_REPLY.";
+
+/// Marker file; its mtime is the last consolidation time.
+fn dream_marker_path(cwd: &Path) -> PathBuf {
+    memory_dir().join(format!("{}.dream", project_key(cwd)))
+}
+
+fn marker_age_hours(path: &Path) -> Option<u64> {
+    let mtime = std::fs::metadata(path).ok()?.modified().ok()?;
+    Some(
+        std::time::SystemTime::now()
+            .duration_since(mtime)
+            .ok()?
+            .as_secs()
+            / 3600,
+    )
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum DreamGate {
+    TooFew,
+    TooSoon,
+    /// Ready: pending session entries.
+    Open(usize),
+}
+
+/// Automatic-consolidation gate; the manual `/memory dream` bypasses it.
+pub fn dream_gate(cwd: &Path) -> DreamGate {
+    dream_gate_at(&session_log_path(cwd), &dream_marker_path(cwd))
+}
+
+fn dream_gate_at(session_log: &Path, marker: &Path) -> DreamGate {
+    let pending = load_entries(session_log).len();
+    if pending < DREAM_MIN_SESSIONS {
+        return DreamGate::TooFew;
+    }
+    if let Some(age) = marker_age_hours(marker)
+        && age < DREAM_MIN_HOURS
+    {
+        return DreamGate::TooSoon;
+    }
+    DreamGate::Open(pending)
+}
+
+#[derive(Debug)]
+pub struct DreamOutcome {
+    pub entries: usize,
+    pub cleared: usize,
+}
+
+/// Curated memory + the session lines consumed (capped); `None` when nothing is pending.
+pub fn build_dream_input(cwd: &Path) -> Option<(String, Vec<String>)> {
+    let existing = std::fs::read_to_string(project_memory_path(cwd)).unwrap_or_default();
+    let sessions = load_entries(&session_log_path(cwd));
+    if sessions.is_empty() {
+        return None;
+    }
+    let mut budget = MAX_DREAM_INPUT_CHARS.saturating_sub(existing.len());
+    let mut consumed = Vec::new();
+    for line in sessions {
+        let need = line.len() + 3;
+        if need > budget && !consumed.is_empty() {
+            break;
+        }
+        budget = budget.saturating_sub(need);
+        consumed.push(line);
+    }
+    Some((existing, consumed))
+}
+
+pub fn build_dream_request(model: &str, existing: &str, sessions: &[String]) -> ChatRequest {
+    let mut user = String::from("## Current curated memory\n");
+    user.push_str(if existing.trim().is_empty() {
+        "(empty)\n"
+    } else {
+        existing
+    });
+    user.push_str("\n\n## Recent session log\n");
+    for s in sessions {
+        user.push_str("- ");
+        user.push_str(s);
+        user.push('\n');
+    }
+    ChatRequest {
+        model: model.to_string(),
+        messages: vec![
+            json!({"role": "system", "content": DREAM_SYSTEM_PROMPT}),
+            json!({"role": "user", "content": user}),
+        ],
+        tools: vec![],
+        extra: Map::new(),
+    }
+}
+
+fn parse_dream_entries(response: &str) -> Vec<String> {
+    response
+        .lines()
+        .map(|l| l.trim().trim_start_matches(['-', '*', '•']).trim())
+        .filter(|l| !l.is_empty())
+        .map(|l| l.chars().take(MAX_ENTRY_CHARS).collect::<String>())
+        .collect()
+}
+
+fn write_bullet_file(path: &Path, header: &str, entries: &[String]) -> Result<(), String> {
+    if let Some(dir) = path.parent() {
+        crate::services::atomic_write::ensure_private_dir_blocking(dir)
+            .map_err(|e| format!("create memory dir: {e}"))?;
+    }
+    let mut out = String::with_capacity(header.len() + 64 * entries.len());
+    out.push_str(header);
+    out.push('\n');
+    for e in entries {
+        out.push_str("- ");
+        out.push_str(e);
+        out.push('\n');
+    }
+    crate::services::atomic_write::atomic_write_secure_blocking(path, out.as_bytes())
+        .map_err(|e| format!("write memory file: {e}"))
+}
+
+fn touch_marker_at(marker: &Path) {
+    if let Some(dir) = marker.parent() {
+        let _ = crate::services::atomic_write::ensure_private_dir_blocking(dir);
+    }
+    let _ = crate::services::atomic_write::atomic_write_secure_blocking(marker, b"");
+}
+
+fn clear_session_lines_at(path: &Path, consumed: &[String]) -> usize {
+    let before = load_entries(path);
+    let remaining: Vec<String> = before
+        .iter()
+        .filter(|e| !consumed.contains(e))
+        .cloned()
+        .collect();
+    let cleared = before.len() - remaining.len();
+    let _ = write_bullet_file(path, SESSION_HEADER, &remaining);
+    cleared
+}
+
+/// Apply a dream response; stamps the marker even on NO_REPLY so retries stay throttled.
+pub fn apply_dream_result(
+    cwd: &Path,
+    response: &str,
+    consumed: &[String],
+) -> Result<DreamOutcome, String> {
+    apply_dream_result_at(
+        &project_memory_path(cwd),
+        &session_log_path(cwd),
+        &dream_marker_path(cwd),
+        response,
+        consumed,
+    )
+}
+
+fn apply_dream_result_at(
+    memory: &Path,
+    session_log: &Path,
+    marker: &Path,
+    response: &str,
+    consumed: &[String],
+) -> Result<DreamOutcome, String> {
+    let body = response.trim();
+    let mut entries = parse_dream_entries(response);
+    let degenerate = body.eq_ignore_ascii_case("NO_REPLY")
+        || body.chars().count() < MIN_DREAM_CHARS
+        || entries.is_empty();
+    touch_marker_at(marker);
+    if degenerate {
+        return Err("dream produced no usable memory (NO_REPLY / too thin)".to_string());
+    }
+    while entries.len() > MAX_ENTRIES
+        || entries.iter().map(|e| e.len() + 3).sum::<usize>() + HEADER.len() > MAX_FILE_BYTES
+    {
+        entries.remove(0);
+    }
+    write_bullet_file(memory, HEADER, &entries)?;
+    let cleared = clear_session_lines_at(session_log, consumed);
+    Ok(DreamOutcome {
+        entries: entries.len(),
+        cleared,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -540,6 +726,131 @@ mod tests {
     /// Path-explicit variant of [`record_session_summary`] (which resolves via config dir).
     fn record_session_summary_at(path: &Path, entry: &str) {
         append_fact(path, SESSION_HEADER, entry.to_string(), session_topic).unwrap();
+    }
+
+    #[test]
+    fn dream_gate_transitions_on_count_then_time() {
+        let dir = tmp();
+        let log = dir.join("s.sessions.md");
+        let marker = dir.join("s.dream");
+        for i in 0..(DREAM_MIN_SESSIONS - 1) {
+            record_session_summary_at(&log, &format!("2026-07-1{i}: topic {i}"));
+        }
+        assert_eq!(dream_gate_at(&log, &marker), DreamGate::TooFew);
+        record_session_summary_at(&log, "2026-07-20: one more topic");
+        assert_eq!(
+            dream_gate_at(&log, &marker),
+            DreamGate::Open(DREAM_MIN_SESSIONS)
+        );
+        touch_marker_at(&marker);
+        assert_eq!(dream_gate_at(&log, &marker), DreamGate::TooSoon);
+        let old = std::time::SystemTime::now()
+            - std::time::Duration::from_secs((DREAM_MIN_HOURS + 1) * 3600);
+        std::fs::File::open(&marker)
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+        assert_eq!(
+            dream_gate_at(&log, &marker),
+            DreamGate::Open(DREAM_MIN_SESSIONS)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn parse_dream_entries_strips_bullets_and_clamps() {
+        let resp = "- first fact\nsecond without bullet\n\n-   \n- third";
+        assert_eq!(
+            parse_dream_entries(resp),
+            vec![
+                "first fact".to_string(),
+                "second without bullet".to_string(),
+                "third".to_string()
+            ]
+        );
+        let long = format!("- {}", "x".repeat(MAX_ENTRY_CHARS + 50));
+        assert_eq!(
+            parse_dream_entries(&long)[0].chars().count(),
+            MAX_ENTRY_CHARS
+        );
+    }
+
+    #[test]
+    fn build_dream_request_embeds_memory_and_sessions() {
+        let sessions = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+        let req = build_dream_request("m", "existing curated", &sessions);
+        let user = req.messages[1]["content"].as_str().unwrap();
+        assert!(
+            user.contains("existing curated"),
+            "existing memory embedded"
+        );
+        assert!(
+            user.contains("- a") && user.contains("- c"),
+            "session lines embedded"
+        );
+        assert!(
+            req.messages[0]["content"]
+                .as_str()
+                .unwrap()
+                .contains("NO_REPLY"),
+            "system prompt tells the model how to decline"
+        );
+    }
+
+    #[test]
+    fn apply_dream_writes_curated_clears_sessions_and_stamps_marker() {
+        let dir = tmp();
+        let memory = dir.join("ws.md");
+        let log = dir.join("ws.sessions.md");
+        let marker = dir.join("ws.dream");
+        remember(&memory, "stale fact to be replaced").unwrap();
+        record_session_summary_at(&log, "2026-07-10: did A");
+        record_session_summary_at(&log, "2026-07-11: did B");
+        let consumed = load_entries(&log);
+
+        let response = "- Project uses postgres (decided 2026-07-11)\n- Prefer ripgrep for search";
+        let outcome = apply_dream_result_at(&memory, &log, &marker, response, &consumed).unwrap();
+        assert_eq!(outcome.entries, 2);
+        assert_eq!(outcome.cleared, 2);
+        assert_eq!(
+            load_entries(&memory),
+            vec![
+                "Project uses postgres (decided 2026-07-11)".to_string(),
+                "Prefer ripgrep for search".to_string(),
+            ],
+            "curated memory replaced wholesale"
+        );
+        assert!(
+            load_entries(&log).is_empty(),
+            "consumed session lines cleared"
+        );
+        assert!(marker.exists(), "marker stamped");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn apply_dream_no_reply_stamps_marker_but_keeps_memory_and_sessions() {
+        let dir = tmp();
+        let memory = dir.join("ws.md");
+        let log = dir.join("ws.sessions.md");
+        let marker = dir.join("ws.dream");
+        remember(&memory, "keep me").unwrap();
+        record_session_summary_at(&log, "2026-07-10: nothing important");
+        let consumed = load_entries(&log);
+
+        let err = apply_dream_result_at(&memory, &log, &marker, "NO_REPLY", &consumed).unwrap_err();
+        assert!(err.contains("no usable memory"), "{err}");
+        assert_eq!(
+            load_entries(&memory),
+            vec!["keep me".to_string()],
+            "memory untouched"
+        );
+        assert_eq!(load_entries(&log).len(), 1, "sessions kept on NO_REPLY");
+        assert!(
+            marker.exists(),
+            "marker stamped so the 24h gate throttles retries"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

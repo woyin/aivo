@@ -546,9 +546,9 @@ pub(super) const SLASH_COMMANDS: &[SlashCommandSpec] = &[
     },
     SlashCommandSpec {
         name: "memory",
-        help_label: "/memory",
-        description: "show this project's persistent memory (facts saved via `remember`)",
-        takes_argument: false,
+        help_label: "/memory [dream]",
+        description: "show persistent memory (facts saved via `remember`); `dream` consolidates it now",
+        takes_argument: true,
     },
     SlashCommandSpec {
         name: "effort",
@@ -2100,8 +2100,10 @@ pub(super) enum SlashCommand {
     Plan(Option<String>),
     /// Read-only review turn: working diff (bare), or vs a ref / scope.
     Review(Option<String>),
-    /// Show this project's persistent memory (`remember` facts).
-    Memory,
+    /// Show this project's persistent memory (`remember` facts); `dream` consolidates it now.
+    Memory {
+        dream: bool,
+    },
     /// Reasoning effort: bare opens a picker of the model's levels, `<level>`
     /// sets it directly.
     Effort(Option<String>),

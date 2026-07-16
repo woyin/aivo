@@ -1628,6 +1628,7 @@ impl CodeTuiApp {
         // Open the cursor session now (no-op for other keys) so its connect
         // overlaps the user typing their first message.
         self.prewarm_cursor_session();
+        self.spawn_startup_dream();
         // Repaint only on change; an idle chat draws nothing.
         let mut needs_redraw = true;
         let mut was_streaming = false;
