@@ -71,6 +71,7 @@ pub(super) struct Palette {
     /// (dark theme); light paints the brand warm paper so dark ink stays readable
     /// even on a dark terminal.
     pub canvas: Option<Color>,
+    pub code: Color,
     pub toast_bg: Color,
     pub jump_fg: Color,
     pub jump_bg: Color,
@@ -107,6 +108,7 @@ impl Palette {
         select_wash: Color::Rgb(48, 52, 64),
         select_flash: Color::Rgb(86, 92, 110),
         canvas: None,
+        code: Color::Rgb(154, 205, 185),
         toast_bg: Color::Rgb(24, 21, 17),
         jump_fg: Color::Rgb(26, 23, 18),
         jump_bg: Color::Rgb(231, 227, 219),
@@ -142,6 +144,7 @@ impl Palette {
         select_wash: Color::Rgb(220, 218, 212),
         select_flash: Color::Rgb(200, 198, 190),
         canvas: Some(Color::Rgb(251, 250, 247)), // --bg-canvas #FBFAF7
+        code: Color::Rgb(38, 105, 98),
         toast_bg: Color::Rgb(255, 255, 255),
         jump_fg: Color::Rgb(251, 250, 247),
         jump_bg: Color::Rgb(22, 20, 26),
@@ -194,6 +197,11 @@ pub(super) fn FAINT() -> Color {
 #[inline]
 pub(super) fn ACCENT() -> Color {
     palette().accent
+}
+#[allow(non_snake_case)]
+#[inline]
+pub(super) fn CODE() -> Color {
+    palette().code
 }
 #[allow(non_snake_case)]
 #[inline]

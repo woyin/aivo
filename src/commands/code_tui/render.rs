@@ -987,7 +987,7 @@ pub(super) fn render_system_message(
     push_styled_line(
         lines,
         role.to_string(),
-        Style::default().fg(ACCENT()).add_modifier(Modifier::BOLD),
+        Style::default().fg(MUTED()).add_modifier(Modifier::BOLD),
     );
     if !content.is_empty() {
         extend_without_leading_blank(lines, render_markdown_lines(content, width));
@@ -3094,7 +3094,7 @@ impl MarkdownRenderer {
             MdEvent::TaskListMarker(checked) => {
                 self.ensure_prefix();
                 let marker = if checked { "☑ " } else { "☐ " };
-                self.push_span(marker.to_string(), Style::default().fg(ACCENT()));
+                self.push_span(marker.to_string(), Style::default().fg(MUTED()));
             }
             _ => {}
         }
@@ -3221,7 +3221,7 @@ impl MarkdownRenderer {
         };
         self.lines.push(line_plain(
             format!("  {label}"),
-            Style::default().fg(ACCENT()).add_modifier(Modifier::BOLD),
+            Style::default().fg(MUTED()),
         ));
 
         let content = if block.content.is_empty() {
@@ -3408,11 +3408,8 @@ impl MarkdownRenderer {
         }
         self.ensure_prefix();
         // No surrounding padding — the markdown source already supplies spacing
-        // and the accent color marks the span; padding caused double spaces.
-        self.push_span(
-            text.to_string(),
-            Style::default().fg(ACCENT()).add_modifier(Modifier::BOLD),
-        );
+        // and the code hue marks the span; padding caused double spaces.
+        self.push_span(text.to_string(), Style::default().fg(CODE()));
     }
 
     fn current_style(&self) -> Style {
@@ -3444,7 +3441,7 @@ impl MarkdownRenderer {
             self.push_span(prefix, Style::default().fg(QUOTE()));
         }
         if let Some(prefix) = self.item_prefix.take() {
-            self.push_span(prefix, Style::default().fg(ACCENT()));
+            self.push_span(prefix, Style::default().fg(MUTED()));
         }
     }
 
@@ -3533,11 +3530,11 @@ pub(super) fn heading_style(level: HeadingLevel) -> Style {
         HeadingLevel::H1 => Style::default()
             .fg(ACCENT())
             .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
-        HeadingLevel::H2 => Style::default().fg(ACCENT()).add_modifier(Modifier::BOLD),
-        HeadingLevel::H3 => Style::default()
-            .fg(ASSISTANT())
-            .add_modifier(Modifier::BOLD),
-        _ => Style::default().fg(TEXT()).add_modifier(Modifier::BOLD),
+        HeadingLevel::H2 => Style::default()
+            .fg(TEXT())
+            .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
+        HeadingLevel::H3 => Style::default().fg(TEXT()).add_modifier(Modifier::BOLD),
+        _ => Style::default().fg(MUTED()).add_modifier(Modifier::BOLD),
     }
 }
 
