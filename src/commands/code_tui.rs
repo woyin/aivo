@@ -346,6 +346,7 @@ impl CodeTuiApp {
             account_task: None,
             account_login: None,
             pending_logout: None,
+            pending_full_repaint: false,
         })
     }
 }

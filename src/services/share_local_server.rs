@@ -180,9 +180,9 @@ async fn live_refresher(state: Arc<RwLock<LiveState>>, shutdown: ShutdownSignal)
         match guard.refresh().await {
             Ok(true) => guard.wake.notify_waiters(),
             Ok(false) => {}
-            Err(err) => {
-                eprintln!("aivo: live refresh failed (non-fatal): {err}");
-            }
+            // Not printed: stderr inside the TUI corrupts the alt screen; the
+            // next tick retries anyway.
+            Err(_) => {}
         }
     }
 }

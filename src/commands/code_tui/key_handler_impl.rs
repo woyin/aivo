@@ -1556,6 +1556,8 @@ impl CodeTuiApp {
             }
             KeyCode::Char('l') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.reset_composer();
+                // Readline muscle memory: Ctrl+L also redraws the screen.
+                self.pending_full_repaint = true;
             }
             KeyCode::Char('w') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.leave_history_navigation();

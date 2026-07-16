@@ -364,6 +364,8 @@ pub(super) const INPUT_REPAINT_INTERVAL: Duration = Duration::from_millis(1);
 /// Minimum time the live status label holds before it may change, so fast steps
 /// don't flash by unreadably.
 pub(super) const STATUS_MIN_DURATION: Duration = Duration::from_millis(1500);
+/// Full-screen rewrite cadence while a reply streams (see `pending_full_repaint`).
+pub(super) const STREAM_FULL_REPAINT_INTERVAL: Duration = Duration::from_secs(3);
 /// Typewriter reveal rate. Each animation frame reveals at least
 /// `TYPEWRITER_MIN_CHARS` of the buffered stream text (a steady floor so a slow
 /// trickle still types out) plus `1/TYPEWRITER_CATCHUP_DIVISOR` of whatever
@@ -2952,4 +2954,7 @@ pub(super) struct CodeTuiApp {
     pub(super) account_login: Option<AccountLoginCard>,
     /// `/logout` awaiting its y/n confirm; the account display name.
     pub(super) pending_logout: Option<String>,
+    /// One-shot: the next draw clears first, healing emulator-corrupted cells
+    /// that diff-only painting would never rewrite (macOS Tahoe Terminal.app).
+    pub(super) pending_full_repaint: bool,
 }

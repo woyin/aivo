@@ -1630,6 +1630,8 @@ impl CodeTuiApp {
         self.prewarm_cursor_session();
         // Repaint only on change; an idle chat draws nothing.
         let mut needs_redraw = true;
+        let mut was_streaming = false;
+        let mut last_stream_repaint = std::time::Instant::now();
         let run_result = loop {
             match self.handle_runtime_events().await {
                 Ok(true) => needs_redraw = true,
@@ -1694,8 +1696,37 @@ impl CodeTuiApp {
                 needs_redraw = true;
             }
 
+            // Self-heal: full repaint mid-stream and once more when it settles.
+            let streaming = self.sending || !self.incoming_buffer.is_empty();
+            if streaming && last_stream_repaint.elapsed() >= STREAM_FULL_REPAINT_INTERVAL {
+                self.pending_full_repaint = true;
+            } else if was_streaming && !streaming {
+                self.pending_full_repaint = true;
+                needs_redraw = true;
+            }
+            if !streaming {
+                last_stream_repaint = std::time::Instant::now();
+            }
+            was_streaming = streaming;
+
             if needs_redraw {
-                if let Err(err) = terminal.draw(|frame| self.render(frame)) {
+                // Atomic frame where supported; cursor hidden while cells paint.
+                let _ = execute!(
+                    terminal.backend_mut(),
+                    crossterm::terminal::BeginSynchronizedUpdate
+                );
+                let _ = terminal.hide_cursor();
+                if std::mem::take(&mut self.pending_full_repaint) {
+                    let _ = terminal.clear();
+                    last_stream_repaint = std::time::Instant::now();
+                }
+                // `.err()` drops the `CompletedFrame` borrow so End can write.
+                let draw_err = terminal.draw(|frame| self.render(frame)).err();
+                let _ = execute!(
+                    terminal.backend_mut(),
+                    crossterm::terminal::EndSynchronizedUpdate
+                );
+                if let Some(err) = draw_err {
                     break Err(err.into());
                 }
                 needs_redraw = false;
