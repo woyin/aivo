@@ -2819,7 +2819,7 @@ fn test_welcome_status_lines_include_static_essentials_hint() {
     assert!(
         plain
             .iter()
-            .any(|l| l.contains("/help commands") && l.contains("Esc interrupts")),
+            .any(|l| l.contains("/help commands") && l.contains("Shift+Tab modes")),
         "essentials hint missing from welcome: {plain:?}"
     );
 }

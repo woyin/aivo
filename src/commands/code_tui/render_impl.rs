@@ -2761,7 +2761,7 @@ impl CodeTuiApp {
         ]));
         // Static essentials a new user needs before any rotating tip matters.
         lines.push(line_plain(
-            "       /help commands · Shift+Tab modes · Esc interrupts".to_string(),
+            "       /help commands · Shift+Tab modes".to_string(),
             Style::default().fg(FAINT()),
         ));
         lines
