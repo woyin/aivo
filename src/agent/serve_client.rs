@@ -146,7 +146,7 @@ pub async fn complete(
             if let Some(u) = v.get("usage")
                 && !u.is_null()
             {
-                usage = Some(u.clone());
+                merge_usage(&mut usage, u);
             }
             if model.is_none()
                 && let Some(m) = v.get("model").and_then(|x| x.as_str())
@@ -314,6 +314,66 @@ fn accumulate_tool_calls(tcs: &[Value], tools: &mut Vec<ToolAcc>) {
     }
 }
 
+/// Fold a streamed `usage` object into the running one by field-wise max, so a
+/// later partial chunk (e.g. an Anthropic-bridged final delta carrying only
+/// `output_tokens`) can't wipe an input count and collapse the footer's fill.
+fn merge_usage(acc: &mut Option<Value>, incoming: &Value) {
+    match acc {
+        Some(existing) => merge_numeric_max(existing, incoming),
+        None => *acc = Some(incoming.clone()),
+    }
+    if let Some(existing) = acc {
+        floor_total_tokens(existing);
+    }
+}
+
+/// Deep-merge keeping the max of each numeric leaf; a `null` can't clear a value.
+fn merge_numeric_max(acc: &mut Value, incoming: &Value) {
+    match (acc, incoming) {
+        (Value::Object(a), Value::Object(b)) => {
+            for (k, v) in b {
+                match a.get_mut(k) {
+                    Some(slot) => merge_numeric_max(slot, v),
+                    None => {
+                        a.insert(k.clone(), v.clone());
+                    }
+                }
+            }
+        }
+        (slot @ Value::Number(_), inc @ Value::Number(_)) => {
+            if inc.as_f64() > slot.as_f64() {
+                *slot = inc.clone();
+            }
+        }
+        (slot, inc) if !inc.is_null() => *slot = inc.clone(),
+        _ => {}
+    }
+}
+
+/// Floor `total_tokens` to the input+output component sum (mirrors `usage_tokens`);
+/// never lowers a larger provider total, so its total-first shortcut can't understate.
+fn floor_total_tokens(usage: &mut Value) {
+    let Some(obj) = usage.as_object_mut() else {
+        return;
+    };
+    let get = |k: &str| obj.get(k).and_then(Value::as_u64).unwrap_or(0);
+    let out = obj
+        .get("output_tokens")
+        .or_else(|| obj.get("completion_tokens"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let component = match obj.get("prompt_tokens").and_then(Value::as_u64) {
+        Some(prompt) => prompt.saturating_add(out),
+        None => get("input_tokens")
+            .saturating_add(get("cache_read_input_tokens"))
+            .saturating_add(get("cache_creation_input_tokens"))
+            .saturating_add(out),
+    };
+    if component > 0 && component > get("total_tokens") {
+        obj.insert("total_tokens".into(), json!(component));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -452,6 +512,92 @@ data: [DONE]\n\n";
         assert_eq!(tools[0].name, "run_bash", "name must not duplicate");
         // Genuine argument fragments are still appended into one valid JSON string.
         assert_eq!(tools[0].args, "{\"cmd\":\"ls\"}");
+    }
+
+    /// A partial final chunk (only `output_tokens`) must not wipe the input count.
+    #[test]
+    fn merge_usage_keeps_input_when_final_chunk_is_output_only() {
+        let mut usage = None;
+        merge_usage(
+            &mut usage,
+            &json!({
+                "prompt_tokens": 118_000,
+                "completion_tokens": 1,
+                "total_tokens": 118_001,
+                "cache_read_input_tokens": 90_000
+            }),
+        );
+        merge_usage(
+            &mut usage,
+            &json!({ "completion_tokens": 5_000, "total_tokens": 5_000 }),
+        );
+        let u = usage.unwrap();
+        assert_eq!(u["prompt_tokens"], 118_000, "input must survive");
+        assert_eq!(u["completion_tokens"], 5_000, "output takes the larger");
+        assert_eq!(u["cache_read_input_tokens"], 90_000);
+        assert_eq!(u["total_tokens"], 123_000);
+        assert_eq!(crate::agent::tokens::usage_tokens(&Some(u)), 123_000);
+    }
+
+    #[test]
+    fn merge_usage_deep_merges_details_and_ignores_null() {
+        let mut usage = None;
+        merge_usage(
+            &mut usage,
+            &json!({
+                "prompt_tokens": 1_000,
+                "completion_tokens": 10,
+                "prompt_tokens_details": { "cached_tokens": 800 }
+            }),
+        );
+        merge_usage(
+            &mut usage,
+            &json!({
+                "prompt_tokens": null,
+                "completion_tokens": 40,
+                "prompt_tokens_details": { "cached_tokens": 800 }
+            }),
+        );
+        let u = usage.unwrap();
+        assert_eq!(u["prompt_tokens"], 1_000, "null must not clear the input");
+        assert_eq!(u["completion_tokens"], 40);
+        assert_eq!(u["prompt_tokens_details"]["cached_tokens"], 800);
+        assert_eq!(u["total_tokens"], 1_040);
+    }
+
+    #[test]
+    fn merge_usage_single_complete_chunk_is_unchanged() {
+        let mut usage = None;
+        merge_usage(
+            &mut usage,
+            &json!({ "prompt_tokens": 100, "completion_tokens": 20, "total_tokens": 120 }),
+        );
+        let u = usage.unwrap();
+        assert_eq!(u["prompt_tokens"], 100);
+        assert_eq!(u["completion_tokens"], 20);
+        assert_eq!(u["total_tokens"], 120);
+    }
+
+    #[tokio::test]
+    async fn complete_merges_usage_across_chunks() {
+        let body = "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}],\"usage\":{\"prompt_tokens\":50000,\"completion_tokens\":1,\"total_tokens\":50001}}\n\n\
+data: {\"choices\":[{\"delta\":{}}],\"usage\":{\"completion_tokens\":200,\"total_tokens\":200}}\n\n\
+data: [DONE]\n\n";
+        let port = spawn_sse(body);
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let msg = complete(
+            &client,
+            &format!("http://127.0.0.1:{port}"),
+            None,
+            &req(),
+            &mut |_| {},
+        )
+        .await
+        .unwrap();
+        let usage = msg.usage.expect("usage captured");
+        assert_eq!(usage["prompt_tokens"], 50_000);
+        assert_eq!(usage["completion_tokens"], 200);
+        assert_eq!(usage["total_tokens"], 50_200);
     }
 
     /// A multi-byte char split across two network chunks must be reassembled, not
