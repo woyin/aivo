@@ -9855,6 +9855,7 @@ async fn test_goal_loop_stops_on_marker_and_cap() {
         objective: "x".to_string(),
         iteration: 3,
         max: 20,
+        msg_floor: 0,
     });
     app.history.push(assistant("all set.\nGOAL COMPLETE"));
     app.maybe_continue_goal().await.unwrap();
@@ -9867,6 +9868,7 @@ async fn test_goal_loop_stops_on_marker_and_cap() {
         objective: "x".to_string(),
         iteration: 20,
         max: 20,
+        msg_floor: 0,
     });
     app.history.push(assistant(
         "I will reply GOAL COMPLETE once everything is finished.",
@@ -9901,6 +9903,8 @@ async fn test_goal_marker_tolerates_markdown_wrapping() {
         "**GOAL COMPLETE**",
         "All tests pass.\n\ngoal complete.",
         "done\n`GOAL COMPLETE.`",
+        "\"GOAL COMPLETE\"",
+        "> GOAL COMPLETE",
     ] {
         app.history.clear();
         app.history.push(assistant(reply));
@@ -9908,6 +9912,7 @@ async fn test_goal_marker_tolerates_markdown_wrapping() {
             objective: "x".to_string(),
             iteration: 2,
             max: 20,
+            msg_floor: 0,
         });
         app.maybe_continue_goal().await.unwrap();
         assert!(app.goal_mode.is_none(), "marker ends the loop: {reply:?}");
@@ -9924,6 +9929,7 @@ async fn test_goal_marker_tolerates_markdown_wrapping() {
             objective: "x".to_string(),
             iteration: 2,
             max: 20,
+            msg_floor: 0,
         });
         app.sending = true;
         app.maybe_continue_goal().await.unwrap();
@@ -9935,8 +9941,8 @@ async fn test_goal_marker_tolerates_markdown_wrapping() {
     }
 }
 
-/// An errored turn stops the loop instead of replaying to the cap, and the
-/// error notice stays visible.
+/// An errored turn — signalled by the durable `error` transcript row — stops the
+/// loop instead of replaying to the cap, and the error notice stays visible.
 #[tokio::test]
 async fn test_goal_stops_on_errored_turn() {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
@@ -9946,11 +9952,20 @@ async fn test_goal_stops_on_errored_turn() {
         objective: "x".to_string(),
         iteration: 3,
         max: 20,
+        msg_floor: 0,
     });
     app.history.push(ChatMessage {
         model: None,
         role: "assistant".to_string(),
         content: "partial work".to_string(),
+        reasoning_content: None,
+        attachments: vec![],
+    });
+    // What `apply_agent_error` records: the ERROR notice + the durable error row.
+    app.history.push(ChatMessage {
+        model: None,
+        role: "error".to_string(),
+        content: "LLM error: insufficient credits".to_string(),
         reasoning_content: None,
         attachments: vec![],
     });
@@ -9966,6 +9981,79 @@ async fn test_goal_stops_on_errored_turn() {
     assert!(msg.contains("goal mode stopped"), "stop noted: {msg}");
 }
 
+/// An incidental ERROR notice with no `error` transcript row (e.g. a failed
+/// /copy pressed mid-turn) must NOT stop an unattended loop — the continuation
+/// still goes out.
+#[tokio::test]
+async fn test_goal_survives_incidental_error_notice() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.key.base_url = "claude-oauth".to_string();
+
+    app.goal_mode = Some(GoalState {
+        objective: "x".to_string(),
+        iteration: 2,
+        max: 20,
+        msg_floor: 0,
+    });
+    app.history.push(ChatMessage {
+        model: None,
+        role: "assistant".to_string(),
+        content: "still working".to_string(),
+        reasoning_content: None,
+        attachments: vec![],
+    });
+    app.notice = Some((ERROR(), "Copy failed: no clipboard".to_string()));
+
+    app.maybe_continue_goal().await.unwrap();
+
+    let sent = app.pending_submit.as_ref().unwrap();
+    assert!(
+        sent.content.contains("Continue toward the goal"),
+        "the continuation was dispatched: {}",
+        sent.content
+    );
+    assert_eq!(app.history.last().unwrap().content, "/goal — continue");
+}
+
+/// Rows from before the goal armed can't end it: a queued `/goal` restart runs
+/// right after a turn whose reply said the marker (or errored) — the fresh loop
+/// must survive both.
+#[tokio::test]
+async fn test_goal_ignores_marker_and_error_below_floor() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+
+    for role in ["assistant", "error"] {
+        app.history.clear();
+        app.history.push(ChatMessage {
+            model: None,
+            role: role.to_string(),
+            content: "GOAL COMPLETE".to_string(),
+            reasoning_content: None,
+            attachments: vec![],
+        });
+        // Fresh goal armed after that row; its first turn is in flight.
+        app.goal_mode = Some(GoalState {
+            objective: "new objective".to_string(),
+            iteration: 1,
+            max: 20,
+            msg_floor: app.history.len(),
+        });
+        app.sending = true;
+        app.notice = None;
+
+        app.maybe_continue_goal().await.unwrap();
+
+        assert!(
+            app.goal_mode.is_some(),
+            "a stale {role} row must not end the fresh goal"
+        );
+        app.sending = false;
+        app.goal_mode = None;
+    }
+}
+
 /// In `/goal` mode a single Esc only arms a confirm — the loop keeps running;
 /// a second consecutive Esc interrupts and stops it.
 #[tokio::test]
@@ -9977,6 +10065,7 @@ async fn test_goal_esc_requires_confirmation_to_stop() {
         objective: "x".to_string(),
         iteration: 3,
         max: 20,
+        msg_floor: 0,
     });
     app.sending = true;
 
@@ -10007,6 +10096,7 @@ async fn test_goal_esc_confirm_resets_on_other_key() {
         objective: "x".to_string(),
         iteration: 3,
         max: 20,
+        msg_floor: 0,
     });
     app.sending = true;
 
@@ -10038,6 +10128,7 @@ async fn test_goal_completion_detected_while_queued_message_runs() {
         objective: "x".to_string(),
         iteration: 2,
         max: 20,
+        msg_floor: 0,
     });
     app.history.push(ChatMessage {
         model: None,
@@ -10075,6 +10166,7 @@ async fn test_goal_continuation_preserves_composer_draft() {
         objective: "x".to_string(),
         iteration: 1,
         max: 20,
+        msg_floor: 0,
     });
     app.history.push(ChatMessage {
         model: None,
@@ -10114,6 +10206,7 @@ async fn test_goal_guard_stop_enriches_continuation() {
         objective: "x".to_string(),
         iteration: 1,
         max: 20,
+        msg_floor: 0,
     });
     app.goal_guard_stop = Some(crate::agent::engine::TurnStop::NoProgress);
     app.history.push(ChatMessage {
@@ -10139,8 +10232,8 @@ async fn test_goal_guard_stop_enriches_continuation() {
         sent.content
     );
     assert!(
-        sent.content.contains("Continue toward the goal"),
-        "the base continuation still rides along: {}",
+        sent.content.contains("Continue toward the goal: x"),
+        "the base continuation restates the objective: {}",
         sent.content
     );
     assert!(
@@ -10160,6 +10253,7 @@ async fn test_goal_step_limit_steers_continuation() {
         objective: "x".to_string(),
         iteration: 1,
         max: 20,
+        msg_floor: 0,
     });
     app.goal_guard_stop = Some(crate::agent::engine::TurnStop::StepLimit);
     app.history.push(ChatMessage {
@@ -10326,6 +10420,7 @@ async fn test_plan_entry_stops_goal_mode() {
         objective: "ship".to_string(),
         iteration: 3,
         max: 20,
+        msg_floor: 0,
     });
     // Image in history + unknown vision pins the kick-off to plain chat — an
     // agent engine build would touch real config/git.
@@ -10417,6 +10512,7 @@ async fn test_resume_resets_plan_and_goal_state() {
         objective: "old goal".to_string(),
         iteration: 2,
         max: 20,
+        msg_floor: 0,
     });
 
     let session = LoadedSession {
@@ -10669,6 +10765,7 @@ fn test_composer_rule_shows_goal_step_indicator() {
         objective: "ship it".to_string(),
         iteration: 2,
         max: 20,
+        msg_floor: 0,
     });
     let on = plain_text_from_spans(&app.composer_rule_line(80).spans);
     assert!(on.contains("goal 2/20"), "goal step indicator: {on:?}");
@@ -13686,6 +13783,7 @@ async fn test_recover_dead_response_task_resets_stuck_turn() {
         objective: "do it".to_string(),
         iteration: 1,
         max: 20,
+        msg_floor: 0,
     });
     // A finished task that sent NO terminal event (stands in for a panic).
     let dead = tokio::spawn(async {});
@@ -13739,6 +13837,7 @@ async fn test_stopping_a_turn_clears_goal_mode() {
             objective: "x".to_string(),
             iteration: 1,
             max: 20,
+            msg_floor: 0,
         });
         app
     };

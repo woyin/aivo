@@ -13,9 +13,14 @@ const GOAL_PREAMBLE: &str = "[Goal mode] Work autonomously toward this objective
 steps as it takes — build directly without pausing to confirm the plan first. When the objective \
 is FULLY achieved, reply with exactly `GOAL COMPLETE` on its own line. If anything remains, keep \
 going. Use `take_note` for key decisions and dead-ends so they survive context compaction.";
-/// Self-checking continuation sent between goal turns.
-const GOAL_CONTINUE: &str = "Continue toward the goal. If the objective is now fully met, reply \
-with exactly `GOAL COMPLETE` and nothing else; otherwise do the next step.";
+/// Self-checking continuation sent between goal turns. Restates the objective
+/// each round so it survives context compaction on long runs.
+fn goal_continue_message(objective: &str) -> String {
+    format!(
+        "Continue toward the goal: {objective}\n\nIf the objective is now fully met, reply with \
+exactly `GOAL COMPLETE` and nothing else; otherwise do the next step."
+    )
+}
 
 /// The `/review` directive: a read-only, line-by-line review of a diff.
 const REVIEW_PREAMBLE: &str = "[Code review] Review the changes below as a senior engineer \
@@ -72,11 +77,12 @@ fn goal_max_iterations() -> usize {
 }
 
 /// Whole-line match so prose mentioning the marker doesn't end the loop; trims
-/// markdown wrapping (the prompts show the marker in backticks, models echo them).
+/// markdown wrapping (the prompts show the marker in backticks, models echo
+/// them — some quote or blockquote it instead).
 fn signals_goal_complete(text: &str) -> bool {
     text.lines().any(|line| {
         line.trim()
-            .trim_matches(|c: char| matches!(c, '`' | '*' | '_' | '.' | '!' | ' '))
+            .trim_matches(|c: char| matches!(c, '`' | '*' | '_' | '.' | '!' | ' ' | '"' | '>'))
             .eq_ignore_ascii_case("GOAL COMPLETE")
     })
 }
@@ -2084,7 +2090,7 @@ impl CodeTuiApp {
     /// status; `stop` ends it. The loop is driven by `maybe_continue_goal`.
     pub(super) async fn run_goal_command(&mut self, arg: Option<String>) {
         match arg.as_deref().map(str::trim) {
-            None | Some("") => {
+            None | Some("") | Some("status") => {
                 let msg = match &self.goal_mode {
                     Some(g) => {
                         let mut obj: String = g.objective.chars().take(48).collect();
@@ -2136,6 +2142,7 @@ impl CodeTuiApp {
                     objective: objective.to_string(),
                     iteration: 1,
                     max: goal_max_iterations(),
+                    msg_floor: self.history.len(),
                 });
                 // Fresh objective: no stale guard-stop from a prior loop.
                 self.goal_guard_stop = None;
@@ -2173,16 +2180,19 @@ impl CodeTuiApp {
     /// Drive the active `/goal` loop after a turn: stop on the completion marker,
     /// an errored turn, or the turn cap; otherwise auto-send the continuation.
     pub(super) async fn maybe_continue_goal(&mut self) -> Result<()> {
-        if self.goal_mode.is_none() {
+        let Some(floor) = self.goal_mode.as_ref().map(|g| g.msg_floor) else {
             return Ok(());
-        }
+        };
         // Checked even mid-queued-turn: the rev-find skips the newer user message.
+        // Rows below the floor predate this goal — a stale reply must not end it.
         let last_reply = self
             .history
             .iter()
+            .enumerate()
             .rev()
-            .find(|m| m.role == "assistant")
-            .map(|m| m.content.clone())
+            .find(|(_, m)| m.role == "assistant")
+            .filter(|(i, _)| *i >= floor)
+            .map(|(_, m)| m.content.clone())
             .unwrap_or_default();
         if signals_goal_complete(&last_reply) {
             let turns = self.goal_mode.take().map(|g| g.iteration).unwrap_or(0);
@@ -2191,11 +2201,24 @@ impl CodeTuiApp {
             return Ok(());
         }
         // An errored turn must not auto-repeat — stop and keep the error visible.
-        if let Some((color, msg)) = self.notice.as_mut()
-            && *color == ERROR()
-        {
-            msg.push_str(" — goal mode stopped");
+        // The durable `error` transcript row is the signal; an incidental ERROR
+        // notice (say, a failed /copy mid-turn) must not kill an unattended loop.
+        let errored = self
+            .history
+            .iter()
+            .enumerate()
+            .rev()
+            .find(|(_, m)| matches!(m.role.as_str(), "assistant" | "error"))
+            .is_some_and(|(i, m)| m.role == "error" && i >= floor);
+        if errored {
             self.goal_mode = None;
+            match self.notice.as_mut() {
+                Some((color, msg)) if *color == ERROR() => msg.push_str(" — goal mode stopped"),
+                _ => {
+                    self.notice =
+                        Some((ERROR(), "Goal mode stopped — the turn errored".to_string()));
+                }
+            }
             return Ok(());
         }
         if self.sending {
@@ -2218,6 +2241,7 @@ impl CodeTuiApp {
             ));
             return Ok(());
         }
+        let objective = goal.objective.clone();
         // An early-stopped turn steers the next one instead of blindly continuing.
         let continuation = match self.goal_guard_stop.take() {
             Some(stop) => {
@@ -2236,9 +2260,12 @@ fix the input or pick another route, and record the dead end with take_note"
 pieces and keep going"
                     }
                 };
-                format!("[Previous turn stopped early: {steer}.]\n\n{GOAL_CONTINUE}")
+                format!(
+                    "[Previous turn stopped early: {steer}.]\n\n{}",
+                    goal_continue_message(&objective)
+                )
             }
-            None => GOAL_CONTINUE.to_string(),
+            None => goal_continue_message(&objective),
         };
         // Machine text: record nothing (↑/↓ recall) and stash the composer so the
         // dispatch can't wipe a mid-turn draft or attach the user's staged files.

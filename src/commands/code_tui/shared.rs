@@ -2490,6 +2490,10 @@ pub(super) struct GoalState {
     pub(super) objective: String,
     pub(super) iteration: usize,
     pub(super) max: usize,
+    /// `history.len()` when this goal armed. Completion/error detection ignores
+    /// rows below it, so a reply from before the goal can't end a fresh loop
+    /// (e.g. a queued `/goal` restart right after a turn that said the marker).
+    pub(super) msg_floor: usize,
 }
 
 /// One persisted input-history entry, tagged with the launch dir it was typed
