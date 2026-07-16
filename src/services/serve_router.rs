@@ -35,8 +35,9 @@ use crate::services::route_cache::{RouteCache, RouteSlot};
 use crate::services::serve_responses::convert_chat_sse_to_responses_sse;
 use crate::services::serve_upstream::{
     RouterResponse, StreamingBody, UpstreamRequestContext, copilot_requires_responses_api,
-    send_anthropic_chat, send_anthropic_native, send_codex_responses, send_copilot_responses,
-    send_gemini_chat, send_gemini_native, send_openai_chat, send_openai_embeddings,
+    send_anthropic_chat, send_anthropic_native, send_claude_oauth_passthrough,
+    send_codex_responses, send_copilot_responses, send_gemini_chat, send_gemini_native,
+    send_openai_chat, send_openai_embeddings,
 };
 use crate::services::session_store::{ApiKey, SessionStore};
 use crate::services::usage_stats_store::RunTokenTally;
@@ -74,6 +75,9 @@ pub struct ServeRouterConfig {
     pub grok_fallback_api_key: Option<String>,
     /// `upstream_api_key` holds the Codex OAuth credential JSON, not a bearer.
     pub is_codex: bool,
+    /// `upstream_api_key` holds the Claude OAuth credential JSON; requests
+    /// forward verbatim to the native backend.
+    pub is_claude_native_oauth: bool,
     pub is_openrouter: bool,
     pub is_starter: bool,
     /// Upstream requires `reasoning_content` on assistant turns (deepseek/moonshot);
@@ -105,14 +109,21 @@ impl ServeRouterConfig {
             provider_profile_for_key, resolve_starter_base_url,
         };
         let profile = provider_profile_for_key(key);
+        // The claude-oauth sentinel has no provider profile; force Anthropic.
+        let is_claude_native_oauth = key.is_claude_oauth();
         Self {
             upstream_base_url: resolve_starter_base_url(&key.base_url),
             upstream_api_key: key.key.as_str().to_string(),
-            upstream_protocol: profile.default_protocol,
+            upstream_protocol: if is_claude_native_oauth {
+                ProviderProtocol::Anthropic
+            } else {
+                profile.default_protocol
+            },
             is_copilot: profile.serve_flags.is_copilot,
             is_grok: key.is_grok_oauth(),
             grok_fallback_api_key: None,
             is_codex: key.is_codex_oauth(),
+            is_claude_native_oauth,
             is_openrouter: profile.serve_flags.is_openrouter,
             is_starter: profile.serve_flags.is_starter,
             requires_reasoning_content: profile.quirks.requires_reasoning_content,
@@ -363,10 +374,11 @@ impl ServeRouter {
                         upstream_api_key: fk.key.as_str().to_string(),
                         upstream_protocol: protocol,
                         is_copilot,
-                        // Failover keys never carry grok/codex state.
+                        // Failover keys never carry grok/codex/claude-oauth state.
                         is_grok: false,
                         grok_fallback_api_key: None,
                         is_codex: false,
+                        is_claude_native_oauth: false,
                         is_openrouter: profile.serve_flags.is_openrouter,
                         is_starter: profile.serve_flags.is_starter,
                         requires_reasoning_content: profile.quirks.requires_reasoning_content,
@@ -559,7 +571,14 @@ async fn run_accept_loop(listener: tokio::net::TcpListener, state: Arc<ServeStat
                     CONTENT_TYPE_JSON,
                     HEALTH_RESPONSE.clone(),
                 )),
-                "/v1/models" | "/models" => handle_models(&state).await,
+                "/v1/models" | "/models" => {
+                    if active.config.is_claude_native_oauth {
+                        // Subscriptions get the native catalog, not the local one.
+                        send_claude_oauth_passthrough(&request, &upstream_context(active)).await
+                    } else {
+                        handle_models(active).await
+                    }
+                }
                 "/v1/chat/completions" => {
                     if !request.starts_with("POST ") {
                         Ok(RouterResponse::buffered(
@@ -613,6 +632,20 @@ async fn run_accept_loop(listener: tokio::net::TcpListener, state: Arc<ServeStat
                         ))
                     } else {
                         handle_embeddings_with_failover(&request, active).await
+                    }
+                }
+                // Other upstreams keep the historical 404 for count_tokens.
+                "/v1/messages/count_tokens" | "/messages/count_tokens"
+                    if active.config.is_claude_native_oauth =>
+                {
+                    if !request.starts_with("POST ") {
+                        Ok(RouterResponse::buffered(
+                            405,
+                            CONTENT_TYPE_JSON,
+                            br#"{"error":{"message":"Method not allowed"}}"#.to_vec(),
+                        ))
+                    } else {
+                        send_claude_oauth_passthrough(&request, &upstream_context(active)).await
                     }
                 }
                 _ => Ok(RouterResponse::buffered(
@@ -1028,6 +1061,9 @@ async fn handle_responses(request: &str, state: &ServeState) -> Result<RouterRes
 /// Anthropic `/v1/messages` inbound: pivot through Chat, or take the direct
 /// Gemini edge when the upstream is confirmed Gemini (`handle_messages_gemini_direct`).
 async fn handle_messages(request: &str, state: &ServeState) -> Result<RouterResponse> {
+    if state.config.is_claude_native_oauth {
+        return send_claude_oauth_passthrough(request, &upstream_context(state)).await;
+    }
     let body_str = http_utils::extract_request_body(request)?;
     let mut body = match parse_json_body(body_str) {
         Ok(v) => v,
@@ -1540,6 +1576,14 @@ fn resolve_slot(body: &Value, state: &ServeState) -> Arc<RouteSlot> {
 }
 
 async fn handle_chat_body(body: Value, state: &ServeState) -> Result<RouterResponse> {
+    // Reject clearly rather than surface a cryptic upstream 401.
+    if state.config.is_claude_native_oauth {
+        return Ok(RouterResponse::buffered(
+            501,
+            CONTENT_TYPE_JSON,
+            br#"{"error":{"message":"Claude subscription upstream only serves the Anthropic wire (/v1/messages)"}}"#.to_vec(),
+        ));
+    }
     let client_wants_stream = body
         .get("stream")
         .and_then(|v| v.as_bool())
@@ -1987,6 +2031,23 @@ mod tests {
         )
     }
 
+    #[test]
+    fn from_key_maps_claude_oauth_sentinel_to_native_passthrough() {
+        use crate::services::claude_oauth::CLAUDE_OAUTH_SENTINEL;
+        let key = ApiKey::new_with_protocol(
+            "id".to_string(),
+            "sub".to_string(),
+            CLAUDE_OAUTH_SENTINEL.to_string(),
+            None,
+            r#"{"token":"sk-ant-oat01-TEST","created_at":"2026-01-01T00:00:00Z"}"#.to_string(),
+        );
+        let config = ServeRouterConfig::from_key(&key, false, 300, None, HashMap::new());
+        assert!(config.is_claude_native_oauth);
+        assert_eq!(config.upstream_base_url, "https://api.anthropic.com");
+        assert_eq!(config.upstream_protocol, ProviderProtocol::Anthropic);
+        assert!(config.upstream_api_key.contains("sk-ant-oat01-TEST"));
+    }
+
     fn test_state(protocol: ProviderProtocol) -> ServeState {
         ServeState {
             config: Arc::new(ServeRouterConfig {
@@ -1997,6 +2058,7 @@ mod tests {
                 is_grok: false,
                 grok_fallback_api_key: None,
                 is_codex: false,
+                is_claude_native_oauth: false,
                 is_openrouter: false,
                 is_starter: false,
                 requires_reasoning_content: false,
@@ -2175,6 +2237,7 @@ mod tests {
                 is_grok: false,
                 grok_fallback_api_key: None,
                 is_codex: false,
+                is_claude_native_oauth: false,
                 is_openrouter: true,
                 is_starter: false,
                 requires_reasoning_content: false,
@@ -2361,6 +2424,7 @@ mod tests {
                 is_grok: false,
                 grok_fallback_api_key: None,
                 is_codex: false,
+                is_claude_native_oauth: false,
                 is_openrouter: false,
                 is_starter: false,
                 requires_reasoning_content: false,
@@ -2402,6 +2466,7 @@ mod tests {
             is_grok: false,
             grok_fallback_api_key: None,
             is_codex: false,
+            is_claude_native_oauth: false,
             is_openrouter: false,
             is_starter: false,
             requires_reasoning_content: false,
@@ -2442,6 +2507,7 @@ mod tests {
                 is_grok: false,
                 grok_fallback_api_key: None,
                 is_codex: false,
+                is_claude_native_oauth: false,
                 is_openrouter: false,
                 is_starter: false,
                 requires_reasoning_content: false,

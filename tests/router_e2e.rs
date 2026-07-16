@@ -62,6 +62,7 @@ enum Mode {
 struct FakeProvider {
     port: u16,
     hits: Arc<Mutex<Vec<Endpoint>>>,
+    heads: Arc<Mutex<Vec<String>>>,
 }
 
 impl FakeProvider {
@@ -75,6 +76,11 @@ impl FakeProvider {
 
     fn hit_count(&self, endpoint: Endpoint) -> usize {
         self.hits().iter().filter(|e| **e == endpoint).count()
+    }
+
+    /// Raw request heads (request line + headers) in arrival order.
+    fn heads(&self) -> Vec<String> {
+        self.heads.lock().unwrap().clone()
     }
 }
 
@@ -168,6 +174,8 @@ fn spawn_fake(modes: &[(Endpoint, Mode)]) -> FakeProvider {
     let port = listener.local_addr().unwrap().port();
     let hits: Arc<Mutex<Vec<Endpoint>>> = Arc::new(Mutex::new(Vec::new()));
     let hits_writer = hits.clone();
+    let heads: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let heads_writer = heads.clone();
 
     std::thread::spawn(move || {
         for stream in listener.incoming() {
@@ -175,6 +183,7 @@ fn spawn_fake(modes: &[(Endpoint, Mode)]) -> FakeProvider {
             let head = read_request_head(&mut stream);
             let endpoint = request_endpoint(&head);
             hits_writer.lock().unwrap().push(endpoint);
+            heads_writer.lock().unwrap().push(head);
 
             let (status, reason, content_type, body) = match modes.get(&endpoint) {
                 Some(Mode::Ok) => (200, "OK", "application/json", success_body(endpoint)),
@@ -203,7 +212,7 @@ fn spawn_fake(modes: &[(Endpoint, Mode)]) -> FakeProvider {
         }
     });
 
-    FakeProvider { port, hits }
+    FakeProvider { port, hits, heads }
 }
 
 /// Withholds the closing SSE frames until the returned sender fires — distinguishes incremental forwarding from buffer-to-EOF.
@@ -212,6 +221,7 @@ fn spawn_fake_sse_drip() -> (FakeProvider, std::sync::mpsc::Sender<()>) {
     let port = listener.local_addr().unwrap().port();
     let hits: Arc<Mutex<Vec<Endpoint>>> = Arc::new(Mutex::new(Vec::new()));
     let hits_writer = hits.clone();
+    let heads: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
     let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
 
     std::thread::spawn(move || {
@@ -249,19 +259,32 @@ fn spawn_fake_sse_drip() -> (FakeProvider, std::sync::mpsc::Sender<()>) {
         }
     });
 
-    (FakeProvider { port, hits }, release_tx)
+    (FakeProvider { port, hits, heads }, release_tx)
 }
 
 // ── Client helpers ───────────────────────────────────────────────────────
 
-async fn raw_post(port: u16, path: &str, body: &str) -> String {
+/// Sends a raw request with arbitrary extra header lines; `None` body → GET-style.
+async fn raw_request(
+    port: u16,
+    method: &str,
+    path: &str,
+    extra_headers: &[&str],
+    body: Option<&str>,
+) -> String {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", port))
         .await
         .unwrap();
+    let mut headers = String::new();
+    for h in extra_headers {
+        headers.push_str(h);
+        headers.push_str("\r\n");
+    }
+    let body = body.unwrap_or("");
     let req = format!(
-        "POST {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Bearer tok\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1\r\n{headers}Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
         body.len()
     );
     stream.write_all(req.as_bytes()).await.unwrap();
@@ -269,6 +292,17 @@ async fn raw_post(port: u16, path: &str, body: &str) -> String {
     let mut buf = Vec::new();
     let _ = stream.read_to_end(&mut buf).await;
     String::from_utf8_lossy(&buf).into_owned()
+}
+
+async fn raw_post(port: u16, path: &str, body: &str) -> String {
+    raw_request(
+        port,
+        "POST",
+        path,
+        &["Authorization: Bearer tok"],
+        Some(body),
+    )
+    .await
 }
 
 /// Reads until `marker` appears (10s cap — a buffering proxy fails here), then to EOF after firing `release`.
@@ -403,6 +437,7 @@ fn serve_config(base_url: String, protocol: ProviderProtocol) -> ServeRouterConf
         is_grok: false,
         grok_fallback_api_key: None,
         is_codex: false,
+        is_claude_native_oauth: false,
         is_openrouter: false,
         is_starter: false,
         requires_reasoning_content: false,
@@ -1006,21 +1041,8 @@ async fn serve_router_learns_routes_per_model() {
 /// Like `raw_post` but with a caller-controlled auth header line
 /// (`None` = no auth header at all).
 async fn raw_post_with_auth(port: u16, path: &str, body: &str, auth_line: Option<&str>) -> String {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-    let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", port))
-        .await
-        .unwrap();
-    let auth = auth_line.map(|l| format!("{l}\r\n")).unwrap_or_default();
-    let req = format!(
-        "POST {path} HTTP/1.1\r\nHost: 127.0.0.1\r\n{auth}Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-        body.len()
-    );
-    stream.write_all(req.as_bytes()).await.unwrap();
-    let _ = stream.shutdown().await;
-    let mut buf = Vec::new();
-    let _ = stream.read_to_end(&mut buf).await;
-    String::from_utf8_lossy(&buf).into_owned()
+    let headers: Vec<&str> = auth_line.into_iter().collect();
+    raw_request(port, "POST", path, &headers, Some(body)).await
 }
 
 #[tokio::test]
@@ -1233,4 +1255,263 @@ async fn serve_router_dispatches_per_model_to_tier_upstream() {
         1,
         "suffixed tier model must not hit base"
     );
+}
+
+// ── Claude-subscription OAuth passthrough ────────────────────────────────
+
+/// Must equal the `token` inside [`CLAUDE_OAUTH_CREDS`].
+const CLAUDE_OAUTH_BEARER: &str = "sk-ant-oat01-TEST";
+const CLAUDE_OAUTH_CREDS: &str =
+    r#"{"token":"sk-ant-oat01-TEST","created_at":"2026-01-01T00:00:00Z"}"#;
+
+fn claude_oauth_key() -> ApiKey {
+    let mut key = test_key("claude-oauth");
+    key.key = Zeroizing::new(CLAUDE_OAUTH_CREDS.to_string());
+    key
+}
+
+/// Config for a subscription main upstream on a fake at `upstream_port`;
+/// the loopback gate expects the client's own OAuth bearer.
+fn claude_oauth_serve_config(upstream_port: u16) -> ServeRouterConfig {
+    let mut config = serve_config(
+        format!("http://127.0.0.1:{upstream_port}"),
+        ProviderProtocol::Anthropic,
+    );
+    config.is_claude_native_oauth = true;
+    config.upstream_api_key = CLAUDE_OAUTH_CREDS.to_string();
+    config.auth_token = Some(CLAUDE_OAUTH_BEARER.to_string());
+    config
+}
+
+fn anthropic_body(model: &str) -> String {
+    format!(
+        r#"{{"model":"{model}","max_tokens":128,"messages":[{{"role":"user","content":"hi"}}]}}"#
+    )
+}
+
+#[tokio::test]
+async fn serve_router_claude_oauth_main_passthrough() {
+    no_proxy();
+    let anthropic = spawn_fake(&[(Endpoint::Messages, Mode::Ok), (Endpoint::Other, Mode::Ok)]);
+    let tier = spawn_fake(&[(Endpoint::Chat, Mode::Ok)]);
+
+    let tmp = tempfile::tempdir().unwrap();
+    let log_store = LogStore::new(tmp.path().to_path_buf());
+    std::mem::forget(tmp);
+
+    let router = ServeRouter::new(
+        claude_oauth_serve_config(anthropic.port),
+        claude_oauth_key(),
+        log_store,
+    )
+    .with_model_upstreams(vec![("model-tier".to_string(), test_key(&tier.base_url()))]);
+    let (_handle, _shutdown, port) = router
+        .start_background_with_addr("127.0.0.1", 0)
+        .await
+        .unwrap();
+
+    let oauth_auth = format!("Authorization: Bearer {CLAUDE_OAUTH_BEARER}");
+    let oauth_auth = oauth_auth.as_str();
+
+    // Wrong bearer → 401 before any upstream traffic.
+    let r = raw_request(
+        port,
+        "POST",
+        "/v1/messages",
+        &["Authorization: Bearer wrong"],
+        Some(&anthropic_body("model-main")),
+    )
+    .await;
+    assert_eq!(response_status(&r), 401, "{r}");
+    assert_eq!(anthropic.hit_count(Endpoint::Messages), 0);
+
+    // Subscription main: forwarded verbatim with merged oauth beta.
+    let r = raw_request(
+        port,
+        "POST",
+        "/v1/messages?beta=true",
+        &[
+            oauth_auth,
+            "anthropic-beta: claude-code-20250219",
+            "User-Agent: claude-cli/2.1.205 (external, cli)",
+        ],
+        Some(&anthropic_body("model-main")),
+    )
+    .await;
+    assert_eq!(response_status(&r), 200, "{r}");
+    assert!(r.contains("hello from anthropic"), "{r}");
+    let head = anthropic.heads().pop().unwrap();
+    let head_lower = head.to_lowercase();
+    assert!(
+        head.lines()
+            .next()
+            .unwrap()
+            .contains("/v1/messages?beta=true"),
+        "query preserved: {head}"
+    );
+    assert!(
+        head.contains(CLAUDE_OAUTH_BEARER),
+        "bearer forwarded: {head}"
+    );
+    assert!(
+        !head_lower.contains("x-api-key"),
+        "no api key header: {head}"
+    );
+    assert!(
+        head_lower.contains("oauth-2025-04-20"),
+        "oauth beta merged: {head}"
+    );
+    assert!(
+        head_lower.contains("claude-code-20250219"),
+        "inbound betas kept: {head}"
+    );
+    assert!(
+        head_lower.contains("claude-cli/2.1.205"),
+        "client UA forwarded: {head}"
+    );
+
+    // Tier model dispatches to its own provider with its own auth.
+    let r = raw_request(
+        port,
+        "POST",
+        "/v1/messages",
+        &[oauth_auth],
+        Some(&anthropic_body("model-tier")),
+    )
+    .await;
+    assert_eq!(response_status(&r), 200, "{r}");
+    assert_eq!(tier.hit_count(Endpoint::Chat), 1, "tier model hits tier");
+    let tier_head = tier.heads().pop().unwrap();
+    assert!(
+        !tier_head.contains(CLAUDE_OAUTH_BEARER),
+        "subscription bearer must not leak to tier: {tier_head}"
+    );
+    assert!(
+        tier_head.contains("sk-test"),
+        "tier uses its own key: {tier_head}"
+    );
+
+    // /v1/models and count_tokens forward to the native backend.
+    let r = raw_request(port, "GET", "/v1/models", &[oauth_auth], None).await;
+    assert_eq!(response_status(&r), 200, "{r}");
+    assert_eq!(anthropic.hit_count(Endpoint::Other), 1, "models forwarded");
+    let r = raw_request(
+        port,
+        "POST",
+        "/v1/messages/count_tokens",
+        &[oauth_auth],
+        Some(&anthropic_body("model-main")),
+    )
+    .await;
+    assert_eq!(response_status(&r), 200, "{r}");
+    assert_eq!(
+        anthropic.hit_count(Endpoint::Messages),
+        2,
+        "count_tokens forwarded"
+    );
+
+    // count_tokens for a non-subscription tier keeps the historical 404.
+    let r = raw_request(
+        port,
+        "POST",
+        "/v1/messages/count_tokens",
+        &[oauth_auth],
+        Some(&anthropic_body("model-tier")),
+    )
+    .await;
+    assert_eq!(response_status(&r), 404, "{r}");
+}
+
+#[tokio::test]
+async fn serve_router_claude_oauth_main_streams_sse_passthrough() {
+    no_proxy();
+    let anthropic = spawn_fake(&[(Endpoint::Messages, Mode::OkSse)]);
+
+    let tmp = tempfile::tempdir().unwrap();
+    let log_store = LogStore::new(tmp.path().to_path_buf());
+    std::mem::forget(tmp);
+
+    let router = ServeRouter::new(
+        claude_oauth_serve_config(anthropic.port),
+        claude_oauth_key(),
+        log_store,
+    );
+    let (_handle, _shutdown, port) = router
+        .start_background_with_addr("127.0.0.1", 0)
+        .await
+        .unwrap();
+
+    let oauth_auth = format!("Authorization: Bearer {CLAUDE_OAUTH_BEARER}");
+    let r = raw_request(
+        port,
+        "POST",
+        "/v1/messages?beta=true",
+        &[oauth_auth.as_str()],
+        Some(
+            r#"{"model":"claude-fable-5","stream":true,"max_tokens":16,"messages":[{"role":"user","content":"hi"}]}"#,
+        ),
+    )
+    .await;
+    assert_eq!(response_status(&r), 200, "{r}");
+    assert!(r.contains("text/event-stream"), "{r}");
+    assert!(r.contains("event: message_start"), "{r}");
+    assert!(r.contains("hello from anthropic"), "{r}");
+}
+
+#[tokio::test]
+async fn serve_router_claude_oauth_tier_passthrough() {
+    no_proxy();
+    let base = spawn_fake(&[(Endpoint::Chat, Mode::Ok)]);
+    let sub = spawn_fake(&[(Endpoint::Messages, Mode::Ok)]);
+
+    // Point the subscription upstream at the fake; only this test touches the var.
+    unsafe {
+        std::env::set_var(
+            "AIVO_CLAUDE_OAUTH_UPSTREAM",
+            format!("http://127.0.0.1:{}", sub.port),
+        )
+    };
+
+    let tmp = tempfile::tempdir().unwrap();
+    let log_store = LogStore::new(tmp.path().to_path_buf());
+    std::mem::forget(tmp);
+
+    let router = ServeRouter::new(
+        serve_config(base.base_url(), ProviderProtocol::Openai),
+        test_key(&base.base_url()),
+        log_store,
+    )
+    .with_model_upstreams(vec![("claude-fable-5".to_string(), claude_oauth_key())]);
+    let (_handle, _shutdown, port) = router
+        .start_background_with_addr("127.0.0.1", 0)
+        .await
+        .unwrap();
+
+    // raw_post sends no anthropic-beta — the router must add the oauth beta itself.
+    let r = raw_post(port, "/v1/messages", &anthropic_body("claude-fable-5")).await;
+    assert_eq!(response_status(&r), 200, "{r}");
+    assert!(r.contains("hello from anthropic"), "{r}");
+    assert_eq!(
+        sub.hit_count(Endpoint::Messages),
+        1,
+        "tier hits subscription"
+    );
+    let head = sub.heads().pop().unwrap();
+    let head_lower = head.to_lowercase();
+    assert!(
+        head.contains(CLAUDE_OAUTH_BEARER),
+        "stored bearer injected: {head}"
+    );
+    assert!(
+        head_lower.contains("oauth-2025-04-20"),
+        "oauth beta added: {head}"
+    );
+    assert!(!head_lower.contains("x-api-key"), "{head}");
+
+    // Base model unaffected.
+    let r = raw_post(port, "/v1/messages", &anthropic_body("model-main")).await;
+    assert_eq!(response_status(&r), 200, "{r}");
+    assert_eq!(base.hit_count(Endpoint::Chat), 1);
+
+    unsafe { std::env::remove_var("AIVO_CLAUDE_OAUTH_UPSTREAM") };
 }

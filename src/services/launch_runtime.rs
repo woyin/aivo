@@ -1040,6 +1040,18 @@ fn loopback_auth_token(env: &HashMap<String, String>) -> Option<String> {
         .cloned()
 }
 
+/// Decodes a Claude-subscription key's OAuth token.
+fn claude_oauth_token(key: &ApiKey) -> Result<String> {
+    crate::services::claude_oauth::ClaudeOAuthCredential::from_json(key.key.as_str())
+        .map(|c| c.token)
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "Claude OAuth credential for key '{}' is unreadable — re-run `aivo keys add claude` ({e})",
+                key.display_name()
+            )
+        })
+}
+
 /// Starts a universal ServeRouter for a grok-oauth credential and returns its
 /// loopback port. It converts Anthropic `/v1/messages` → OpenAI and injects the
 /// grok token, so `aivo claude` reaches grok via the same path as `aivo code`.
@@ -1166,6 +1178,10 @@ async fn start_multi_upstream_serve_router(
             )
         })?;
         SessionStore::decrypt_key_secret(&mut key)?;
+        // Fail at launch, not with per-request 500s later.
+        if key.is_claude_oauth() {
+            claude_oauth_token(&key)?;
+        }
         model_upstreams.push((tier.model, key));
     }
 
@@ -1174,14 +1190,15 @@ async fn start_multi_upstream_serve_router(
     } else {
         None
     };
-    let config = ServeRouterConfig::from_key(
-        &main_key,
-        false,
-        300,
-        loopback_auth_token(env),
-        HashMap::new(),
-    )
-    .with_grok_fallback(fallback);
+    // A Claude-subscription main authenticates to the loopback with its own
+    // OAuth bearer, so the gate must expect that token.
+    let auth_token = if main_key.is_claude_oauth() {
+        Some(claude_oauth_token(&main_key)?)
+    } else {
+        loopback_auth_token(env)
+    };
+    let config = ServeRouterConfig::from_key(&main_key, false, 300, auth_token, HashMap::new())
+        .with_grok_fallback(fallback);
     let (handle, _shutdown, port) = ServeRouter::new(config, main_key, session_store.logs())
         .with_oauth_persist(session_store.clone())
         .with_model_upstreams(model_upstreams)

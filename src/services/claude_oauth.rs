@@ -11,6 +11,16 @@ use tokio::process::Command;
 /// Sentinel stored in `ApiKey.base_url` for Claude Code OAuth entries.
 pub const CLAUDE_OAUTH_SENTINEL: &str = "claude-oauth";
 
+/// Beta flag Anthropic requires on OAuth-authenticated inference requests.
+pub const ANTHROPIC_OAUTH_BETA: &str = "oauth-2025-04-20";
+
+/// Native upstream for Claude-subscription passthrough requests.
+/// `AIVO_CLAUDE_OAUTH_UPSTREAM` overrides it (test seam).
+pub fn upstream_base_url() -> String {
+    std::env::var("AIVO_CLAUDE_OAUTH_UPSTREAM")
+        .unwrap_or_else(|_| "https://api.anthropic.com".to_string())
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ClaudeOAuthCredential {
     pub token: String,

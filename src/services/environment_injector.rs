@@ -438,10 +438,32 @@ impl EnvironmentInjector {
             // source-detection treats a set-but-empty var as "present" and
             // labels the session as API-key auth. The launcher must actually
             // unset (env_remove) them so the child inherits no value at all.
-            env.insert(
-                AIVO_INTERNAL_ENV_UNSET.to_string(),
-                "ANTHROPIC_API_KEY,ANTHROPIC_AUTH_TOKEN,ANTHROPIC_BASE_URL".to_string(),
-            );
+            //
+            // With tiers, ANTHROPIC_BASE_URL points at the loopback router
+            // instead, so it must stay off the unset list (env_remove runs
+            // after .envs()).
+            if overrides.tier_upstreams.is_empty() {
+                env.insert(
+                    AIVO_INTERNAL_ENV_UNSET.to_string(),
+                    "ANTHROPIC_API_KEY,ANTHROPIC_AUTH_TOKEN,ANTHROPIC_BASE_URL".to_string(),
+                );
+            } else {
+                env.insert(
+                    AIVO_INTERNAL_ENV_UNSET.to_string(),
+                    "ANTHROPIC_API_KEY,ANTHROPIC_AUTH_TOKEN".to_string(),
+                );
+                env.insert(
+                    "ANTHROPIC_BASE_URL".to_string(),
+                    PLACEHOLDER_LOOPBACK_URL.to_string(),
+                );
+                env.insert(
+                    "AIVO_USE_ANTHROPIC_TO_OPENAI_ROUTER".to_string(),
+                    "1".to_string(),
+                );
+                Self::seed_tier_router_markers(&mut env, key, &overrides.tier_upstreams);
+                // No router auth token: the gate expects the OAuth bearer
+                // itself (launch_runtime reads it from the store).
+            }
 
             // `-m`, `--1m`/`--2m`, and per-slot overrides apply to OAuth the
             // same as to API keys: Claude Code reads ANTHROPIC_MODEL and the
@@ -458,20 +480,8 @@ impl EnvironmentInjector {
                     env.insert(slot.to_string(), anthropic_model.clone());
                 }
             }
-            for (env_var, value) in [
-                ("ANTHROPIC_DEFAULT_FABLE_MODEL", overrides.fable.as_deref()),
-                ("CLAUDE_CODE_SUBAGENT_MODEL", overrides.subagent.as_deref()),
-                ("ANTHROPIC_DEFAULT_HAIKU_MODEL", overrides.haiku.as_deref()),
-                (
-                    "ANTHROPIC_DEFAULT_SONNET_MODEL",
-                    overrides.sonnet.as_deref(),
-                ),
-                ("ANTHROPIC_DEFAULT_OPUS_MODEL", overrides.opus.as_deref()),
-            ] {
-                if let Some(v) = value {
-                    env.insert(env_var.to_string(), anthropic_native_model_name(v));
-                }
-            }
+            // Subscription upstream is always native Anthropic.
+            Self::apply_claude_slot_overrides(&mut env, overrides, true);
             return env;
         }
 
@@ -503,18 +513,8 @@ impl EnvironmentInjector {
                 variant.to_string(),
             );
         }
-        // Seed for the multi-upstream router: model→keyId map + main key id.
-        if !overrides.tier_upstreams.is_empty()
-            && let Ok(json) = serde_json::to_string(&overrides.tier_upstreams)
-        {
-            env.insert(
-                "AIVO_ANTHROPIC_TO_OPENAI_ROUTER_TIERS_JSON".to_string(),
-                json,
-            );
-            env.insert(
-                "AIVO_ANTHROPIC_TO_OPENAI_ROUTER_MAIN_KEY_ID".to_string(),
-                key.id.clone(),
-            );
+        if !overrides.tier_upstreams.is_empty() {
+            Self::seed_tier_router_markers(&mut env, key, &overrides.tier_upstreams);
         }
         env.insert("ANTHROPIC_API_KEY".to_string(), String::new());
         if Self::should_disable_claude_nonessential_traffic(key) {
@@ -586,23 +586,43 @@ impl EnvironmentInjector {
             }
         }
 
-        // Per-slot overrides win over the fan-out from `model`. Each slot is
-        // normalized through the same anthropic_native_model_name() pass when
-        // talking to a native Anthropic endpoint so e.g. `claude-sonnet-4.6`
-        // becomes `claude-sonnet-4-6`.
-        // Tier slots go elsewhere — don't Anthropic-normalize their ids.
+        Self::apply_claude_slot_overrides(&mut env, overrides, base_is_native_anthropic);
+
+        env
+    }
+
+    /// Seeds the multi-upstream router env contract: model→keyId map + main key id.
+    fn seed_tier_router_markers(
+        env: &mut HashMap<String, String>,
+        key: &ApiKey,
+        tier_upstreams: &[TierUpstream],
+    ) {
+        let Ok(json) = serde_json::to_string(tier_upstreams) else {
+            return;
+        };
+        env.insert(
+            "AIVO_ANTHROPIC_TO_OPENAI_ROUTER_TIERS_JSON".to_string(),
+            json,
+        );
+        env.insert(
+            "AIVO_ANTHROPIC_TO_OPENAI_ROUTER_MAIN_KEY_ID".to_string(),
+            key.id.clone(),
+        );
+    }
+
+    /// Per-slot overrides win over the fan-out from `model`. Native-Anthropic
+    /// slots get the `anthropic_native_model_name` pass; tier slots stay
+    /// verbatim to match the router's dispatch map.
+    fn apply_claude_slot_overrides(
+        env: &mut HashMap<String, String>,
+        overrides: &ClaudeModelOverrides,
+        native_anthropic: bool,
+    ) {
         let tier_models: std::collections::HashSet<&str> = overrides
             .tier_upstreams
             .iter()
             .map(|t| t.model.as_str())
             .collect();
-        let normalize = |v: &str| {
-            if base_is_native_anthropic && !tier_models.contains(v) {
-                anthropic_native_model_name(v)
-            } else {
-                v.to_string()
-            }
-        };
         for (env_var, value) in [
             ("ANTHROPIC_DEFAULT_FABLE_MODEL", overrides.fable.as_deref()),
             ("CLAUDE_CODE_SUBAGENT_MODEL", overrides.subagent.as_deref()),
@@ -614,11 +634,14 @@ impl EnvironmentInjector {
             ("ANTHROPIC_DEFAULT_OPUS_MODEL", overrides.opus.as_deref()),
         ] {
             if let Some(v) = value {
-                env.insert(env_var.to_string(), normalize(v));
+                let slot_model = if native_anthropic && !tier_models.contains(v) {
+                    anthropic_native_model_name(v)
+                } else {
+                    v.to_string()
+                };
+                env.insert(env_var.to_string(), slot_model);
             }
         }
-
-        env
     }
 
     /// Prepares environment variables for Codex CLI
@@ -1695,6 +1718,86 @@ mod tests {
         assert_eq!(
             env.get("ANTHROPIC_DEFAULT_HAIKU_MODEL"),
             Some(&"glm-4.6".to_string())
+        );
+    }
+
+    #[test]
+    fn for_claude_oauth_with_tiers_emits_router_markers_and_keeps_oauth_token() {
+        use crate::services::claude_oauth::{CLAUDE_OAUTH_SENTINEL, ClaudeOAuthCredential};
+        let creds = ClaudeOAuthCredential {
+            token: "sk-ant-oat01-TEST".into(),
+            created_at: chrono::Utc::now(),
+        };
+        let key = ApiKey::new_with_protocol(
+            "subid".into(),
+            "sub".into(),
+            CLAUDE_OAUTH_SENTINEL.into(),
+            None,
+            creds.to_json().unwrap(),
+        );
+        let overrides = ClaudeModelOverrides {
+            haiku: Some("grok-4.5".into()),
+            opus: Some("claude-opus-4.6".into()),
+            tier_upstreams: vec![TierUpstream {
+                model: "grok-4.5".into(),
+                key_id: "tierid".into(),
+            }],
+            ..Default::default()
+        };
+        let env = EnvironmentInjector::new().for_claude_with_overrides(
+            &key,
+            Some("claude-fable-5"),
+            &overrides,
+        );
+
+        // OAuth auth stays intact; the base URL now points at the loopback.
+        assert_eq!(
+            env.get("CLAUDE_CODE_OAUTH_TOKEN"),
+            Some(&"sk-ant-oat01-TEST".to_string())
+        );
+        assert_eq!(
+            env.get("ANTHROPIC_BASE_URL"),
+            Some(&PLACEHOLDER_LOOPBACK_URL.to_string())
+        );
+        assert_eq!(
+            env.get("AIVO_USE_ANTHROPIC_TO_OPENAI_ROUTER"),
+            Some(&"1".to_string())
+        );
+        assert_eq!(
+            env.get("AIVO_ANTHROPIC_TO_OPENAI_ROUTER_MAIN_KEY_ID"),
+            Some(&"subid".to_string())
+        );
+        let tiers = env
+            .get("AIVO_ANTHROPIC_TO_OPENAI_ROUTER_TIERS_JSON")
+            .expect("tiers json present");
+        assert!(tiers.contains("\"model\":\"grok-4.5\""));
+        // Base URL must stay off the unset list.
+        let unset = env
+            .get(AIVO_INTERNAL_ENV_UNSET)
+            .expect("unset list present");
+        let names: Vec<&str> = unset.split(',').collect();
+        assert!(names.contains(&"ANTHROPIC_API_KEY"));
+        assert!(names.contains(&"ANTHROPIC_AUTH_TOKEN"));
+        assert!(!names.contains(&"ANTHROPIC_BASE_URL"));
+        // OAuth mode intact: no auth vars, no exported gate secret.
+        assert!(!env.contains_key("ANTHROPIC_AUTH_TOKEN"));
+        assert!(!env.contains_key("ANTHROPIC_API_KEY"));
+        assert!(!env.contains_key(AIVO_ROUTER_AUTH_TOKEN));
+        assert!(!env.contains_key("CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS"));
+        assert!(!env.contains_key("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"));
+        assert!(!env.contains_key("ANTHROPIC_CUSTOM_MODEL_OPTION"));
+        // Subscription-bound slots normalize; tier slots stay verbatim.
+        assert_eq!(
+            env.get("ANTHROPIC_DEFAULT_HAIKU_MODEL"),
+            Some(&"grok-4.5".to_string())
+        );
+        assert_eq!(
+            env.get("ANTHROPIC_DEFAULT_OPUS_MODEL"),
+            Some(&"claude-opus-4-6".to_string())
+        );
+        assert_eq!(
+            env.get("ANTHROPIC_MODEL"),
+            Some(&"claude-fable-5".to_string())
         );
     }
 

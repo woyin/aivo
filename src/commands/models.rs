@@ -319,8 +319,8 @@ impl ModelsCommand {
             },
         };
 
-        // Grok/Codex tokens can enumerate models; other OAuth can't.
-        if key.is_any_oauth() && !key.is_provider_oauth() {
+        // Grok/Codex/Claude tokens can enumerate models; other OAuth can't.
+        if key.is_any_oauth() && !key.is_provider_oauth() && !key.is_claude_oauth() {
             eprintln!(
                 "{} Key '{}' is an OAuth credential — it doesn't have a model listing API.",
                 style::red("Error:"),
@@ -1060,6 +1060,40 @@ async fn fetch_models_detailed_filtered(
     if key.is_codex_oauth() {
         let ids = crate::services::codex_oauth::known_model_ids();
         return Ok(ids.into_iter().map(ModelInfo::id_only).collect());
+    }
+    // Native `/v1/models` accepts the OAuth bearer (no oauth beta needed) and
+    // returns live token limits.
+    if key.is_claude_oauth() {
+        let mut key = key.clone();
+        SessionStore::decrypt_key_secret(&mut key)?;
+        let token =
+            crate::services::claude_oauth::ClaudeOAuthCredential::from_json(&key.key)?.token;
+        let url = format!(
+            "{}/v1/models?limit=1000",
+            crate::services::claude_oauth::upstream_base_url().trim_end_matches('/')
+        );
+        let response = client
+            .get(&url)
+            .header("Authorization", format!("Bearer {token}"))
+            .header("anthropic-version", "2023-06-01")
+            .send_logged()
+            .await?;
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            return Err(friendly_api_error(status, &body));
+        }
+        let resp: OpenAIModelsResponse = response.json().await?;
+        let scale = infer_price_scale(&resp.data);
+        let mut models: Vec<ModelInfo> = resp
+            .data
+            .into_iter()
+            .map(|m| m.into_model_info(scale))
+            .collect();
+        if chat_only {
+            models.retain(|m| is_text_chat_model(&m.id));
+        }
+        return Ok(models);
     }
     if key.is_any_oauth() {
         anyhow::bail!(

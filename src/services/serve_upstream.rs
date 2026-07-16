@@ -221,6 +221,93 @@ pub(crate) async fn send_anthropic_native(
     ))
 }
 
+/// Forwards a Claude Code request verbatim (headers included — the edge
+/// inspects them) to the Anthropic native backend, authenticating with the
+/// stored subscription OAuth token.
+pub(crate) async fn send_claude_oauth_passthrough(
+    request: &str,
+    context: &UpstreamRequestContext,
+) -> Result<RouterResponse> {
+    let token = match crate::services::claude_oauth::ClaudeOAuthCredential::from_json(
+        &context.upstream_api_key,
+    ) {
+        Ok(creds) => creds.token,
+        Err(_) => {
+            return Ok(RouterResponse::buffered(
+                500,
+                CONTENT_TYPE_JSON,
+                br#"{"error":{"message":"Claude OAuth credential unreadable - re-run `aivo keys add claude`"}}"#
+                    .to_vec(),
+            ));
+        }
+    };
+
+    // Raw target keeps the query string (`/v1/messages?beta=true`).
+    let target = http_utils::extract_request_path(request);
+    let url = http_utils::build_target_url(&context.upstream_base_url, &target);
+
+    let mut headers = http_utils::extract_passthrough_headers(request)?;
+    ensure_oauth_beta(&mut headers);
+    if !headers.contains_key("anthropic-version") {
+        headers.insert(
+            "anthropic-version",
+            reqwest::header::HeaderValue::from_static("2023-06-01"),
+        );
+    }
+
+    let is_post = request.starts_with("POST ");
+    let mut builder = if is_post {
+        context.client.post(&url)
+    } else {
+        context.client.get(&url)
+    };
+    builder = builder
+        .headers(headers)
+        .header("Authorization", format!("Bearer {token}"));
+    if is_post {
+        builder = builder
+            .header("Content-Type", CONTENT_TYPE_JSON)
+            .body(http_utils::extract_request_body(request)?.to_string());
+    }
+
+    let response = builder.send_logged().await?;
+    let status = response.status().as_u16();
+    let content_type = http_utils::response_content_type(&response);
+    if status < 400 && content_type.contains("text/event-stream") {
+        return Ok(RouterResponse::Streaming {
+            status,
+            content_type: "text/event-stream".to_string(),
+            body: Box::new(StreamingBody::Upstream(response)),
+        });
+    }
+    Ok(RouterResponse::buffered(
+        status,
+        &content_type,
+        response.bytes().await?.to_vec(),
+    ))
+}
+
+/// Merges the OAuth beta flag into `anthropic-beta` — Claude Code omits it
+/// when the subscription is only a tier behind an API-key main.
+fn ensure_oauth_beta(headers: &mut reqwest::header::HeaderMap) {
+    use crate::services::claude_oauth::ANTHROPIC_OAUTH_BETA;
+    let merged = match headers.get("anthropic-beta").and_then(|v| v.to_str().ok()) {
+        Some(existing) => {
+            if existing
+                .split(',')
+                .any(|b| b.trim() == ANTHROPIC_OAUTH_BETA)
+            {
+                return;
+            }
+            format!("{ANTHROPIC_OAUTH_BETA},{existing}")
+        }
+        None => ANTHROPIC_OAUTH_BETA.to_string(),
+    };
+    if let Ok(value) = reqwest::header::HeaderValue::from_str(&merged) {
+        headers.insert("anthropic-beta", value);
+    }
+}
+
 pub(crate) async fn send_openai_chat(
     body: &mut Value,
     client_wants_stream: bool,
@@ -964,6 +1051,43 @@ mod tests {
         let mut body = json!({"model": "claude-sonnet-4-6-20250603"});
         normalize_openai_request_model(&mut body, false, true);
         assert_eq!(body["model"], "claude-sonnet-4.6");
+    }
+
+    #[test]
+    fn ensure_oauth_beta_inserts_when_absent() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        ensure_oauth_beta(&mut headers);
+        assert_eq!(headers.get("anthropic-beta").unwrap(), "oauth-2025-04-20");
+    }
+
+    #[test]
+    fn ensure_oauth_beta_merges_with_existing() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            "anthropic-beta",
+            "claude-code-20250219,extended-cache-ttl-2025-04-11"
+                .parse()
+                .unwrap(),
+        );
+        ensure_oauth_beta(&mut headers);
+        assert_eq!(
+            headers.get("anthropic-beta").unwrap(),
+            "oauth-2025-04-20,claude-code-20250219,extended-cache-ttl-2025-04-11"
+        );
+    }
+
+    #[test]
+    fn ensure_oauth_beta_noop_when_already_present() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            "anthropic-beta",
+            "oauth-2025-04-20,claude-code-20250219".parse().unwrap(),
+        );
+        ensure_oauth_beta(&mut headers);
+        assert_eq!(
+            headers.get("anthropic-beta").unwrap(),
+            "oauth-2025-04-20,claude-code-20250219"
+        );
     }
 
     #[test]

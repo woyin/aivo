@@ -81,12 +81,13 @@ impl RunCommand {
         refresh: bool,
         main_model: Option<&str>,
     ) -> Result<Option<ClaudeModelOverrides>> {
+        // (flag stem, display label, value)
         let slots = [
-            ("fable family model", flags.fable),
-            ("subagent model", flags.subagent),
-            ("haiku family model", flags.haiku),
-            ("sonnet family model", flags.sonnet),
-            ("opus family model", flags.opus),
+            ("fable", "fable family model", flags.fable),
+            ("subagent", "subagent model", flags.subagent),
+            ("haiku", "haiku family model", flags.haiku),
+            ("sonnet", "sonnet family model", flags.sonnet),
+            ("opus", "opus family model", flags.opus),
         ];
 
         let aliases = self.session_store.get_aliases().await.unwrap_or_default();
@@ -98,7 +99,7 @@ impl RunCommand {
         let mut slot_routes: Vec<(String, String)> = Vec::new();
         // (slot, model, key name, routes off the main key) — for the summary.
         let mut summary_rows: Vec<(String, String, String, bool)> = Vec::new();
-        for (idx, (label, value)) in slots.into_iter().enumerate() {
+        for (idx, (stem, label, value)) in slots.into_iter().enumerate() {
             let Some(raw) = value else { continue };
             let (key_ref, model_part) = crate::cli_args::split_tier_spec(&raw);
             let (key_ref, model_part) =
@@ -125,14 +126,6 @@ impl RunCommand {
                 key.clone()
             };
 
-            // A Claude subscription tier hits the native backend, not the loopback.
-            if tier_key.is_claude_oauth() && tier_key.id != key.id {
-                anyhow::bail!(
-                    "per-tier routing can't use Claude subscription key '{}' for {label} — pick an API key",
-                    tier_key.display_name()
-                );
-            }
-
             let model_empty = model_part.is_empty(); // empty → picker
             let flag_model = Some(model_part);
             let prompt = if model_empty {
@@ -155,15 +148,19 @@ impl RunCommand {
                     &prompt,
                 )
                 .await?;
-            let model = match outcome {
+            let mut model = match outcome {
                 ModelOutcome::Cancelled => return Ok(None),
                 ModelOutcome::UseDefault => continue,
                 ModelOutcome::Model(m) => m,
             };
+            // Canonicalize so the slot env and the router's dispatch key match.
+            if tier_key.is_claude_oauth() {
+                model = crate::services::model_names::anthropic_native_model_name(&model);
+            }
             resolved[idx] = Some(model.clone());
             slot_routes.push((model.clone(), tier_key.id.clone()));
             summary_rows.push((
-                label.split_whitespace().next().unwrap_or(label).to_string(),
+                stem.to_string(),
                 model.clone(),
                 tier_key.display_name().to_string(),
                 tier_key.id != key.id,
@@ -178,12 +175,6 @@ impl RunCommand {
         }
 
         if !tier_upstreams.is_empty() {
-            // A Claude subscription main launches natively — no loopback to route.
-            if key.is_claude_oauth() {
-                anyhow::bail!(
-                    "per-tier routing isn't supported with a Claude subscription main key — relaunch with an API key via -k"
-                );
-            }
             // The `ollama` base-URL sentinel isn't resolvable by the router.
             if crate::services::provider_profile::provider_profile_for_key(key).kind
                 == crate::services::provider_profile::ProviderKind::Ollama

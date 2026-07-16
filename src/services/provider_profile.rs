@@ -159,6 +159,8 @@ pub fn resolve_starter_base_url(base_url: &str) -> String {
         crate::services::grok_oauth::INFERENCE_BASE_URL.to_string()
     } else if base_url == crate::services::codex_oauth::CODEX_OAUTH_SENTINEL {
         crate::services::codex_oauth::CHATGPT_BACKEND_BASE_URL.to_string()
+    } else if base_url == crate::services::claude_oauth::CLAUDE_OAUTH_SENTINEL {
+        crate::services::claude_oauth::upstream_base_url()
     } else {
         base_url.to_string()
     }
