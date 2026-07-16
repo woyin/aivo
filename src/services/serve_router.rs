@@ -283,7 +283,7 @@ impl ServeRouter {
         tokio::task::JoinHandle<Result<()>>,
         Arc<tokio::sync::Notify>,
     )> {
-        let listener = tokio::net::TcpListener::bind(format!("{}:{}", host, port)).await?;
+        let listener = bind_serve_listener(host, port).await?;
         Ok(self.spawn_on(listener))
     }
 
@@ -299,7 +299,7 @@ impl ServeRouter {
         Arc<tokio::sync::Notify>,
         u16,
     )> {
-        let listener = tokio::net::TcpListener::bind(format!("{}:{}", host, port)).await?;
+        let listener = bind_serve_listener(host, port).await?;
         let bound = listener.local_addr()?.port();
         let (handle, shutdown) = self.spawn_on(listener);
         Ok((handle, shutdown, bound))
@@ -420,6 +420,16 @@ impl ServeRouter {
         });
 
         (tokio::spawn(run_accept_loop(listener, state)), shutdown)
+    }
+}
+
+/// `port == 0` goes through `bind_concrete_ephemeral` (reachable under WSL
+/// VirtioProxy, issue #22); an explicit port binds directly.
+async fn bind_serve_listener(host: &str, port: u16) -> Result<tokio::net::TcpListener> {
+    if port == 0 {
+        crate::services::http_utils::bind_concrete_ephemeral(host).await
+    } else {
+        Ok(tokio::net::TcpListener::bind(format!("{}:{}", host, port)).await?)
     }
 }
 

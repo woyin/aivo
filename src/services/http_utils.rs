@@ -93,11 +93,32 @@ pub async fn read_full_request(
     Ok(buf)
 }
 
-/// Binds a router listener to a random localhost port and returns the listener and port.
 pub async fn bind_local_listener() -> Result<(tokio::net::TcpListener, u16)> {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let listener = bind_concrete_ephemeral("127.0.0.1").await?;
     let port = listener.local_addr()?.port();
     Ok((listener, port))
+}
+
+/// Binds `host` to a concrete OS-assigned port (discover via `:0`, then rebind
+/// that exact port). WSL2 `networkingMode=VirtioProxy` never registers ports
+/// opened via `:0`, so they get ECONNREFUSED/RST even same-netns; a concrete
+/// bind is registered (issue #22). Retry covers the rebind TOCTOU race.
+pub async fn bind_concrete_ephemeral(host: &str) -> Result<tokio::net::TcpListener> {
+    use tokio::net::TcpListener;
+    let mut last_err: Option<std::io::Error> = None;
+    for _ in 0..8 {
+        let probe = TcpListener::bind(format!("{host}:0")).await?;
+        let port = probe.local_addr()?.port();
+        drop(probe);
+        match TcpListener::bind(format!("{host}:{port}")).await {
+            Ok(listener) => return Ok(listener),
+            Err(e) => last_err = Some(e),
+        }
+    }
+    Err(
+        anyhow::Error::from(last_err.expect("rebind loop always records an error"))
+            .context(format!("failed to bind a concrete port on {host}")),
+    )
 }
 
 /// Builds an authorized POST request for OpenAI-compatible upstreams.
@@ -1030,6 +1051,19 @@ pub fn copilot_initiator_from_openai(body: &Value) -> &'static str {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[tokio::test]
+    async fn bind_concrete_ephemeral_binds_reachable_nonzero_port() {
+        let listener = bind_concrete_ephemeral("127.0.0.1").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        assert_ne!(port, 0);
+
+        let accept = tokio::spawn(async move { listener.accept().await.map(|_| ()) });
+        tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .unwrap();
+        accept.await.unwrap().unwrap();
+    }
 
     #[test]
     fn sse_line_buffer_reassembles_split_multibyte() {
