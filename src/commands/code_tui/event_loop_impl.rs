@@ -1820,7 +1820,10 @@ impl CodeTuiApp {
         // close an overlay) followed by its tail `[<…M` as literal `Char`s typed
         // into the composer. We withhold a bare Esc for one event to see whether
         // that tail follows in the same burst; if so the Esc is dropped, the tail
-        // swallowed, and the scroll the user meant is re-synthesized.
+        // swallowed, and the scroll the user meant is re-synthesized. The same
+        // machine swallows leaked OSC 10/11 color replies — a terminal answering
+        // some earlier program's query late (seen over slow SSH), which would
+        // otherwise be typed into the composer as `]11;rgb:…`.
         let mut esc = EscReassembly::Idle;
         while event::poll(Duration::from_millis(0))? {
             let event = event::read()?;
@@ -1936,12 +1939,29 @@ impl CodeTuiApp {
                     *esc = EscReassembly::PendingEsc;
                     return Ok(EscStep::Consumed);
                 }
+                // `ESC ]` coalesced in one read surfaces as Alt+`]` — the lead
+                // of a leaked OSC color reply.
+                if is_alt_char(&event, ']') {
+                    *esc = EscReassembly::Osc {
+                        buf: "]".to_string(),
+                        alt_lead: true,
+                    };
+                    return Ok(EscStep::Consumed);
+                }
                 Ok(EscStep::Passthrough(event))
             }
             EscReassembly::PendingEsc => {
                 // `\x1b[` is the CSI lead of a split mouse report — start swallowing.
                 if char_press(&event) == Some('[') {
                     *esc = EscReassembly::Sgr("[".to_string());
+                    return Ok(EscStep::Consumed);
+                }
+                // `\x1b]` split across reads: same OSC lead.
+                if char_press(&event) == Some(']') {
+                    *esc = EscReassembly::Osc {
+                        buf: "]".to_string(),
+                        alt_lead: false,
+                    };
                     return Ok(EscStep::Consumed);
                 }
                 // A genuine lone Esc: deliver it, then let this event through.
@@ -1986,6 +2006,55 @@ impl CodeTuiApp {
                     }
                 }
             }
+            EscReassembly::Osc { buf, alt_lead } => {
+                let alt_lead = *alt_lead;
+                // Terminator: ST coalesced to Alt+`\`, or BEL (0x07 → Ctrl+G).
+                if is_alt_char(&event, '\\') || is_ctrl_char(&event, 'g') {
+                    *esc = EscReassembly::Idle;
+                    return Ok(EscStep::Consumed);
+                }
+                // A split ST: hold its ESC and expect the trailing `\`.
+                if is_bare_esc(&event) {
+                    let buf = std::mem::take(buf);
+                    *esc = EscReassembly::OscSt { buf, alt_lead };
+                    return Ok(EscStep::Consumed);
+                }
+                let Some(c) = char_press(&event) else {
+                    let buffered = std::mem::take(buf);
+                    *esc = EscReassembly::Idle;
+                    if self.replay_osc(&buffered, alt_lead).await? {
+                        return Ok(EscStep::Exit);
+                    }
+                    return Ok(EscStep::Passthrough(event));
+                };
+                buf.push(c);
+                match osc_reply_frag_step(buf) {
+                    FragStep::Continue => Ok(EscStep::Consumed),
+                    // No char terminates an OSC reply, so a mismatch is real input.
+                    _ => {
+                        let buffered = std::mem::take(buf);
+                        *esc = EscReassembly::Idle;
+                        if self.replay_osc(&buffered, alt_lead).await? {
+                            return Ok(EscStep::Exit);
+                        }
+                        Ok(EscStep::Consumed)
+                    }
+                }
+            }
+            EscReassembly::OscSt { buf, alt_lead } => {
+                // The `\` completing the split ST.
+                if char_press(&event) == Some('\\') {
+                    *esc = EscReassembly::Idle;
+                    return Ok(EscStep::Consumed);
+                }
+                // Not an ST: replay the run, the held Esc, then this event.
+                let (buffered, alt_lead) = (std::mem::take(buf), *alt_lead);
+                *esc = EscReassembly::Idle;
+                if self.replay_osc(&buffered, alt_lead).await? || self.deliver_esc().await? {
+                    return Ok(EscStep::Exit);
+                }
+                Ok(EscStep::Passthrough(event))
+            }
         }
     }
 
@@ -1995,6 +2064,24 @@ impl CodeTuiApp {
             EscReassembly::Idle => Ok(false),
             EscReassembly::PendingEsc => self.deliver_esc().await,
             EscReassembly::Sgr(buf) => self.replay_held(&buf).await,
+            // A confirmed reply prefix that never terminated is one split
+            // mid-flight — drop it; an ambiguous shorter run replays as text.
+            EscReassembly::Osc { buf, alt_lead } => {
+                if osc_reply_confirmed(&buf) {
+                    Ok(false)
+                } else {
+                    self.replay_osc(&buf, alt_lead).await
+                }
+            }
+            EscReassembly::OscSt { buf, alt_lead } => {
+                if osc_reply_confirmed(&buf) {
+                    Ok(false)
+                } else if self.replay_osc(&buf, alt_lead).await? {
+                    Ok(true)
+                } else {
+                    self.deliver_esc().await
+                }
+            }
         }
     }
 
@@ -2010,6 +2097,20 @@ impl CodeTuiApp {
         if self.deliver_esc().await? {
             return Ok(true);
         }
+        self.replay_chars(buffered).await
+    }
+
+    /// Replays a held suspected-OSC run that turned out to be real input;
+    /// only an esc-led run has a separate Esc to replay.
+    async fn replay_osc(&mut self, buffered: &str, alt_lead: bool) -> Result<bool> {
+        if alt_lead {
+            self.replay_chars(buffered).await
+        } else {
+            self.replay_held(buffered).await
+        }
+    }
+
+    async fn replay_chars(&mut self, buffered: &str) -> Result<bool> {
         for c in buffered.chars() {
             if self
                 .handle_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE))
@@ -2870,13 +2971,19 @@ impl CodeTuiApp {
 }
 
 /// State for stitching a mouse report that crossterm split at its leading ESC
-/// back together (see `drain_input`). `Idle` is the common case; `PendingEsc`
-/// holds a bare Esc whose fate is undecided; `Sgr` accumulates the `[<…`
-/// fragment once the CSI lead is confirmed.
+/// back together, and for swallowing leaked OSC color replies (see
+/// `drain_input`). `Idle` is the common case; `PendingEsc` holds a bare Esc
+/// whose fate is undecided; `Sgr` accumulates the `[<…` fragment once the CSI
+/// lead is confirmed; `Osc` accumulates a `]10;…`/`]11;…` reply and `OscSt`
+/// has seen the ESC of its split `ESC \` terminator. `alt_lead` records a
+/// coalesced Alt+`]` opening (vs bare Esc then `]`), so a false match replays
+/// exactly what was held.
 pub(super) enum EscReassembly {
     Idle,
     PendingEsc,
     Sgr(String),
+    Osc { buf: String, alt_lead: bool },
+    OscSt { buf: String, alt_lead: bool },
 }
 
 /// Outcome of feeding one event through the reassembler.
@@ -2930,6 +3037,22 @@ fn is_bare_esc(event: &Event) -> bool {
         if k.kind == KeyEventKind::Press && k.code == KeyCode::Esc && k.modifiers.is_empty())
 }
 
+/// `true` when `event` is `ch` pressed with exactly Alt — how crossterm
+/// surfaces `ESC ch` coalesced into a single read.
+fn is_alt_char(event: &Event, ch: char) -> bool {
+    matches!(event, Event::Key(k)
+        if k.kind == KeyEventKind::Press && k.code == KeyCode::Char(ch)
+            && k.modifiers == KeyModifiers::ALT)
+}
+
+/// `true` when `event` is `ch` pressed with exactly Ctrl — how a raw control
+/// byte (BEL 0x07 → Ctrl+G) surfaces from crossterm.
+fn is_ctrl_char(event: &Event, ch: char) -> bool {
+    matches!(event, Event::Key(k)
+        if k.kind == KeyEventKind::Press && k.code == KeyCode::Char(ch)
+            && k.modifiers == KeyModifiers::CONTROL)
+}
+
 /// Lead an image-rejection 400 with an actionable line, for models the snapshot
 /// didn't know were text-only. The provider wording is the cross-vendor signal.
 pub(super) fn reframe_image_input_error(err: String, model: &str) -> String {
@@ -2976,6 +3099,36 @@ pub(super) fn sgr_mouse_frag_step(buf: &str) -> FragStep {
             FragStep::Invalid
         }
     } else if last.is_ascii_digit() || last == ';' {
+        FragStep::Continue
+    } else {
+        FragStep::Invalid
+    }
+}
+
+/// `true` once `buf` carries the unambiguous OSC color-report prefix.
+pub(super) fn osc_reply_confirmed(buf: &str) -> bool {
+    buf.starts_with("]10;") || buf.starts_with("]11;")
+}
+
+/// Classifies how a leaked OSC color reply (`]{10|11};{payload}`) fits its
+/// grammar. Payload chars cover xterm reply formats (`rgb:`, `rgba:`, `#hex`,
+/// `cielab:`); no char is final — the terminator (BEL / `ESC \`) is an event.
+pub(super) fn osc_reply_frag_step(buf: &str) -> FragStep {
+    const MAX_LEN: usize = 64;
+    const PREFIXES: [&str; 2] = ["]10;", "]11;"];
+    if buf.len() > MAX_LEN {
+        return FragStep::Invalid;
+    }
+    if let Some(payload) = PREFIXES.iter().find_map(|p| buf.strip_prefix(p)) {
+        if payload
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, ':' | '/' | '#' | '.' | '%'))
+        {
+            FragStep::Continue
+        } else {
+            FragStep::Invalid
+        }
+    } else if PREFIXES.iter().any(|p| p.starts_with(buf)) {
         FragStep::Continue
     } else {
         FragStep::Invalid
