@@ -1,5 +1,27 @@
 # Changelog
 
+## v0.41.0
+
+A per-tier routing and TUI polish release. A Claude subscription can now serve as the main model or any individual tier in per-tier routing, alongside the existing `<key>::<model>` shorthand which now also works on the `code`/`run` paths. `/resume` can import and continue sessions from other coding agents, `/config` gets a segmented-switches redesign, and the TUI adds a dark/light theme with terminal auto-detection. Agent memory gains dream-based consolidation and copy-on-write worktrees, plus a batch of stability fixes for the TUI, networking, and model discovery.
+
+- feat(claude): let a Claude subscription serve as main or tier in per-tier routing (#21) (f91b8a86)
+- feat(claude): per-tier provider/key routing via `<key>::<model>` (b88bd6ba)
+- feat(claude): add `--fable-model` tier, drop dead `--reasoning-model` (fafd4f52)
+- feat(agent): dream memory consolidation, compaction hardening, CoW worktrees (0edcadb7)
+- feat(code): accept `<key>::<model>` shorthand on code and run paths (ce010254)
+- feat(code): import & resume other coding agents' sessions in `/resume` (a3999428)
+- feat(code): redesign `/config` as segmented switches with a Mode radio (2f363f7e)
+- feat(code): dark/light theme for the TUI with `/config` toggle + terminal auto-detect (01cf5f9c)
+- fix(code): harden the `/goal` loop's stop signals (01bad947)
+- fix(code): self-heal terminal-side cell corruption in the TUI (5f254cf1)
+- fix(code): tone down accent color in transcript content (c90b6554)
+- fix(code): merge streamed usage chunks so a partial final chunk can't understate context fill (37f56a06)
+- fix(models): probe base-URL paths before origin so different paths get their own model lists (#24) (2e34952c)
+- fix(net): bind concrete loopback ports so WSL VirtioProxy reaches routers (452db23f)
+- fix(grok): persist rotated refresh_token so it survives process exit (f36279d3)
+- fix(test): open dream marker with write access for set_modified on Windows (a5ab6bf3)
+- chore: drop 'Esc interrupts' from the essentials hint (c46f665d)
+
 ## v0.40.0
 
 A provider-auth and protocol release. Codex ChatGPT OAuth and SuperGrok OAuth both become usable by any coding agent (not just their native CLIs), Grok models show up in the `code`/`start` pickers with an `aivo-login`-style sign-in flow, and `aivo serve` gains a wire-format registry with native protocol edges. The TUI also fixes parallel tool batches so each result draws under its call.
