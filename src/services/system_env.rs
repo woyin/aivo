@@ -78,6 +78,12 @@ pub fn env_flag(var: &str) -> Option<bool> {
     ))
 }
 
+/// Parse a typed env override; `None` means unset/empty/unparseable (caller's
+/// default applies). The numeric sibling of [`env_flag`], for the same reason.
+pub fn env_parse<T: std::str::FromStr>(var: &str) -> Option<T> {
+    std::env::var(var).ok()?.trim().parse().ok()
+}
+
 /// Returns true if a process with `pid` is still alive on this system. Used
 /// to prune stale registry entries and detect orphaned helper processes.
 pub fn is_pid_alive(pid: u32) -> bool {

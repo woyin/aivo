@@ -93,13 +93,16 @@ pub async fn collect_all(
     let Some(home) = system_env::home_dir() else {
         return HashMap::new();
     };
-    collect_all_in(&home, refresh, cutoff, extra_steps).await
+    let cache_dir = crate::services::paths::config_dir();
+    collect_all_in(&home, &cache_dir, refresh, cutoff, extra_steps).await
 }
 
-/// [`collect_all`] against an explicit home dir, so tests can drive it with
-/// fixture files instead of the process environment.
+/// [`collect_all`] against an explicit home dir (tool data sources) and cache
+/// dir (aivo's own write-back caches), so tests can drive both ends with
+/// fixtures instead of the process environment.
 async fn collect_all_in(
     home: &Path,
+    cache_dir: &Path,
     refresh: bool,
     cutoff: Option<chrono::DateTime<chrono::Utc>>,
     extra_steps: usize,
@@ -109,7 +112,8 @@ async fn collect_all_in(
     let mut result = HashMap::new();
     for (i, &tool) in tools.iter().enumerate() {
         let step = Some((i + 1, total_steps));
-        if let Ok(Some(stats)) = collect_with_step(home, tool, refresh, step, cutoff).await
+        if let Ok(Some(stats)) =
+            collect_with_step(home, cache_dir, tool, refresh, step, cutoff).await
             && (stats.total_tokens() > 0 || stats.sessions > 0)
         {
             result.insert(tool.to_string(), stats);
@@ -126,11 +130,13 @@ pub async fn collect(
     let Some(home) = system_env::home_dir() else {
         return Ok(None);
     };
-    collect_with_step(&home, tool, refresh, None, cutoff).await
+    let cache_dir = crate::services::paths::config_dir();
+    collect_with_step(&home, &cache_dir, tool, refresh, None, cutoff).await
 }
 
 async fn collect_with_step(
     home: &Path,
+    cache_dir: &Path,
     tool: &str,
     refresh: bool,
     step: Option<(usize, usize)>,
@@ -143,7 +149,7 @@ async fn collect_with_step(
     // stats-cache holds lifetime-only totals with no per-period breakdown.
     if tool == "claude"
         && cutoff.is_none()
-        && let Some(stats) = collect_claude_from_cache(home, refresh, step).await
+        && let Some(stats) = collect_claude_from_cache(home, cache_dir, refresh, step).await
     {
         return Ok(Some(stats));
     }
@@ -162,7 +168,7 @@ async fn collect_with_step(
     };
 
     let filter = tool_file_filter(tool);
-    let cache_path = cache_path(tool);
+    let cache_path = crate::services::paths::stats_cache(cache_dir, tool);
     // When `cutoff` is set, parsed `FileEntry`s contain only post-cutoff
     // token totals. Persisting them would corrupt later non-cutoff runs
     // (size matches → no re-parse → wrong lifetime totals). Treat cutoff
@@ -345,8 +351,14 @@ fn native_present_tools(home: &Path) -> Vec<&'static str> {
 /// count to size the `(x/N)` counter.
 pub fn native_present_count() -> usize {
     system_env::home_dir()
-        .map(|home| native_present_tools(&home).len())
+        .map(|home| native_present_count_in(&home))
         .unwrap_or(0)
+}
+
+/// [`native_present_count`] against an explicit home dir — the same test seam
+/// as [`collect_all_in`].
+fn native_present_count_in(home: &Path) -> usize {
+    native_present_tools(home).len()
 }
 
 fn tool_data_dir(home: &Path, tool: &str) -> Option<PathBuf> {
@@ -356,10 +368,6 @@ fn tool_data_dir(home: &Path, tool: &str) -> Option<PathBuf> {
         "gemini" => Some(home.join(".gemini").join("tmp")),
         _ => None,
     }
-}
-
-fn cache_path(tool: &str) -> PathBuf {
-    crate::services::paths::stats_cache(&crate::services::paths::config_dir(), tool)
 }
 
 fn tool_file_filter(tool: &str) -> fn(&str) -> bool {
@@ -458,6 +466,7 @@ async fn write_cache<T: Serialize>(path: &Path, cache: &T) -> Result<()> {
 /// only way to reproduce the totals shown in Claude Code's `/stats` UI.
 async fn collect_claude_from_cache(
     home: &Path,
+    cache_dir: &Path,
     refresh: bool,
     step: Option<(usize, usize)>,
 ) -> Option<GlobalToolStats> {
@@ -475,7 +484,7 @@ async fn collect_claude_from_cache(
             &projects_dir,
             cutoff,
             &mut stats,
-            &cache_path("claude-delta"),
+            &crate::services::paths::stats_cache(cache_dir, "claude-delta"),
             refresh,
             step,
         )
@@ -1169,14 +1178,15 @@ mod tests {
         )
     }
 
-    // All fixture-driven collects pass `refresh: true`: aivo's own stats cache
-    // lives under the shared (sandboxed) config dir, and skipping reads keeps
-    // parallel tests from seeing each other's write-backs.
+    // Each test injects its own cache dir alongside the fixture home, so both
+    // the sources and aivo's own write-back caches stay test-local and both
+    // refresh paths are exercisable hermetically.
 
     #[tokio::test]
     async fn collect_all_walks_claude_jsonl_and_applies_cutoff() {
         let tmp = tempfile::TempDir::new().unwrap();
         let home = tmp.path();
+        let cache = home.join("cache");
         let proj = home.join(".claude").join("projects").join("p1");
         std::fs::create_dir_all(&proj).unwrap();
         std::fs::write(
@@ -1189,7 +1199,7 @@ mod tests {
         )
         .unwrap();
 
-        let all = collect_all_in(home, true, None, 0).await;
+        let all = collect_all_in(home, &cache, true, None, 0).await;
         assert_eq!(all.len(), 1, "only claude has data: {:?}", all.keys());
         let claude = all.get("claude").expect("claude present");
         assert_eq!(claude.input_tokens, 300);
@@ -1197,11 +1207,18 @@ mod tests {
         assert_eq!(claude.sessions, 1);
         assert_eq!(claude.models.len(), 1);
 
+        // refresh:false reuses the write-back cache (sizes unchanged → no
+        // re-parse) and must reproduce the same totals.
+        let all = collect_all_in(home, &cache, false, None, 0).await;
+        let claude = all.get("claude").expect("claude present from cache");
+        assert_eq!(claude.input_tokens, 300);
+        assert_eq!(claude.output_tokens, 30);
+
         // A cutoff between the two lines keeps only the later one.
         let cutoff = chrono::DateTime::parse_from_rfc3339("2026-02-01T00:00:00Z")
             .unwrap()
             .with_timezone(&chrono::Utc);
-        let all = collect_all_in(home, true, Some(cutoff), 2).await;
+        let all = collect_all_in(home, &cache, true, Some(cutoff), 2).await;
         let claude = all.get("claude").expect("claude present after cutoff");
         assert_eq!(claude.input_tokens, 200);
         assert_eq!(claude.output_tokens, 20);
@@ -1210,8 +1227,16 @@ mod tests {
     #[tokio::test]
     async fn collect_all_returns_empty_for_a_home_with_no_tool_data() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let all = collect_all_in(tmp.path(), true, None, 0).await;
+        let all = collect_all_in(tmp.path(), &tmp.path().join("cache"), true, None, 0).await;
         assert!(all.is_empty(), "unexpected tools: {:?}", all.keys());
+    }
+
+    #[test]
+    fn native_present_count_in_counts_only_tools_with_data() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        assert_eq!(native_present_count_in(tmp.path()), 0);
+        std::fs::create_dir_all(tmp.path().join(".claude").join("projects")).unwrap();
+        assert_eq!(native_present_count_in(tmp.path()), 1);
     }
 
     #[tokio::test]
@@ -1238,7 +1263,7 @@ mod tests {
         )
         .unwrap();
 
-        let stats = collect_with_step(home, "claude", true, None, None)
+        let stats = collect_with_step(home, &home.join("cache"), "claude", true, None, None)
             .await
             .expect("collect claude")
             .expect("stats present");

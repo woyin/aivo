@@ -26,10 +26,7 @@ pub(crate) fn retry_delay(
     if let Some(d) = retry_after {
         return d.min(std::time::Duration::from_secs(30));
     }
-    let base = std::env::var("AIVO_AGENT_RETRY_BASE_MS")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(600u64);
+    let base = crate::services::system_env::env_parse("AIVO_AGENT_RETRY_BASE_MS").unwrap_or(600u64);
     std::time::Duration::from_millis(base * (1u64 << attempt.saturating_sub(1)))
 }
 

@@ -94,6 +94,10 @@ fn aivo(home: &TempDir) -> Command {
     cmd.env("HOME", home.path())
         .env("USERPROFILE", home.path())
         .env("AIVO_TEST_FAST_CRYPTO_OK", "1")
+        // Generous probe deadline: under full-suite CPU load the default 2s
+        // starves a healthy manifest probe and flakes the capture assertions
+        // (same guard as cli_smoke.rs).
+        .env("AIVO_PLUGIN_PROBE_TIMEOUT_MS", "30000")
         .env("NO_COLOR", "1")
         .env("HTTP_PROXY", "")
         .env("HTTPS_PROXY", "")

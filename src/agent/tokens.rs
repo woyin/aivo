@@ -19,10 +19,7 @@ pub(crate) const CALIBRATION_MIN_SAMPLE: usize = 2_000;
 
 /// Recent-window size held out of compaction; `AIVO_AGENT_KEEP_RECENT` overrides.
 pub(crate) fn keep_recent_tokens() -> usize {
-    std::env::var("AIVO_AGENT_KEEP_RECENT")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(KEEP_RECENT_TOKENS)
+    crate::services::system_env::env_parse("AIVO_AGENT_KEEP_RECENT").unwrap_or(KEEP_RECENT_TOKENS)
 }
 
 /// Measured/estimate ratio clamped to [1.0, [`MAX_CALIBRATION`]]; `.max(1)` keeps the division safe.

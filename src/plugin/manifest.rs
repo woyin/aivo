@@ -16,17 +16,6 @@ pub(crate) const PROTOCOL_VERSION: &str = "1";
 /// Grace period for a plugin to print its manifest before the probe gives up.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// `AIVO_PLUGIN_PROBE_TIMEOUT_MS` overrides [`PROBE_TIMEOUT`]. The integration
-/// suite depends on it both ways: generous so full-suite CPU load can't starve
-/// a healthy probe into a flake, tiny so the hanging-probe test is instant.
-fn probe_timeout() -> Duration {
-    std::env::var("AIVO_PLUGIN_PROBE_TIMEOUT_MS")
-        .ok()
-        .and_then(|v| v.trim().parse().ok())
-        .map(Duration::from_millis)
-        .unwrap_or(PROBE_TIMEOUT)
-}
-
 /// A plugin's self-description, captured at install/update and cached verbatim in
 /// `.registry.json`. Unknown fields are ignored (forward-compatible). In
 /// protocol v1, `endpoint` is the only capability with host behavior; the rest
@@ -210,7 +199,7 @@ pub(crate) async fn probe_manifest(bin: &Path, name: &str) -> Option<PluginManif
         .kill_on_drop(true);
 
     // On timeout the future is dropped → kill_on_drop reaps the child.
-    let output = tokio::time::timeout(probe_timeout(), cmd.output())
+    let output = tokio::time::timeout(super::probe_timeout(PROBE_TIMEOUT), cmd.output())
         .await
         .ok()?
         .ok()?;

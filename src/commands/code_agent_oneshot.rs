@@ -36,15 +36,8 @@ pub(crate) fn key_is_agent_capable(key: &ApiKey) -> bool {
 const DEFAULT_MAX_STEPS: u32 = 1000;
 const DEFAULT_MAX_OUTPUT_TOKENS: u64 = 300_000;
 
-fn env_or<T: std::str::FromStr>(var: &str, default: T) -> T {
-    std::env::var(var)
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(default)
-}
-
 fn cli_env_or<T: Copy + std::str::FromStr>(cli: Option<T>, var: &str, default: T) -> T {
-    cli.unwrap_or_else(|| env_or(var, default))
+    cli.unwrap_or_else(|| crate::services::system_env::env_parse(var).unwrap_or(default))
 }
 
 #[derive(Clone, Copy, Debug, Default)]

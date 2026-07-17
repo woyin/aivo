@@ -21,10 +21,7 @@ pub(crate) const SEARCH_MAX_RESULTS: usize = 10;
 /// Deferral threshold in estimate-token space. `AIVO_AGENT_MCP_DEFER_TOKENS`
 /// overrides the default; `0` disables deferral (schemas always inline).
 pub(crate) fn defer_threshold() -> Option<usize> {
-    match std::env::var("AIVO_AGENT_MCP_DEFER_TOKENS")
-        .ok()
-        .and_then(|s| s.parse::<usize>().ok())
-    {
+    match crate::services::system_env::env_parse::<usize>("AIVO_AGENT_MCP_DEFER_TOKENS") {
         Some(0) => None,
         Some(n) => Some(n),
         None => Some(DEFAULT_DEFER_TOKENS),

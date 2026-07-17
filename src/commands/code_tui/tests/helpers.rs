@@ -7,10 +7,7 @@ pub(super) fn make_test_app(
     // Unique throwaway stores — NEVER the real `~/.config/aivo` / models
     // cache. Tests that drive a save (persist / flush / turn-finish) would
     // otherwise write through them (the process HOME sandbox is the backstop).
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static N: AtomicU64 = AtomicU64::new(0);
-    let n = N.fetch_add(1, Ordering::Relaxed);
-    let dir = std::env::temp_dir().join(format!("aivo-test-{}-{n}", std::process::id()));
+    let dir = crate::test_sandbox::tmp("aivo-test");
     let mut app = CodeTuiApp::bare(
         tx,
         rx,

@@ -14,8 +14,6 @@ use std::path::{Component, Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 
-/// Max bytes / lines returned from any single tool result before truncation
-/// (whichever is hit first). Borrowed from pi's bounded-output approach.
 mod bash;
 pub use bash::*;
 mod files;
@@ -31,8 +29,9 @@ pub use specs::*;
 mod web;
 pub(crate) use web::*;
 
+/// Max bytes / lines returned from any single tool result before truncation
+/// (whichever is hit first). Borrowed from pi's bounded-output approach.
 const MAX_OUTPUT: usize = 30_000;
-
 const MAX_OUTPUT_LINES: usize = 2_000;
 
 /// Default / hard cap on `read_file` lines when no limit is given.

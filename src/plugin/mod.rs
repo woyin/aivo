@@ -20,6 +20,16 @@ use crate::style;
 
 pub(crate) const PLUGIN_PREFIX: &str = "aivo-";
 
+/// `AIVO_PLUGIN_PROBE_TIMEOUT_MS` overrides a probe's default deadline
+/// (manifest and stats probes alike). The integration suite depends on it both
+/// ways: generous so full-suite CPU load can't starve a healthy probe into a
+/// flake, tiny so hanging-probe tests are instant.
+pub(crate) fn probe_timeout(default: std::time::Duration) -> std::time::Duration {
+    crate::services::system_env::env_parse("AIVO_PLUGIN_PROBE_TIMEOUT_MS")
+        .map(std::time::Duration::from_millis)
+        .unwrap_or(default)
+}
+
 /// Well-known aivo plugins with a canonical install source. Invoking one that
 /// isn't installed offers to install it on the spot instead of letting clap
 /// reject the name as unknown. `(name, install_source)`.

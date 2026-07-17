@@ -69,9 +69,7 @@ pub(super) fn plan_go_message(guidance: &str) -> String {
 }
 
 fn goal_max_iterations() -> usize {
-    std::env::var("AIVO_GOAL_MAX_ITERS")
-        .ok()
-        .and_then(|s| s.parse().ok())
+    crate::services::system_env::env_parse("AIVO_GOAL_MAX_ITERS")
         .filter(|n| *n > 0)
         .unwrap_or(GOAL_DEFAULT_MAX_ITERS)
 }

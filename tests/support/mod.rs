@@ -12,16 +12,20 @@
 /// Pre-main and therefore single-threaded: the env mutation is race-free.
 #[ctor::ctor(unsafe)]
 fn sandbox_process_env() {
+    // No home at all → fail loud rather than quarantine under temp_dir():
+    // temp paths sit inside the agent write-sandbox allowlist, which would
+    // silently flip its HOME-must-be-blocked enforcement tests.
     let real_home = std::env::var_os("HOME")
         .or_else(|| std::env::var_os("USERPROFILE"))
         .map(std::path::PathBuf::from)
-        .unwrap_or_else(std::env::temp_dir);
+        .expect("test sandbox requires HOME (or USERPROFILE) to be set");
     let root = real_home.join(".aivo-test-home");
     sweep_stale_quarantines(&root);
     let home = root.join(std::process::id().to_string());
     // PID reuse could resurface state from an earlier run; start clean.
     let _ = std::fs::remove_dir_all(&home);
-    std::fs::create_dir_all(&home).expect("create sandbox HOME");
+    std::fs::create_dir_all(&home)
+        .unwrap_or_else(|e| panic!("create sandbox HOME {}: {e}", home.display()));
     // SAFETY: no other threads exist before main().
     unsafe {
         std::env::set_var("HOME", &home);
@@ -53,11 +57,31 @@ fn sweep_stale_quarantines(root: &std::path::Path) {
     }
 }
 
+/// Unique per call — parallel tests must not share a dir. The one temp-dir
+/// helper; test helpers alias it instead of re-rolling the pid+counter scheme.
+#[allow(dead_code)] // compiled into every test binary; not all of them call it
+pub fn tmp(prefix: &str) -> std::path::PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static N: AtomicU64 = AtomicU64::new(0);
+    let id = N.fetch_add(1, Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!("{prefix}-{}-{}", std::process::id(), id));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
 /// The sandbox only protects binaries that compile this module in — a new
 /// tests/*.rs that forgets `mod support;` silently runs unprotected. Enforced
 /// here so the check needs no CI wiring; runs (cheaply) in every binary.
 #[test]
 fn every_integration_test_binary_includes_the_sandbox() {
+    // This binary first: prove the ctor actually ran, not just that the
+    // module is mentioned somewhere.
+    let home = std::env::var("HOME").expect("HOME set");
+    assert!(
+        home.contains(".aivo-test-home"),
+        "sandbox ctor did not run in this binary (HOME={home})"
+    );
     // Opted out by design: its Landlock assertions are about the real HOME's
     // placement outside the sandbox allowlist.
     const EXEMPT: &[&str] = &["sandbox_linux"];
@@ -75,8 +99,10 @@ fn every_integration_test_binary_includes_the_sandbox() {
             continue;
         }
         let src = std::fs::read_to_string(&path).expect("read test source");
+        // Whole-line match: a comment or string merely mentioning the
+        // declaration must not satisfy the guard.
         assert!(
-            src.contains("mod support;"),
+            src.lines().any(|l| l.trim() == "mod support;"),
             "tests/{name}.rs must declare `mod support;` (HOME sandbox) or join the exemption list in tests/support/mod.rs"
         );
     }

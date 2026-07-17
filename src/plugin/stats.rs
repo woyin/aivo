@@ -82,7 +82,7 @@ pub(crate) async fn probe_stats(name: &str) -> Option<PluginStatsReport> {
         .kill_on_drop(true);
 
     // On timeout the future is dropped → kill_on_drop reaps the child.
-    let output = tokio::time::timeout(PROBE_TIMEOUT, cmd.output())
+    let output = tokio::time::timeout(super::probe_timeout(PROBE_TIMEOUT), cmd.output())
         .await
         .ok()?
         .ok()?;

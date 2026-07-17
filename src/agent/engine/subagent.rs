@@ -319,7 +319,7 @@ pub(super) fn parse_artifact_seq(name: &str) -> Option<usize> {
 }
 
 /// Filesystem-safe slug from a task's first 40 chars; empty → `report`.
-pub(super) fn slug_for_artifact(task: &str) -> String {
+fn slug_for_artifact(task: &str) -> String {
     let mut slug = String::new();
     let mut prev_dash = false;
     for ch in task.chars().take(40) {

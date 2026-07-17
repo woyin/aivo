@@ -18,9 +18,7 @@ impl AgentEngine {
         max_steps: u32,
     ) -> Self {
         // Env override so compaction can be exercised without a small-context model.
-        let context_window = std::env::var("AIVO_AGENT_CONTEXT_WINDOW")
-            .ok()
-            .and_then(|s| s.parse().ok())
+        let context_window = crate::services::system_env::env_parse("AIVO_AGENT_CONTEXT_WINDOW")
             .unwrap_or(context_window);
         let max_steps = resolve_max_steps(max_steps);
         let mut specs = tools::tool_specs_for(model);
