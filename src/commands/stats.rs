@@ -251,17 +251,24 @@ impl StatsCommand {
                 },
             );
         }
-        // Chat sessions go through the index (timestamped), not the per-key
-        // counters (lifetime-only). One walk yields both count and tokens.
+        // The session index is evicted, so counting it saturates: lifetime
+        // uses the launch counter, windowed floors it with logged sessions.
         let (chat_sessions, chat_window) = match cutoff {
             Some(c) => {
-                let w = self.store.aggregate_chat_window_since(c).await;
-                (w.count, w)
+                let logs = self.store.logs();
+                let (w, logged) = tokio::join!(
+                    self.store.aggregate_chat_window_since(c),
+                    logs.count_distinct_code_sessions_since(c),
+                );
+                (w.count.max(logged.unwrap_or(0)), w)
             }
-            None => (
-                self.store.count_chat_sessions().await,
-                ChatTokenWindow::default(),
-            ),
+            None => {
+                let launches = aivo_tool_counts.get("code").copied().unwrap_or(0);
+                (
+                    launches.max(self.store.count_chat_sessions().await),
+                    ChatTokenWindow::default(),
+                )
+            }
         };
         let chat_tokens = chat_tokens_for_summary(&stats, &key_ids, cutoff, &chat_window);
         if chat_tokens.total_tokens() > 0 || chat_sessions > 0 {

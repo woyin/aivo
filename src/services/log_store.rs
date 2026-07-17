@@ -367,6 +367,19 @@ impl LogStore {
         .await
     }
 
+    /// Counts distinct chat sessions with any logged turn since `cutoff`.
+    /// Turn events outlive session-index eviction, making this the windowed floor.
+    pub async fn count_distinct_code_sessions_since(
+        &self,
+        cutoff: chrono::DateTime<chrono::Utc>,
+    ) -> Result<u64> {
+        let cutoff_str = cutoff.to_rfc3339();
+        self.read_with_fallback("chat session counts", move |conn| {
+            count_distinct_code_sessions_with_connection(conn, &cutoff_str)
+        })
+        .await
+    }
+
     /// Sums per-model token usage from `tool_launch` *finished* rows since
     /// `cutoff`. These tokens are stamped by the plugin endpoint at run end (see
     /// `finish_accounting`), so this is the timestamped, windowable view of a
@@ -836,6 +849,18 @@ fn count_runs_with_connection(
     Ok(count.max(0) as u64)
 }
 
+fn count_distinct_code_sessions_with_connection(conn: &Connection, cutoff: &str) -> Result<u64> {
+    let count: i64 = conn
+        .prepare(
+            "select count(distinct session_id) from events \
+             where source in ('chat','code') and session_id is not null and ts_utc >= ?",
+        )
+        .context("Failed to prepare chat-session-count query")?
+        .query_row([cutoff], |row| row.get(0))
+        .context("Failed to execute chat-session-count query")?;
+    Ok(count.max(0) as u64)
+}
+
 fn aggregate_run_tokens_with_connection(
     conn: &Connection,
     cutoff: &str,
@@ -1265,6 +1290,45 @@ mod tests {
             .await
             .unwrap();
         assert!(map.is_empty());
+    }
+
+    #[tokio::test]
+    async fn count_distinct_code_sessions_since_dedupes_and_windows() {
+        let dir = TempDir::new().unwrap();
+        let store = store(&dir);
+
+        let turn = |source: &str, session: Option<&str>| LogEvent {
+            source: source.to_string(),
+            kind: "code_turn".to_string(),
+            session_id: session.map(str::to_string),
+            ..Default::default()
+        };
+
+        // Two turns in one session count once; legacy 'chat' source counts too.
+        store.append(turn("code", Some("s1"))).await.unwrap();
+        store.append(turn("code", Some("s1"))).await.unwrap();
+        store.append(turn("chat", Some("s2"))).await.unwrap();
+        // Session-less one-shot and non-chat sources are excluded.
+        store.append(turn("code", None)).await.unwrap();
+        store.append(turn("run", Some("s3"))).await.unwrap();
+
+        let past = chrono::Utc::now() - chrono::Duration::hours(1);
+        assert_eq!(
+            store
+                .count_distinct_code_sessions_since(past)
+                .await
+                .unwrap(),
+            2
+        );
+
+        let future = chrono::Utc::now() + chrono::Duration::hours(1);
+        assert_eq!(
+            store
+                .count_distinct_code_sessions_since(future)
+                .await
+                .unwrap(),
+            0
+        );
     }
 
     #[tokio::test]

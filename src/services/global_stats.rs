@@ -71,6 +71,14 @@ struct StatsCache {
     files: HashMap<String, FileEntry>,
 }
 
+/// Delta parses keyed to the `lastComputedDate` they were cut against;
+/// a recomputed date invalidates them all.
+#[derive(Serialize, Deserialize, Default)]
+struct DeltaCache {
+    cutoff_date: String,
+    files: HashMap<String, FileEntry>,
+}
+
 /// Collect global stats for all known tools sequentially.
 /// Sequential avoids progress line flickering (all tools share one stderr line).
 /// Returns a map of tool name → stats (only tools with data).
@@ -117,7 +125,7 @@ async fn collect_with_step(
     // stats-cache holds lifetime-only totals with no per-period breakdown.
     if tool == "claude"
         && cutoff.is_none()
-        && let Some(stats) = collect_claude_from_cache().await
+        && let Some(stats) = collect_claude_from_cache(refresh, step).await
     {
         return Ok(Some(stats));
     }
@@ -191,15 +199,15 @@ async fn collect_with_step(
                 "gemini" => parse_gemini_file(path, cutoff).await,
                 _ => None,
             };
-            if let Some(entry) = entry_opt {
-                cache.files.insert(
-                    path.to_string_lossy().to_string(),
-                    FileEntry {
-                        size: *size,
-                        ..entry
-                    },
-                );
-            }
+            // Cache no-usage parses too — uncached files re-parse every run.
+            let entry = entry_opt.unwrap_or_default();
+            cache.files.insert(
+                path.to_string_lossy().to_string(),
+                FileEntry {
+                    size: *size,
+                    ..entry
+                },
+            );
             if show_progress && ((i + 1) % update_interval == 0 || i + 1 == total) {
                 print_progress(i + 1, total, step);
             }
@@ -406,12 +414,12 @@ pub fn clear_progress_line() {
     eprint!("\r{:<40}\r", "");
 }
 
-async fn read_cache(path: &Path) -> Option<StatsCache> {
+async fn read_cache<T: serde::de::DeserializeOwned>(path: &Path) -> Option<T> {
     let data = fs::read_to_string(path).await.ok()?;
     serde_json::from_str(&data).ok()
 }
 
-async fn write_cache(path: &Path, cache: &StatsCache) -> Result<()> {
+async fn write_cache<T: Serialize>(path: &Path, cache: &T) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).await?;
     }
@@ -432,10 +440,13 @@ async fn write_cache(path: &Path, cache: &StatsCache) -> Result<()> {
 /// Claude Code merges historical session totals into this cache even after
 /// the underlying JSONL files are pruned, so reading it directly is the
 /// only way to reproduce the totals shown in Claude Code's `/stats` UI.
-async fn collect_claude_from_cache() -> Option<GlobalToolStats> {
+async fn collect_claude_from_cache(
+    refresh: bool,
+    step: Option<(usize, usize)>,
+) -> Option<GlobalToolStats> {
     let home = system_env::home_dir()?;
-    let cache_path = home.join(".claude").join("stats-cache.json");
-    let data = fs::read_to_string(&cache_path).await.ok()?;
+    let cc_cache_path = home.join(".claude").join("stats-cache.json");
+    let data = fs::read_to_string(&cc_cache_path).await.ok()?;
     let v: Value = serde_json::from_str(&data).ok()?;
     let mut stats = parse_claude_stats_cache(&v)?;
 
@@ -444,7 +455,15 @@ async fn collect_claude_from_cache() -> Option<GlobalToolStats> {
     // Replay the same merge so aivo shows the same live total.
     if let Some(cutoff) = v.get("lastComputedDate").and_then(|s| s.as_str()) {
         let projects_dir = home.join(".claude").join("projects");
-        merge_claude_jsonl_deltas(&projects_dir, cutoff, &mut stats).await;
+        merge_claude_jsonl_deltas(
+            &projects_dir,
+            cutoff,
+            &mut stats,
+            &cache_path("claude-delta"),
+            refresh,
+            step,
+        )
+        .await;
     }
 
     Some(stats)
@@ -453,9 +472,16 @@ async fn collect_claude_from_cache() -> Option<GlobalToolStats> {
 /// Walk `dir`/**/*.jsonl and fold any assistant activity dated after
 /// `cutoff_date` (YYYY-MM-DD, UTC) into `stats`. Files whose mtime is
 /// strictly before the day after `cutoff_date` are skipped without being
-/// opened — this turns a full-history rescan (thousands of files) into
-/// O(files touched today) work on the interactive `aivo stats` path.
-async fn merge_claude_jsonl_deltas(dir: &Path, cutoff_date: &str, stats: &mut GlobalToolStats) {
+/// opened; parses persist at `delta_cache_path` — the window grows until
+/// Claude Code recomputes its stats-cache.
+async fn merge_claude_jsonl_deltas(
+    dir: &Path,
+    cutoff_date: &str,
+    stats: &mut GlobalToolStats,
+    delta_cache_path: &Path,
+    refresh: bool,
+    step: Option<(usize, usize)>,
+) {
     let mtime_threshold = day_after_start_utc(cutoff_date);
     let Some(cutoff_dt) = NaiveDate::parse_from_str(cutoff_date, "%Y-%m-%d")
         .ok()
@@ -467,13 +493,76 @@ async fn merge_claude_jsonl_deltas(dir: &Path, cutoff_date: &str, stats: &mut Gl
     };
     let files = walk_files_with_size(dir, |name| name.ends_with(".jsonl")).await;
 
-    for (path, _, mtime) in &files {
-        if let (Some(t), Some(m)) = (mtime_threshold, mtime)
-            && *m < t
-        {
-            continue;
+    let mut cache: DeltaCache = if refresh {
+        DeltaCache::default()
+    } else {
+        read_cache(delta_cache_path).await.unwrap_or_default()
+    };
+    let date_reset = cache.cutoff_date != cutoff_date;
+    if date_reset {
+        cache = DeltaCache {
+            cutoff_date: cutoff_date.to_string(),
+            files: HashMap::new(),
+        };
+    }
+
+    let in_window: Vec<(&Path, u64)> = files
+        .iter()
+        .filter(|(_, _, mtime)| {
+            !matches!((mtime_threshold, mtime.as_ref()), (Some(t), Some(m)) if *m < t)
+        })
+        .map(|(path, size, _)| (path.as_path(), *size))
+        .collect();
+
+    let current: HashSet<String> = in_window
+        .iter()
+        .map(|(p, _)| p.to_string_lossy().to_string())
+        .collect();
+    let before = cache.files.len();
+    cache.files.retain(|k, _| current.contains(k));
+    let pruned = cache.files.len() != before;
+
+    let stale: Vec<(&Path, u64)> = in_window
+        .iter()
+        .filter(|(p, size)| {
+            cache
+                .files
+                .get(p.to_string_lossy().as_ref())
+                .is_none_or(|e| e.size != *size)
+        })
+        .copied()
+        .collect();
+
+    let total = stale.len();
+    let show_progress = total > 5 && std::io::IsTerminal::is_terminal(&std::io::stderr());
+    let update_interval = (total / 50).max(1);
+    if show_progress {
+        print_progress(0, total, step);
+    }
+    for (i, (path, size)) in stale.iter().enumerate() {
+        let entry = parse_claude_file_with_cutoff(path, Some(cutoff_dt))
+            .await
+            .unwrap_or_default();
+        cache.files.insert(
+            path.to_string_lossy().to_string(),
+            FileEntry {
+                size: *size,
+                ..entry
+            },
+        );
+        if show_progress && ((i + 1) % update_interval == 0 || i + 1 == total) {
+            print_progress(i + 1, total, step);
         }
-        let Some(entry) = parse_claude_file_with_cutoff(path, Some(cutoff_dt)).await else {
+    }
+    if show_progress {
+        eprint!("\r{:<30}\r", "");
+    }
+    if date_reset || pruned || !stale.is_empty() {
+        let _ = write_cache(delta_cache_path, &cache).await;
+    }
+
+    for (path, _) in &in_window {
+        let Some(entry) = cache.files.get(path.to_string_lossy().as_ref()) else {
             continue;
         };
         stats.input_tokens += entry.input_tokens;
@@ -483,8 +572,8 @@ async fn merge_claude_jsonl_deltas(dir: &Path, cutoff_date: &str, stats: &mut Gl
         if entry.has_session {
             stats.sessions += 1;
         }
-        for (model, mt) in entry.models {
-            let m = stats.models.entry(model).or_default();
+        for (model, mt) in &entry.models {
+            let m = stats.models.entry(model.clone()).or_default();
             m.input_tokens += mt.input_tokens;
             m.output_tokens += mt.output_tokens;
             m.cache_read_tokens += mt.cache_read_tokens;
@@ -1069,8 +1158,11 @@ mod tests {
     #[tokio::test]
     async fn collect_all_accepts_cutoff_signature() {
         // Compile-time check on the signature (cutoff + extra-steps count).
-        let _ = collect_all(false, None, 0).await;
-        let _ = collect_all(false, Some(chrono::Utc::now()), 3).await;
+        // Never invoked: running would scan the real ~/.claude and write real cache files.
+        let _ = || async {
+            let _ = collect_all(false, None, 0).await;
+            let _ = collect_all(false, Some(chrono::Utc::now()), 3).await;
+        };
     }
 
     #[test]
@@ -1146,6 +1238,55 @@ mod tests {
         let path = dir.path().join(name);
         fs::write(&path, lines.join("\n")).await.unwrap();
         path
+    }
+
+    #[tokio::test]
+    async fn merge_claude_jsonl_deltas_persists_parses_and_invalidates() {
+        let dir = tempfile::tempdir().unwrap();
+        let line = r#"{"type":"assistant","isSidechain":false,"timestamp":"2026-01-05T00:00:00Z","message":{"model":"claude-sonnet-4-6","usage":{"input_tokens":100,"output_tokens":40}},"sessionId":"abc"}"#;
+        write_jsonl(&dir, "delta.jsonl", &[line]).await;
+        let cache_dir = tempfile::tempdir().unwrap();
+        let cache_path = cache_dir.path().join("delta-cache.json");
+
+        let merge = |cutoff: &'static str, refresh: bool| {
+            let dir = dir.path().to_path_buf();
+            let cache_path = cache_path.clone();
+            async move {
+                let mut stats = GlobalToolStats::default();
+                merge_claude_jsonl_deltas(&dir, cutoff, &mut stats, &cache_path, refresh, None)
+                    .await;
+                stats
+            }
+        };
+
+        let first = merge("2026-01-01", false).await;
+        assert_eq!(first.input_tokens, 100);
+        assert_eq!(first.sessions, 1);
+        assert!(cache_path.exists(), "first merge must persist the cache");
+
+        // Tamper with the cached entry; the sentinel showing through proves a cache hit.
+        let mut v: Value =
+            serde_json::from_str(&std::fs::read_to_string(&cache_path).unwrap()).unwrap();
+        let files = v.get_mut("files").unwrap().as_object_mut().unwrap();
+        files.values_mut().next().unwrap()["input_tokens"] = 999.into();
+        std::fs::write(&cache_path, v.to_string()).unwrap();
+
+        let second = merge("2026-01-01", false).await;
+        assert_eq!(
+            second.input_tokens, 999,
+            "unchanged file must be read from the delta cache"
+        );
+
+        let third = merge("2026-01-02", false).await;
+        assert_eq!(third.input_tokens, 100, "date change must force a re-parse");
+
+        let mut v: Value =
+            serde_json::from_str(&std::fs::read_to_string(&cache_path).unwrap()).unwrap();
+        let files = v.get_mut("files").unwrap().as_object_mut().unwrap();
+        files.values_mut().next().unwrap()["input_tokens"] = 555.into();
+        std::fs::write(&cache_path, v.to_string()).unwrap();
+        let fourth = merge("2026-01-02", true).await;
+        assert_eq!(fourth.input_tokens, 100, "refresh must bypass the cache");
     }
 
     #[tokio::test]
