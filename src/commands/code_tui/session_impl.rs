@@ -434,21 +434,46 @@ is preserved."
             return Ok(());
         }
 
-        // Explicit id: jump if in this dir, else global fallback — a named
-        // session should resolve regardless of where it ran.
+        // Explicit id: exact hit in the loaded rows first, then the shared
+        // resolver — unique prefix over saved aivo sessions (globally — a named
+        // session resolves regardless of where it ran) or this dir's
+        // importables (aivo import id or the source tool's own id).
         if let Some(query) = &query {
             if let Some(snapshot) = sessions.iter().find(|session| session.session_id == *query) {
                 self.begin_resume_load(snapshot.clone());
                 return Ok(());
             }
-            if scope_cwd.is_some()
-                && let Some(snapshot) = load_resume_snapshots(&self.session_store, None)
-                    .await?
-                    .into_iter()
-                    .find(|session| session.session_id == *query)
+            use crate::services::session_import::{ResumeTarget, resolve_resume_target};
+            match resolve_resume_target(
+                &self.session_store,
+                std::path::Path::new(&self.real_cwd),
+                query,
+            )
+            .await
             {
-                self.begin_resume_load(snapshot);
-                return Ok(());
+                ResumeTarget::AivoSession(full) => {
+                    let snapshot = match sessions.iter().find(|s| s.session_id == full) {
+                        Some(s) => Some(s.clone()),
+                        None => load_resume_snapshots(&self.session_store, None)
+                            .await?
+                            .into_iter()
+                            .find(|s| s.session_id == full),
+                    };
+                    if let Some(snapshot) = snapshot {
+                        self.begin_resume_load(snapshot);
+                        return Ok(());
+                    }
+                }
+                ResumeTarget::Foreign(imp) => {
+                    self.begin_resume_load(SessionPreview::from_importable(*imp));
+                    return Ok(());
+                }
+                ResumeTarget::Ambiguous(msg) => {
+                    self.notice = Some((MUTED(), msg));
+                    return Ok(());
+                }
+                // Fall through to the filtered picker.
+                ResumeTarget::Unknown => {}
             }
         }
 
@@ -2649,16 +2674,22 @@ is preserved."
     }
 
     pub(super) async fn apply_loaded_session(&mut self, session: LoadedSession) -> Result<()> {
+        let mut key_fallback_notice = None;
         if self.key.id != session.key_id {
-            let key = self
-                .session_store
-                .get_key_by_id(&session.key_id)
-                .await?
-                .ok_or_else(|| {
-                    anyhow::anyhow!("Saved key for this session is no longer available")
-                })?;
-            self.key = key;
-            self.copilot_tm = copilot_token_manager_for_key(&self.key);
+            match self.session_store.get_key_by_id(&session.key_id).await? {
+                Some(key) => {
+                    self.key = key;
+                    self.copilot_tm = copilot_token_manager_for_key(&self.key);
+                }
+                // Saved key was removed — keep the live key so the conversation
+                // still opens; the next save re-stamps it.
+                None => {
+                    key_fallback_notice = Some(
+                        "This session's saved key was removed — continuing with the current key"
+                            .to_string(),
+                    );
+                }
+            }
         }
 
         self.overlay = Overlay::None;
@@ -2737,6 +2768,18 @@ is preserved."
         // After model/window are set, so the preview mirrors the resumed session.
         self.context_tokens = self.estimated_context_used().await;
         self.context_is_estimate = true;
+        if session.source_newer {
+            let label = crate::services::session_import::import_source_label(&self.session_id)
+                .unwrap_or("source");
+            self.notice = Some((
+                MUTED(),
+                format!(
+                    "This fork is behind its {label} session — newer messages there were never imported here"
+                ),
+            ));
+        } else if let Some(msg) = key_fallback_notice {
+            self.notice = Some((MUTED(), msg));
+        }
         // Session-local: no persist, so viewing an old chat can't reset the key's
         // default model. Only explicit `/model` and `/key` persist.
         Ok(())

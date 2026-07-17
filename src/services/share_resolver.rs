@@ -697,13 +697,12 @@ async fn resolve_run_event(entry: &LogEntry, ctx: &ResolverContext) -> Result<Sh
         }
         _ => {
             let opts = IngestOptions {
-                max_age_days: None,
-                min_updated_at: None,
                 max_per_source: Some(50),
                 // Run-event fallback resolves short sessions too — the
                 // resolver looks up the native session that aivo launched,
                 // and that session might have started with a short prompt.
                 include_short_first_user: true,
+                ..IngestOptions::unlimited()
             };
             context_ingest::ingest_project(run_path, opts)
                 .await?

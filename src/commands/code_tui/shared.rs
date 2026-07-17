@@ -667,9 +667,10 @@ pub(crate) struct CodeTuiParams {
     pub initial_resume: Option<String>,
     /// Positional `aivo code "<text>"`: auto-sent as the first message.
     pub initial_prompt: Option<String>,
-    /// `--context` block, appended to the system prompt per build. Session-only.
+    /// Context-digest block (`--resume`'s digest rung), appended to the system
+    /// prompt per build. Session-only.
     pub injected_context: Option<String>,
-    /// One-line `-c` injection summary for the startup notice + `/context` header.
+    /// One-line digest summary for the startup notice + `/context` header.
     pub injected_context_summary: Option<String>,
     /// `--max-context <SIZE>` manual context-window override (tokens). Session-only.
     pub max_context: Option<u64>,
@@ -711,14 +712,19 @@ pub(super) fn to_chat_messages(
 }
 
 impl SessionPreview {
+    /// `key` is `None` when the session's stored key has since been removed —
+    /// the row stays listed (the conversation is still valuable) and resuming
+    /// it falls back to the live key.
     pub(super) fn from_index_entry(
         entry: crate::services::session_store::SessionIndexEntry,
-        key: &ApiKey,
+        key: Option<&ApiKey>,
     ) -> Self {
         Self {
-            key_id: key.id.clone(),
-            key_name: key.display_name().to_string(),
-            base_url: key.base_url.clone(),
+            key_id: key.map(|k| k.id.clone()).unwrap_or_default(),
+            key_name: key
+                .map(|k| k.display_name().to_string())
+                .unwrap_or_else(|| "key removed".to_string()),
+            base_url: key.map(|k| k.base_url.clone()).unwrap_or_default(),
             session_id: entry.session_id,
             raw_model: entry.model,
             updated_at: entry.updated_at,
@@ -793,6 +799,10 @@ pub(super) struct LoadedSession {
     /// viewing a Claude/Codex session shouldn't create an aivo copy. It persists
     /// (as a fork) only when a real turn grows the transcript past this baseline.
     pub(super) pristine_import: bool,
+    /// True when this is a saved fork whose SOURCE session has newer messages
+    /// than the fork has seen (the histories diverged) — surfaced as a notice
+    /// so loading the older fork is never silent.
+    pub(super) source_newer: bool,
 }
 
 impl LoadedSession {
@@ -804,6 +814,7 @@ impl LoadedSession {
             messages: to_chat_messages(state.messages),
             engine_messages: state.engine_messages,
             pristine_import: false,
+            source_newer: false,
         }
     }
 }
@@ -1461,7 +1472,7 @@ pub(super) enum Overlay {
     McpPaste(McpPasteOverlay),
     /// `/config` — a small fixed list of chat preferences, toggleable.
     Config(ConfigOverlay),
-    /// `/context` — the context-window breakdown, over the injected `-c` text.
+    /// `/context` — the context-window breakdown, over the injected digest text.
     Context {
         report: Box<crate::agent::engine::ContextReport>,
         scroll: u16,
@@ -2136,7 +2147,7 @@ pub(super) enum SlashCommand {
     Compact {
         fast: bool,
     },
-    /// `/context` — read-only viewer of the injected `-c` block.
+    /// `/context` — read-only viewer of the injected context digest.
     Context,
     /// `/session` — this session's id, provenance, model, key, and resume command.
     Session,
@@ -2639,7 +2650,7 @@ pub(super) struct CodeTuiApp {
     /// `--max-context` manual override (tokens); wins over the resolved window in
     /// `refresh_context_window` and the engine build. Session-only.
     pub(super) context_window_override: Option<u64>,
-    /// `--context` block, re-appended to the system prompt per engine build.
+    /// Context-digest block, re-appended to the system prompt per engine build.
     pub(super) injected_context: Option<String>,
     /// One-line `injected_context` summary, shown as the `/context` header.
     pub(super) injected_context_summary: Option<String>,

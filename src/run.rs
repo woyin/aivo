@@ -1,7 +1,4 @@
 //! Top-level CLI dispatch.
-//!
-//! Owns the process lifecycle (`process::exit`) so internal helpers can stay
-//! `pub(crate)` instead of leaking onto the lib's public surface.
 
 use std::process;
 
@@ -30,16 +27,9 @@ use crate::services::session_store::{AliasValue, BundleAlias};
 use crate::services::{self, AILauncher, EnvironmentInjector, SessionStore};
 use crate::{style, version};
 
-/// Refuses to run a `__internal_test_fast_crypto`-built binary against real user config.
-///
-/// `__internal_test_fast_crypto` (documented in CLAUDE.md) uses reduced PBKDF2 iterations
-/// so the test suite runs fast. A binary built with that feature derives a
-/// different encryption key than a normal release binary, so it silently fails
-/// to decrypt any real API key stored in `~/.config/aivo/config.json`. Shipping
-/// or running such a binary as a CLI is always a mistake. Tests run library
-/// code directly in tempdirs and don't hit this guard.
-///
-/// Override for intentional manual testing: `AIVO_TEST_FAST_CRYPTO_OK=1`.
+/// Binary built with `__internal_test_fast_crypto` uses reduced PBKDF2 iterations.
+/// It cannot decrypt keys encrypted by a normal aivo binary.
+/// Override with `AIVO_TEST_FAST_CRYPTO_OK=1`.
 #[cfg(feature = "__internal_test_fast_crypto")]
 fn fast_crypto_guard() {
     if std::env::var_os("AIVO_TEST_FAST_CRYPTO_OK").is_some() {
@@ -460,7 +450,6 @@ pub async fn run() -> ! {
                     model,
                     one_shot,
                     initial_prompt,
-                    code_args.context,
                     code_args.attachments,
                     code_args.refresh,
                     key_override,
@@ -632,8 +621,8 @@ pub async fn run() -> ! {
             let dry_run = extracted.dry_run;
             let refresh = extracted.refresh;
             let relogin = extracted.relogin;
-            // Context selector: prefer clap-parsed value, fall back to passthrough-recovered.
-            let context_selector = run_args.context.or(extracted.context);
+            // Recovered from passthrough — `--resume` is not a clap arg (see `RunArgs`).
+            let resume_selector = extracted.resume;
             let env_strings = extracted.env_strings;
             let remaining_args = extracted.remaining_args;
 
@@ -669,10 +658,10 @@ pub async fn run() -> ! {
                     process::exit(ExitCode::UserError.code());
                 }
 
-                // The start flow has no injection hook; warn rather than drop `-c` silently.
-                if context_selector.is_some() {
+                // The start flow has no resume hook; warn rather than drop it silently.
+                if resume_selector.is_some() {
                     eprintln!(
-                        "  {} --context is ignored here; use `aivo code -c` or `aivo <tool> -c`",
+                        "  {} --resume is ignored here; use `aivo code --resume` or `aivo <tool> --resume=<id>`",
                         style::yellow("!")
                     );
                 }
@@ -856,7 +845,7 @@ pub async fn run() -> ! {
                         slots,
                         env,
                         key_override,
-                        context_selector,
+                        resume_selector,
                         max_context,
                     )
                     .await

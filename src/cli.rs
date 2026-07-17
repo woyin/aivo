@@ -724,13 +724,10 @@ pub struct RunArgs {
     #[arg(long)]
     pub relogin: bool,
 
-    /// Inject context from one past session in this project — a native AI
-    /// CLI's or aivo code's own. Bare flag opens an interactive picker;
-    /// `--context=<session-id>` picks a specific session (prefix match; see
-    /// `aivo logs` for available ids).
-    #[arg(short = 'c', long, value_name = "SESSION_ID", num_args = 0..=1, default_missing_value = "")]
-    pub context: Option<String>,
-
+    // `--resume [<id>]` is aivo-owned (it shadows the tool's native flag so
+    // all forms behave the same under aivo) but deliberately NOT a clap arg:
+    // it usually appears after the tool name, inside the trailing passthrough
+    // slice, so `extract_aivo_flags` handles every form uniformly there.
     /// Inject environment variable (KEY=VALUE)
     #[arg(short, long = "env", value_name = "KEY=VALUE")]
     pub envs: Vec<String>,
@@ -1032,7 +1029,9 @@ pub struct CodeArgs {
 
     /// Resume a saved session: bare opens the session picker, `last` reopens the
     /// most recent session, or pass a session id to jump straight to it (same as
-    /// the in-session `/resume [query]`).
+    /// the in-session `/resume [query]`). Also accepts another agent's session
+    /// id from this directory (claude/codex/pi — see `aivo logs`); it's imported
+    /// and continued here. Other sources are injected as a context digest.
     #[arg(long, value_name = "last|SESSION_ID", num_args = 0..=1, default_missing_value = "")]
     pub resume: Option<String>,
 
@@ -1126,13 +1125,6 @@ pub struct CodeArgs {
         value_parser = ["text", "json", "stream-json"]
     )]
     pub output_format: Option<String>,
-
-    /// Inject context from one past session in this project — a native AI
-    /// CLI's (claude, codex, gemini, opencode, pi) or a previous aivo code
-    /// session. Bare flag opens an interactive picker; `--context=<session-id>`
-    /// picks a specific session (prefix match; see `aivo logs` for ids).
-    #[arg(short = 'c', long, value_name = "SESSION_ID", num_args = 0..=1, default_missing_value = "")]
-    pub context: Option<String>,
 
     /// Attach a file or image to the next message (repeatable)
     #[arg(long = "attach", value_name = "PATH", value_parser = non_empty())]

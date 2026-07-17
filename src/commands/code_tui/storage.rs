@@ -1,9 +1,9 @@
 use super::*;
 use std::collections::HashMap;
 
-/// Resumable chat sessions, newest first. `Some(dir)` scopes to that cwd (the
-/// `/resume` picker); `None` returns all (explicit-id lookups). Sessions whose
-/// key was removed are dropped.
+/// Resumable chat sessions, newest first. `Some(dir)` scopes to that cwd;
+/// `None` returns all sessions. Sessions whose key was removed stay listed
+/// (labeled; resume falls back to the live key) so the list agrees with `aivo logs`.
 pub(super) async fn load_resume_snapshots(
     session_store: &SessionStore,
     cwd_filter: Option<&str>,
@@ -20,9 +20,9 @@ pub(super) async fn load_resume_snapshots(
         .await?
         .into_iter()
         .filter(|entry| cwd_filter.is_none_or(|dir| entry.cwd == dir))
-        .filter_map(|entry| {
-            let key = by_id.get(&entry.key_id)?;
-            Some(SessionPreview::from_index_entry(entry, key))
+        .map(|entry| {
+            let key = by_id.get(&entry.key_id);
+            SessionPreview::from_index_entry(entry, key)
         })
         .collect();
 
@@ -31,8 +31,7 @@ pub(super) async fn load_resume_snapshots(
 }
 
 /// This directory's importable Claude Code / Codex sessions, as picker rows.
-/// Scanned once per `/resume` open (headline reads — see
-/// [`list_importable_sessions`](crate::services::session_import::list_importable_sessions)).
+/// Scanned once per `/resume` open (headline reads).
 pub(super) async fn load_importable_previews(cwd: &str) -> Vec<SessionPreview> {
     crate::services::session_import::list_importable_sessions(std::path::Path::new(cwd))
         .await
@@ -52,32 +51,37 @@ pub(super) async fn load_or_import_resume_session(
     key_id: &str,
     model: &str,
 ) -> std::result::Result<LoadedSession, String> {
+    use crate::services::session_import::{ForeignResume, resume_foreign};
     if let Some(origin) = &preview.origin {
-        let aivo_id =
-            crate::services::session_import::import_session_id(&origin.cli, &origin.foreign_id);
-        // Already forked (continued in aivo before) → load the saved fork.
-        if let Some(state) = session_store
-            .get_code_session(&aivo_id)
+        let source_ts = chrono::DateTime::parse_from_rfc3339(&preview.updated_at)
+            .ok()
+            .map(|ts| ts.with_timezone(&chrono::Utc));
+        return match resume_foreign(session_store, origin, source_ts)
             .await
             .map_err(|err| err.to_string())?
         {
-            return Ok(LoadedSession::from_state(state));
-        }
-        // First open → reconstruct in memory; the normal turn-save persists it.
-        let transcript = crate::services::session_import::convert_foreign(origin)
-            .await
-            .map_err(|err| err.to_string())?;
-        if transcript.messages.is_empty() {
-            return Err("nothing to import from this session".to_string());
-        }
-        return Ok(LoadedSession {
-            key_id: key_id.to_string(),
-            session_id: aivo_id,
-            raw_model: model.to_string(),
-            messages: to_chat_messages(transcript.messages),
-            engine_messages: Some(transcript.engine_messages),
-            pristine_import: true,
-        });
+            ForeignResume::Fork {
+                state,
+                source_newer,
+            } => {
+                let mut loaded = LoadedSession::from_state(state);
+                loaded.source_newer = source_newer;
+                Ok(loaded)
+            }
+            // First open → reconstructed in memory; the turn-save persists it.
+            ForeignResume::Fresh(transcript) => Ok(LoadedSession {
+                key_id: key_id.to_string(),
+                session_id: crate::services::session_import::import_session_id(
+                    &origin.cli,
+                    &origin.foreign_id,
+                ),
+                raw_model: model.to_string(),
+                messages: to_chat_messages(transcript.messages),
+                engine_messages: Some(transcript.engine_messages),
+                pristine_import: true,
+                source_newer: false,
+            }),
+        };
     }
     load_resume_session(session_store, preview).await
 }

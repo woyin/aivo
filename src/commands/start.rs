@@ -32,9 +32,7 @@ struct Resolved<T> {
     interactive: bool,
 }
 
-/// A picked launch target: a native tool, aivo's own in-process chat agent, or
-/// an installed coding-agent plugin (which owns its key/model resolution via the
-/// plugin dispatch).
+/// A picked launch target: a native tool, aivo's chat agent, or a plugin.
 enum StartTool {
     Native(AIToolType),
     Code,
@@ -90,14 +88,11 @@ impl StartCommand {
         let key_explicit = args.key.is_some();
         let model_explicit = args.model.is_some();
 
-        // Resolve tool first (uses last selection for the picker default)
         let tool = self.resolve_tool(args.tool.as_deref(), last_sel.as_ref(), args.yes)?;
         let tool = match tool.value {
-            // Plugins resolve their own key/model (and write the shared last
-            // selection) inside the standard dispatch — hand off the flags.
+            // Plugins resolve their own key/model and write the shared last selection.
             StartTool::Plugin(name) => return self.dispatch_plugin(&name, &args).await,
-            // The in-process chat agent owns its model picker, sandbox, and
-            // conversation loop — hand off the resolved key + model flags.
+            // The chat agent owns its model picker, sandbox, and conversation loop.
             StartTool::Code => return self.dispatch_code(&args).await,
             StartTool::Native(t) => Resolved {
                 value: t,
@@ -109,7 +104,7 @@ impl StartCommand {
             .resolve_key(args.key.as_deref(), last_sel.as_ref())
             .await?;
 
-        // Determine model: if -k was explicit, force picker; otherwise use last selection
+        // Determine model: if -k was explicit, force picker; otherwise use last selection.
         let model_arg = if model_explicit {
             args.model
         } else if key_explicit {
@@ -134,10 +129,7 @@ impl StartCommand {
             .resolve_model(model_arg, last_sel.as_ref(), &key, args.refresh, tool.value)
             .await?;
 
-        // HF models run against a synthetic local key — the user's actual API
-        // key is irrelevant. Skip persisting so the "Active key" footer doesn't
-        // show a misleading (real-key, hf:...) pairing on the next bare `aivo`.
-        // Matches chat.rs and run.rs.
+        // HF models run against a synthetic local key; skip persisting selection.
         let model_is_hf = model
             .value
             .as_deref()
@@ -425,14 +417,9 @@ impl StartCommand {
         })
     }
 
-    /// Launch aivo's in-process chat agent. Resolves the key the same way the
-    /// native launch flow does (honoring `-k`, the last selection, then the
-    /// active key) and forwards the model; `aivo code` owns its own model
-    /// picker, sandbox, and conversation loop from there.
+    /// Launch aivo's chat agent. Resolves key (honoring `-k`, last selection, active key).
     async fn dispatch_code(&self, args: &StartFlowArgs) -> Result<ExitCode> {
-        // An `hf:`/local-gguf model runs against a synthetic local key, so the
-        // real key store is irrelevant — skip resolution (which would otherwise
-        // error for a user with no keys yet) and let chat spawn llama-server.
+        // HF models run against a synthetic local key; skip resolution.
         let model_is_hf = args
             .model
             .as_deref()
@@ -447,9 +434,7 @@ impl StartCommand {
                     .value,
             )
         };
-        // `-k` without `-m` forces the model picker, matching the native flow;
-        // otherwise hand the model through (None lets chat reuse its own saved
-        // selection or open its picker).
+        // `-k` without `-m` forces the model picker; otherwise hand model through.
         let model = match args.model.clone() {
             Some(m) => Some(m),
             None if args.key.is_some() => Some(String::new()),
@@ -459,7 +444,6 @@ impl StartCommand {
         Ok(command
             .execute(
                 model,
-                None,
                 None,
                 None,
                 Vec::new(),

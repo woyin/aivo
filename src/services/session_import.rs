@@ -1,31 +1,18 @@
-//! Full-fidelity import of another coding agent's session into an aivo `code`
-//! session, so `/resume` can continue it with exact tool history. Where
-//! [`context_ingest`](super::context_ingest) reduces a session to a two-field
-//! bracket for `--context`, this reconstructs the WHOLE conversation — every
-//! turn plus tool calls/results — into both the display transcript
-//! ([`StoredChatMessage`]) and the agent-engine wire log (`engine_messages`,
-//! OpenAI chat format) that [`AgentEngine::restore_conversation`] replays.
-//!
-//! Sources: Claude Code (`~/.claude/projects/<enc-cwd>/*.jsonl`), Codex
-//! (`~/.codex/sessions/YYYY/MM/DD/*.jsonl`), and Pi
-//! (`~/.pi/agent/sessions/--<cwd>--/*.jsonl`). Discovery reuses `context_ingest`.
+//! Import another coding agent's session into aivo `code`. Full-fidelity reconstruct
+//! of the WHOLE conversation (turns + tool calls/results) for `/resume`.
 
 use std::path::Path;
-use std::time::SystemTime;
 
 use anyhow::{Context, Result, anyhow};
 use chrono::{DateTime, Utc};
 use serde_json::{Value, json};
-use tokio::io::{AsyncBufReadExt, BufReader};
 
 use crate::agent::protocol::{AssistantMessage, ToolCall};
 use crate::agent::request::assistant_to_openai;
 use crate::services::context_ingest::{
-    encode_claude_dir, extract_claude_text, extract_codex_message_text, extract_pi_text,
-    list_jsonl_newest_first, paths_match, pi_session_dir, walk_jsonl_newest_first,
+    extract_codex_message_text, extract_pi_text, ingest_project_headlines,
 };
 use crate::services::session_store::StoredChatMessage;
-use crate::services::system_env;
 
 /// Shown in place of an image block (image reconstruction is deferred).
 const IMAGE_PLACEHOLDER: &str = "[image omitted on import]";
@@ -97,262 +84,104 @@ pub fn import_source_label(session_id: &str) -> Option<&'static str> {
     split_fork_id(session_id).map(|(cli, _)| source_label(cli))
 }
 
-/// Recency cutoff for the `/resume` picker's importable list.
-const MAX_AGE_DAYS: i64 = 30;
+/// What a `--resume <selector>` names. Resolution order is fidelity order:
+/// a saved aivo session (exact id, then unique prefix, globally — a named
+/// session resolves regardless of where it ran), else an importable foreign
+/// session from this directory (matched by aivo import id or the source
+/// tool's own id, prefix). `Unknown` leaves the selector to lower rungs
+/// (digest injection / the filtered picker).
+pub enum ResumeTarget {
+    AivoSession(String),
+    Foreign(Box<ImportableSession>),
+    Ambiguous(String),
+    Unknown,
+}
+
+/// Resolve a non-empty, non-`last` resume selector. Shared by the
+/// `aivo code --resume` launch path and the TUI's `/resume <id>`.
+pub async fn resolve_resume_target(
+    store: &crate::services::session_store::SessionStore,
+    project_root: &Path,
+    selector: &str,
+) -> ResumeTarget {
+    let sel = selector.trim();
+    if sel.is_empty() {
+        return ResumeTarget::Unknown;
+    }
+    let (index, imports) = tokio::join!(
+        store.all_chat_sessions(),
+        list_importable_sessions(project_root),
+    );
+    let aivo_ids = index
+        .unwrap_or_default()
+        .into_iter()
+        .map(|entry| entry.session_id);
+    match_resume_candidates(aivo_ids, imports, sel)
+}
+
+/// Pure matching half of [`resolve_resume_target`]. An exact aivo id wins
+/// outright (a full id must never read as ambiguous with sessions it
+/// prefixes); an importable whose fork already exists as a saved aivo session
+/// collapses into that session (same conversation, higher fidelity).
+fn match_resume_candidates(
+    aivo_ids: impl Iterator<Item = String>,
+    imports: Vec<ImportableSession>,
+    sel: &str,
+) -> ResumeTarget {
+    let mut aivo_hits: Vec<String> = aivo_ids.filter(|id| id.starts_with(sel)).collect();
+    if aivo_hits.iter().any(|id| id == sel) {
+        return ResumeTarget::AivoSession(sel.to_string());
+    }
+    let mut import_hits: Vec<ImportableSession> = imports
+        .into_iter()
+        .filter(|s| s.aivo_id.starts_with(sel) || s.origin.foreign_id.starts_with(sel))
+        .collect();
+    import_hits.retain(|s| !aivo_hits.contains(&s.aivo_id));
+    match (aivo_hits.len(), import_hits.len()) {
+        (1, 0) => ResumeTarget::AivoSession(aivo_hits.remove(0)),
+        (0, 1) => ResumeTarget::Foreign(Box::new(import_hits.into_iter().next().unwrap())),
+        (0, 0) => ResumeTarget::Unknown,
+        (a, i) => ResumeTarget::Ambiguous(format!(
+            "Session id prefix '{sel}' is ambiguous ({} matches). Use more characters.",
+            a + i
+        )),
+    }
+}
+
 /// Per-source cap: the picker's working set, not an archive.
 const MAX_PER_SOURCE: usize = 40;
-/// Codex sessions live under one flat tree for all repos; cap how many files we
-/// peek at (one header line each) while filtering to this cwd.
-const CODEX_PROBE_LIMIT: usize = 400;
 
-/// List Claude Code + Codex sessions that ran in `project_root`, newest-first.
-///
-/// Uses a HEADLINE read (session id + first user turn, then stop) rather than a
-/// full transcript parse — the picker only needs a title and time, and these
-/// transcripts can be multi-MB. Bounded (recent + capped per source) so opening
-/// `/resume` stays responsive on a repo with a deep history.
+/// List Claude Code / Codex / Pi sessions in `project_root`, newest-first.
 pub async fn list_importable_sessions(project_root: &Path) -> Vec<ImportableSession> {
-    let after = SystemTime::from(Utc::now() - chrono::Duration::days(MAX_AGE_DAYS));
-    // Canonicalize once; every source resolves its dir from this same real path.
-    let root = std::fs::canonicalize(project_root).unwrap_or_else(|_| project_root.to_path_buf());
-    let (claude, codex, pi) = tokio::join!(
-        list_claude_headlines(&root, after),
-        list_codex_headlines(&root, after),
-        list_pi_headlines(&root, after),
-    );
-    let mut all: Vec<ImportableSession> = claude.into_iter().chain(codex).chain(pi).collect();
-    all.sort_by_key(|s| std::cmp::Reverse(s.updated_at));
-    all
-}
-
-async fn list_claude_headlines(root: &Path, after: SystemTime) -> Vec<ImportableSession> {
-    let Some(home) = system_env::home_dir() else {
-        return Vec::new();
+    let opts = crate::services::context_ingest::IngestOptions {
+        max_per_source: Some(MAX_PER_SOURCE),
+        include_short_first_user: true,
+        ..Default::default()
     };
-    let dir = home
-        .join(".claude")
-        .join("projects")
-        .join(encode_claude_dir(&root.to_string_lossy()));
-    let mut out = Vec::new();
-    for path in list_jsonl_newest_first(&dir, Some(after))
+    ingest_project_headlines(project_root, opts)
         .await
+        .unwrap_or_default()
         .into_iter()
-        .take(MAX_PER_SOURCE)
-    {
-        if let Some(s) = claude_headline(&path).await {
-            out.push(s);
-        }
-    }
-    out
-}
-
-async fn list_codex_headlines(root: &Path, after: SystemTime) -> Vec<ImportableSession> {
-    let Some(home) = system_env::home_dir() else {
-        return Vec::new();
-    };
-    let sessions_root = home.join(".codex").join("sessions");
-    if !sessions_root.exists() {
-        return Vec::new();
-    }
-    let project = root.to_string_lossy().to_string();
-    let mut out = Vec::new();
-    for path in walk_jsonl_newest_first(&sessions_root, Some(after))
-        .await
-        .into_iter()
-        .take(CODEX_PROBE_LIMIT)
-    {
-        if out.len() >= MAX_PER_SOURCE {
-            break;
-        }
-        if let Some(s) = codex_headline(&path, &project).await {
-            out.push(s);
-        }
-    }
-    out
-}
-
-async fn list_pi_headlines(root: &Path, after: SystemTime) -> Vec<ImportableSession> {
-    let dir = match pi_session_dir(&root.to_string_lossy()) {
-        Some(d) if d.exists() => d,
-        _ => return Vec::new(),
-    };
-    let mut out = Vec::new();
-    for path in list_jsonl_newest_first(&dir, Some(after))
-        .await
-        .into_iter()
-        .take(MAX_PER_SOURCE)
-    {
-        if let Some(s) = pi_headline(&path).await {
-            out.push(s);
-        }
-    }
-    out
-}
-
-/// Read a Pi transcript's headline: session id (`session` line) + first
-/// substantive user turn. `updated_at` is the file mtime.
-async fn pi_headline(path: &Path) -> Option<ImportableSession> {
-    let mtime = tokio::fs::metadata(path).await.ok()?.modified().ok()?;
-    let file = tokio::fs::File::open(path).await.ok()?;
-    let mut lines = BufReader::new(file).lines();
-    let mut session_id: Option<String> = None;
-    let mut topic: Option<String> = None;
-    while let Ok(Some(line)) = lines.next_line().await {
-        if line.is_empty() {
-            continue;
-        }
-        let Ok(v) = serde_json::from_str::<Value>(&line) else {
-            continue;
-        };
-        let kind = v.get("type").and_then(|t| t.as_str()).unwrap_or("");
-        if kind == "session" && session_id.is_none() {
-            session_id = v.get("id").and_then(|s| s.as_str()).map(str::to_string);
-        }
-        if kind == "message"
-            && topic.is_none()
-            && let Some(message) = v.get("message")
-            && message.get("role").and_then(|r| r.as_str()) == Some("user")
-            && let Some(text) = extract_pi_text(message)
-            && !looks_like_boilerplate(&text)
-        {
-            topic = title_from_turn(&text);
-        }
-        if session_id.is_some() && topic.is_some() {
-            break;
-        }
-    }
-    Some(importable("pi", session_id?, topic, path, mtime))
-}
-
-/// Read a Claude transcript's headline: session id + first substantive user
-/// turn. Stops as soon as both are found; `updated_at` is the file mtime
-/// (≥ last-message ts for an append-only jsonl).
-async fn claude_headline(path: &Path) -> Option<ImportableSession> {
-    let mtime = tokio::fs::metadata(path).await.ok()?.modified().ok()?;
-    let file = tokio::fs::File::open(path).await.ok()?;
-    let mut lines = BufReader::new(file).lines();
-    let mut session_id: Option<String> = None;
-    let mut topic: Option<String> = None;
-    while let Ok(Some(line)) = lines.next_line().await {
-        if line.is_empty() {
-            continue;
-        }
-        let Ok(v) = serde_json::from_str::<Value>(&line) else {
-            continue;
-        };
-        if session_id.is_none()
-            && let Some(sid) = v.get("sessionId").and_then(|s| s.as_str())
-        {
-            session_id = Some(sid.to_string());
-        }
-        if topic.is_none()
-            && v.get("type").and_then(|t| t.as_str()) == Some("user")
-            && !v
-                .get("isSidechain")
-                .and_then(|b| b.as_bool())
-                .unwrap_or(false)
-            && let Some(text) = extract_claude_text(v.get("message"))
-            && !looks_like_boilerplate(&text)
-        {
-            topic = title_from_turn(&text);
-        }
-        if session_id.is_some() && topic.is_some() {
-            break;
-        }
-    }
-    let session_id = session_id?;
-    Some(importable("claude", session_id, topic, path, mtime))
-}
-
-/// Read a Codex transcript's headline. Bails after the `session_meta` line when
-/// its `cwd` doesn't match this project (so non-matching files cost one line).
-async fn codex_headline(path: &Path, project_root: &str) -> Option<ImportableSession> {
-    let mtime = tokio::fs::metadata(path).await.ok()?.modified().ok()?;
-    let file = tokio::fs::File::open(path).await.ok()?;
-    let mut lines = BufReader::new(file).lines();
-    let mut session_id: Option<String> = None;
-    let mut matched = false;
-    let mut topic: Option<String> = None;
-    while let Ok(Some(line)) = lines.next_line().await {
-        if line.is_empty() {
-            continue;
-        }
-        let Ok(v) = serde_json::from_str::<Value>(&line) else {
-            continue;
-        };
-        let kind = v.get("type").and_then(|t| t.as_str()).unwrap_or("");
-        if kind == "session_meta"
-            && let Some(payload) = v.get("payload")
-        {
-            if let Some(id) = payload.get("id").and_then(|s| s.as_str()) {
-                session_id = Some(id.to_string());
+        .filter(|t| matches!(t.cli.as_str(), "claude" | "codex" | "pi"))
+        .map(|t| {
+            let aivo_id = import_session_id(&t.cli, &t.session_id);
+            let title = if t.topic.is_empty() {
+                format!("{} session", source_label(&t.cli))
+            } else {
+                t.topic
+            };
+            ImportableSession {
+                aivo_id,
+                title,
+                updated_at: t.updated_at,
+                origin: SessionOrigin {
+                    cli: t.cli,
+                    foreign_id: t.session_id,
+                    source_path: t.source_path,
+                },
             }
-            matched = payload
-                .get("cwd")
-                .and_then(|c| c.as_str())
-                .is_some_and(|c| paths_match(c, project_root));
-            if !matched {
-                return None; // session_meta is the first line — not our cwd
-            }
-        }
-        if matched
-            && topic.is_none()
-            && kind == "response_item"
-            && let Some(payload) = v.get("payload")
-            && payload.get("type").and_then(|t| t.as_str()) == Some("message")
-            && payload.get("role").and_then(|r| r.as_str()) == Some("user")
-            && let Some(text) = extract_codex_message_text(payload)
-            && !looks_like_boilerplate(&text)
-        {
-            topic = title_from_turn(&text);
-        }
-        if matched && session_id.is_some() && topic.is_some() {
-            break;
-        }
-    }
-    if !matched {
-        return None;
-    }
-    Some(importable("codex", session_id?, topic, path, mtime))
-}
-
-fn importable(
-    cli: &str,
-    foreign_id: String,
-    topic: Option<String>,
-    path: &Path,
-    mtime: SystemTime,
-) -> ImportableSession {
-    ImportableSession {
-        aivo_id: import_session_id(cli, &foreign_id),
-        title: topic.unwrap_or_else(|| format!("{} session", source_label(cli))),
-        updated_at: DateTime::<Utc>::from(mtime),
-        origin: SessionOrigin {
-            cli: cli.to_string(),
-            foreign_id,
-            source_path: path.to_string_lossy().to_string(),
-        },
-    }
-}
-
-/// First non-empty line of a turn, capped for the picker row.
-fn title_from_turn(text: &str) -> Option<String> {
-    let line = text.lines().find(|l| !l.trim().is_empty())?.trim();
-    (!line.is_empty()).then(|| line.chars().take(200).collect())
-}
-
-/// A user turn dominated by CLI-harness wrappers isn't the user's intent — skip
-/// it as a title and keep scanning for the real first prompt.
-fn looks_like_boilerplate(text: &str) -> bool {
-    let t = text.trim_start();
-    t.starts_with("<command-name>")
-        || t.starts_with("<local-command")
-        || t.starts_with("<system-reminder")
-        || t.starts_with("<environment_context")
-        || t.starts_with("<user_instructions")
-        || t.starts_with("<task-notification")
-        || t.starts_with("<user_shell_command")
-        || t.starts_with("Caveat:")
+        })
+        .collect()
 }
 
 /// Reconstruct a foreign session's transcript (no persistence). Used by the
@@ -366,6 +195,57 @@ pub async fn convert_foreign(origin: &SessionOrigin) -> Result<ImportedTranscrip
         "pi" => import_pi_session(path).await,
         other => Err(anyhow!("unsupported import source: {other}")),
     }
+}
+
+/// Divergence slack absorbing file-mtime vs save-clock jitter.
+const SOURCE_NEWER_SLACK_SECS: i64 = 5;
+
+/// Outcome of [`resume_foreign`]: the saved fork when one exists, else a
+/// fresh conversion of the source transcript.
+pub enum ForeignResume {
+    Fork {
+        state: crate::services::session_store::CodeSessionState,
+        /// The source gained messages after the fork's last save — loading
+        /// the fork must not be silent. Heuristic: a fork turn taken after
+        /// the source's last message masks it (exact detection needs a
+        /// persisted import watermark).
+        source_newer: bool,
+    },
+    Fresh(ImportedTranscript),
+}
+
+/// Fork-first foreign resume — the single copy of the policy shared by the
+/// TUI and the one-shot: a saved fork (which may hold aivo-side turns) wins
+/// over a fresh conversion; an empty source transcript is an error.
+pub async fn resume_foreign(
+    store: &crate::services::session_store::SessionStore,
+    origin: &SessionOrigin,
+    source_updated_at: Option<DateTime<Utc>>,
+) -> Result<ForeignResume> {
+    let aivo_id = import_session_id(&origin.cli, &origin.foreign_id);
+    if let Some(state) = store.get_code_session(&aivo_id).await? {
+        let source_newer = match (
+            source_updated_at,
+            DateTime::parse_from_rfc3339(&state.updated_at),
+        ) {
+            (Some(source), Ok(fork)) => {
+                source.signed_duration_since(fork)
+                    > chrono::Duration::seconds(SOURCE_NEWER_SLACK_SECS)
+            }
+            _ => false,
+        };
+        return Ok(ForeignResume::Fork {
+            state,
+            source_newer,
+        });
+    }
+    let transcript = convert_foreign(origin)
+        .await
+        .with_context(|| format!("could not import {} session", origin.cli))?;
+    if transcript.messages.is_empty() {
+        anyhow::bail!("nothing to import from this session");
+    }
+    Ok(ForeignResume::Fresh(transcript))
 }
 
 /// Display label for a source cli (`claude` → `Claude`).
@@ -1056,6 +936,111 @@ mod tests {
 
     fn role(m: &Value) -> &str {
         m.get("role").and_then(|r| r.as_str()).unwrap_or("")
+    }
+
+    fn imp(cli: &str, foreign_id: &str) -> ImportableSession {
+        ImportableSession {
+            origin: SessionOrigin {
+                cli: cli.into(),
+                foreign_id: foreign_id.into(),
+                source_path: "/tmp/x.jsonl".into(),
+            },
+            title: "t".into(),
+            updated_at: Utc::now(),
+            aivo_id: import_session_id(cli, foreign_id),
+        }
+    }
+
+    fn ids(v: &[&str]) -> std::vec::IntoIter<String> {
+        v.iter()
+            .map(|s| s.to_string())
+            .collect::<Vec<_>>()
+            .into_iter()
+    }
+
+    #[test]
+    fn match_unique_aivo_prefix_resolves_full_id() {
+        match match_resume_candidates(ids(&["sess-1234", "other-99"]), vec![], "sess-12") {
+            ResumeTarget::AivoSession(id) => assert_eq!(id, "sess-1234"),
+            _ => panic!("expected AivoSession"),
+        }
+    }
+
+    #[test]
+    fn match_foreign_by_source_or_import_id_prefix() {
+        let one = imp("claude", "049faa11-2222");
+        // The source tool's own id (what `aivo logs` shows)…
+        match match_resume_candidates(ids(&[]), vec![one.clone()], "049fa") {
+            ResumeTarget::Foreign(f) => assert_eq!(f.origin.foreign_id, "049faa11-2222"),
+            _ => panic!("expected Foreign via source id"),
+        }
+        // …and the deterministic aivo import id both match.
+        let by_import = one.aivo_id.clone();
+        match match_resume_candidates(ids(&[]), vec![one], &by_import) {
+            ResumeTarget::Foreign(f) => assert_eq!(f.aivo_id, by_import),
+            _ => panic!("expected Foreign via import id"),
+        }
+    }
+
+    #[test]
+    fn match_already_forked_import_collapses_to_saved_session() {
+        // The fork exists as a saved aivo session AND the source is still
+        // listed — same conversation, so this must not read as ambiguous.
+        let one = imp("claude", "feedbeef-4242");
+        let fork_id = one.aivo_id.clone();
+        match match_resume_candidates(ids(&[fork_id.as_str()]), vec![one], &fork_id) {
+            ResumeTarget::AivoSession(id) => assert_eq!(id, fork_id),
+            _ => panic!("expected the saved fork to win"),
+        }
+    }
+
+    #[test]
+    fn match_ambiguous_across_sources_and_unknown() {
+        let foreign = imp("codex", "abc-junction");
+        match match_resume_candidates(ids(&["abc-native"]), vec![foreign], "abc") {
+            ResumeTarget::Ambiguous(msg) => assert!(msg.contains("2 matches")),
+            _ => panic!("expected Ambiguous"),
+        }
+        assert!(matches!(
+            match_resume_candidates(ids(&["sess-1"]), vec![], "zzz"),
+            ResumeTarget::Unknown
+        ));
+    }
+
+    #[tokio::test]
+    async fn resolve_resume_target_store_rungs() {
+        let dir = tempfile::tempdir().unwrap();
+        let store =
+            crate::services::session_store::SessionStore::with_path(dir.path().join("cfg.json"));
+        let key_id = store
+            .add_key_with_protocol("k", "https://api.example.com", None, "sk-test")
+            .await
+            .unwrap();
+        store
+            .save_code_session_with_id(
+                &key_id,
+                "https://api.example.com",
+                "/tmp/demo",
+                "sess-abcd1234",
+                "m1",
+                None,
+                &[],
+                "t",
+                "p",
+                crate::services::session_store::SessionTokens::default(),
+                0.0,
+            )
+            .await
+            .unwrap();
+
+        // Exact id, unique prefix, and no-match — against a real store.
+        for (sel, want_hit) in [("sess-abcd1234", true), ("sess-abc", true), ("nope", false)] {
+            match resolve_resume_target(&store, dir.path(), sel).await {
+                ResumeTarget::AivoSession(id) if want_hit => assert_eq!(id, "sess-abcd1234"),
+                ResumeTarget::Unknown if !want_hit => {}
+                _ => panic!("unexpected resolution for {sel}"),
+            }
+        }
     }
 
     async fn import_claude_str(jsonl: &str) -> ImportedTranscript {

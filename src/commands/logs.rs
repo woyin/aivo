@@ -155,10 +155,7 @@ pub(crate) fn min_unique_id_width(rows: &[UnifiedRow]) -> usize {
     ID_COL_WIDTH_MAX
 }
 
-/// A `[run]` row for a plugin coding-agent — a tool that isn't a native CLI
-/// (e.g. omp, amp). These have no native session source, so their run row is
-/// their only representation in `aivo logs`. We surface them like first-class
-/// agents: tool name in the bracket column, not a generic `[run]`.
+/// A `[run]` row for a plugin coding-agent (e.g. omp, amp).
 fn is_plugin_run(entry: &LogEntry) -> bool {
     entry.source == "run"
         && entry
@@ -168,15 +165,13 @@ fn is_plugin_run(entry: &LogEntry) -> bool {
 }
 
 /// The built-in agent's logs.db source. `"code"` is written post-rename;
-/// `"chat"` is the pre-rename value still on disk in existing users' logs.db.
+/// `"chat"` is the pre-rename value in existing logs.db.
 pub(crate) fn is_code_source(source: &str) -> bool {
     matches!(source, "code" | "chat")
 }
 
-/// Bracket-column label for a logs.db row. Plugin coding-agent runs use their
-/// tool name (`[omp]`) so they read like native agents; the built-in agent
-/// normalizes to `[code]` (legacy `chat` rows included); everything else uses
-/// its source (`[run]`, `[serve]`).
+/// Bracket-column label for a logs.db row. Plugin runs use tool name;
+/// built-in agent normalizes to `[code]` (legacy `chat` rows); others use source.
 fn log_bracket_label(entry: &LogEntry) -> &str {
     if is_plugin_run(entry) {
         entry.tool.as_deref().unwrap_or("run")
@@ -187,9 +182,7 @@ fn log_bracket_label(entry: &LogEntry) -> &str {
     }
 }
 
-/// Plain-text detail string for a logs.db row — mirrors the `text` half of
-/// `print_summary` (token suffix included for chat rows). Kept here so
-/// picker labels stay in sync with `aivo logs` printing.
+/// Plain-text detail string for a logs.db row (token suffix for chat rows).
 fn log_row_detail(entry: &LogEntry) -> String {
     match entry.source.as_str() {
         "chat" | "code" => {
@@ -1430,7 +1423,8 @@ async fn fetch_native_rows(
         max_age_days: if args.since.is_some() || args.until.is_some() {
             None // explicit time filter takes over
         } else {
-            Some(14) // matches the previous `aivo context` default
+            // The shared listing window — keeps `aivo logs` and `/resume` in step.
+            Some(crate::services::project_id::DEFAULT_THREAD_MAX_AGE_DAYS)
         },
         // Push --since down to the ingester so jsonl files whose mtime is
         // older than the cutoff can be skipped without parsing. --until can't
@@ -1444,6 +1438,8 @@ async fn fetch_native_rows(
         // Listing view: keep `hi`/`ok` sessions visible. `aivo run`'s
         // context picker uses a separate IngestOptions with this off.
         include_short_first_user: true,
+        // The global listing has its own head-parse switch (below).
+        headline: false,
     };
     // Only search matching and `--json` read `last_response`; when neither
     // does, the ingester head-parses each session file instead of the full

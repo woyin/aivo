@@ -1,15 +1,4 @@
-//! aivo-owned flag extraction and bundle expansion that runs *before* clap.
-//!
-//! Two responsibilities:
-//! 1. **`rewrite_cli_args`**: pre-clap argv munging. Expands tool aliases
-//!    (`aivo claude` → `aivo run claude`), built-in shortcuts (`aivo use`,
-//!    `aivo ping`, `aivo -x`), and Bundle aliases (user's saved
-//!    `aivo run <tool> <args...>` macros) so clap sees a normalized form.
-//! 2. **`extract_aivo_flags`**: post-clap recovery for flags clap's
-//!    `trailing_var_arg` swallowed. Also collapses `[<N>m]` suffixes and
-//!    `--<N>m` shorthands (any digits) into a single `max_context` signal.
-//!    Validation that <N> is actually supported (1m/2m today) lives downstream.
-//!
+//! aivo flag extraction and bundle expansion (pre/post-clap).
 //! Pure functions over `Vec<String>` and `HashMap` — no I/O.
 
 use std::collections::{HashMap, HashSet};
@@ -45,7 +34,7 @@ pub(crate) fn rewrite_cli_args(
         return rewritten;
     }
 
-    // `aivo code <mcp|skills> …` → the hidden clap command named "code mcp"/"code skills".
+    // `aivo code <mcp|skills> …` → hidden clap command named "code mcp"/"code skills".
     if raw_args[1] == "code"
         && let Some(sub @ ("mcp" | "skills" | "packs" | "agents")) =
             raw_args.get(2).map(String::as_str)
@@ -61,7 +50,7 @@ pub(crate) fn rewrite_cli_args(
         return rewritten;
     }
 
-    // `aivo run <bundle> [user-args...]` — expand the bundle, dropping flags
+    // `aivo run <bundle> [user-args...]` — expand bundle, dropping flags
     // the user already supplied so user wins on conflicts.
     if raw_args[1] == "run"
         && raw_args.len() > 2
@@ -71,9 +60,7 @@ pub(crate) fn rewrite_cli_args(
     }
 
     // `aivo <bundle> [user-args...]` — top-level shortcut, expanded if and
-    // only if the first arg doesn't collide with a built-in name. Reserved
-    // names are validated at `alias add`, so a Bundle entry here is always
-    // safe to expand.
+    // only if the first arg doesn't collide with a built-in name.
     if !raw_args[1].starts_with('-')
         && !RESERVED_ALIAS_NAMES.contains(&raw_args[1].as_str())
         && let Some(bundle) = bundles.get(&raw_args[1])
@@ -81,20 +68,15 @@ pub(crate) fn rewrite_cli_args(
         return expand_bundle(&raw_args[0], bundle, &raw_args[2..]);
     }
 
-    // Bare-prompt shortcut. After tool/subcommand/bundle/plugin matches have
-    // failed, a top-level non-flag arg is interpreted as input to `code`:
-    //   `aivo hf:Qwen/...` / `aivo https://...`      → `aivo code <ref>`
-    //     (code's positional REF; opens TUI with that model)
-    //   `aivo alt::gpt-4o` / `aivo alt::`            → `aivo code <ref>` (key::model)
-    //   `aivo "tell me a story"` / `aivo 你好` / `aivo hi?` → `aivo code -p <text>`
-    //     (one-shot prompt; trailing args pass through to code)
-    // A bare `[a-z0-9-]` word is never a prompt: it falls through to clap's
-    // "unrecognized subcommand" with did-you-mean (this also keeps reserved
-    // names and clap's built-in `help` reachable — all are shaped). The shell
-    // strips quotes, so `aivo "hello"` is indistinguishable from `aivo hello`
-    // and gets the same treatment; use `-p` to force a one-word prompt.
-    // Embedded whitespace (only producible via quoting), uppercase,
-    // punctuation, or non-ASCII marks a prompt.
+    // Bare-prompt shortcut: non-flag args interpreted as prompt text.
+    // `aivo hf:Qwen/...` / `aivo https://...` → `aivo code <ref>`
+    // `aivo alt::gpt-4o` / `aivo alt::` → `aivo code <ref>` (key::model)
+    // `aivo "tell me a story"` → `aivo code -p <text>` (one-shot prompt)
+    // A bare `[a-z0-9-]` word is never a prompt: falls through to clap's
+    // "unrecognized subcommand" with did-you-mean. The shell strips quotes,
+    // so `aivo "hello"` is indistinguishable from `aivo hello` and gets
+    // the same treatment; use `-p` to force a one-word prompt.
+    // Embedded whitespace, uppercase, punctuation, or non-ASCII marks a prompt.
     let first = raw_args[1].as_str();
     if first.starts_with('-') || is_subcommand_shaped(first) {
         return raw_args;
@@ -185,7 +167,6 @@ fn canonical_flag_name(arg: &str) -> Option<String> {
         "-m" => "--model",
         "-r" => "--refresh",
         "-e" => "--env",
-        "-c" => "--context",
         s => s,
     };
     Some(canon.to_string())
@@ -299,9 +280,8 @@ pub(crate) struct ExtractedFlags {
     pub(crate) relogin: bool,
     pub(crate) env_strings: Vec<String>,
     pub(crate) remaining_args: Vec<String>,
-    /// `None` = flag absent. `Some("")` = bare flag (interactive picker).
-    /// `Some("id")` = explicit session id prefix.
-    pub(crate) context: Option<String>,
+    /// `None` = flag absent, `Some("id")` = session id, `Some("")` = bare flag (picker).
+    pub(crate) resume: Option<String>,
     /// `None` = flag absent. `Some("1m")` = activate the 1M-context spoof.
     pub(crate) max_context: Option<String>,
     pub(crate) transform: bool,
@@ -377,7 +357,7 @@ pub(crate) fn extract_aivo_flags(
     let mut dry_run = initial_dry_run;
     let mut refresh = initial_refresh;
     let mut relogin = initial_relogin;
-    let mut context: Option<String> = None;
+    let mut resume: Option<String> = None;
     let mut max_context: Option<String> = initial_max_context;
     let mut transform = false;
     let mut transparent = false;
@@ -470,16 +450,20 @@ pub(crate) fn extract_aivo_flags(
             refresh = true;
         } else if arg == "--relogin" {
             relogin = true;
-        } else if let Some(value) = arg
-            .strip_prefix("--context=")
-            .or_else(|| arg.strip_prefix("-c="))
-        {
-            if context.is_none() {
-                context = Some(value.to_string());
+        } else if let Some(value) = arg.strip_prefix("--resume=") {
+            if resume.is_none() {
+                resume = Some(value.to_string());
+            } else {
+                remaining_args.push(arg.clone());
             }
-        } else if (arg == "--context" || arg == "-c") && context.is_none() {
-            // Bare flag (no value): open the interactive picker.
-            context = Some(String::new());
+        } else if arg == "--resume" && resume.is_none() {
+            // Space form consumes the next non-flag arg as the id; otherwise bare → picker.
+            if i + 1 < passthrough_args.len() && !passthrough_args[i + 1].starts_with('-') {
+                resume = Some(passthrough_args[i + 1].clone());
+                i += 1;
+            } else {
+                resume = Some(String::new());
+            }
         } else if let Some(value) = arg
             .strip_prefix("--env=")
             .or_else(|| arg.strip_prefix("-e="))
@@ -601,7 +585,7 @@ pub(crate) fn extract_aivo_flags(
         relogin,
         env_strings,
         remaining_args,
-        context,
+        resume,
         max_context,
         transform,
         transparent,
@@ -906,6 +890,73 @@ mod tests {
         );
         assert_eq!(r.model, Some(String::new())); // picker triggered
         assert_eq!(r.remaining_args, args(&["--resume"]));
+    }
+
+    #[test]
+    fn resume_equals_and_space_forms_bind_the_same() {
+        for argv in [&["--resume=abc123"][..], &["--resume", "abc123"][..]] {
+            let r = extract_aivo_flags(
+                None,
+                ClaudeSlotFlags::default(),
+                None,
+                None,
+                false,
+                false,
+                false,
+                vec![],
+                None,
+                &args(argv),
+            );
+            assert_eq!(r.resume, Some("abc123".to_string()));
+            assert!(r.remaining_args.is_empty());
+        }
+        // The tool's own `-c` still reaches it untouched.
+        let r = extract_aivo_flags(
+            None,
+            ClaudeSlotFlags::default(),
+            None,
+            None,
+            false,
+            false,
+            false,
+            vec![],
+            None,
+            &args(&["--resume", "abc", "-c"]),
+        );
+        assert_eq!(r.resume, Some("abc".to_string()));
+        assert_eq!(r.remaining_args, args(&["-c"]));
+    }
+
+    #[test]
+    fn resume_bare_opens_picker_second_binding_passes_through() {
+        // Bare at end, and bare followed by a flag, both mean the picker.
+        let r = extract_aivo_flags(
+            None,
+            ClaudeSlotFlags::default(),
+            None,
+            None,
+            false,
+            false,
+            false,
+            vec![],
+            None,
+            &args(&["--resume", "--dry-run"]),
+        );
+        assert_eq!(r.resume, Some(String::new()));
+        let r = extract_aivo_flags(
+            None,
+            ClaudeSlotFlags::default(),
+            None,
+            None,
+            false,
+            false,
+            false,
+            vec![],
+            None,
+            &args(&["--resume=", "--resume=zzz"]),
+        );
+        assert_eq!(r.resume, Some(String::new())); // picker
+        assert_eq!(r.remaining_args, args(&["--resume=zzz"]));
     }
 
     #[test]
@@ -1388,6 +1439,7 @@ mod tests {
 
     #[test]
     fn unknown_args_pass_through() {
+        // `--resume` is aivo-owned (trailing bare → picker); the rest passes through.
         let r = extract_aivo_flags(
             None,
             ClaudeSlotFlags::default(),
@@ -1400,7 +1452,8 @@ mod tests {
             None,
             &args(&["--agent-name", "foo", "--resume"]),
         );
-        assert_eq!(r.remaining_args, args(&["--agent-name", "foo", "--resume"]));
+        assert_eq!(r.remaining_args, args(&["--agent-name", "foo"]));
+        assert_eq!(r.resume, Some(String::new()));
         assert_eq!(r.model, None);
     }
 

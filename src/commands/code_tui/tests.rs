@@ -4408,6 +4408,67 @@ async fn opening_foreign_session_resumes_in_memory_without_persisting() {
     assert_eq!(store.count_chat_sessions().await, 0);
 }
 
+#[tokio::test]
+async fn resuming_stale_fork_by_source_id_flags_source_newer() {
+    use crate::services::session_import::{ImportableSession, SessionOrigin, import_session_id};
+    let dir = tempfile::tempdir().unwrap();
+    let store =
+        crate::services::session_store::SessionStore::with_path(dir.path().join("config.json"));
+    let fork_id = import_session_id("claude", "src-42");
+    store
+        .save_code_session_with_id(
+            "key-1",
+            "https://api.example.com",
+            "/tmp/demo",
+            &fork_id,
+            "gpt-x",
+            None,
+            &one_user_message("imported turn"),
+            "imported turn",
+            "imported turn",
+            crate::services::session_store::SessionTokens::default(),
+            0.0,
+        )
+        .await
+        .unwrap();
+
+    let preview_at = |ts: chrono::DateTime<Utc>| {
+        SessionPreview::from_importable(ImportableSession {
+            origin: SessionOrigin {
+                cli: "claude".to_string(),
+                foreign_id: "src-42".to_string(),
+                source_path: "/tmp/src.jsonl".to_string(),
+            },
+            title: "imported turn".to_string(),
+            updated_at: ts,
+            aivo_id: fork_id.clone(),
+        })
+    };
+
+    // Source file newer than the fork's save → diverged, flagged.
+    let loaded = super::storage::load_or_import_resume_session(
+        &store,
+        &preview_at(Utc::now() + ChronoDuration::hours(1)),
+        "key-1",
+        "gpt-x",
+    )
+    .await
+    .unwrap();
+    assert_eq!(loaded.session_id, fork_id);
+    assert!(loaded.source_newer, "future source must flag divergence");
+
+    // Source untouched since the import → clean fork-first load.
+    let loaded = super::storage::load_or_import_resume_session(
+        &store,
+        &preview_at(Utc::now() - ChronoDuration::hours(1)),
+        "key-1",
+        "gpt-x",
+    )
+    .await
+    .unwrap();
+    assert!(!loaded.source_newer);
+}
+
 #[test]
 fn test_picker_visible_items_respect_single_line_session_rows() {
     let preview = SessionPreview {
@@ -8258,7 +8319,7 @@ fn test_parse_slash_session() {
     );
 }
 
-/// `/context` always opens the breakdown, folding in the injected `-c` section when present.
+/// `/context` always opens the breakdown, folding in the injected digest section when present.
 #[tokio::test]
 async fn test_context_overlay_shows_breakdown() {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
@@ -10669,6 +10730,7 @@ async fn test_resume_resets_plan_and_goal_state() {
         messages: vec![],
         engine_messages: None,
         pristine_import: false,
+        source_newer: false,
     };
     app.apply_loaded_session(session).await.unwrap();
 
@@ -14831,6 +14893,7 @@ async fn test_resume_resets_agent_engine() {
             serde_json::json!({"role": "assistant", "content": "earlier reply"}),
         ]),
         pristine_import: false,
+        source_newer: false,
     };
     app.apply_loaded_session(session).await.unwrap();
 
@@ -14882,6 +14945,7 @@ async fn test_resume_footer_estimate_uses_durable_transcript() {
             serde_json::json!({"role": "tool", "tool_call_id": "t1", "content": fat}),
         ]),
         pristine_import: false,
+        source_newer: false,
     };
     app.apply_loaded_session(session).await.unwrap();
 
@@ -14939,6 +15003,7 @@ async fn test_resume_restores_session_cost_and_billed_model() {
         messages: vec![],
         engine_messages: None,
         pristine_import: false,
+        source_newer: false,
     };
     app.apply_loaded_session(session).await.unwrap();
 
@@ -14976,6 +15041,7 @@ async fn test_resume_does_not_overwrite_persisted_default_model() {
         }],
         engine_messages: None,
         pristine_import: false,
+        source_newer: false,
     };
     app.apply_loaded_session(session).await.unwrap();
 
@@ -15080,6 +15146,39 @@ async fn test_resume_snapshots_scope_by_cwd() {
         .unwrap();
     let sandbox_ids: Vec<&str> = sandbox.iter().map(|s| s.session_id.as_str()).collect();
     assert_eq!(sandbox_ids, vec!["sandbox-sess"], "got {sandbox_ids:?}");
+}
+
+#[tokio::test]
+async fn test_resume_snapshots_keep_key_removed_sessions() {
+    // A session whose stored key no longer exists (interrupted delete-cascade,
+    // legacy data) stays listed — labeled — so /resume agrees with `aivo logs`;
+    // resuming falls back to the live key.
+    let temp_dir = TempDir::new().unwrap();
+    let store = SessionStore::with_path(temp_dir.path().join("config.json"));
+    store
+        .save_code_session_with_id(
+            "ghost-key",
+            "https://api.example.com",
+            "/tmp/demo",
+            "orphaned-sess",
+            "claude",
+            None,
+            &one_user_message("hello"),
+            "hello",
+            "hello",
+            crate::services::session_store::SessionTokens::default(),
+            0.0,
+        )
+        .await
+        .unwrap();
+
+    let rows = load_resume_snapshots(&store, Some("/tmp/demo"))
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 1, "key-removed session must stay listed");
+    assert_eq!(rows[0].session_id, "orphaned-sess");
+    assert_eq!(rows[0].key_name, "key removed");
+    assert!(rows[0].key_id.is_empty());
 }
 
 /// `session_tokens` (the running per-session total folded from each turn) is

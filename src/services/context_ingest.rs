@@ -1,23 +1,6 @@
-//! On-demand ingestion of AI CLI session content into normalized context
-//! threads. **No persistent storage** — each call reads the authoritative
-//! sources fresh and returns an in-memory thread list.
-//!
-//! Scope: the native CLIs (`aivo run` tools), plus — via
-//! `ingest_project_with_code`, the `--context` injection path — aivo's own
-//! code sessions. `ingest_project` stays native-only for the share resolver,
-//! which looks up the native session a run launched.
-//!
-//! Sources:
-//! - Claude Code: `~/.claude/projects/<encoded-cwd>/*.jsonl` (matched by
-//!   encoded directory name, which is `/a/b/c` → `-a-b-c`).
-//! - Codex: `~/.codex/sessions/YYYY/MM/DD/*.jsonl`. Per-file `session_meta`
-//!   payload's `cwd` must match the project root.
-//!
-//! Extraction uses the bracket (first substantive user + last substantive
-//! assistant) + substance filter (min chars, skip CLI boilerplate and echoed
-//! aivo context). Each source is walked most-recent first and stops once
-//! enough candidate threads are collected, so heavy projects don't parse
-//! every historical session.
+//! On-demand ingestion of AI CLI session content into normalized context threads.
+//! Sources: Claude Code (`~/.claude/projects/`), Codex (`~/.codex/sessions/`),
+//! Gemini (`~/.gemini/tmp/`), Pi (`~/.pi/agent/sessions/`), OpenCode (`~/.local/share/opencode/opencode.db`).
 
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
@@ -93,6 +76,11 @@ pub struct IngestOptions {
     /// short-prompt sessions show up. Context-injection callers leave it
     /// false — short prompts don't help seed prior context.
     pub include_short_first_user: bool,
+    /// When true, read each session only until id/title/time are in hand
+    /// (multi-MB transcripts stay unread; `last_response` is empty), and skip
+    /// sources with no stop-early read (gemini, opencode). For listing
+    /// surfaces; injection callers need the full extraction.
+    pub headline: bool,
 }
 
 impl Default for IngestOptions {
@@ -102,12 +90,13 @@ impl Default for IngestOptions {
             min_updated_at: None,
             max_per_source: Some(DEFAULT_MAX_THREADS_PER_SOURCE),
             include_short_first_user: false,
+            headline: false,
         }
     }
 }
 
 impl IngestOptions {
-    /// Bypass both caps — used when `--context=<id>` names a session that may
+    /// Bypass both caps — used when `--resume <id>` names a session that may
     /// be older than the capped walk reaches.
     pub fn unlimited() -> Self {
         Self {
@@ -115,6 +104,7 @@ impl IngestOptions {
             min_updated_at: None,
             max_per_source: None,
             include_short_first_user: false,
+            headline: false,
         }
     }
 }
@@ -141,8 +131,8 @@ pub async fn ingest_project(project_root: &Path, opts: IngestOptions) -> Result<
 }
 
 /// `ingest_project` plus aivo's own code sessions (from `store`'s session
-/// index) as a sixth source. This is the `--context` injection path: `aivo
-/// logs` lists `[code]` sessions, so injection must be able to find them too.
+/// index) as a sixth source. This is the `--resume` digest path: `aivo
+/// logs` lists `[code]` sessions, so resolution must be able to find them too.
 pub async fn ingest_project_with_code(
     store: &SessionStore,
     project_root: &Path,
@@ -151,26 +141,50 @@ pub async fn ingest_project_with_code(
     ingest_project_inner(Some(store), project_root, opts).await
 }
 
+/// `ingest_project` with `opts.headline` forced on (see the field doc).
+/// Powers the `/resume` importable listing so it, `aivo logs`, and the
+/// resume resolver share one discovery layer.
+pub async fn ingest_project_headlines(
+    project_root: &Path,
+    mut opts: IngestOptions,
+) -> Result<Vec<Thread>> {
+    opts.headline = true;
+    ingest_project_inner(None, project_root, opts).await
+}
+
 async fn ingest_project_inner(
     store: Option<&SessionStore>,
     project_root: &Path,
     opts: IngestOptions,
 ) -> Result<Vec<Thread>> {
-    // Compute the canonical project root once and pass it down — six
-    // separate `canonicalize` syscalls would otherwise hit the same path.
     let canonical_root =
         std::fs::canonicalize(project_root).unwrap_or_else(|_| project_root.to_path_buf());
     let canonical_str = canonical_root.to_string_lossy().to_string();
     let cap = opts.max_per_source;
     let permissive = opts.include_short_first_user;
 
-    // Independent I/O — fan out across sources concurrently.
+    // Walk-level mtime pruning (mtime ≥ last-message-ts for append-only jsonl;
+    // the post-extraction age filter below still applies either way).
+    let walk_cutoff = effective_cutoff(&opts).map(SystemTime::from);
+
     let (claude, codex, gemini, pi, opencode, code) = tokio::join!(
-        ingest_claude(&canonical_root, cap, permissive),
-        ingest_codex(&canonical_str, cap, permissive),
-        ingest_gemini(&canonical_str, cap, permissive),
-        ingest_pi(&canonical_str, cap, permissive),
-        ingest_opencode(canonical_str.clone(), cap, permissive),
+        ingest_claude(&canonical_root, opts, walk_cutoff),
+        ingest_codex(&canonical_str, opts, walk_cutoff),
+        async {
+            match opts.headline {
+                // No stop-early read for gemini's single-blob JSON.
+                true => Vec::new(),
+                false => ingest_gemini(&canonical_str, cap, permissive).await,
+            }
+        },
+        ingest_pi(&canonical_str, opts, walk_cutoff),
+        async {
+            match opts.headline {
+                // Nor for opencode's sqlite rows.
+                true => Vec::new(),
+                false => ingest_opencode(canonical_str.clone(), cap, permissive).await,
+            }
+        },
         async {
             match store {
                 Some(s) => ingest_code(s, &canonical_str, cap, permissive).await,
@@ -189,7 +203,7 @@ async fn ingest_project_inner(
     threads.extend(opencode);
     threads.extend(code);
 
-    // Optional age filter (replaces the old `gc` command — evaluated lazily).
+    // Optional age filter.
     if let Some(cutoff) = effective_cutoff(&opts) {
         threads.retain(|t| t.updated_at >= cutoff);
     }
@@ -198,23 +212,14 @@ async fn ingest_project_inner(
 }
 
 /// Global counterpart to `ingest_project`: walks every native CLI session
-/// aivo can see, regardless of cwd. Used by `aivo logs` for the unified
-/// listing. Each source is fanned out concurrently and capped per
-/// `opts.max_per_source`. Threads are merged, age-filtered, sorted desc by
-/// `updated_at`.
+/// aivo can see, regardless of cwd.
 pub async fn ingest_native_sessions_global(
     opts: IngestOptions,
     need_last_response: bool,
 ) -> Result<Vec<Thread>> {
     let cap = opts.max_per_source;
     let permissive = opts.include_short_first_user;
-    // Head-only parse unless a caller needs `last_response`. See
-    // `extract_claude_thread_headline`.
     let headline = !need_last_response;
-    // Push the time cutoff down to the file walks: each per-source ingester
-    // drops jsonl files whose mtime is already older than the cutoff before
-    // touching them. mtime ≥ last-message-ts for an append-only jsonl, so a
-    // file failing the mtime check can't produce a thread that would pass.
     let cutoff = effective_cutoff(&opts);
     let cutoff_st = cutoff.map(SystemTime::from);
     let (claude, codex, gemini, pi, opencode) = tokio::join!(
@@ -233,9 +238,7 @@ pub async fn ingest_native_sessions_global(
     threads.extend(pi);
     threads.extend(opencode);
 
-    // Some files have mtime later than their last message ts (e.g. metadata
-    // touch). Re-check thread updated_at to be safe — pushdown is a parsing
-    // optimization, not a correctness shortcut.
+    // Re-check thread updated_at (mtime may lag behind last message ts).
     if let Some(cutoff) = cutoff {
         threads.retain(|t| t.updated_at >= cutoff);
     }
@@ -677,7 +680,11 @@ fn opencode_query_global(db_path: &Path, cap: i64, after_ms: i64, permissive: bo
 // Claude: ~/.claude/projects/<encoded-cwd>/*.jsonl
 // ---------------------------------------------------------------------------
 
-async fn ingest_claude(canonical_root: &Path, cap: Option<usize>, permissive: bool) -> Vec<Thread> {
+async fn ingest_claude(
+    canonical_root: &Path,
+    opts: IngestOptions,
+    walk_cutoff: Option<SystemTime>,
+) -> Vec<Thread> {
     let home = match system_env::home_dir() {
         Some(h) => h,
         None => return Vec::new(),
@@ -690,15 +697,21 @@ async fn ingest_claude(canonical_root: &Path, cap: Option<usize>, permissive: bo
         return Vec::new();
     }
 
-    let files = list_jsonl_newest_first(&session_dir, None).await;
+    let files = list_jsonl_newest_first(&session_dir, walk_cutoff).await;
     let mut out = Vec::new();
     for path in files {
-        if let Some(n) = cap
+        if let Some(n) = opts.max_per_source
             && out.len() >= n
         {
             break;
         }
-        if let Some(thread) = extract_claude_thread(&path, permissive).await {
+        let thread = if opts.headline {
+            let mtime = file_mtime(&path).await;
+            extract_claude_thread_headline(&path, mtime, opts.include_short_first_user).await
+        } else {
+            extract_claude_thread(&path, opts.include_short_first_user).await
+        };
+        if let Some(thread) = thread {
             out.push(thread);
         }
     }
@@ -801,7 +814,17 @@ async fn extract_claude_session_stub(path: &Path) -> Option<Thread> {
 // Codex: ~/.codex/sessions/YYYY/MM/DD/*.jsonl, per-file cwd match
 // ---------------------------------------------------------------------------
 
-async fn ingest_codex(canonical_root: &str, cap: Option<usize>, permissive: bool) -> Vec<Thread> {
+/// Codex sessions live in one flat tree for every repo; in headline mode
+/// (listing surfaces) bound how many files we peek at (one header read each)
+/// while filtering to this cwd. The full mode stays uncapped — the digest
+/// path may legitimately name an old session by id.
+const CODEX_PROJECT_PROBE_LIMIT: usize = 400;
+
+async fn ingest_codex(
+    canonical_root: &str,
+    opts: IngestOptions,
+    walk_cutoff: Option<SystemTime>,
+) -> Vec<Thread> {
     let home = match system_env::home_dir() {
         Some(h) => h,
         None => return Vec::new(),
@@ -811,15 +834,31 @@ async fn ingest_codex(canonical_root: &str, cap: Option<usize>, permissive: bool
         return Vec::new();
     }
 
-    let files = walk_jsonl_newest_first(&codex_root, None).await;
+    let files = walk_jsonl_newest_first(&codex_root, walk_cutoff).await;
     let mut out = Vec::new();
-    for path in files {
-        if let Some(n) = cap
+    for (probed, path) in files.into_iter().enumerate() {
+        if let Some(n) = opts.max_per_source
             && out.len() >= n
         {
             break;
         }
-        if let Some(thread) = extract_codex_thread(&path, canonical_root, permissive).await {
+        if opts.headline && probed >= CODEX_PROJECT_PROBE_LIMIT {
+            break;
+        }
+        let thread = if opts.headline {
+            // The headline extractor has no cwd filter (it serves the global
+            // walk too) — match on the returned session cwd here.
+            extract_codex_thread_headline(&path, opts.include_short_first_user)
+                .await
+                .filter(|t| {
+                    t.cwd
+                        .as_deref()
+                        .is_some_and(|cwd| paths_match(cwd, canonical_root))
+                })
+        } else {
+            extract_codex_thread(&path, canonical_root, opts.include_short_first_user).await
+        };
+        if let Some(thread) = thread {
             out.push(thread);
         }
     }
@@ -1298,21 +1337,31 @@ pub(crate) fn pi_session_dir(canonical_root: &str) -> Option<PathBuf> {
     )
 }
 
-async fn ingest_pi(canonical_root: &str, cap: Option<usize>, permissive: bool) -> Vec<Thread> {
+async fn ingest_pi(
+    canonical_root: &str,
+    opts: IngestOptions,
+    walk_cutoff: Option<SystemTime>,
+) -> Vec<Thread> {
     let session_dir = match pi_session_dir(canonical_root) {
         Some(d) if d.exists() => d,
         _ => return Vec::new(),
     };
 
-    let files = list_jsonl_newest_first(&session_dir, None).await;
+    let files = list_jsonl_newest_first(&session_dir, walk_cutoff).await;
     let mut out = Vec::new();
     for path in files {
-        if let Some(n) = cap
+        if let Some(n) = opts.max_per_source
             && out.len() >= n
         {
             break;
         }
-        if let Some(thread) = extract_pi_thread(&path, permissive).await {
+        let thread = if opts.headline {
+            let mtime = file_mtime(&path).await;
+            extract_pi_thread_headline(&path, mtime, opts.include_short_first_user).await
+        } else {
+            extract_pi_thread(&path, opts.include_short_first_user).await
+        };
+        if let Some(thread) = thread {
             out.push(thread);
         }
     }
@@ -1817,7 +1866,7 @@ async fn ingest_code(
 
 /// Same bracket extraction as the native sources, over the stored display
 /// messages. `strip_aivo_context` matters here too: a `-p` one-shot seeded
-/// with `--context` stores the injected block at the head of its first user
+/// with a context digest stores the injected block at the head of its first user
 /// message.
 async fn extract_code_thread(
     store: &SessionStore,
@@ -1861,7 +1910,7 @@ async fn extract_code_thread(
 }
 
 /// Code sessions matching a session-id prefix, cwd-agnostic — the global
-/// fallback for an explicit `--context=<id>` (parity with `/resume <id>`).
+/// fallback for an explicit `--resume <id>` (parity with `/resume <id>`).
 pub async fn code_threads_by_id_global(
     store: &SessionStore,
     id_prefix: &str,
@@ -1886,6 +1935,15 @@ pub async fn code_threads_by_id_global(
 // ---------------------------------------------------------------------------
 // Filesystem walking — newest-first
 // ---------------------------------------------------------------------------
+
+/// File mtime, `UNIX_EPOCH` when unreadable (sorts oldest; age-filtered out).
+async fn file_mtime(path: &Path) -> SystemTime {
+    fs::metadata(path)
+        .await
+        .ok()
+        .and_then(|m| m.modified().ok())
+        .unwrap_or(SystemTime::UNIX_EPOCH)
+}
 
 pub(crate) async fn list_jsonl_newest_first(dir: &Path, after: Option<SystemTime>) -> Vec<PathBuf> {
     let mut entries: Vec<(PathBuf, SystemTime)> = Vec::new();
@@ -1975,7 +2033,7 @@ pub fn encode_claude_dir(canonical_path: &str) -> String {
 /// Log when a session file/DB that was discoverable cannot be read or
 /// parsed. Release builds stay silent (per-line JSONL churn and mid-write
 /// files are routine); debug builds surface it so developers chasing a
-/// "--context doesn't see my session" report have a breadcrumb.
+/// "--resume doesn't see my session" report have a breadcrumb.
 fn warn_unreadable_session(path: &Path, reason: &str) {
     #[cfg(debug_assertions)]
     eprintln!(
@@ -2473,7 +2531,7 @@ mod tests {
         )
         .await;
 
-        // A prefix from a foreign dir resolves — the `--context=<id>` fallback.
+        // A prefix from a foreign dir resolves — the `--resume <id>` fallback.
         let hits = code_threads_by_id_global(&store, "bbbb2222", true).await;
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].session_id, "bbbb2222-two");
@@ -2487,7 +2545,7 @@ mod tests {
 
     #[tokio::test]
     async fn ingest_code_drops_context_seeded_one_shots() {
-        // A `-p` one-shot launched with `--context` stores the injected block
+        // A `-p` one-shot launched with a context digest stores the injected block
         // at the head of its first user message; re-ingesting it must not
         // produce context-in-context recursion.
         let config_dir = TempDir::new().unwrap();
@@ -2783,8 +2841,7 @@ mod tests {
         let recent = IngestOptions {
             max_age_days: Some(1),
             min_updated_at: Some(Utc::now() - chrono::Duration::days(30)),
-            max_per_source: None,
-            include_short_first_user: false,
+            ..IngestOptions::unlimited()
         };
         let cutoff = effective_cutoff(&recent).unwrap();
         assert!(cutoff > Utc::now() - chrono::Duration::days(2));
@@ -2793,8 +2850,7 @@ mod tests {
         let explicit = IngestOptions {
             max_age_days: Some(30),
             min_updated_at: Some(Utc::now() - chrono::Duration::days(1)),
-            max_per_source: None,
-            include_short_first_user: false,
+            ..IngestOptions::unlimited()
         };
         let cutoff = effective_cutoff(&explicit).unwrap();
         assert!(cutoff > Utc::now() - chrono::Duration::days(2));
@@ -2802,13 +2858,7 @@ mod tests {
 
     #[test]
     fn effective_cutoff_none_when_both_unset() {
-        let opts = IngestOptions {
-            max_age_days: None,
-            min_updated_at: None,
-            max_per_source: None,
-            include_short_first_user: false,
-        };
-        assert!(effective_cutoff(&opts).is_none());
+        assert!(effective_cutoff(&IngestOptions::unlimited()).is_none());
     }
 
     /// Regression: a codex session whose only user turn is a short CJK

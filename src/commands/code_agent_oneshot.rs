@@ -456,6 +456,7 @@ async fn finalize(
             key,
             &cap.model,
             &cap.cwd,
+            &cap.session_id,
             &cap.prompt,
             &cap.ui.answer,
             &cap.usage,
@@ -700,10 +701,53 @@ async fn resolve_resume_session(
     } else {
         selector.to_string()
     };
-    session_store
-        .get_code_session(&id)
-        .await?
-        .ok_or_else(|| anyhow::anyhow!("no saved session '{id}' — see `aivo code` → /resume"))
+    use crate::services::session_import::{ResumeTarget, resolve_resume_target};
+    match resolve_resume_target(session_store, Path::new(cwd), &id).await {
+        ResumeTarget::AivoSession(full) => {
+            session_store.get_code_session(&full).await?.ok_or_else(|| {
+                anyhow::anyhow!("no saved session '{full}' — see `aivo code` → /resume")
+            })
+        }
+        // Foreign (claude/codex/pi) session: reconstruct it in memory under its
+        // stable import id — the run's end-of-turn save persists the fork.
+        ResumeTarget::Foreign(imp) => {
+            use crate::services::session_import::{ForeignResume, resume_foreign};
+            match resume_foreign(session_store, &imp.origin, Some(imp.updated_at)).await? {
+                ForeignResume::Fork {
+                    state,
+                    source_newer,
+                } => {
+                    if source_newer {
+                        eprintln!(
+                            "  ! fork {} is behind its {} source session — newer messages there were never imported",
+                            state.session_id,
+                            crate::services::session_import::source_label(&imp.origin.cli),
+                        );
+                    }
+                    Ok(state)
+                }
+                ForeignResume::Fresh(transcript) => {
+                    let now = chrono::Utc::now().to_rfc3339();
+                    Ok(crate::services::session_store::CodeSessionState {
+                        session_id: imp.aivo_id,
+                        key_id: key_id.to_string(),
+                        base_url: String::new(),
+                        cwd: cwd.to_string(),
+                        // Empty → the caller falls back to the key's model.
+                        model: String::new(),
+                        messages: transcript.messages,
+                        engine_messages: Some(transcript.engine_messages),
+                        updated_at: now.clone(),
+                        created_at: now,
+                    })
+                }
+            }
+        }
+        ResumeTarget::Ambiguous(msg) => anyhow::bail!(msg),
+        ResumeTarget::Unknown => {
+            anyhow::bail!("no saved session '{id}' — see `aivo code` → /resume")
+        }
+    }
 }
 
 /// Best-effort — a failed save must not fail the run whose answer already printed.
@@ -792,6 +836,7 @@ async fn log_oneshot_turn(
     key: &ApiKey,
     model: &str,
     cwd: &str,
+    session_id: &str,
     prompt: &str,
     answer: &str,
     usage: &crate::services::session_store::SessionTokens,
@@ -816,6 +861,9 @@ async fn log_oneshot_turn(
             tool: Some("code".to_string()),
             model: Some(model.to_string()),
             cwd: Some(cwd.to_string()),
+            // Real session id so `aivo logs` groups this row with the TUI's
+            // turns (log_chat_turn), not a synthetic per-run id.
+            session_id: Some(session_id.to_string()),
             exit_code: Some(i64::from(exit.code())),
             duration_ms: Some(elapsed.as_millis() as i64),
             input_tokens: Some(usage.prompt_tokens as i64),

@@ -61,10 +61,10 @@ pub(crate) use code_tui_format::format_time_ago_short;
 
 #[path = "code_tui.rs"]
 mod code_tui;
-// `code_tui_format` is now declared at the parent (`commands/mod.rs`) so other
-// commands (notably `aivo context` / `--context`) can reuse its time/text
-// formatters. Re-export at this scope so the chat module still references it
-// without `super::`.
+// `code_tui_format` is declared at the parent (`commands/mod.rs`) so other
+// commands (notably `aivo logs` / `--resume`) can reuse its time/text
+// formatters. Re-exported here so the chat module references it without
+// `super::`.
 use super::code_agent_oneshot;
 use super::code_tui_format;
 
@@ -408,7 +408,6 @@ impl CodeCommand {
         model: Option<String>,
         one_shot: Option<String>,
         initial_prompt: Option<String>,
-        context_selector: Option<String>,
         attachments: Vec<String>,
         refresh: bool,
         key_override: Option<ApiKey>,
@@ -429,7 +428,6 @@ impl CodeCommand {
                 model,
                 one_shot,
                 initial_prompt,
-                context_selector,
                 attachments,
                 refresh,
                 key_override,
@@ -461,7 +459,6 @@ impl CodeCommand {
         model_flag: Option<String>,
         one_shot: Option<String>,
         initial_prompt: Option<String>,
-        context_selector: Option<String>,
         attachments: Vec<String>,
         refresh: bool,
         key_override: Option<ApiKey>,
@@ -659,25 +656,51 @@ impl CodeCommand {
             None
         };
 
-        // `-c` that finds nothing to inject is a hard failure, not a silent
-        // context-less launch; a cancelled picker launches plain.
+        // `--resume <id>` pre-resolution, fidelity ladder: a saved aivo session
+        // (prefix → full id), an importable claude/codex/pi session (left for
+        // the TUI/one-shot import path), or — for sources with no importer
+        // (gemini, opencode, out-of-window natives) — a rendered context
+        // digest into a fresh session. A selector that matches nothing is a
+        // hard failure. Bare/`last` selectors go straight through.
+        let mut resume = resume;
         let mut injected_context: Option<String> = None;
         let mut injected_context_summary: Option<String> = None;
-        if let Some(selector) = context_selector {
-            use crate::commands::run::ContextResolution;
-            match crate::commands::run::resolve_context_thread(&self.session_store, &selector).await
+        if let Some(sel) = resume
+            .clone()
+            .filter(|s| !s.trim().is_empty() && s != "last")
+        {
+            use crate::services::session_import::{ResumeTarget, resolve_resume_target};
+            let cwd = crate::services::system_env::current_dir().unwrap_or_default();
+            match resolve_resume_target(&self.session_store, std::path::Path::new(&cwd), &sel).await
             {
-                ContextResolution::Selected(thread) => {
-                    let rendered = crate::services::context_render::render_for_aivo_code(&thread);
-                    let summary =
-                        crate::commands::run::context_injection_summary(&rendered, &thread);
-                    // Echoed to stderr (one-shot paths); the summary rides into the TUI.
-                    crate::commands::run::announce_context_injection(&rendered, &thread);
-                    injected_context = Some(rendered.text);
-                    injected_context_summary = Some(summary);
+                // Resolvable: keep the user's selector — the TUI/one-shot
+                // re-resolve it through the same ladder, and the LOAD path
+                // owns the fork-first collapse plus the source-diverged
+                // notice. This block only vets Ambiguous/Unknown up front.
+                ResumeTarget::AivoSession(_) | ResumeTarget::Foreign(_) => {}
+                ResumeTarget::Ambiguous(msg) => anyhow::bail!(msg),
+                ResumeTarget::Unknown => {
+                    use crate::commands::run::ContextResolution;
+                    match crate::commands::run::resolve_context_thread(&self.session_store, &sel)
+                        .await
+                    {
+                        ContextResolution::Selected(thread) => {
+                            let rendered =
+                                crate::services::context_render::render_for_aivo_code(&thread);
+                            let summary = format!(
+                                "{} (context digest — no importer for {} sessions)",
+                                crate::commands::run::context_injection_summary(&rendered, &thread),
+                                thread.cli,
+                            );
+                            eprintln!("  {} {}", crate::style::arrow_symbol(), summary);
+                            injected_context = Some(rendered.text);
+                            injected_context_summary = Some(summary);
+                            resume = None;
+                        }
+                        ContextResolution::Cancelled => resume = None,
+                        ContextResolution::Unavailable(msg) => anyhow::bail!(msg),
+                    }
                 }
-                ContextResolution::Cancelled => {}
-                ContextResolution::Unavailable(msg) => anyhow::bail!(msg),
             }
         }
 
@@ -1058,13 +1081,9 @@ impl CodeCommand {
         print_opt("-r, --refresh", "Refresh the model list (skip cache)");
         print_opt(
             "--resume [last|id]",
-            "Resume a saved session (bare/last/id; works with -e)",
+            "Resume a saved session, or another agent's (claude/codex/pi id from `aivo logs`; works with -e)",
         );
         print_opt("--share", "Share this session live (needs `aivo login`)");
-        print_opt(
-            "-c, --context[=<id>]",
-            "Inject one past AI CLI session as context",
-        );
         print_opt("--attach <path>", "Attach a file or image to the message");
         print_opt("--json", "Raw provider JSON (with -p)");
         print_opt(
@@ -2897,7 +2916,6 @@ mod tests {
             .execute(
                 None,
                 Some("hi".to_string()),
-                None,
                 None,
                 Vec::new(),
                 false,

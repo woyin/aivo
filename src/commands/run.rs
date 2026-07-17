@@ -40,11 +40,7 @@ impl RunCommand {
         }
     }
 
-    /// Resolves the model to use when --model flag is provided.
-    /// --model <value> → use as-is. --model (no value) → show picker with
-    /// the given header. No --model flag → returns `UseDefault` (let the tool
-    /// use its own default). The `prompt` lets callers render per-slot
-    /// headers like `"Step 2 of 3 — fast model"`.
+    /// Resolves the model when --model flag is provided.
     #[allow(clippy::too_many_arguments)]
     async fn resolve_model(
         &self,
@@ -236,7 +232,7 @@ impl RunCommand {
         slots: ClaudeSlotFlags,
         env: Option<HashMap<String, String>>,
         key_override: Option<ApiKey>,
-        context_selector: Option<String>,
+        resume_selector: Option<String>,
         max_context: Option<String>,
     ) -> ExitCode {
         match self
@@ -250,7 +246,7 @@ impl RunCommand {
                 slots,
                 env,
                 key_override,
-                context_selector,
+                resume_selector,
                 max_context,
             )
             .await
@@ -275,7 +271,7 @@ impl RunCommand {
         slots: ClaudeSlotFlags,
         env: Option<HashMap<String, String>>,
         key_override: Option<ApiKey>,
-        context_selector: Option<String>,
+        resume_selector: Option<String>,
         max_context: Option<String>,
     ) -> anyhow::Result<ExitCode> {
         let mut model = model;
@@ -307,15 +303,10 @@ impl RunCommand {
             }
         };
 
-        // OAuth keys carry serialized tokens only the matching native CLI can
-        // consume (shadow CODEX_HOME, CLAUDE_CODE_OAUTH_TOKEN); every other
-        // tool would see an unusable JSON blob. Legacy `gemini-oauth` keys are
-        // defunct (sign-in removed) and rejected before launch via
-        // `oauth_incompat_reason`.
+        // OAuth keys carry serialized tokens only the matching native CLI can consume.
         let mut key_override = key_override;
 
-        // Bare `hf:` opens a picker; rewrite to a concrete ref so the
-        // match below treats it like any other `hf:<repo>` value.
+        // Bare `hf:` opens a picker; rewrite to a concrete ref.
         if let Some(m) = model.as_deref()
             && huggingface::is_bare_hf_picker_trigger(m)
         {
@@ -325,9 +316,7 @@ impl RunCommand {
             }
         }
 
-        // HF takeover: bypass key resolution, spawn a local llama-server,
-        // synthesize a loopback key pinned to OpenAI Chat Completions on
-        // every tool's protocol (llama-server speaks nothing else).
+        // HF takeover: spawn a local llama-server, synthesize a loopback key.
         let hf_active = match model.as_deref() {
             Some(m) if huggingface::is_hf_or_local_gguf(m) => {
                 let hf_ref = huggingface::parse_hf_ref(m)?;
@@ -422,17 +411,13 @@ impl RunCommand {
             }
             AIToolType::Claude => ClaudeModelOverrides::default(),
             _ => {
-                // Non-Claude tool: warn once per set slot flag and forget them.
-                // Running pickers we'd throw away would be wasted UI.
+                // Non-Claude tool: warn for ignored slot flags.
                 warn_slot_flags_ignored(ai_tool, &slots);
                 ClaudeModelOverrides::default()
             }
         };
 
-        // `--max-context` is Claude-only — it targets Anthropic's beta-tier
-        // context-bar opt-in 1m/2m. Other tools (codex included) get their
-        // context windows from the limits cascade; the run entry point
-        // rejects the flag for them before dispatch reaches here.
+        // `--max-context` is Claude-only; other tools get context from limits.
         claude_overrides.max_context = match ai_tool {
             AIToolType::Claude => {
                 resolve_max_context(
@@ -448,16 +433,9 @@ impl RunCommand {
 
         let launch_model = resolve_model_placeholder(resolved_model);
 
-        // `--max-context` / `--1m` is a model-name suffix: aivo writes
-        // `<model>[<tag>]` into ANTHROPIC_MODEL, Claude Code parses the suffix
-        // off and adds the `anthropic-beta: context-1m-2025-08-07` header.
-        // With no model resolved (user picked "(leave it to the tool)", let
-        // it persist via `__default__`, or skipped `-m` entirely), there's
-        // nothing to attach the suffix to — env vars are never written and
-        // the flag silently no-ops. Surface this before Claude takes over the
-        // screen, and gate the launch on Enter so the note isn't lost. Check
-        // after `resolve_model_placeholder` so the `__default__` sentinel is
-        // already collapsed to `None`.
+        // `--max-context` / `--1m` is a model-name suffix: Claude Code parses it
+        // and adds the beta header. If no model resolved, flag silently no-ops.
+        // Surface before Claude takes over and gate launch on Enter.
         if matches!(ai_tool, AIToolType::Claude)
             && claude_overrides.max_context.is_some()
             && launch_model.is_none()
@@ -482,24 +460,19 @@ impl RunCommand {
             }
         }
 
-        // Optional context injection: inject exactly one past session.
-        let args = if let Some(selector) = context_selector {
+        // `--resume=<id>`: continue a past session — natively or as injected digest.
+        let args = if let Some(selector) = resume_selector {
             if ai_tool == AIToolType::CodexApp {
-                eprintln!(
-                    "  {} --context is ignored for codex-app",
-                    style::yellow("!")
-                );
+                eprintln!("  {} --resume is ignored for codex-app", style::yellow("!"));
                 args
             } else {
-                maybe_inject_context(&self.session_store, ai_tool, args, &selector).await
+                maybe_apply_resume(&self.session_store, ai_tool, args, &selector).await
             }
         } else {
             args
         };
 
-        // `--transform` only changes pi's launch path. On other tools the
-        // flag is meaningless — warn and clear the global so `for_pi`
-        // never sees it on a subsequent call in the same process.
+        // `--transform` only changes Pi's launch path; warn and clear for other tools.
         if crate::services::transform_mode::is_active() && ai_tool != AIToolType::Pi {
             eprintln!(
                 "  {} --transform is ignored for {}",
@@ -540,7 +513,7 @@ impl RunCommand {
     ///     `--subagent-model`) → claude
     ///   - `--max-context`/`--1m`/`--2m` → claude
     ///   - `--relogin` → claude, codex/codex-app, gemini (the OAuth-backed keys)
-    ///   - `-c, --context` → every tool (no flat prompt-flag path)
+    ///   - `--resume [<id>]` → every tool but codex-app (native resume or digest)
     pub fn print_help(tool: Option<&str>) {
         let generic = tool.is_none();
         let is = |name: &str| generic || tool == Some(name);
@@ -653,7 +626,10 @@ impl RunCommand {
             );
         }
         if tool != Some("codex-app") {
-            print_opt("-c, --context[=<id>]", "Inject one past session");
+            print_opt(
+                "--resume [<id>]",
+                "Continue a past session (native resume when it's this tool's, else a context digest; bare = picker)",
+            );
         }
 
         section("Key & Auth:");
@@ -806,8 +782,8 @@ fn warn_slot_flags_ignored(tool: AIToolType, slots: &ClaudeSlotFlags) {
     }
 }
 
-/// Outcome of resolving a `--context` selector. `aivo run` skips injection on
-/// Cancelled/Unavailable; `aivo code -c` launches on a cancel but bails on
+/// Outcome of resolving a `--resume` selector. `aivo run` skips the resume on
+/// Cancelled/Unavailable; `aivo code` launches on a cancel but bails on
 /// `Unavailable` (its `String` is a ready-to-print reason).
 pub(crate) enum ContextResolution {
     Selected(Thread),
@@ -815,9 +791,9 @@ pub(crate) enum ContextResolution {
     Unavailable(String),
 }
 
-/// Resolve a `--context` selector into one past session: empty → interactive
+/// Resolve a `--resume` selector into one past session: empty → interactive
 /// picker; else session-id prefix match. The scan runs under a spinner. Shared
-/// with `aivo code -c`.
+/// with `aivo code --resume`'s digest rung.
 pub(crate) async fn resolve_context_thread(
     store: &SessionStore,
     selector: &str,
@@ -900,35 +876,23 @@ pub(crate) fn context_injection_summary(rendered: &RenderedContext, thread: &Thr
     )
 }
 
-/// Print the injection summary to stderr (non-TUI paths).
-pub(crate) fn announce_context_injection(rendered: &RenderedContext, thread: &Thread) {
-    eprintln!(
-        "  {} {}",
-        style::arrow_symbol(),
-        context_injection_summary(rendered, thread),
-    );
-}
-
-/// Loads context from exactly one past session and injects it into the CLI
-/// args. `selector`: empty → most-recent; otherwise prefix-match on session_id.
-async fn maybe_inject_context(
+/// Continue one past session in the target tool, strongest mechanism first.
+/// Rung 1 — the session belongs to this tool and it resumes by id: rewrite
+/// argv to the tool's own resume (routing env still applies, so a session can
+/// be resumed on a different key). Rung 2 — anything else: render the session
+/// and inject it as a context digest. `selector`: empty → interactive picker;
+/// otherwise prefix-match on session_id.
+async fn maybe_apply_resume(
     store: &SessionStore,
     tool: AIToolType,
     args: Vec<String>,
     selector: &str,
 ) -> Vec<String> {
-    // Every tool has *some* injection path:
-    //   claude, pi  → `--append-system-prompt <text>` (clean, hidden from user)
-    //   codex       → prepended to [PROMPT] positional
-    //   gemini      → `-i <text>` (prompt-interactive)
-    //   opencode    → `--prompt <text>` (TUI launch flag)
-    // The non-claude paths are visible to the user as part of the first
-    // message; we wrap with a "context only — wait for me" preamble.
     let selected = match resolve_context_thread(store, selector).await {
         ContextResolution::Selected(thread) => thread,
         ContextResolution::Cancelled => {
             eprintln!(
-                "  {} context picker cancelled; launching without injection",
+                "  {} session picker cancelled; launching plain",
                 style::dim("›")
             );
             return args;
@@ -939,8 +903,32 @@ async fn maybe_inject_context(
         }
     };
 
+    if selected.cli == tool.as_str()
+        && let Some(rewritten) = native_resume_args(tool, &selected.session_id, &args)
+    {
+        eprintln!(
+            "  {} resuming {} session {} natively",
+            style::arrow_symbol(),
+            selected.cli,
+            &selected.session_id[..selected.session_id.len().min(8)],
+        );
+        return rewritten;
+    }
+
+    // Digest rung. Every tool has *some* injection path:
+    //   claude, pi  → `--append-system-prompt <text>` (clean, hidden from user)
+    //   codex       → prepended to [PROMPT] positional
+    //   gemini      → `-i <text>` (prompt-interactive)
+    //   opencode    → `--prompt <text>` (TUI launch flag)
+    // The non-claude paths are visible to the user as part of the first
+    // message; we wrap with a "context only — wait for me" preamble.
     let rendered = render_single_session(tool, &selected);
-    announce_context_injection(&rendered, &selected);
+    eprintln!(
+        "  {} {} {}",
+        style::arrow_symbol(),
+        context_injection_summary(&rendered, &selected),
+        style::dim("(context digest — no native resume for this session here)"),
+    );
 
     match tool {
         // Both claude and pi accept the same `--append-system-prompt <text>` flag.
@@ -949,6 +937,20 @@ async fn maybe_inject_context(
         AIToolType::Gemini => inject_via_flag(&rendered, args, "-i"),
         AIToolType::Opencode => inject_via_flag(&rendered, args, "--prompt"),
     }
+}
+
+/// Argv rewrite for a tool's native resume-by-id, when it has one: claude
+/// `--resume <id>`, codex `resume <id>` (subcommand, so it must lead), pi and
+/// opencode `--session <id>`. Gemini's `--resume` takes a list index, not a
+/// session id → no rung 1. Verified against each CLI's `--help` (2026-07).
+fn native_resume_args(tool: AIToolType, session_id: &str, args: &[String]) -> Option<Vec<String>> {
+    let lead: Vec<String> = match tool {
+        AIToolType::Claude => vec!["--resume".into(), session_id.into()],
+        AIToolType::Codex => vec!["resume".into(), session_id.into()],
+        AIToolType::Pi | AIToolType::Opencode => vec!["--session".into(), session_id.into()],
+        AIToolType::Gemini | AIToolType::CodexApp => return None,
+    };
+    Some(lead.into_iter().chain(args.iter().cloned()).collect())
 }
 
 /// Selection outcome. `Cancelled` distinguishes "user aborted the picker"
@@ -965,7 +967,6 @@ fn select_thread<'a>(threads: &'a [Thread], selector: &str) -> SelectOutcome<'a>
     }
     let selector = selector.trim();
     if selector.is_empty() {
-        // Bare `--context`: interactive picker.
         return pick_interactive(threads);
     }
     let matches: Vec<&Thread> = threads
@@ -1154,6 +1155,33 @@ mod tests {
             console::strip_ansi_codes(&highlight_slot_label("opus family model")).as_ref(),
             "opus family model",
         );
+    }
+
+    #[test]
+    fn native_resume_args_per_tool_shapes() {
+        let rest = vec!["--model".to_string(), "opus".to_string()];
+        // claude: flag pair leads, passthrough follows.
+        assert_eq!(
+            native_resume_args(AIToolType::Claude, "abc-123", &rest).unwrap(),
+            vec!["--resume", "abc-123", "--model", "opus"],
+        );
+        // codex: `resume` is a subcommand, so it must lead.
+        assert_eq!(
+            native_resume_args(AIToolType::Codex, "r1", &rest).unwrap(),
+            vec!["resume", "r1", "--model", "opus"],
+        );
+        // pi / opencode: `--session <id>`.
+        assert_eq!(
+            native_resume_args(AIToolType::Pi, "u-1", &[]).unwrap(),
+            vec!["--session", "u-1"],
+        );
+        assert_eq!(
+            native_resume_args(AIToolType::Opencode, "s9", &[]).unwrap(),
+            vec!["--session", "s9"],
+        );
+        // gemini resumes by list index, not id; codex-app has no hook.
+        assert!(native_resume_args(AIToolType::Gemini, "x", &[]).is_none());
+        assert!(native_resume_args(AIToolType::CodexApp, "x", &[]).is_none());
     }
 
     #[test]

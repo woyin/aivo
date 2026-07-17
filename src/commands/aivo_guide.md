@@ -110,14 +110,15 @@ Key flags:
 -k, --key <id|name>        use a specific saved key
 -r, --refresh              bypass the model-list cache
 --max-context <size>       larger context window (e.g. 1m, 2m);  --1m / --2m shorthands
--c, --context[=<id>]       inject one past session as context
+--resume [<id>]            continue a past session (same-tool sessions resume natively;
+                           foreign ones inject as a context digest; bare = picker)
 --env <k=v>                inject an environment variable
 --relogin                  force OAuth re-login (codex / codex-app / claude)
 --dry-run                  print the resolved command + env without launching
 --transparent              pi only: bypass the router, talk to the model natively
 ```
 
-Claude-only model-slot overrides: `--reasoning-model`, `--subagent-model`, and
+Claude-only model-slot overrides: `--fable-model`, `--subagent-model`, and
 `--haiku|--sonnet|--opus-model` (what `/model <name>` resolves to; bare = picker).
 
 ```bash
@@ -156,9 +157,10 @@ aivo code "<text>"            # TUI with the text sent as the first message
 --json-schema <schema>       constrain the -e final answer to a JSON Schema
                               (inline JSON or @path to a file)
 -r, --refresh                 refresh the model list (skip cache)
---resume [last|id]            resume a saved session (TUI and -e; -e runs persist too)
+--resume [last|id]            resume a saved session, or another agent's session by id
+                              (claude/codex/pi — see `aivo logs`; imported and continued
+                              here; other sources inject as a context digest; TUI and -e)
 --share                       share this session live (needs `aivo login`)
--c, --context[=<id>]          inject one past AI CLI session as context (bare = picker)
 --attach <path>               attach a file or image
 --json                        raw provider JSON (with -p)
 --output-format <fmt>         -e output: text (default), json (one final result

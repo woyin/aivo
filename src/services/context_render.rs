@@ -34,8 +34,8 @@ pub fn render_single_session(tool: AIToolType, thread: &Thread) -> RenderedConte
     RenderedContext { text, tokens }
 }
 
-/// Render one past session for `aivo code -c` as compact markdown, appended
-/// to the system prompt rather than shown as a user message.
+/// Render one past session for `aivo code --resume`'s digest rung as compact
+/// markdown, appended to the system prompt rather than shown as a user message.
 pub fn render_for_aivo_code(thread: &Thread) -> RenderedContext {
     let text = format_markdown_single(thread);
     let tokens = estimate_tokens(&text);

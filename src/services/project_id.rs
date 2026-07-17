@@ -1,18 +1,13 @@
 //! Normalized thread type + age constant for the context pipeline.
-//!
-//! Context is stateless — extracted threads live in memory only, reconstructed
-//! from claude/codex session files and `logs.db` on every invocation. This
-//! module holds the shared primitives used across the ingest/render pipeline.
+//! Context is stateless — threads are reconstructed from session files.
 
 use chrono::{DateTime, Utc};
 
-/// Default: threads older than this are filtered out at read time. Age
-/// filtering is lazy (no persistent GC needed). Users can override with
-/// `--last-days=<N>` or bypass entirely with `--all`.
-pub const DEFAULT_THREAD_MAX_AGE_DAYS: i64 = 14;
+/// Default: threads older than this are filtered out. Override with `--last-days=<N>` or `--all`.
+pub const DEFAULT_THREAD_MAX_AGE_DAYS: i64 = 30;
 
-/// A normalized conversational thread: one session summarized into a first
-/// user "topic" and a last assistant "last_response". In-memory only.
+/// A conversational thread: one session summarized into a first user "topic" and
+/// last assistant "last_response". In-memory only.
 #[derive(Debug, Clone)]
 pub struct Thread {
     /// Which CLI produced the session: "claude" | "codex" | "code" | ...
