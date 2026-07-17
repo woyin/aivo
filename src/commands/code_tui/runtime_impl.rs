@@ -662,8 +662,14 @@ impl CodeTuiApp {
         let self_correct =
             env_self_correct() || (self.goal_mode.is_some() && goal_verify_enabled());
         // Sync a reused engine to the session mode + self-correct toggle before the turn.
+        let unsend_pending = std::mem::take(&mut self.agent_unsend_pending);
         if let Some(session) = self.agent_engine.as_ref() {
             let mut engine = session.engine.lock().await;
+            // An Esc-unsent turn whose async un-send hasn't run yet: drop the stale
+            // user tail now, before this turn would merge into it.
+            if unsend_pending {
+                engine.unsend_last_user_turn();
+            }
             engine.set_plan_mode(self.plan_mode);
             engine.set_self_correct(self_correct);
         }
@@ -2830,14 +2836,21 @@ pieces and keep going"
             });
         }
         if matches!(kind, CancelKind::Unsend) {
-            // Nothing committed, so un-send is safe even for an agent turn: the engine
-            // keeps its bare user message and merges the resent text (see `begin_user_turn`).
             restore_cancelled_submission(
                 &mut self.history,
                 &mut self.draft,
                 &mut self.draft_attachments,
                 &mut self.pending_submit,
             );
+            // Un-send from the engine too, or the resent (possibly edited) text
+            // merges with the stale copy. Async because the aborted turn task may
+            // still hold the engine lock; the pending flag re-applies at next
+            // dispatch as the ordering backstop.
+            if was_agent_turn && let Some(session) = &self.agent_engine {
+                self.agent_unsend_pending = true;
+                let engine = session.engine.clone();
+                tokio::spawn(async move { engine.lock().await.unsend_last_user_turn() });
+            }
         } else if was_agent_turn {
             // Keep the user turn in the transcript; just drop the restore buffer so
             // it can't be resurrected by a later non-agent cancel.

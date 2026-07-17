@@ -321,6 +321,15 @@ pub(crate) struct Checkpoint {
     pub(crate) seg_tree: Option<String>,
 }
 
+/// Undo record for [`AgentEngine::begin_user_turn`], consumed by
+/// [`AgentEngine::unsend_last_user_turn`]. `merged_prior` = the trailing user
+/// message the turn merged into (restored verbatim); `None` = fresh append (popped).
+pub(crate) struct TurnUnsend {
+    msg_index: usize,
+    merged_prior: Option<Value>,
+    checkpoint_pushed: bool,
+}
+
 /// Result of a [`AgentEngine::rewind_to`] — counts for the notice.
 #[derive(Default)]
 pub struct RewindOutcome {
@@ -389,6 +398,9 @@ pub struct AgentEngine {
     /// turns by matching prompt text newest-backward (robust to trim/compaction/rebuild,
     /// which a positional index isn't). In-memory; tree objects live in `checkpoint_store`.
     pub(crate) checkpoints: Vec<Checkpoint>,
+    /// Lets an Esc before anything streamed un-send the turn's opening user
+    /// message. Overwritten each `begin_user_turn`.
+    turn_unsend: Option<TurnUnsend>,
     /// Tree-level snapshot/restore via a shadow git store. `None` until `/rewind` is
     /// enabled (top-level chat only). See [`crate::agent::checkpoint`].
     checkpoint_store: Option<crate::agent::checkpoint::CheckpointStore>,

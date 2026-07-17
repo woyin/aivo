@@ -340,6 +340,66 @@ fn repair_interrupted_tail_leaves_clean_transcript_unchanged() {
     );
 }
 
+/// Esc before anything streamed un-sends the turn from the engine too: the TUI
+/// returned the text to the composer, so a resend must not merge with the stale
+/// copy ("hello" + "hi" → "hello\n\nhi" on the wire).
+#[test]
+fn unsend_last_user_turn_removes_fresh_turn_and_checkpoint() {
+    let mut engine = AgentEngine::new("/tmp", "m", "", &[], &[], 0, 0);
+    engine.begin_user_turn(Value::String("hello".into()), "hello".to_string());
+    assert_eq!(engine.messages.len(), 2);
+    assert_eq!(engine.checkpoints.len(), 1);
+
+    engine.unsend_last_user_turn();
+    assert_eq!(engine.messages.len(), 1, "the bare user turn is popped");
+    assert_eq!(engine.checkpoints.len(), 0, "its checkpoint goes with it");
+
+    // The resend carries only the new text — the cancelled copy is gone.
+    engine.begin_user_turn(Value::String("hi".into()), "hi".to_string());
+    assert_eq!(content_str(&engine.messages[1]), "hi");
+
+    // A second un-send without a new turn is a no-op (record already consumed).
+    engine
+        .messages
+        .push(json!({"role":"assistant","content":"yo"}));
+    engine.unsend_last_user_turn();
+    engine.unsend_last_user_turn();
+    assert_eq!(engine.messages.len(), 3);
+}
+
+/// A turn merged into a prior interrupted user turn un-sends only its own text:
+/// the prior tail (still shown in the transcript) is restored verbatim, and the
+/// reused checkpoint stays.
+#[test]
+fn unsend_last_user_turn_restores_merged_prior_tail() {
+    let mut engine = AgentEngine::new("/tmp", "m", "", &[], &[], 0, 0);
+    // Turn 1 interrupted after partial output: its user message stays in the engine.
+    engine.begin_user_turn(Value::String("hello".into()), "hello".to_string());
+    engine.begin_user_turn(Value::String("hi".into()), "hi".to_string());
+    assert_eq!(content_str(&engine.messages[1]), "hello\n\nhi");
+    assert_eq!(engine.checkpoints.len(), 1);
+
+    engine.unsend_last_user_turn();
+    assert_eq!(content_str(&engine.messages[1]), "hello");
+    assert_eq!(engine.checkpoints.len(), 1, "turn 1's checkpoint is kept");
+}
+
+/// Once anything was recorded after the opening user message, un-send must not
+/// touch the transcript (the interrupt path commits the partial turn instead).
+#[test]
+fn unsend_last_user_turn_noops_after_any_reply() {
+    let mut engine = AgentEngine::new("/tmp", "m", "", &[], &[], 0, 0);
+    engine.begin_user_turn(Value::String("hello".into()), "hello".to_string());
+    engine
+        .messages
+        .push(json!({"role":"assistant","content":"partial"}));
+
+    engine.unsend_last_user_turn();
+    assert_eq!(engine.messages.len(), 3, "nothing removed");
+    assert_eq!(content_str(&engine.messages[1]), "hello");
+    assert_eq!(engine.checkpoints.len(), 1);
+}
+
 // ── named specialist sub-agents ─────────────────────────────────────────
 
 /// Durable resume round trip: `export_conversation` drops the system prompt but keeps

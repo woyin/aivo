@@ -2788,6 +2788,9 @@ pub(super) struct CodeTuiApp {
     /// them at the next safe async point (turn end / cancel / next dispatch), never
     /// while the model is still running.
     pub(super) plan_exit_pending: bool,
+    /// An Esc-unsent agent turn whose engine-side un-send may not have landed yet
+    /// (the aborted turn task can still hold the lock): re-apply at next dispatch.
+    pub(super) agent_unsend_pending: bool,
     /// A drafted plan (a plan-mode reply that ended without `exit_plan_mode`),
     /// awaiting `/plan go`. Cleared on execute, `/plan stop`, or `/new`.
     pub(super) pending_plan: Option<String>,
@@ -3108,6 +3111,7 @@ impl CodeTuiApp {
             goal_guard_stop: None,
             plan_mode: false,
             plan_exit_pending: false,
+            agent_unsend_pending: false,
             pending_plan: None,
             plan_card_idx: None,
             agent_engine: None,

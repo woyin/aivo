@@ -14,6 +14,7 @@ impl AgentEngine {
         self.notes.clear();
         // `/rewind` checkpoints' `msg_index` pointed into the cleared transcript.
         self.checkpoints.clear();
+        self.turn_unsend = None;
     }
 
     /// Seed prior conversation into a fresh engine (resume / mid-chat switch) so it
@@ -139,6 +140,35 @@ impl AgentEngine {
         }
         self.messages
             .push(json!({"role": role, "content": content}));
+    }
+
+    /// Un-send the current turn's opening user message: Esc with nothing streamed
+    /// returned the text to the composer, so the engine's copy must go too or the
+    /// next submit merges with it. Restores a merged-into prior tail verbatim,
+    /// drops the checkpoint this turn pushed; no-op once anything followed.
+    pub fn unsend_last_user_turn(&mut self) {
+        let Some(undo) = self.turn_unsend.take() else {
+            return;
+        };
+        if self.messages.len() != undo.msg_index + 1
+            || self.messages.last().map(role) != Some("user")
+        {
+            return;
+        }
+        match undo.merged_prior {
+            Some(prior) => self.messages[undo.msg_index] = prior,
+            None => {
+                self.messages.pop();
+            }
+        }
+        if undo.checkpoint_pushed
+            && self
+                .checkpoints
+                .last()
+                .is_some_and(|c| c.msg_index == undo.msg_index)
+        {
+            self.checkpoints.pop();
+        }
     }
 
     /// Restore the assistant↔tool invariant before a new turn. A turn torn down
@@ -386,6 +416,8 @@ impl AgentEngine {
             self.messages.truncate(at);
         }
         self.checkpoints.truncate(ordinal);
+        // The un-send record pointed into the truncated region.
+        self.turn_unsend = None;
         self.rebuild_working_set_from_log();
         outcome
     }

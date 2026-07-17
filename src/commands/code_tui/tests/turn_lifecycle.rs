@@ -116,6 +116,63 @@ async fn test_cancel_keeps_user_turn_for_in_process_agent_turn() {
     assert!(!app.sending);
 }
 
+/// Esc before anything streamed un-sends the turn from the in-process engine
+/// too — leaving the bare user message there made the next submit merge with
+/// it, so the model saw text the transcript no longer showed.
+#[tokio::test]
+async fn test_esc_unsend_removes_agent_engine_user_turn() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    // The dispatched turn reached the engine: its opening user message is recorded.
+    let mut engine = crate::agent::engine::AgentEngine::new("/tmp", "m", "", &[], &[], 0, 0);
+    engine.begin_user_turn(
+        serde_json::Value::String("hello".into()),
+        "hello".to_string(),
+    );
+    app.agent_engine = Some(AgentSession {
+        key_id: "k".to_string(),
+        model: "m".to_string(),
+        engine: std::sync::Arc::new(tokio::sync::Mutex::new(engine)),
+    });
+    app.history.push(ChatMessage {
+        model: None,
+        role: "user".to_string(),
+        content: "hello".to_string(),
+        reasoning_content: None,
+        attachments: vec![],
+    });
+    app.pending_submit = Some(PendingSubmission {
+        content: "hello".to_string(),
+        attachments: Vec::new(),
+    });
+    app.sending = true;
+    app.request_started_at = Some(Instant::now());
+    let handle = tokio::spawn(async { anyhow::Ok(()) });
+    let shutdown = std::sync::Arc::new(tokio::sync::Notify::new());
+    app.agent_serve = Some((handle, shutdown));
+
+    // Esc with nothing streamed → the Unsend path.
+    app.interrupt_inflight_request().await.unwrap();
+
+    assert_eq!(app.draft, "hello", "text returned to the composer");
+    assert!(app.history.is_empty(), "transcript row un-sent");
+    assert!(
+        app.agent_unsend_pending,
+        "backstop armed for the next dispatch"
+    );
+
+    // Apply the dispatch backstop; idempotent with the async apply, so the final
+    // state is deterministic whichever ran first.
+    let engine = app.agent_engine.as_ref().unwrap().engine.clone();
+    let mut engine = engine.lock().await;
+    engine.unsend_last_user_turn();
+    assert_eq!(
+        engine.export_conversation().len(),
+        0,
+        "the engine's stale user turn is gone"
+    );
+}
+
 #[tokio::test]
 async fn test_interrupt_inflight_request_keeps_partial_response() {
     let temp_dir = TempDir::new().unwrap();

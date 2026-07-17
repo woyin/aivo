@@ -26,7 +26,8 @@ impl AgentEngine {
 
     /// Record the opening user turn: repair the tail, checkpoint, append (merging into a
     /// trailing user turn to keep the no-consecutive-user invariant).
-    pub(super) fn begin_user_turn(&mut self, user_content: Value, checkpoint_prompt: String) {
+    /// `pub(crate)` so the TUI's Esc-unsend tests can drive the real turn entry.
+    pub(crate) fn begin_user_turn(&mut self, user_content: Value, checkpoint_prompt: String) {
         self.repair_interrupted_tail();
         self.check_prefix_drift();
         // `/rewind` checkpoint at this turn's opening user message. The push below
@@ -50,6 +51,13 @@ impl AgentEngine {
                 seg_tree: None,
             });
         }
+        // Recorded before `push_user_content` mutates the tail it may merge into.
+        self.turn_unsend = Some(TurnUnsend {
+            msg_index: turn_start,
+            merged_prior: (self.messages.last().map(role) == Some("user"))
+                .then(|| self.messages[turn_start].clone()),
+            checkpoint_pushed: !already_checkpointed,
+        });
         // Merge into a preceding user turn (e.g. a turn cancelled before its first
         // reply) rather than appending a second one (two consecutive users → Anthropic 400 / brick).
         self.push_user_content(user_content);

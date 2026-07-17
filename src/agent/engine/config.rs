@@ -63,6 +63,7 @@ impl AgentEngine {
             notes: Vec::new(),
             turn_usage: SessionTokens::default(),
             checkpoints: Vec::new(),
+            turn_unsend: None,
             checkpoint_store: None,
             artifacts_dir: None,
             artifact_seq: AtomicUsize::new(1),
