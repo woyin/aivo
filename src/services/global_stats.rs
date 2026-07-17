@@ -90,12 +90,26 @@ pub async fn collect_all(
     cutoff: Option<chrono::DateTime<chrono::Utc>>,
     extra_steps: usize,
 ) -> HashMap<String, GlobalToolStats> {
-    let tools = native_present_tools();
+    let Some(home) = system_env::home_dir() else {
+        return HashMap::new();
+    };
+    collect_all_in(&home, refresh, cutoff, extra_steps).await
+}
+
+/// [`collect_all`] against an explicit home dir, so tests can drive it with
+/// fixture files instead of the process environment.
+async fn collect_all_in(
+    home: &Path,
+    refresh: bool,
+    cutoff: Option<chrono::DateTime<chrono::Utc>>,
+    extra_steps: usize,
+) -> HashMap<String, GlobalToolStats> {
+    let tools = native_present_tools(home);
     let total_steps = tools.len() + extra_steps;
     let mut result = HashMap::new();
     for (i, &tool) in tools.iter().enumerate() {
         let step = Some((i + 1, total_steps));
-        if let Ok(Some(stats)) = collect_with_step(tool, refresh, step, cutoff).await
+        if let Ok(Some(stats)) = collect_with_step(home, tool, refresh, step, cutoff).await
             && (stats.total_tokens() > 0 || stats.sessions > 0)
         {
             result.insert(tool.to_string(), stats);
@@ -109,10 +123,14 @@ pub async fn collect(
     refresh: bool,
     cutoff: Option<chrono::DateTime<chrono::Utc>>,
 ) -> Result<Option<GlobalToolStats>> {
-    collect_with_step(tool, refresh, None, cutoff).await
+    let Some(home) = system_env::home_dir() else {
+        return Ok(None);
+    };
+    collect_with_step(&home, tool, refresh, None, cutoff).await
 }
 
 async fn collect_with_step(
+    home: &Path,
     tool: &str,
     refresh: bool,
     step: Option<(usize, usize)>,
@@ -125,20 +143,20 @@ async fn collect_with_step(
     // stats-cache holds lifetime-only totals with no per-period breakdown.
     if tool == "claude"
         && cutoff.is_none()
-        && let Some(stats) = collect_claude_from_cache(refresh, step).await
+        && let Some(stats) = collect_claude_from_cache(home, refresh, step).await
     {
         return Ok(Some(stats));
     }
 
     if !matches!(tool, "claude" | "codex" | "gemini") {
         return match tool {
-            "opencode" => collect_opencode(cutoff).await,
-            "pi" => collect_pi(cutoff).await,
+            "opencode" => collect_opencode(home, cutoff).await,
+            "pi" => collect_pi(home, cutoff).await,
             _ => Ok(None),
         };
     }
 
-    let data_dir = match tool_data_dir(tool) {
+    let data_dir = match tool_data_dir(home, tool) {
         Some(d) if d.exists() => d,
         _ => return Ok(None),
     };
@@ -295,10 +313,7 @@ pub fn is_native_tool(tool: &str) -> bool {
 }
 
 /// True when `tool`'s native data store exists on disk.
-fn native_data_present(tool: &str) -> bool {
-    let Some(home) = system_env::home_dir() else {
-        return false;
-    };
+fn native_data_present(home: &Path, tool: &str) -> bool {
     match tool {
         // claude's stats-cache.json survives projects-dir pruning, so either counts.
         "claude" => {
@@ -319,21 +334,22 @@ fn native_data_present(tool: &str) -> bool {
 }
 
 /// Native tools (in scan order) whose data is present on disk.
-fn native_present_tools() -> Vec<&'static str> {
+fn native_present_tools(home: &Path) -> Vec<&'static str> {
     ["claude", "codex", "gemini", "opencode", "pi"]
         .into_iter()
-        .filter(|t| native_data_present(t))
+        .filter(|t| native_data_present(home, t))
         .collect()
 }
 
 /// Native-tool count for the next `collect_all`; the caller adds its probe
 /// count to size the `(x/N)` counter.
 pub fn native_present_count() -> usize {
-    native_present_tools().len()
+    system_env::home_dir()
+        .map(|home| native_present_tools(&home).len())
+        .unwrap_or(0)
 }
 
-fn tool_data_dir(tool: &str) -> Option<PathBuf> {
-    let home = system_env::home_dir()?;
+fn tool_data_dir(home: &Path, tool: &str) -> Option<PathBuf> {
     match tool {
         "claude" => Some(home.join(".claude").join("projects")),
         "codex" => Some(home.join(".codex").join("sessions")),
@@ -441,10 +457,10 @@ async fn write_cache<T: Serialize>(path: &Path, cache: &T) -> Result<()> {
 /// the underlying JSONL files are pruned, so reading it directly is the
 /// only way to reproduce the totals shown in Claude Code's `/stats` UI.
 async fn collect_claude_from_cache(
+    home: &Path,
     refresh: bool,
     step: Option<(usize, usize)>,
 ) -> Option<GlobalToolStats> {
-    let home = system_env::home_dir()?;
     let cc_cache_path = home.join(".claude").join("stats-cache.json");
     let data = fs::read_to_string(&cc_cache_path).await.ok()?;
     let v: Value = serde_json::from_str(&data).ok()?;
@@ -905,13 +921,9 @@ async fn parse_gemini_file(
 
 /// OpenCode: ~/.local/share/opencode/opencode.db (SQLite via rusqlite)
 async fn collect_opencode(
+    home: &Path,
     cutoff: Option<chrono::DateTime<chrono::Utc>>,
 ) -> Result<Option<GlobalToolStats>> {
-    let home = match system_env::home_dir() {
-        Some(h) => h,
-        None => return Ok(None),
-    };
-
     let db_path = home
         .join(".local")
         .join("share")
@@ -992,13 +1004,9 @@ fn aggregate_opencode_messages(
 
 /// Pi: ~/.pi/agent/sessions/**/*.jsonl
 async fn collect_pi(
+    home: &Path,
     cutoff: Option<chrono::DateTime<chrono::Utc>>,
 ) -> Result<Option<GlobalToolStats>> {
-    let home = match system_env::home_dir() {
-        Some(h) => h,
-        None => return Ok(None),
-    };
-
     let data_dir = home.join(".pi").join("agent").join("sessions");
     if !data_dir.exists() {
         return Ok(None);
@@ -1155,14 +1163,89 @@ pub fn tool_display_name(tool: &str) -> &str {
 mod tests {
     use super::*;
 
+    fn claude_assistant_line(ts: &str, input: u64, output: u64) -> String {
+        format!(
+            r#"{{"type":"assistant","timestamp":"{ts}","sessionId":"s1","message":{{"model":"claude-opus-4-8","usage":{{"input_tokens":{input},"output_tokens":{output}}}}}}}"#
+        )
+    }
+
+    // All fixture-driven collects pass `refresh: true`: aivo's own stats cache
+    // lives under the shared (sandboxed) config dir, and skipping reads keeps
+    // parallel tests from seeing each other's write-backs.
+
     #[tokio::test]
-    async fn collect_all_accepts_cutoff_signature() {
-        // Compile-time check on the signature (cutoff + extra-steps count).
-        // Never invoked: running would scan the real ~/.claude and write real cache files.
-        let _ = || async {
-            let _ = collect_all(false, None, 0).await;
-            let _ = collect_all(false, Some(chrono::Utc::now()), 3).await;
-        };
+    async fn collect_all_walks_claude_jsonl_and_applies_cutoff() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let home = tmp.path();
+        let proj = home.join(".claude").join("projects").join("p1");
+        std::fs::create_dir_all(&proj).unwrap();
+        std::fs::write(
+            proj.join("session1.jsonl"),
+            format!(
+                "{}\n{}\n",
+                claude_assistant_line("2026-01-10T10:00:00Z", 100, 10),
+                claude_assistant_line("2026-03-10T10:00:00Z", 200, 20),
+            ),
+        )
+        .unwrap();
+
+        let all = collect_all_in(home, true, None, 0).await;
+        assert_eq!(all.len(), 1, "only claude has data: {:?}", all.keys());
+        let claude = all.get("claude").expect("claude present");
+        assert_eq!(claude.input_tokens, 300);
+        assert_eq!(claude.output_tokens, 30);
+        assert_eq!(claude.sessions, 1);
+        assert_eq!(claude.models.len(), 1);
+
+        // A cutoff between the two lines keeps only the later one.
+        let cutoff = chrono::DateTime::parse_from_rfc3339("2026-02-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let all = collect_all_in(home, true, Some(cutoff), 2).await;
+        let claude = all.get("claude").expect("claude present after cutoff");
+        assert_eq!(claude.input_tokens, 200);
+        assert_eq!(claude.output_tokens, 20);
+    }
+
+    #[tokio::test]
+    async fn collect_all_returns_empty_for_a_home_with_no_tool_data() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let all = collect_all_in(tmp.path(), true, None, 0).await;
+        assert!(all.is_empty(), "unexpected tools: {:?}", all.keys());
+    }
+
+    #[tokio::test]
+    async fn claude_stats_cache_short_circuits_and_merges_jsonl_deltas() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let home = tmp.path();
+        std::fs::create_dir_all(home.join(".claude")).unwrap();
+        std::fs::write(
+            home.join(".claude").join("stats-cache.json"),
+            r#"{"totalSessions":2,"lastComputedDate":"2026-01-31","modelUsage":{"claude-opus-4-8":{"inputTokens":1000,"outputTokens":100}}}"#,
+        )
+        .unwrap();
+        let proj = home.join(".claude").join("projects").join("p1");
+        std::fs::create_dir_all(&proj).unwrap();
+        // One line already covered by the cache's computed window, one after
+        // it — only the latter may fold into the delta merge.
+        std::fs::write(
+            proj.join("s.jsonl"),
+            format!(
+                "{}\n{}\n",
+                claude_assistant_line("2026-01-15T10:00:00Z", 400, 40),
+                claude_assistant_line("2026-02-02T10:00:00Z", 50, 5),
+            ),
+        )
+        .unwrap();
+
+        let stats = collect_with_step(home, "claude", true, None, None)
+            .await
+            .expect("collect claude")
+            .expect("stats present");
+        assert_eq!(stats.input_tokens, 1050, "cache total + post-window delta");
+        assert_eq!(stats.output_tokens, 105);
+        // The delta file carries a session on top of the cache's two.
+        assert_eq!(stats.sessions, 3);
     }
 
     #[test]

@@ -1,3 +1,5 @@
+mod support;
+
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
@@ -69,7 +71,15 @@ exit 2
 }
 
 fn run_ok(home: &TempDir, args: &[&str]) -> String {
-    let output = aivo(home)
+    run_ok_env(home, &[], args)
+}
+
+fn run_ok_env(home: &TempDir, envs: &[(&str, &str)], args: &[&str]) -> String {
+    let mut cmd = aivo(home);
+    for (k, v) in envs {
+        cmd.env(k, v);
+    }
+    let output = cmd
         .args(args)
         .output()
         .unwrap_or_else(|e| panic!("spawn aivo {args:?}: {e}"));
@@ -422,7 +432,13 @@ fn plugins_install_captures_manifest_and_surfaces_it() {
     let src = TempDir::new().unwrap();
     let plugin_src = fake_plugin(&src, "aivo-widget", MANIFEST_PLUGIN);
 
-    run_ok(&home, &["plugins", "install", plugin_src.to_str().unwrap()]);
+    // Generous probe deadline: under full-suite CPU load the default 2s starved
+    // the child and flaked this test (the probe is best-effort by design).
+    run_ok_env(
+        &home,
+        &[("AIVO_PLUGIN_PROBE_TIMEOUT_MS", "30000")],
+        &["plugins", "install", plugin_src.to_str().unwrap()],
+    );
 
     // The registry captured the probed manifest + an integrity pin.
     let registry_path = home.path().join(".config/aivo/plugins/.registry.json");
@@ -482,7 +498,12 @@ fn plugins_install_survives_a_hanging_manifest_probe() {
     let plugin_src = fake_plugin(&src, "aivo-slow", SLOW_MANIFEST_PLUGIN);
 
     // Must return (the probe is deadline-bounded), installing without a manifest.
-    run_ok(&home, &["plugins", "install", plugin_src.to_str().unwrap()]);
+    // Tiny deadline: the hang is the point, so don't sit out the default 2s.
+    run_ok_env(
+        &home,
+        &[("AIVO_PLUGIN_PROBE_TIMEOUT_MS", "300")],
+        &["plugins", "install", plugin_src.to_str().unwrap()],
+    );
     assert!(
         registry_json(&home)["plugins"]["slow"]["manifest"].is_null(),
         "a hung probe must yield no manifest"

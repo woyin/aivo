@@ -155,188 +155,50 @@ impl CodeTuiApp {
                 .session_artifacts_dir(&params.initial_session)
                 .join("jobs"),
         ));
-        Ok(Self {
-            session_store: params.session_store,
-            cache: params.cache,
-            client: params.client,
-            key: params.key,
-            copilot_tm: params.copilot_tm,
-            cwd: params.cwd,
-            real_cwd,
-            git_branch: None,
-            git_branch_checked_at: None,
-            raw_model: params.raw_model,
-            model: params.model,
-            billed_model: None,
-            turn_model: None,
-            format: initial_format,
-            history: params.initial_history,
-            draft: String::new(),
-            draft_attachments: params.initial_draft_attachments,
-            cursor: 0,
-            command_menu: CommandMenuState::default(),
-            skill_commands: Vec::new(),
-            last_subagents: Vec::new(),
-            mcp_configured_count,
-            welcome_tip_index,
-            welcome_tip_rotated_at: None,
-            draft_history,
-            draft_history_all,
-            draft_history_index: None,
-            draft_history_stash: None,
-            session_id: params.initial_session,
-            overlay: Overlay::None,
-            notice: startup_notice,
-            pending_response: String::new(),
-            incoming_buffer: String::new(),
-            pending_finish: None,
-            pending_reasoning: String::new(),
-            pending_submit: None,
-            sending: false,
-            request_started_at: None,
-            compact_before: None,
-            last_tool_action: None,
-            wait_tick: None,
-            last_stream_activity: None,
-            subagent_rows: Vec::new(),
-            tool_output_tail: std::collections::VecDeque::new(),
-            tool_output_partial: String::new(),
-            status_display: None,
-            turn_output_tokens: 0,
-            retrying: false,
-            last_usage: None,
-            live_usage: None,
-            context_tokens: 0,
-            session_tokens: crate::services::session_store::SessionTokens::default(),
-            session_cost_usd: 0.0,
-            context_window: 0,
-            context_window_override: params.max_context,
-            injected_context: params.injected_context,
-            injected_context_summary: params.injected_context_summary,
-            context_is_estimate: true,
-            follow_output: true,
-            transcript_revision: 0,
-            transcript_scroll: 0,
-            transcript_width: 0,
-            transcript_view_height: 0,
-            last_max_scroll: None,
-            transcript_hitbox: None,
-            jump_to_bottom_hit: None,
-            session_id_hit: None,
-            composer_text_area: None,
-            composer_scroll: 0,
-            transcript_cache: None,
-            volatile_tail_cache: None,
-            transcript_selection: None,
-            transcript_drag_active: false,
-            screen_selection: None,
-            screen_drag_active: false,
-            screen_surface: None,
-            screen_region: None,
-            drag_autoscroll: None,
-            last_autoscroll: None,
-            last_click: None,
-            selection_flash_until: None,
-            scroll_speed: chat_scroll_speed(),
-            swipe_scroll: chat_swipe_scroll_enabled(),
-            toast: None,
+        // Everything below overrides a `bare()` default; fields not named here
+        // keep the neutral value from the one exhaustive literal in shared.rs.
+        let mut app = Self::bare(
             tx,
             rx,
-            response_task: None,
-            resume_task: None,
-            resume_request_id: 0,
-            loading_resume: None,
-            resume_restore_state: None,
-            session_preview_cache: std::collections::HashMap::new(),
-            session_preview_pending: None,
-            session_preview_task: None,
-            reduce_motion: reduce_motion_requested(),
-            frame_tick: 0,
-            picker_hitbox: None,
-            overlay_detail_area: None,
-            overlay_hitbox: None,
-            exit_confirm_pending: false,
-            goal_stop_confirm_pending: false,
-            pending_ctrl_x: false,
-            pending_external_edit: false,
-            cursor_acp_session: None,
-            cursor_prewarm: None,
-            cursor_plan_mode: false,
-            pending_agent_messages: None,
-            pristine_import_len: None,
-            goal_mode: None,
-            goal_guard_stop: None,
-            plan_mode: false,
-            plan_exit_pending: false,
-            pending_plan: None,
-            plan_card_idx: None,
-            agent_engine: None,
-            agent_route_cache: None,
-            mcp_client: None,
-            mcp_connecting: false,
-            mcp_connect_progress: std::collections::HashMap::new(),
-            disabled_mcp_tools: std::collections::HashSet::new(),
-            mcp_connect_gen: 0,
-            engine_rebuild_pending: false,
-            pending_mcp_auth: std::collections::HashMap::new(),
-            agent_serve: None,
-            agent_permission: None,
-            agent_ask: None,
-            agent_review: None,
-            agent_plan_approval: None,
-            // Modes are exclusive; stale prefs with both on → review wins.
-            // `--auto-approve` pre-sets the toggle (session-only, outranks review).
-            agent_auto_approve: params.auto_approve || (auto_approve && !review_edits),
-            auto_approve_flag: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
-                params.auto_approve || (auto_approve && !review_edits),
-            )),
-            agent_review_edits: review_edits && !params.auto_approve,
-            review_edits_flag: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
-                review_edits && !params.auto_approve,
-            )),
-            thinking_enabled,
-            web_search_enabled,
-            agent_tools_enabled,
-            theme,
-            // Set by `refresh_context_window` (called right after construction and
-            // on every model switch); false until the first resolve.
-            model_supports_thinking: false,
-            model_image_input: None,
-            cursor_effort_label: None,
-            // Loaded per-model by `refresh_context_window` (called right after).
-            reasoning_effort: None,
-            model_reasoning_efforts: Vec::new(),
-            queued_messages: Vec::new(),
-            steering_queue: SteeringQueue::default(),
-            queued_commands: Vec::new(),
-            queue_focus: None,
-            project_mcp_consent: ProjectMcpConsent::default(),
-            pending_mcp_consent: None,
-            local_command: None,
-            jobs,
-            jobs_running: 0,
-            last_jobs_poll: std::time::Instant::now(),
-            local_outputs: std::collections::HashMap::new(),
-            expanded_output: std::collections::HashSet::new(),
-            expanded_thinking: std::collections::HashSet::new(),
-            agent_turn_indices: std::collections::HashSet::new(),
-            reasoning_durations: std::collections::HashMap::new(),
-            turn_durations: std::collections::HashMap::new(),
-            turn_notes: std::collections::HashMap::new(),
-            reasoning_started_at: None,
-            reasoning_elapsed_ms: None,
-            installing_skill: None,
-            staged_skill_install: None,
-            live_share: None,
-            live_share_starting: false,
-            live_share_gen: 0,
-            live_requested: false,
-            account_gen: 0,
-            account_task: None,
-            account_login: None,
-            pending_logout: None,
-            pending_full_repaint: false,
-        })
+            params.session_store,
+            params.cache,
+            params.client,
+            params.key,
+        );
+        app.copilot_tm = params.copilot_tm;
+        app.cwd = params.cwd;
+        app.real_cwd = real_cwd;
+        app.raw_model = params.raw_model;
+        app.model = params.model;
+        app.format = initial_format;
+        app.history = params.initial_history;
+        app.draft_attachments = params.initial_draft_attachments;
+        app.mcp_configured_count = mcp_configured_count;
+        app.welcome_tip_index = welcome_tip_index;
+        app.draft_history = draft_history;
+        app.draft_history_all = draft_history_all;
+        app.session_id = params.initial_session;
+        app.notice = startup_notice;
+        app.context_window_override = params.max_context;
+        app.injected_context = params.injected_context;
+        app.injected_context_summary = params.injected_context_summary;
+        app.scroll_speed = chat_scroll_speed();
+        app.swipe_scroll = chat_swipe_scroll_enabled();
+        app.reduce_motion = reduce_motion_requested();
+        // Modes are exclusive; stale prefs with both on → review wins.
+        // `--auto-approve` pre-sets the toggle (session-only, outranks review).
+        let auto = params.auto_approve || (auto_approve && !review_edits);
+        let review = review_edits && !params.auto_approve;
+        app.agent_auto_approve = auto;
+        app.auto_approve_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(auto));
+        app.agent_review_edits = review;
+        app.review_edits_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(review));
+        app.thinking_enabled = thinking_enabled;
+        app.web_search_enabled = web_search_enabled;
+        app.agent_tools_enabled = agent_tools_enabled;
+        app.theme = theme;
+        app.jobs = jobs;
+        Ok(app)
     }
 }
 

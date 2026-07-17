@@ -3,6 +3,8 @@
 //! a child pointed at the mock via `AIVO_GITHUB_API` / `AIVO_NPM_REGISTRY`.
 #![cfg(unix)]
 
+mod support;
+
 use std::io::{BufRead, BufReader, Write};
 use std::net::TcpListener;
 use std::os::unix::fs::PermissionsExt;

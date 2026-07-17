@@ -2,6 +2,8 @@
 //! only one protocol, asserting convergence, learned routes, and that failed
 //! cascades surface the real upstream error instead of thrashing.
 
+mod support;
+
 use std::collections::{BTreeMap, HashMap};
 use std::io::{Read, Write};
 use std::sync::{Arc, Mutex};

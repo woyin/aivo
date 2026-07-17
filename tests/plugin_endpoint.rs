@@ -4,6 +4,8 @@
 //! as the upstream provider the loopback endpoint forwards to.
 #![cfg(unix)]
 
+mod support;
+
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpListener;
 use std::os::unix::fs::PermissionsExt;

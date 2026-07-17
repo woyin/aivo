@@ -93,6 +93,7 @@ windows-sys = { version = "0.59", features = ["Win32_Storage_FileSystem", "Win32
 __internal_test_fast_crypto = []
 
 [dev-dependencies]
+ctor = "1.0.9"
 tempfile = "3.0"
 
 [profile.dev]

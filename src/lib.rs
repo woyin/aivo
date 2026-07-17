@@ -16,3 +16,8 @@ pub mod tui;
 pub mod version;
 
 pub use errors::{CLIError, ErrorCategory, ExitCode};
+
+// Same sandbox the integration binaries use (see that file for rationale).
+#[cfg(test)]
+#[path = "../tests/support/mod.rs"]
+mod test_sandbox;

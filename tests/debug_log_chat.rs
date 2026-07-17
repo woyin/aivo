@@ -8,6 +8,8 @@
 //! is meaningful per binary. Each tests/*.rs is its own binary, so this
 //! file is dedicated to this single test.
 
+mod support;
+
 use aivo::services::http_debug::{self, LoggedSend};
 use std::path::PathBuf;
 use tempfile::TempDir;

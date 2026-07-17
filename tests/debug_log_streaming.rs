@@ -10,6 +10,8 @@
 //! compiled separately, so the http_debug `OnceLock` global init in
 //! `debug_log_chat.rs` does not collide with this one.
 
+mod support;
+
 use aivo::services::http_debug::{self, LoggedSend};
 use std::path::PathBuf;
 use tempfile::TempDir;

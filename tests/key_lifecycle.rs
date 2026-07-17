@@ -1,3 +1,5 @@
+mod support;
+
 use aivo::services::session_store::{SessionStore, decrypt, encrypt, is_encrypted};
 use tempfile::TempDir;
 

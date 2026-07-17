@@ -19,6 +19,8 @@ cargo fmt                               # Format (run before committing)
 
 `__internal_test_fast_crypto` uses reduced PBKDF2 iterations. A `Makefile` wraps common workflows: `make test`, `make build`, `make clippy`, `make install`, `make release`.
 
+Tests are hermetic: a pre-main sandbox (`tests/support/mod.rs`, included by every test binary and the lib) points `$HOME` at `~/.aivo-test-home/<pid>`, so tests can never touch the real config. `tests/sandbox_linux.rs` deliberately opts out. Per-case isolation still uses `with_path` + tempdirs; the sandbox is the safety net.
+
 ## Git Conventions
 
 - Always squash merge to main: `git merge --squash <branch> && git commit`
