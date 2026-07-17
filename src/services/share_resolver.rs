@@ -655,19 +655,12 @@ async fn resolve_run_event(entry: &LogEntry, ctx: &ResolverContext) -> Result<Sh
     }
 
     // Native CLIs: project-scoped enumeration, then closest-mtime match within
-    // the matching cli.
-    //
-    // Every native CLI uses a dedicated enumerator that skips the
-    // substantive-content filter `ingest_project`'s extractors apply (turns
-    // must be ≥ MIN_TURN_CHARS, no `<environment_context>`/`<turn_aborted>`
-    // markers). That filter is right for AI-context injection but wrong here
-    // — short prompts like `claude -p 'say hi'`, CJK queries like
-    // `今天成都的天气` (7 chars), or a session that's still mid-conversation
-    // would otherwise be silently un-shareable, and the resolver would fall
-    // back to whichever older session in the same cwd happens to have
-    // substantive turns. An unknown tool name falls back to `ingest_project`
-    // (which won't return anything for unknown tools, yielding a clean "no
-    // session found" error).
+    // the matching cli. Each cli uses a dedicated stub enumerator rather than
+    // `ingest_project`, whose extractors drop sessions with no extractable user
+    // turn (brand-new or boilerplate-only) — those would otherwise be
+    // un-shareable and the resolver would fall back to a stale older session in
+    // the same cwd. An unknown tool falls back to `ingest_project`, which
+    // yields a clean "no session found" error.
     let run_path = std::path::Path::new(&run_cwd);
     // A plugin run reads its declared format from its own sessions dir; a native
     // run uses the tool name + the ctx roots. The format determines the reader,
@@ -698,10 +691,6 @@ async fn resolve_run_event(entry: &LogEntry, ctx: &ResolverContext) -> Result<Sh
         _ => {
             let opts = IngestOptions {
                 max_per_source: Some(50),
-                // Run-event fallback resolves short sessions too — the
-                // resolver looks up the native session that aivo launched,
-                // and that session might have started with a short prompt.
-                include_short_first_user: true,
                 ..IngestOptions::unlimited()
             };
             context_ingest::ingest_project(run_path, opts)

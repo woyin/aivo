@@ -102,8 +102,10 @@ impl FuzzySelect {
     /// not in the curated autocomplete list).
     pub fn interact_outcome(self) -> std::io::Result<FuzzyOutcome> {
         let term = Term::stderr();
-        term.hide_cursor()?;
+        // Raw mode before hiding the cursor: if either step fails, the
+        // guard's Drop (or never having hidden) leaves the terminal intact.
         let _raw_mode = RawModeGuard::enable()?;
+        term.hide_cursor()?;
         let _paste_mode = BracketedPasteGuard::enable().ok();
 
         let mut query = String::new();

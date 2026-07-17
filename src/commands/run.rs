@@ -466,7 +466,12 @@ impl RunCommand {
                 eprintln!("  {} --resume is ignored for codex-app", style::yellow("!"));
                 args
             } else {
-                maybe_apply_resume(&self.session_store, ai_tool, args, &selector).await
+                match maybe_apply_resume(&self.session_store, ai_tool, args, &selector).await {
+                    Some(args) => args,
+                    // Picker cancelled: the user backed out of resuming, so
+                    // don't launch the tool at all.
+                    None => return Ok(ExitCode::Success),
+                }
             }
         } else {
             args
@@ -782,9 +787,9 @@ fn warn_slot_flags_ignored(tool: AIToolType, slots: &ClaudeSlotFlags) {
     }
 }
 
-/// Outcome of resolving a `--resume` selector. `aivo run` skips the resume on
-/// Cancelled/Unavailable; `aivo code` launches on a cancel but bails on
-/// `Unavailable` (its `String` is a ready-to-print reason).
+/// Outcome of resolving a `--resume` selector. Cancelled aborts the launch;
+/// `aivo run` skips the resume on Unavailable while `aivo code` bails on it
+/// (its `String` is a ready-to-print reason).
 pub(crate) enum ContextResolution {
     Selected(Thread),
     Cancelled,
@@ -804,17 +809,14 @@ pub(crate) async fn resolve_context_thread(
     let opts = if selector.trim().is_empty() {
         IngestOptions::default()
     } else {
-        // Explicit id: skip the substance filter — `aivo logs` lists
-        // short-first-prompt sessions the user may name here.
-        IngestOptions {
-            include_short_first_user: true,
-            ..IngestOptions::unlimited()
-        }
+        // Explicit id: unlimited walk — `aivo logs` lists sessions older than
+        // the default window the user may name here.
+        IngestOptions::unlimited()
     };
 
     // Spinner covers the scan only — stop it before the picker.
     let (spinning, spinner_handle) = style::start_spinner(Some(" Loading context…"));
-    let mut threads = match ingest_project_with_code(store, &cwd, opts).await {
+    let threads = match ingest_project_with_code(store, &cwd, opts).await {
         Ok(t) => t,
         Err(e) => {
             style::stop_spinner(&spinning);
@@ -822,22 +824,6 @@ pub(crate) async fn resolve_context_thread(
             return ContextResolution::Unavailable(format!("Could not load context: {e}"));
         }
     };
-    // The substance filter keeps the picker's working set high-signal, but a
-    // project whose only sessions are short ("hello") would show an empty
-    // picker right after `aivo logs` listed them. Retry permissive rather
-    // than claim there's no context.
-    if threads.is_empty() && selector.trim().is_empty() {
-        threads = ingest_project_with_code(
-            store,
-            &cwd,
-            IngestOptions {
-                include_short_first_user: true,
-                ..IngestOptions::default()
-            },
-        )
-        .await
-        .unwrap_or_default();
-    }
     style::stop_spinner(&spinning);
     let _ = spinner_handle.await;
 
@@ -851,7 +837,7 @@ pub(crate) async fn resolve_context_thread(
             if id.is_empty() {
                 return ContextResolution::Unavailable(msg);
             }
-            let global = code_threads_by_id_global(store, id, true).await;
+            let global = code_threads_by_id_global(store, id).await;
             match select_thread(&global, id) {
                 SelectOutcome::Picked(t) => ContextResolution::Selected(t.clone()),
                 SelectOutcome::Cancelled => ContextResolution::Cancelled,
@@ -881,25 +867,23 @@ pub(crate) fn context_injection_summary(rendered: &RenderedContext, thread: &Thr
 /// argv to the tool's own resume (routing env still applies, so a session can
 /// be resumed on a different key). Rung 2 — anything else: render the session
 /// and inject it as a context digest. `selector`: empty → interactive picker;
-/// otherwise prefix-match on session_id.
+/// otherwise prefix-match on session_id. `None` means the user cancelled the
+/// picker — the caller must not launch.
 async fn maybe_apply_resume(
     store: &SessionStore,
     tool: AIToolType,
     args: Vec<String>,
     selector: &str,
-) -> Vec<String> {
+) -> Option<Vec<String>> {
     let selected = match resolve_context_thread(store, selector).await {
         ContextResolution::Selected(thread) => thread,
         ContextResolution::Cancelled => {
-            eprintln!(
-                "  {} session picker cancelled; launching plain",
-                style::dim("›")
-            );
-            return args;
+            eprintln!("  {} session picker cancelled", style::dim("›"));
+            return None;
         }
         ContextResolution::Unavailable(msg) => {
             eprintln!("  {} {}", style::yellow("!"), msg);
-            return args;
+            return Some(args);
         }
     };
 
@@ -912,7 +896,7 @@ async fn maybe_apply_resume(
             selected.cli,
             &selected.session_id[..selected.session_id.len().min(8)],
         );
-        return rewritten;
+        return Some(rewritten);
     }
 
     // Digest rung. Every tool has *some* injection path:
@@ -930,13 +914,12 @@ async fn maybe_apply_resume(
         style::dim("(context digest — no native resume for this session here)"),
     );
 
-    match tool {
-        // Both claude and pi accept the same `--append-system-prompt <text>` flag.
+    Some(match tool {
         AIToolType::Claude | AIToolType::Pi => inject_append_system_prompt(&rendered, args),
         AIToolType::Codex | AIToolType::CodexApp => inject_codex(&rendered, args),
         AIToolType::Gemini => inject_via_flag(&rendered, args, "-i"),
         AIToolType::Opencode => inject_via_flag(&rendered, args, "--prompt"),
-    }
+    })
 }
 
 /// Argv rewrite for a tool's native resume-by-id, when it has one: claude

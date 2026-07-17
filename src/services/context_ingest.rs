@@ -2,6 +2,7 @@
 //! Sources: Claude Code (`~/.claude/projects/`), Codex (`~/.codex/sessions/`),
 //! Gemini (`~/.gemini/tmp/`), Pi (`~/.pi/agent/sessions/`), OpenCode (`~/.local/share/opencode/opencode.db`).
 
+use std::borrow::Cow;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
@@ -11,6 +12,7 @@ use serde_json::Value;
 use tokio::fs;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 
+use crate::services::ansi;
 use crate::services::device_fingerprint::hex_sha256;
 use crate::services::project_id::{DEFAULT_THREAD_MAX_AGE_DAYS, Thread};
 use crate::services::session_store::{SessionIndexEntry, SessionStore};
@@ -32,6 +34,8 @@ const DEFAULT_MAX_THREADS_PER_SOURCE: usize = 20;
 /// metadata wrappers rather than the user's actual intent).
 const BOILERPLATE_MARKERS: &[&str] = &[
     "<local-command-caveat>",
+    "<local-command-stdout>",
+    "<local-command-stderr>",
     "<command-name>",
     "<command-message>",
     "<system-reminder>",
@@ -69,13 +73,6 @@ pub struct IngestOptions {
     pub min_updated_at: Option<DateTime<Utc>>,
     /// `Some(n)` early-exits each source after `n` extractions; `None` = all.
     pub max_per_source: Option<usize>,
-    /// When true, accept sessions whose first user turn falls under
-    /// `MIN_TURN_CHARS` ("hi", "ok", …). The text still passes through
-    /// `strip_aivo_context` and is rejected only if empty after that.
-    /// Set by listing callers (`aivo logs`, share picker) so today's
-    /// short-prompt sessions show up. Context-injection callers leave it
-    /// false — short prompts don't help seed prior context.
-    pub include_short_first_user: bool,
     /// When true, read each session only until id/title/time are in hand
     /// (multi-MB transcripts stay unread; `last_response` is empty), and skip
     /// sources with no stop-early read (gemini, opencode). For listing
@@ -89,7 +86,6 @@ impl Default for IngestOptions {
             max_age_days: Some(DEFAULT_THREAD_MAX_AGE_DAYS),
             min_updated_at: None,
             max_per_source: Some(DEFAULT_MAX_THREADS_PER_SOURCE),
-            include_short_first_user: false,
             headline: false,
         }
     }
@@ -103,7 +99,6 @@ impl IngestOptions {
             max_age_days: None,
             min_updated_at: None,
             max_per_source: None,
-            include_short_first_user: false,
             headline: false,
         }
     }
@@ -161,7 +156,6 @@ async fn ingest_project_inner(
         std::fs::canonicalize(project_root).unwrap_or_else(|_| project_root.to_path_buf());
     let canonical_str = canonical_root.to_string_lossy().to_string();
     let cap = opts.max_per_source;
-    let permissive = opts.include_short_first_user;
 
     // Walk-level mtime pruning (mtime ≥ last-message-ts for append-only jsonl;
     // the post-extraction age filter below still applies either way).
@@ -174,7 +168,7 @@ async fn ingest_project_inner(
             match opts.headline {
                 // No stop-early read for gemini's single-blob JSON.
                 true => Vec::new(),
-                false => ingest_gemini(&canonical_str, cap, permissive).await,
+                false => ingest_gemini(&canonical_str, cap).await,
             }
         },
         ingest_pi(&canonical_str, opts, walk_cutoff),
@@ -182,12 +176,12 @@ async fn ingest_project_inner(
             match opts.headline {
                 // Nor for opencode's sqlite rows.
                 true => Vec::new(),
-                false => ingest_opencode(canonical_str.clone(), cap, permissive).await,
+                false => ingest_opencode(canonical_str.clone(), cap).await,
             }
         },
         async {
             match store {
-                Some(s) => ingest_code(s, &canonical_str, cap, permissive).await,
+                Some(s) => ingest_code(s, &canonical_str, cap).await,
                 None => Vec::new(),
             }
         },
@@ -203,7 +197,6 @@ async fn ingest_project_inner(
     threads.extend(opencode);
     threads.extend(code);
 
-    // Optional age filter.
     if let Some(cutoff) = effective_cutoff(&opts) {
         threads.retain(|t| t.updated_at >= cutoff);
     }
@@ -218,16 +211,15 @@ pub async fn ingest_native_sessions_global(
     need_last_response: bool,
 ) -> Result<Vec<Thread>> {
     let cap = opts.max_per_source;
-    let permissive = opts.include_short_first_user;
     let headline = !need_last_response;
     let cutoff = effective_cutoff(&opts);
     let cutoff_st = cutoff.map(SystemTime::from);
     let (claude, codex, gemini, pi, opencode) = tokio::join!(
-        ingest_claude_global(cap, cutoff_st, permissive, headline),
-        ingest_codex_global(cap, cutoff_st, permissive, headline),
-        ingest_gemini_global(cap, cutoff_st, permissive),
-        ingest_pi_global(cap, cutoff_st, permissive, headline),
-        ingest_opencode_global(cap, cutoff, permissive),
+        ingest_claude_global(cap, cutoff_st, headline),
+        ingest_codex_global(cap, cutoff_st, headline),
+        ingest_gemini_global(cap, cutoff_st),
+        ingest_pi_global(cap, cutoff_st, headline),
+        ingest_opencode_global(cap, cutoff),
     );
 
     let mut threads: Vec<Thread> =
@@ -249,7 +241,6 @@ pub async fn ingest_native_sessions_global(
 async fn ingest_claude_global(
     cap: Option<usize>,
     after: Option<SystemTime>,
-    permissive: bool,
     headline: bool,
 ) -> Vec<Thread> {
     let Some(home) = system_env::home_dir() else {
@@ -300,9 +291,9 @@ async fn ingest_claude_global(
             break;
         }
         let thread = if headline {
-            extract_claude_thread_headline(&path, mtime, permissive).await
+            extract_claude_thread_headline(&path, mtime).await
         } else {
-            extract_claude_thread(&path, permissive).await
+            extract_claude_thread(&path).await
         };
         if let Some(thread) = thread {
             out.push(thread);
@@ -314,7 +305,6 @@ async fn ingest_claude_global(
 async fn ingest_codex_global(
     cap: Option<usize>,
     after: Option<SystemTime>,
-    permissive: bool,
     headline: bool,
 ) -> Vec<Thread> {
     let Some(home) = system_env::home_dir() else {
@@ -333,9 +323,9 @@ async fn ingest_codex_global(
             break;
         }
         let thread = if headline {
-            extract_codex_thread_headline(&path, permissive).await
+            extract_codex_thread_headline(&path).await
         } else {
-            extract_codex_thread_any(&path, permissive).await
+            extract_codex_thread_any(&path).await
         };
         if let Some(thread) = thread {
             out.push(thread);
@@ -346,7 +336,7 @@ async fn ingest_codex_global(
 
 /// Codex extractor without the cwd filter — accepts any session_meta.cwd
 /// and surfaces it on the resulting `Thread`. Used by the global ingester.
-async fn extract_codex_thread_any(path: &Path, permissive: bool) -> Option<Thread> {
+async fn extract_codex_thread_any(path: &Path) -> Option<Thread> {
     let file = match fs::File::open(path).await {
         Ok(f) => f,
         Err(err) => {
@@ -394,7 +384,7 @@ async fn extract_codex_thread_any(path: &Path, permissive: bool) -> Option<Threa
             let raw = extract_codex_message_text(payload).unwrap_or_default();
             match role {
                 "user" if first_user.is_none() => {
-                    first_user = pick_first_user_turn(&raw, permissive);
+                    first_user = pick_first_user_turn(&raw);
                 }
                 "assistant" => {
                     if let Some(t) = sanitize_turn(&raw) {
@@ -418,7 +408,7 @@ async fn extract_codex_thread_any(path: &Path, permissive: bool) -> Option<Threa
 }
 
 /// Head-only codex extractor; see `extract_claude_thread_headline`.
-async fn extract_codex_thread_headline(path: &Path, permissive: bool) -> Option<Thread> {
+async fn extract_codex_thread_headline(path: &Path) -> Option<Thread> {
     let file = match fs::File::open(path).await {
         Ok(f) => f,
         Err(err) => {
@@ -458,7 +448,7 @@ async fn extract_codex_thread_headline(path: &Path, permissive: bool) -> Option<
             && payload.get("role").and_then(|s| s.as_str()) == Some("user")
         {
             let raw = extract_codex_message_text(payload).unwrap_or_default();
-            first_user = pick_first_user_turn(&raw, permissive);
+            first_user = pick_first_user_turn(&raw);
         }
         if session_id.is_some() && first_user.is_some() {
             break;
@@ -482,11 +472,7 @@ async fn extract_codex_thread_headline(path: &Path, permissive: bool) -> Option<
     })
 }
 
-async fn ingest_gemini_global(
-    cap: Option<usize>,
-    after: Option<SystemTime>,
-    permissive: bool,
-) -> Vec<Thread> {
+async fn ingest_gemini_global(cap: Option<usize>, after: Option<SystemTime>) -> Vec<Thread> {
     let Some(home) = system_env::home_dir() else {
         return Vec::new();
     };
@@ -532,7 +518,7 @@ async fn ingest_gemini_global(
         {
             break;
         }
-        if let Some(thread) = extract_gemini_thread(&path, permissive).await {
+        if let Some(thread) = extract_gemini_thread(&path).await {
             out.push(thread);
         }
     }
@@ -542,7 +528,6 @@ async fn ingest_gemini_global(
 async fn ingest_pi_global(
     cap: Option<usize>,
     after: Option<SystemTime>,
-    permissive: bool,
     headline: bool,
 ) -> Vec<Thread> {
     let Some(home) = system_env::home_dir() else {
@@ -590,9 +575,9 @@ async fn ingest_pi_global(
             break;
         }
         let thread = if headline {
-            extract_pi_thread_headline(&path, mtime, permissive).await
+            extract_pi_thread_headline(&path, mtime).await
         } else {
-            extract_pi_thread(&path, permissive).await
+            extract_pi_thread(&path).await
         };
         if let Some(thread) = thread {
             out.push(thread);
@@ -601,11 +586,7 @@ async fn ingest_pi_global(
     out
 }
 
-async fn ingest_opencode_global(
-    cap: Option<usize>,
-    after: Option<DateTime<Utc>>,
-    permissive: bool,
-) -> Vec<Thread> {
+async fn ingest_opencode_global(cap: Option<usize>, after: Option<DateTime<Utc>>) -> Vec<Thread> {
     let Some(home) = system_env::home_dir() else {
         return Vec::new();
     };
@@ -622,14 +603,12 @@ async fn ingest_opencode_global(
     // cutoff so the SQL doesn't need two prepared statements.
     let after_ms = after.map(|dt| dt.timestamp_millis()).unwrap_or(0);
 
-    tokio::task::spawn_blocking(move || {
-        opencode_query_global(&db_path, cap_i, after_ms, permissive)
-    })
-    .await
-    .unwrap_or_default()
+    tokio::task::spawn_blocking(move || opencode_query_global(&db_path, cap_i, after_ms))
+        .await
+        .unwrap_or_default()
 }
 
-fn opencode_query_global(db_path: &Path, cap: i64, after_ms: i64, permissive: bool) -> Vec<Thread> {
+fn opencode_query_global(db_path: &Path, cap: i64, after_ms: i64) -> Vec<Thread> {
     let conn = match rusqlite::Connection::open_with_flags(
         db_path,
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
@@ -662,14 +641,9 @@ fn opencode_query_global(db_path: &Path, cap: i64, after_ms: i64, permissive: bo
 
     let mut out = Vec::new();
     for (session_id, time_updated_ms, worktree) in rows {
-        if let Some(thread) = opencode_extract_session(
-            db_path,
-            &conn,
-            &session_id,
-            time_updated_ms,
-            Some(worktree),
-            permissive,
-        ) {
+        if let Some(thread) =
+            opencode_extract_session(db_path, &conn, &session_id, time_updated_ms, Some(worktree))
+        {
             out.push(thread);
         }
     }
@@ -707,9 +681,9 @@ async fn ingest_claude(
         }
         let thread = if opts.headline {
             let mtime = file_mtime(&path).await;
-            extract_claude_thread_headline(&path, mtime, opts.include_short_first_user).await
+            extract_claude_thread_headline(&path, mtime).await
         } else {
-            extract_claude_thread(&path, opts.include_short_first_user).await
+            extract_claude_thread(&path).await
         };
         if let Some(thread) = thread {
             out.push(thread);
@@ -718,15 +692,10 @@ async fn ingest_claude(
     out
 }
 
-/// Enumerate claude session files under the project's encoded cwd dir without
-/// applying the substantive-turn filter that `extract_claude_thread` uses.
-/// Returns one stub per parseable file with `session_id`, `source_path`, and
-/// `updated_at` populated; `topic` / `last_response` stay empty.
-///
-/// Used by the share resolver, which only needs to find which sessions exist
-/// for a cwd — `extract_claude_thread` drops files whose turns are all under
-/// `MIN_TURN_CHARS` (e.g. `claude -p 'say hi'`), so reusing it makes short
-/// sessions un-shareable.
+/// Stub enumerator for the share resolver: one `Thread` per claude session file
+/// under the project's encoded cwd dir, with only `session_id`, `source_path`,
+/// `updated_at` set. Unlike `extract_claude_thread` it keeps files with no
+/// extractable user turn, which would otherwise be un-shareable.
 pub async fn list_claude_sessions_for_cwd(project_root: &Path) -> Vec<Thread> {
     let home = match system_env::home_dir() {
         Some(h) => h,
@@ -848,15 +817,13 @@ async fn ingest_codex(
         let thread = if opts.headline {
             // The headline extractor has no cwd filter (it serves the global
             // walk too) — match on the returned session cwd here.
-            extract_codex_thread_headline(&path, opts.include_short_first_user)
-                .await
-                .filter(|t| {
-                    t.cwd
-                        .as_deref()
-                        .is_some_and(|cwd| paths_match(cwd, canonical_root))
-                })
+            extract_codex_thread_headline(&path).await.filter(|t| {
+                t.cwd
+                    .as_deref()
+                    .is_some_and(|cwd| paths_match(cwd, canonical_root))
+            })
         } else {
-            extract_codex_thread(&path, canonical_root, opts.include_short_first_user).await
+            extract_codex_thread(&path, canonical_root).await
         };
         if let Some(thread) = thread {
             out.push(thread);
@@ -865,21 +832,12 @@ async fn ingest_codex(
     out
 }
 
-/// Enumerate every codex session file under `codex_root` whose
-/// `session_meta.cwd` matches `project_root`, without
-/// `extract_codex_thread`'s substantive-turn filter. Returns one stub per
-/// parseable file with `session_id`, `source_path`, `cwd`, and
-/// `updated_at` populated; `topic` / `last_response` stay empty.
-///
-/// Used by the share resolver's run-event path, which only needs to know
-/// which sessions exist for a cwd. Without this, sessions whose user
-/// prompts are all under `MIN_TURN_CHARS` (e.g. CJK prompts like
-/// `今天成都的天气`, 7 chars) get silently dropped and the resolver picks
-/// the closest-mtime *surviving* session instead — typically an older,
-/// longer session in the same cwd.
-///
-/// `codex_root` is parameterized (rather than read from `$HOME/.codex/`)
-/// so tests can inject a temp directory without mutating env vars.
+/// Stub enumerator for the share resolver's run-event path: one `Thread` per
+/// codex session file whose `session_meta.cwd` matches `project_root`, with
+/// `topic` / `last_response` left empty. Unlike `extract_codex_thread` it keeps
+/// files with no extractable user turn, else the resolver would drop them and
+/// pick a stale older session in the same cwd. `codex_root` is parameterized so
+/// tests can inject a temp dir.
 pub async fn list_codex_sessions_for_cwd(codex_root: &Path, project_root: &Path) -> Vec<Thread> {
     if !codex_root.exists() {
         return Vec::new();
@@ -966,7 +924,7 @@ async fn extract_codex_session_stub(path: &Path, project_root: &str) -> Option<T
 // Gemini: ~/.gemini/tmp/<sha256(abs_cwd)>/chats/session-*.json
 // ---------------------------------------------------------------------------
 
-async fn ingest_gemini(canonical_root: &str, cap: Option<usize>, permissive: bool) -> Vec<Thread> {
+async fn ingest_gemini(canonical_root: &str, cap: Option<usize>) -> Vec<Thread> {
     let paths = gemini_matching_session_files(canonical_root).await;
     let mut out = Vec::new();
     for path in paths {
@@ -975,7 +933,7 @@ async fn ingest_gemini(canonical_root: &str, cap: Option<usize>, permissive: boo
         {
             break;
         }
-        if let Some(thread) = extract_gemini_thread(&path, permissive).await {
+        if let Some(thread) = extract_gemini_thread(&path).await {
             out.push(thread);
         }
     }
@@ -1120,7 +1078,7 @@ async fn gemini_project_root_for_session(session_path: &Path) -> Option<String> 
     }
 }
 
-async fn extract_gemini_thread(path: &Path, permissive: bool) -> Option<Thread> {
+async fn extract_gemini_thread(path: &Path) -> Option<Thread> {
     let content = match fs::read_to_string(path).await {
         Ok(c) => c,
         Err(err) => {
@@ -1156,7 +1114,7 @@ async fn extract_gemini_thread(path: &Path, permissive: bool) -> Option<Thread> 
         }
         match kind {
             "user" if first_user.is_none() => {
-                first_user = pick_first_user_turn(&raw, permissive);
+                first_user = pick_first_user_turn(&raw);
             }
             "gemini" => {
                 if let Some(t) = sanitize_turn(&raw) {
@@ -1186,14 +1144,9 @@ async fn extract_gemini_thread(path: &Path, permissive: bool) -> Option<Thread> 
     })
 }
 
-/// Enumerate gemini session files for the project without applying
-/// `extract_gemini_thread`'s substantive-turn filter. Returns one stub per
-/// parseable file with `session_id` and `updated_at` populated.
-///
-/// Used by the share resolver's run-event path. `extract_gemini_thread`
-/// drops sessions whose user turns are all short — same bug class as
-/// claude/codex/pi.
-///
+/// Stub enumerator for the share resolver's run-event path: one `Thread` per
+/// gemini session file, keeping files with no extractable user turn that
+/// `extract_gemini_thread` would drop (same bug class as claude/codex/pi).
 /// `gemini_tmp_root` is parameterized so tests can inject a temp dir.
 pub async fn list_gemini_sessions_for_cwd(
     gemini_tmp_root: &Path,
@@ -1357,9 +1310,9 @@ async fn ingest_pi(
         }
         let thread = if opts.headline {
             let mtime = file_mtime(&path).await;
-            extract_pi_thread_headline(&path, mtime, opts.include_short_first_user).await
+            extract_pi_thread_headline(&path, mtime).await
         } else {
-            extract_pi_thread(&path, opts.include_short_first_user).await
+            extract_pi_thread(&path).await
         };
         if let Some(thread) = thread {
             out.push(thread);
@@ -1368,7 +1321,7 @@ async fn ingest_pi(
     out
 }
 
-async fn extract_pi_thread(path: &Path, permissive: bool) -> Option<Thread> {
+async fn extract_pi_thread(path: &Path) -> Option<Thread> {
     let file = match fs::File::open(path).await {
         Ok(f) => f,
         Err(err) => {
@@ -1417,7 +1370,7 @@ async fn extract_pi_thread(path: &Path, permissive: bool) -> Option<Thread> {
         let raw = extract_pi_text(message).unwrap_or_default();
         match role {
             "user" if first_user.is_none() => {
-                first_user = pick_first_user_turn(&raw, permissive);
+                first_user = pick_first_user_turn(&raw);
             }
             "assistant" => {
                 if let Some(t) = sanitize_turn(&raw) {
@@ -1440,11 +1393,7 @@ async fn extract_pi_thread(path: &Path, permissive: bool) -> Option<Thread> {
 }
 
 /// Head-only pi extractor; see `extract_claude_thread_headline`.
-async fn extract_pi_thread_headline(
-    path: &Path,
-    mtime: SystemTime,
-    permissive: bool,
-) -> Option<Thread> {
+async fn extract_pi_thread_headline(path: &Path, mtime: SystemTime) -> Option<Thread> {
     let file = match fs::File::open(path).await {
         Ok(f) => f,
         Err(err) => {
@@ -1478,7 +1427,7 @@ async fn extract_pi_thread_headline(
             && message.get("role").and_then(|s| s.as_str()) == Some("user")
         {
             let raw = extract_pi_text(message).unwrap_or_default();
-            first_user = pick_first_user_turn(&raw, permissive);
+            first_user = pick_first_user_turn(&raw);
         }
         if session_id.is_some() && first_user.is_some() {
             break;
@@ -1496,18 +1445,11 @@ async fn extract_pi_thread_headline(
     })
 }
 
-/// Enumerate pi session files under the project's encoded cwd dir without
-/// applying `extract_pi_thread`'s substantive-turn filter. Returns one stub
-/// per parseable file with `session_id`, `source_path`, `cwd`, and
-/// `updated_at` populated; `topic` / `last_response` stay empty.
-///
-/// Used by the share resolver's run-event path. Without this, a brand-new pi
-/// run whose only turns are still short prompts gets dropped, and the
-/// resolver falls back to whichever older session in the same cwd survived
-/// the filter — making `aivo share <run-id>` display a stale session from
-/// days ago instead of the live one.
-///
-/// `pi_root` is parameterized so tests can inject a temp dir.
+/// Stub enumerator for the share resolver's run-event path: one `Thread` per pi
+/// session file under the project's encoded cwd dir, keeping files with no
+/// extractable user turn that `extract_pi_thread` would drop — else a brand-new
+/// run resolves to a stale older session in the same cwd. `pi_root` is
+/// parameterized so tests can inject a temp dir.
 pub async fn list_pi_sessions_for_cwd(pi_root: &Path, project_root: &Path) -> Vec<Thread> {
     if !pi_root.exists() {
         return Vec::new();
@@ -1615,11 +1557,7 @@ pub(crate) fn extract_pi_text(message: &Value) -> Option<String> {
 // OpenCode: SQLite at ~/.local/share/opencode/opencode.db
 // ---------------------------------------------------------------------------
 
-async fn ingest_opencode(
-    canonical_root: String,
-    cap: Option<usize>,
-    permissive: bool,
-) -> Vec<Thread> {
+async fn ingest_opencode(canonical_root: String, cap: Option<usize>) -> Vec<Thread> {
     let home = match system_env::home_dir() {
         Some(h) => h,
         None => return Vec::new(),
@@ -1635,14 +1573,12 @@ async fn ingest_opencode(
     let cap_i = cap.unwrap_or(1_000) as i64;
 
     // rusqlite is sync — run the whole query block in spawn_blocking.
-    tokio::task::spawn_blocking(move || {
-        opencode_query(&db_path, &canonical_root, cap_i, permissive)
-    })
-    .await
-    .unwrap_or_default()
+    tokio::task::spawn_blocking(move || opencode_query(&db_path, &canonical_root, cap_i))
+        .await
+        .unwrap_or_default()
 }
 
-fn opencode_query(db_path: &Path, project_root: &str, cap: i64, permissive: bool) -> Vec<Thread> {
+fn opencode_query(db_path: &Path, project_root: &str, cap: i64) -> Vec<Thread> {
     let conn = match rusqlite::Connection::open_with_flags(
         db_path,
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
@@ -1693,7 +1629,6 @@ fn opencode_query(db_path: &Path, project_root: &str, cap: i64, permissive: bool
             &session_id,
             time_updated_ms,
             Some(project_root.to_string()),
-            permissive,
         ) {
             out.push(thread);
         }
@@ -1707,7 +1642,6 @@ fn opencode_extract_session(
     session_id: &str,
     time_updated_ms: i64,
     worktree: Option<String>,
-    permissive: bool,
 ) -> Option<Thread> {
     // Join messages to their text parts, ordered chronologically. First
     // `role=user` → topic; last `role=assistant` → last_response.
@@ -1741,7 +1675,7 @@ fn opencode_extract_session(
         let raw = v.get("text").and_then(|t| t.as_str()).unwrap_or("");
         match role.as_str() {
             "user" if first_user.is_none() => {
-                first_user = pick_first_user_turn(raw, permissive);
+                first_user = pick_first_user_turn(raw);
             }
             "assistant" => {
                 if let Some(t) = sanitize_turn(raw) {
@@ -1765,12 +1699,10 @@ fn opencode_extract_session(
     })
 }
 
-/// Enumerate opencode sessions for the project without joining onto the
-/// `message`/`part` tables (which `opencode_extract_session` does to pick
-/// `topic`/`last_response`, and which it then filters via `sanitize_turn`).
-/// Returns one stub per row in `session` whose `project_id` matches —
-/// share resolver only needs `session_id` + `updated_at` for the
-/// closest-mtime pick.
+/// Stub enumerator for the share resolver: one `Thread` per `session` row whose
+/// `project_id` matches, skipping the `message`/`part` join that
+/// `opencode_extract_session` uses for `topic`/`last_response`. The resolver
+/// only needs `session_id` + `updated_at` for its closest-mtime pick.
 pub async fn list_opencode_sessions_for_cwd(db_path: &Path, project_root: &Path) -> Vec<Thread> {
     if !db_path.exists() {
         return Vec::new();
@@ -1839,7 +1771,6 @@ async fn ingest_code(
     store: &SessionStore,
     canonical_root: &str,
     cap: Option<usize>,
-    permissive: bool,
 ) -> Vec<Thread> {
     let mut entries = match store.all_chat_sessions().await {
         Ok(e) => e,
@@ -1857,7 +1788,7 @@ async fn ingest_code(
         {
             break;
         }
-        if let Some(thread) = extract_code_thread(store, &entry, permissive).await {
+        if let Some(thread) = extract_code_thread(store, &entry).await {
             out.push(thread);
         }
     }
@@ -1868,11 +1799,7 @@ async fn ingest_code(
 /// messages. `strip_aivo_context` matters here too: a `-p` one-shot seeded
 /// with a context digest stores the injected block at the head of its first user
 /// message.
-async fn extract_code_thread(
-    store: &SessionStore,
-    entry: &SessionIndexEntry,
-    permissive: bool,
-) -> Option<Thread> {
+async fn extract_code_thread(store: &SessionStore, entry: &SessionIndexEntry) -> Option<Thread> {
     let state = store.get_code_session(&entry.session_id).await.ok()??;
 
     let mut first_user: Option<String> = None;
@@ -1880,7 +1807,7 @@ async fn extract_code_thread(
     for msg in &state.messages {
         match msg.role.as_str() {
             "user" if first_user.is_none() => {
-                first_user = pick_first_user_turn(&msg.content, permissive);
+                first_user = pick_first_user_turn(&msg.content);
             }
             "assistant" => {
                 if let Some(t) = sanitize_turn(&msg.content) {
@@ -1911,11 +1838,7 @@ async fn extract_code_thread(
 
 /// Code sessions matching a session-id prefix, cwd-agnostic — the global
 /// fallback for an explicit `--resume <id>` (parity with `/resume <id>`).
-pub async fn code_threads_by_id_global(
-    store: &SessionStore,
-    id_prefix: &str,
-    permissive: bool,
-) -> Vec<Thread> {
+pub async fn code_threads_by_id_global(store: &SessionStore, id_prefix: &str) -> Vec<Thread> {
     let mut entries = match store.all_chat_sessions().await {
         Ok(e) => e,
         Err(_) => return Vec::new(),
@@ -1925,7 +1848,7 @@ pub async fn code_threads_by_id_global(
 
     let mut out = Vec::new();
     for entry in entries {
-        if let Some(thread) = extract_code_thread(store, &entry, permissive).await {
+        if let Some(thread) = extract_code_thread(store, &entry).await {
             out.push(thread);
         }
     }
@@ -2049,7 +1972,7 @@ fn warn_unreadable_session(path: &Path, reason: &str) {
 // Per-file JSONL extractors
 // ---------------------------------------------------------------------------
 
-async fn extract_claude_thread(path: &Path, permissive: bool) -> Option<Thread> {
+async fn extract_claude_thread(path: &Path) -> Option<Thread> {
     let file = match fs::File::open(path).await {
         Ok(f) => f,
         Err(err) => {
@@ -2111,7 +2034,7 @@ async fn extract_claude_thread(path: &Path, permissive: bool) -> Option<Thread> 
 
         match kind {
             "user" if first_user.is_none() => {
-                first_user = pick_first_user_turn(&raw, permissive);
+                first_user = pick_first_user_turn(&raw);
             }
             "assistant" => {
                 if let Some(t) = sanitize_turn(&raw) {
@@ -2138,11 +2061,7 @@ async fn extract_claude_thread(path: &Path, permissive: bool) -> Option<Thread> 
 /// (often multi-MB) transcript for `last_response` + the trailing timestamp is
 /// waste. `updated_at` uses the walk's file mtime (≥ last-message-ts for an
 /// append-only jsonl); search/`--json` callers use `extract_claude_thread`.
-async fn extract_claude_thread_headline(
-    path: &Path,
-    mtime: SystemTime,
-    permissive: bool,
-) -> Option<Thread> {
+async fn extract_claude_thread_headline(path: &Path, mtime: SystemTime) -> Option<Thread> {
     let file = match fs::File::open(path).await {
         Ok(f) => f,
         Err(err) => {
@@ -2183,7 +2102,7 @@ async fn extract_claude_thread_headline(
             && v.get("type").and_then(|t| t.as_str()) == Some("user")
         {
             let raw = extract_claude_text(v.get("message")).unwrap_or_default();
-            first_user = pick_first_user_turn(&raw, permissive);
+            first_user = pick_first_user_turn(&raw);
         }
         if first_user.is_some() && session_id.is_some() && event_cwd.is_some() {
             break;
@@ -2213,7 +2132,7 @@ fn decode_claude_cwd(path: &Path) -> Option<String> {
 }
 
 /// Returns Some iff the session's session_meta.cwd matches the project root.
-async fn extract_codex_thread(path: &Path, project_root: &str, permissive: bool) -> Option<Thread> {
+async fn extract_codex_thread(path: &Path, project_root: &str) -> Option<Thread> {
     let file = match fs::File::open(path).await {
         Ok(f) => f,
         Err(err) => {
@@ -2269,7 +2188,7 @@ async fn extract_codex_thread(path: &Path, project_root: &str, permissive: bool)
             let raw = extract_codex_message_text(payload).unwrap_or_default();
             match role {
                 "user" if first_user.is_none() => {
-                    first_user = pick_first_user_turn(&raw, permissive);
+                    first_user = pick_first_user_turn(&raw);
                 }
                 "assistant" => {
                     if let Some(t) = sanitize_turn(&raw) {
@@ -2339,22 +2258,28 @@ pub(crate) fn extract_codex_message_text(payload: &Value) -> Option<String> {
     if buf.is_empty() { None } else { Some(buf) }
 }
 
-/// Pick the first user turn for use as a session title. Both modes strip
-/// aivo-context echo and skip turns dominated by CLI-harness boilerplate
+/// Scrub escapes and controls (newlines survive) so transcript content —
+/// e.g. an echoed `/model` stdout with color codes — can't paint live
+/// escapes into list rows or digest text.
+fn scrub_ansi_and_controls(s: &str) -> Cow<'_, str> {
+    ansi::scrub(s, ansi::ControlPolicy::DropExceptNewlines)
+}
+
+/// Pick the first user turn for use as a session title: strip aivo-context
+/// echo and skip turns dominated by CLI-harness boilerplate
 /// (`<environment_context>`, `<local-command-caveat>`, …) — those aren't
-/// what the user said. Strict mode additionally enforces `MIN_TURN_CHARS`;
-/// permissive mode keeps short prompts like "hi" as the row title.
-fn pick_first_user_turn(raw: &str, permissive: bool) -> Option<String> {
+/// what the user said. Short prompts like "hi" are kept as the row title;
+/// a length floor here would hide CJK sessions (a full sentence rarely
+/// reaches `MIN_TURN_CHARS`) and mistitle others with a later long turn.
+fn pick_first_user_turn(raw: &str) -> Option<String> {
     let cleaned = strip_aivo_context(raw);
+    let cleaned = scrub_ansi_and_controls(cleaned);
     let trimmed = cleaned.trim();
     if trimmed.is_empty() {
         return None;
     }
     let lower = trimmed.to_lowercase();
     if BOILERPLATE_MARKERS.iter().any(|m| lower.contains(m)) {
-        return None;
-    }
-    if !permissive && trimmed.chars().count() < MIN_TURN_CHARS {
         return None;
     }
     Some(truncate_chars(trimmed, MAX_TURN_CHARS))
@@ -2376,6 +2301,7 @@ fn is_substantive(text: &str) -> bool {
 /// Returns None if what's left after stripping isn't substantive.
 fn sanitize_turn(text: &str) -> Option<String> {
     let cleaned = strip_aivo_context(text);
+    let cleaned = scrub_ansi_and_controls(cleaned);
     let trimmed = cleaned.trim();
     if !is_substantive(trimmed) {
         return None;
@@ -2383,14 +2309,14 @@ fn sanitize_turn(text: &str) -> Option<String> {
     Some(truncate_chars(trimmed, MAX_TURN_CHARS))
 }
 
-fn strip_aivo_context(text: &str) -> String {
+fn strip_aivo_context(text: &str) -> &str {
     let mut earliest = text.len();
     for marker in AIVO_CONTEXT_MARKERS {
         if let Some(pos) = text.find(marker) {
             earliest = earliest.min(pos);
         }
     }
-    text[..earliest].to_string()
+    &text[..earliest]
 }
 
 fn truncate_chars(text: &str, max_chars: usize) -> String {
@@ -2495,7 +2421,7 @@ mod tests {
         )
         .await;
 
-        let threads = ingest_code(&store, &cwd, None, false).await;
+        let threads = ingest_code(&store, &cwd, None).await;
         assert_eq!(threads.len(), 1);
         let t = &threads[0];
         assert_eq!(t.cli, "code");
@@ -2532,12 +2458,12 @@ mod tests {
         .await;
 
         // A prefix from a foreign dir resolves — the `--resume <id>` fallback.
-        let hits = code_threads_by_id_global(&store, "bbbb2222", true).await;
+        let hits = code_threads_by_id_global(&store, "bbbb2222").await;
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].session_id, "bbbb2222-two");
 
         assert!(
-            code_threads_by_id_global(&store, "cccc3333", true)
+            code_threads_by_id_global(&store, "cccc3333")
                 .await
                 .is_empty()
         );
@@ -2570,7 +2496,7 @@ mod tests {
         )
         .await;
 
-        let threads = ingest_code(&store, &cwd, None, true).await;
+        let threads = ingest_code(&store, &cwd, None).await;
         assert!(threads.is_empty());
     }
 
@@ -2648,6 +2574,32 @@ mod tests {
     }
 
     #[test]
+    fn pick_first_user_turn_skips_local_command_stdout() {
+        // A `/model` echo is harness output, not the user's intent — it must
+        // never become a session title.
+        let echo = "<local-command-stdout>Set model to \x1b[1mFable 5\x1b[22m and saved as your default</local-command-stdout>";
+        assert!(pick_first_user_turn(echo).is_none());
+    }
+
+    #[test]
+    fn pick_first_user_turn_scrubs_ansi_escapes() {
+        let colored =
+            "please look at the \x1b[1mbold\x1b[22m rendering issue in the footer status line";
+        let picked = pick_first_user_turn(colored).unwrap();
+        assert_eq!(
+            picked,
+            "please look at the bold rendering issue in the footer status line"
+        );
+    }
+
+    #[test]
+    fn pick_first_user_turn_keeps_short_prompts() {
+        // No length floor — short prompts stay visible on listing surfaces.
+        let short = "fix ci error";
+        assert_eq!(pick_first_user_turn(short).as_deref(), Some(short));
+    }
+
+    #[test]
     fn extract_claude_text_handles_string_and_array() {
         let as_string: Value = serde_json::from_str(r#"{"content":"hello world"}"#).unwrap();
         assert_eq!(
@@ -2670,7 +2622,8 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("sess.jsonl");
         let lines = [
-            r#"{"type":"user","sessionId":"sess1","isSidechain":false,"timestamp":"2026-04-01T10:00:00Z","message":{"content":"hi"}}"#,
+            // Boilerplate first turn is skipped; the real prompt wins.
+            r#"{"type":"user","sessionId":"sess1","isSidechain":false,"timestamp":"2026-04-01T10:00:00Z","message":{"content":"<command-name>/clear</command-name>"}}"#,
             r#"{"type":"user","sessionId":"sess1","isSidechain":false,"timestamp":"2026-04-01T10:01:00Z","message":{"content":"Please explain how the cursor pagination helper in handlers/users.go handles empty cursors."}}"#,
             r#"{"type":"assistant","sessionId":"sess1","isSidechain":true,"timestamp":"2026-04-01T10:02:00Z","message":{"content":[{"type":"text","text":"SHOULD NOT APPEAR"}]}}"#,
             r#"{"type":"assistant","sessionId":"sess1","isSidechain":false,"timestamp":"2026-04-01T10:03:00Z","message":{"content":[{"type":"text","text":"Empty cursors default to the first page — see the helper at line 42."}]}}"#,
@@ -2678,9 +2631,7 @@ mod tests {
         ];
         fs::write(&path, lines.join("\n")).await.unwrap();
 
-        let thread = extract_claude_thread(&path, false)
-            .await
-            .expect("should extract");
+        let thread = extract_claude_thread(&path).await.expect("should extract");
         assert_eq!(thread.cli, "claude");
         assert_eq!(thread.session_id, "sess1");
         assert!(thread.topic.starts_with("Please explain how the cursor"));
@@ -2689,21 +2640,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn extract_claude_thread_returns_none_without_substantive_turns() {
+    async fn extract_claude_thread_returns_none_without_user_turns() {
+        // Only harness boilerplate — no title to extract, so no thread.
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("sess.jsonl");
         let lines = [
-            r#"{"type":"user","sessionId":"sess1","isSidechain":false,"message":{"content":"hi"}}"#,
+            r#"{"type":"user","sessionId":"sess1","isSidechain":false,"message":{"content":"<command-name>/clear</command-name>"}}"#,
             r#"{"type":"assistant","sessionId":"sess1","isSidechain":false,"message":{"content":"ok"}}"#,
         ];
         fs::write(&path, lines.join("\n")).await.unwrap();
-        assert!(extract_claude_thread(&path, false).await.is_none());
+        assert!(extract_claude_thread(&path).await.is_none());
     }
 
     #[tokio::test]
-    async fn extract_claude_thread_permissive_keeps_short_turns() {
-        // Listing callers set `permissive=true` so today's `hi`/`ok` sessions
-        // show up in `aivo logs` instead of vanishing under MIN_TURN_CHARS.
+    async fn extract_claude_thread_keeps_short_turns() {
+        // `hi`/`ok` sessions show up in listings instead of vanishing under
+        // a length floor.
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("sess.jsonl");
         let lines = [
@@ -2712,18 +2664,17 @@ mod tests {
         ];
         fs::write(&path, lines.join("\n")).await.unwrap();
 
-        let thread = extract_claude_thread(&path, true)
+        let thread = extract_claude_thread(&path)
             .await
-            .expect("permissive extractor keeps short-turn sessions");
+            .expect("extractor keeps short-turn sessions");
         assert_eq!(thread.session_id, "sess1");
         assert_eq!(thread.topic, "hi");
     }
 
     #[tokio::test]
     async fn extract_claude_session_stub_works_on_short_turns() {
-        // Short user turn under MIN_TURN_CHARS — extract_claude_thread drops
-        // this file. The stub variant must still find the sessionId so the
-        // share resolver can surface short sessions (e.g. `claude -p 'say hi'`).
+        // The stub variant finds the sessionId without reading turns, so the
+        // share resolver can surface even sessions with no extractable title.
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("sess.jsonl");
         let lines = [
@@ -2732,10 +2683,6 @@ mod tests {
         ];
         fs::write(&path, lines.join("\n")).await.unwrap();
 
-        assert!(
-            extract_claude_thread(&path, false).await.is_none(),
-            "strict extractor still rejects short turns (regression guard for `aivo run` context injection)"
-        );
         let stub = extract_claude_session_stub(&path)
             .await
             .expect("stub extractor keeps short sessions");
@@ -2776,7 +2723,7 @@ mod tests {
         ];
         fs::write(&path, lines.join("\n")).await.unwrap();
 
-        let thread = extract_codex_thread(&path, &proj_str, false)
+        let thread = extract_codex_thread(&path, &proj_str)
             .await
             .expect("matched cwd");
         assert_eq!(thread.cli, "codex");
@@ -2794,11 +2741,7 @@ mod tests {
             r#"{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"Lorem ipsum dolor sit amet consectetur"}]}}"#,
         ];
         fs::write(&path, lines.join("\n")).await.unwrap();
-        assert!(
-            extract_codex_thread(&path, "/not/matching", false)
-                .await
-                .is_none()
-        );
+        assert!(extract_codex_thread(&path, "/not/matching").await.is_none());
     }
 
     #[tokio::test]
@@ -2861,23 +2804,18 @@ mod tests {
         assert!(effective_cutoff(&IngestOptions::unlimited()).is_none());
     }
 
-    /// Regression: a codex session whose only user turn is a short CJK
-    /// prompt (e.g. `今天成都的天气`, 7 chars) used to be silently dropped
-    /// by `extract_codex_thread`'s `MIN_TURN_CHARS = 40` filter. The share
-    /// resolver's "closest-mtime codex session in this cwd" heuristic
-    /// would then fall back to an older, longer session that happened to
-    /// survive the filter — wrong session, wrong date, wrong contents.
-    /// `list_codex_sessions_for_cwd` must include the short-prompt
+    /// `list_codex_sessions_for_cwd` must include a session whose only user
+    /// turn is a short prompt, alongside an older longer session in the same
+    /// cwd — else the resolver's closest-mtime pick resolves to the wrong
     /// session.
     #[tokio::test]
-    async fn list_codex_sessions_for_cwd_includes_short_cjk_prompt() {
+    async fn list_codex_sessions_for_cwd_includes_short_prompt_session() {
         let codex_root = TempDir::new().unwrap();
         let project = TempDir::new().unwrap();
         let project_path = std::fs::canonicalize(project.path()).unwrap();
         let project_str = project_path.to_string_lossy().to_string();
 
-        // Older session in the same cwd with a *long* user turn — would
-        // survive the substantive-turn filter under the old code.
+        // Older, longer session in the same cwd — must appear alongside the new one.
         let day_old = codex_root.path().join("2026").join("05").join("01");
         std::fs::create_dir_all(&day_old).unwrap();
         let old_file = day_old.join("rollout-old.jsonl");
@@ -2898,8 +2836,8 @@ mod tests {
         );
         fs::write(&old_file, old_jsonl).await.unwrap();
 
-        // Today's session in the same cwd with a short CJK prompt — the
-        // case the user-reported bug exercised.
+        // Today's session in the same cwd with a short prompt — the case
+        // the user-reported bug exercised.
         let day_today = codex_root.path().join("2026").join("05").join("12");
         std::fs::create_dir_all(&day_today).unwrap();
         let new_file = day_today.join("rollout-new.jsonl");
@@ -2914,7 +2852,7 @@ mod tests {
                 "timestamp": "2026-05-12T03:26:41Z",
                 "type": "response_item",
                 "payload": {"type": "message", "role": "user",
-                            "content": [{"type": "input_text", "text": "今天成都的天气"}]}
+                            "content": [{"type": "input_text", "text": "say hi"}]}
             })
         );
         fs::write(&new_file, new_jsonl).await.unwrap();
@@ -2923,7 +2861,7 @@ mod tests {
         let ids: Vec<&str> = threads.iter().map(|t| t.session_id.as_str()).collect();
         assert!(
             ids.contains(&"NEW-ID"),
-            "short CJK prompt session must be included; got {ids:?}"
+            "short-prompt session must be included; got {ids:?}"
         );
         assert!(
             ids.contains(&"OLD-ID"),
@@ -2964,13 +2902,10 @@ mod tests {
         );
     }
 
-    /// Regression: a live pi session whose only turns so far are short
-    /// prompts (e.g. `hi`) used to be dropped by `extract_pi_thread`'s
-    /// `sanitize_turn`/`MIN_TURN_CHARS` filter. The share resolver then
-    /// returned the closest-mtime *surviving* session, typically a long
-    /// older session in the same cwd — so two distinct run events both
-    /// resolved to the same stale session. The new enumerator must
-    /// include the short-prompt session.
+    /// `list_pi_sessions_for_cwd` must include a live pi session whose only
+    /// turns so far are short prompts (`hi`), alongside an older longer session
+    /// in the same cwd — else the resolver's closest-mtime pick resolves both
+    /// run events to the same stale session.
     ///
     /// Unix-only: pi's per-cwd dir encoding (`list_pi_sessions_for_cwd`)
     /// uses a Unix-path-shaped scheme (`trim '/'`, `replace '/' → '-'`).
@@ -2988,7 +2923,7 @@ mod tests {
         let session_dir = pi_root.path().join(&encoded);
         std::fs::create_dir_all(&session_dir).unwrap();
 
-        // Old long session — survives the old filter, masks the new one.
+        // Older, longer session in the same cwd — must appear alongside the new one.
         let long_text = "x".repeat(120);
         let old_jsonl = format!(
             "{}\n{}\n",
@@ -3029,9 +2964,9 @@ mod tests {
         );
     }
 
-    /// Regression: a gemini session whose user turns are all short used to
-    /// be dropped by `extract_gemini_thread`'s sanitize_turn filter, with
-    /// the same fall-back-to-older-session symptom as claude/codex/pi.
+    /// `list_gemini_sessions_for_cwd` must include a short-prompt session
+    /// alongside an older longer one in the same cwd — same closest-mtime
+    /// fall-back symptom as claude/codex/pi.
     #[tokio::test]
     async fn list_gemini_sessions_for_cwd_includes_short_prompt_session() {
         let gemini_tmp = TempDir::new().unwrap();
@@ -3043,7 +2978,7 @@ mod tests {
         let chats_dir = gemini_tmp.path().join(&project_hash).join("chats");
         std::fs::create_dir_all(&chats_dir).unwrap();
 
-        // Old long session — survives the old filter.
+        // Older, longer session in the same cwd — must appear alongside the new one.
         let long_text = "x".repeat(120);
         let old_file = chats_dir.join("session-old.json");
         let old_json = serde_json::json!({

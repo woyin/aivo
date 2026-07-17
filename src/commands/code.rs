@@ -697,7 +697,9 @@ impl CodeCommand {
                             injected_context_summary = Some(summary);
                             resume = None;
                         }
-                        ContextResolution::Cancelled => resume = None,
+                        // Unreachable today (explicit selectors never open a
+                        // picker), but a cancel means don't open at all.
+                        ContextResolution::Cancelled => return Ok(ExitCode::Success),
                         ContextResolution::Unavailable(msg) => anyhow::bail!(msg),
                     }
                 }

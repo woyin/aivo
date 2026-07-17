@@ -2811,58 +2811,11 @@ pub(super) fn truncate_path_left(s: &str, max: usize) -> String {
     format!("…/{kept}")
 }
 
-/// Compact `⎿` summary: a line count for multi-line output, else the single line
-/// (with the agent's cwd stripped so result paths stay short).
-/// Strip ANSI escape sequences and other control characters from text about to
-/// be shown in the TUI. Captured command output (`git -c color.ui=always …`,
-/// `printf '\033[..'`, anything forced to `--color=always`) can carry escape
-/// bytes that ratatui mis-measures (zero/unknown width) and paints as garbage;
-/// we only ever want the visible characters. Tabs become a single space so words
-/// stay separated.
+/// Strip ANSI escapes and control bytes from text bound for the TUI: forced
+/// `--color=always` output carries escape bytes ratatui mis-measures and paints
+/// as garbage.
 pub(super) fn strip_ansi_and_controls(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    let mut chars = s.chars().peekable();
-    while let Some(c) = chars.next() {
-        if c == '\x1b' {
-            match chars.peek() {
-                // CSI: ESC [ … final byte in 0x40..=0x7e.
-                Some('[') => {
-                    chars.next();
-                    for d in chars.by_ref() {
-                        if ('\u{40}'..='\u{7e}').contains(&d) {
-                            break;
-                        }
-                    }
-                }
-                // OSC: ESC ] … terminated by BEL or ST (ESC \).
-                Some(']') => {
-                    chars.next();
-                    while let Some(d) = chars.next() {
-                        if d == '\x07' {
-                            break;
-                        }
-                        if d == '\x1b' {
-                            if chars.peek() == Some(&'\\') {
-                                chars.next();
-                            }
-                            break;
-                        }
-                    }
-                }
-                // Lone ESC or a 2-byte escape — drop the following byte.
-                _ => {
-                    chars.next();
-                }
-            }
-            continue;
-        }
-        if c == '\t' {
-            out.push(' ');
-        } else if !c.is_control() {
-            out.push(c);
-        }
-    }
-    out
+    crate::services::ansi::scrub(s, crate::services::ansi::ControlPolicy::Drop).into_owned()
 }
 
 /// Clean one captured `!cmd` line with single-line cursor semantics, so a

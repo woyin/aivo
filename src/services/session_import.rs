@@ -155,7 +155,6 @@ const MAX_PER_SOURCE: usize = 40;
 pub async fn list_importable_sessions(project_root: &Path) -> Vec<ImportableSession> {
     let opts = crate::services::context_ingest::IngestOptions {
         max_per_source: Some(MAX_PER_SOURCE),
-        include_short_first_user: true,
         ..Default::default()
     };
     ingest_project_headlines(project_root, opts)

@@ -1435,9 +1435,6 @@ async fn fetch_native_rows(
         } else {
             Some(args.limit.saturating_mul(2).max(50))
         },
-        // Listing view: keep `hi`/`ok` sessions visible. `aivo run`'s
-        // context picker uses a separate IngestOptions with this off.
-        include_short_first_user: true,
         // The global listing has its own head-parse switch (below).
         headline: false,
     };
