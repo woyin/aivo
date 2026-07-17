@@ -1,0 +1,24 @@
+mod helpers;
+
+mod cards;
+mod command_menu;
+mod composer;
+mod event_stream;
+mod goal;
+mod local_commands;
+mod mcp;
+mod models_keys;
+mod mouse;
+mod overlays;
+mod pickers;
+mod plan;
+mod queue;
+mod render;
+mod session_persist;
+mod session_resume;
+mod skills;
+mod slash_commands;
+mod status_footer;
+mod thinking;
+mod tools_render;
+mod turn_lifecycle;

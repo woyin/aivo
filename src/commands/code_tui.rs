@@ -517,5 +517,5 @@ fn chat_swipe_scroll_enabled_for(override_val: Option<&str>, is_termux: bool) ->
 }
 
 #[cfg(test)]
-#[path = "code_tui/tests.rs"]
+#[path = "code_tui/tests/mod.rs"]
 mod tests;
