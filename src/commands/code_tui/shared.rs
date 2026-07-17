@@ -2740,6 +2740,9 @@ pub(super) struct CodeTuiApp {
     /// Split overlay's right-pane rect from the last render (`None` = single-pane);
     /// the key/mouse "split active" signal — a draw always precedes input.
     pub(super) overlay_detail_area: Option<Rect>,
+    /// Non-picker overlay's full box (borders included) from the last render;
+    /// a left press outside it dismisses the overlay like Esc.
+    pub(super) overlay_hitbox: Option<Rect>,
     pub(super) exit_confirm_pending: bool,
     /// Armed by one Esc during a `/goal` turn; a second consecutive Esc stops the loop.
     pub(super) goal_stop_confirm_pending: bool,

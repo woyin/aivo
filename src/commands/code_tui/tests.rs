@@ -1622,6 +1622,7 @@ fn make_test_app(
         frame_tick: 0,
         picker_hitbox: None,
         overlay_detail_area: None,
+        overlay_hitbox: None,
         exit_confirm_pending: false,
         goal_stop_confirm_pending: false,
         pending_ctrl_x: false,
@@ -3057,6 +3058,104 @@ async fn test_clicking_footer_session_id_opens_overlay() {
     .await
     .unwrap();
     assert!(matches!(app.overlay, Overlay::Session { .. }));
+}
+
+fn left_click(column: u16, row: u16) -> MouseEvent {
+    MouseEvent {
+        kind: MouseEventKind::Down(MouseButton::Left),
+        column,
+        row,
+        modifiers: KeyModifiers::NONE,
+    }
+}
+
+#[tokio::test]
+async fn test_overlay_backdrop_click_dismisses_help() {
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.overlay = Overlay::Help { scroll: 0 };
+
+    let mut terminal = Terminal::new(TestBackend::new(100, 40)).unwrap();
+    terminal.draw(|frame| app.render(frame)).unwrap();
+    let hit = app.overlay_hitbox.expect("overlay box recorded");
+
+    // Inside the box the press falls through to text selection — overlay stays.
+    app.handle_mouse(left_click(hit.x + hit.width / 2, hit.y + hit.height / 2))
+        .await
+        .unwrap();
+    assert!(matches!(app.overlay, Overlay::Help { .. }));
+
+    // On the backdrop it dismisses, like Esc.
+    app.handle_mouse(left_click(0, 0)).await.unwrap();
+    assert!(matches!(app.overlay, Overlay::None));
+}
+
+#[tokio::test]
+async fn test_overlay_backdrop_click_steps_back_like_esc() {
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.overlay = Overlay::Skills(SkillsOverlay {
+        items: Vec::new(),
+        selected: 0,
+        query: "abc".to_string(),
+        adding: None,
+        pending_delete: None,
+        viewing: None,
+        detail_scroll: 0,
+    });
+
+    let mut terminal = Terminal::new(TestBackend::new(100, 40)).unwrap();
+    terminal.draw(|frame| app.render(frame)).unwrap();
+    assert!(app.overlay_hitbox.is_some());
+
+    // First backdrop press clears the filter (Esc's first stage)…
+    app.handle_mouse(left_click(0, 0)).await.unwrap();
+    match &app.overlay {
+        Overlay::Skills(state) => assert!(state.query.is_empty()),
+        _ => panic!("overlay closed too early"),
+    }
+
+    // …the next one closes the overlay.
+    app.handle_mouse(left_click(0, 0)).await.unwrap();
+    assert!(matches!(app.overlay, Overlay::None));
+}
+
+#[tokio::test]
+async fn test_loading_picker_backdrop_click_closes() {
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.overlay = Overlay::Picker(Box::new(PickerState::loading(
+        "Select model",
+        String::new(),
+        PickerKind::Key,
+    )));
+
+    let mut terminal = Terminal::new(TestBackend::new(100, 40)).unwrap();
+    terminal.draw(|frame| app.render(frame)).unwrap();
+    let list_area = app
+        .picker_hitbox
+        .as_ref()
+        .expect("loading picker box recorded")
+        .list_area;
+
+    // A click on the (empty) list while loading is inert.
+    app.handle_mouse(left_click(list_area.x, list_area.y))
+        .await
+        .unwrap();
+    assert!(matches!(app.overlay, Overlay::Picker(_)));
+
+    // A backdrop click closes it, same as a loaded picker.
+    app.handle_mouse(left_click(0, 0)).await.unwrap();
+    assert!(matches!(app.overlay, Overlay::None));
 }
 
 #[test]
@@ -12285,7 +12384,7 @@ fn test_skills_overlay_narrow_keeps_single_pane_and_drill_in() {
     terminal.draw(|frame| app.render(frame)).unwrap();
     let screen = test_screen(&terminal);
     assert!(
-        screen.contains("Instructions:") && screen.contains("Esc back"),
+        screen.contains("Instructions:") && screen.contains("esc back"),
         "narrow drill-in should render full-modal:\n{screen}"
     );
 }
@@ -13005,7 +13104,7 @@ fn test_mcp_drill_in_renders_command_and_footer() {
         "detail missing the command value:\n{screen}"
     );
     assert!(
-        screen.contains("Esc back"),
+        screen.contains("esc back"),
         "detail missing back hint:\n{screen}"
     );
 }
@@ -13095,7 +13194,7 @@ fn test_skill_drill_in_renders_body_and_path() {
         "detail missing the SKILL.md body:\n{screen}"
     );
     assert!(
-        screen.contains("Esc back"),
+        screen.contains("esc back"),
         "detail missing back hint:\n{screen}"
     );
 }

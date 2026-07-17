@@ -254,6 +254,7 @@ impl CodeTuiApp {
             frame_tick: 0,
             picker_hitbox: None,
             overlay_detail_area: None,
+            overlay_hitbox: None,
             exit_confirm_pending: false,
             goal_stop_confirm_pending: false,
             pending_ctrl_x: false,

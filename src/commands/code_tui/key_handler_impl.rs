@@ -659,7 +659,7 @@ impl CodeTuiApp {
         });
     }
 
-    async fn handle_overlay_key(&mut self, key: KeyEvent) -> Result<Option<bool>> {
+    pub(super) async fn handle_overlay_key(&mut self, key: KeyEvent) -> Result<Option<bool>> {
         match self.apply_overlay_key(key) {
             OverlayKeyAction::NotOpen => Ok(None),
             OverlayKeyAction::Handled => Ok(Some(false)),

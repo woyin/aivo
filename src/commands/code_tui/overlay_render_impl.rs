@@ -63,89 +63,58 @@ impl CodeTuiApp {
             return self.render_session_picker(frame, area, picker, split);
         }
 
-        clear_to_canvas(frame, area);
-        let shell = Block::default()
-            .borders(Borders::ALL)
-            .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(FAINT()));
-        frame.render_widget(shell, area);
-
-        let inner = area.inner(ratatui::layout::Margin {
-            vertical: 1,
-            horizontal: 2,
-        });
-        let chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Length(2),
-                Constraint::Min(6),
-                Constraint::Length(1),
-            ])
-            .split(inner);
-
-        let filtered_count = picker.filtered_items().len();
-        let total_count = picker.items.len();
-        let status_label = if picker.loading {
+        // Same chrome as /skills and the session picker: title + count badge in
+        // the top border, search row + gap + list + hint strip inside.
+        let status = if picker.loading {
             "loading · esc".to_string()
         } else {
             format!(
                 "{} · esc",
                 format_picker_match_count(
-                    filtered_count,
-                    total_count,
+                    picker.filtered_items().len(),
+                    picker.items.len(),
                     picker_kind_noun(&picker.kind)
                 )
             )
         };
-        let status_width = display_width(&status_label) as u16;
-        let title_width = display_width(picker.title) as u16;
-        let middle_padding = chunks[0]
-            .width
-            .saturating_sub(title_width + status_width)
-            .max(1);
-        let header = Line::from(vec![
-            Span::styled(
-                picker.title,
-                Style::default().fg(TEXT()).add_modifier(Modifier::BOLD),
-            ),
-            Span::raw(" ".repeat(usize::from(middle_padding))),
-            Span::styled(status_label, Style::default().fg(MUTED())),
-        ]);
-        frame.render_widget(
-            Paragraph::new(header),
-            Rect::new(chunks[0].x, chunks[0].y, chunks[0].width, 1),
-        );
-        let search_line = if picker.query.is_empty() {
-            Line::from(vec![
-                Span::styled("/ ", Style::default().fg(MUTED())),
-                Span::styled(
-                    picker_search_placeholder(&picker.kind),
-                    Style::default().fg(MUTED()).add_modifier(Modifier::ITALIC),
-                ),
+        let inner = overlay_shell(frame, area, picker.title, Some((status, MUTED())));
+        if inner.height == 0 {
+            return OverlayRenderOut::default();
+        }
+        let gap = u16::from(inner.height >= 8);
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(1),
+                Constraint::Length(gap),
+                Constraint::Min(6),
+                Constraint::Length(1),
             ])
-        } else {
-            Line::from(vec![
-                Span::styled("/ ", Style::default().fg(MUTED())),
-                Span::styled(
-                    picker.query.clone(),
-                    Style::default().fg(TEXT()).add_modifier(Modifier::BOLD),
-                ),
-            ])
-        };
+            .split(inner);
+
         frame.render_widget(
-            Paragraph::new(search_line),
-            Rect::new(chunks[0].x, chunks[0].y + 1, chunks[0].width, 1),
+            Paragraph::new(search_input_line(
+                &picker.query,
+                picker_search_placeholder(&picker.kind),
+            )),
+            chunks[0],
         );
 
         if picker.loading {
+            // No rows to click yet, but the box rect still bounds click-away dismissal.
+            self.picker_hitbox = Some(PickerHitbox {
+                overlay_area: area,
+                list_area: chunks[2],
+                row_to_filtered_index: Vec::new(),
+            });
             frame.render_widget(
                 Paragraph::new("Loading available models…").style(Style::default().fg(MUTED())),
-                chunks[1],
+                chunks[2],
             );
             return OverlayRenderOut::default();
         }
 
-        let visible = picker.visible_items(usize::from(chunks[1].height));
+        let visible = picker.visible_items(usize::from(chunks[2].height));
         let (lines, row_to_filtered_index) = if visible.is_empty() {
             (
                 vec![Line::from(Span::styled(
@@ -160,7 +129,7 @@ impl CodeTuiApp {
 
             for (filtered_index, item) in visible {
                 let item_lines =
-                    picker_entry_lines(item, filtered_index == picker.selected, chunks[1].width);
+                    picker_entry_lines(item, filtered_index == picker.selected, chunks[2].width);
                 row_to_filtered_index.extend(std::iter::repeat_n(filtered_index, item_lines.len()));
                 lines.extend(item_lines);
             }
@@ -170,7 +139,7 @@ impl CodeTuiApp {
 
         self.picker_hitbox = Some(PickerHitbox {
             overlay_area: area,
-            list_area: chunks[1],
+            list_area: chunks[2],
             row_to_filtered_index: row_to_filtered_index.into_iter().map(Some).collect(),
         });
 
@@ -178,13 +147,9 @@ impl CodeTuiApp {
             Paragraph::new(Text::from(lines))
                 .style(Style::default().fg(TEXT()))
                 .wrap(Wrap { trim: false }),
-            chunks[1],
-        );
-        frame.render_widget(
-            Paragraph::new("Type to filter · Up/Down wrap · Enter open · Esc close")
-                .style(Style::default().fg(MUTED())),
             chunks[2],
         );
+        render_footer_hints(frame, chunks[3], &[("↑↓", "move"), ("Enter", "select")]);
         OverlayRenderOut::default()
     }
 
@@ -271,17 +236,19 @@ impl CodeTuiApp {
                 .wrap(Wrap { trim: false }),
             chunks[2],
         );
-        let footer_text = if picker.pending_delete.is_some() {
-            "Enter or Ctrl+D confirm delete · Esc cancel"
+        let footer: &[(&str, &str)] = if picker.pending_delete.is_some() {
+            &[("Enter/^D", "confirm delete"), ("Esc", "cancel")]
         } else if preview_pane.is_some() {
-            "Type to filter · Up/Down wrap · Enter open · PgUp preview · Ctrl+D delete"
+            &[
+                ("↑↓", "move"),
+                ("Enter", "open"),
+                ("PgUp", "preview"),
+                ("^D", "delete"),
+            ]
         } else {
-            "Type to filter · Up/Down wrap · Enter open · Ctrl+D delete"
+            &[("↑↓", "move"), ("Enter", "open"), ("^D", "delete")]
         };
-        frame.render_widget(
-            Paragraph::new(footer_text).style(Style::default().fg(MUTED())),
-            footer_rect,
-        );
+        render_footer_hints(frame, footer_rect, footer);
 
         let Some(right) = preview_pane else {
             return OverlayRenderOut::default();
@@ -339,21 +306,7 @@ impl CodeTuiApp {
         area: Rect,
         scroll: u16,
     ) -> u16 {
-        clear_to_canvas(frame, area);
-        let shell = Block::default()
-            .borders(Borders::ALL)
-            .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(FAINT()))
-            .title(Span::styled(
-                "Help",
-                Style::default().fg(ACCENT()).add_modifier(Modifier::BOLD),
-            ));
-        frame.render_widget(shell, area);
-
-        let inner = area.inner(ratatui::layout::Margin {
-            vertical: 1,
-            horizontal: 2,
-        });
+        let inner = overlay_shell(frame, area, "Help", Some(("esc".to_string(), MUTED())));
 
         let cmd_style = Style::default()
             .fg(ASSISTANT())
@@ -452,7 +405,7 @@ impl CodeTuiApp {
             )));
         }
 
-        render_detail_lines(frame, inner, lines, scroll, "Esc close")
+        render_detail_lines(frame, inner, lines, scroll)
     }
 
     /// `/context` overlay: fill bar + segment legend + free space, then the injected
@@ -464,21 +417,7 @@ impl CodeTuiApp {
         report: &crate::agent::engine::ContextReport,
         scroll: u16,
     ) -> u16 {
-        clear_to_canvas(frame, area);
-        let shell = Block::default()
-            .borders(Borders::ALL)
-            .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(FAINT()))
-            .title(Span::styled(
-                "Context",
-                Style::default().fg(ACCENT()).add_modifier(Modifier::BOLD),
-            ));
-        frame.render_widget(shell, area);
-
-        let inner = area.inner(ratatui::layout::Margin {
-            vertical: 1,
-            horizontal: 2,
-        });
+        let inner = overlay_shell(frame, area, "Context", Some(("esc".to_string(), MUTED())));
         let width = usize::from(inner.width).max(1);
 
         // Anchor the split to the footer's measured fill so the two match.
@@ -644,7 +583,7 @@ impl CodeTuiApp {
             }
         }
 
-        render_detail_lines(frame, inner, lines, scroll, "Esc close")
+        render_detail_lines(frame, inner, lines, scroll)
     }
 
     /// `/session` detail: the full id (the footer only had room for a handle), the
@@ -656,21 +595,7 @@ impl CodeTuiApp {
         area: Rect,
         scroll: u16,
     ) -> u16 {
-        clear_to_canvas(frame, area);
-        let shell = Block::default()
-            .borders(Borders::ALL)
-            .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(FAINT()))
-            .title(Span::styled(
-                "Session",
-                Style::default().fg(ACCENT()).add_modifier(Modifier::BOLD),
-            ));
-        frame.render_widget(shell, area);
-
-        let inner = area.inner(ratatui::layout::Margin {
-            vertical: 1,
-            horizontal: 2,
-        });
+        let inner = overlay_shell(frame, area, "Session", Some(("esc".to_string(), MUTED())));
         let width = usize::from(inner.width).max(1);
 
         // Provenance: a fork names its source agent; a native session says so.
@@ -721,7 +646,7 @@ impl CodeTuiApp {
             )));
         }
 
-        render_detail_lines(frame, inner, lines, scroll, "Esc close")
+        render_detail_lines(frame, inner, lines, scroll)
     }
 
     /// `/skills` overlay: a checkbox toggle list of the discovered skills. Split
@@ -736,7 +661,12 @@ impl CodeTuiApp {
     ) -> OverlayRenderOut {
         // Narrow-only Tab drill-in; the split's right pane replaces it.
         if !split && let Some(item) = state.viewing.and_then(|i| state.items.get(i)) {
-            let inner = overlay_shell(frame, area, "Skills", None);
+            let inner = overlay_shell(
+                frame,
+                area,
+                "Skills",
+                Some(("esc back".to_string(), MUTED())),
+            );
             if inner.height == 0 {
                 return OverlayRenderOut {
                     detail_scroll: Some(state.detail_scroll),
@@ -750,7 +680,6 @@ impl CodeTuiApp {
                     item,
                     usize::from(inner.width).max(1),
                     state.detail_scroll,
-                    "Esc back",
                 )),
                 ..Default::default()
             };
@@ -779,7 +708,7 @@ impl CodeTuiApp {
             frame,
             area,
             "Skills",
-            count_badge(state.adding.is_none(), enabled, state.items.len()),
+            count_badge(state.adding.is_none(), enabled, state.items.len(), "esc"),
         );
         if inner.height == 0 {
             return OverlayRenderOut::default();
@@ -953,7 +882,6 @@ impl CodeTuiApp {
                 item,
                 usize::from(right.width).max(1),
                 state.detail_scroll,
-                "",
             )),
             None => {
                 frame.render_widget(
@@ -984,7 +912,12 @@ impl CodeTuiApp {
     ) -> OverlayRenderOut {
         // Narrow-only Tab drill-in; the split's right pane replaces it.
         if !split && let Some(item) = state.viewing.and_then(|i| state.items.get(i)) {
-            let inner = overlay_shell(frame, area, "Install skills", None);
+            let inner = overlay_shell(
+                frame,
+                area,
+                "Install skills",
+                Some(("esc back".to_string(), MUTED())),
+            );
             if inner.height == 0 {
                 return OverlayRenderOut {
                     detail_scroll: Some(state.detail_scroll),
@@ -999,7 +932,6 @@ impl CodeTuiApp {
                     item,
                     usize::from(inner.width).max(1),
                     state.detail_scroll,
-                    "Esc back",
                 )),
                 ..Default::default()
             };
@@ -1007,11 +939,16 @@ impl CodeTuiApp {
 
         let filtered = state.filtered_indices();
         let marked = state.items.iter().filter(|i| i.checked).count();
-        let badge = (!state.items.is_empty()).then(|| {
+        let badge = if state.items.is_empty() {
+            ("esc".to_string(), MUTED())
+        } else {
             let color = if marked > 0 { ASSISTANT() } else { MUTED() };
-            (format!("{marked}/{} marked", state.items.len()), color)
-        });
-        let inner = overlay_shell(frame, area, "Install skills", badge);
+            (
+                format!("{marked}/{} marked · esc", state.items.len()),
+                color,
+            )
+        };
+        let inner = overlay_shell(frame, area, "Install skills", Some(badge));
         if inner.height == 0 {
             return OverlayRenderOut::default();
         }
@@ -1181,7 +1118,6 @@ impl CodeTuiApp {
                 item,
                 usize::from(right.width).max(1),
                 state.detail_scroll,
-                "",
             )),
             None => {
                 frame.render_widget(
@@ -1251,12 +1187,12 @@ impl CodeTuiApp {
             area,
             ToggleListView {
                 title: "Config",
-                badge: count_badge(true, on, switches.len()),
+                badge: count_badge(true, on, switches.len(), "esc"),
                 input_line,
                 rows,
                 selected_pos,
                 detail,
-                footer: vec![("↑↓", "move"), ("←→", "change"), ("Esc", "close")],
+                footer: vec![("↑↓", "move"), ("←→", "change")],
             },
         );
     }
@@ -1314,12 +1250,12 @@ impl CodeTuiApp {
             area,
             ToggleListView {
                 title: &title,
-                badge: count_badge(true, on, state.items.len()),
+                badge: count_badge(true, on, state.items.len(), "esc back"),
                 input_line,
                 rows,
                 selected_pos,
                 detail: None,
-                footer: vec![("↑↓", "move"), ("Space", "toggle"), ("Esc", "back")],
+                footer: vec![("↑↓", "move"), ("Space", "toggle")],
             },
         );
     }
@@ -1378,7 +1314,15 @@ impl CodeTuiApp {
             ToggleListView {
                 title,
                 badge: Some((
-                    format!("{marked}/{} marked", state.items.len()),
+                    format!(
+                        "{marked}/{} marked · {}",
+                        state.items.len(),
+                        if state.parent.is_some() {
+                            "esc back"
+                        } else {
+                            "esc"
+                        },
+                    ),
                     if marked > 0 { ACCENT() } else { MUTED() },
                 )),
                 input_line,
@@ -1390,7 +1334,6 @@ impl CodeTuiApp {
                     ("Space", "mark"),
                     ("^A", "all"),
                     ("Enter", "add"),
-                    ("Esc", "back"),
                 ],
             },
         );
@@ -1411,7 +1354,12 @@ impl CodeTuiApp {
     ) -> OverlayRenderOut {
         // Narrow-only Tab/Enter drill-in; the split's right pane replaces it.
         if !split && let Some(item) = state.viewing.and_then(|i| state.items.get(i)) {
-            let inner = overlay_shell(frame, area, "Agents", None);
+            let inner = overlay_shell(
+                frame,
+                area,
+                "Agents",
+                Some(("esc back".to_string(), MUTED())),
+            );
             if inner.height == 0 {
                 return OverlayRenderOut {
                     detail_scroll: Some(state.detail_scroll),
@@ -1425,7 +1373,6 @@ impl CodeTuiApp {
                     item,
                     usize::from(inner.width).max(1),
                     state.detail_scroll,
-                    "Esc back",
                 )),
                 ..Default::default()
             };
@@ -1446,7 +1393,7 @@ impl CodeTuiApp {
             search_input_line(&state.query, "filter sub-agents")
         };
 
-        let inner = overlay_shell(frame, area, "Agents", None);
+        let inner = overlay_shell(frame, area, "Agents", Some(("esc".to_string(), MUTED())));
         if inner.height == 0 {
             return OverlayRenderOut::default();
         }
@@ -1585,7 +1532,6 @@ impl CodeTuiApp {
                 item,
                 usize::from(right.width).max(1),
                 state.detail_scroll,
-                "",
             )),
             None => {
                 frame.render_widget(
@@ -1615,7 +1561,6 @@ impl CodeTuiApp {
         item: &AgentRow,
         width: usize,
         scroll: u16,
-        esc_label: &str,
     ) -> u16 {
         let mut meta: Vec<String> = Vec::new();
         if let Some(m) = &item.model {
@@ -1642,7 +1587,6 @@ impl CodeTuiApp {
             &body,
             width,
             scroll,
-            esc_label,
         )
     }
 
@@ -1683,7 +1627,12 @@ impl CodeTuiApp {
     ) -> OverlayRenderOut {
         // Narrow-only Tab drill-in; the split's right pane replaces it.
         if !split && let Some(row) = state.viewing.and_then(|i| state.items.get(i)) {
-            let inner = overlay_shell(frame, area, "MCP servers", None);
+            let inner = overlay_shell(
+                frame,
+                area,
+                "MCP servers",
+                Some(("esc back".to_string(), MUTED())),
+            );
             if inner.height == 0 {
                 return OverlayRenderOut {
                     detail_scroll: Some(state.detail_scroll),
@@ -1697,7 +1646,6 @@ impl CodeTuiApp {
                     row,
                     usize::from(inner.width).max(1),
                     state.detail_scroll,
-                    "Esc back",
                 )),
                 ..Default::default()
             };
@@ -1726,7 +1674,7 @@ impl CodeTuiApp {
             frame,
             area,
             "MCP servers",
-            count_badge(state.adding.is_none(), on, state.items.len()),
+            count_badge(state.adding.is_none(), on, state.items.len(), "esc"),
         );
         if inner.height == 0 {
             return OverlayRenderOut::default();
@@ -1876,7 +1824,6 @@ impl CodeTuiApp {
                 row,
                 usize::from(right.width).max(1),
                 state.detail_scroll,
-                "",
             )),
             None => {
                 frame.render_widget(
@@ -1938,7 +1885,6 @@ impl CodeTuiApp {
         row: &McpServerRow,
         width: usize,
         scroll: u16,
-        esc_label: &str,
     ) -> u16 {
         use crate::agent::mcp::ServerScope;
         let scope = match row.scope {
@@ -2033,7 +1979,7 @@ impl CodeTuiApp {
                 Style::default().fg(MUTED()),
             )));
         }
-        render_detail_lines(frame, area, lines, scroll, esc_label)
+        render_detail_lines(frame, area, lines, scroll)
     }
 
     /// `/skills` detail (split right pane / narrow drill-in): location, full
@@ -2045,7 +1991,6 @@ impl CodeTuiApp {
         item: &SkillToggle,
         width: usize,
         scroll: u16,
-        esc_label: &str,
     ) -> u16 {
         use crate::agent::skills::SkillScope;
         let scope = match item.scope {
@@ -2062,7 +2007,6 @@ impl CodeTuiApp {
             &item.body,
             width,
             scroll,
-            esc_label,
         )
     }
 
@@ -2076,7 +2020,6 @@ impl CodeTuiApp {
         item: &InstallPickItem,
         width: usize,
         scroll: u16,
-        esc_label: &str,
     ) -> u16 {
         let tag = if item.installed && item.checked {
             "[marked for update]"
@@ -2097,7 +2040,6 @@ impl CodeTuiApp {
             &item.body,
             width,
             scroll,
-            esc_label,
         )
     }
 
@@ -2114,7 +2056,6 @@ impl CodeTuiApp {
         body: &str,
         width: usize,
         scroll: u16,
-        esc_label: &str,
     ) -> u16 {
         let mut title = vec![Span::styled(
             name.to_string(),
@@ -2165,7 +2106,7 @@ impl CodeTuiApp {
                 }
             }
         }
-        render_detail_lines(frame, area, lines, scroll, esc_label)
+        render_detail_lines(frame, area, lines, scroll)
     }
 }
 
@@ -2480,13 +2421,19 @@ fn add_input_line(buffer: &str) -> Line<'static> {
     ])
 }
 
-/// The right-aligned `N/M on` border badge, or `None` while adding / when empty.
-fn count_badge(show: bool, on: usize, total: usize) -> Option<(String, Color)> {
-    if !show || total == 0 {
+/// Top-border badge for a toggle list: `on/total on · esc`; the esc hint alone
+/// when empty, `None` while adding. The esc affordance lives in the badge so
+/// every modal names its dismiss key in the same corner; `esc` is "esc back"
+/// for sub-modals that restore a parent.
+fn count_badge(show: bool, on: usize, total: usize, esc: &str) -> Option<(String, Color)> {
+    if !show {
         return None;
     }
+    if total == 0 {
+        return Some((esc.to_string(), MUTED()));
+    }
     let color = if on > 0 { ASSISTANT() } else { MUTED() };
-    Some((format!("{on}/{total} on"), color))
+    Some((format!("{on}/{total} on · {esc}"), color))
 }
 
 /// Footer key hints: each `key` brightish-bold, its `label` muted, groups spaced.
@@ -2743,43 +2690,37 @@ fn render_session_preview_pane(
     scroll_up
 }
 
-/// Render a scrollable Enter drill-in panel: `lines` in the body (the last row is
-/// a footer with the close hint (`esc_label`), scroll hint, and position),
-/// scrolled by `scroll` lines. Returns the scroll offset clamped to the real
-/// content height so the caller can write it back — over-scrolling (e.g. `End`)
-/// lands exactly at the bottom rather than off the end.
-fn render_detail_lines(
-    frame: &mut Frame<'_>,
-    area: Rect,
-    lines: Vec<Line>,
-    scroll: u16,
-    esc_label: &str,
-) -> u16 {
+/// Render a scrollable Enter drill-in panel: `lines` in the body, with a scroll
+/// hint + position footer when the content overflows. Returns the scroll offset
+/// clamped to the real content height so the caller can write it back —
+/// over-scrolling (e.g. `End`) lands exactly at the bottom rather than off the end.
+fn render_detail_lines(frame: &mut Frame<'_>, area: Rect, lines: Vec<Line>, scroll: u16) -> u16 {
     if area.height == 0 {
         return 0;
     }
-    let body_h = usize::from(area.height.saturating_sub(1));
     let total = lines.len();
+    // No footer when the content fits — the shell badge already names the dismiss key.
+    if total <= usize::from(area.height) {
+        frame.render_widget(Paragraph::new(Text::from(lines)), area);
+        return 0;
+    }
+    let body_h = usize::from(area.height.saturating_sub(1));
     let max_scroll = (total.saturating_sub(body_h)) as u16;
     let scroll = scroll.min(max_scroll);
 
-    let footer_line = if max_scroll == 0 {
-        Line::from(Span::styled(
-            esc_label.to_string(),
+    let first = usize::from(scroll) + 1;
+    let last = (usize::from(scroll) + body_h).min(total);
+    let footer_line = Line::from(vec![
+        Span::styled(
+            "↑↓",
+            Style::default().fg(MUTED()).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(" scroll   ", Style::default().fg(FAINT())),
+        Span::styled(
+            format!("{first}–{last}/{total}"),
             Style::default().fg(MUTED()),
-        ))
-    } else {
-        let first = usize::from(scroll) + 1;
-        let last = (usize::from(scroll) + body_h).min(total);
-        Line::from(vec![
-            Span::styled(esc_label.to_string(), Style::default().fg(MUTED())),
-            Span::styled("   ↑↓ scroll   ", Style::default().fg(FAINT())),
-            Span::styled(
-                format!("{first}–{last}/{total}"),
-                Style::default().fg(MUTED()),
-            ),
-        ])
-    };
+        ),
+    ]);
     frame.render_widget(
         Paragraph::new(footer_line),
         Rect {

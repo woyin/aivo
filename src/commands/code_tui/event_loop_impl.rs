@@ -2763,7 +2763,8 @@ impl CodeTuiApp {
     async fn handle_overlay_mouse(&mut self, mouse: MouseEvent) -> Result<Option<bool>> {
         // A left press/drag/release over a non-picker overlay falls through to the
         // screen selection, so the help / skills / mcp bodies are selectable; wheel +
-        // picker clicks stay handled below.
+        // picker clicks stay handled below. A press on the backdrop dismisses one
+        // modal level, exactly like Esc.
         if matches!(
             mouse.kind,
             MouseEventKind::Down(MouseButton::Left)
@@ -2771,6 +2772,15 @@ impl CodeTuiApp {
                 | MouseEventKind::Up(MouseButton::Left)
         ) && !matches!(self.overlay, Overlay::Picker(_) | Overlay::None)
         {
+            if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
+                && self
+                    .overlay_hitbox
+                    .is_some_and(|area| !rect_contains(area, (mouse.column, mouse.row)))
+            {
+                return self
+                    .handle_overlay_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+                    .await;
+            }
             return Ok(None);
         }
         match (&self.overlay, mouse.kind) {
@@ -2938,9 +2948,7 @@ impl CodeTuiApp {
                 }
                 Ok(Some(false))
             }
-            (Overlay::Picker(picker), MouseEventKind::Down(MouseButton::Left))
-                if !picker.loading =>
-            {
+            (Overlay::Picker(_), MouseEventKind::Down(MouseButton::Left)) => {
                 self.handle_picker_click(mouse).await
             }
             (Overlay::Picker(_), _) => Ok(Some(false)),
@@ -2953,10 +2961,11 @@ impl CodeTuiApp {
             return Ok(Some(false));
         };
 
+        let loading = matches!(&self.overlay, Overlay::Picker(p) if p.loading);
         let point = (mouse.column, mouse.row);
         if rect_contains(hitbox.list_area, point) {
             let row = usize::from(mouse.row.saturating_sub(hitbox.list_area.y));
-            if let Some(Some(filtered_index)) = hitbox.row_to_filtered_index.get(row) {
+            if !loading && let Some(Some(filtered_index)) = hitbox.row_to_filtered_index.get(row) {
                 return self
                     .activate_picker_selection(*filtered_index)
                     .await

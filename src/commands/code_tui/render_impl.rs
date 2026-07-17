@@ -1056,6 +1056,14 @@ impl CodeTuiApp {
             .collect()
     }
 
+    /// Records a non-picker overlay's rects for input routing: the inner
+    /// content confines the screen selection; the full box is the click-away
+    /// dismiss boundary.
+    fn set_overlay_regions(&mut self, area: Rect) {
+        self.screen_region = Some(overlay_content_rect(area));
+        self.overlay_hitbox = Some(area);
+    }
+
     pub(super) fn render(&mut self, frame: &mut Frame<'_>) {
         self.tick_selection_flash();
         self.refresh_git_branch();
@@ -1068,6 +1076,7 @@ impl CodeTuiApp {
         self.transcript_hitbox = None;
         self.screen_region = None;
         self.overlay_detail_area = None;
+        self.overlay_hitbox = None;
         let composer_area = self.render_main(frame, outer);
         if let Some(menu) = self.visible_command_menu() {
             let (area, placement) = command_menu_area(
@@ -1098,7 +1107,7 @@ impl CodeTuiApp {
             }
             Overlay::Help { scroll } => {
                 let area = centered_rect(72, 88, body);
-                self.screen_region = Some(overlay_content_rect(area));
+                self.set_overlay_regions(area);
                 let clamped = self.render_help_overlay(frame, area, scroll);
                 if let Overlay::Help { scroll } = &mut self.overlay {
                     *scroll = clamped;
@@ -1106,7 +1115,7 @@ impl CodeTuiApp {
             }
             Overlay::Context { report, scroll } => {
                 let area = centered_rect(72, 88, body);
-                self.screen_region = Some(overlay_content_rect(area));
+                self.set_overlay_regions(area);
                 let clamped = self.render_context_overlay(frame, area, &report, scroll);
                 if let Overlay::Context { scroll, .. } = &mut self.overlay {
                     *scroll = clamped;
@@ -1114,7 +1123,7 @@ impl CodeTuiApp {
             }
             Overlay::Session { scroll } => {
                 let area = centered_rect(64, 60, body);
-                self.screen_region = Some(overlay_content_rect(area));
+                self.set_overlay_regions(area);
                 let clamped = self.render_session_overlay(frame, area, scroll);
                 if let Overlay::Session { scroll } = &mut self.overlay {
                     *scroll = clamped;
@@ -1122,7 +1131,7 @@ impl CodeTuiApp {
             }
             Overlay::Skills(skills) => {
                 let (area, split) = split_overlay_area(body, 84, 80, 64, 80);
-                self.screen_region = Some(overlay_content_rect(area));
+                self.set_overlay_regions(area);
                 let out = self.render_skills_overlay(frame, area, &skills, split);
                 self.overlay_detail_area = out.detail_area;
                 if let Overlay::Skills(s) = &mut self.overlay {
@@ -1137,7 +1146,7 @@ impl CodeTuiApp {
             }
             Overlay::Agents(agents) => {
                 let (area, split) = split_overlay_area(body, 84, 80, 64, 80);
-                self.screen_region = Some(overlay_content_rect(area));
+                self.set_overlay_regions(area);
                 let out = self.render_agents_overlay(frame, area, &agents, split);
                 self.overlay_detail_area = out.detail_area;
                 if let Overlay::Agents(s) = &mut self.overlay {
@@ -1151,7 +1160,7 @@ impl CodeTuiApp {
             }
             Overlay::SkillInstall(pick) => {
                 let (area, split) = split_overlay_area(body, 84, 80, 64, 80);
-                self.screen_region = Some(overlay_content_rect(area));
+                self.set_overlay_regions(area);
                 let out = self.render_skill_install_overlay(frame, area, &pick, split);
                 self.overlay_detail_area = out.detail_area;
                 if let Overlay::SkillInstall(s) = &mut self.overlay {
@@ -1165,7 +1174,7 @@ impl CodeTuiApp {
             }
             Overlay::Mcp(mcp) => {
                 let (area, split) = split_overlay_area(body, 84, 80, 64, 80);
-                self.screen_region = Some(overlay_content_rect(area));
+                self.set_overlay_regions(area);
                 let out = self.render_mcp_overlay(frame, area, &mcp, split);
                 self.overlay_detail_area = out.detail_area;
                 if let Overlay::Mcp(s) = &mut self.overlay {
@@ -1179,12 +1188,12 @@ impl CodeTuiApp {
             }
             Overlay::McpTools(tools) => {
                 let area = centered_rect(64, 80, body);
-                self.screen_region = Some(overlay_content_rect(area));
+                self.set_overlay_regions(area);
                 self.render_mcp_tools_overlay(frame, area, &tools);
             }
             Overlay::McpPaste(paste) => {
                 let area = centered_rect(64, 80, body);
-                self.screen_region = Some(overlay_content_rect(area));
+                self.set_overlay_regions(area);
                 self.render_mcp_paste_overlay(frame, area, &paste);
             }
             Overlay::Config(config) => {
@@ -1198,7 +1207,7 @@ impl CodeTuiApp {
                     .clamp(48, 56);
                 let height = n.saturating_mul(2) + 6;
                 let area = centered_rect_fixed(width, height, body);
-                self.screen_region = Some(overlay_content_rect(area));
+                self.set_overlay_regions(area);
                 self.render_config_overlay(frame, area, &config);
             }
             Overlay::None => {}
