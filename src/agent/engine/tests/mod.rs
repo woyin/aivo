@@ -1,0 +1,22 @@
+mod helpers;
+
+mod approvals;
+mod compaction_budget;
+mod compaction_pinning;
+mod context_usage;
+mod external_tools;
+mod history;
+mod hooks;
+mod jobs;
+mod plan_mode;
+mod plan_tracking;
+mod review_gate;
+mod rewind;
+mod secrets_sandbox;
+mod selfcorrect;
+mod session;
+mod subagent_profiles;
+mod subagents;
+mod thinking;
+mod tools_wiring;
+mod turn_loop;
