@@ -1,5 +1,17 @@
 # Changelog
 
+## v0.41.1
+
+A session-continuation and TUI-stability patch. `--resume` becomes the one continuation flag across launch, one-shot, and the TUI, backed by a native-rewrite → import → digest fidelity ladder, with picker cancel/title fixes riding along. Image paste no longer freezes the TUI for seconds per Ctrl+V, and `stats` reports honest code-session counts.
+
+- feat(code): unify session continuation behind `--resume` with a fidelity ladder (3ce6c0b3)
+- fix(run): `--resume` picker cancel aborts launch; short-prompt sessions list with real titles (0dba1416)
+- fix(code): remove theme auto-detection; scrub leaked OSC color replies (641ee33e)
+- fix(code): image paste froze the TUI ~3s per Ctrl+V (2fedc19c)
+- fix(code): improve modal style and actions (477c6f6c)
+- fix(stats): honest code session counts and cached claude delta merge (e468df68)
+- refactor(code): split code_tui tests.rs into topic modules (a9f3ad17)
+
 ## v0.41.0
 
 A per-tier routing and TUI polish release. A Claude subscription can now serve as the main model or any individual tier in per-tier routing, alongside the existing `<key>::<model>` shorthand which now also works on the `code`/`run` paths. `/resume` can import and continue sessions from other coding agents, `/config` gets a segmented-switches redesign, and the TUI adds a dark/light theme with terminal auto-detection. Agent memory gains dream-based consolidation and copy-on-write worktrees, plus a batch of stability fixes for the TUI, networking, and model discovery.
