@@ -1517,9 +1517,10 @@ mod tests {
         // Cursor has its own ACP-backed router for coding-agent plugins.
         assert_eq!(plugin_serve(&key(CURSOR_ACP_SENTINEL)), PluginServe::Cursor);
         assert!(plugin_serve(&key(CURSOR_ACP_SENTINEL)).is_servable());
-        // Provider OAuth (grok/codex) is servable.
+        // Provider OAuth (grok/kimi/codex) is servable.
         for base in [
             crate::services::grok_oauth::GROK_OAUTH_SENTINEL,
+            crate::services::kimi_oauth::KIMI_OAUTH_SENTINEL,
             CODEX_OAUTH_SENTINEL,
         ] {
             assert_eq!(plugin_serve(&key(base)), PluginServe::Serve, "{base}");

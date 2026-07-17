@@ -73,6 +73,8 @@ pub struct ServeRouterConfig {
     pub is_grok: bool,
     /// `XAI_API_KEY` fallback for grok 403s; `None` if unset.
     pub grok_fallback_api_key: Option<String>,
+    /// `upstream_api_key` holds the Kimi OAuth credential JSON, not a bearer.
+    pub is_kimi: bool,
     /// `upstream_api_key` holds the Codex OAuth credential JSON, not a bearer.
     pub is_codex: bool,
     /// `upstream_api_key` holds the Claude OAuth credential JSON; requests
@@ -122,6 +124,7 @@ impl ServeRouterConfig {
             is_copilot: profile.serve_flags.is_copilot,
             is_grok: key.is_grok_oauth(),
             grok_fallback_api_key: None,
+            is_kimi: key.is_kimi_oauth(),
             is_codex: key.is_codex_oauth(),
             is_claude_native_oauth,
             is_openrouter: profile.serve_flags.is_openrouter,
@@ -181,6 +184,7 @@ struct ServeState {
     key: ApiKey,
     copilot_tokens: Option<Arc<CopilotTokenManager>>,
     grok_tokens: Option<Arc<crate::services::grok_oauth::GrokTokenManager>>,
+    kimi_tokens: Option<Arc<crate::services::kimi_oauth::KimiTokenManager>>,
     codex_tokens: Option<Arc<crate::services::codex_oauth::CodexTokenManager>>,
     /// Per-model learned protocol routes (in-memory only — `aivo serve` doesn't
     /// persist routes yet). Replaces the old single per-process pin so a
@@ -206,6 +210,7 @@ struct FailoverEntry {
     key: ApiKey,
     copilot_tokens: Option<Arc<CopilotTokenManager>>,
     grok_tokens: Option<Arc<crate::services::grok_oauth::GrokTokenManager>>,
+    kimi_tokens: Option<Arc<crate::services::kimi_oauth::KimiTokenManager>>,
     codex_tokens: Option<Arc<crate::services::codex_oauth::CodexTokenManager>>,
     /// Shared across failover attempts so a route learned during one failover
     /// carries to the next request instead of being re-probed every time.
@@ -333,6 +338,7 @@ impl ServeRouter {
             None
         };
         let grok_tokens = build_grok_tokens(&self.config, self.oauth_persist_store.clone());
+        let kimi_tokens = build_kimi_tokens(&self.config, self.oauth_persist_store.clone());
         let codex_tokens = build_codex_tokens(&self.config);
 
         let initial_protocol = self.config.upstream_protocol;
@@ -374,9 +380,10 @@ impl ServeRouter {
                         upstream_api_key: fk.key.as_str().to_string(),
                         upstream_protocol: protocol,
                         is_copilot,
-                        // Failover keys never carry grok/codex/claude-oauth state.
+                        // Failover keys never carry grok/kimi/codex/claude-oauth state.
                         is_grok: false,
                         grok_fallback_api_key: None,
+                        is_kimi: false,
                         is_codex: false,
                         is_claude_native_oauth: false,
                         is_openrouter: profile.serve_flags.is_openrouter,
@@ -390,6 +397,7 @@ impl ServeRouter {
                     key: fk,
                     copilot_tokens: ct,
                     grok_tokens: None,
+                    kimi_tokens: None,
                     codex_tokens: None,
                     route_cache: Arc::new(RouteCache::new(
                         "serve",
@@ -418,6 +426,7 @@ impl ServeRouter {
             key: self.key,
             copilot_tokens,
             grok_tokens,
+            kimi_tokens,
             codex_tokens,
             route_cache,
             log_store: self.log_store,
@@ -1429,6 +1438,7 @@ fn failover_state(
         key: entry.key.clone(),
         copilot_tokens: entry.copilot_tokens.clone(),
         grok_tokens: entry.grok_tokens.clone(),
+        kimi_tokens: entry.kimi_tokens.clone(),
         codex_tokens: entry.codex_tokens.clone(),
         route_cache: entry.route_cache.clone(),
         log_store: log_store.clone(),
@@ -1459,6 +1469,7 @@ fn build_upstream_entry(
         None
     };
     let grok_tokens = build_grok_tokens(&config, oauth_persist.cloned());
+    let kimi_tokens = build_kimi_tokens(&config, oauth_persist.cloned());
     let codex_tokens = build_codex_tokens(&config);
     let route_cache = Arc::new(RouteCache::new(
         "serve",
@@ -1470,6 +1481,7 @@ fn build_upstream_entry(
         key,
         copilot_tokens,
         grok_tokens,
+        kimi_tokens,
         codex_tokens,
         route_cache,
     }
@@ -1631,9 +1643,9 @@ async fn handle_chat_body(body: Value, state: &ServeState) -> Result<RouterRespo
         };
     }
 
-    // Grok speaks only OpenAI chat completions; pin it so the protocol-probe
-    // loop never tries the Anthropic/Gemini handlers.
-    if state.config.is_grok {
+    // Grok and Kimi speak only OpenAI chat completions; pin them so the
+    // protocol-probe loop never tries the Anthropic/Gemini handlers.
+    if state.config.is_grok || state.config.is_kimi {
         let mut body = body;
         return handle_chat_openai(&mut body, client_wants_stream, state).await;
     }
@@ -1760,6 +1772,7 @@ fn upstream_context(state: &ServeState) -> UpstreamRequestContext {
         is_starter: state.config.is_starter,
         copilot_tokens: state.copilot_tokens.clone(),
         grok_tokens: state.grok_tokens.clone(),
+        kimi_tokens: state.kimi_tokens.clone(),
         codex_tokens: state.codex_tokens.clone(),
         accounting: state.usage_sink.is_some(),
     }
@@ -1789,6 +1802,28 @@ fn build_grok_tokens(
     match GrokOAuthCredential::from_json(&config.upstream_api_key) {
         Ok(creds) => {
             let mut mgr = GrokTokenManager::new(creds, config.grok_fallback_api_key.clone());
+            if let Some(store) = persist_store {
+                mgr = mgr.with_persist_store(store);
+            }
+            Some(Arc::new(mgr))
+        }
+        Err(_) => None,
+    }
+}
+
+/// Builds the kimi token manager from a kimi-oauth config. `None` for non-kimi
+/// configs or an unparseable credential.
+fn build_kimi_tokens(
+    config: &ServeRouterConfig,
+    persist_store: Option<SessionStore>,
+) -> Option<Arc<crate::services::kimi_oauth::KimiTokenManager>> {
+    use crate::services::kimi_oauth::{KimiOAuthCredential, KimiTokenManager};
+    if !config.is_kimi {
+        return None;
+    }
+    match KimiOAuthCredential::from_json(&config.upstream_api_key) {
+        Ok(creds) => {
+            let mut mgr = KimiTokenManager::new(creds);
             if let Some(store) = persist_store {
                 mgr = mgr.with_persist_store(store);
             }
@@ -2057,6 +2092,7 @@ mod tests {
                 is_copilot: false,
                 is_grok: false,
                 grok_fallback_api_key: None,
+                is_kimi: false,
                 is_codex: false,
                 is_claude_native_oauth: false,
                 is_openrouter: false,
@@ -2071,6 +2107,7 @@ mod tests {
             key: test_key(),
             copilot_tokens: None,
             grok_tokens: None,
+            kimi_tokens: None,
             codex_tokens: None,
             route_cache: Arc::new(RouteCache::new(
                 "serve",
@@ -2236,6 +2273,7 @@ mod tests {
                 is_copilot: false,
                 is_grok: false,
                 grok_fallback_api_key: None,
+                is_kimi: false,
                 is_codex: false,
                 is_claude_native_oauth: false,
                 is_openrouter: true,
@@ -2250,6 +2288,7 @@ mod tests {
             key: test_key(),
             copilot_tokens: None,
             grok_tokens: None,
+            kimi_tokens: None,
             codex_tokens: None,
             route_cache: Arc::new(RouteCache::new(
                 "serve",
@@ -2423,6 +2462,7 @@ mod tests {
                 is_copilot: false,
                 is_grok: false,
                 grok_fallback_api_key: None,
+                is_kimi: false,
                 is_codex: false,
                 is_claude_native_oauth: false,
                 is_openrouter: false,
@@ -2436,6 +2476,7 @@ mod tests {
             key: test_key(),
             copilot_tokens: None,
             grok_tokens: None,
+            kimi_tokens: None,
             codex_tokens: None,
             route_cache: Arc::new(RouteCache::new(
                 "serve",
@@ -2465,6 +2506,7 @@ mod tests {
             is_copilot: false,
             is_grok: false,
             grok_fallback_api_key: None,
+            is_kimi: false,
             is_codex: false,
             is_claude_native_oauth: false,
             is_openrouter: false,
@@ -2481,6 +2523,7 @@ mod tests {
             key: test_key(),
             copilot_tokens: None,
             grok_tokens: None,
+            kimi_tokens: None,
             codex_tokens: None,
             route_cache: Arc::new(RouteCache::new(
                 "serve",
@@ -2506,6 +2549,7 @@ mod tests {
                 is_copilot: false,
                 is_grok: false,
                 grok_fallback_api_key: None,
+                is_kimi: false,
                 is_codex: false,
                 is_claude_native_oauth: false,
                 is_openrouter: false,
@@ -2519,6 +2563,7 @@ mod tests {
             key: test_key(),
             copilot_tokens: None,
             grok_tokens: None,
+            kimi_tokens: None,
             codex_tokens: None,
             route_cache: Arc::new(RouteCache::new(
                 "serve",

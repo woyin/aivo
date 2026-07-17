@@ -31,6 +31,7 @@ pub(crate) struct UpstreamRequestContext {
     pub(crate) is_starter: bool,
     pub(crate) copilot_tokens: Option<Arc<CopilotTokenManager>>,
     pub(crate) grok_tokens: Option<Arc<crate::services::grok_oauth::GrokTokenManager>>,
+    pub(crate) kimi_tokens: Option<Arc<crate::services::kimi_oauth::KimiTokenManager>>,
     pub(crate) codex_tokens: Option<Arc<crate::services::codex_oauth::CodexTokenManager>>,
     /// Usage accounting is on — streamed OpenAI requests must ask for the
     /// trailing usage chunk or the sniffer records zero for the turn.
@@ -385,6 +386,7 @@ async fn send_openai_chat_once(
         context.upstream_api_key.as_str(),
         context.copilot_tokens.as_deref(),
         context.grok_tokens.as_deref(),
+        context.kimi_tokens.as_deref(),
         initiator,
     )
     .await?;
@@ -443,6 +445,7 @@ pub(crate) async fn send_copilot_responses(
         "/v1/responses",
         context.upstream_api_key.as_str(),
         context.copilot_tokens.as_deref(),
+        None,
         None,
         Some(initiator),
     )
@@ -673,6 +676,7 @@ pub(crate) async fn send_openai_embeddings(
         &url,
         context.upstream_api_key.as_str(),
         context.copilot_tokens.as_deref(),
+        None,
         None,
         None,
     )

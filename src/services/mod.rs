@@ -55,6 +55,7 @@ pub mod http_utils;
 pub mod huggingface;
 pub mod id_compact;
 pub mod key_compat;
+pub mod kimi_oauth;
 pub mod known_providers;
 pub mod last_selection;
 pub mod launch_args;

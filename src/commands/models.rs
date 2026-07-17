@@ -364,6 +364,13 @@ impl ModelsCommand {
                 crate::services::grok_oauth::fetch_model_ids(&mut creds, Some(&self.session_store))
                     .await?;
             ids.into_iter().map(ModelInfo::id_only).collect()
+        } else if key.is_kimi_oauth() {
+            SessionStore::decrypt_key_secret(&mut key)?;
+            let mut creds = crate::services::kimi_oauth::KimiOAuthCredential::from_json(&key.key)?;
+            let models =
+                crate::services::kimi_oauth::fetch_models(&mut creds, Some(&self.session_store))
+                    .await?;
+            kimi_model_infos(models)
         } else if key.is_codex_oauth() {
             crate::services::codex_oauth::known_model_ids()
                 .into_iter()
@@ -861,6 +868,18 @@ pub(crate) fn full_catalog_cache_key_for_key(key: &ApiKey) -> String {
     full_catalog_key(&model_cache_key_for_key(key))
 }
 
+/// Kimi `/models` rows → display rows; the endpoint reports context inline.
+fn kimi_model_infos(models: Vec<crate::services::kimi_oauth::KimiModel>) -> Vec<ModelInfo> {
+    models
+        .into_iter()
+        .map(|m| ModelInfo {
+            context: m.context_length.map(format_token_count),
+            context_tokens: m.context_length,
+            ..ModelInfo::id_only(m.id)
+        })
+        .collect()
+}
+
 /// Rebuilds the `aivo models` row list from a cached id list and metadata
 /// map. Models present in `ids` but missing from `metadata` (e.g. Cloudflare
 /// id-only entries) render as plain rows.
@@ -1056,6 +1075,13 @@ async fn fetch_models_detailed_filtered(
         let mut creds = crate::services::grok_oauth::GrokOAuthCredential::from_json(&key.key)?;
         let ids = crate::services::grok_oauth::fetch_model_ids(&mut creds, None).await?;
         return Ok(ids.into_iter().map(ModelInfo::id_only).collect());
+    }
+    if key.is_kimi_oauth() {
+        let mut key = key.clone();
+        SessionStore::decrypt_key_secret(&mut key)?;
+        let mut creds = crate::services::kimi_oauth::KimiOAuthCredential::from_json(&key.key)?;
+        let models = crate::services::kimi_oauth::fetch_models(&mut creds, None).await?;
+        return Ok(kimi_model_infos(models));
     }
     if key.is_codex_oauth() {
         let ids = crate::services::codex_oauth::known_model_ids();

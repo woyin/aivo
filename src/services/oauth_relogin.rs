@@ -40,9 +40,15 @@ pub async fn relogin_key(session_store: &SessionStore, key: &ApiKey) -> Result<A
             .map_err(|e| e.context("grok re-login"))?;
         let json = creds.to_json()?;
         persist(session_store, key, &json).await
+    } else if key.is_kimi_oauth() {
+        let creds = crate::services::kimi_oauth::interactive_login()
+            .await
+            .map_err(|e| e.context("kimi re-login"))?;
+        let json = creds.to_json()?;
+        persist(session_store, key, &json).await
     } else {
         Err(anyhow!(
-            "--relogin only applies to OAuth keys (codex / claude / grok); '{}' is a plain API key",
+            "--relogin only applies to OAuth keys (codex / claude / grok / kimi); '{}' is a plain API key",
             key.display_name()
         ))
     }

@@ -556,6 +556,10 @@ const GROK_OAUTH_INFO: (&str, &str) = (
     "SuperGrok (xAI)",
     "sign in with your SuperGrok / X Premium+ subscription — usable by any coding agent",
 );
+const KIMI_OAUTH_INFO: (&str, &str) = (
+    "Kimi Code (OAuth)",
+    "sign in with your Kimi membership — usable by any coding agent",
+);
 const OLLAMA_INFO: (&str, &str) = ("Ollama", "install: ollama.com/download");
 const STARTER_INFO: (&str, &str) = ("aivo starter", "free shared key, no signup needed");
 
@@ -2067,6 +2071,7 @@ impl KeysCommand {
             CodexOAuth,
             ClaudeOAuth,
             GrokOAuth,
+            KimiOAuth,
             Cursor,
             Ollama,
             Starter,
@@ -2104,6 +2109,10 @@ impl KeysCommand {
                     "SuperGrok (xAI)",
                     "device login — any coding agent".to_string(),
                 ),
+                ProviderChoice::KimiOAuth => (
+                    "Kimi Code (OAuth)",
+                    "device login — any coding agent".to_string(),
+                ),
                 ProviderChoice::Cursor => ("Cursor", "cursor-agent login/API key".to_string()),
                 ProviderChoice::Starter => ("aivo starter", "free".to_string()),
                 ProviderChoice::Custom => ("Custom URL", "enter manually".to_string()),
@@ -2132,32 +2141,35 @@ impl KeysCommand {
                 .collect()
         };
 
-        let hoisted_special: Option<ProviderChoice> =
-            if detected_indices.is_empty() && !name.is_empty() {
-                match name.trim().to_ascii_lowercase().as_str() {
-                    "ollama" => Some(ProviderChoice::Ollama),
-                    "copilot" => Some(ProviderChoice::Copilot),
-                    "codex" => Some(ProviderChoice::CodexOAuth),
-                    "claude" => Some(ProviderChoice::ClaudeOAuth),
-                    "grok" | "supergrok" => Some(ProviderChoice::GrokOAuth),
-                    "cursor" => Some(ProviderChoice::Cursor),
-                    _ => None,
-                }
-            } else {
-                None
-            };
+        let hoisted_special: Option<ProviderChoice> = if name.is_empty() {
+            None
+        } else {
+            match name.trim().to_ascii_lowercase().as_str() {
+                "ollama" => Some(ProviderChoice::Ollama),
+                "copilot" => Some(ProviderChoice::Copilot),
+                "codex" => Some(ProviderChoice::CodexOAuth),
+                "claude" => Some(ProviderChoice::ClaudeOAuth),
+                "grok" | "supergrok" => Some(ProviderChoice::GrokOAuth),
+                "kimi" | "kimi-code" => Some(ProviderChoice::KimiOAuth),
+                "cursor" => Some(ProviderChoice::Cursor),
+                _ => None,
+            }
+        };
 
-        // Hoist every matched entry right after Custom URL so users can pick
-        // among ambiguous matches (e.g. "bedrock" → Mantle + Runtime) without
-        // scrolling. The first match becomes the picker default.
-        if !detected_indices.is_empty() {
+        // Hoist matched entries right after Custom URL so users can pick among
+        // ambiguous matches (e.g. "bedrock" → Mantle + Runtime) without
+        // scrolling. An exact special-name match ("kimi" → Kimi Code OAuth)
+        // outranks substring provider matches ("Kimi For Coding" API key);
+        // both are offered, special first and preselected.
+        let hoisted = usize::from(hoisted_special.is_some()) + detected_indices.len();
+        if hoisted > 0 {
+            if let Some(special) = hoisted_special {
+                push(&mut choices, &mut labels, special);
+            }
             for &di in &detected_indices {
                 push(&mut choices, &mut labels, ProviderChoice::Known(di));
             }
-            preselected = Some(labels.len() - detected_indices.len());
-        } else if let Some(special) = hoisted_special {
-            push(&mut choices, &mut labels, special);
-            preselected = Some(labels.len() - 1);
+            preselected = Some(labels.len() - hoisted);
         }
 
         for (i, _) in providers.iter().enumerate() {
@@ -2173,6 +2185,7 @@ impl KeysCommand {
             ProviderChoice::CodexOAuth,
             ProviderChoice::ClaudeOAuth,
             ProviderChoice::GrokOAuth,
+            ProviderChoice::KimiOAuth,
             ProviderChoice::Cursor,
         ] {
             if hoisted_special == Some(choice) {
@@ -2224,6 +2237,7 @@ impl KeysCommand {
             ProviderChoice::CodexOAuth => self.add_codex_oauth_interactive(name).await,
             ProviderChoice::ClaudeOAuth => self.add_claude_oauth_interactive(name).await,
             ProviderChoice::GrokOAuth => self.add_grok_oauth_interactive(name).await,
+            ProviderChoice::KimiOAuth => self.add_kimi_oauth_interactive(name).await,
             ProviderChoice::Cursor => self.add_cursor_interactive(name, None).await,
             ProviderChoice::Ollama => self.add_ollama_interactive(name).await,
             ProviderChoice::Starter => self.add_starter_interactive(name).await,
@@ -2489,6 +2503,33 @@ impl KeysCommand {
             &id,
             final_name,
             "Signed in to SuperGrok",
+            Some(("aivo code", "(any coding agent can use this subscription)")),
+        )
+        .await?;
+        Ok(ExitCode::Success)
+    }
+
+    /// Interactive Kimi Code OAuth sign-in (device-code flow). The stored
+    /// credential is a provider bearer usable by any coding agent.
+    async fn add_kimi_oauth_interactive(&self, name: &str) -> Result<ExitCode> {
+        use crate::services::kimi_oauth::{KIMI_OAUTH_SENTINEL, interactive_login};
+
+        keys_ui::provider_info(KIMI_OAUTH_INFO.0, KIMI_OAUTH_INFO.1);
+        keys_ui::step_header(3, 3, "Sign in", "enter the code shown below at the URL");
+
+        let creds = interactive_login().await?;
+        let final_name = if name.is_empty() { "kimi" } else { name };
+        let creds_json = creds.to_json()?;
+
+        let id = self
+            .session_store
+            .add_key_with_protocol(final_name, KIMI_OAUTH_SENTINEL, None, &creds_json)
+            .await?;
+
+        self.finalize_add(
+            &id,
+            final_name,
+            "Signed in to Kimi Code",
             Some(("aivo code", "(any coding agent can use this subscription)")),
         )
         .await?;
@@ -2904,6 +2945,10 @@ impl KeysCommand {
                     (
                         crate::services::grok_oauth::GROK_OAUTH_SENTINEL,
                         "SuperGrok login needs the device flow",
+                    ),
+                    (
+                        crate::services::kimi_oauth::KIMI_OAUTH_SENTINEL,
+                        "Kimi Code login needs the device flow",
                     ),
                 ];
                 let reject = |msg: String| -> Option<ExitCode> {

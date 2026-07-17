@@ -786,6 +786,7 @@ async fn run_chat_via_responses(
         &config.api_key,
         config.copilot_token_manager.as_deref(),
         None,
+        None,
         initiator,
     )
     .await?;
@@ -903,6 +904,7 @@ async fn try_responses_api_passthrough(
         &target_url,
         &config.api_key,
         config.copilot_token_manager.as_deref(),
+        None,
         None,
         None,
     )
@@ -1147,6 +1149,7 @@ async fn stream_responses_via_chat(
         &config.api_key,
         config.copilot_token_manager.as_deref(),
         None,
+        None,
         initiator,
     )
     .await?;
@@ -1276,6 +1279,7 @@ async fn stream_chat_completions(
         &config.api_key,
         config.copilot_token_manager.as_deref(),
         None,
+        None,
         initiator,
     )
     .await?;
@@ -1385,6 +1389,7 @@ async fn forward_request(
         &target_url,
         &config.api_key,
         config.copilot_token_manager.as_deref(),
+        None,
         None,
         None,
     )
@@ -1532,6 +1537,7 @@ async fn forward_openai_protocol(
         &config.api_key,
         config.copilot_token_manager.as_deref(),
         None,
+        None,
         initiator,
     )
     .await?;
@@ -1599,6 +1605,7 @@ async fn try_responses_fallback(
         &target_url,
         &config.api_key,
         config.copilot_token_manager.as_deref(),
+        None,
         None,
         None,
     )

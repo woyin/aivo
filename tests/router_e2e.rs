@@ -438,6 +438,7 @@ fn serve_config(base_url: String, protocol: ProviderProtocol) -> ServeRouterConf
         is_copilot: false,
         is_grok: false,
         grok_fallback_api_key: None,
+        is_kimi: false,
         is_codex: false,
         is_claude_native_oauth: false,
         is_openrouter: false,

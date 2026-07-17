@@ -285,20 +285,27 @@ impl ApiKey {
         self.base_url == crate::services::grok_oauth::GROK_OAUTH_SENTINEL
     }
 
+    /// True when this entry stores a Kimi Code OAuth credential — a provider
+    /// bearer like grok's.
+    pub fn is_kimi_oauth(&self) -> bool {
+        self.base_url == crate::services::kimi_oauth::KIMI_OAUTH_SENTINEL
+    }
+
     /// OAuth credentials aivo can route to any coding agent via the ServeRouter
-    /// (SuperGrok, Codex), as opposed to single-CLI logins.
+    /// (SuperGrok, Codex, Kimi), as opposed to single-CLI logins.
     pub fn is_provider_oauth(&self) -> bool {
-        self.is_grok_oauth() || self.is_codex_oauth()
+        self.is_grok_oauth() || self.is_codex_oauth() || self.is_kimi_oauth()
     }
 
     /// True when this entry is any of the multi-account OAuth variants
-    /// (Codex/Claude/Gemini/Grok) — used by callers that share the same
+    /// (Codex/Claude/Gemini/Grok/Kimi) — used by callers that share the same
     /// "OAuth entries lack a REST endpoint / hold a credential blob" semantics.
     pub fn is_any_oauth(&self) -> bool {
         self.is_codex_oauth()
             || self.is_claude_oauth()
             || self.is_gemini_oauth()
             || self.is_grok_oauth()
+            || self.is_kimi_oauth()
     }
 
     pub fn oauth_tool_hint(&self) -> &'static str {
@@ -308,7 +315,7 @@ impl ApiKey {
             "aivo codex"
         } else if self.is_gemini_oauth() {
             "aivo gemini"
-        } else if self.is_grok_oauth() {
+        } else if self.is_grok_oauth() || self.is_kimi_oauth() {
             "aivo code"
         } else {
             "aivo <tool>"
@@ -341,6 +348,8 @@ impl ApiKey {
             "Gemini"
         } else if self.is_grok_oauth() {
             "SuperGrok"
+        } else if self.is_kimi_oauth() {
+            "Kimi Code"
         } else {
             "OAuth"
         }
@@ -369,6 +378,8 @@ impl ApiKey {
             Some("<Gemini OAuth>")
         } else if self.is_grok_oauth() {
             Some("<SuperGrok OAuth>")
+        } else if self.is_kimi_oauth() {
+            Some("<Kimi OAuth>")
         } else if self.is_copilot() {
             Some("<Copilot>")
         } else if self.is_cursor_acp() {

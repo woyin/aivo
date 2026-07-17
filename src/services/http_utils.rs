@@ -132,6 +132,7 @@ pub async fn authorized_openai_post(
     api_key: &str,
     copilot_token_manager: Option<&CopilotTokenManager>,
     grok_token_manager: Option<&crate::services::grok_oauth::GrokTokenManager>,
+    kimi_token_manager: Option<&crate::services::kimi_oauth::KimiTokenManager>,
     initiator: Option<&str>,
 ) -> Result<reqwest::RequestBuilder> {
     if let Some(gtm) = grok_token_manager {
@@ -161,6 +162,22 @@ pub async fn authorized_openai_post(
                 );
         }
         return Ok(b);
+    }
+    if let Some(ktm) = kimi_token_manager {
+        // Kimi: host + bearer come from the token manager. The base ends in
+        // `/coding/v1`, so re-join via build_target_url — naive host-relative
+        // glue would double the prefix.
+        use crate::services::kimi_oauth;
+        let auth = ktm.authorize().await?;
+        let url = build_target_url(&auth.base_url, copilot_path_from_target(target_url));
+        return Ok(client
+            .post(&url)
+            .header("Authorization", format!("Bearer {}", auth.bearer))
+            .header("Content-Type", CONTENT_TYPE_JSON)
+            .header("User-Agent", kimi_oauth::KIMI_USER_AGENT)
+            .header(kimi_oauth::PLATFORM_HEADER, kimi_oauth::PLATFORM_VALUE)
+            .header(kimi_oauth::VERSION_HEADER, kimi_oauth::CLIENT_VERSION)
+            .header(kimi_oauth::DEVICE_ID_HEADER, auth.device_id));
     }
     if let Some(tm) = copilot_token_manager {
         let (token, api_endpoint) = tm.get_token().await?;
@@ -1945,5 +1962,35 @@ mod tests {
             .await
             .expect("a flowing stream slower than the read timeout in total must complete");
         assert_eq!(&body[..], b"abcabcabc");
+    }
+
+    /// The kimi base ends in `/coding/v1`; re-deriving the path from a target
+    /// URL and gluing it back must not double that prefix (regression: 404s
+    /// from `/coding/v1/coding/v1/chat/completions`).
+    #[tokio::test]
+    async fn kimi_authorized_post_does_not_double_base_path() {
+        use crate::services::kimi_oauth::{
+            INFERENCE_BASE_URL, KimiOAuthCredential, KimiProviderTag, KimiTokenManager,
+        };
+        let creds = KimiOAuthCredential {
+            provider: KimiProviderTag::KimiCode,
+            access_token: "at".into(),
+            refresh_token: "rt".into(),
+            device_id: "d-id".into(),
+            expires_at: chrono::Utc::now() + chrono::Duration::seconds(900),
+            last_refresh: chrono::Utc::now(),
+        };
+        let mgr = KimiTokenManager::new(creds);
+        let client = reqwest::Client::new();
+        let target = build_target_url(INFERENCE_BASE_URL, "/v1/chat/completions");
+        let req = authorized_openai_post(&client, &target, "", None, None, Some(&mgr), None)
+            .await
+            .unwrap()
+            .build()
+            .unwrap();
+        assert_eq!(
+            req.url().as_str(),
+            "https://api.kimi.com/coding/v1/chat/completions"
+        );
     }
 }

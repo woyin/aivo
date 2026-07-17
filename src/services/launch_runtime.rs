@@ -1086,11 +1086,12 @@ async fn start_grok_serve_router(
     Ok(port)
 }
 
-/// If `router_key` is a provider-OAuth credential (Codex/Grok), starts the
+/// If `router_key` is a provider-OAuth credential (Codex/Kimi/Grok), starts the
 /// universal ServeRouter and returns its loopback port; `None` otherwise so the
-/// caller falls back to its tool-native static router. Probes codex first — a
-/// codex bundle also parses as the looser grok shape. Shared by every tool
-/// whose upstream is a local loopback router (claude/gemini/opencode/pi/codex).
+/// caller falls back to its tool-native static router. Probes codex and kimi
+/// before grok — both also parse as the looser grok shape (kimi's `provider`
+/// tag makes its own parse strict). Shared by every tool whose upstream is a
+/// local loopback router (claude/gemini/opencode/pi/codex).
 async fn start_provider_oauth_router(
     env: &HashMap<String, String>,
     router_key: String,
@@ -1100,6 +1101,10 @@ async fn start_provider_oauth_router(
         Ok(Some(
             start_codex_serve_router(env, router_key, session_store).await?,
         ))
+    } else if crate::services::kimi_oauth::KimiOAuthCredential::from_json(&router_key).is_ok() {
+        Ok(Some(
+            start_kimi_serve_router(env, router_key, session_store).await?,
+        ))
     } else if crate::services::grok_oauth::GrokOAuthCredential::from_json(&router_key).is_ok() {
         Ok(Some(
             start_grok_serve_router(env, router_key, session_store).await?,
@@ -1107,6 +1112,37 @@ async fn start_provider_oauth_router(
     } else {
         Ok(None)
     }
+}
+
+/// Universal ServeRouter for a kimi-oauth credential, so `aivo claude` etc.
+/// reach Kimi Code via the same path as `aivo code`. Returns the loopback port.
+async fn start_kimi_serve_router(
+    env: &HashMap<String, String>,
+    creds_json: String,
+    session_store: &SessionStore,
+) -> Result<u16> {
+    use crate::services::kimi_oauth::KIMI_OAUTH_SENTINEL;
+    use crate::services::serve_router::{ServeRouter, ServeRouterConfig};
+
+    let key = ApiKey::new_with_protocol(
+        "kimi".to_string(),
+        "kimi".to_string(),
+        KIMI_OAUTH_SENTINEL.to_string(),
+        None,
+        creds_json,
+    );
+    let config =
+        ServeRouterConfig::from_key(&key, false, 300, loopback_auth_token(env), HashMap::new());
+    let (handle, _shutdown, port) = ServeRouter::new(config, key, session_store.logs())
+        .with_oauth_persist(session_store.clone())
+        .start_background_with_addr("127.0.0.1", 0)
+        .await?;
+    tokio::spawn(async move {
+        if let Ok(Err(e)) = handle.await {
+            eprintln!("aivo: kimi serve router exited unexpectedly: {e}");
+        }
+    });
+    Ok(port)
 }
 
 /// Universal ServeRouter for a codex-oauth credential, so `aivo claude` reaches
