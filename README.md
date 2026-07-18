@@ -3,10 +3,11 @@
 Aivo `/ˈeɪ.voʊ/` is a lightweight CLI that runs coding agents — Claude Code, Codex, Gemini,
 OpenCode, Pi, and more — keeps your keys encrypted, and ships starter models that need no API key.
 
-[![CI](https://github.com/yuanchuan/aivo/actions/workflows/ci.yml/badge.svg)](https://github.com/yuanchuan/aivo/actions/workflows/ci.yml)
-[![MSRV](https://img.shields.io/badge/rustc-1.97+-orange.svg)](Cargo.toml)
-[![Binary size](https://img.shields.io/badge/binary-%3C10MB-blue.svg)](https://github.com/yuanchuan/aivo/releases)
-[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+![CI](https://github.com/yuanchuan/aivo/actions/workflows/ci.yml/badge.svg)
+![Release](https://img.shields.io/github/v/tag/yuanchuan/aivo?label=release&color=brightgreen)
+![MSRV](https://img.shields.io/badge/rustc-1.97+-orange.svg)
+![Binary size](https://img.shields.io/badge/binary-%3C10MB-blue.svg)
+![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)
 
 [**Docs**](https://getaivo.dev) · [Install](#install) · [Quick Start](#quick-start) · [Coding agents](#coding-agents) · [Commands](#commands)
 
