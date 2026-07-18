@@ -227,7 +227,7 @@ async fn install_action(args: SkillsInstallArgs) -> Result<ExitCode> {
     let dest_root = if args.project {
         skills::project_skills_dir(&cwd())
     } else {
-        skills::user_skills_dir().ok_or_else(|| anyhow!("cannot determine the home directory"))?
+        skills::user_skills_dir()
     };
     let only = if args.all {
         Some("*".to_string())

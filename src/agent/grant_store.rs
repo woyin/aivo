@@ -129,7 +129,8 @@ impl GrantStore {
             grants: self.persistent.clone(),
         };
         if let Ok(json) = serde_json::to_string_pretty(&file) {
-            let _ = std::fs::write(path, json);
+            let _ =
+                crate::services::atomic_write::atomic_write_secure_blocking(path, json.as_bytes());
         }
     }
 }

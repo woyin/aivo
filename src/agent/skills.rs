@@ -140,9 +140,10 @@ pub enum SkillScope {
     Project,
 }
 
-/// The user-global skills dir the `/skills` overlay scaffolds into.
-pub fn user_skills_dir() -> Option<PathBuf> {
-    crate::services::system_env::home_dir().map(|h| h.join(".config/aivo/skills"))
+/// The user-global skills dir the `/skills` overlay scaffolds into. Must match
+/// the aivo root `discover_skills` scans, including `AIVO_CONFIG_DIR` overrides.
+pub fn user_skills_dir() -> PathBuf {
+    crate::services::paths::config_dir().join("skills")
 }
 
 /// The project-tier dir `/skills add -p/--project` writes into: the repo's
@@ -1410,6 +1411,17 @@ mod tests {
         assert!(section.contains("- x: Short summary."));
         assert!(!section.contains("verbose verbose"));
         assert!(!section.contains("<untrusted"));
+    }
+
+    #[test]
+    fn user_skills_dir_matches_discovery_root() {
+        // The dir `/skills` scaffolds into must be one `discover_skills` scans,
+        // including under an `AIVO_CONFIG_DIR` override — a plain `~/.config/aivo`
+        // join here once left installs invisible to discovery.
+        assert_eq!(
+            user_skills_dir(),
+            crate::services::paths::config_dir().join("skills")
+        );
     }
 
     #[test]

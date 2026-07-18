@@ -1132,7 +1132,7 @@ is preserved."
                 std::path::Path::new(cwd),
             ))
         } else {
-            crate::agent::skills::user_skills_dir().ok_or_else(|| "no home directory".to_string())
+            Ok(crate::agent::skills::user_skills_dir())
         }
     }
 
