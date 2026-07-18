@@ -28,16 +28,16 @@ impl CodeTuiApp {
 
     /// Bump the generation and abort the prior task; returns the fresh gen.
     fn begin_account_flow(&mut self) -> u64 {
-        self.account_gen = self.account_gen.wrapping_add(1);
-        if let Some(task) = self.account_task.take() {
+        self.account.generation = self.account.generation.wrapping_add(1);
+        if let Some(task) = self.account.task.take() {
             task.abort();
         }
-        self.account_gen
+        self.account.generation
     }
 
     pub(super) fn cancel_account_login(&mut self) {
         let _ = self.begin_account_flow();
-        self.account_login = None;
+        self.account.login = None;
         self.notice = Some((MUTED(), "Sign-in cancelled.".to_string()));
     }
 
@@ -48,13 +48,13 @@ impl CodeTuiApp {
             return;
         }
         let account_gen = self.begin_account_flow();
-        self.pending_logout = None;
-        self.account_login = None;
+        self.account.pending_logout = None;
+        self.account.login = None;
         self.notice = Some((MUTED(), "Starting sign-in…".to_string()));
         let tx = self.tx.clone();
         let session_store = self.session_store.clone();
         let label = device_label();
-        self.account_task = Some(tokio::spawn(async move {
+        self.account.task = Some(tokio::spawn(async move {
             run_login_flow(tx, session_store, account_gen, label).await;
         }));
     }
@@ -69,11 +69,11 @@ impl CodeTuiApp {
             self.notice = Some((MUTED(), "Not logged in.".to_string()));
             return;
         };
-        if self.account_login.is_some() {
+        if self.account.login.is_some() {
             self.cancel_account_login();
             self.notice = None;
         }
-        self.pending_logout = Some(account.display().to_string());
+        self.account.pending_logout = Some(account.display().to_string());
     }
 
     /// `/logout` confirm card: y/Enter unlinks, n/Esc dismisses, else card stays.
@@ -83,7 +83,7 @@ impl CodeTuiApp {
         if !allow && !deny {
             return;
         }
-        if self.pending_logout.take().is_none() {
+        if self.account.pending_logout.take().is_none() {
             return;
         }
         if deny {
@@ -93,7 +93,7 @@ impl CodeTuiApp {
         self.notice = Some((MUTED(), "Signing out…".to_string()));
         let account_gen = self.begin_account_flow();
         let tx = self.tx.clone();
-        self.account_task = Some(tokio::spawn(async move {
+        self.account.task = Some(tokio::spawn(async move {
             let result = match device_auth::unlink_device().await {
                 Ok(()) => {
                     account_store::clear();
@@ -120,7 +120,7 @@ impl CodeTuiApp {
         }
         match key.code {
             KeyCode::Enter => {
-                let Some(url) = self.account_login.as_ref().map(|c| c.open_url.clone()) else {
+                let Some(url) = self.account.login.as_ref().map(|c| c.open_url.clone()) else {
                     return false;
                 };
                 if crate::services::browser_open::open_url(&url).is_err() {
@@ -155,19 +155,19 @@ impl CodeTuiApp {
         account_gen: u64,
         result: std::result::Result<(String, String), String>,
     ) {
-        if account_gen != self.account_gen {
+        if account_gen != self.account.generation {
             return;
         }
         match result {
             Ok((user_code, open_url)) => {
                 self.notice = None;
-                self.account_login = Some(AccountLoginCard {
+                self.account.login = Some(AccountLoginCard {
                     user_code,
                     open_url,
                 });
             }
             Err(msg) => {
-                self.account_login = None;
+                self.account.login = None;
                 self.notice = Some((ERROR(), msg));
             }
         }
@@ -179,11 +179,11 @@ impl CodeTuiApp {
         account_gen: u64,
         result: std::result::Result<String, String>,
     ) {
-        if account_gen != self.account_gen {
+        if account_gen != self.account.generation {
             return;
         }
-        self.account_task = None;
-        self.account_login = None;
+        self.account.task = None;
+        self.account.login = None;
         match result {
             Ok(msg) => {
                 // The TUI reads its own `ModelsCache`, not the shared instance
@@ -202,10 +202,10 @@ impl CodeTuiApp {
         account_gen: u64,
         result: std::result::Result<(), String>,
     ) {
-        if account_gen != self.account_gen {
+        if account_gen != self.account.generation {
             return;
         }
-        self.account_task = None;
+        self.account.task = None;
         match result {
             Ok(()) => {
                 // See `apply_account_login_done` on why this instance too.

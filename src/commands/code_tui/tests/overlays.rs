@@ -103,7 +103,7 @@ async fn test_account_commands_gated_to_aivo_key() {
     }
     // `/usage` on a BYOK key is a no-op with a hint — no task spawned.
     app.run_usage_command().await;
-    assert!(app.account_task.is_none());
+    assert!(app.account.task.is_none());
     assert!(
         app.notice
             .as_ref()
@@ -136,9 +136,9 @@ async fn test_account_login_card_flow_and_stale_generation() {
     app.key.base_url = crate::constants::AIVO_STARTER_SENTINEL.to_string();
 
     // Stand in for `run_login_command` (no network poll): notice, no card yet.
-    app.account_gen = 7;
+    app.account.generation = 7;
     app.notice = Some((MUTED(), "Starting sign-in…".to_string()));
-    assert!(app.account_login.is_none());
+    assert!(app.account.login.is_none());
 
     // The device code + URL arrive → the card appears, notice cleared.
     app.apply_account_login_prompt(
@@ -168,22 +168,22 @@ async fn test_account_login_card_flow_and_stale_generation() {
 
     // A prompt stamped with a stale generation is ignored (card stays).
     app.apply_account_login_prompt(3, Err("boom".to_string()));
-    assert!(app.account_login.is_some(), "stale error dropped the card");
+    assert!(app.account.login.is_some(), "stale error dropped the card");
 
     // Esc with a non-empty composer belongs to the draft — the card stays.
     app.draft = "half a thought".to_string();
     app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
         .await
         .unwrap();
-    assert!(app.account_login.is_some(), "Esc stole the draft's key");
+    assert!(app.account.login.is_some(), "Esc stole the draft's key");
 
     // Esc on an empty composer cancels: card gone, generation bumped.
     app.draft.clear();
     app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
         .await
         .unwrap();
-    assert!(app.account_login.is_none());
-    assert_ne!(app.account_gen, 7, "cancel must invalidate the flow");
+    assert!(app.account.login.is_none());
+    assert_ne!(app.account.generation, 7, "cancel must invalidate the flow");
 
     // A late success for the cancelled flow is dropped (no login notice).
     app.apply_account_login_done(7, Ok("Logged in as x".to_string()))
@@ -201,7 +201,7 @@ async fn test_account_login_card_flow_and_stale_generation() {
     app.cache
         .set(sentinel, vec!["aivo/starter".to_string()])
         .await;
-    let account_gen = app.account_gen;
+    let account_gen = app.account.generation;
     app.apply_account_login_done(account_gen, Ok("Logged in as x".to_string()))
         .await;
     assert!(
@@ -247,7 +247,7 @@ async fn test_logout_confirm_card_and_stale_done() {
     let mut app = make_test_app(tx, rx);
 
     // The confirm card owns the keyboard: n dismisses without unlinking.
-    app.pending_logout = Some("me@example.com".to_string());
+    app.account.pending_logout = Some("me@example.com".to_string());
     let (frame, _) = render_full_screen(&mut app, 80, 24);
     assert!(
         frame.contains("sign out of aivo"),
@@ -260,15 +260,15 @@ async fn test_logout_confirm_card_and_stale_done() {
     app.handle_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE))
         .await
         .unwrap();
-    assert!(app.pending_logout.is_none());
-    assert!(app.account_task.is_none(), "deny must not spawn an unlink");
+    assert!(app.account.pending_logout.is_none());
+    assert!(app.account.task.is_none(), "deny must not spawn an unlink");
 
     // A stale unlink result is ignored; the current one lands as a notice.
     let sentinel = crate::constants::AIVO_STARTER_SENTINEL;
     app.cache
         .set(sentinel, vec!["aivo/starter".to_string()])
         .await;
-    app.account_gen = 4;
+    app.account.generation = 4;
     app.apply_account_logout_done(1, Ok(())).await;
     assert!(
         app.notice

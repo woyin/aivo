@@ -85,7 +85,7 @@ impl CodeTuiApp {
         }
 
         // The `/logout` confirm card likewise owns the keyboard until decided.
-        if self.pending_logout.is_some() {
+        if self.account.pending_logout.is_some() {
             self.handle_logout_confirm_key(key);
             return Ok(false);
         }
@@ -129,7 +129,7 @@ impl CodeTuiApp {
         }
 
         // The `/login` status card consumes Enter/Esc only on an empty composer.
-        if self.account_login.is_some() && self.handle_login_card_key(key) {
+        if self.account.login.is_some() && self.handle_login_card_key(key) {
             return Ok(false);
         }
 

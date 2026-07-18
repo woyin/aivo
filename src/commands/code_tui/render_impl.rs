@@ -1215,7 +1215,7 @@ impl CodeTuiApp {
 
         if self.pending_mcp_consent.is_some() {
             self.render_mcp_consent_card(frame, composer_area, outer);
-        } else if self.pending_logout.is_some() {
+        } else if self.account.pending_logout.is_some() {
             self.render_logout_confirm_card(frame, composer_area, outer);
         } else if self.agent_permission.is_some() {
             self.render_permission_card(frame, composer_area, outer);
@@ -1231,7 +1231,7 @@ impl CodeTuiApp {
             if let (Some(s), Some(r)) = (clamped, self.agent_review.as_mut()) {
                 r.scroll = s;
             }
-        } else if self.account_login.is_some() {
+        } else if self.account.login.is_some() {
             // Last: passive status — decision cards win the slot.
             self.render_login_card(frame, composer_area, outer);
         }
@@ -1424,7 +1424,7 @@ impl CodeTuiApp {
         composer_area: Rect,
         frame_area: Rect,
     ) {
-        let Some(account) = self.pending_logout.as_ref() else {
+        let Some(account) = self.account.pending_logout.as_ref() else {
             return;
         };
         let lines = vec![
@@ -1456,7 +1456,7 @@ impl CodeTuiApp {
     /// The `/login` status card: code + URL + waiting state. Passive — it never
     /// owns the keyboard (see `handle_login_card_key`), so typing stays live.
     fn render_login_card(&self, frame: &mut Frame<'_>, composer_area: Rect, frame_area: Rect) {
-        let Some(card) = self.account_login.as_ref() else {
+        let Some(card) = self.account.login.as_ref() else {
             return;
         };
         let lines = vec![

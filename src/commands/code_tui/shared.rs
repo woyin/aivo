@@ -2971,19 +2971,27 @@ pub(super) struct CodeTuiApp {
     /// `--share` requested but not yet started — `maybe_start_live_share` defers it
     /// until the session settles so it pins the final session id.
     pub(super) live_requested: bool,
-    /// Account-flow generation — bumped on start/cancel so a superseded flow's
-    /// late result is dropped (mirrors `live_share_gen`).
-    pub(super) account_gen: u64,
-    /// In-flight login poll / unlink, aborted on cancel so an escaped login
-    /// can't write `account.json` after the user walked away.
-    pub(super) account_task: Option<JoinHandle<()>>,
-    /// `/login` waiting for approval — the status card.
-    pub(super) account_login: Option<AccountLoginCard>,
-    /// `/logout` awaiting its y/n confirm; the account display name.
-    pub(super) pending_logout: Option<String>,
+    /// `/login`–`/logout` flow state; only `account_impl.rs` drives it.
+    pub(super) account: AccountFlow,
     /// One-shot: the next draw clears first, healing emulator-corrupted cells
     /// that diff-only painting would never rewrite (macOS Tahoe Terminal.app).
     pub(super) pending_full_repaint: bool,
+}
+
+/// `/login`–`/logout` account-flow state, extracted so the one impl file that
+/// drives it (`account_impl.rs`) owns a named cluster instead of loose fields.
+#[derive(Default)]
+pub(super) struct AccountFlow {
+    /// Generation — bumped on start/cancel so a superseded flow's late result
+    /// is dropped (mirrors `live_share_gen`).
+    pub(super) generation: u64,
+    /// In-flight login poll / unlink, aborted on cancel so an escaped login
+    /// can't write `account.json` after the user walked away.
+    pub(super) task: Option<JoinHandle<()>>,
+    /// `/login` waiting for approval — the status card.
+    pub(super) login: Option<AccountLoginCard>,
+    /// `/logout` awaiting its y/n confirm; the account display name.
+    pub(super) pending_logout: Option<String>,
 }
 
 impl CodeTuiApp {
@@ -3166,10 +3174,7 @@ impl CodeTuiApp {
             live_share: None,
             live_share_starting: false,
             live_requested: false,
-            account_gen: 0,
-            account_task: None,
-            account_login: None,
-            pending_logout: None,
+            account: AccountFlow::default(),
             pending_full_repaint: false,
         }
     }
