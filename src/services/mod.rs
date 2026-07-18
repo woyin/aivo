@@ -54,6 +54,7 @@ pub mod http_debug;
 pub mod http_utils;
 pub mod huggingface;
 pub mod id_compact;
+pub mod json_store;
 pub mod key_compat;
 pub mod kimi_oauth;
 pub mod known_providers;

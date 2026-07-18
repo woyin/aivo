@@ -11,8 +11,6 @@ use std::path::{Path, PathBuf};
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
-use crate::services::atomic_write::{atomic_write_secure, ensure_private_dir};
-
 /// The account this device is linked to. `email`/`name` are best-effort —
 /// the server may omit them.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -54,18 +52,13 @@ pub fn load() -> Option<Account> {
 }
 
 fn load_from(path: &Path) -> Option<Account> {
-    let bytes = std::fs::read(path).ok()?;
-    serde_json::from_slice(&bytes).ok()
+    crate::services::json_store::load_optional(path)
 }
 
 /// Persists the account record atomically (0600).
 pub async fn save(account: &Account) -> Result<()> {
     let path = account_path().ok_or_else(|| anyhow::anyhow!("could not resolve home directory"))?;
-    if let Some(parent) = path.parent() {
-        ensure_private_dir(parent).await?;
-    }
-    let data = serde_json::to_vec_pretty(account)?;
-    atomic_write_secure(&path, data).await
+    crate::services::json_store::save(&path, account).await
 }
 
 /// Removes the stored account. Returns true if a record was present.

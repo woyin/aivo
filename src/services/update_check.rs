@@ -35,7 +35,7 @@ pub fn load() -> Option<UpdateCheck> {
 }
 
 fn load_from(path: &Path) -> Option<UpdateCheck> {
-    serde_json::from_slice(&std::fs::read(path).ok()?).ok()
+    crate::services::json_store::load_optional(path)
 }
 
 /// Best-effort persist (0600); a failed write just means we re-check sooner.
@@ -43,12 +43,7 @@ fn save_blocking(check: &UpdateCheck) {
     let Some(path) = cache_path() else {
         return;
     };
-    if let Some(parent) = path.parent() {
-        let _ = crate::services::atomic_write::ensure_private_dir_blocking(parent);
-    }
-    if let Ok(data) = serde_json::to_vec_pretty(check) {
-        let _ = crate::services::atomic_write::atomic_write_secure_blocking(&path, &data);
-    }
+    let _ = crate::services::json_store::save_blocking(&path, check);
 }
 
 /// Semver compare (a pre-release sorts below its release); shared with `UpdateCommand`.

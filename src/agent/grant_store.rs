@@ -45,9 +45,7 @@ impl GrantStore {
     /// grants already there. Missing/unreadable/foreign-schema file ⇒ empty (grants are
     /// additive, so failing open here only means "ask again", never "allow more").
     pub(crate) fn load(path: PathBuf) -> Self {
-        let persistent = std::fs::read_to_string(&path)
-            .ok()
-            .and_then(|t| serde_json::from_str::<GrantsFile>(&t).ok())
+        let persistent = crate::services::json_store::load_optional::<GrantsFile>(&path)
             .filter(|f| f.schema_version == SCHEMA_VERSION)
             .map(|f| f.grants)
             .unwrap_or_default();
@@ -121,17 +119,11 @@ impl GrantStore {
     /// plaintext JSON). A write failure is silent — the in-memory grant still holds.
     fn save(&self) {
         let Some(path) = &self.path else { return };
-        if let Some(parent) = path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
         let file = GrantsFile {
             schema_version: SCHEMA_VERSION,
             grants: self.persistent.clone(),
         };
-        if let Ok(json) = serde_json::to_string_pretty(&file) {
-            let _ =
-                crate::services::atomic_write::atomic_write_secure_blocking(path, json.as_bytes());
-        }
+        let _ = crate::services::json_store::save_blocking(path, &file);
     }
 }
 

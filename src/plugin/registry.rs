@@ -11,12 +11,11 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
 use super::manifest::PluginManifest;
 use super::plugins_dir;
-use crate::services::atomic_write::atomic_write_secure_blocking;
 use crate::style;
 
 const REGISTRY_VERSION: u32 = 1;
@@ -210,9 +209,7 @@ fn load_for_write(dir: &Path) -> Registry {
 }
 
 fn save_to(dir: &Path, reg: &Registry) -> Result<()> {
-    std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
-    let text = serde_json::to_string_pretty(reg).context("serializing the plugin registry")?;
-    atomic_write_secure_blocking(&dir.join(REGISTRY_FILE), text.as_bytes())
+    crate::services::json_store::save_blocking(&dir.join(REGISTRY_FILE), reg)
 }
 
 #[cfg(test)]

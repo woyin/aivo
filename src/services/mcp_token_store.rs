@@ -44,30 +44,16 @@ pub async fn remove(server: &str) -> Result<bool> {
 
 // ---- path-injectable inner functions (for tests) --------------------------
 
-/// Lenient read for the load path: a missing or unparseable file yields an empty
-/// map (a corrupt store just means tokens don't load → servers show needs-auth).
+/// Lenient read for the load path: a corrupt store just means tokens don't
+/// load → servers show needs-auth.
 fn read_root(path: &Path) -> BTreeMap<String, Value> {
-    std::fs::read_to_string(path)
-        .ok()
-        .and_then(|t| serde_json::from_str::<BTreeMap<String, Value>>(&t).ok())
-        .unwrap_or_default()
+    crate::services::json_store::load_or_default(path)
 }
 
-/// Strict read for the write path: a present-but-unparseable file is an error,
-/// so a save/remove never silently rewrites it from an empty map and destroys
-/// every other server's stored credential. A genuinely absent file is fine
-/// (start fresh).
+/// Strict read for the write path, so a save/remove never silently rewrites
+/// the store from an empty map and destroys other servers' credentials.
 fn read_root_for_write(path: &Path) -> Result<BTreeMap<String, Value>> {
-    match std::fs::read_to_string(path) {
-        Ok(text) => serde_json::from_str(&text).with_context(|| {
-            format!(
-                "{} is present but unparseable; refusing to overwrite it",
-                path.display()
-            )
-        }),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(BTreeMap::new()),
-        Err(e) => Err(anyhow::Error::new(e).context(format!("read {}", path.display()))),
-    }
+    crate::services::json_store::load_for_write(path)
 }
 
 fn load_at(path: &Path, server: &str) -> Option<McpOAuthCredential> {
@@ -93,13 +79,7 @@ async fn remove_at(path: &Path, server: &str) -> Result<bool> {
 }
 
 async fn write_root(path: &Path, root: &BTreeMap<String, Value>) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
-    }
-    let data = serde_json::to_vec_pretty(root).context("serialize mcp_tokens.json")?;
-    crate::services::atomic_write::atomic_write_secure(path, data)
-        .await
-        .with_context(|| format!("write {}", path.display()))
+    crate::services::json_store::save(path, root).await
 }
 
 #[cfg(test)]

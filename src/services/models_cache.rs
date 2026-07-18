@@ -202,9 +202,14 @@ impl ModelsCache {
 
         if let Some(json) = json {
             if let Some(parent) = self.cache_path.parent() {
-                let _ = tokio::fs::create_dir_all(parent).await;
+                let _ = crate::services::atomic_write::ensure_private_dir(parent).await;
             }
-            let _ = tokio::fs::write(&self.cache_path, json).await;
+            // Atomic so a crash mid-write can't leave a truncated cache file.
+            let _ = crate::services::atomic_write::atomic_write_secure(
+                &self.cache_path,
+                json.into_bytes(),
+            )
+            .await;
         }
     }
 
@@ -224,9 +229,14 @@ impl ModelsCache {
         };
         if let Some(json) = json {
             if let Some(parent) = self.cache_path.parent() {
-                let _ = tokio::fs::create_dir_all(parent).await;
+                let _ = crate::services::atomic_write::ensure_private_dir(parent).await;
             }
-            let _ = tokio::fs::write(&self.cache_path, json).await;
+            // Atomic so a crash mid-write can't leave a truncated cache file.
+            let _ = crate::services::atomic_write::atomic_write_secure(
+                &self.cache_path,
+                json.into_bytes(),
+            )
+            .await;
         }
     }
 

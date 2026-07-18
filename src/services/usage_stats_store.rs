@@ -2,7 +2,6 @@ use anyhow::{Context, Result};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::services::atomic_write::atomic_write_secure;
 use crate::services::session_store::{ConfigContext, ConfigLockGuard, UsageStats};
 
 /// Per-run token accumulator the plugin endpoint taps so a coding-agent run's
@@ -61,25 +60,13 @@ impl StatsFileContext {
     }
 
     async fn load(&self) -> Result<UsageStats> {
-        let data = match tokio::fs::read_to_string(&self.stats_path).await {
-            Ok(d) => d,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                return Ok(UsageStats::default());
-            }
-            Err(e) => return Err(e.into()),
-        };
-        serde_json::from_str(&data).context("Failed to parse stats.json")
+        // Strict on parse errors: a save under this lock follows, and it must
+        // not rewrite stats.json from a default it couldn't read.
+        crate::services::json_store::load_for_write_async(&self.stats_path).await
     }
 
     async fn save(&self, stats: &UsageStats) -> Result<()> {
-        if let Some(parent) = self.stats_path.parent() {
-            tokio::fs::create_dir_all(parent)
-                .await
-                .with_context(|| format!("Failed to create config directory: {:?}", parent))?;
-        }
-
-        let data = serde_json::to_string_pretty(stats).context("Failed to serialize stats")?;
-        atomic_write_secure(&self.stats_path, data.into_bytes()).await
+        crate::services::json_store::save(&self.stats_path, stats).await
     }
 }
 
