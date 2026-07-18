@@ -855,6 +855,12 @@ pub fn current_unix_ts() -> u64 {
         .as_secs()
 }
 
+/// Strips trailing slashes and a bare `/v1` suffix from a provider base URL.
+pub(crate) fn normalize_base_url(url: &str) -> &str {
+    let url = url.trim_end_matches('/');
+    url.strip_suffix("/v1").unwrap_or(url)
+}
+
 /// Parses a JSON value as a `u64`, accepting JSON integers, floats, numeric
 /// strings, and K/M-suffixed display strings.
 pub fn parse_token_u64(v: &Value) -> Option<u64> {

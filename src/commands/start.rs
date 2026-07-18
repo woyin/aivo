@@ -505,7 +505,9 @@ impl StartCommand {
             return Some(model);
         }
 
-        if crate::commands::models::starter_model_still_available(key, &self.cache, &model).await {
+        if crate::services::model_catalog::starter_model_still_available(key, &self.cache, &model)
+            .await
+        {
             return Some(model);
         }
 

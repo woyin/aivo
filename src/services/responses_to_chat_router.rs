@@ -527,7 +527,7 @@ async fn handle_models_request(
         None,
         config.api_key.clone(),
     );
-    let models = crate::commands::models::fetch_models(client, &key).await?;
+    let models = crate::services::model_catalog::fetch_models(client, &key).await?;
     let body = enriched_models_body(&models, &config.target_base_url, "aivo")
         .await
         .to_string();

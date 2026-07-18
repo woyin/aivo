@@ -267,7 +267,9 @@ impl CodeCommand {
     /// persisted model has been removed from the aivo-starter catalog so the
     /// caller knows why the picker is about to open.
     async fn starter_model_valid(&self, key: &ApiKey, model: &str) -> bool {
-        if crate::commands::models::starter_model_still_available(key, &self.cache, model).await {
+        if crate::services::model_catalog::starter_model_still_available(key, &self.cache, model)
+            .await
+        {
             return true;
         }
         eprintln!(

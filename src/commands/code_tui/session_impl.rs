@@ -3161,10 +3161,10 @@ async fn load_model_choices(
     key: &ApiKey,
     cache: &crate::services::ModelsCache,
 ) -> Vec<ModelChoice> {
-    match crate::commands::models::fetch_models_detailed(client, key).await {
+    match crate::services::model_catalog::fetch_models_detailed(client, key).await {
         Ok(infos) => {
             let ids: Vec<String> = infos.iter().map(|m| m.id.clone()).collect();
-            let cache_key = crate::commands::models::model_cache_key_for_key(key);
+            let cache_key = crate::services::model_catalog::model_cache_key_for_key(key);
             cache.set(&cache_key, ids).await;
             infos
                 .into_iter()

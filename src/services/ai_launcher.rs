@@ -807,7 +807,7 @@ impl AILauncher {
             options.tool,
             AIToolType::Pi | AIToolType::Opencode | AIToolType::Claude
         ) {
-            let cache_base = crate::commands::models::model_cache_key_for_key(&key);
+            let cache_base = crate::services::model_catalog::model_cache_key_for_key(&key);
             let mut limits = HashMap::new();
             for id in catalog_ids.into_iter().chain(model.as_deref()) {
                 if !limits.contains_key(id) {
@@ -853,14 +853,15 @@ impl AILauncher {
         if key.is_codex_oauth() || is_ollama_base(&key.base_url) || is_copilot_base(&key.base_url) {
             return None;
         }
-        let cache_key = crate::commands::models::model_cache_key_for_key(key);
+        let cache_key = crate::services::model_catalog::model_cache_key_for_key(key);
         if let Some(models) = self.cache.get(&cache_key).await {
             return Some(sanitize_discovered_slugs(models));
         }
         let client = crate::services::http_utils::router_http_client();
         let (spinning, spinner_handle) = crate::style::start_spinner(Some(" Fetching models..."));
         let result =
-            crate::commands::models::fetch_models_cached(&client, key, &self.cache, false).await;
+            crate::services::model_catalog::fetch_models_cached(&client, key, &self.cache, false)
+                .await;
         crate::style::stop_spinner(&spinning);
         let _ = spinner_handle.await;
         result.ok().map(sanitize_discovered_slugs)
@@ -955,7 +956,7 @@ impl AILauncher {
     ) -> Result<(Option<String>, Vec<String>)> {
         let requested_model = model.map(|m| m.strip_prefix("aivo/").unwrap_or(m).to_string());
         let client = crate::services::http_utils::router_http_client();
-        let cache_key = crate::commands::models::model_cache_key_for_key(key);
+        let cache_key = crate::services::model_catalog::model_cache_key_for_key(key);
 
         // Check cache first — skip the spinner if we get a hit
         let fetch_result = if let Some(cached) = self.cache.get(&cache_key).await {
@@ -966,8 +967,13 @@ impl AILauncher {
                 crate::style::start_spinner(Some(" Fetching models..."));
 
             // bypass_cache=true: we know it's a miss; fetch_models_cached will still write result to cache
-            let result =
-                crate::commands::models::fetch_models_cached(&client, key, &self.cache, true).await;
+            let result = crate::services::model_catalog::fetch_models_cached(
+                &client,
+                key,
+                &self.cache,
+                true,
+            )
+            .await;
 
             crate::style::stop_spinner(&spinning);
             let _ = spinner_handle.await;
@@ -1027,7 +1033,7 @@ impl AILauncher {
     /// right after the user selected a model. Cache-first so the spinner only
     /// shows on a genuine miss.
     async fn fetch_pi_models(&self, key: &ApiKey) -> Vec<String> {
-        let cache_key = crate::commands::models::full_catalog_cache_key_for_key(key);
+        let cache_key = crate::services::model_catalog::full_catalog_cache_key_for_key(key);
         if let Some((ids, metadata)) = self.cache.get_with_metadata(&cache_key).await
             && starter_catalog_window_cached(key, &metadata)
         {
@@ -1035,8 +1041,13 @@ impl AILauncher {
         }
         let client = crate::services::http_utils::router_http_client();
         let (spinning, spinner_handle) = crate::style::start_spinner(Some(" Fetching models..."));
-        let result =
-            crate::commands::models::fetch_all_models_cached(&client, key, &self.cache, true).await;
+        let result = crate::services::model_catalog::fetch_all_models_cached(
+            &client,
+            key,
+            &self.cache,
+            true,
+        )
+        .await;
         crate::style::stop_spinner(&spinning);
         let _ = spinner_handle.await;
         result.unwrap_or_default()

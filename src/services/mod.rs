@@ -64,6 +64,7 @@ pub mod log_store;
 pub mod loopback_oauth_callback;
 pub mod mcp_oauth;
 pub mod mcp_token_store;
+pub mod model_catalog;
 pub mod model_compat;
 pub mod model_data_sync;
 pub mod model_list_response;

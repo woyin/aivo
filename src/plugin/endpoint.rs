@@ -1100,7 +1100,7 @@ async fn model_limit_env_with_cache(
     key: &ApiKey,
     model: &str,
 ) -> Vec<(String, String)> {
-    let cache_base = crate::commands::models::model_cache_key_for_key(key);
+    let cache_base = crate::services::model_catalog::model_cache_key_for_key(key);
     let limits =
         crate::services::model_metadata::resolve_limits(cache, Some(&cache_base), model).await;
     let mut env = Vec::new();

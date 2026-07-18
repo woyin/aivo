@@ -18,11 +18,7 @@ pub(crate) fn print_no_model_list_hint() {
     eprintln!("  {} {}", style::dim("note:"), NO_MODEL_LIST_HINT);
 }
 
-/// Strips trailing slashes and a bare `/v1` suffix from a provider base URL.
-pub(crate) fn normalize_base_url(url: &str) -> &str {
-    let url = url.trim_end_matches('/');
-    url.strip_suffix("/v1").unwrap_or(url)
-}
+pub(crate) use crate::services::http_utils::normalize_base_url;
 
 /// Truncates `text` to its first line, then to `max_cols` terminal columns
 /// with an ellipsis. Width-aware: CJK chars count as 2 columns so picker

@@ -784,8 +784,12 @@ pub async fn run() -> ! {
                         (Some(m), Some(k))
                             if services::provider_profile::is_aivo_starter_base(&k.base_url) =>
                         {
-                            if commands::models::starter_model_still_available(k, &models_cache, &m)
-                                .await
+                            if services::model_catalog::starter_model_still_available(
+                                k,
+                                &models_cache,
+                                &m,
+                            )
+                            .await
                             {
                                 Some(m)
                             } else {

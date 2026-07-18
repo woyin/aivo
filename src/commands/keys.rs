@@ -1363,7 +1363,9 @@ impl KeysCommand {
         // A stale route usually means the endpoint changed; drop its cached
         // model list too so pickers re-fetch instead of serving the old catalog.
         self.models_cache
-            .remove(&crate::commands::models::model_cache_key_for_key(&key))
+            .remove(&crate::services::model_catalog::model_cache_key_for_key(
+                &key,
+            ))
             .await;
         println!(
             "{} Cleared learned routing state for {}.",

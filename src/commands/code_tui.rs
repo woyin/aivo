@@ -227,14 +227,14 @@ pub(super) async fn run_chat_tui(params: CodeTuiParams) -> Result<()> {
     // cache is stale, so server-side edits (e.g. reasoning-effort levels)
     // refresh on the next launch. Best-effort.
     let catalog_stale =
-        !crate::commands::models::full_catalog_metadata_fresh(&app.key, &app.cache).await;
+        !crate::services::model_catalog::full_catalog_metadata_fresh(&app.key, &app.cache).await;
     if app.context_window == 0 || catalog_stale {
         let cache = app.cache.clone();
         let key = app.key.clone();
         let client = app.client.clone();
         let tx = app.tx.clone();
         tokio::spawn(async move {
-            crate::commands::models::warm_full_catalog_metadata(&client, &key, &cache).await;
+            crate::services::model_catalog::warm_full_catalog_metadata(&client, &key, &cache).await;
             // Re-resolve the full limits (window + efforts), not just the window.
             let _ = tx.send(RuntimeEvent::CatalogWarmed);
         });

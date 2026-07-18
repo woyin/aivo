@@ -517,7 +517,7 @@ pub(crate) async fn handle_request(
 
     // Collapse `/v1/...` (Claude/Anthropic style) and the unversioned `/...`
     // (Codex/Pi style) to a single canonical form so each handler is named
-    // once below. Mirrors `commands::normalize_base_url`'s suffix-stripping
+    // once below. Mirrors `http_utils::normalize_base_url`'s suffix-stripping
     // on outbound URLs; here we strip the same prefix from inbound paths.
     let canonical = strip_v1_prefix(&path);
 

@@ -9,13 +9,13 @@ use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use crate::commands::models::fetch_models;
 use crate::constants::CONTENT_TYPE_JSON;
 use crate::services::anthropic_chat_request::AnthropicToOpenAIConfig;
 use crate::services::anthropic_chat_response::{OpenAIToAnthropicConfig, UsageValueMode};
 use crate::services::copilot_auth::CopilotTokenManager;
 use crate::services::http_utils::{self, router_http_client_with_timeout};
 use crate::services::log_store::{LogEvent, LogStore};
+use crate::services::model_catalog::fetch_models;
 use crate::services::model_list_response;
 use crate::services::model_names::strip_context_suffix;
 use crate::services::openai_anthropic_bridge::convert_openai_chat_response_to_sse;
@@ -782,7 +782,7 @@ async fn handle_models(state: &ServeState) -> Result<RouterResponse> {
     // Local cache instance: lazy one-time disk read, and this endpoint
     // already pays a network fetch per call.
     let cache = crate::services::models_cache::ModelsCache::new();
-    let cache_base = crate::commands::models::model_cache_key_for_key(&state.key);
+    let cache_base = crate::services::model_catalog::model_cache_key_for_key(&state.key);
     let mut entries = Vec::with_capacity(models.len() + state.config.aliases.len());
     for id in models {
         let limits =
