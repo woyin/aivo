@@ -257,7 +257,7 @@ pub(super) async fn run_chat_tui(params: CodeTuiParams) -> Result<()> {
     }
     // The event loop starts the share once the session settles (an async
     // `--resume` could still be loading a different session id here).
-    app.live_requested = share;
+    app.share.requested = share;
     let result = app.run().await;
     // The public link dies with the chat.
     app.stop_live_share();

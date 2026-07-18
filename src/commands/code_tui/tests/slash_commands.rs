@@ -139,7 +139,7 @@ async fn test_share_command_stop_and_usage_notices() {
         "notice: {:?}",
         app.notice
     );
-    assert!(app.live_share.is_none());
+    assert!(app.share.handle.is_none());
 
     // Unknown argument → usage notice (no background start).
     app.run_share_command(Some("frobnicate".to_string())).await;
@@ -148,7 +148,7 @@ async fn test_share_command_stop_and_usage_notices() {
         "notice: {:?}",
         app.notice
     );
-    assert!(!app.live_share_starting);
+    assert!(!app.share.starting);
 }
 
 #[tokio::test]
@@ -156,7 +156,7 @@ async fn test_share_command_reshows_url_then_stops() {
     use crate::services::share_live::LiveShareHandle;
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let mut app = make_test_app(tx, rx);
-    app.live_share = Some(LiveShareHandle::for_test(
+    app.share.handle = Some(LiveShareHandle::for_test(
         "https://s.getaivo.dev/v.html?t=zz",
     ));
 
@@ -167,12 +167,12 @@ async fn test_share_command_reshows_url_then_stops() {
         "notice: {:?}",
         app.notice
     );
-    assert!(app.live_share.is_some());
-    assert!(!app.live_share_starting);
+    assert!(app.share.handle.is_some());
+    assert!(!app.share.starting);
 
     // `/share stop` tears it down.
     app.run_share_command(Some("stop".to_string())).await;
-    assert!(app.live_share.is_none());
+    assert!(app.share.handle.is_none());
     assert!(app.notice.as_ref().unwrap().1.contains("stopped"));
 }
 
@@ -182,23 +182,23 @@ fn test_apply_live_share_ready_ok_and_err() {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let mut app = make_test_app(tx, rx);
 
-    app.live_share_starting = true;
+    app.share.starting = true;
     app.apply_live_share_ready(
-        app.live_share_gen,
+        app.share.generation,
         Ok(LiveShareHandle::for_test(
             "https://s.getaivo.dev/v.html?t=ok",
         )),
     );
-    assert!(!app.live_share_starting);
-    assert!(app.live_share.is_some());
+    assert!(!app.share.starting);
+    assert!(app.share.handle.is_some());
     assert!(app.notice.as_ref().unwrap().1.contains("t=ok"));
 
     // Failure: clears the starting flag, surfaces the reason, stores nothing.
-    app.live_share = None;
-    app.live_share_starting = true;
-    app.apply_live_share_ready(app.live_share_gen, Err("no link".to_string()));
-    assert!(!app.live_share_starting);
-    assert!(app.live_share.is_none());
+    app.share.handle = None;
+    app.share.starting = true;
+    app.apply_live_share_ready(app.share.generation, Err("no link".to_string()));
+    assert!(!app.share.starting);
+    assert!(app.share.handle.is_none());
     assert_eq!(app.notice.as_ref().unwrap().1, "no link");
 }
 
@@ -210,24 +210,24 @@ fn test_stale_live_share_ready_is_dropped() {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let mut app = make_test_app(tx, rx);
 
-    app.live_share_starting = true;
-    let stale_gen = app.live_share_gen;
+    app.share.starting = true;
+    let stale_gen = app.share.generation;
     assert!(
         app.stop_live_share(),
         "cancelling a mid-handshake start counts as a stop"
     );
-    assert!(!app.live_share_starting);
+    assert!(!app.share.starting);
 
     app.apply_live_share_ready(stale_gen, Ok(LiveShareHandle::for_test("https://s/old")));
-    assert!(app.live_share.is_none(), "stale handle must not install");
+    assert!(app.share.handle.is_none(), "stale handle must not install");
 
     // A new start under the bumped generation works.
-    app.live_share_starting = true;
+    app.share.starting = true;
     app.apply_live_share_ready(
-        app.live_share_gen,
+        app.share.generation,
         Ok(LiveShareHandle::for_test("https://s/new")),
     );
-    assert!(app.live_share.is_some());
+    assert!(app.share.handle.is_some());
 }
 
 /// A dead tunnel (network drop — no auto-reconnect) clears the badge and its
@@ -240,11 +240,11 @@ fn test_dead_share_tunnel_clears_badge() {
 
     let handle = LiveShareHandle::for_test("https://s/z");
     handle.mark_dead_for_test();
-    app.live_share = Some(handle);
+    app.share.handle = Some(handle);
 
     app.check_live_share_health();
 
-    assert!(app.live_share.is_none());
+    assert!(app.share.handle.is_none());
     assert!(app.notice.as_ref().unwrap().1.contains("disconnected"));
 
     // No share → no-op (must not overwrite an unrelated notice).
@@ -262,7 +262,7 @@ async fn test_maybe_start_live_share_defers_until_session_settles() {
     // No `--share` request → never starts.
     assert!(!app.maybe_start_live_share().await);
 
-    app.live_requested = true;
+    app.share.requested = true;
 
     // A pending `--resume` load defers the start (it must pin the resumed session).
     app.loading_resume = Some(LoadingResume {
@@ -281,18 +281,18 @@ async fn test_maybe_start_live_share_defers_until_session_settles() {
     });
     assert!(!app.maybe_start_live_share().await);
     assert!(
-        app.live_requested,
+        app.share.requested,
         "request stays pending while resume loads"
     );
     app.loading_resume = None;
 
     // An already-running share or an in-flight start are both no-ops.
-    app.live_share = Some(LiveShareHandle::for_test("https://x"));
+    app.share.handle = Some(LiveShareHandle::for_test("https://x"));
     assert!(!app.maybe_start_live_share().await);
-    app.live_share = None;
-    app.live_share_starting = true;
+    app.share.handle = None;
+    app.share.starting = true;
     assert!(!app.maybe_start_live_share().await);
-    assert!(app.live_requested);
+    assert!(app.share.requested);
 }
 
 #[test]

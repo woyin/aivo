@@ -27,15 +27,15 @@ impl CodeTuiApp {
     /// `--resume` load and with no startup picker open — so it pins the final
     /// session id, not the transient launch one. Fires at most once.
     pub(super) async fn maybe_start_live_share(&mut self) -> bool {
-        if !self.live_requested
-            || self.live_share.is_some()
-            || self.live_share_starting
+        if !self.share.requested
+            || self.share.handle.is_some()
+            || self.share.starting
             || self.loading_resume.is_some()
             || self.overlay.blocks_input()
         {
             return false;
         }
-        self.live_requested = false;
+        self.share.requested = false;
         self.begin_live_share().await;
         true
     }
@@ -43,12 +43,12 @@ impl CodeTuiApp {
     /// Persist, then kick off the share on a background task. No-op (re-shows the
     /// URL) when already sharing; ignored while a start is mid-flight.
     pub(super) async fn begin_live_share(&mut self) {
-        if let Some(handle) = &self.live_share {
+        if let Some(handle) = &self.share.handle {
             let url = handle.url().to_string();
             self.announce_live_url(&url);
             return;
         }
-        if self.live_share_starting {
+        if self.share.starting {
             self.notice = Some((MUTED(), "Share is already starting…".to_string()));
             return;
         }
@@ -58,7 +58,7 @@ impl CodeTuiApp {
             return;
         }
 
-        self.live_share_starting = true;
+        self.share.starting = true;
         self.notice = Some((MUTED(), "Starting share…".to_string()));
 
         let tx = self.tx.clone();
@@ -66,7 +66,7 @@ impl CodeTuiApp {
         let session_id = self.session_id.clone();
         let cwd = self.real_cwd.clone();
         // Stamped so a stop//new//resume during the handshake makes this start stale.
-        let share_gen = self.live_share_gen;
+        let share_gen = self.share.generation;
         tokio::spawn(async move {
             // `/share` without a login gets a clear notice; `--share` gated pre-TUI.
             if !crate::commands::share::device_linked().await {
@@ -116,9 +116,9 @@ impl CodeTuiApp {
     /// Tear down the active share and invalidate any start still mid-handshake.
     /// Returns whether anything was stopped.
     pub(super) fn stop_live_share(&mut self) -> bool {
-        self.live_share_gen = self.live_share_gen.wrapping_add(1);
-        let was_starting = std::mem::take(&mut self.live_share_starting);
-        if let Some(handle) = self.live_share.take() {
+        self.share.generation = self.share.generation.wrapping_add(1);
+        let was_starting = std::mem::take(&mut self.share.starting);
+        if let Some(handle) = self.share.handle.take() {
             handle.stop();
             true
         } else {
@@ -133,17 +133,17 @@ impl CodeTuiApp {
     ) {
         // Stale start (stopped//new//resumed mid-handshake): tear down, don't
         // install; `live_share_starting` belongs to a newer start, if any.
-        if share_gen != self.live_share_gen {
+        if share_gen != self.share.generation {
             if let Ok(handle) = result {
                 handle.stop();
             }
             return;
         }
-        self.live_share_starting = false;
+        self.share.starting = false;
         match result {
             Ok(handle) => {
                 let url = handle.url().to_string();
-                self.live_share = Some(handle);
+                self.share.handle = Some(handle);
                 self.announce_live_url(&url);
             }
             Err(msg) => self.notice = Some((ERROR(), msg)),
@@ -153,7 +153,7 @@ impl CodeTuiApp {
     /// Frame-tick check: a dead tunnel (no auto-reconnect) clears the badge and
     /// its server/refresher instead of lying until the URL stops resolving.
     pub(super) fn check_live_share_health(&mut self) {
-        if self.live_share.as_ref().is_some_and(|h| h.is_dead()) {
+        if self.share.handle.as_ref().is_some_and(|h| h.is_dead()) {
             self.stop_live_share();
             self.notice = Some((
                 ERROR(),

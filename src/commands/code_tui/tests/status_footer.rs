@@ -1404,7 +1404,7 @@ fn test_footer_shows_share_badge_only_when_sharing() {
     );
 
     // Active share → the `● sharing` badge appears in the footer.
-    app.live_share = Some(LiveShareHandle::for_test(
+    app.share.handle = Some(LiveShareHandle::for_test(
         "https://s.getaivo.dev/v.html?t=ab",
     ));
     let (screen, _) = render_full_screen(&mut app, 80, 12);

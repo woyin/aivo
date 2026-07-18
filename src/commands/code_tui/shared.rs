@@ -2961,21 +2961,30 @@ pub(super) struct CodeTuiApp {
     /// Held here, not in the (cloned-every-render) overlay, so the temp tree is
     /// deleted exactly once. The bool is the pick's `-p/--project` destination.
     pub(super) staged_skill_install: Option<(crate::agent::skills::StagedInstall, bool)>,
-    /// Active share, `None` when not sharing; its presence drives the footer
-    /// `● sharing` badge. Stopped on `/share stop`, `/new`, resume, and exit.
-    pub(super) live_share: Option<crate::services::share_live::LiveShareHandle>,
-    /// True between a start and its `LiveShareReady` event; blocks a second start.
-    pub(super) live_share_starting: bool,
-    /// Bumped by `stop_live_share` so an in-flight start's result reads as stale.
-    pub(super) live_share_gen: u64,
-    /// `--share` requested but not yet started — `maybe_start_live_share` defers it
-    /// until the session settles so it pins the final session id.
-    pub(super) live_requested: bool,
+    /// `/share` live-share state; only `live_impl.rs` drives it (the footer
+    /// badge reads `handle` presence).
+    pub(super) share: LiveShareState,
     /// `/login`–`/logout` flow state; only `account_impl.rs` drives it.
     pub(super) account: AccountFlow,
     /// One-shot: the next draw clears first, healing emulator-corrupted cells
     /// that diff-only painting would never rewrite (macOS Tahoe Terminal.app).
     pub(super) pending_full_repaint: bool,
+}
+
+/// `/share` live-share state, extracted so the one impl file that drives it
+/// (`live_impl.rs`) owns a named cluster instead of loose fields.
+#[derive(Default)]
+pub(super) struct LiveShareState {
+    /// Active share, `None` when not sharing; its presence drives the footer
+    /// `● sharing` badge. Stopped on `/share stop`, `/new`, resume, and exit.
+    pub(super) handle: Option<crate::services::share_live::LiveShareHandle>,
+    /// True between a start and its `LiveShareReady` event; blocks a second start.
+    pub(super) starting: bool,
+    /// Bumped by `stop_live_share` so an in-flight start's result reads as stale.
+    pub(super) generation: u64,
+    /// `--share` requested but not yet started — `maybe_start_live_share` defers it
+    /// until the session settles so it pins the final session id.
+    pub(super) requested: bool,
 }
 
 /// `/login`–`/logout` account-flow state, extracted so the one impl file that
@@ -3130,7 +3139,6 @@ impl CodeTuiApp {
             disabled_mcp_tools: std::collections::HashSet::new(),
             mcp_connect_gen: 0,
             engine_rebuild_pending: false,
-            live_share_gen: 0,
             pending_mcp_auth: std::collections::HashMap::new(),
             agent_serve: None,
             agent_permission: None,
@@ -3171,9 +3179,7 @@ impl CodeTuiApp {
             reasoning_elapsed_ms: None,
             installing_skill: None,
             staged_skill_install: None,
-            live_share: None,
-            live_share_starting: false,
-            live_requested: false,
+            share: LiveShareState::default(),
             account: AccountFlow::default(),
             pending_full_repaint: false,
         }

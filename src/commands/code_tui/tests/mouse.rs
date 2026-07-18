@@ -932,7 +932,7 @@ fn test_empty_state_notice_selects_via_screen_surface() {
     // `--share` launch state: empty transcript, share-URL notice (the notice draws
     // the URL line; the handle just drives the badge).
     assert!(app.is_transcript_empty());
-    app.live_share = Some(LiveShareHandle::for_test(
+    app.share.handle = Some(LiveShareHandle::for_test(
         "https://s.getaivo.dev/s/uniqueurlzz",
     ));
     app.notice = Some((

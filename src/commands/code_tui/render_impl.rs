@@ -2943,7 +2943,7 @@ impl CodeTuiApp {
             });
         }
         // Reserve columns for the model-line badges so the text truncates to fit them.
-        let live = self.live_share.is_some();
+        let live = self.share.handle.is_some();
         let plain_chat = !self.agent_tools_enabled;
         let glue = 3u16; // " · " between the model and each badge
         let badge_w = if live {
