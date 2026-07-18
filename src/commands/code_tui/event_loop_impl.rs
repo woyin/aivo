@@ -39,16 +39,17 @@ impl CodeTuiApp {
             }
             RuntimeEvent::SessionPreviewLoaded { session_id, entry } => {
                 // Always cache — an entry for a no-longer-selected row is still correct.
-                if self.session_preview_cache.len() >= PREVIEW_CACHE_CAP {
-                    self.session_preview_cache.clear();
+                if self.session_preview.cache.len() >= PREVIEW_CACHE_CAP {
+                    self.session_preview.cache.clear();
                 }
-                self.session_preview_cache.insert(session_id.clone(), entry);
+                self.session_preview.cache.insert(session_id.clone(), entry);
                 if self
-                    .session_preview_task
+                    .session_preview
+                    .task
                     .as_ref()
                     .is_some_and(|(sid, _)| *sid == session_id)
                 {
-                    self.session_preview_task = None;
+                    self.session_preview.task = None;
                 }
             }
             RuntimeEvent::CursorSessionOpened(session) => {
@@ -1562,38 +1563,40 @@ impl CodeTuiApp {
             _ => None,
         };
         let Some(preview) = wanted else {
-            self.session_preview_pending = None;
+            self.session_preview.pending = None;
             return false;
         };
         let session_id = preview.session_id.clone();
         let updated_at = preview.updated_at.clone();
         // Valid cache entry (same index updated_at) → nothing to load.
         if self
-            .session_preview_cache
+            .session_preview
+            .cache
             .get(&session_id)
             .is_some_and(|entry| entry.updated_at == updated_at)
         {
-            self.session_preview_pending = None;
+            self.session_preview.pending = None;
             return false;
         }
-        let due = match &self.session_preview_pending {
+        let due = match &self.session_preview.pending {
             Some((sid, due)) if *sid == session_id => Instant::now() >= *due,
             _ => {
                 // (Re)arm the debounce whenever the selection lands on a new row.
-                self.session_preview_pending =
+                self.session_preview.pending =
                     Some((session_id, Instant::now() + PREVIEW_DEBOUNCE));
                 return false;
             }
         };
         if !due
             || self
-                .session_preview_task
+                .session_preview
+                .task
                 .as_ref()
                 .is_some_and(|(sid, task)| *sid == session_id && !task.is_finished())
         {
             return false;
         }
-        self.session_preview_pending = None;
+        self.session_preview.pending = None;
 
         let session_store = self.session_store.clone();
         let tx = self.tx.clone();
@@ -1619,7 +1622,7 @@ impl CodeTuiApp {
                 entry,
             });
         });
-        self.session_preview_task = Some((session_id, task));
+        self.session_preview.task = Some((session_id, task));
         true
     }
 
@@ -1779,11 +1782,11 @@ impl CodeTuiApp {
         // itself shuts down at process exit.
         let response_task = self.response_task.take();
         let resume_task = self.resume_task.take();
-        let preview_task = self.session_preview_task.take();
+        let preview_task = self.session_preview.task.take();
         let local_command = self.local_command.take();
         self.loading_resume = None;
         self.resume_restore_state = None;
-        self.session_preview_pending = None;
+        self.session_preview.pending = None;
         if let Some(task) = response_task {
             task.abort();
             let _ = task.await;

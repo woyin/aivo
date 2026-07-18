@@ -2727,13 +2727,8 @@ pub(super) struct CodeTuiApp {
     pub(super) resume_request_id: u64,
     pub(super) loading_resume: Option<LoadingResume>,
     pub(super) resume_restore_state: Option<ResumeRestoreState>,
-    /// `/resume` preview cache: session id → history tail, valid while its
-    /// `updated_at` matches the index row's.
-    pub(super) session_preview_cache: std::collections::HashMap<String, PreviewEntry>,
-    /// Debounced preview load: spawned once `due` passes with the selection still there.
-    pub(super) session_preview_pending: Option<(String, Instant)>,
-    /// In-flight preview load; at most one at a time.
-    pub(super) session_preview_task: Option<(String, JoinHandle<()>)>,
+    /// `/resume` picker preview state; only `event_loop_impl.rs` drives it.
+    pub(super) session_preview: SessionPreviewState,
     pub(super) reduce_motion: bool,
     pub(super) frame_tick: usize,
     pub(super) picker_hitbox: Option<PickerHitbox>,
@@ -2971,6 +2966,19 @@ pub(super) struct CodeTuiApp {
     pub(super) pending_full_repaint: bool,
 }
 
+/// `/resume` picker preview state (cache + debounce + in-flight load), driven
+/// by `event_loop_impl.rs`.
+#[derive(Default)]
+pub(super) struct SessionPreviewState {
+    /// Preview cache: session id → history tail, valid while its
+    /// `updated_at` matches the index row's.
+    pub(super) cache: std::collections::HashMap<String, PreviewEntry>,
+    /// Debounced preview load: spawned once `due` passes with the selection still there.
+    pub(super) pending: Option<(String, Instant)>,
+    /// In-flight preview load; at most one at a time.
+    pub(super) task: Option<(String, JoinHandle<()>)>,
+}
+
 /// `/share` live-share state, extracted so the one impl file that drives it
 /// (`live_impl.rs`) owns a named cluster instead of loose fields.
 #[derive(Default)]
@@ -3107,9 +3115,7 @@ impl CodeTuiApp {
             resume_request_id: 0,
             loading_resume: None,
             resume_restore_state: None,
-            session_preview_cache: std::collections::HashMap::new(),
-            session_preview_pending: None,
-            session_preview_task: None,
+            session_preview: SessionPreviewState::default(),
             reduce_motion: false,
             frame_tick: 0,
             picker_hitbox: None,

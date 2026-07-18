@@ -276,7 +276,8 @@ impl CodeTuiApp {
         };
         // A stale entry (updated_at mismatch) reads as absent; the tick reloads it.
         let entry = self
-            .session_preview_cache
+            .session_preview
+            .cache
             .get(&preview.session_id)
             .filter(|entry| entry.updated_at == preview.updated_at);
         let scroll_up = if picker.preview_scroll_for.as_deref() == Some(preview.session_id.as_str())

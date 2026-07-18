@@ -451,7 +451,7 @@ async fn test_session_picker_preview_bottom_anchor_and_clamp() {
             )
         })
         .collect();
-    app.session_preview_cache.insert(
+    app.session_preview.cache.insert(
         newest.session_id.clone(),
         PreviewEntry {
             updated_at: newest.updated_at.clone(),
@@ -511,7 +511,7 @@ async fn test_session_preview_loaded_caches_even_when_not_selected() {
         })
         .unwrap();
     assert!(app.handle_runtime_events().await.unwrap());
-    assert!(app.session_preview_cache.contains_key("sess-old"));
+    assert!(app.session_preview.cache.contains_key("sess-old"));
 }
 
 #[tokio::test]
@@ -523,26 +523,26 @@ async fn test_tick_session_preview_debounce_and_invalidation() {
 
     // No split pane rendered yet → nothing scheduled.
     assert!(!app.tick_session_preview());
-    assert!(app.session_preview_pending.is_none());
+    assert!(app.session_preview.pending.is_none());
 
     // Split active: the first tick arms the debounce, the next is not yet due.
     app.overlay_detail_area = Some(Rect::new(0, 0, 40, 20));
     assert!(!app.tick_session_preview());
-    assert!(app.session_preview_pending.is_some());
+    assert!(app.session_preview.pending.is_some());
     assert!(!app.tick_session_preview());
-    assert!(app.session_preview_task.is_none());
+    assert!(app.session_preview.task.is_none());
 
     // Once due, exactly one load task spawns and the pending slot clears.
-    if let Some((_, due)) = &mut app.session_preview_pending {
+    if let Some((_, due)) = &mut app.session_preview.pending {
         *due = Instant::now() - Duration::from_millis(1);
     }
     assert!(app.tick_session_preview());
-    assert!(app.session_preview_task.is_some());
-    assert!(app.session_preview_pending.is_none());
+    assert!(app.session_preview.task.is_some());
+    assert!(app.session_preview.pending.is_none());
 
     // A valid cache entry (matching updated_at) suppresses any reload…
-    app.session_preview_task = None;
-    app.session_preview_cache.insert(
+    app.session_preview.task = None;
+    app.session_preview.cache.insert(
         newest.session_id.clone(),
         PreviewEntry {
             updated_at: newest.updated_at.clone(),
@@ -552,15 +552,16 @@ async fn test_tick_session_preview_debounce_and_invalidation() {
         },
     );
     assert!(!app.tick_session_preview());
-    assert!(app.session_preview_pending.is_none());
+    assert!(app.session_preview.pending.is_none());
 
     // …while a stale one (index row updated since) re-arms the debounce.
-    app.session_preview_cache
+    app.session_preview
+        .cache
         .get_mut(&newest.session_id)
         .unwrap()
         .updated_at = "stale".to_string();
     assert!(!app.tick_session_preview());
-    assert!(app.session_preview_pending.is_some());
+    assert!(app.session_preview.pending.is_some());
 }
 
 #[tokio::test]
