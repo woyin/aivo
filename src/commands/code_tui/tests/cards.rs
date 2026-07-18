@@ -16,7 +16,7 @@ fn test_permission_card_anchored_above_composer() {
         });
     }
     let (reply, _rx) = tokio::sync::oneshot::channel::<crate::agent::protocol::Decision>();
-    app.agent_permission = Some(PendingPermission {
+    app.cards.permission = Some(PendingPermission {
         tool: "run_bash".to_string(),
         preview: Some("rm -rf build/".to_string()),
         reply,
@@ -88,7 +88,7 @@ fn test_permission_card_keys_always_visible_in_short_terminal() {
         .map(|i| format!("line {i} of a very long command"))
         .collect::<Vec<_>>()
         .join("\n");
-    app.agent_permission = Some(PendingPermission {
+    app.cards.permission = Some(PendingPermission {
         tool: "run_bash".to_string(),
         preview: Some(preview),
         reply,
@@ -149,7 +149,7 @@ async fn test_shift_tab_on_permission_card_approves_and_enables() {
 
     // A tool-permission card is up, holding the keyboard.
     let (reply, decision_rx) = tokio::sync::oneshot::channel();
-    app.agent_permission = Some(PendingPermission {
+    app.cards.permission = Some(PendingPermission {
         tool: "run_bash".to_string(),
         preview: Some("rm -rf build".to_string()),
         reply,
@@ -166,7 +166,7 @@ async fn test_shift_tab_on_permission_card_approves_and_enables() {
             .load(std::sync::atomic::Ordering::Relaxed),
         "the live flag the running turn reads is set"
     );
-    assert!(app.agent_permission.is_none(), "the card is dismissed");
+    assert!(app.cards.permission.is_none(), "the card is dismissed");
     assert_eq!(
         decision_rx.await.unwrap(),
         Decision::Allow,
@@ -186,7 +186,7 @@ async fn test_always_on_cursor_card_enables_auto_approve() {
     assert!(!app.agent_auto_approve);
 
     let (reply, decision_rx) = tokio::sync::oneshot::channel();
-    app.agent_permission = Some(PendingPermission {
+    app.cards.permission = Some(PendingPermission {
         tool: "cursor".to_string(),
         preview: Some("Cursor wants to run:\nedit main.rs".to_string()),
         reply,
@@ -218,7 +218,7 @@ async fn test_always_on_native_card_leaves_auto_approve_off() {
     assert!(!app.agent_auto_approve);
 
     let (reply, decision_rx) = tokio::sync::oneshot::channel();
-    app.agent_permission = Some(PendingPermission {
+    app.cards.permission = Some(PendingPermission {
         tool: "run_bash".to_string(),
         preview: Some("rm -rf build".to_string()),
         reply,
@@ -253,7 +253,7 @@ async fn test_permission_card_keys_do_not_decide_while_composing() {
     app.draft = "deplo".to_string();
     app.cursor = app.draft.len();
     let (reply, mut decision_rx) = tokio::sync::oneshot::channel::<Decision>();
-    app.agent_permission = Some(PendingPermission {
+    app.cards.permission = Some(PendingPermission {
         tool: "run_bash".to_string(),
         preview: Some("rm -rf build".to_string()),
         reply,
@@ -265,7 +265,7 @@ async fn test_permission_card_keys_do_not_decide_while_composing() {
         .unwrap();
     assert_eq!(app.draft, "deploy", "the keystroke typed into the draft");
     assert!(
-        app.agent_permission.is_some(),
+        app.cards.permission.is_some(),
         "the card stays up — the key did not decide"
     );
     assert!(
@@ -280,7 +280,7 @@ async fn test_permission_card_keys_do_not_decide_while_composing() {
     app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
         .await
         .unwrap();
-    assert!(app.agent_permission.is_none(), "Esc resolves the card");
+    assert!(app.cards.permission.is_none(), "Esc resolves the card");
     assert_eq!(decision_rx.await.unwrap(), Decision::Deny);
 }
 
@@ -294,7 +294,7 @@ async fn test_permission_card_y_approves_with_empty_composer() {
     assert!(app.draft.is_empty());
 
     let (reply, decision_rx) = tokio::sync::oneshot::channel::<Decision>();
-    app.agent_permission = Some(PendingPermission {
+    app.cards.permission = Some(PendingPermission {
         tool: "run_bash".to_string(),
         preview: Some("ls".to_string()),
         reply,
@@ -302,7 +302,7 @@ async fn test_permission_card_y_approves_with_empty_composer() {
     app.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE))
         .await
         .unwrap();
-    assert!(app.agent_permission.is_none(), "the card is resolved");
+    assert!(app.cards.permission.is_none(), "the card is resolved");
     assert_eq!(decision_rx.await.unwrap(), Decision::Allow);
 }
 
@@ -315,7 +315,7 @@ fn test_permission_card_shows_composing_hint() {
     app.draft = "next message".to_string();
     app.cursor = app.draft.len();
     let (reply, _rx) = tokio::sync::oneshot::channel::<crate::agent::protocol::Decision>();
-    app.agent_permission = Some(PendingPermission {
+    app.cards.permission = Some(PendingPermission {
         tool: "run_bash".to_string(),
         preview: Some("ls".to_string()),
         reply,
@@ -335,7 +335,7 @@ fn test_permission_card_cursor_always_label_says_session() {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let mut app = make_test_app(tx, rx);
     let (reply, _rx) = tokio::sync::oneshot::channel::<crate::agent::protocol::Decision>();
-    app.agent_permission = Some(PendingPermission {
+    app.cards.permission = Some(PendingPermission {
         tool: "cursor".to_string(),
         preview: Some("edit main.rs".to_string()),
         reply,
@@ -354,7 +354,7 @@ fn test_permission_card_native_always_label_is_plain() {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let mut app = make_test_app(tx, rx);
     let (reply, _rx) = tokio::sync::oneshot::channel::<crate::agent::protocol::Decision>();
-    app.agent_permission = Some(PendingPermission {
+    app.cards.permission = Some(PendingPermission {
         tool: "run_bash".to_string(),
         preview: Some("ls".to_string()),
         reply,
@@ -387,7 +387,7 @@ async fn test_ask_card_arrow_then_enter_selects_option() {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let mut app = make_test_app(tx, rx);
     let (reply, answer_rx) = tokio::sync::oneshot::channel::<std::result::Result<String, String>>();
-    app.agent_ask = Some(PendingAskUser {
+    app.cards.ask = Some(PendingAskUser {
         question: "Add release notes now?".to_string(),
         options: ask_options(&["Yes, I'll write them", "You add them", "No, auto-generate"]),
         allow_free_text: true,
@@ -404,7 +404,7 @@ async fn test_ask_card_arrow_then_enter_selects_option() {
         .await
         .unwrap();
 
-    assert!(app.agent_ask.is_none(), "answering resolves the card");
+    assert!(app.cards.ask.is_none(), "answering resolves the card");
     assert_eq!(answer_rx.await.unwrap(), Ok("You add them".to_string()));
 }
 
@@ -414,7 +414,7 @@ async fn test_ask_card_digit_picks_option() {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let mut app = make_test_app(tx, rx);
     let (reply, answer_rx) = tokio::sync::oneshot::channel::<std::result::Result<String, String>>();
-    app.agent_ask = Some(PendingAskUser {
+    app.cards.ask = Some(PendingAskUser {
         question: "Pick one".to_string(),
         options: ask_options(&["alpha", "beta", "gamma"]),
         allow_free_text: true,
@@ -428,7 +428,7 @@ async fn test_ask_card_digit_picks_option() {
         .await
         .unwrap();
 
-    assert!(app.agent_ask.is_none());
+    assert!(app.cards.ask.is_none());
     assert_eq!(answer_rx.await.unwrap(), Ok("gamma".to_string()));
 }
 
@@ -439,7 +439,7 @@ async fn test_ask_card_free_text_answer() {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let mut app = make_test_app(tx, rx);
     let (reply, answer_rx) = tokio::sync::oneshot::channel::<std::result::Result<String, String>>();
-    app.agent_ask = Some(PendingAskUser {
+    app.cards.ask = Some(PendingAskUser {
         question: "Which version?".to_string(),
         options: ask_options(&["patch", "minor"]),
         allow_free_text: true,
@@ -455,7 +455,7 @@ async fn test_ask_card_free_text_answer() {
         .await
         .unwrap();
 
-    assert!(app.agent_ask.is_none());
+    assert!(app.cards.ask.is_none());
     assert!(app.draft.is_empty(), "the draft is consumed as the answer");
     assert_eq!(answer_rx.await.unwrap(), Ok("0.36.0".to_string()));
 }
@@ -467,7 +467,7 @@ async fn test_ask_card_esc_dismisses() {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let mut app = make_test_app(tx, rx);
     let (reply, answer_rx) = tokio::sync::oneshot::channel::<std::result::Result<String, String>>();
-    app.agent_ask = Some(PendingAskUser {
+    app.cards.ask = Some(PendingAskUser {
         question: "Proceed?".to_string(),
         options: ask_options(&["Yes", "No"]),
         allow_free_text: false,
@@ -481,7 +481,7 @@ async fn test_ask_card_esc_dismisses() {
         .await
         .unwrap();
 
-    assert!(app.agent_ask.is_none(), "Esc resolves the card");
+    assert!(app.cards.ask.is_none(), "Esc resolves the card");
     assert!(answer_rx.await.unwrap().is_err());
 }
 
@@ -491,7 +491,7 @@ fn test_ask_card_renders_question_and_options() {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let mut app = make_test_app(tx, rx);
     let (reply, _rx) = tokio::sync::oneshot::channel::<std::result::Result<String, String>>();
-    app.agent_ask = Some(PendingAskUser {
+    app.cards.ask = Some(PendingAskUser {
         question: "Add release notes now?".to_string(),
         options: ask_options(&["You add them", "Auto-generate"]),
         allow_free_text: true,
@@ -528,7 +528,7 @@ async fn test_ask_card_multi_select_space_toggles_and_enter_joins() {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let mut app = make_test_app(tx, rx);
     let (reply, answer_rx) = tokio::sync::oneshot::channel::<std::result::Result<String, String>>();
-    app.agent_ask = Some(PendingAskUser {
+    app.cards.ask = Some(PendingAskUser {
         question: "Which checks?".to_string(),
         options: ask_options(&["fmt", "clippy", "test"]),
         allow_free_text: false,
@@ -551,13 +551,13 @@ async fn test_ask_card_multi_select_space_toggles_and_enter_joins() {
     app.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE))
         .await
         .unwrap();
-    assert!(app.agent_ask.is_some(), "space toggles without confirming");
+    assert!(app.cards.ask.is_some(), "space toggles without confirming");
     app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
         .await
         .unwrap();
 
     assert!(
-        app.agent_ask.is_none(),
+        app.cards.ask.is_none(),
         "Enter resolves the multi-select card"
     );
     assert_eq!(answer_rx.await.unwrap(), Ok("fmt, test".to_string()));
@@ -570,7 +570,7 @@ async fn test_ask_card_multi_select_digit_toggles_box() {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let mut app = make_test_app(tx, rx);
     let (reply, answer_rx) = tokio::sync::oneshot::channel::<std::result::Result<String, String>>();
-    app.agent_ask = Some(PendingAskUser {
+    app.cards.ask = Some(PendingAskUser {
         question: "Which checks?".to_string(),
         options: ask_options(&["fmt", "clippy", "test"]),
         allow_free_text: false,
@@ -605,11 +605,11 @@ async fn test_ask_card_multi_select_digit_toggles_box() {
         .await
         .unwrap();
     assert!(
-        app.agent_ask.is_some(),
+        app.cards.ask.is_some(),
         "a digit toggles, it does not submit"
     );
     assert_eq!(
-        app.agent_ask.as_ref().unwrap().checked,
+        app.cards.ask.as_ref().unwrap().checked,
         vec![false, true, false],
         "digit 2 checks the second box"
     );
@@ -647,7 +647,7 @@ fn test_review_card_renders_diff_and_keys() {
         }),
     )];
     let body = super::super::render::review_body_lines(&items, std::path::Path::new("."));
-    app.agent_review = Some(PendingReview {
+    app.cards.review = Some(PendingReview {
         count: 1,
         body,
         scroll: 0,
@@ -695,7 +695,7 @@ async fn test_review_card_keys_resolve_decision() {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let mut app = make_test_app(tx, rx);
         let (reply, decision_rx) = tokio::sync::oneshot::channel::<ReviewDecision>();
-        app.agent_review = Some(PendingReview {
+        app.cards.review = Some(PendingReview {
             count: 1,
             body: vec![ratatui::text::Line::from("diff")],
             scroll: 0,
@@ -704,7 +704,7 @@ async fn test_review_card_keys_resolve_decision() {
         app.handle_key(KeyEvent::new(code, KeyModifiers::NONE))
             .await
             .unwrap();
-        assert!(app.agent_review.is_none(), "{code:?} resolves the card");
+        assert!(app.cards.review.is_none(), "{code:?} resolves the card");
         assert_eq!(decision_rx.await.unwrap(), expected, "{code:?}");
     }
 }
@@ -718,7 +718,7 @@ async fn test_review_card_arrows_scroll() {
     let body: Vec<ratatui::text::Line> = (0..10)
         .map(|i| ratatui::text::Line::from(format!("line {i}")))
         .collect();
-    app.agent_review = Some(PendingReview {
+    app.cards.review = Some(PendingReview {
         count: 1,
         body,
         scroll: 0,
@@ -730,16 +730,16 @@ async fn test_review_card_arrows_scroll() {
     app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE))
         .await
         .unwrap();
-    assert_eq!(app.agent_review.as_ref().unwrap().scroll, 2, "down scrolls");
+    assert_eq!(app.cards.review.as_ref().unwrap().scroll, 2, "down scrolls");
     app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE))
         .await
         .unwrap();
     assert_eq!(
-        app.agent_review.as_ref().unwrap().scroll,
+        app.cards.review.as_ref().unwrap().scroll,
         1,
         "up scrolls back"
     );
-    assert!(app.agent_review.is_some(), "scrolling does not resolve");
+    assert!(app.cards.review.is_some(), "scrolling does not resolve");
 }
 
 /// History pushes the composer to the bottom, giving cards a real viewport.
@@ -765,7 +765,7 @@ fn test_review_card_long_diff_keeps_keys_visible() {
     let body: Vec<ratatui::text::Line> = (0..100)
         .map(|i| ratatui::text::Line::from(format!("diff line {i}")))
         .collect();
-    app.agent_review = Some(PendingReview {
+    app.cards.review = Some(PendingReview {
         count: 1,
         body,
         scroll: 0,
@@ -792,7 +792,7 @@ async fn test_review_card_overscroll_clamps_stable_height() {
     let body: Vec<ratatui::text::Line> = (0..100)
         .map(|i| ratatui::text::Line::from(format!("diff line {i}")))
         .collect();
-    app.agent_review = Some(PendingReview {
+    app.cards.review = Some(PendingReview {
         count: 1,
         body,
         scroll: 0,
@@ -804,7 +804,7 @@ async fn test_review_card_overscroll_clamps_stable_height() {
             .unwrap();
     }
     let (bottom, _rows) = render_full_screen(&mut app, 80, 24);
-    let clamped = app.agent_review.as_ref().unwrap().scroll;
+    let clamped = app.cards.review.as_ref().unwrap().scroll;
     assert!(
         usize::from(clamped) < 99,
         "scroll clamps to the last page, not the last line (got {clamped})"

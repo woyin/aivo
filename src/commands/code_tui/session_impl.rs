@@ -1503,9 +1503,9 @@ is preserved."
         held.extend(stdio.iter().map(|(name, _)| name.clone()));
         // Unknown → surface the consent card (unless one is already up).
         if self.project_mcp_consent == ProjectMcpConsent::Unknown
-            && self.pending_mcp_consent.is_none()
+            && self.cards.mcp_consent.is_none()
         {
-            self.pending_mcp_consent = Some(McpConsentPrompt {
+            self.cards.mcp_consent = Some(McpConsentPrompt {
                 servers: stdio,
                 cwd: cwd.clone(),
                 base_disabled,
@@ -1525,7 +1525,7 @@ is preserved."
         if !allow && !deny {
             return; // unrecognized key: leave the card up
         }
-        let Some(prompt) = self.pending_mcp_consent.take() else {
+        let Some(prompt) = self.cards.mcp_consent.take() else {
             return;
         };
         if deny {
@@ -1696,7 +1696,7 @@ is preserved."
     /// later hand-edit of `.mcp.json` re-prompts as usual.
     fn allow_self_added_project_stdio(&mut self) {
         self.project_mcp_consent = ProjectMcpConsent::Allowed;
-        self.pending_mcp_consent = None;
+        self.cards.mcp_consent = None;
     }
 
     /// Add server(s) from a pasted `mcpServers` JSON block, preserving each
@@ -2698,10 +2698,10 @@ is preserved."
         // turn. Reusing a same-key/model engine would continue the PREVIOUS
         // session's thread (`/new` and key/model switches reset it the same way).
         self.agent_engine = None;
-        self.agent_permission = None;
-        self.agent_ask = None;
-        self.agent_review = None;
-        self.agent_plan_approval = None;
+        self.cards.permission = None;
+        self.cards.ask = None;
+        self.cards.review = None;
+        self.cards.plan_approval = None;
         // Plan/goal modes belong to the OLD conversation — a leaked plan card
         // indexes the replaced history and `/plan go` would run the old plan.
         self.plan_mode = false;

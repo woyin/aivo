@@ -2821,19 +2821,11 @@ pub(super) struct CodeTuiApp {
         JoinHandle<anyhow::Result<()>>,
         std::sync::Arc<tokio::sync::Notify>,
     )>,
-    /// Pending tool-permission card, while the agent waits for the user's y/n/a.
-    pub(super) agent_permission: Option<PendingPermission>,
-    /// Pending `ask_user` question card, while the agent waits for the user's pick.
-    pub(super) agent_ask: Option<PendingAskUser>,
-    /// Pending edit-review card, while the agent waits for approve/reject.
-    pub(super) agent_review: Option<PendingReview>,
-    /// Pending plan-approval card (`exit_plan_mode`), while the agent waits for
-    /// the verdict.
-    pub(super) agent_plan_approval: Option<PendingPlanApproval>,
+    /// Agent decision cards (permission/ask/review/plan/MCP consent); the
+    /// engine blocks on each oneshot, so at most one is visible at a time.
+    pub(super) cards: AgentCards,
     /// Session decision on spawning a repo's project `.mcp.json` stdio servers.
     pub(super) project_mcp_consent: ProjectMcpConsent,
-    /// Pending consent card for project MCP servers (held back until decided).
-    pub(super) pending_mcp_consent: Option<McpConsentPrompt>,
     /// Session-wide auto-approve (Shift+Tab): when on, the agent runs mutating
     /// tools without a permission card. Off by default (safe).
     pub(super) agent_auto_approve: bool,
@@ -2950,6 +2942,24 @@ pub(super) struct CodeTuiApp {
     /// One-shot: the next draw clears first, healing emulator-corrupted cells
     /// that diff-only painting would never rewrite (macOS Tahoe Terminal.app).
     pub(super) pending_full_repaint: bool,
+}
+
+/// Agent decision cards awaiting the user's verdict. The UI shows at most one
+/// at a time (the engine blocks on each oneshot), but the fields are
+/// independent Options — fold into a single enum before adding a sixth card.
+#[derive(Default)]
+pub(super) struct AgentCards {
+    /// Pending tool-permission card, while the agent waits for the user's y/n/a.
+    pub(super) permission: Option<PendingPermission>,
+    /// Pending `ask_user` question card, while the agent waits for the user's pick.
+    pub(super) ask: Option<PendingAskUser>,
+    /// Pending edit-review card, while the agent waits for approve/reject.
+    pub(super) review: Option<PendingReview>,
+    /// Pending plan-approval card (`exit_plan_mode`), while the agent waits for
+    /// the verdict.
+    pub(super) plan_approval: Option<PendingPlanApproval>,
+    /// Pending consent card for project MCP servers (held back until decided).
+    pub(super) mcp_consent: Option<McpConsentPrompt>,
 }
 
 /// Per-frame render products and cross-frame memos, written during render;
@@ -3153,10 +3163,7 @@ impl CodeTuiApp {
             engine_rebuild_pending: false,
             pending_mcp_auth: std::collections::HashMap::new(),
             agent_serve: None,
-            agent_permission: None,
-            agent_ask: None,
-            agent_review: None,
-            agent_plan_approval: None,
+            cards: AgentCards::default(),
             agent_auto_approve: false,
             auto_approve_flag: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             agent_review_edits: false,
@@ -3175,7 +3182,6 @@ impl CodeTuiApp {
             queued_commands: Vec::new(),
             queue_focus: None,
             project_mcp_consent: ProjectMcpConsent::default(),
-            pending_mcp_consent: None,
             local_command: None,
             jobs: crate::agent::jobs::JobTable::new(None),
             last_jobs_poll: std::time::Instant::now(),

@@ -218,7 +218,7 @@ async fn test_mcp_add_project_flag_writes_repo_config_and_grants_consent() {
     );
     // Typing the command IS the consent — run-once session approval, like `y`.
     assert_eq!(app.project_mcp_consent, ProjectMcpConsent::Allowed);
-    assert!(app.pending_mcp_consent.is_none());
+    assert!(app.cards.mcp_consent.is_none());
     let notice = app.notice.as_ref().unwrap().1.clone();
     assert!(notice.contains("./.mcp.json"), "notice: {notice}");
     std::fs::remove_dir_all(&dir).ok();
@@ -969,7 +969,7 @@ async fn project_mcp_stdio_raises_consent_card() {
 
     app.connect_mcp_with_consent(cwd, Default::default()).await;
 
-    let prompt = app.pending_mcp_consent.as_ref().expect("a consent card");
+    let prompt = app.cards.mcp_consent.as_ref().expect("a consent card");
     assert_eq!(
         prompt.servers,
         vec![("x".to_string(), "sh -c echo hi".to_string())],
@@ -989,14 +989,14 @@ async fn project_mcp_stdio_raises_consent_card() {
 async fn project_mcp_consent_deny_holds_back() {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let mut app = make_test_app(tx, rx);
-    app.pending_mcp_consent = Some(McpConsentPrompt {
+    app.cards.mcp_consent = Some(McpConsentPrompt {
         servers: vec![("x".to_string(), "sh -c echo hi".to_string())],
         cwd: ".".to_string(),
         base_disabled: Default::default(),
     });
     app.handle_mcp_consent_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE))
         .await;
-    assert!(app.pending_mcp_consent.is_none(), "the card is cleared");
+    assert!(app.cards.mcp_consent.is_none(), "the card is cleared");
     assert_eq!(app.project_mcp_consent, ProjectMcpConsent::Denied);
 }
 
@@ -1010,7 +1010,7 @@ async fn project_mcp_consent_always_persists() {
     let _ = std::fs::remove_dir_all(&repo);
     std::fs::create_dir_all(&repo).unwrap();
     let cwd = repo.to_str().unwrap().to_string();
-    app.pending_mcp_consent = Some(McpConsentPrompt {
+    app.cards.mcp_consent = Some(McpConsentPrompt {
         servers: vec![("x".to_string(), "echo".to_string())],
         cwd: cwd.clone(),
         base_disabled: Default::default(),
@@ -1019,7 +1019,7 @@ async fn project_mcp_consent_always_persists() {
     app.handle_mcp_consent_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE))
         .await;
     assert_eq!(app.project_mcp_consent, ProjectMcpConsent::Allowed);
-    assert!(app.pending_mcp_consent.is_none());
+    assert!(app.cards.mcp_consent.is_none());
 
     let dir_key = std::fs::canonicalize(&repo)
         .unwrap()
@@ -1063,7 +1063,7 @@ async fn project_mcp_preapproved_repo_skips_card() {
 
     app.connect_mcp_with_consent(cwd, Default::default()).await;
     assert!(
-        app.pending_mcp_consent.is_none(),
+        app.cards.mcp_consent.is_none(),
         "a pre-approved repo doesn't prompt"
     );
     assert_eq!(app.project_mcp_consent, ProjectMcpConsent::Allowed);
@@ -1106,7 +1106,7 @@ async fn project_mcp_changed_config_reprompts() {
     .unwrap();
     app.connect_mcp_with_consent(cwd, Default::default()).await;
     assert!(
-        app.pending_mcp_consent.is_some(),
+        app.cards.mcp_consent.is_some(),
         "a changed .mcp.json re-prompts instead of reusing the old approval"
     );
     assert_eq!(app.project_mcp_consent, ProjectMcpConsent::Unknown);
@@ -1131,7 +1131,7 @@ async fn project_mcp_no_stdio_no_card() {
 
     app.connect_mcp_with_consent(cwd, Default::default()).await;
     assert!(
-        app.pending_mcp_consent.is_none(),
+        app.cards.mcp_consent.is_none(),
         "HTTP-only project servers aren't gated (no local exec)"
     );
     let _ = std::fs::remove_dir_all(&repo);

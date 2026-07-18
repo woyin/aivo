@@ -420,7 +420,7 @@ async fn test_plan_mode_enter_and_approval_verdicts() {
 
     // Approve & auto-approve: mode off, execution continues unattended.
     let (reply, mut rx1) = tokio::sync::oneshot::channel();
-    app.agent_plan_approval = Some(super::super::PendingPlanApproval {
+    app.cards.plan_approval = Some(super::super::PendingPlanApproval {
         body: vec![],
         scroll: 0,
         selected: 0,
@@ -441,7 +441,7 @@ async fn test_plan_mode_enter_and_approval_verdicts() {
     // Approve with per-edit review: mode off, review mode on.
     app.plan_mode = true;
     let (reply, mut rx2) = tokio::sync::oneshot::channel();
-    app.agent_plan_approval = Some(super::super::PendingPlanApproval {
+    app.cards.plan_approval = Some(super::super::PendingPlanApproval {
         body: vec![],
         scroll: 0,
         selected: 0,
@@ -461,7 +461,7 @@ async fn test_plan_mode_enter_and_approval_verdicts() {
     // Keep planning: mode stays on.
     app.plan_mode = true;
     let (reply, mut rx3) = tokio::sync::oneshot::channel();
-    app.agent_plan_approval = Some(super::super::PendingPlanApproval {
+    app.cards.plan_approval = Some(super::super::PendingPlanApproval {
         body: vec![],
         scroll: 0,
         selected: 0,
@@ -542,7 +542,7 @@ async fn test_permission_card_shift_tab_in_plan_mode_allows_once() {
     let mut app = make_test_app(tx, rx);
     app.plan_mode = true;
     let (reply, mut rx1) = tokio::sync::oneshot::channel();
-    app.agent_permission = Some(super::super::PendingPermission {
+    app.cards.permission = Some(super::super::PendingPermission {
         tool: "run_bash".to_string(),
         preview: Some("cargo build".to_string()),
         reply,

@@ -114,7 +114,7 @@ impl CodeTuiApp {
         // loads, a permission card holds the keyboard, or queue focus is active.
         !self.overlay.blocks_input()
             && self.loading_resume.is_none()
-            && self.agent_permission.is_none()
+            && self.cards.permission.is_none()
             && self.queue_focus.is_none()
     }
 
