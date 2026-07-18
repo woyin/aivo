@@ -1,13 +1,17 @@
 [![aivo](https://getaivo.dev/banner.webp)](https://getaivo.dev)
 
-> Aivo is a command-line tool that connects your existing coding agent to the model you want.
-> It includes starter models to get you going — no API key required.
+Aivo `/ˈeɪ.voʊ/` is a lightweight CLI that runs coding agents — Claude Code, Codex, Gemini,
+OpenCode, Pi, and more — keeps your keys encrypted, and ships starter models that need no API key.
 
+[![CI](https://github.com/yuanchuan/aivo/actions/workflows/ci.yml/badge.svg)](https://github.com/yuanchuan/aivo/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/yuanchuan/aivo?label=release&color=brightgreen)](https://github.com/yuanchuan/aivo/releases)
+[![MSRV](https://img.shields.io/badge/rustc-1.97+-orange.svg)](Cargo.toml)
+[![Binary size](https://img.shields.io/badge/binary-%3C10MB-blue.svg)](https://github.com/yuanchuan/aivo/releases)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-## Docs
+[**Docs**](https://getaivo.dev) · [Install](#install) · [Quick Start](#quick-start) · [Coding agents](#coding-agents) · [Commands](#commands)
 
-https://getaivo.dev
-
+---
 
 ## Install
 
@@ -46,7 +50,7 @@ aivo claude
 aivo claude --model moonshotai/kimi-k2.5     # pin a model
 ```
 
-## Supported coding agents
+## Coding agents
 
 | Command | Agent | Type |
 | ------- | ----- | ---- |
@@ -70,10 +74,25 @@ aivo pi --dry-run                            # preview command + env, don't laun
 aivo opencode --debug                        # JSONL log of upstream HTTP traffic
 ```
 
-
 Without a tool name, `aivo run` opens the tool picker — native agents and installed coding-agent plugins.
 
-## keys
+## Commands
+
+| Command | What it does |
+| ------- | ------------ |
+| [`keys`](#keys) | Manage saved API keys (encrypted) |
+| [`account`](#account) | Link a device, check plan & usage |
+| [`models`](#models) | List models from the active provider |
+| [`code`](#code) | Built-in terminal coding agent |
+| [`hf`](#hf) | Run open-weight GGUF models locally |
+| [`serve`](#serve) | Local OpenAI-compatible endpoint |
+| [`alias`](#alias) | Shortcuts for models and launch presets |
+| [`logs`](#logs) | Unified activity feed across tools |
+| [`stats`](#stats) | Token usage across every tool |
+| [`update`](#update) | Update aivo to the latest version |
+| [`plugins`](#plugins) | Add custom `aivo-<name>` commands |
+
+### keys
 
 Manage saved API keys. Stored AES-256-GCM encrypted in the user config directory.
 
@@ -90,7 +109,7 @@ One-liner.
 aivo keys add --name groq --base-url https://api.groq.com/openai/v1 --key sk-xxx
 ```
 
-### Export & import
+#### Export & import
 
 Move keys between machines via a password-encrypted file:
 
@@ -103,7 +122,7 @@ aivo keys import https://example.com/bak.keys   # or from a URL
 aivo keys export ~/bak.keys --password-stdin <<< "my secret password"
 ```
 
-## account
+### account
 
 Link this device to your [getaivo.dev](https://getaivo.dev) account to unlock higher
 `aivo/starter` limits, then check your plan and usage.
@@ -116,7 +135,7 @@ aivo account login --label "work laptop"     # name this device in your account
 aivo account open                            # open your dashboard in the browser
 ```
 
-## models
+### models
 
 List models from the active provider. Cached for one hour.
 
@@ -127,7 +146,7 @@ aivo models -s sonnet                        # filter by substring
 aivo models --json | jq '.models[].id'
 ```
 
-## code
+### code
 
 `aivo code` is the built-in coding agent in your terminal.
 
@@ -155,8 +174,7 @@ aivo code -e "make the failing test pass"
 aivo code -e "fix lint" --max-steps 50 --max-output-tokens 20000
 ```
 
-
-## hf
+### hf
 
 Run open-weight GGUF models locally, it fetches and caches them from HuggingFace repositories.
 
@@ -190,7 +208,7 @@ aivo hf rm <repo> --all -y                    # delete whole repo
 aivo hf clean -y                              # wipe everything
 ```
 
-## serve
+### serve
 
 Expose the active provider as a local OpenAI-compatible endpoint.
 
@@ -203,7 +221,7 @@ aivo serve --auth-token                      # require bearer token (auto-genera
 aivo serve --log /tmp/requests.jsonl
 ```
 
-## alias
+### alias
 
 Short names for models or launch presets. Both share one namespace.
 
@@ -221,7 +239,7 @@ aivo alias rm fast                           # remove (works for both kinds)
 
 Names that collide with built-in subcommands or tool names are rejected.
 
-## logs
+### logs
 
 Unified activity feed across aivo's own events (`code`, `run`, `serve`) and native CLI sessions (`claude`, `codex`, `gemini`, `pi`, `opencode`). Defaults to the current project's cwd; use `-a` for every project.
 
@@ -243,10 +261,9 @@ aivo logs share                              # interactive picker
 aivo logs share <id>                         # share by id prefix
 ```
 
-## stats
+### stats
 
 Aggregates token counts from aivo code, Claude Code, Codex, Gemini, OpenCode, and Pi by reading each tool's native data files.
-
 
 ```bash
 aivo stats
@@ -256,7 +273,7 @@ aivo stats -s openrouter -n                  # filter, exact numbers
 aivo stats --json | jq '.totals.tokens'
 ```
 
-## update
+### update
 
 Update to the latest version. Delegates to Homebrew or npm when installed by those package managers.
 
@@ -267,7 +284,7 @@ aivo update --rollback                       # restore previous backup
 aivo update --sync-model-data                # sync model metadata
 ```
 
-## plugins
+### plugins
 
 Add a top-level command — a standalone `aivo-<name>` executable, in any language, that aivo runs
 as `aivo <name>`. Plugins run with your privileges; install only ones you trust. Full contract:
@@ -286,4 +303,4 @@ aivo plugins rm amp
 
 ## License
 
-MIT
+[MIT](LICENSE)
