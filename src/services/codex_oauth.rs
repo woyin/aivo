@@ -260,11 +260,15 @@ pub async fn refresh(creds: &mut CodexOAuthCredential) -> Result<()> {
 /// Refreshes only if the token is near expiry. Returns `true` if a refresh
 /// actually happened (so the caller can persist the new tokens).
 pub async fn ensure_fresh(creds: &mut CodexOAuthCredential, skew_secs: i64) -> Result<bool> {
-    if creds.is_expired(skew_secs) {
-        refresh(creds).await?;
-        Ok(true)
-    } else {
-        Ok(false)
+    crate::services::oauth_credential::ensure_fresh(creds, skew_secs).await
+}
+
+impl crate::services::oauth_credential::OAuthCredential for CodexOAuthCredential {
+    fn is_expired(&self, skew_secs: i64) -> bool {
+        CodexOAuthCredential::is_expired(self, skew_secs)
+    }
+    async fn refresh(&mut self) -> Result<()> {
+        refresh(self).await
     }
 }
 

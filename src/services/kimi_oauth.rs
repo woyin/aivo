@@ -191,6 +191,30 @@ async fn poll_device_token(
 }
 
 /// Refreshes `access_token`, rotating `refresh_token` when reissued.
+impl crate::services::oauth_credential::OAuthCredential for KimiOAuthCredential {
+    fn is_expired(&self, skew_secs: i64) -> bool {
+        KimiOAuthCredential::is_expired(self, skew_secs)
+    }
+    async fn refresh(&mut self) -> Result<()> {
+        refresh(self).await
+    }
+}
+
+impl crate::services::oauth_credential::StoredOAuthCredential for KimiOAuthCredential {
+    fn key_matches(key: &crate::services::session_store::ApiKey) -> bool {
+        key.is_kimi_oauth()
+    }
+    fn from_json(json: &str) -> Result<Self> {
+        KimiOAuthCredential::from_json(json)
+    }
+    fn to_json(&self) -> Result<String> {
+        KimiOAuthCredential::to_json(self)
+    }
+    fn refresh_token(&self) -> &str {
+        &self.refresh_token
+    }
+}
+
 pub async fn refresh(creds: &mut KimiOAuthCredential) -> Result<()> {
     let resp = with_client_headers(client().post(TOKEN_URL), &creds.device_id)
         .form(&[
@@ -232,12 +256,7 @@ pub async fn refresh(creds: &mut KimiOAuthCredential) -> Result<()> {
 
 /// Refreshes only if near expiry; `true` if it did (caller persists).
 pub async fn ensure_fresh(creds: &mut KimiOAuthCredential, skew_secs: i64) -> Result<bool> {
-    if creds.is_expired(skew_secs) {
-        refresh(creds).await?;
-        Ok(true)
-    } else {
-        Ok(false)
-    }
+    crate::services::oauth_credential::ensure_fresh(creds, skew_secs).await
 }
 
 /// Writes a rotated credential back to the store so later processes start from
@@ -248,36 +267,8 @@ pub async fn persist_rotated_credential(
     prev_refresh_token: &str,
     creds: &KimiOAuthCredential,
 ) {
-    use crate::services::session_store::SessionStore;
-    let Ok(json) = creds.to_json() else {
-        return;
-    };
-    let Ok(keys) = store.get_keys().await else {
-        return;
-    };
-    let mut candidates: Vec<_> = keys.into_iter().filter(|k| k.is_kimi_oauth()).collect();
-    let target = match candidates.len() {
-        0 => return,
-        1 => candidates.pop(),
-        _ => candidates.into_iter().find(|k| {
-            let mut probe = k.clone();
-            SessionStore::decrypt_key_secret(&mut probe).is_ok()
-                && KimiOAuthCredential::from_json(&probe.key)
-                    .map(|c| c.refresh_token == prev_refresh_token)
-                    .unwrap_or(false)
-        }),
-    };
-    if let Some(existing) = target {
-        let _ = store
-            .update_key(
-                &existing.id,
-                &existing.name,
-                &existing.base_url,
-                existing.claude_protocol,
-                &json,
-            )
-            .await;
-    }
+    crate::services::oauth_credential::persist_rotated_credential(store, prev_refresh_token, creds)
+        .await
 }
 
 /// One `/models` entry; the coding endpoint reports per-model context length.

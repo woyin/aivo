@@ -480,11 +480,15 @@ pub async fn refresh(creds: &mut McpOAuthCredential) -> Result<()> {
 /// Refresh only if near expiry. Returns `true` when a refresh happened (so the
 /// caller knows to persist the new tokens).
 pub async fn ensure_fresh(creds: &mut McpOAuthCredential, skew_secs: i64) -> Result<bool> {
-    if creds.is_expired(skew_secs) {
-        refresh(creds).await?;
-        Ok(true)
-    } else {
-        Ok(false)
+    crate::services::oauth_credential::ensure_fresh(creds, skew_secs).await
+}
+
+impl crate::services::oauth_credential::OAuthCredential for McpOAuthCredential {
+    fn is_expired(&self, skew_secs: i64) -> bool {
+        McpOAuthCredential::is_expired(self, skew_secs)
+    }
+    async fn refresh(&mut self) -> Result<()> {
+        refresh(self).await
     }
 }
 

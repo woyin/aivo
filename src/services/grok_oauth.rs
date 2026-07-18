@@ -190,6 +190,30 @@ async fn poll_device_token(
 }
 
 /// Refreshes `access_token`, rotating `refresh_token` when reissued.
+impl crate::services::oauth_credential::OAuthCredential for GrokOAuthCredential {
+    fn is_expired(&self, skew_secs: i64) -> bool {
+        GrokOAuthCredential::is_expired(self, skew_secs)
+    }
+    async fn refresh(&mut self) -> Result<()> {
+        refresh(self).await
+    }
+}
+
+impl crate::services::oauth_credential::StoredOAuthCredential for GrokOAuthCredential {
+    fn key_matches(key: &crate::services::session_store::ApiKey) -> bool {
+        key.is_grok_oauth()
+    }
+    fn from_json(json: &str) -> Result<Self> {
+        GrokOAuthCredential::from_json(json)
+    }
+    fn to_json(&self) -> Result<String> {
+        GrokOAuthCredential::to_json(self)
+    }
+    fn refresh_token(&self) -> &str {
+        &self.refresh_token
+    }
+}
+
 pub async fn refresh(creds: &mut GrokOAuthCredential) -> Result<()> {
     let resp = with_client_headers(client().post(TOKEN_URL))
         .form(&[
@@ -224,12 +248,7 @@ pub async fn refresh(creds: &mut GrokOAuthCredential) -> Result<()> {
 
 /// Refreshes only if near expiry; `true` if it did (caller persists).
 pub async fn ensure_fresh(creds: &mut GrokOAuthCredential, skew_secs: i64) -> Result<bool> {
-    if creds.is_expired(skew_secs) {
-        refresh(creds).await?;
-        Ok(true)
-    } else {
-        Ok(false)
-    }
+    crate::services::oauth_credential::ensure_fresh(creds, skew_secs).await
 }
 
 /// Writes a rotated credential back to the store. xAI revokes the prior
@@ -241,36 +260,8 @@ pub async fn persist_rotated_credential(
     prev_refresh_token: &str,
     creds: &GrokOAuthCredential,
 ) {
-    use crate::services::session_store::SessionStore;
-    let Ok(json) = creds.to_json() else {
-        return;
-    };
-    let Ok(keys) = store.get_keys().await else {
-        return;
-    };
-    let mut candidates: Vec<_> = keys.into_iter().filter(|k| k.is_grok_oauth()).collect();
-    let target = match candidates.len() {
-        0 => return,
-        1 => candidates.pop(),
-        _ => candidates.into_iter().find(|k| {
-            let mut probe = k.clone();
-            SessionStore::decrypt_key_secret(&mut probe).is_ok()
-                && GrokOAuthCredential::from_json(&probe.key)
-                    .map(|c| c.refresh_token == prev_refresh_token)
-                    .unwrap_or(false)
-        }),
-    };
-    if let Some(existing) = target {
-        let _ = store
-            .update_key(
-                &existing.id,
-                &existing.name,
-                &existing.base_url,
-                existing.claude_protocol,
-                &json,
-            )
-            .await;
-    }
+    crate::services::oauth_credential::persist_rotated_credential(store, prev_refresh_token, creds)
+        .await
 }
 
 /// Lists model ids via the CLI proxy. Refreshes only with a `store` to persist
