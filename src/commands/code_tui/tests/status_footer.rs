@@ -908,7 +908,10 @@ fn test_status_label_throttled_to_min_duration() {
     // First tick adopts the current label.
     app.tick_status_throttle();
     assert_eq!(
-        app.status_display.as_ref().map(|(s, _)| s.as_str()),
+        app.render_cache
+            .status_display
+            .as_ref()
+            .map(|(s, _)| s.as_str()),
         Some("Thinking")
     );
 
@@ -922,7 +925,10 @@ fn test_status_label_throttled_to_min_duration() {
     );
     app.tick_status_throttle();
     assert_eq!(
-        app.status_display.as_ref().map(|(s, _)| s.as_str()),
+        app.render_cache
+            .status_display
+            .as_ref()
+            .map(|(s, _)| s.as_str()),
         Some("Thinking"),
         "must hold the prior label for its minimum second"
     );
@@ -931,10 +937,13 @@ fn test_status_label_throttled_to_min_duration() {
     let old = std::time::Instant::now()
         .checked_sub(STATUS_MIN_DURATION + std::time::Duration::from_millis(50))
         .expect("instant in range");
-    app.status_display = Some(("Thinking".to_string(), old));
+    app.render_cache.status_display = Some(("Thinking".to_string(), old));
     app.tick_status_throttle();
     assert_eq!(
-        app.status_display.as_ref().map(|(s, _)| s.as_str()),
+        app.render_cache
+            .status_display
+            .as_ref()
+            .map(|(s, _)| s.as_str()),
         Some("searching foo"),
         "switches once the prior label has had its second"
     );

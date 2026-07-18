@@ -2620,9 +2620,6 @@ pub(super) struct CodeTuiApp {
     pub(super) tool_output_tail: std::collections::VecDeque<String>,
     /// Unterminated last line of the stream (rendered too, for progress output).
     pub(super) tool_output_partial: String,
-    /// The status label on screen + when first shown; throttled by
-    /// `tick_status_throttle` so it switches at most once per `STATUS_MIN_DURATION`.
-    pub(super) status_display: Option<(String, Instant)>,
     /// This turn's cumulative generated tokens (status-line tail). Reset at turn
     /// start; fed by `AgentTurnTokens` (agent) or `Usage` (plain chat).
     pub(super) turn_output_tokens: u64,
@@ -2688,13 +2685,9 @@ pub(super) struct CodeTuiApp {
     /// cursor stays visible when a multi-line draft outgrows the composer's rows.
     /// Recomputed each render from the cursor position; never persisted.
     pub(super) composer_scroll: usize,
-    /// Cross-frame memo of the built + wrapped transcript body; see
-    /// [`TranscriptCache`]. Rebuilt only on content/width change.
-    pub(super) transcript_cache: Option<TranscriptCache>,
-    /// Cross-frame memo of the volatile tail (streamed reply + running `!cmd` +
-    /// notice); see [`VolatileTailCache`]. Keeps a 60fps redraw off the O(reply²)
-    /// re-parse/re-wrap path while the answer streams.
-    pub(super) volatile_tail_cache: Option<VolatileTailCache>,
+    /// Per-frame render products and cross-frame memos; written by
+    /// `render_impl.rs`, hitboxes read back by mouse handling.
+    pub(super) render_cache: RenderCache,
     pub(super) transcript_selection: Option<TranscriptSelection>,
     pub(super) transcript_drag_active: bool,
     /// Full-screen drag selection (overlays, composer, footer), mutually exclusive
@@ -2702,10 +2695,6 @@ pub(super) struct CodeTuiApp {
     pub(super) screen_selection: Option<TranscriptSelection>,
     pub(super) screen_drag_active: bool,
     pub(super) screen_surface: Option<ScreenSurface>,
-    /// Region the screen selection is confined to — a modal's inner content rect
-    /// while one is open, so a drag selects inside the modal, not the whole line.
-    /// `None` = the full screen.
-    pub(super) screen_region: Option<Rect>,
     /// Live edge auto-scroll state while dragging a selection.
     pub(super) drag_autoscroll: Option<DragAutoscroll>,
     /// When the last auto-scroll step fired, to throttle the scroll rate.
@@ -2735,9 +2724,6 @@ pub(super) struct CodeTuiApp {
     /// Split overlay's right-pane rect from the last render (`None` = single-pane);
     /// the key/mouse "split active" signal — a draw always precedes input.
     pub(super) overlay_detail_area: Option<Rect>,
-    /// Non-picker overlay's full box (borders included) from the last render;
-    /// a left press outside it dismisses the overlay like Esc.
-    pub(super) overlay_hitbox: Option<Rect>,
     pub(super) exit_confirm_pending: bool,
     /// Armed by one Esc during a `/goal` turn; a second consecutive Esc stops the loop.
     pub(super) goal_stop_confirm_pending: bool,
@@ -2966,6 +2952,30 @@ pub(super) struct CodeTuiApp {
     pub(super) pending_full_repaint: bool,
 }
 
+/// Per-frame render products and cross-frame memos, written during render;
+/// the hitboxes are read back by mouse handling (backdrop-click dismiss,
+/// modal-confined selection).
+#[derive(Default)]
+pub(super) struct RenderCache {
+    /// Cross-frame memo of the built + wrapped transcript body; see
+    /// [`TranscriptCache`]. Rebuilt only on content/width change.
+    pub(super) transcript: Option<TranscriptCache>,
+    /// Cross-frame memo of the volatile tail (streamed reply + running `!cmd` +
+    /// notice); see [`VolatileTailCache`]. Keeps a 60fps redraw off the O(reply²)
+    /// re-parse/re-wrap path while the answer streams.
+    pub(super) volatile_tail: Option<VolatileTailCache>,
+    /// The status label on screen + when first shown; throttled by
+    /// `tick_status_throttle` so it switches at most once per `STATUS_MIN_DURATION`.
+    pub(super) status_display: Option<(String, Instant)>,
+    /// Non-picker overlay's full box (borders included) from the last render;
+    /// a left press outside it dismisses the overlay like Esc.
+    pub(super) overlay_hitbox: Option<Rect>,
+    /// Region the screen selection is confined to — a modal's inner content rect
+    /// while one is open, so a drag selects inside the modal, not the whole line.
+    /// `None` = the full screen.
+    pub(super) screen_region: Option<Rect>,
+}
+
 /// `/resume` picker preview state (cache + debounce + in-flight load), driven
 /// by `event_loop_impl.rs`.
 #[derive(Default)]
@@ -3069,7 +3079,6 @@ impl CodeTuiApp {
             subagent_rows: Vec::new(),
             tool_output_tail: std::collections::VecDeque::new(),
             tool_output_partial: String::new(),
-            status_display: None,
             turn_output_tokens: 0,
             retrying: false,
             last_usage: None,
@@ -3093,14 +3102,11 @@ impl CodeTuiApp {
             session_id_hit: None,
             composer_text_area: None,
             composer_scroll: 0,
-            transcript_cache: None,
-            volatile_tail_cache: None,
             transcript_selection: None,
             transcript_drag_active: false,
             screen_selection: None,
             screen_drag_active: false,
             screen_surface: None,
-            screen_region: None,
             drag_autoscroll: None,
             last_autoscroll: None,
             last_click: None,
@@ -3116,11 +3122,11 @@ impl CodeTuiApp {
             loading_resume: None,
             resume_restore_state: None,
             session_preview: SessionPreviewState::default(),
+            render_cache: RenderCache::default(),
             reduce_motion: false,
             frame_tick: 0,
             picker_hitbox: None,
             overlay_detail_area: None,
-            overlay_hitbox: None,
             exit_confirm_pending: false,
             goal_stop_confirm_pending: false,
             pending_ctrl_x: false,

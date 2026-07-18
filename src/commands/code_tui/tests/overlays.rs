@@ -509,7 +509,10 @@ async fn test_overlay_backdrop_click_dismisses_help() {
 
     let mut terminal = Terminal::new(TestBackend::new(100, 40)).unwrap();
     terminal.draw(|frame| app.render(frame)).unwrap();
-    let hit = app.overlay_hitbox.expect("overlay box recorded");
+    let hit = app
+        .render_cache
+        .overlay_hitbox
+        .expect("overlay box recorded");
 
     // Inside the box the press falls through to text selection — overlay stays.
     app.handle_mouse(left_click(hit.x + hit.width / 2, hit.y + hit.height / 2))
@@ -541,7 +544,7 @@ async fn test_overlay_backdrop_click_steps_back_like_esc() {
 
     let mut terminal = Terminal::new(TestBackend::new(100, 40)).unwrap();
     terminal.draw(|frame| app.render(frame)).unwrap();
-    assert!(app.overlay_hitbox.is_some());
+    assert!(app.render_cache.overlay_hitbox.is_some());
 
     // First backdrop press clears the filter (Esc's first stage)…
     app.handle_mouse(left_click(0, 0)).await.unwrap();

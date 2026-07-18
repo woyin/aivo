@@ -572,7 +572,7 @@ impl CodeTuiApp {
             return None;
         };
         // Throttled label; fall back to the live one before the first tick.
-        let activity = match &self.status_display {
+        let activity = match &self.render_cache.status_display {
             Some((label, _)) => label.clone(),
             None => self.desired_status(),
         };
@@ -709,15 +709,15 @@ impl CodeTuiApp {
     /// so fast steps don't flicker. Called per frame.
     pub(super) fn tick_status_throttle(&mut self) {
         if !self.sending && self.local_command.is_none() {
-            self.status_display = None;
+            self.render_cache.status_display = None;
             return;
         }
         let desired = self.desired_status();
-        match &self.status_display {
+        match &self.render_cache.status_display {
             // Unchanged — keep the original timestamp so it can still age out.
             Some((label, _)) if *label == desired => {}
             Some((_, since)) if since.elapsed() < STATUS_MIN_DURATION => {}
-            _ => self.status_display = Some((desired, Instant::now())),
+            _ => self.render_cache.status_display = Some((desired, Instant::now())),
         }
     }
 
@@ -851,7 +851,8 @@ impl CodeTuiApp {
     fn ensure_transcript_cache(&mut self, area_width: u16) {
         let fp = self.transcript_body_fp();
         let fresh = self
-            .transcript_cache
+            .render_cache
+            .transcript
             .as_ref()
             .is_some_and(|cache| cache.fp == fp && cache.area_width == area_width);
         if fresh {
@@ -860,7 +861,7 @@ impl CodeTuiApp {
         let body = self.build_transcript_history_body(table_layout_width(area_width));
         let plain_width = area_width.saturating_sub(ACCENT_GUTTER_WIDTH).max(1);
         let plain_prepass = wrap_plain_lines(&body.plain_lines, plain_width).len();
-        self.transcript_cache = Some(TranscriptCache {
+        self.render_cache.transcript = Some(TranscriptCache {
             fp,
             area_width,
             body,
@@ -874,7 +875,8 @@ impl CodeTuiApp {
     /// the width is unchanged. Must run after [`ensure_transcript_cache`].
     fn ensure_transcript_wrap(&mut self, text_width: u16) {
         let cache = self
-            .transcript_cache
+            .render_cache
+            .transcript
             .as_mut()
             .expect("ensure_transcript_cache runs before ensure_transcript_wrap");
         if cache.wrapped.is_some() && cache.styled_width == text_width {
@@ -924,14 +926,15 @@ impl CodeTuiApp {
     fn ensure_volatile_tail(&mut self, render_width: u16) {
         let fp = self.volatile_tail_fp();
         let fresh = self
-            .volatile_tail_cache
+            .render_cache
+            .volatile_tail
             .as_ref()
             .is_some_and(|cache| cache.fp == fp && cache.render_width == render_width);
         if fresh {
             return;
         }
         let (lines, bars) = self.volatile_tail_blocks(render_width);
-        self.volatile_tail_cache = Some(VolatileTailCache {
+        self.render_cache.volatile_tail = Some(VolatileTailCache {
             fp,
             render_width,
             lines,
@@ -948,7 +951,8 @@ impl CodeTuiApp {
     /// every frame. Must run after [`ensure_volatile_tail`].
     fn volatile_tail_prepass(&mut self, plain_width: u16) -> usize {
         let cache = self
-            .volatile_tail_cache
+            .render_cache
+            .volatile_tail
             .as_mut()
             .expect("ensure_volatile_tail runs before volatile_tail_prepass");
         if cache.lines.is_empty() {
@@ -969,7 +973,8 @@ impl CodeTuiApp {
     /// it contributes no rows). Must run after [`ensure_volatile_tail`].
     fn ensure_volatile_tail_wrap(&mut self, text_width: u16) {
         let cache = self
-            .volatile_tail_cache
+            .render_cache
+            .volatile_tail
             .as_mut()
             .expect("ensure_volatile_tail runs before ensure_volatile_tail_wrap");
         if cache.lines.is_empty() {
@@ -996,7 +1001,8 @@ impl CodeTuiApp {
         text_width: u16,
     ) -> (Text<'static>, Vec<String>, Vec<Option<Color>>) {
         let wrapped = self
-            .transcript_cache
+            .render_cache
+            .transcript
             .as_ref()
             .and_then(|cache| cache.wrapped.as_ref())
             .expect("ensure_transcript_wrap runs before composed_transcript_rows");
@@ -1009,7 +1015,8 @@ impl CodeTuiApp {
         // streamed reply every frame. `wrapped` is `None` exactly when the tail is
         // empty, so this adds no spurious rows.
         if let Some(tail) = self
-            .volatile_tail_cache
+            .render_cache
+            .volatile_tail
             .as_ref()
             .and_then(|cache| cache.wrapped.as_ref())
         {
@@ -1060,8 +1067,8 @@ impl CodeTuiApp {
     /// content confines the screen selection; the full box is the click-away
     /// dismiss boundary.
     fn set_overlay_regions(&mut self, area: Rect) {
-        self.screen_region = Some(overlay_content_rect(area));
-        self.overlay_hitbox = Some(area);
+        self.render_cache.screen_region = Some(overlay_content_rect(area));
+        self.render_cache.overlay_hitbox = Some(area);
     }
 
     pub(super) fn render(&mut self, frame: &mut Frame<'_>) {
@@ -1074,9 +1081,9 @@ impl CodeTuiApp {
         }
         self.picker_hitbox = None;
         self.transcript_hitbox = None;
-        self.screen_region = None;
+        self.render_cache.screen_region = None;
         self.overlay_detail_area = None;
-        self.overlay_hitbox = None;
+        self.render_cache.overlay_hitbox = None;
         let composer_area = self.render_main(frame, outer);
         if let Some(menu) = self.visible_command_menu() {
             let (area, placement) = command_menu_area(
@@ -1250,6 +1257,7 @@ impl CodeTuiApp {
     fn capture_screen_surface(&mut self, frame: &mut Frame<'_>) {
         let full = frame.area();
         let area = self
+            .render_cache
             .screen_region
             .map(|region| region.intersection(full))
             .unwrap_or(full);
@@ -2001,7 +2009,8 @@ impl CodeTuiApp {
             })
             .unwrap_or(0);
         let prepass_rows = self
-            .transcript_cache
+            .render_cache
+            .transcript
             .as_ref()
             .map(|cache| cache.plain_prepass)
             .unwrap_or(1)

@@ -2777,6 +2777,7 @@ impl CodeTuiApp {
         {
             if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
                 && self
+                    .render_cache
                     .overlay_hitbox
                     .is_some_and(|area| !rect_contains(area, (mouse.column, mouse.row)))
             {

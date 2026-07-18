@@ -370,15 +370,31 @@ fn test_transcript_cache_reuses_across_frames_until_content_changes() {
     };
 
     draw(&mut app, &mut terminal);
-    let fp_after_first = app.transcript_cache.as_ref().unwrap().fp;
-    let body_ptr = app.transcript_cache.as_ref().unwrap().body.lines.as_ptr();
+    let fp_after_first = app.render_cache.transcript.as_ref().unwrap().fp;
+    let body_ptr = app
+        .render_cache
+        .transcript
+        .as_ref()
+        .unwrap()
+        .body
+        .lines
+        .as_ptr();
 
     // A second frame with identical content must NOT rebuild the body: same
     // fingerprint and the same backing allocation (no re-parse / re-wrap).
     draw(&mut app, &mut terminal);
-    assert_eq!(app.transcript_cache.as_ref().unwrap().fp, fp_after_first);
     assert_eq!(
-        app.transcript_cache.as_ref().unwrap().body.lines.as_ptr(),
+        app.render_cache.transcript.as_ref().unwrap().fp,
+        fp_after_first
+    );
+    assert_eq!(
+        app.render_cache
+            .transcript
+            .as_ref()
+            .unwrap()
+            .body
+            .lines
+            .as_ptr(),
         body_ptr,
         "identical content must reuse the cached body without rebuilding"
     );
@@ -393,7 +409,7 @@ fn test_transcript_cache_reuses_across_frames_until_content_changes() {
     });
     draw(&mut app, &mut terminal);
     assert_ne!(
-        app.transcript_cache.as_ref().unwrap().fp,
+        app.render_cache.transcript.as_ref().unwrap().fp,
         fp_after_first,
         "new content must invalidate the cache fingerprint"
     );
@@ -434,7 +450,14 @@ fn test_spinner_animation_does_not_invalidate_transcript_cache() {
     };
 
     let screen = render_screen(&mut app, &mut terminal);
-    let body_ptr = app.transcript_cache.as_ref().unwrap().body.lines.as_ptr();
+    let body_ptr = app
+        .render_cache
+        .transcript
+        .as_ref()
+        .unwrap()
+        .body
+        .lines
+        .as_ptr();
     assert!(screen.contains("Thinking"), "spinner missing:\n{screen}");
 
     // Advancing the spinner glyph must not rebuild the body — only the appended
@@ -442,7 +465,13 @@ fn test_spinner_animation_does_not_invalidate_transcript_cache() {
     app.frame_tick = app.frame_tick.wrapping_add(7);
     let screen = render_screen(&mut app, &mut terminal);
     assert_eq!(
-        app.transcript_cache.as_ref().unwrap().body.lines.as_ptr(),
+        app.render_cache
+            .transcript
+            .as_ref()
+            .unwrap()
+            .body
+            .lines
+            .as_ptr(),
         body_ptr,
         "spinner animation must reuse the cached body"
     );
@@ -485,7 +514,14 @@ fn test_streaming_tokens_do_not_invalidate_history_body_cache() {
     };
 
     let screen = render_screen(&mut app, &mut terminal);
-    let body_ptr = app.transcript_cache.as_ref().unwrap().body.lines.as_ptr();
+    let body_ptr = app
+        .render_cache
+        .transcript
+        .as_ref()
+        .unwrap()
+        .body
+        .lines
+        .as_ptr();
     assert!(
         screen.contains("Stream"),
         "streamed text missing:\n{screen}"
@@ -497,7 +533,13 @@ fn test_streaming_tokens_do_not_invalidate_history_body_cache() {
     app.pending_response.push_str(" more text");
     let screen = render_screen(&mut app, &mut terminal);
     assert_eq!(
-        app.transcript_cache.as_ref().unwrap().body.lines.as_ptr(),
+        app.render_cache
+            .transcript
+            .as_ref()
+            .unwrap()
+            .body
+            .lines
+            .as_ptr(),
         body_ptr,
         "streamed tokens must reuse the cached history body (no full re-render)"
     );

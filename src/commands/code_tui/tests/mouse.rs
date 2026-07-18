@@ -530,6 +530,7 @@ fn test_open_modal_confines_screen_selection_to_its_content() {
     // A modal is open → the selection surface is its inner content rect, not the
     // whole screen, so a drag/line-select can't grab the full terminal line.
     let region = app
+        .render_cache
         .screen_region
         .expect("an open modal sets a selection region");
     assert!(
