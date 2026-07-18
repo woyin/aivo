@@ -10,18 +10,19 @@ use std::sync::Arc;
 
 use crate::constants::CONTENT_TYPE_JSON;
 use crate::services::anthropic_chat_request::{
-    AnthropicToOpenAIConfig, convert_anthropic_to_openai_request, hoist_anthropic_system_messages,
-    is_anthropic_server_tool, tool_parameters_from_input_schema,
+    AnthropicToOpenAIConfig, hoist_anthropic_system_messages, is_anthropic_server_tool,
+    tool_parameters_from_input_schema,
 };
-use crate::services::anthropic_chat_response::{
-    OpenAIToAnthropicConfig, UsageValueMode, convert_openai_to_anthropic_message,
-};
+use crate::services::anthropic_chat_response::{OpenAIToAnthropicConfig, UsageValueMode};
 use crate::services::copilot_auth::{
     COPILOT_EDITOR_VERSION, COPILOT_INITIATOR_HEADER, COPILOT_INTEGRATION_ID,
     COPILOT_OPENAI_INTENT, CopilotTokenManager,
 };
 use crate::services::http_debug::LoggedSend;
 use crate::services::http_utils;
+use crate::services::wire_format::{
+    RequestOptions, ResponseOptions, translate_request, translate_response,
+};
 
 #[derive(Clone)]
 pub struct CopilotRouterConfig {
@@ -271,9 +272,9 @@ fn explain_copilot_error(resp_body: &str) -> String {
 }
 
 fn anthropic_to_openai_chat(body: &Value) -> Value {
-    convert_anthropic_to_openai_request(
+    translate_request(
         body,
-        &AnthropicToOpenAIConfig {
+        &RequestOptions::AnthropicToChat(&AnthropicToOpenAIConfig {
             default_model: "claude-sonnet-4-20250514",
             preserve_stream: false,
             model_transform: Some(copilot_model_name),
@@ -282,7 +283,7 @@ fn anthropic_to_openai_chat(body: &Value) -> Value {
             stringify_other_tool_result_content: false,
             tool_result_supports_multimodal: true,
             fallback_tool_arguments_json: "",
-        },
+        }),
     )
 }
 
@@ -291,15 +292,15 @@ fn copilot_model_name(model: &str) -> String {
 }
 
 fn openai_to_anthropic(resp: &Value, model: &str) -> Result<Value> {
-    Ok(convert_openai_to_anthropic_message(
+    translate_response(
         resp,
-        &OpenAIToAnthropicConfig {
+        &ResponseOptions::AnthropicToChat(&OpenAIToAnthropicConfig {
             fallback_id: "msg_copilot",
             model,
             include_created: false,
             usage_value_mode: UsageValueMode::PreserveJson,
-        },
-    )?)
+        }),
+    )
 }
 
 fn anthropic_to_responses(body: &Value) -> Value {

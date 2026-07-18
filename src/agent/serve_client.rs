@@ -5,12 +5,9 @@
 //! delta for live rendering.
 
 use crate::agent::protocol::{AssistantMessage, ChatRequest, ToolCall};
+use crate::services::tool_call_accumulator::{StreamedToolCall, accumulate_tool_call_deltas};
 use futures::StreamExt;
 use serde_json::{Value, json};
-
-/// Upper bound on parallel tool calls in one streamed response — guards the
-/// index-keyed accumulator against a bogus huge `index` from upstream.
-const MAX_TOOL_CALLS: usize = 256;
 
 /// A streamed delta handed to the caller's render callback: the visible answer
 /// text, or the model's reasoning/thinking (DeepSeek `reasoning_content`, the
@@ -101,7 +98,7 @@ pub async fn complete(
     }
 
     let mut content = String::new();
-    let mut tools: Vec<ToolAcc> = Vec::new();
+    let mut tools: Vec<StreamedToolCall> = Vec::new();
     let mut usage: Option<Value> = None;
     let mut model: Option<String> = None;
     // Accumulate raw BYTES, not lossily-decoded chunks: a multi-byte char (CJK,
@@ -176,7 +173,7 @@ pub async fn complete(
                 on_delta(StreamDelta::Text(c));
             }
             if let Some(tcs) = delta.get("tool_calls").and_then(|x| x.as_array()) {
-                accumulate_tool_calls(tcs, &mut tools);
+                accumulate_tool_call_deltas(tcs, &mut tools);
             }
         }
         if done {
@@ -189,7 +186,7 @@ pub async fn complete(
         .enumerate()
         .filter(|(_, a)| !a.name.is_empty())
         .map(|(i, a)| {
-            let arguments = repair_tool_arguments(&a.name, &a.args);
+            let arguments = repair_tool_arguments(&a.name, &a.arguments);
             ToolCall {
                 id: if a.id.is_empty() {
                     format!("call_{i}")
@@ -268,50 +265,6 @@ fn close_truncated_json(raw: &str) -> Option<String> {
         out.push(close);
     }
     Some(out)
-}
-
-#[derive(Default)]
-struct ToolAcc {
-    id: String,
-    name: String,
-    args: String,
-}
-
-/// Merge a streamed `tool_calls` delta array into the per-index accumulators.
-/// OpenAI sends `id`/`function.name` once and `function.arguments` as fragments.
-/// Some providers (e.g. qwen) re-send the *full* `function.name` on every delta,
-/// so the name is assigned (replaced), not appended — otherwise `run_bash` would
-/// accumulate into `run_bashrun_bashrun_bash…` and fail tool lookup. Arguments are
-/// still genuine fragments and are appended.
-fn accumulate_tool_calls(tcs: &[Value], tools: &mut Vec<ToolAcc>) {
-    for tc in tcs {
-        let idx = tc.get("index").and_then(|x| x.as_u64()).unwrap_or(0) as usize;
-        // Bound the index so a bogus/huge `index` from upstream can't grow the
-        // accumulator unboundedly (a 2^31 index would OOM). No real response has
-        // anywhere near this many parallel tool calls.
-        if idx >= MAX_TOOL_CALLS {
-            continue;
-        }
-        while tools.len() <= idx {
-            tools.push(ToolAcc::default());
-        }
-        let acc = &mut tools[idx];
-        if let Some(id) = tc.get("id").and_then(|x| x.as_str())
-            && !id.is_empty()
-        {
-            acc.id = id.to_string();
-        }
-        if let Some(f) = tc.get("function") {
-            if let Some(n) = f.get("name").and_then(|x| x.as_str())
-                && !n.is_empty()
-            {
-                acc.name = n.to_string();
-            }
-            if let Some(a) = f.get("arguments").and_then(|x| x.as_str()) {
-                acc.args.push_str(a);
-            }
-        }
-    }
 }
 
 /// Fold a streamed `usage` object into the running one by field-wise max, so a
@@ -459,59 +412,6 @@ data: [DONE]\n\n";
         .await
         .unwrap();
         assert_eq!(msg.model.as_deref(), Some("deepseek-v4-flash"));
-    }
-
-    #[test]
-    fn accumulate_tool_calls_bounds_a_huge_index() {
-        let mut tools = Vec::new();
-        // A bogus huge index must be ignored, not allocated up to.
-        accumulate_tool_calls(
-            &[json!({"index": 1_000_000_000_u64, "function": {"name": "x"}})],
-            &mut tools,
-        );
-        assert!(
-            tools.is_empty(),
-            "huge index should be dropped, not allocated"
-        );
-        // Normal small indices still accumulate.
-        accumulate_tool_calls(
-            &[
-                json!({"index": 0, "id": "a", "function": {"name": "f", "arguments": "{}"}}),
-                json!({"index": 1, "id": "b", "function": {"name": "g", "arguments": "[]"}}),
-            ],
-            &mut tools,
-        );
-        assert_eq!(tools.len(), 2);
-        assert_eq!(tools[0].name, "f");
-        assert_eq!(tools[1].name, "g");
-    }
-
-    /// qwen (and some other OpenAI-compatible providers) re-send the *full*
-    /// `function.name` on every delta instead of only the first. The name must be
-    /// assigned, not appended — otherwise `run_bash` corrupts into
-    /// `run_bashrun_bashrun_bash…` and fails tool lookup with "unknown tool".
-    #[test]
-    fn accumulate_tool_calls_handles_repeated_full_name() {
-        let mut tools = Vec::new();
-        accumulate_tool_calls(
-            &[
-                json!({"index": 0, "id": "c1", "function": {"name": "run_bash", "arguments": "{\"cmd\":"}}),
-            ],
-            &mut tools,
-        );
-        // Subsequent deltas repeat the whole name and carry argument fragments.
-        accumulate_tool_calls(
-            &[json!({"index": 0, "function": {"name": "run_bash", "arguments": "\"ls\"}"}})],
-            &mut tools,
-        );
-        accumulate_tool_calls(
-            &[json!({"index": 0, "function": {"name": "run_bash"}})],
-            &mut tools,
-        );
-        assert_eq!(tools.len(), 1);
-        assert_eq!(tools[0].name, "run_bash", "name must not duplicate");
-        // Genuine argument fragments are still appended into one valid JSON string.
-        assert_eq!(tools[0].args, "{\"cmd\":\"ls\"}");
     }
 
     /// A partial final chunk (only `output_tokens`) must not wipe the input count.

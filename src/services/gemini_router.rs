@@ -12,7 +12,6 @@ use crate::services::device_fingerprint;
 use crate::services::http_debug::LoggedSend;
 use crate::services::http_utils;
 use crate::services::model_names::select_model_for_provider_attempt;
-use crate::services::openai_anthropic_bridge::convert_anthropic_to_openai_chat_response;
 use crate::services::openai_gemini_bridge::{
     build_google_generate_content_url, convert_openai_chat_to_gemini_sse, openai_chat_model,
 };
@@ -347,13 +346,15 @@ async fn forward_to_provider(
                 let body_text = response.text().await?;
                 let parsed = if status == 200 {
                     let anthropic_response: Value = serde_json::from_str(&body_text)?;
-                    Some(convert_anthropic_to_openai_chat_response(
+                    Some(translate_response(
                         &anthropic_response,
-                        req_body
-                            .get("model")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("gemini-2.5-pro"),
-                    ))
+                        &ResponseOptions::ChatToAnthropic {
+                            model: req_body
+                                .get("model")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("gemini-2.5-pro"),
+                        },
+                    )?)
                 } else {
                     None
                 };

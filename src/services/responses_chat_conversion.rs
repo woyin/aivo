@@ -14,6 +14,7 @@ use crate::services::openai_models::{
     convert_responses_to_chat_response as convert_typed_responses_to_chat,
 };
 use crate::services::provider_protocol::ProviderProtocol;
+use crate::services::tool_call_accumulator::{StreamedToolCall, accumulate_tool_call_deltas};
 use serde_json::{Value, json};
 use std::collections::HashSet;
 
@@ -689,8 +690,7 @@ pub fn parse_provider_response(text: &str) -> anyhow::Result<Value> {
 pub fn accumulate_chat_sse(text: &str) -> Value {
     let mut content = String::new();
     let mut reasoning_content = String::new();
-    // (id, name, accumulated_args)
-    let mut tool_calls_acc: Vec<(String, String, String)> = Vec::new();
+    let mut tool_calls_acc: Vec<StreamedToolCall> = Vec::new();
     let mut finish_reason = String::from("stop");
 
     for line in text.lines() {
@@ -709,28 +709,7 @@ pub fn accumulate_chat_sse(text: &str) -> Value {
                     reasoning_content.push_str(rc);
                 }
                 if let Some(tcs) = delta["tool_calls"].as_array() {
-                    for tc in tcs {
-                        let idx = tc["index"].as_u64().unwrap_or(0) as usize;
-                        while tool_calls_acc.len() <= idx {
-                            tool_calls_acc.push((String::new(), String::new(), String::new()));
-                        }
-                        if let Some(id) = tc["id"].as_str()
-                            && !id.is_empty()
-                        {
-                            tool_calls_acc[idx].0 = id.to_string();
-                        }
-                        if let Some(name) = tc["function"]["name"].as_str()
-                            && !name.is_empty()
-                        {
-                            // Assign, don't append: some providers (e.g. qwen)
-                            // re-send the full name on every delta, which would
-                            // otherwise accumulate into `run_bashrun_bash…`.
-                            tool_calls_acc[idx].1 = name.to_string();
-                        }
-                        if let Some(args) = tc["function"]["arguments"].as_str() {
-                            tool_calls_acc[idx].2.push_str(args);
-                        }
-                    }
+                    accumulate_tool_call_deltas(tcs, &mut tool_calls_acc);
                 }
                 if let Some(fr) = choice["finish_reason"].as_str()
                     && !fr.is_empty()
@@ -745,11 +724,11 @@ pub fn accumulate_chat_sse(text: &str) -> Value {
         let tcs: Vec<Value> = tool_calls_acc
             .iter()
             .enumerate()
-            .map(|(i, (id, name, args))| {
+            .map(|(i, call)| {
                 json!({
-                    "id": if id.is_empty() { format!("call_{}", i) } else { id.clone() },
+                    "id": if call.id.is_empty() { format!("call_{}", i) } else { call.id.clone() },
                     "type": "function",
-                    "function": {"name": name, "arguments": args}
+                    "function": {"name": call.name, "arguments": call.arguments}
                 })
             })
             .collect();

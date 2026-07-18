@@ -113,6 +113,7 @@ pub mod stdin_io;
 pub mod symlink_util;
 pub mod system_env;
 pub mod termux_exec;
+pub mod tool_call_accumulator;
 pub mod transform_mode;
 pub mod update_check;
 pub mod usage_stats_store;
