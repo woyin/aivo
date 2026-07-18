@@ -35,10 +35,7 @@ use crate::services::model_names::{
 use crate::services::openai_anthropic_bridge::convert_openai_chat_response_to_sse;
 use crate::services::openai_gemini_bridge::{build_google_generate_content_url, openai_chat_model};
 use crate::services::openai_models::{
-    OpenAIChatRequest, ResponsesResponse,
-    convert_chat_to_responses_request as convert_typed_chat_to_responses_request,
-    convert_responses_to_chat_response as convert_typed_responses_to_chat_response,
-    stringify_message_content as stringify_typed_message_content,
+    OpenAIChatRequest, stringify_message_content as stringify_typed_message_content,
 };
 use crate::services::protocol_fallback::{
     AttemptOutcome, FirstError, MismatchDirective, QuirkRetryState, classify_attempt,
@@ -48,6 +45,9 @@ use crate::services::provider_profile::is_direct_openai_base;
 use crate::services::provider_protocol::{
     PathVariant, ProviderProtocol, classify_failed_attempt, decode_route, is_endpoint_missing,
     is_protocol_mismatch, is_terminal_upstream_error,
+};
+use crate::services::responses_chat_conversion::{
+    try_convert_chat_to_responses_request, try_convert_responses_json_to_chat,
 };
 use crate::services::route_cache::{PersistedRoute, RouteCache};
 use crate::services::serve_upstream::disable_stream_for_inception_with_tools;
@@ -268,77 +268,58 @@ impl AnthropicToOpenAIRouter {
             probe: ProbeState::new(),
             learned_requires_reasoning: learned_requires_reasoning.clone(),
         };
-        let handle = tokio::spawn(async move { run_router(listener, state).await });
+        let handle = tokio::spawn(async move {
+            http_utils::run_streaming_router(listener, Arc::new(state), handle_router_request).await
+        });
         Ok((port, route_cache, learned_requires_reasoning, handle))
     }
 }
 
-async fn run_router(
-    listener: tokio::net::TcpListener,
-    state: AnthropicToOpenAIRouterState,
-) -> Result<()> {
-    loop {
-        let (mut socket, _) = listener.accept().await?;
-        let config = state.config.clone();
-        let expected_token = state.expected_token.clone();
-        let client = state.client.clone();
-        let route_cache = state.route_cache.clone();
-        let probe = state.probe.clone();
-        let learned_requires_reasoning = state.learned_requires_reasoning.clone();
+async fn handle_router_request(
+    request: String,
+    state: Arc<AnthropicToOpenAIRouterState>,
+    mut socket: tokio::net::TcpStream,
+) {
+    use tokio::io::AsyncWriteExt;
 
-        tokio::spawn(async move {
-            use tokio::io::AsyncWriteExt;
-
-            let request_bytes = match http_utils::read_full_request(&mut socket).await {
-                Ok(b) => b,
-                Err(err) => {
-                    let response = http_utils::http_request_read_error_response(&err);
-                    let _ = socket.write_all(response.as_bytes()).await;
-                    return;
-                }
-            };
-            let request = String::from_utf8_lossy(&request_bytes).into_owned();
-
-            if let Some(expected) = expected_token.as_deref()
-                && !http_utils::request_loopback_authorized(&request, expected)
-            {
-                let response = http_utils::http_error_response(
-                    401,
-                    "Invalid or missing auth token (expected Authorization: Bearer or x-api-key)",
-                );
-                let _ = socket.write_all(response.as_bytes()).await;
-                return;
-            }
-
-            if !http_utils::is_post_path(&request, &["/v1/messages", "/messages"]) {
-                let not_found =
-                    http_utils::http_response(404, CONTENT_TYPE_JSON, "{\"error\":\"Not found\"}");
-                let _ = socket.write_all(not_found.as_bytes()).await;
-                return;
-            }
-
-            let response = match handle_anthropic_to_upstream(
-                &request,
-                &config,
-                &client,
-                &route_cache,
-                &probe,
-                &learned_requires_reasoning,
-                &mut socket,
-            )
-            .await
-            {
-                Ok(response) => response,
-                Err(e) => {
-                    let error = http_utils::http_error_response(500, &format!("{e:#}"));
-                    let _ = socket.write_all(error.as_bytes()).await;
-                    return;
-                }
-            };
-
-            let _ = write_router_response(&mut socket, response).await;
-        });
+    if let Some(expected) = state.expected_token.as_deref()
+        && !http_utils::request_loopback_authorized(&request, expected)
+    {
+        let response = http_utils::http_error_response(
+            401,
+            "Invalid or missing auth token (expected Authorization: Bearer or x-api-key)",
+        );
+        let _ = socket.write_all(response.as_bytes()).await;
+        return;
     }
+
+    if !http_utils::is_post_path(&request, &["/v1/messages", "/messages"]) {
+        let not_found =
+            http_utils::http_response(404, CONTENT_TYPE_JSON, "{\"error\":\"Not found\"}");
+        let _ = socket.write_all(not_found.as_bytes()).await;
+        return;
+    }
+
+    let response = match handle_anthropic_to_upstream(
+        &request,
+        &state.config,
+        &state.client,
+        &state.route_cache,
+        &state.probe,
+        &state.learned_requires_reasoning,
+        &mut socket,
+    )
+    .await
+    {
+        Ok(response) => response,
+        Err(e) => {
+            let error = http_utils::http_error_response(500, &format!("{e:#}"));
+            let _ = socket.write_all(error.as_bytes()).await;
+            return;
+        }
+    };
+
+    let _ = write_router_response(&mut socket, response).await;
 }
 
 async fn write_router_response(
@@ -823,8 +804,7 @@ async fn handle_anthropic_to_upstream(
                 classify_attempt(status_code, response_body, parsed)
             }
             ProviderProtocol::ResponsesApi => {
-                let mut responses_body = convert_chat_to_responses_request(&req_body)?;
-                responses_body["stream"] = json!(false);
+                let responses_body = try_convert_chat_to_responses_request(&req_body)?;
                 let url = build_responses_url(&config.target_base_url, variant);
                 let response = device_fingerprint::maybe_with_starter_headers(
                     client
@@ -844,7 +824,7 @@ async fn handle_anthropic_to_upstream(
                     None
                 } else {
                     let resp: Value = serde_json::from_str(&response_body)?;
-                    let openai_response = convert_responses_to_chat_response(&resp)?;
+                    let openai_response = try_convert_responses_json_to_chat(&resp)?;
                     Some(openai_chat_response_to_anthropic_router(
                         &openai_response,
                         requested_stream,
@@ -1126,22 +1106,6 @@ fn router_candidates(
         .filter(|(proto, _)| *proto != ProviderProtocol::Anthropic)
         .filter(|(proto, _)| allow_responses_fallback || *proto != ProviderProtocol::ResponsesApi)
         .collect()
-}
-
-/// Convert OpenAI Chat Completions request → Responses API request.
-fn convert_chat_to_responses_request(openai_req: &Value) -> Result<Value> {
-    let openai_req: OpenAIChatRequest = serde_json::from_value(openai_req.clone())
-        .context("failed to parse openai chat request for responses conversion")?;
-    serde_json::to_value(convert_typed_chat_to_responses_request(&openai_req))
-        .context("failed to serialize responses request")
-}
-
-/// Convert Responses API response → OpenAI Chat Completions response.
-fn convert_responses_to_chat_response(resp: &Value) -> Result<Value> {
-    let response: ResponsesResponse =
-        serde_json::from_value(resp.clone()).context("failed to parse responses API response")?;
-    serde_json::to_value(convert_typed_responses_to_chat_response(&response))
-        .context("failed to serialize openai chat response")
 }
 
 fn prepare_gateway_model_metadata(

@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::Result;
 use serde_json::Value;
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -21,6 +21,9 @@ use crate::services::protocol_fallback::{
     commit_protocol_switch, mismatch_directive, protocol_candidates, record_slot_outcome,
 };
 use crate::services::provider_protocol::{PathVariant, ProviderProtocol, classify_failed_attempt};
+use crate::services::responses_chat_conversion::{
+    try_convert_chat_to_responses_request, try_convert_responses_json_to_chat,
+};
 use crate::services::route_cache::{PersistedRoute, RouteCache, RouteSlot};
 use crate::services::wire_format::{
     RequestOptions, ResponseOptions, translate_request, translate_response,
@@ -419,7 +422,7 @@ async fn forward_to_provider(
                 (status, body_text, parsed)
             }
             ProviderProtocol::ResponsesApi => {
-                let responses_body = chat_to_responses_request(&req_body)?;
+                let responses_body = try_convert_chat_to_responses_request(&req_body)?;
                 let target_url = http_utils::build_target_url(
                     &config.target_base_url,
                     variant.apply("/v1/responses"),
@@ -443,7 +446,9 @@ async fn forward_to_provider(
                 let status = response.status().as_u16();
                 let body_text = response.text().await?;
                 let parsed = if status == 200 {
-                    Some(responses_to_chat_response(&body_text)?)
+                    Some(try_convert_responses_json_to_chat(&serde_json::from_str(
+                        &body_text,
+                    )?)?)
                 } else {
                     None
                 };
@@ -682,26 +687,6 @@ fn schema_param_accepts_string(schema: &Value, name: &str) -> bool {
         }
     }
     false
-}
-
-fn chat_to_responses_request(openai_req: &Value) -> Result<Value> {
-    use crate::services::openai_models::{
-        OpenAIChatRequest, convert_chat_to_responses_request as convert_typed,
-    };
-    let typed: OpenAIChatRequest = serde_json::from_value(openai_req.clone())?;
-    let mut resp = serde_json::to_value(convert_typed(&typed))
-        .context("failed to serialize responses request")?;
-    resp["stream"] = serde_json::json!(false);
-    Ok(resp)
-}
-
-fn responses_to_chat_response(body_text: &str) -> Result<Value> {
-    use crate::services::openai_models::{
-        ResponsesResponse, convert_responses_to_chat_response as convert_typed,
-    };
-    let typed: ResponsesResponse = serde_json::from_str(body_text)?;
-    serde_json::to_value(convert_typed(&typed))
-        .context("failed to convert responses to chat format")
 }
 
 #[cfg(test)]

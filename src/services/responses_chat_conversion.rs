@@ -3,7 +3,7 @@
 //! Converts between OpenAI Responses API format and Chat Completions format.
 //! Used by the ResponsesToChatRouter and ServeRouter to bridge clients that
 //! speak the Responses API with providers that only support Chat Completions.
-use anyhow::Result;
+use anyhow::{Context, Result};
 
 use crate::services::codex_model_map::map_model_for_codex_cli;
 use crate::services::http_utils::{self, SseLineBuffer, current_unix_ts, gen_id, sse_event};
@@ -1562,19 +1562,25 @@ fn extract_message_text(message: &Value) -> String {
 
 /// Converts an OpenAI Chat Completions request body to a Responses API request body.
 /// Delegates to the typed converter in `openai_models` to avoid duplicating conversion logic.
-pub fn convert_chat_to_responses_request(body: &Value) -> Value {
-    let Ok(typed): Result<OpenAIChatRequest, _> = serde_json::from_value(body.clone()) else {
-        return json!({"model": "gpt-4o", "input": [], "stream": false});
-    };
+/// Every caller re-streams to its own client, so the upstream request is always
+/// non-streaming. `cache_control` is an Anthropic-only field the Anthropic→Chat
+/// step preserves for caching-aware gateways; it has no place in the Responses
+/// schema and strict backends (ChatGPT Codex) 400 on it.
+pub fn try_convert_chat_to_responses_request(body: &Value) -> Result<Value> {
+    let typed: OpenAIChatRequest = serde_json::from_value(body.clone())
+        .context("failed to parse openai chat request for responses conversion")?;
     let mut resp = serde_json::to_value(convert_typed_chat_to_responses(&typed))
-        .unwrap_or_else(|_| json!({"model": "gpt-4o", "input": [], "stream": false}));
-    // Force non-streaming for the fallback path
+        .context("failed to serialize responses request")?;
     resp["stream"] = json!(false);
-    // `cache_control` is an Anthropic-only field the Anthropic→Chat step preserves
-    // for caching-aware gateways; it has no place in the Responses schema and
-    // strict backends (ChatGPT Codex) 400 on it.
     strip_key_recursive(&mut resp, "cache_control");
-    resp
+    Ok(resp)
+}
+
+/// Infallible variant of [`try_convert_chat_to_responses_request`] for paths
+/// that must always produce a body to forward.
+pub fn convert_chat_to_responses_request(body: &Value) -> Value {
+    try_convert_chat_to_responses_request(body)
+        .unwrap_or_else(|_| json!({"model": "gpt-4o", "input": [], "stream": false}))
 }
 
 /// Removes every occurrence of `key` anywhere in the JSON tree.
@@ -1597,18 +1603,22 @@ fn strip_key_recursive(v: &mut Value, key: &str) {
 
 /// Converts a Responses API JSON response to Chat Completions format.
 /// Delegates to the typed converter in `openai_models` to avoid duplicating conversion logic.
-pub fn convert_responses_json_to_chat(resp: &Value) -> Value {
-    // Handle both direct response and wrapped {"response": ...} format
+/// Accepts both a direct response object and the wrapped `{"response": ...}` shape.
+pub fn try_convert_responses_json_to_chat(resp: &Value) -> Result<Value> {
     let inner = resp
         .get("response")
         .filter(|r| r.is_object())
         .unwrap_or(resp);
-
-    let Ok(typed): Result<ResponsesResponse, _> = serde_json::from_value(inner.clone()) else {
-        return json!({"choices": [], "usage": {}});
-    };
+    let typed: ResponsesResponse =
+        serde_json::from_value(inner.clone()).context("failed to parse responses API response")?;
     serde_json::to_value(convert_typed_responses_to_chat(&typed))
-        .unwrap_or_else(|_| json!({"choices": [], "usage": {}}))
+        .context("failed to serialize openai chat response")
+}
+
+/// Infallible variant of [`try_convert_responses_json_to_chat`] for paths that
+/// must always produce a body to forward.
+pub fn convert_responses_json_to_chat(resp: &Value) -> Value {
+    try_convert_responses_json_to_chat(resp).unwrap_or_else(|_| json!({"choices": [], "usage": {}}))
 }
 
 /// Streaming inverse of [`ResponsesStreamConverter`]: feeds upstream Responses

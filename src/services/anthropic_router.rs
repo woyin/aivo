@@ -83,84 +83,63 @@ impl AnthropicRouter {
             client: router_http_client(),
             beta_header_rejected: Arc::new(AtomicBool::new(false)),
         };
-        let handle = tokio::spawn(async move { run_router(listener, state).await });
+        let handle = tokio::spawn(async move {
+            http_utils::run_streaming_router(listener, Arc::new(state), handle_router_request).await
+        });
         Ok((port, handle))
     }
 }
 
-async fn run_router(listener: tokio::net::TcpListener, state: AnthropicRouterState) -> Result<()> {
-    loop {
-        let (mut socket, _) = listener.accept().await?;
-        let config = state.config.clone();
-        let expected_token = state.expected_token.clone();
-        let client = state.client.clone();
-        let beta_header_rejected = state.beta_header_rejected.clone();
+async fn handle_router_request(
+    request: String,
+    state: Arc<AnthropicRouterState>,
+    mut socket: tokio::net::TcpStream,
+) {
+    use tokio::io::AsyncWriteExt;
 
-        tokio::spawn(async move {
-            use tokio::io::AsyncWriteExt;
+    if let Some(expected) = state.expected_token.as_deref()
+        && !http_utils::request_loopback_authorized(&request, expected)
+    {
+        let response = http_utils::http_error_response(
+            401,
+            "Invalid or missing auth token (expected Authorization: Bearer or x-api-key)",
+        );
+        let _ = socket.write_all(response.as_bytes()).await;
+        return;
+    }
 
-            let request_bytes = match http_utils::read_full_request(&mut socket).await {
-                Ok(b) => b,
-                Err(err) => {
-                    let response = http_utils::http_request_read_error_response(&err);
-                    let _ = socket.write_all(response.as_bytes()).await;
-                    return;
-                }
-            };
+    let path = http_utils::extract_request_path(&request);
+    let path = path.split('?').next().unwrap_or("");
 
-            let request = String::from_utf8_lossy(&request_bytes);
+    let route = if request.starts_with("POST ") {
+        AnthropicRoute::from_request_path(path)
+    } else {
+        None
+    };
+    let Some(route) = route else {
+        let not_found =
+            http_utils::http_response(404, CONTENT_TYPE_JSON, "{\"error\":\"Not found\"}");
+        let _ = socket.write_all(not_found.as_bytes()).await;
+        return;
+    };
 
-            if let Some(expected) = expected_token.as_deref()
-                && !http_utils::request_loopback_authorized(&request, expected)
-            {
-                let response = http_utils::http_error_response(
-                    401,
-                    "Invalid or missing auth token (expected Authorization: Bearer or x-api-key)",
-                );
-                let _ = socket.write_all(response.as_bytes()).await;
-                return;
-            }
-
-            let path = http_utils::extract_request_path(&request);
-            let path = path.split('?').next().unwrap_or("");
-            let method_is_post = request.starts_with("POST ");
-
-            let result = if method_is_post {
-                match AnthropicRoute::from_request_path(path) {
-                    Some(route) => {
-                        forward_request(&request, &config, &client, route, &beta_header_rejected)
-                            .await
-                    }
-                    None => {
-                        let not_found = http_utils::http_response(
-                            404,
-                            CONTENT_TYPE_JSON,
-                            "{\"error\":\"Not found\"}",
-                        );
-                        let _ = socket.write_all(not_found.as_bytes()).await;
-                        return;
-                    }
-                }
-            } else {
-                let not_found =
-                    http_utils::http_response(404, CONTENT_TYPE_JSON, "{\"error\":\"Not found\"}");
-                let _ = socket.write_all(not_found.as_bytes()).await;
-                return;
-            };
-
-            match result {
-                Ok(resp) => {
-                    let _ = write_router_response(&mut socket, resp).await;
-                }
-                Err(e) => {
-                    let err = http_utils::http_error_response(
-                        500,
-                        &format!("Internal Server Error: {e:#}"),
-                    );
-                    let _ = socket.write_all(err.as_bytes()).await;
-                }
-            }
-        });
+    match forward_request(
+        &request,
+        &state.config,
+        &state.client,
+        route,
+        &state.beta_header_rejected,
+    )
+    .await
+    {
+        Ok(resp) => {
+            let _ = write_router_response(&mut socket, resp).await;
+        }
+        Err(e) => {
+            let err =
+                http_utils::http_error_response(500, &format!("Internal Server Error: {e:#}"));
+            let _ = socket.write_all(err.as_bytes()).await;
+        }
     }
 }
 
