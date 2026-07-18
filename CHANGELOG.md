@@ -1,5 +1,15 @@
 # Changelog
 
+## v0.41.2
+
+Adds Kimi Code as an OAuth provider — sign in with a Kimi membership, and use it from any coding agent. Also fixes an Esc-cancelled message leaking into the next turn's history, alongside internal test-infra hardening and an engine/tools module split.
+
+- feat(keys): Kimi Code (OAuth) provider login via device flow (057138f8)
+- fix(code): Esc-cancelled message no longer duplicated into the next turn's history (640c8ba5)
+- fix: probe-timeout coverage, injectable stats cache, env_parse/tmp dedup, sandbox hardening (79fee3d7)
+- refactor(agent): split engine.rs and tools.rs into topic modules (1cde6544)
+- test: hermetic test infra — HOME sandbox, injectable home, one app literal (9a41e0ef)
+
 ## v0.41.1
 
 A session-continuation and TUI-stability patch. `--resume` becomes the one continuation flag across launch, one-shot, and the TUI, backed by a native-rewrite → import → digest fidelity ladder, with picker cancel/title fixes riding along. Image paste no longer freezes the TUI for seconds per Ctrl+V, and `stats` reports honest code-session counts.
