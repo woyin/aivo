@@ -2489,9 +2489,11 @@ is preserved."
                 PickerValue::RewindTurn {
                     history_index,
                     ordinal,
+                    keep_engine,
                 },
             ) => {
-                self.rewind_to_turn(history_index, ordinal).await?;
+                self.rewind_to_turn(history_index, ordinal, keep_engine)
+                    .await?;
             }
             (PickerKind::Effort, PickerValue::Effort(level)) => {
                 self.apply_reasoning_effort(level).await;

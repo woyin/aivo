@@ -33,7 +33,7 @@ async fn test_rewind_truncates_history_and_restores_draft() {
 
     // Rewind to the second user turn (history index 2). No live engine in the
     // test app → conversation-only path (ordinal None).
-    app.rewind_to_turn(2, None).await.unwrap();
+    app.rewind_to_turn(2, None, false).await.unwrap();
 
     // That turn and everything after it are gone; the prior exchange stays.
     assert_eq!(app.history.len(), 2);
@@ -60,7 +60,7 @@ async fn test_rewind_reestimates_context_fill() {
         ..Default::default()
     });
 
-    app.rewind_to_turn(2, None).await.unwrap();
+    app.rewind_to_turn(2, None, false).await.unwrap();
 
     assert!(app.context_is_estimate, "measured flag must not survive");
     assert_eq!(app.last_usage, None);
@@ -78,7 +78,7 @@ async fn test_rewind_to_first_turn_clears_history() {
     app.session_id = "rewind-2".to_string();
     seed_two_exchanges(&mut app);
 
-    app.rewind_to_turn(0, None).await.unwrap();
+    app.rewind_to_turn(0, None, false).await.unwrap();
 
     assert!(app.history.is_empty());
     assert_eq!(app.draft, "first question");
@@ -101,6 +101,7 @@ async fn test_open_rewind_picker_lists_user_turns_newest_first() {
     let PickerValue::RewindTurn {
         history_index,
         ordinal,
+        keep_engine,
     } = &picker.items[0].value
     else {
         panic!("expected a RewindTurn value");
@@ -108,6 +109,7 @@ async fn test_open_rewind_picker_lists_user_turns_newest_first() {
     assert_eq!(*history_index, 2);
     // No live engine in the test app → no checkpoints → conversation-only.
     assert!(ordinal.is_none());
+    assert!(!keep_engine);
     assert!(picker.items[0].label.contains("conversation only"));
 }
 
@@ -153,10 +155,11 @@ async fn test_rewind_picker_ignores_non_agent_row_with_identical_text() {
         panic!("expected a rewind picker overlay");
     };
     assert_eq!(picker.items.len(), 2);
-    // Newest row = the plain-chat duplicate: no checkpoint, conversation-only.
+    // Newest row: no checkpoint of its own and none newer — conversation-only.
     let PickerValue::RewindTurn {
         history_index,
         ordinal,
+        keep_engine,
     } = &picker.items[0].value
     else {
         panic!("expected a RewindTurn value");
@@ -166,18 +169,191 @@ async fn test_rewind_picker_ignores_non_agent_row_with_identical_text() {
         ordinal.is_none(),
         "a non-engine row must not steal the checkpoint"
     );
+    assert!(!keep_engine);
     assert!(picker.items[0].label.contains("conversation only"));
     // Older row = the real engine turn: keeps its checkpoint and file revert.
     let PickerValue::RewindTurn {
         history_index,
         ordinal,
+        keep_engine,
     } = &picker.items[1].value
     else {
         panic!("expected a RewindTurn value");
     };
     assert_eq!(*history_index, 0);
     assert_eq!(*ordinal, Some(0));
+    assert!(keep_engine);
     assert!(!picker.items[1].label.contains("conversation only"));
+}
+
+#[tokio::test]
+async fn test_rewind_picker_boundary_reverts_newer_turns_for_conversation_only_row() {
+    // A checkpoint-less row must revert newer edits via the nearest newer checkpoint.
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    for (role, content) in [
+        ("user", "old ask"),
+        ("assistant", "old reply"),
+        ("user", "new ask"),
+    ] {
+        app.history.push(ChatMessage {
+            model: None,
+            role: role.to_string(),
+            content: content.to_string(),
+            reasoning_content: None,
+            attachments: vec![],
+        });
+    }
+    app.agent_turn_indices.insert(2);
+    let mut engine =
+        crate::agent::engine::AgentEngine::new("/tmp", "claude", "2026-06-14", &[], &[], 0, 0);
+    engine.checkpoints.push(crate::agent::engine::Checkpoint {
+        msg_index: 1,
+        prompt: "new ask".to_string(),
+        tree: Some("abc".to_string()),
+        changed: Some(Vec::new()),
+        seg_tree: None,
+    });
+    app.agent_engine = Some(AgentSession {
+        key_id: "k".to_string(),
+        model: "claude".to_string(),
+        engine: std::sync::Arc::new(tokio::sync::Mutex::new(engine)),
+    });
+
+    app.open_rewind_picker().await.unwrap();
+
+    let Overlay::Picker(picker) = &app.overlay else {
+        panic!("expected a rewind picker overlay");
+    };
+    assert_eq!(picker.items.len(), 2);
+    let PickerValue::RewindTurn {
+        history_index,
+        ordinal,
+        keep_engine,
+    } = &picker.items[0].value
+    else {
+        panic!("expected a RewindTurn value");
+    };
+    assert_eq!((*history_index, *ordinal, *keep_engine), (2, Some(0), true));
+    let PickerValue::RewindTurn {
+        history_index,
+        ordinal,
+        keep_engine,
+    } = &picker.items[1].value
+    else {
+        panic!("expected a RewindTurn value");
+    };
+    assert_eq!(
+        (*history_index, *ordinal, *keep_engine),
+        (0, Some(0), false)
+    );
+    assert!(!picker.items[1].label.contains("conversation only"));
+}
+
+/// Boundary rewind: files revert via the newer checkpoint; engine + transcript drop.
+#[tokio::test]
+async fn test_rewind_boundary_reverts_files_then_drops_engine() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.session_id = "rewind-boundary".to_string();
+    let dir = TempDir::new().unwrap();
+    let cwd = dir.path();
+    std::fs::write(cwd.join("a.txt"), "v0").unwrap();
+
+    let mut engine = crate::agent::engine::AgentEngine::new(
+        &cwd.display().to_string(),
+        "claude",
+        "2026-06-14",
+        &[],
+        &[],
+        0,
+        0,
+    );
+    engine.enable_rewind_checkpoints(&cwd.display().to_string());
+    // Reach the store through the transplant API (private field otherwise).
+    let (store, _) = engine.take_rewind_state();
+    let mut store = store.unwrap();
+    if !store.git_available().await {
+        return; // git missing → skip
+    }
+    let tree = store.snapshot().await;
+    assert!(tree.is_some(), "snapshot must succeed");
+    engine.adopt_rewind_state(
+        Some(store),
+        vec![crate::agent::engine::Checkpoint {
+            msg_index: 1,
+            prompt: "new ask".to_string(),
+            tree,
+            changed: None,
+            seg_tree: None,
+        }],
+    );
+    std::fs::write(cwd.join("a.txt"), "v1").unwrap();
+
+    for (role, content) in [("user", "old ask"), ("assistant", "r"), ("user", "new ask")] {
+        app.history.push(ChatMessage {
+            model: None,
+            role: role.to_string(),
+            content: content.to_string(),
+            reasoning_content: None,
+            attachments: vec![],
+        });
+    }
+    app.agent_turn_indices.insert(2);
+    app.agent_engine = Some(AgentSession {
+        key_id: "k".to_string(),
+        model: "claude".to_string(),
+        engine: std::sync::Arc::new(tokio::sync::Mutex::new(engine)),
+    });
+    app.pending_agent_messages = Some(vec![serde_json::json!({"role": "user", "content": "x"})]);
+
+    app.rewind_to_turn(0, Some(0), false).await.unwrap();
+
+    assert_eq!(
+        std::fs::read_to_string(cwd.join("a.txt")).unwrap(),
+        "v0",
+        "the newer turn's edit reverts through the boundary checkpoint"
+    );
+    assert!(
+        app.agent_engine.is_none(),
+        "engine dropped after the revert"
+    );
+    assert!(app.pending_agent_messages.is_none());
+    assert!(app.history.is_empty());
+    assert_eq!(app.draft, "old ask");
+}
+
+/// Home/root launch dirs disable snapshots permanently — the picker title must say so.
+#[tokio::test]
+async fn test_rewind_picker_title_explains_permanent_file_revert_off() {
+    let Some(home) = crate::services::system_env::home_dir() else {
+        return;
+    };
+    if home.parent().is_none() {
+        return; // HOME="/" classifies as root, not home — env-fragile
+    }
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    seed_two_exchanges(&mut app);
+    let mut engine =
+        crate::agent::engine::AgentEngine::new("/tmp", "claude", "2026-06-14", &[], &[], 0, 0);
+    engine.enable_rewind_checkpoints(&home.display().to_string());
+    app.agent_engine = Some(AgentSession {
+        key_id: "k".to_string(),
+        model: "claude".to_string(),
+        engine: std::sync::Arc::new(tokio::sync::Mutex::new(engine)),
+    });
+
+    app.open_rewind_picker().await.unwrap();
+
+    let Overlay::Picker(picker) = &app.overlay else {
+        panic!("expected a rewind picker overlay");
+    };
+    assert!(
+        picker.title.contains("file revert off"),
+        "got title: {}",
+        picker.title
+    );
 }
 
 #[tokio::test]
@@ -338,7 +514,7 @@ async fn test_conversation_only_rewind_drops_pending_transcript() {
         serde_json::json!({"role": "assistant", "content": "rewound-away reply"}),
     ]);
 
-    app.rewind_to_turn(0, None).await.unwrap();
+    app.rewind_to_turn(0, None, false).await.unwrap();
 
     assert!(
         app.pending_agent_messages.is_none(),

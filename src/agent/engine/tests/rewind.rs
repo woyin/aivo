@@ -334,6 +334,52 @@ async fn rewind_to_read_only_turn_restores_from_the_next_tree() {
 }
 
 #[tokio::test]
+async fn model_switch_transplant_keeps_file_revert() {
+    // export→restore preserves message indices, so transplanted checkpoints stay valid.
+    let dir = tempfile::tempdir().unwrap();
+    let p = dir.path();
+    std::fs::write(p.join("a.txt"), "v0").unwrap();
+    let mut old_engine = rewind_engine(p);
+    old_engine.enable_rewind_checkpoints(&p.display().to_string());
+    let tree = {
+        let store = old_engine.checkpoint_store.as_mut().unwrap();
+        if !store.git_available().await {
+            return; // git missing → skip
+        }
+        store.snapshot().await
+    };
+    old_engine.checkpoints.push(Checkpoint {
+        msg_index: old_engine.messages.len(),
+        prompt: "go".into(),
+        tree,
+        changed: None,
+        seg_tree: None,
+    });
+    old_engine
+        .messages
+        .push(json!({"role": "user", "content": "go"}));
+    old_engine
+        .messages
+        .push(json!({"role": "assistant", "content": "done"}));
+    std::fs::write(p.join("a.txt"), "v1").unwrap();
+
+    let conversation = old_engine.export_conversation();
+    let (store, checkpoints) = old_engine.take_rewind_state();
+    let mut new_engine = rewind_engine(p);
+    new_engine.enable_rewind_checkpoints(&p.display().to_string());
+    new_engine.restore_conversation(conversation);
+    new_engine.adopt_rewind_state(store, checkpoints);
+
+    let targets = new_engine.rewind_targets();
+    assert_eq!(targets, vec![("go".to_string(), true)]);
+    let outcome = new_engine.rewind_to(0).await;
+    assert_eq!(std::fs::read_to_string(p.join("a.txt")).unwrap(), "v0");
+    assert_eq!(outcome.restored, 1);
+    assert!(outcome.error.is_none());
+    assert_eq!(new_engine.messages.len(), 1);
+}
+
+#[tokio::test]
 async fn lazy_checkpoint_snapshots_only_before_a_mutating_tool() {
     let dir = tempfile::tempdir().unwrap();
     let p = dir.path();

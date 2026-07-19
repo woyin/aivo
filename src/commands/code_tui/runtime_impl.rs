@@ -693,12 +693,20 @@ impl CodeTuiApp {
             // model switch rebuilds from the exact prior messages (ids intact), not
             // the lossy display seed. Empty after /new or key switch (they clear
             // agent_engine); skipped when a resume payload is pending (it wins).
+            // Rewind state rides along: verbatim restore keeps checkpoint indices valid.
+            let mut prior_rewind_state = None;
             let prior_engine_messages: Option<Vec<serde_json::Value>> =
                 if self.pending_agent_messages.is_some() {
                     None
                 } else if let Some(prev) = self.agent_engine.as_ref() {
-                    let msgs = prev.engine.lock().await.export_conversation();
-                    (!msgs.is_empty()).then_some(msgs)
+                    let mut prev_engine = prev.engine.lock().await;
+                    let msgs = prev_engine.export_conversation();
+                    if msgs.is_empty() {
+                        None
+                    } else {
+                        prior_rewind_state = Some(prev_engine.take_rewind_state());
+                        Some(msgs)
+                    }
                 } else {
                     None
                 };
@@ -793,6 +801,9 @@ impl CodeTuiApp {
                 engine.restore_conversation(conversation);
             } else if let Some(conversation) = prior_engine_messages {
                 engine.restore_conversation(conversation);
+                if let Some((store, checkpoints)) = prior_rewind_state.take() {
+                    engine.adopt_rewind_state(store, checkpoints);
+                }
             } else {
                 let prior = self.history.len().saturating_sub(1);
                 let seed = agent_seed_turns(&self.history[..prior]);
@@ -909,9 +920,15 @@ impl CodeTuiApp {
         };
         // Flag the user row as engine-dispatched for the `/rewind` picker match —
         // after every early return, so a turn that never ran stays unflagged.
-        if self.history.last().is_some_and(|m| m.role == "user") {
-            self.agent_turn_indices.insert(self.history.len() - 1);
-        }
+        // Checkpoint by the row's DISPLAYED content — the picker matches by
+        // transcript text, which can diverge from the expanded prompt (`/review`).
+        let checkpoint_prompt = match self.history.last() {
+            Some(m) if m.role == "user" => {
+                self.agent_turn_indices.insert(self.history.len() - 1);
+                m.content.clone()
+            }
+            _ => input.clone(),
+        };
         self.response_task = Some(tokio::spawn(async move {
             let client = crate::services::http_utils::router_http_client();
             let ctx = TurnCtx {
@@ -939,14 +956,10 @@ impl CodeTuiApp {
                 engine.set_reasoning_effort(effort);
             }
             // run_turn ends by calling ui.footer → AgentFinished commits the turn.
-            match multimodal {
-                Some(content) => {
-                    engine
-                        .run_turn_with_content(&ctx, &mut ui, content, input)
-                        .await
-                }
-                None => engine.run_turn(&ctx, &mut ui, input).await,
-            }
+            let content = multimodal.unwrap_or(serde_json::Value::String(input));
+            engine
+                .run_turn_with_content(&ctx, &mut ui, content, checkpoint_prompt)
+                .await
         }));
     }
 
@@ -1738,9 +1751,9 @@ impl CodeTuiApp {
     /// `/rewind`: open the picker listing every past user turn (newest first), so
     /// the user can jump back to one. Selecting a turn (see [`rewind_to_turn`])
     /// truncates the conversation there, reverts the agent's file edits made since,
-    /// and restores that turn's prompt to the composer for edit/resend. Each row is
-    /// labeled with the file impact, or marked "conversation only" for turns that
-    /// predate the live engine (restored on resume — no file snapshots).
+    /// and restores that turn's prompt to the composer for edit/resend. Rows without
+    /// their own checkpoint revert newer turns' edits through the nearest newer one;
+    /// "conversation only" marks rows where no file revert is possible.
     pub(super) async fn open_rewind_picker(&mut self) -> Result<()> {
         if self.sending {
             self.queue_command(SlashCommand::Rewind, "/rewind");
@@ -1761,12 +1774,13 @@ impl CodeTuiApp {
         // Engine checkpoints, in order: (opening prompt, file-revertible). `sending`
         // is guarded above, so `lock().await` is uncontended — `try_lock` could
         // miss transiently and mark every turn conversation-only.
-        let targets: Vec<(String, bool)> = if let Some(session) = self.agent_engine.as_ref() {
-            let engine = session.engine.lock().await;
-            engine.rewind_targets()
-        } else {
-            Vec::new()
-        };
+        let (targets, revert_block): (Vec<(String, bool)>, Option<&'static str>) =
+            if let Some(session) = self.agent_engine.as_ref() {
+                let engine = session.engine.lock().await;
+                (engine.rewind_targets(), engine.rewind_file_revert_block())
+            } else {
+                (Vec::new(), None)
+            };
         // Map display turns onto checkpoints by prompt text from the newest
         // backward, over engine-dispatched rows only (a plain-chat/ACP row with
         // identical text must not steal an engine turn's checkpoint). A flagged
@@ -1775,7 +1789,6 @@ impl CodeTuiApp {
         // Robust to trimming, compaction, and rebuilds — unlike positional
         // arithmetic, which restored the wrong tree when the lists drifted.
         let mut row_ordinal: Vec<Option<usize>> = vec![None; turn_count];
-        let mut row_revertible: Vec<bool> = vec![false; turn_count];
         let mut remaining = targets.len();
         for turn_idx in (0..turn_count).rev() {
             let history_index = user_indices[turn_idx];
@@ -1786,14 +1799,29 @@ impl CodeTuiApp {
             {
                 remaining -= 1;
                 row_ordinal[turn_idx] = Some(remaining);
-                row_revertible[turn_idx] = targets[remaining].1;
+            }
+        }
+        // Rows without their own checkpoint (pre-resume, plain-chat/ACP, compacted
+        // away) still revert newer turns' edits via the nearest newer checkpoint.
+        let mut row_boundary: Vec<Option<usize>> = vec![None; turn_count];
+        let mut nearest_newer: Option<usize> = None;
+        for turn_idx in (0..turn_count).rev() {
+            row_boundary[turn_idx] = row_ordinal[turn_idx].or(nearest_newer);
+            if row_ordinal[turn_idx].is_some() {
+                nearest_newer = row_ordinal[turn_idx];
             }
         }
         let mut items = Vec::with_capacity(turn_count);
         for (turn_idx, &history_index) in user_indices.iter().enumerate() {
-            let ordinal = row_ordinal[turn_idx];
-            // Files won't revert if no checkpoint matched or it has no tree.
-            let conversation_only = !row_revertible[turn_idx];
+            let ordinal = row_boundary[turn_idx];
+            // The engine transcript can only truncate to a turn it checkpointed
+            // itself; other rows revert files, then drop and re-seed the engine.
+            let keep_engine = row_ordinal[turn_idx].is_some();
+            // Files won't revert if no checkpoint applies or none from it has a tree.
+            let conversation_only = match ordinal {
+                Some(ord) => !targets[ord].1,
+                None => true,
+            };
             let prompt = rewind_excerpt(&self.history[history_index].content);
             let suffix = rewind_label_suffix(conversation_only);
             items.push(PickerEntry {
@@ -1802,13 +1830,21 @@ impl CodeTuiApp {
                 value: PickerValue::RewindTurn {
                     history_index,
                     ordinal,
+                    keep_engine,
                 },
             });
         }
         // Newest turn at the top — the common rewind target.
         items.reverse();
+        // Home/root launch dirs never snapshot — explain once in the title.
+        let title = match revert_block {
+            Some("home directory") => "Rewind to turn — file revert off (launched in home dir)",
+            Some("filesystem root") => "Rewind to turn — file revert off (launched at fs root)",
+            Some(_) => "Rewind to turn — file revert off here",
+            None => "Rewind to turn",
+        };
         self.overlay = Overlay::Picker(Box::new(PickerState::ready(
-            "Rewind to turn",
+            title,
             String::new(),
             items,
             PickerKind::Rewind,
@@ -1816,15 +1852,15 @@ impl CodeTuiApp {
         Ok(())
     }
 
-    /// Apply a `/rewind` to the turn the user picked: truncate history at that turn,
-    /// restore its prompt + attachments to the composer, and — for a live turn —
-    /// revert the agent's file edits via the engine while keeping the engine so a
-    /// further rewind still works. Conversation-only turns fall back to the lossy
-    /// engine reset (file edits are not reverted) and say so.
+    /// Apply a `/rewind` to the picked turn: truncate history there, restore its
+    /// prompt + attachments to the composer, and revert file edits through
+    /// `ordinal` when a checkpoint applies. `keep_engine: false` drops the engine
+    /// after the revert; no checkpoint at all means a lossy conversation-only reset.
     pub(super) async fn rewind_to_turn(
         &mut self,
         history_index: usize,
         ordinal: Option<usize>,
+        keep_engine: bool,
     ) -> Result<()> {
         if self.sending {
             self.notice = Some((
@@ -1860,12 +1896,23 @@ impl CodeTuiApp {
         let notice = match ordinal {
             Some(ord) if self.agent_engine.is_some() => {
                 // Rewind through the engine: truncates the conversation, reverts the
-                // turn's files, keeps earlier checkpoints. Lock is uncontended
-                // (`sending` guarded above).
+                // rewound turns' files, keeps earlier checkpoints. Lock is
+                // uncontended (`sending` guarded above).
                 let session = self.agent_engine.as_ref().expect("engine present");
                 let mut engine = session.engine.lock().await;
                 let outcome = engine.rewind_to(ord).await;
                 drop(engine);
+                if !keep_engine {
+                    // The engine transcript can't truncate to this un-checkpointed
+                    // target: drop it and clear the durable transcript, or a
+                    // resume restores the pre-rewind conversation.
+                    self.agent_engine = None;
+                    self.pending_agent_messages = None;
+                    let _ = self
+                        .session_store
+                        .save_agent_messages(&self.session_id, &[])
+                        .await;
+                }
                 rewind_notice(&outcome)
             }
             _ => {

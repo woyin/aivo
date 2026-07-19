@@ -385,6 +385,41 @@ questions.",
         }
     }
 
+    /// Permanent reason `/rewind` file revert is off (home / fs-root launch dir), if any.
+    pub fn rewind_file_revert_block(&self) -> Option<&'static str> {
+        self.checkpoint_store
+            .as_ref()
+            .and_then(|s| s.permanent_disabled_reason())
+    }
+
+    /// Hand the `/rewind` state to a successor engine on a model/key switch.
+    /// Only valid when the successor restores this exact conversation —
+    /// `restore_conversation` preserves message indices, so every `msg_index` stays right.
+    pub(crate) fn take_rewind_state(
+        &mut self,
+    ) -> (
+        Option<crate::agent::checkpoint::CheckpointStore>,
+        Vec<Checkpoint>,
+    ) {
+        (
+            self.checkpoint_store.take(),
+            std::mem::take(&mut self.checkpoints),
+        )
+    }
+
+    /// Install state from [`Self::take_rewind_state`] (same index contract);
+    /// keeps the fresh store when the donor had none.
+    pub(crate) fn adopt_rewind_state(
+        &mut self,
+        store: Option<crate::agent::checkpoint::CheckpointStore>,
+        checkpoints: Vec<Checkpoint>,
+    ) {
+        if store.is_some() {
+            self.checkpoint_store = store;
+        }
+        self.checkpoints = checkpoints;
+    }
+
     /// Drain the last turn's provider-measured token split (zeroing the accumulator);
     /// the chat TUI folds it into the chat session index for `aivo stats`.
     pub fn take_turn_usage(&mut self) -> SessionTokens {
