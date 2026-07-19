@@ -2944,22 +2944,109 @@ pub(super) struct CodeTuiApp {
     pub(super) pending_full_repaint: bool,
 }
 
-/// Agent decision cards awaiting the user's verdict. The UI shows at most one
-/// at a time (the engine blocks on each oneshot), but the fields are
-/// independent Options — fold into a single enum before adding a sixth card.
+/// The one agent decision card awaiting the user's verdict. Mutually
+/// exclusive by construction; at most one can block the agent because every
+/// producer awaits its oneshot before the next request (detached subagents
+/// deny visibly without a card).
+pub(super) enum AgentCard {
+    /// Tool-permission card, while the agent waits for the user's y/n/a.
+    Permission(PendingPermission),
+    /// `ask_user` question card, while the agent waits for the user's pick.
+    Ask(PendingAskUser),
+    /// Edit-review card, while the agent waits for approve/reject.
+    Review(PendingReview),
+    /// Plan-approval card (`exit_plan_mode`), while the agent waits for the
+    /// verdict.
+    PlanApproval(PendingPlanApproval),
+}
+
+/// Agent decision cards awaiting the user's verdict.
 #[derive(Default)]
 pub(super) struct AgentCards {
-    /// Pending tool-permission card, while the agent waits for the user's y/n/a.
-    pub(super) permission: Option<PendingPermission>,
-    /// Pending `ask_user` question card, while the agent waits for the user's pick.
-    pub(super) ask: Option<PendingAskUser>,
-    /// Pending edit-review card, while the agent waits for approve/reject.
-    pub(super) review: Option<PendingReview>,
-    /// Pending plan-approval card (`exit_plan_mode`), while the agent waits for
-    /// the verdict.
-    pub(super) plan_approval: Option<PendingPlanApproval>,
+    /// The active agent card. Setting a new one drops (= denies via closed
+    /// oneshot) any predecessor.
+    active: Option<AgentCard>,
     /// Pending consent card for project MCP servers (held back until decided).
+    /// Independent lifecycle: shown above any agent card and NOT dropped by
+    /// [`Self::clear_agent_cards`] at turn teardown.
     pub(super) mcp_consent: Option<McpConsentPrompt>,
+}
+
+/// Typed views of `active` so call sites keep their per-card shape:
+/// `$get()` / `$get_mut()` borrow when that variant is up, `$take()` resolves
+/// it, `$set()` replaces whatever was up.
+macro_rules! card_accessors {
+    ($get:ident, $take:ident, $set:ident, $variant:ident, $ty:ty) => {
+        pub(super) fn $get(&self) -> Option<&$ty> {
+            match &self.active {
+                Some(AgentCard::$variant(c)) => Some(c),
+                _ => None,
+            }
+        }
+
+        pub(super) fn $take(&mut self) -> Option<$ty> {
+            match self.active.take() {
+                Some(AgentCard::$variant(c)) => Some(c),
+                other => {
+                    self.active = other;
+                    None
+                }
+            }
+        }
+
+        pub(super) fn $set(&mut self, card: $ty) {
+            self.active = Some(AgentCard::$variant(card));
+        }
+    };
+    ($get:ident, $get_mut:ident, $take:ident, $set:ident, $variant:ident, $ty:ty) => {
+        card_accessors!($get, $take, $set, $variant, $ty);
+
+        pub(super) fn $get_mut(&mut self) -> Option<&mut $ty> {
+            match &mut self.active {
+                Some(AgentCard::$variant(c)) => Some(c),
+                _ => None,
+            }
+        }
+    };
+}
+
+impl AgentCards {
+    card_accessors!(
+        permission,
+        take_permission,
+        set_permission,
+        Permission,
+        PendingPermission
+    );
+    card_accessors!(ask, ask_mut, take_ask, set_ask, Ask, PendingAskUser);
+    card_accessors!(
+        review,
+        review_mut,
+        take_review,
+        set_review,
+        Review,
+        PendingReview
+    );
+    card_accessors!(
+        plan_approval,
+        plan_approval_mut,
+        take_plan_approval,
+        set_plan_approval,
+        PlanApproval,
+        PendingPlanApproval
+    );
+
+    /// True while any agent decision card blocks the turn (`mcp_consent` has
+    /// its own lifecycle and doesn't count).
+    pub(super) fn any_agent_card(&self) -> bool {
+        self.active.is_some()
+    }
+
+    /// Turn teardown (finish/error/cancel): drop the active card, denying a
+    /// still-pending request via its closed oneshot. Leaves `mcp_consent` up.
+    pub(super) fn clear_agent_cards(&mut self) {
+        self.active = None;
+    }
 }
 
 /// Per-frame render products and cross-frame memos, written during render;

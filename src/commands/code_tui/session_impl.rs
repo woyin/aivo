@@ -2698,10 +2698,7 @@ is preserved."
         // turn. Reusing a same-key/model engine would continue the PREVIOUS
         // session's thread (`/new` and key/model switches reset it the same way).
         self.agent_engine = None;
-        self.cards.permission = None;
-        self.cards.ask = None;
-        self.cards.review = None;
-        self.cards.plan_approval = None;
+        self.cards.clear_agent_cards();
         // Plan/goal modes belong to the OLD conversation — a leaked plan card
         // indexes the replaced history and `/plan go` would run the old plan.
         self.plan_mode = false;

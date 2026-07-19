@@ -2775,10 +2775,7 @@ pieces and keep going"
         self.agent_engine = None;
         // A fresh chat must not inherit a resumed session's pending transcript.
         self.pending_agent_messages = None;
-        self.cards.permission = None;
-        self.cards.ask = None;
-        self.cards.review = None;
-        self.cards.plan_approval = None;
+        self.cards.clear_agent_cards();
         self.stop_agent_serve();
     }
 
@@ -2819,10 +2816,7 @@ pieces and keep going"
         // Tear down the agent turn's serve and drop any pending permission card
         // (the dropped reply makes the engine's awaiting tool fail closed).
         self.stop_agent_serve();
-        self.cards.permission = None;
-        self.cards.ask = None;
-        self.cards.review = None;
-        self.cards.plan_approval = None;
+        self.cards.clear_agent_cards();
         let discarded = self.discard_queued_input();
         if was_sending && let Some(session) = self.cursor_acp_session.as_ref() {
             // Fire-and-forget session/cancel so the agent stops generating
@@ -2919,10 +2913,7 @@ pieces and keep going"
         }
         // Tear down an agent turn's serve / permission card if this was one.
         self.stop_agent_serve();
-        self.cards.permission = None;
-        self.cards.ask = None;
-        self.cards.review = None;
-        self.cards.plan_approval = None;
+        self.cards.clear_agent_cards();
         let discarded = self.discard_queued_input();
 
         let partial = std::mem::take(&mut self.pending_response);

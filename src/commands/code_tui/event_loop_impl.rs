@@ -169,7 +169,7 @@ impl CodeTuiApp {
                 preview,
                 reply,
             } => {
-                self.cards.permission = Some(PendingPermission {
+                self.cards.set_permission(PendingPermission {
                     tool,
                     preview,
                     reply,
@@ -194,7 +194,7 @@ impl CodeTuiApp {
                 reply,
             } => {
                 let checked = vec![false; options.len()];
-                self.cards.ask = Some(PendingAskUser {
+                self.cards.set_ask(PendingAskUser {
                     question,
                     options,
                     allow_free_text,
@@ -212,7 +212,7 @@ impl CodeTuiApp {
                     self.real_cwd.clone()
                 };
                 let body = super::render::review_body_lines(&items, std::path::Path::new(&cwd));
-                self.cards.review = Some(PendingReview {
+                self.cards.set_review(PendingReview {
                     count: items.len(),
                     body,
                     scroll: 0,
@@ -227,7 +227,7 @@ impl CodeTuiApp {
                         .into_iter()
                         .map(|l| l.line)
                         .collect();
-                self.cards.plan_approval = Some(PendingPlanApproval {
+                self.cards.set_plan_approval(PendingPlanApproval {
                     body,
                     scroll: 0,
                     selected: 0,
@@ -939,10 +939,7 @@ impl CodeTuiApp {
         self.request_started_at = None;
         self.response_task = None;
         self.pending_submit = None;
-        self.cards.permission = None;
-        self.cards.ask = None;
-        self.cards.review = None;
-        self.cards.plan_approval = None;
+        self.cards.clear_agent_cards();
         self.stop_agent_serve();
         // Adopt + persist the protocol the serve negotiated this turn.
         self.persist_agent_route().await;
@@ -1200,10 +1197,7 @@ impl CodeTuiApp {
         self.pending_submit = None;
         // A dead compact turn must not mark the NEXT turn as a compact.
         self.compact_before = None;
-        self.cards.permission = None;
-        self.cards.ask = None;
-        self.cards.review = None;
-        self.cards.plan_approval = None;
+        self.cards.clear_agent_cards();
         self.queued_messages.clear();
         self.queued_commands.clear();
         self.stop_agent_serve();
@@ -2651,11 +2645,7 @@ impl CodeTuiApp {
     /// waiting interval — decision time must not read as tool runtime or
     /// inflate `✶ Done in …`. Called per frame beside `tick_status_throttle`.
     pub(super) fn tick_decision_wait(&mut self) {
-        let waiting = self.sending
-            && (self.cards.permission.is_some()
-                || self.cards.ask.is_some()
-                || self.cards.review.is_some()
-                || self.cards.plan_approval.is_some());
+        let waiting = self.sending && self.cards.any_agent_card();
         if !waiting {
             self.wait_tick = None;
             return;

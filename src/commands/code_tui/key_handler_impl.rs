@@ -95,7 +95,7 @@ impl CodeTuiApp {
         // message those keystrokes belong to that message — letting them decide
         // would corrupt the draft and risk an accidental approval. Unconsumed keys
         // fall through to the editor so composing continues with the card still up.
-        if self.cards.permission.is_some() {
+        if self.cards.permission().is_some() {
             if self.handle_permission_key(key) {
                 return Ok(false);
             }
@@ -104,7 +104,7 @@ impl CodeTuiApp {
 
         // The `ask_user` card owns nav/selection on an empty composer; keys fall
         // through to the editor once a free-text answer is being typed.
-        if self.cards.ask.is_some() {
+        if self.cards.ask().is_some() {
             if self.handle_ask_user_key(key) {
                 return Ok(false);
             }
@@ -113,7 +113,7 @@ impl CodeTuiApp {
 
         // The plan-approval card: nav/verdict on an empty composer; typed text
         // becomes keep-planning feedback (Enter submits it).
-        if self.cards.plan_approval.is_some() {
+        if self.cards.plan_approval().is_some() {
             if self.handle_plan_approval_key(key) {
                 return Ok(false);
             }
@@ -121,7 +121,7 @@ impl CodeTuiApp {
         }
 
         // Same draft-guard as the permission card so a queued message isn't corrupted.
-        if self.cards.review.is_some() {
+        if self.cards.review().is_some() {
             if self.handle_review_key(key) {
                 return Ok(false);
             }
@@ -170,14 +170,14 @@ impl CodeTuiApp {
         // auto-approve — just allow this one call; the session stays read-only.
         if is_auto_approve_toggle(key) {
             if self.plan_mode {
-                if let Some(pending) = self.cards.permission.take() {
+                if let Some(pending) = self.cards.take_permission() {
                     let _ = pending.reply.send(Decision::Allow);
                 }
                 self.show_toast("Allowed once — plan mode stays read-only");
                 return true;
             }
             self.set_auto_approve(true);
-            if let Some(pending) = self.cards.permission.take() {
+            if let Some(pending) = self.cards.take_permission() {
                 let _ = pending.reply.send(Decision::Allow);
             }
             return true;
@@ -185,7 +185,7 @@ impl CodeTuiApp {
         // Esc denies regardless of the composer state — Esc is never message
         // content, so it can't be a stray keystroke from a queued draft.
         if matches!(key.code, KeyCode::Esc) {
-            if let Some(pending) = self.cards.permission.take() {
+            if let Some(pending) = self.cards.take_permission() {
                 let _ = pending.reply.send(Decision::Deny);
             }
             return true;
@@ -211,15 +211,11 @@ impl CodeTuiApp {
         // otherwise the composer keeps reading "off" while Cursor silently allows
         // the rest of the session. (Native "always" stays scoped, badge unchanged.)
         if matches!(decision, Decision::AlwaysAllow)
-            && self
-                .cards
-                .permission
-                .as_ref()
-                .is_some_and(|p| p.tool == "cursor")
+            && self.cards.permission().is_some_and(|p| p.tool == "cursor")
         {
             self.set_auto_approve(true);
         }
-        if let Some(pending) = self.cards.permission.take() {
+        if let Some(pending) = self.cards.take_permission() {
             let _ = pending.reply.send(decision);
         }
         true
@@ -230,7 +226,7 @@ impl CodeTuiApp {
     /// While a free-text answer is being typed, Enter submits it. Returns `true`
     /// when consumed, `false` to hand the key to the editor.
     fn handle_ask_user_key(&mut self, key: KeyEvent) -> bool {
-        let Some(ask) = self.cards.ask.as_ref() else {
+        let Some(ask) = self.cards.ask() else {
             return false;
         };
         let len = ask.options.len();
@@ -287,7 +283,7 @@ impl CodeTuiApp {
             }
             // Multi-select: space toggles the highlighted box.
             KeyCode::Char(' ') if multi => {
-                let idx = self.cards.ask.as_ref().map(|a| a.selected).unwrap_or(0);
+                let idx = self.cards.ask().map(|a| a.selected).unwrap_or(0);
                 self.toggle_ask_check(idx);
                 true
             }
@@ -295,7 +291,7 @@ impl CodeTuiApp {
                 if multi {
                     self.confirm_ask_multi();
                 } else {
-                    let idx = self.cards.ask.as_ref().map(|a| a.selected).unwrap_or(0);
+                    let idx = self.cards.ask().map(|a| a.selected).unwrap_or(0);
                     self.select_ask_option(idx);
                 }
                 true
@@ -322,7 +318,7 @@ impl CodeTuiApp {
 
     /// Move the `ask_user` highlight by `delta`, clamped to the option range.
     fn move_ask_selection(&mut self, delta: isize) {
-        if let Some(ask) = self.cards.ask.as_mut() {
+        if let Some(ask) = self.cards.ask_mut() {
             let last = ask.options.len().saturating_sub(1);
             ask.selected = (ask.selected as isize + delta).clamp(0, last as isize) as usize;
         }
@@ -330,7 +326,7 @@ impl CodeTuiApp {
 
     /// Pick option `idx` and send its label back to the waiting engine task.
     fn select_ask_option(&mut self, idx: usize) {
-        let Some(ask) = self.cards.ask.take() else {
+        let Some(ask) = self.cards.take_ask() else {
             return;
         };
         let answer = ask
@@ -343,7 +339,7 @@ impl CodeTuiApp {
 
     /// Toggle the checkbox for option `idx` in a multi-select card.
     fn toggle_ask_check(&mut self, idx: usize) {
-        if let Some(ask) = self.cards.ask.as_mut()
+        if let Some(ask) = self.cards.ask_mut()
             && let Some(c) = ask.checked.get_mut(idx)
         {
             *c = !*c;
@@ -353,7 +349,7 @@ impl CodeTuiApp {
     /// Confirm a multi-select card: send the checked labels joined by ", " (an empty
     /// selection sends "none" so the model still gets an explicit answer, not a hang).
     fn confirm_ask_multi(&mut self) {
-        let Some(ask) = self.cards.ask.take() else {
+        let Some(ask) = self.cards.take_ask() else {
             return;
         };
         let picked: Vec<String> = ask
@@ -373,7 +369,7 @@ impl CodeTuiApp {
 
     /// Send a free-text answer back to the waiting engine task.
     fn answer_ask_user(&mut self, answer: String) {
-        if let Some(ask) = self.cards.ask.take() {
+        if let Some(ask) = self.cards.take_ask() {
             let _ = ask.reply.send(Ok(answer));
         }
     }
@@ -381,7 +377,7 @@ impl CodeTuiApp {
     /// Dismiss the card without answering — the engine gets the stop-don't-decide
     /// directive as the tool result.
     fn dismiss_ask_user(&mut self) {
-        if let Some(ask) = self.cards.ask.take() {
+        if let Some(ask) = self.cards.take_ask() {
             let _ = ask
                 .reply
                 .send(Err(crate::agent::ask::DISMISSED_DIRECTIVE.to_string()));
@@ -394,12 +390,12 @@ impl CodeTuiApp {
     /// submits it; Esc dismisses (plan mode stays on). `true` when consumed.
     fn handle_plan_approval_key(&mut self, key: KeyEvent) -> bool {
         use crate::agent::protocol::PlanDecision;
-        if self.cards.plan_approval.is_none() {
+        if self.cards.plan_approval().is_none() {
             return false;
         }
         // Esc dismisses regardless of composer state — Esc is never message text.
         if matches!(key.code, KeyCode::Esc) {
-            if let Some(pending) = self.cards.plan_approval.take() {
+            if let Some(pending) = self.cards.take_plan_approval() {
                 let _ = pending.reply.send(Err(
                     crate::agent::plan_mode::PLAN_APPROVAL_DISMISSED.to_string()
                 ));
@@ -460,12 +456,7 @@ impl CodeTuiApp {
                 true
             }
             KeyCode::Enter if !ctrl => {
-                let idx = self
-                    .cards
-                    .plan_approval
-                    .as_ref()
-                    .map(|p| p.selected)
-                    .unwrap_or(0);
+                let idx = self.cards.plan_approval().map(|p| p.selected).unwrap_or(0);
                 self.pick_plan_approval_option(idx);
                 true
             }
@@ -481,14 +472,14 @@ impl CodeTuiApp {
 
     /// Move the plan-approval highlight by `delta`, clamped to the 3 options.
     fn move_plan_approval_selection(&mut self, delta: isize) {
-        if let Some(pending) = self.cards.plan_approval.as_mut() {
+        if let Some(pending) = self.cards.plan_approval_mut() {
             pending.selected = (pending.selected as isize + delta).clamp(0, 2) as usize;
         }
     }
 
     /// Scroll the plan body by `delta` rows; render clamps and writes back.
     fn scroll_plan_approval(&mut self, delta: isize) {
-        if let Some(pending) = self.cards.plan_approval.as_mut() {
+        if let Some(pending) = self.cards.plan_approval_mut() {
             let max = (pending.body.len().saturating_sub(1)) as isize;
             pending.scroll = (pending.scroll as isize + delta).clamp(0, max.max(0)) as u16;
         }
@@ -514,7 +505,7 @@ impl CodeTuiApp {
         auto_approve: bool,
     ) {
         use crate::agent::protocol::PlanDecision;
-        let Some(pending) = self.cards.plan_approval.take() else {
+        let Some(pending) = self.cards.take_plan_approval() else {
             return;
         };
         match &decision {
@@ -552,7 +543,7 @@ impl CodeTuiApp {
     /// approve, `n` rejects, arrows scroll. Esc always rejects; decision/scroll keys
     /// fall through while a queued message is being typed. `true` when consumed.
     fn handle_review_key(&mut self, key: KeyEvent) -> bool {
-        if self.cards.review.is_none() {
+        if self.cards.review().is_none() {
             return false;
         }
         // Esc rejects regardless of composer state — Esc is never message text.
@@ -596,7 +587,7 @@ impl CodeTuiApp {
 
     /// Scroll the review body by `delta` rows; render clamps and writes back.
     fn scroll_review(&mut self, delta: isize) {
-        if let Some(review) = self.cards.review.as_mut() {
+        if let Some(review) = self.cards.review_mut() {
             let max = (review.body.len().saturating_sub(1)) as isize;
             review.scroll = (review.scroll as isize + delta).clamp(0, max.max(0)) as u16;
         }
@@ -604,7 +595,7 @@ impl CodeTuiApp {
 
     /// Send the review verdict back to the waiting engine task and close the card.
     fn resolve_review(&mut self, decision: crate::agent::review::ReviewDecision) {
-        if let Some(review) = self.cards.review.take() {
+        if let Some(review) = self.cards.take_review() {
             let _ = review.reply.send(decision);
         }
     }

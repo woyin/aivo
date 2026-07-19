@@ -587,13 +587,13 @@ fn test_desired_status_names_decision_waits_and_stalls() {
     // A permission card means blocked on the user — the status must not read as
     // the (possibly destructive) command already executing.
     let (reply, _rx) = tokio::sync::oneshot::channel();
-    app.cards.permission = Some(PendingPermission {
+    app.cards.set_permission(PendingPermission {
         tool: "run_bash".to_string(),
         preview: Some("rm -rf build".to_string()),
         reply,
     });
     assert_eq!(app.desired_status(), "waiting for your approval");
-    app.cards.permission = None;
+    app.cards.take_permission();
 
     // A silent stream reads as a stall, not an ever-ticking "Thinking".
     app.last_stream_activity =
@@ -612,7 +612,7 @@ fn test_decision_wait_freezes_step_and_turn_clocks() {
     app.last_tool_action = Some(("running rm -rf build".to_string(), t0, None));
     app.request_started_at = Some(t0);
     let (reply, _rx) = tokio::sync::oneshot::channel();
-    app.cards.permission = Some(PendingPermission {
+    app.cards.set_permission(PendingPermission {
         tool: "run_bash".to_string(),
         preview: None,
         reply,
@@ -633,7 +633,7 @@ fn test_decision_wait_freezes_step_and_turn_clocks() {
         "turn clock ran during the wait"
     );
     // Card resolved → clocks run again from here.
-    app.cards.permission = None;
+    app.cards.take_permission();
     app.tick_decision_wait();
     assert!(app.wait_tick.is_none());
 }

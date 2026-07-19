@@ -648,16 +648,16 @@ impl CodeTuiApp {
         }
         // Blocked on the user — "running rm -rf build (38s)" would imply the
         // command is already executing.
-        if self.cards.permission.is_some() {
+        if self.cards.permission().is_some() {
             return "waiting for your approval".to_string();
         }
-        if self.cards.ask.is_some() {
+        if self.cards.ask().is_some() {
             return "waiting for your answer".to_string();
         }
-        if self.cards.review.is_some() {
+        if self.cards.review().is_some() {
             return "waiting for your review".to_string();
         }
-        if self.cards.plan_approval.is_some() {
+        if self.cards.plan_approval().is_some() {
             return "waiting for plan approval".to_string();
         }
         // A parallel sub-agent batch owns the headline while its rows are live.
@@ -1224,18 +1224,18 @@ impl CodeTuiApp {
             self.render_mcp_consent_card(frame, composer_area, outer);
         } else if self.account.pending_logout.is_some() {
             self.render_logout_confirm_card(frame, composer_area, outer);
-        } else if self.cards.permission.is_some() {
+        } else if self.cards.permission().is_some() {
             self.render_permission_card(frame, composer_area, outer);
-        } else if self.cards.ask.is_some() {
+        } else if self.cards.ask().is_some() {
             self.render_ask_user_card(frame, composer_area, outer);
-        } else if self.cards.plan_approval.is_some() {
+        } else if self.cards.plan_approval().is_some() {
             let clamped = self.render_plan_approval_card(frame, composer_area, outer);
-            if let (Some(s), Some(p)) = (clamped, self.cards.plan_approval.as_mut()) {
+            if let (Some(s), Some(p)) = (clamped, self.cards.plan_approval_mut()) {
                 p.scroll = s;
             }
-        } else if self.cards.review.is_some() {
+        } else if self.cards.review().is_some() {
             let clamped = self.render_review_card(frame, composer_area, outer);
-            if let (Some(s), Some(r)) = (clamped, self.cards.review.as_mut()) {
+            if let (Some(s), Some(r)) = (clamped, self.cards.review_mut()) {
                 r.scroll = s;
             }
         } else if self.account.login.is_some() {
@@ -1507,7 +1507,7 @@ impl CodeTuiApp {
     /// floating mid-screen, so the decision sits right next to the input. Shows
     /// the action, a preview (diff / command / path), and color-coded y/a/n keys.
     fn render_permission_card(&self, frame: &mut Frame<'_>, composer_area: Rect, frame_area: Rect) {
-        let Some(pending) = self.cards.permission.as_ref() else {
+        let Some(pending) = self.cards.permission() else {
             return;
         };
         // Flag a run_bash card: locally destructive, or a remote mutation.
@@ -1636,7 +1636,7 @@ impl CodeTuiApp {
     /// hint. Floats above the composer like the permission card, clamped to the
     /// rows above.
     fn render_ask_user_card(&self, frame: &mut Frame<'_>, composer_area: Rect, frame_area: Rect) {
-        let Some(ask) = self.cards.ask.as_ref() else {
+        let Some(ask) = self.cards.ask() else {
             return;
         };
         let anchor = composer_area.y.saturating_sub(1);
@@ -1783,7 +1783,7 @@ impl CodeTuiApp {
         composer_area: Rect,
         frame_area: Rect,
     ) -> Option<u16> {
-        let review = self.cards.review.as_ref()?;
+        let review = self.cards.review()?;
         let anchor = composer_area.y.saturating_sub(1);
         let max_total = anchor.saturating_sub(frame_area.y).max(1);
         let max_width = composer_area.width.min(frame_area.width).max(1);
@@ -1862,7 +1862,7 @@ impl CodeTuiApp {
         composer_area: Rect,
         frame_area: Rect,
     ) -> Option<u16> {
-        let pending = self.cards.plan_approval.as_ref()?;
+        let pending = self.cards.plan_approval()?;
         let anchor = composer_area.y.saturating_sub(1);
         let max_total = anchor.saturating_sub(frame_area.y).max(1);
         let max_width = composer_area.width.min(frame_area.width).max(1);
