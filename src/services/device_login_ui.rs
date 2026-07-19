@@ -1,4 +1,5 @@
-//! Shared terminal UX for device-code sign-in flows (`aivo login`, SuperGrok).
+//! Shared terminal UX for device-code sign-in flows (`aivo login`, SuperGrok,
+//! Kimi Code, GitHub Copilot).
 //!
 //! Centralizes the pieces every device flow wants: an Enter-to-open-browser
 //! convenience that never gates the poll, echo suppression so the Enter newline

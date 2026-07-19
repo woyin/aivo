@@ -149,9 +149,12 @@ impl CopilotTokenManager {
 
 /// Runs the GitHub OAuth device flow and returns the access token.
 ///
-/// Displays a prompt asking the user to visit the verification URL and enter the code.
+/// Mirrors the shared device-login UX (`aivo login`, SuperGrok, Kimi Code):
+/// show the code, offer Enter-to-open-browser, poll until authorized.
 pub async fn device_flow_login() -> Result<String> {
+    use crate::services::device_login_ui;
     use crate::style;
+    use std::io::IsTerminal;
 
     let client = crate::services::http_utils::aivo_http_client_builder()
         .connect_timeout(std::time::Duration::from_secs(30))
@@ -159,7 +162,6 @@ pub async fn device_flow_login() -> Result<String> {
         .build()
         .unwrap_or_else(|_| reqwest::Client::new());
 
-    // Step 1: Request device code
     let resp = client
         .post(DEVICE_CODE_URL)
         .header("Accept", CONTENT_TYPE_JSON)
@@ -178,27 +180,33 @@ pub async fn device_flow_login() -> Result<String> {
         .await
         .context("Failed to parse device code response")?;
 
-    // Step 2: Display instructions
-    println!(
-        "{} Visit {} — enter code: {}",
-        style::arrow_symbol(),
-        style::blue(&device.verification_uri),
-        style::bold(&device.user_code)
+    // GitHub has no code-prefilled URL; Enter opens the verify page and the
+    // user types the code there.
+    let open_url = device.verification_uri.clone();
+    let interactive = std::io::stdin().is_terminal();
+
+    eprintln!();
+    eprintln!("  {}", style::bold("Sign in to GitHub Copilot"));
+    eprintln!(
+        "  Enter this code when prompted:  {}",
+        style::cyan(style::bold(&device.user_code))
     );
+    if interactive {
+        eprintln!(
+            "  Press {} to open your browser, or visit {}",
+            style::keycap(" Enter "),
+            style::blue(&open_url)
+        );
+    } else {
+        eprintln!("  Visit {} to sign in.", style::blue(&open_url));
+    }
+    eprintln!();
 
-    let (spinning, spinner_handle) = style::start_spinner(Some(" Waiting for authorization..."));
-
-    // Step 3: Poll for access token
-    let token = poll_for_token(&client, &device.device_code, device.interval).await;
-
-    style::stop_spinner(&spinning);
-    let _ = spinner_handle.await;
-
-    let token = token?;
-
-    println!("  {} Authenticated with GitHub", style::success_symbol());
-
-    Ok(token)
+    let poll = poll_for_token(&client, &device.device_code, device.interval);
+    match device_login_ui::wait_for_approval(open_url, poll).await {
+        Some(result) => result,
+        None => anyhow::bail!("sign-in cancelled"),
+    }
 }
 
 /// Polls GitHub for the access token until the user authorizes.

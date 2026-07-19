@@ -386,8 +386,8 @@ pub async fn interactive_login() -> Result<CodexOAuthCredential> {
     // the URL themselves.
     if std::io::stdin().is_terminal() {
         eprint!(
-            "Press {} to open in browser (or copy manually) ",
-            crate::style::cyan("Enter")
+            "Press {} to open your browser, or copy the URL above ",
+            crate::style::keycap(" Enter ")
         );
         let _ = std::io::stderr().flush();
         let mut buf = String::new();

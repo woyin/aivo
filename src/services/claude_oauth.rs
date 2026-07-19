@@ -117,7 +117,7 @@ fn prompt_before_browser_open() {
     eprintln!();
     eprint!(
         "Press {} to run `claude setup-token` (a browser tab will open) ",
-        crate::style::cyan("Enter")
+        crate::style::keycap(" Enter ")
     );
     let _ = std::io::stderr().flush();
     let mut buf = String::new();
