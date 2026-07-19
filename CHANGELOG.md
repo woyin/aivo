@@ -1,5 +1,18 @@
 # Changelog
 
+## v0.41.3
+
+A stability-and-internals release. The code TUI stops corrupting the terminal — self-heal now repaints in place instead of clearing the screen — the prompt caret no longer blinks during streaming repaints, and `/rewind` checkpoints line up with compacted display turns and revert cleanly through boundary checkpoints. Copilot adopts the shared Enter-to-open-browser device login, and Kimi refreshes its OAuth token when listing models without a stored session. Under the hood, a large architecture-audit pass consolidates shared helpers and breaks `CodeTuiApp` into focused sub-structs.
+
+- fix(code): self-heal repaints in place instead of clearing the screen (b5a039ac)
+- fix(code): `/rewind` checkpoints match compact-display turns and revert through boundary checkpoints (702fc545)
+- fix(code): stop the prompt caret blinking during streaming repaints (feb1a602)
+- fix(copilot): adopt the shared device-login UX with Enter-to-open-browser (04afc9dc)
+- fix(kimi): refresh the OAuth token on storeless model listing (42142a55)
+- fix: grants.json atomic write + skills dir honors AIVO_CONFIG_DIR (3e4d8ff1)
+- refactor: consolidate shared helpers — TokenUsage, OAuth refresh/persist, loopback OAuth callback, json_store, model_catalog, wire_format routing (bf89a707)
+- refactor(code_tui): extract AgentCards/RenderCache/SessionPreviewState/LiveShareState/AccountFlow sub-structs and fold agent cards into one AgentCard enum (3be705ae)
+
 ## v0.41.2
 
 Adds Kimi Code as an OAuth provider — sign in with a Kimi membership, and use it from any coding agent. Also fixes an Esc-cancelled message leaking into the next turn's history, alongside internal test-infra hardening and an engine/tools module split.
