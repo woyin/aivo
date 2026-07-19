@@ -1714,7 +1714,11 @@ impl CodeTuiApp {
                     crossterm::cursor::Hide
                 );
                 if std::mem::take(&mut self.pending_full_repaint) {
-                    let _ = terminal.clear();
+                    terminal.swap_buffers();
+                    for cell in &mut terminal.current_buffer_mut().content {
+                        cell.skip = true;
+                    }
+                    terminal.swap_buffers();
                     last_stream_repaint = std::time::Instant::now();
                 }
                 // `.err()` drops the `CompletedFrame` borrow so End can write.
