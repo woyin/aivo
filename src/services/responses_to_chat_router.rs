@@ -53,7 +53,7 @@ pub use responses_chat_conversion::{
 };
 
 // Internal re-exports used within this router
-use crate::services::serve_router::{StreamUsageSniffer, TokenUsage, parse_token_usage};
+use crate::services::token_usage::{StreamUsageSniffer, TokenUsage, parse_token_usage};
 use responses_chat_conversion::{
     apply_max_tokens_cap_to_fields, cap_reasoning_effort, convert_chat_to_responses_request,
     convert_responses_json_to_chat, sanitize_input_content,
@@ -350,16 +350,21 @@ async fn record_endpoint_usage(acct: &UsageAccounting, model: Option<&str>, u: &
             &acct.key_id,
             Some(acct.tool.as_str()),
             model,
-            u.prompt,
-            u.completion,
-            u.cache_read,
-            u.cache_creation,
+            u.prompt_tokens,
+            u.completion_tokens,
+            u.cache_read_input_tokens,
+            u.cache_creation_input_tokens,
         )
         .await;
     // Same totals into the per-run tally, so the finished log row is windowable
     // by `aivo stats --since` (lifetime per-key counters aren't timestamped).
     if let Some(tally) = &acct.run_tally {
-        tally.add(u.prompt, u.completion, u.cache_read, u.cache_creation);
+        tally.add(
+            u.prompt_tokens,
+            u.completion_tokens,
+            u.cache_read_input_tokens,
+            u.cache_creation_input_tokens,
+        );
     }
 }
 

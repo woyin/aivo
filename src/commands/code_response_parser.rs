@@ -1,8 +1,13 @@
 //! Response parsing for chat: SSE chunk parsing, usage extraction, think-tag
 //! handling, and content/delta extraction for OpenAI and Anthropic formats.
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 
 use crate::services::http_utils::parse_token_u64;
+use crate::services::token_usage::responses_usage_update;
+pub(crate) use crate::services::token_usage::{
+    TokenUsage, TokenUsageUpdate, extract_anthropic_usage, extract_anthropic_usage_update,
+    extract_openai_usage, extract_openai_usage_update, extract_responses_usage, merge_token_usage,
+};
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct ChatChunk {
@@ -36,37 +41,6 @@ pub(crate) enum ChatResponseChunk {
 pub(crate) struct AssistantResponse {
     pub content: String,
     pub reasoning_content: Option<String>,
-}
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
-pub(crate) struct TokenUsage {
-    pub prompt_tokens: u64,
-    pub completion_tokens: u64,
-    pub cache_read_input_tokens: u64,
-    pub cache_creation_input_tokens: u64,
-}
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub(crate) struct TokenUsageUpdate {
-    pub prompt_tokens: Option<u64>,
-    pub completion_tokens: Option<u64>,
-    pub cache_read_input_tokens: Option<u64>,
-    pub cache_creation_input_tokens: Option<u64>,
-}
-
-impl TokenUsageUpdate {
-    pub(crate) fn is_empty(self) -> bool {
-        self.prompt_tokens.is_none()
-            && self.completion_tokens.is_none()
-            && self.cache_read_input_tokens.is_none()
-            && self.cache_creation_input_tokens.is_none()
-    }
-}
-
-impl TokenUsage {
-    pub(crate) fn total_tokens(self) -> u64 {
-        self.prompt_tokens.saturating_add(self.completion_tokens)
-    }
 }
 
 #[derive(Debug, Default)]
@@ -172,79 +146,6 @@ pub(crate) fn extract_openai_message(body: &serde_json::Value) -> AssistantRespo
     }
 }
 
-pub(crate) fn extract_openai_usage(body: &serde_json::Value) -> Option<TokenUsage> {
-    let update = extract_openai_usage_update(body)?;
-    Some(TokenUsage {
-        prompt_tokens: update.prompt_tokens.unwrap_or(0),
-        completion_tokens: update.completion_tokens.unwrap_or(0),
-        cache_read_input_tokens: update.cache_read_input_tokens.unwrap_or(0),
-        cache_creation_input_tokens: update.cache_creation_input_tokens.unwrap_or(0),
-    })
-}
-
-pub(crate) fn extract_anthropic_usage(body: &serde_json::Value) -> Option<TokenUsage> {
-    let update = extract_anthropic_usage_update(body)?;
-    Some(TokenUsage {
-        prompt_tokens: update.prompt_tokens.unwrap_or(0),
-        completion_tokens: update.completion_tokens.unwrap_or(0),
-        cache_read_input_tokens: update.cache_read_input_tokens.unwrap_or(0),
-        cache_creation_input_tokens: update.cache_creation_input_tokens.unwrap_or(0),
-    })
-}
-
-pub(crate) fn extract_openai_usage_update(body: &serde_json::Value) -> Option<TokenUsageUpdate> {
-    let usage = body.get("usage")?;
-    let update = TokenUsageUpdate {
-        prompt_tokens: usage
-            .get("prompt_tokens")
-            .or_else(|| usage.get("input_tokens"))
-            .and_then(parse_token_u64),
-        completion_tokens: usage
-            .get("completion_tokens")
-            .or_else(|| usage.get("output_tokens"))
-            .and_then(parse_token_u64),
-        cache_read_input_tokens: usage
-            .get("cache_read_input_tokens")
-            .and_then(parse_token_u64)
-            .or_else(|| crate::services::openai_models::extract_cached_prompt_tokens(usage)),
-        cache_creation_input_tokens: usage
-            .get("cache_creation_input_tokens")
-            .and_then(parse_token_u64),
-    };
-    if update.is_empty() {
-        None
-    } else {
-        Some(update)
-    }
-}
-
-pub(crate) fn extract_anthropic_usage_update(body: &serde_json::Value) -> Option<TokenUsageUpdate> {
-    let usage = body.get("usage")?;
-    let raw_input = usage.get("input_tokens").and_then(parse_token_u64);
-    let cache_read = usage
-        .get("cache_read_input_tokens")
-        .and_then(parse_token_u64);
-    let cache_creation = usage
-        .get("cache_creation_input_tokens")
-        .and_then(parse_token_u64);
-    // Normalize: Anthropic's input_tokens excludes cache, so add cache to get total input
-    let prompt_tokens = raw_input.map(|it| {
-        it.saturating_add(cache_read.unwrap_or(0))
-            .saturating_add(cache_creation.unwrap_or(0))
-    });
-    let update = TokenUsageUpdate {
-        prompt_tokens,
-        completion_tokens: usage.get("output_tokens").and_then(parse_token_u64),
-        cache_read_input_tokens: cache_read,
-        cache_creation_input_tokens: cache_creation,
-    };
-    if update.is_empty() {
-        None
-    } else {
-        Some(update)
-    }
-}
-
 pub(crate) fn parse_openai_usage_chunk(data: &str) -> Option<TokenUsageUpdate> {
     let value = serde_json::from_str::<serde_json::Value>(data).ok()?;
     extract_openai_usage_update(&value)
@@ -337,24 +238,6 @@ pub(crate) fn parse_responses_model_chunk(data: &str) -> Option<String> {
         .map(str::to_string)
 }
 
-/// Per-field max: stream counts are cumulative, and a partial Anthropic
-/// `message_delta` must not clobber the cache-normalized prompt from `message_start`.
-pub(crate) fn merge_token_usage(usage: &mut Option<TokenUsage>, update: TokenUsageUpdate) {
-    let current = usage.get_or_insert_with(TokenUsage::default);
-    if let Some(tokens) = update.prompt_tokens {
-        current.prompt_tokens = current.prompt_tokens.max(tokens);
-    }
-    if let Some(tokens) = update.completion_tokens {
-        current.completion_tokens = current.completion_tokens.max(tokens);
-    }
-    if let Some(tokens) = update.cache_read_input_tokens {
-        current.cache_read_input_tokens = current.cache_read_input_tokens.max(tokens);
-    }
-    if let Some(tokens) = update.cache_creation_input_tokens {
-        current.cache_creation_input_tokens = current.cache_creation_input_tokens.max(tokens);
-    }
-}
-
 /// Parses a single SSE data chunk and extracts either a content or reasoning delta.
 pub(crate) fn parse_sse_chunk(data: &str) -> Option<ChatResponseChunk> {
     let chunk: ChatChunk = serde_json::from_str(data).ok()?;
@@ -392,25 +275,6 @@ pub(crate) fn parse_responses_chunk(data: &str) -> Option<ChatResponseChunk> {
 }
 
 /// Responses-API usage; `input_tokens` already includes the cached subset.
-fn responses_usage_update(usage: &serde_json::Value) -> TokenUsageUpdate {
-    TokenUsageUpdate {
-        prompt_tokens: usage.get("input_tokens").and_then(parse_token_u64),
-        completion_tokens: usage.get("output_tokens").and_then(parse_token_u64),
-        cache_read_input_tokens: usage
-            .get("cache_read_input_tokens")
-            .and_then(parse_token_u64)
-            .or_else(|| {
-                usage
-                    .get("input_tokens_details")
-                    .and_then(|d| d.get("cached_tokens"))
-                    .and_then(parse_token_u64)
-            }),
-        cache_creation_input_tokens: usage
-            .get("cache_creation_input_tokens")
-            .and_then(parse_token_u64),
-    }
-}
-
 /// Extracts usage from a Responses API SSE `response.completed` event.
 pub(crate) fn parse_responses_usage_chunk(data: &str) -> Option<TokenUsageUpdate> {
     let value: serde_json::Value = serde_json::from_str(data).ok()?;
@@ -455,20 +319,6 @@ pub(crate) fn extract_responses_message(body: &serde_json::Value) -> AssistantRe
 }
 
 /// Extracts usage from a non-streaming Responses API response.
-pub(crate) fn extract_responses_usage(body: &serde_json::Value) -> Option<TokenUsage> {
-    let update = responses_usage_update(body.get("usage")?);
-    if update.is_empty() {
-        None
-    } else {
-        Some(TokenUsage {
-            prompt_tokens: update.prompt_tokens.unwrap_or(0),
-            completion_tokens: update.completion_tokens.unwrap_or(0),
-            cache_read_input_tokens: update.cache_read_input_tokens.unwrap_or(0),
-            cache_creation_input_tokens: update.cache_creation_input_tokens.unwrap_or(0),
-        })
-    }
-}
-
 /// Parses a Google Gemini SSE data line and extracts text content.
 pub(crate) fn parse_google_chunk(data: &str) -> Option<ChatResponseChunk> {
     let value: serde_json::Value = serde_json::from_str(data).ok()?;

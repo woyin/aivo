@@ -217,10 +217,10 @@ impl AgentEngine {
             if let Some(u) = &message.usage {
                 if let Some(split) = extract_usage_from_value(&json!({ "usage": u })) {
                     self.turn_usage = self.turn_usage.merge(SessionTokens {
-                        prompt_tokens: split.prompt,
-                        completion_tokens: split.completion,
-                        cache_read_tokens: split.cache_read,
-                        cache_write_tokens: split.cache_creation,
+                        prompt_tokens: split.prompt_tokens,
+                        completion_tokens: split.completion_tokens,
+                        cache_read_tokens: split.cache_read_input_tokens,
+                        cache_write_tokens: split.cache_creation_input_tokens,
                     });
                     ui.turn_tokens(self.turn_usage.completion_tokens);
                 }

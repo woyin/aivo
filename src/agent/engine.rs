@@ -31,8 +31,8 @@ use crate::agent::subagents::{self, Subagent};
 use crate::agent::system_prompt::system_prompt;
 use crate::agent::tokens::{content_to_parts, estimate_str_tokens, estimate_tokens, usage_tokens};
 use crate::agent::{serve_client, tool_repair, tool_search, tools, verify};
-use crate::services::serve_router::extract_usage_from_value;
 use crate::services::session_store::SessionTokens;
+use crate::services::token_usage::extract_usage_from_value;
 
 /// Stop a turn after this many identical consecutive tool-call batches (weak-model loop).
 const REPEAT_LIMIT: usize = 3;
