@@ -277,17 +277,15 @@ pub struct KimiModel {
     pub context_length: Option<u64>,
 }
 
-/// Lists models on the coding endpoint. Refreshes only with a `store` to
-/// persist the rotation into; storeless callers use the current token as-is.
 pub async fn fetch_models(
     creds: &mut KimiOAuthCredential,
     persist: Option<&crate::services::session_store::SessionStore>,
 ) -> Result<Vec<KimiModel>> {
-    if let Some(store) = persist {
-        let prev_refresh = creds.refresh_token.clone();
-        if ensure_fresh(creds, REFRESH_SKEW_SECS).await? {
-            persist_rotated_credential(store, &prev_refresh, creds).await;
-        }
+    let prev_refresh = creds.refresh_token.clone();
+    if ensure_fresh(creds, REFRESH_SKEW_SECS).await?
+        && let Some(store) = persist
+    {
+        persist_rotated_credential(store, &prev_refresh, creds).await;
     }
     let url = format!("{}/models", INFERENCE_BASE_URL.trim_end_matches('/'));
     let resp = with_client_headers(client().get(&url), &creds.device_id)
