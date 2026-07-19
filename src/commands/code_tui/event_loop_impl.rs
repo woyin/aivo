@@ -1708,12 +1708,11 @@ impl CodeTuiApp {
             was_streaming = streaming;
 
             if needs_redraw {
-                // Atomic frame where supported; cursor hidden while cells paint.
-                let _ = execute!(
+                let _ = crossterm::queue!(
                     terminal.backend_mut(),
-                    crossterm::terminal::BeginSynchronizedUpdate
+                    crossterm::terminal::BeginSynchronizedUpdate,
+                    crossterm::cursor::Hide
                 );
-                let _ = terminal.hide_cursor();
                 if std::mem::take(&mut self.pending_full_repaint) {
                     let _ = terminal.clear();
                     last_stream_repaint = std::time::Instant::now();
