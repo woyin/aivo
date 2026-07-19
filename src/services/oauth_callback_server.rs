@@ -1,63 +1,108 @@
-//! Single-shot local HTTP server that captures an OAuth `/oauth2callback`
-//! redirect on an ephemeral loopback port. Used by the MCP OAuth flow
-//! (`mcp_oauth`).
+//! Single-shot local HTTP server that captures an OAuth redirect on
+//! loopback. Two bind modes cover both flows that use it: a fixed
+//! registered port that is part of the provider's redirect URI (Codex
+//! ChatGPT), and an ephemeral port the caller threads into the authorize
+//! URL before printing it (MCP OAuth).
 //!
-//! Unlike Codex's `codex_oauth_callback` — which must bind a registered
-//! port — the flows here use providers that accept *any* loopback port, so
-//! we bind an ephemeral `127.0.0.1:0` and thread the assigned port into the
-//! authorize URL before printing it.
+//! Reads the first request line, pulls `code` + `state` from the query
+//! string, returns a small success HTML to the browser. Resolves on the
+//! first valid callback or on timeout; rejects mismatched `state`.
 
 use anyhow::{Context, Result, anyhow};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
-/// Redirect URI path segment. Any loopback port + path is accepted by the
-/// providers we drive here; `/oauth2callback` mirrors the common convention.
-pub const CALLBACK_PATH: &str = "/oauth2callback";
-
-/// Owns a bound loopback listener + its assigned port. Split from
-/// `wait_for_callback` so callers can embed the port in the authorize URL
-/// *before* waiting for the redirect.
-pub struct LoopbackBinding {
-    listener: TcpListener,
-    port: u16,
+/// Fixed-port bind failure. Distinct so callers can fall back to a
+/// manual-paste flow instead of bailing hard.
+#[derive(Debug)]
+pub struct PortUnavailable {
+    pub port: u16,
 }
 
-impl LoopbackBinding {
-    pub fn port(&self) -> u16 {
-        self.port
+impl std::fmt::Display for PortUnavailable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "127.0.0.1:{} is in use; falling back to manual paste",
+            self.port
+        )
     }
 }
 
-pub async fn bind_loopback() -> Result<LoopbackBinding> {
-    let listener = TcpListener::bind(("127.0.0.1", 0))
-        .await
-        .context("bind OAuth callback listener on 127.0.0.1:0")?;
-    let port = listener.local_addr().context("resolve bound port")?.port();
-    Ok(LoopbackBinding { listener, port })
+impl std::error::Error for PortUnavailable {}
+
+/// Provider-specific shape of the redirect: the path the provider redirects
+/// to and the success-page strings shown in the browser.
+pub struct CallbackSpec {
+    pub path: &'static str,
+    pub page_title: &'static str,
+    pub page_heading: &'static str,
 }
 
 pub struct CallbackOutcome {
     pub code: String,
 }
 
-/// Waits for one valid `/oauth2callback` hit on the pre-bound listener.
-///
-/// On state mismatch or error parameter, returns `Err` and the browser sees
-/// a 400. On timeout, returns `Err`. Other paths (`/favicon.ico`, etc.) are
-/// 404'd and the loop continues.
-pub async fn wait_for_callback(
-    binding: LoopbackBinding,
-    expected_state: &str,
-    timeout: Duration,
-) -> Result<CallbackOutcome> {
-    tokio::time::timeout(timeout, accept_one(binding.listener, expected_state))
-        .await
-        .map_err(|_| anyhow!("timed out waiting for OAuth callback"))?
+#[derive(Debug)]
+pub struct CallbackServer {
+    listener: TcpListener,
+    port: u16,
 }
 
-async fn accept_one(listener: TcpListener, expected_state: &str) -> Result<CallbackOutcome> {
+impl CallbackServer {
+    /// Binds an ephemeral loopback port; read it back via [`Self::port`] to
+    /// embed in the authorize URL before waiting.
+    pub async fn bind_ephemeral() -> Result<Self> {
+        let listener = TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .context("bind OAuth callback listener on 127.0.0.1:0")?;
+        let port = listener.local_addr().context("resolve bound port")?.port();
+        Ok(Self { listener, port })
+    }
+
+    /// Binds a fixed registered port. Port-in-use maps to [`PortUnavailable`]
+    /// so callers can offer manual paste.
+    pub async fn bind_fixed(port: u16) -> Result<Self> {
+        let listener = TcpListener::bind(("127.0.0.1", port)).await.map_err(|e| {
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::AddrInUse | std::io::ErrorKind::PermissionDenied
+            ) {
+                anyhow!(PortUnavailable { port })
+            } else {
+                anyhow!(e).context("bind OAuth callback listener")
+            }
+        })?;
+        Ok(Self { listener, port })
+    }
+
+    pub fn port(&self) -> u16 {
+        self.port
+    }
+
+    /// Waits for one valid hit on `spec.path`.
+    ///
+    /// On a state mismatch or error parameter the browser sees a 400 and the
+    /// call returns `Err`. On timeout returns `Err`. Other paths
+    /// (`/favicon.ico`, etc.) are 404'd and the loop continues.
+    pub async fn wait_for_callback(
+        self,
+        spec: &CallbackSpec,
+        expected_state: &str,
+        timeout: Duration,
+    ) -> Result<CallbackOutcome> {
+        tokio::time::timeout(timeout, accept_one(self.listener, spec, expected_state))
+            .await
+            .map_err(|_| anyhow!("timed out waiting for OAuth callback"))?
+    }
+}
+
+async fn accept_one(
+    listener: TcpListener,
+    spec: &CallbackSpec,
+    expected_state: &str,
+) -> Result<CallbackOutcome> {
     loop {
         let (mut stream, _) = listener.accept().await.context("accept OAuth callback")?;
         let request_line = match read_request_line(&mut stream).await {
@@ -70,7 +115,7 @@ async fn accept_one(listener: TcpListener, expected_state: &str) -> Result<Callb
 
         let path_and_query = parse_request_target(&request_line);
 
-        if !path_and_query.starts_with(CALLBACK_PATH) {
+        if !path_and_query.starts_with(spec.path) {
             respond(&mut stream, 404, "text/plain; charset=utf-8", b"not found").await;
             continue;
         }
@@ -106,14 +151,15 @@ async fn accept_one(listener: TcpListener, expected_state: &str) -> Result<Callb
             &mut stream,
             200,
             "text/html; charset=utf-8",
-            SUCCESS_HTML.as_bytes(),
+            success_html(spec).as_bytes(),
         )
         .await;
         return Ok(CallbackOutcome { code });
     }
 }
 
-/// Reads up to the first CRLF (or plain LF fallback). Bounded to 8 KiB.
+/// Reads up to the first CRLF (or plain LF fallback). Bounded to 8 KiB so a
+/// misbehaving client can't eat memory.
 async fn read_request_line(stream: &mut tokio::net::TcpStream) -> Result<String> {
     let mut buf = [0u8; 8192];
     let mut total = 0usize;
@@ -148,6 +194,7 @@ fn find_line_end(bytes: &[u8]) -> Option<usize> {
 }
 
 fn parse_request_target(request_line: &str) -> &str {
+    // "GET /auth/callback?code=...&state=... HTTP/1.1"
     let mut parts = request_line.split_whitespace();
     let _method = parts.next();
     parts.next().unwrap_or("")
@@ -203,11 +250,17 @@ async fn respond(stream: &mut tokio::net::TcpStream, status: u16, content_type: 
     let _ = stream.shutdown().await;
 }
 
-const SUCCESS_HTML: &str = r#"<!doctype html>
+fn success_html(spec: &CallbackSpec) -> String {
+    SUCCESS_HTML_TEMPLATE
+        .replace("__TITLE__", spec.page_title)
+        .replace("__HEADING__", spec.page_heading)
+}
+
+const SUCCESS_HTML_TEMPLATE: &str = r#"<!doctype html>
 <html lang="en">
 <head>
   <meta charset="utf-8">
-  <title>aivo — authorized</title>
+  <title>__TITLE__</title>
   <style>
     body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
            background: #0b0b0e; color: #e5e7eb; display: flex; align-items: center;
@@ -220,7 +273,7 @@ const SUCCESS_HTML: &str = r#"<!doctype html>
 </head>
 <body>
   <div class="card">
-    <h1>Authorized.</h1>
+    <h1>__HEADING__</h1>
     <p>You can close this tab and return to your terminal.</p>
   </div>
 </body>
@@ -231,10 +284,23 @@ const SUCCESS_HTML: &str = r#"<!doctype html>
 mod tests {
     use super::*;
 
+    const SPEC: CallbackSpec = CallbackSpec {
+        path: "/oauth2callback",
+        page_title: "aivo — authorized",
+        page_heading: "Authorized.",
+    };
+
     #[tokio::test]
-    async fn bind_loopback_assigns_nonzero_port() {
-        let b = bind_loopback().await.unwrap();
-        assert!(b.port() > 0);
+    async fn bind_ephemeral_assigns_nonzero_port() {
+        let s = CallbackServer::bind_ephemeral().await.unwrap();
+        assert!(s.port() > 0);
+    }
+
+    #[tokio::test]
+    async fn bind_fixed_port_in_use_maps_to_port_unavailable() {
+        let taken = CallbackServer::bind_ephemeral().await.unwrap();
+        let err = CallbackServer::bind_fixed(taken.port()).await.unwrap_err();
+        assert!(err.downcast_ref::<PortUnavailable>().is_some());
     }
 
     #[test]
@@ -278,5 +344,13 @@ mod tests {
         assert_eq!(find_line_end(b"GET /x\r\n"), Some(6));
         assert_eq!(find_line_end(b"GET /x\n"), Some(6));
         assert_eq!(find_line_end(b"no newline"), None);
+    }
+
+    #[test]
+    fn success_html_substitutes_spec_strings() {
+        let html = success_html(&SPEC);
+        assert!(html.contains("<title>aivo — authorized</title>"));
+        assert!(html.contains("<h1>Authorized.</h1>"));
+        assert!(!html.contains("__TITLE__") && !html.contains("__HEADING__"));
     }
 }

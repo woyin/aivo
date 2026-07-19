@@ -16,7 +16,7 @@
 //!    loopback callback, then a token exchange.
 //!
 //! The PKCE pair and `state` are the same primitives the codex OAuth flow
-//! uses; the loopback callback server lives in [`loopback_oauth_callback`].
+//! uses; the loopback callback server lives in [`oauth_callback_server`].
 //! The resulting [`McpOAuthCredential`] carries everything needed to silently
 //! `refresh` later without re-running discovery; persistence + the `/mcp`
 //! authorize UX live in a later phase.
@@ -35,6 +35,15 @@ pub const MCP_OAUTH_REFRESH_SKEW_SECS: i64 = 120;
 
 /// Client name advertised to the authorization server at registration.
 const CLIENT_NAME: &str = "aivo";
+
+/// Callback-server shape. Any loopback port + path is accepted by the
+/// providers we drive here; `/oauth2callback` mirrors the common convention.
+const CALLBACK_SPEC: crate::services::oauth_callback_server::CallbackSpec =
+    crate::services::oauth_callback_server::CallbackSpec {
+        path: "/oauth2callback",
+        page_title: "aivo — authorized",
+        page_heading: "Authorized.",
+    };
 
 /// Tokens + the metadata needed to refresh without re-discovery, persisted
 /// (encrypted, in a later phase) per MCP server. `expiry_date` is milliseconds
@@ -507,9 +516,7 @@ pub async fn authorize(
     on_authorize_url: impl FnOnce(&str),
 ) -> Result<McpOAuthCredential> {
     use crate::services::browser_open;
-    use crate::services::loopback_oauth_callback::{
-        CALLBACK_PATH, bind_loopback, wait_for_callback,
-    };
+    use crate::services::oauth_callback_server::CallbackServer;
     use std::time::Duration;
 
     let client = crate::services::http_utils::router_http_client_with_timeout(30);
@@ -528,8 +535,8 @@ pub async fn authorize(
     let asm = fetch_auth_server_metadata(&client, &issuer).await?;
 
     // 3. Bind the loopback redirect, then self-register a client for it.
-    let binding = bind_loopback().await?;
-    let redirect_uri = format!("http://127.0.0.1:{}{CALLBACK_PATH}", binding.port());
+    let server = CallbackServer::bind_ephemeral().await?;
+    let redirect_uri = format!("http://127.0.0.1:{}{}", server.port(), CALLBACK_SPEC.path);
     let registration_endpoint = asm.registration_endpoint.clone().ok_or_else(|| {
         anyhow!(
             "authorization server doesn't support dynamic client registration; \
@@ -556,7 +563,9 @@ pub async fn authorize(
     on_authorize_url(&authorize_url);
     let _ = browser_open::open_url(&authorize_url);
 
-    let outcome = wait_for_callback(binding, &state, Duration::from_secs(300)).await?;
+    let outcome = server
+        .wait_for_callback(&CALLBACK_SPEC, &state, Duration::from_secs(300))
+        .await?;
 
     // 5. Exchange the code for tokens.
     let tokens = exchange_code(

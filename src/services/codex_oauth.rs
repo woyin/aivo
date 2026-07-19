@@ -53,6 +53,14 @@ pub const DEFAULT_CODEX_MODEL: &str = "gpt-5.5";
 pub const CALLBACK_PORT: u16 = 1455;
 pub const REDIRECT_URI: &str = "http://localhost:1455/auth/callback";
 
+/// Callback-server shape; the path must match [`REDIRECT_URI`].
+const CALLBACK_SPEC: crate::services::oauth_callback_server::CallbackSpec =
+    crate::services::oauth_callback_server::CallbackSpec {
+        path: "/auth/callback",
+        page_title: "aivo — signed in",
+        page_heading: "Signed in to Codex.",
+    };
+
 pub const SCOPE: &str = "openid profile email offline_access";
 
 /// Sentinel stored in `ApiKey.base_url` to identify Codex OAuth entries.
@@ -359,7 +367,7 @@ pub fn redact_oauth_body(body: &str) -> String {
 /// with sandboxed browsers can always open it manually.
 pub async fn interactive_login() -> Result<CodexOAuthCredential> {
     use crate::services::browser_open;
-    use crate::services::codex_oauth_callback::{PortUnavailable, wait_for_callback};
+    use crate::services::oauth_callback_server::{CallbackServer, PortUnavailable};
     use std::io::{BufRead, IsTerminal, Write as _};
     use std::time::Duration;
 
@@ -388,7 +396,13 @@ pub async fn interactive_login() -> Result<CodexOAuthCredential> {
     }
 
     // 5-minute ceiling matches codex-multi-auth's 300 × 100ms poll window.
-    let result = wait_for_callback(&state, Duration::from_secs(300)).await;
+    let result = async {
+        let server = CallbackServer::bind_fixed(CALLBACK_PORT).await?;
+        server
+            .wait_for_callback(&CALLBACK_SPEC, &state, Duration::from_secs(300))
+            .await
+    }
+    .await;
 
     let code = match result {
         Ok(cb) => cb.code,
@@ -425,7 +439,7 @@ fn manual_paste_prompt() -> Result<String> {
     let query = line.split_once('?').map(|(_, q)| q).unwrap_or(line);
 
     let (code, _state, error) =
-        crate::services::codex_oauth_callback::extract_callback_params(query);
+        crate::services::oauth_callback_server::extract_callback_params(query);
 
     if let Some(err) = error {
         anyhow::bail!("callback URL contained an error: {err}");
