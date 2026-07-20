@@ -1700,6 +1700,65 @@ pub async fn start_provider_oauth_loopback_router(
     Ok(Some(port))
 }
 
+/// Starts a bearer-gated multi-upstream loopback ServeRouter: base = `main_key`
+/// (already decrypted), each `(model, key_id)` tier dispatched by
+/// suffix-stripped model name to its own key. Tier keys are resolved and
+/// decrypted from the store here, so only ids cross the caller boundary and
+/// secrets never travel in env. `pub`: sibling-binary plugins (aivo-amp
+/// per-mode keys) link it.
+pub async fn start_tier_loopback_router(
+    main_key: ApiKey,
+    tiers: &[(String, String)],
+    auth_token: Option<String>,
+    session_store: &SessionStore,
+) -> Result<u16> {
+    // Load once; per-key `get_key_by_id` would re-read config.json each time.
+    // `get_keys` returns secrets encrypted, so decrypt only what we reference.
+    let all_keys = session_store.get_keys().await?;
+
+    let mut model_upstreams: Vec<(String, ApiKey)> = Vec::with_capacity(tiers.len());
+    for (model, key_id) in tiers {
+        let mut key = all_keys
+            .iter()
+            .find(|k| k.id == *key_id)
+            .cloned()
+            .ok_or_else(|| {
+                anyhow::anyhow!("per-tier routing: key '{key_id}' for model '{model}' not found")
+            })?;
+        SessionStore::decrypt_key_secret(&mut key)?;
+        // Fail at launch, not with per-request 500s later.
+        if key.is_claude_oauth() {
+            crate::services::claude_oauth::ClaudeOAuthCredential::from_json(key.key.as_str())
+                .map_err(|e| {
+                    anyhow::anyhow!(
+                        "Claude OAuth credential for key '{}' is unreadable — re-run `aivo keys add claude` ({e})",
+                        key.display_name()
+                    )
+                })?;
+        }
+        model_upstreams.push((model.clone(), key));
+    }
+
+    let fallback = if main_key.is_grok_oauth() {
+        resolve_grok_fallback(session_store).await
+    } else {
+        None
+    };
+    let config = ServeRouterConfig::from_key(&main_key, false, 300, auth_token, HashMap::new())
+        .with_grok_fallback(fallback);
+    let (handle, _shutdown, port) = ServeRouter::new(config, main_key, session_store.logs())
+        .with_oauth_persist(session_store.clone())
+        .with_model_upstreams(model_upstreams)
+        .start_background_with_addr("127.0.0.1", 0)
+        .await?;
+    tokio::spawn(async move {
+        if let Ok(Err(e)) = handle.await {
+            eprintln!("aivo: multi-upstream serve router exited unexpectedly: {e}");
+        }
+    });
+    Ok(port)
+}
+
 /// Builds the grok token manager from a grok-oauth config. `None` for non-grok
 /// configs or an unparseable credential.
 fn build_grok_tokens(

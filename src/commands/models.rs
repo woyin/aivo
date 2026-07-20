@@ -459,7 +459,8 @@ pub(crate) fn merge_models_spec(
 /// picker" (exit success, don't launch) from "no fetchable model list, fall back
 /// to the tool's own default" (launch anyway, no injected model). Shared by
 /// `aivo run` and the plugin endpoint so both resolve models identically.
-pub(crate) enum ModelOutcome {
+/// `pub`: fat plugins (aivo-amp) link this for their own bare-flag pickers.
+pub enum ModelOutcome {
     /// User picked a model, or `--model <value>` was passed.
     Model(String),
     /// No `--model` flag, or the picker fetched an empty list. Launch with the
@@ -476,7 +477,7 @@ pub(crate) enum ModelOutcome {
 /// it also falls back to the default. `tool` colors the picker's "(leave it to
 /// the tool)" row; pass `None` for a generic client (plugins).
 #[allow(clippy::too_many_arguments)]
-pub(crate) async fn resolve_model_outcome(
+pub async fn resolve_model_outcome(
     client: &Client,
     key: &ApiKey,
     flag_model: Option<String>,

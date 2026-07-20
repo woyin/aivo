@@ -239,7 +239,7 @@ pub(crate) fn looks_like_key_model_spec(s: &str) -> bool {
 
 /// Splits a slot value into `(<keyRef>, model)` on the first `::`, so single
 /// `:` / `/` / `@` in model ids survive. Empty/absent key ref → `None`.
-pub(crate) fn split_tier_spec(value: &str) -> (Option<String>, String) {
+pub fn split_tier_spec(value: &str) -> (Option<String>, String) {
     match value.split_once("::") {
         Some((key_ref, model)) => {
             let key_ref = key_ref.trim();
@@ -253,7 +253,7 @@ pub(crate) fn split_tier_spec(value: &str) -> (Option<String>, String) {
 /// Alias-resolves a model token, re-splitting so an alias that expands to
 /// `key::model` carries a provider (`fast` = `groq::llama`). An explicit
 /// `key_ref` wins; an empty model stays empty (picker trigger).
-pub(crate) fn resolve_alias_with_tier(
+pub fn resolve_alias_with_tier(
     aliases: &HashMap<String, String>,
     key_ref: Option<String>,
     model: String,

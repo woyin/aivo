@@ -1076,18 +1076,16 @@ async fn start_multi_upstream_serve_router(
     session_store: &SessionStore,
 ) -> Result<u16> {
     use crate::services::environment_injector::TierUpstream;
-    use crate::services::serve_router::{ServeRouter, ServeRouterConfig, resolve_grok_fallback};
-
-    // Load once; per-key `get_key_by_id` would re-read config.json each time.
-    // `get_keys` returns secrets encrypted, so decrypt only what we reference.
-    let all_keys = session_store.get_keys().await?;
-    let lookup = |id: &str| all_keys.iter().find(|k| k.id == id).cloned();
 
     let main_id = env
         .get("AIVO_ANTHROPIC_TO_OPENAI_ROUTER_MAIN_KEY_ID")
         .cloned()
         .unwrap_or_default();
-    let mut main_key = lookup(&main_id)
+    let mut main_key = session_store
+        .get_keys()
+        .await?
+        .into_iter()
+        .find(|k| k.id == main_id)
         .ok_or_else(|| anyhow::anyhow!("per-tier routing: main key '{main_id}' not found"))?;
     SessionStore::decrypt_key_secret(&mut main_key)?;
 
@@ -1097,28 +1095,8 @@ async fn start_multi_upstream_serve_router(
             .map_err(|e| anyhow::anyhow!("per-tier routing: invalid tiers spec: {e}"))?,
         None => Vec::new(),
     };
-    let mut model_upstreams: Vec<(String, ApiKey)> = Vec::with_capacity(tiers.len());
-    for tier in tiers {
-        let mut key = lookup(&tier.key_id).ok_or_else(|| {
-            anyhow::anyhow!(
-                "per-tier routing: key '{}' for model '{}' not found",
-                tier.key_id,
-                tier.model
-            )
-        })?;
-        SessionStore::decrypt_key_secret(&mut key)?;
-        // Fail at launch, not with per-request 500s later.
-        if key.is_claude_oauth() {
-            claude_oauth_token(&key)?;
-        }
-        model_upstreams.push((tier.model, key));
-    }
+    let tiers: Vec<(String, String)> = tiers.into_iter().map(|t| (t.model, t.key_id)).collect();
 
-    let fallback = if main_key.is_grok_oauth() {
-        resolve_grok_fallback(session_store).await
-    } else {
-        None
-    };
     // A Claude-subscription main authenticates to the loopback with its own
     // OAuth bearer, so the gate must expect that token.
     let auth_token = if main_key.is_claude_oauth() {
@@ -1126,19 +1104,13 @@ async fn start_multi_upstream_serve_router(
     } else {
         loopback_auth_token(env)
     };
-    let config = ServeRouterConfig::from_key(&main_key, false, 300, auth_token, HashMap::new())
-        .with_grok_fallback(fallback);
-    let (handle, _shutdown, port) = ServeRouter::new(config, main_key, session_store.logs())
-        .with_oauth_persist(session_store.clone())
-        .with_model_upstreams(model_upstreams)
-        .start_background_with_addr("127.0.0.1", 0)
-        .await?;
-    tokio::spawn(async move {
-        if let Ok(Err(e)) = handle.await {
-            eprintln!("aivo: multi-upstream serve router exited unexpectedly: {e}");
-        }
-    });
-    Ok(port)
+    crate::services::serve_router::start_tier_loopback_router(
+        main_key,
+        &tiers,
+        auth_token,
+        session_store,
+    )
+    .await
 }
 
 async fn start_anthropic_router(env: &HashMap<String, String>) -> Result<u16> {

@@ -3563,7 +3563,7 @@ fn prompt_pick_key(
     Ok(selection.map(|idx| keys[idx].clone()))
 }
 
-pub(crate) fn prompt_pick_key_without_activation(
+pub fn prompt_pick_key_without_activation(
     keys: &[ApiKey],
     annotations: &[Option<String>],
     prompt: &str,
