@@ -456,10 +456,10 @@ fn plugins_install_captures_manifest_and_surfaces_it() {
         "expected a sha256 pin, got:\n{rec}"
     );
 
-    // `plugins list` shows the version + declared capability.
+    // `plugins list` shows the version + description from the manifest.
     let list = run_ok(&home, &["plugins", "list"]);
-    assert!(list.contains("0.3.0"), "list:\n{list}");
-    assert!(list.contains("endpoint"), "list:\n{list}");
+    assert!(list.contains("v0.3.0"), "list:\n{list}");
+    assert!(list.contains("demo"), "list:\n{list}");
 
     // `--help-json` enriches the plugin entry from the registry.
     let help: Value = serde_json::from_str(&run_ok(&home, &["--help-json"])).expect("help json");

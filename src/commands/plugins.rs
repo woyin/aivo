@@ -107,142 +107,130 @@ fn list_action() -> Result<ExitCode> {
     }
 
     let records = registry::load().plugins;
-    let width = plugins
+
+    // Only exceptional states earn a trailing note; healthy detail stays out.
+    struct Row {
+        bullet: String,
+        name: String,
+        kind: String,
+        version: String,
+        desc: String,
+        notes: Vec<String>,
+    }
+
+    let rows: Vec<Row> = plugins
         .iter()
-        .map(|(n, _)| n.len())
-        .max()
-        .unwrap_or(0)
-        .min(24);
-    // Continuation lines align under the name: "  ● " (4) + name + "  " (2).
-    let indent = " ".repeat(width + 6);
-    let sep = style::dim("  ·  ");
-    // Piped output keeps single lines for greppability.
+        .map(|(name, path)| {
+            let is_managed = managed_dir
+                .as_deref()
+                .is_some_and(|d| path.parent() == Some(d));
+            let manifest = records.get(name).and_then(|r| r.manifest.as_ref());
+            let missing: Vec<&str> = manifest
+                .map(|m| {
+                    m.requires
+                        .iter()
+                        .map(|r| r.bin.as_str())
+                        .filter(|b| !bin_on_path(b))
+                        .collect()
+                })
+                .unwrap_or_default();
+
+            // Bullet encodes readiness: green = ready to run, yellow = a
+            // required binary is missing, dim ○ = no manifest (can't tell).
+            let bullet = if manifest.is_none() {
+                style::empty_bullet_symbol()
+            } else if !missing.is_empty() {
+                style::yellow("●")
+            } else {
+                style::bullet_symbol()
+            };
+
+            let mut notes = Vec::new();
+            if !missing.is_empty() {
+                notes.push(style::yellow(format!("needs {}", missing.join(", "))));
+            }
+            if !is_managed {
+                notes.push(style::dim("(external)"));
+            } else if manifest.is_none() {
+                notes.push(style::dim("(no manifest)"));
+            }
+
+            // For external plugins the path is the most identifying thing we have.
+            let desc = manifest
+                .and_then(|m| m.description.clone())
+                .filter(|d| !d.is_empty())
+                .unwrap_or_else(|| {
+                    if is_managed {
+                        String::new()
+                    } else {
+                        collapse_tilde(&path.display().to_string())
+                    }
+                });
+
+            Row {
+                bullet,
+                name: name.clone(),
+                kind: manifest
+                    .and_then(|m| m.kind.as_ref())
+                    .map(|k| k.to_string())
+                    .unwrap_or_default(),
+                version: manifest
+                    .map(|m| format!("v{}", m.version))
+                    .unwrap_or_default(),
+                desc,
+                notes,
+            }
+        })
+        .collect();
+
+    let name_w = rows.iter().map(|r| r.name.len()).max().unwrap_or(0).min(24);
+    let kind_w = rows.iter().map(|r| r.kind.len()).max().unwrap_or(0);
+    let ver_w = rows.iter().map(|r| r.version.len()).max().unwrap_or(0);
+    // Piped output keeps full lines for greppability.
     let cols = if std::io::stdout().is_terminal() {
         (console::Term::stdout().size().1 as usize).max(40)
     } else {
         usize::MAX
     };
-    let body_width = cols.saturating_sub(indent.len());
 
-    println!(
-        "{} {}",
-        style::bold("Installed plugins"),
-        style::dim(format!("({})", plugins.len()))
-    );
-    println!();
-
-    for (name, path) in &plugins {
-        let is_managed = managed_dir
-            .as_deref()
-            .is_some_and(|d| path.parent() == Some(d));
-        let manifest = records.get(name).and_then(|r| r.manifest.as_ref());
-
-        // Resolve each required binary once (PATH scan), reused for both the
-        // status bullet and the detail line.
-        let reqs: Vec<(&str, bool)> = manifest
-            .map(|m| {
-                m.requires
-                    .iter()
-                    .map(|r| (r.bin.as_str(), bin_on_path(&r.bin)))
-                    .collect()
-            })
-            .unwrap_or_default();
-
-        // Bullet encodes readiness: green = ready to run, yellow = installed but
-        // a required binary is missing, dim ○ = no manifest (can't tell).
-        let bullet = if manifest.is_none() {
-            style::empty_bullet_symbol()
-        } else if reqs.iter().any(|(_, ok)| !ok) {
-            style::yellow("●")
-        } else {
-            style::bullet_symbol()
-        };
-
-        // Line 1: bullet + name + identity (type · version) + provenance tag.
-        let mut ident: Vec<String> = Vec::new();
-        if let Some(m) = manifest {
-            if let Some(kind) = &m.kind {
-                ident.push(kind.to_string());
-            }
-            ident.push(format!("v{}", m.version));
-        }
-        let tag = if !is_managed {
-            " (external)"
-        } else if manifest.is_none() {
-            " (no manifest)"
-        } else {
-            ""
-        };
-        println!(
-            "  {} {}  {}{}",
-            bullet,
-            style::cyan(format!("{name:<width$}")),
-            style::dim(ident.join(" · ")),
-            style::dim(tag),
+    for r in &rows {
+        let notes = r.notes.join(" ");
+        // Notes always stay visible; the description absorbs any truncation.
+        let reserved = 2
+            + name_w
+            + 2
+            + kind_w
+            + 2
+            + ver_w
+            + 2
+            + if notes.is_empty() {
+                0
+            } else {
+                console::measure_text_width(&notes) + 2
+            };
+        let desc = truncate_width(&r.desc, cols.saturating_sub(reserved));
+        let mut line = format!(
+            "{} {}  {}  {}",
+            r.bullet,
+            style::cyan(format!("{:<name_w$}", r.name)),
+            style::dim(format!("{:<kind_w$}", r.kind)),
+            style::dim(format!("{:<ver_w$}", r.version)),
         );
-
-        // Description on its own line — tells you what the plugin actually is.
-        if let Some(desc) = manifest.and_then(|m| m.description.as_deref())
-            && !desc.is_empty()
-        {
-            for line in wrap_plain(desc, body_width) {
-                println!("{indent}{}", style::dim(line));
-            }
+        if !desc.is_empty() {
+            line.push_str("  ");
+            line.push_str(&style::dim(desc));
         }
-
-        // Detail line: caps, requirement status, provenance (what `update`
-        // re-fetches); external plugins show their resolved path instead.
-        let mut details: Vec<String> = Vec::new();
-        if let Some(m) = manifest {
-            let grantable = grantable_capabilities(&m.capabilities);
-            let granted = records.get(name).map(|r| {
-                grantable
-                    .iter()
-                    .filter(|c| r.granted_caps.contains(c))
-                    .cloned()
-                    .collect::<Vec<_>>()
-            });
-            match granted.as_deref() {
-                Some(g) if !g.is_empty() => {
-                    details.push(style::dim(format!("caps: {}", g.join(", "))))
-                }
-                _ if !m.capabilities.is_empty() => details.push(style::dim(format!(
-                    "requests: {}",
-                    m.capabilities.join(", ")
-                ))),
-                _ => {}
-            }
-            if !reqs.is_empty() {
-                let marked = reqs
-                    .iter()
-                    .map(|(bin, ok)| {
-                        let mark = if *ok {
-                            style::green("✓")
-                        } else {
-                            style::red("✗")
-                        };
-                        format!("{} {mark}", style::dim(*bin))
-                    })
-                    .collect::<Vec<_>>()
-                    .join(&style::dim(", "));
-                details.push(format!("{} {marked}", style::dim("requires")));
-            }
+        if !notes.is_empty() {
+            line.push_str("  ");
+            line.push_str(&notes);
         }
-        if let Some(rec) = records.get(name).filter(|_| is_managed) {
-            details.push(style::dim(format!("from {}", collapse_tilde(&rec.source))));
-        }
-        if !is_managed {
-            details.push(style::dim(collapse_tilde(&path.display().to_string())));
-        }
-        for line in wrap_segments(&details, &sep, body_width) {
-            println!("{indent}{line}");
-        }
-        println!();
+        println!("{line}");
     }
 
     if let Some(dir) = &managed_dir_display {
+        println!();
         println!(
-            "  {}",
+            "{}",
             style::dim(format!(
                 "Run one with `aivo <name>` · plugins live in {dir}"
             ))
@@ -251,77 +239,27 @@ fn list_action() -> Result<ExitCode> {
     Ok(ExitCode::Success)
 }
 
-/// Greedy word-wrap by display width; wide (CJK) chars break anywhere.
-fn wrap_plain(text: &str, width: usize) -> Vec<String> {
+/// Truncate to display width, appending `…` when cut; wide (CJK) chars count as 2.
+fn truncate_width(text: &str, max: usize) -> String {
     use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
-    let mut units: Vec<(bool, String)> = Vec::new();
-    let mut word = String::new();
-    let mut spaced = false;
+    if UnicodeWidthStr::width(text) <= max {
+        return text.to_string();
+    }
+    if max == 0 {
+        return String::new();
+    }
+    let mut out = String::new();
+    let mut used = 0;
     for ch in text.chars() {
-        if ch.is_whitespace() {
-            if !word.is_empty() {
-                units.push((spaced, std::mem::take(&mut word)));
-            }
-            spaced = true;
-        } else if UnicodeWidthChar::width(ch).unwrap_or(1) >= 2 {
-            if !word.is_empty() {
-                units.push((spaced, std::mem::take(&mut word)));
-                spaced = false;
-            }
-            units.push((spaced, ch.to_string()));
-            spaced = false;
-        } else {
-            word.push(ch);
+        let w = UnicodeWidthChar::width(ch).unwrap_or(1);
+        if used + w > max - 1 {
+            break;
         }
-    }
-    if !word.is_empty() {
-        units.push((spaced, word));
-    }
-
-    let mut lines = Vec::new();
-    let (mut line, mut used) = (String::new(), 0usize);
-    for (spaced, unit) in units {
-        let w = UnicodeWidthStr::width(unit.as_str());
-        let glue = usize::from(spaced && !line.is_empty());
-        if !line.is_empty() && used + glue + w > width {
-            lines.push(std::mem::take(&mut line));
-            used = 0;
-        }
-        if !line.is_empty() && glue == 1 {
-            line.push(' ');
-            used += 1;
-        }
-        line.push_str(&unit);
+        out.push(ch);
         used += w;
     }
-    if !line.is_empty() {
-        lines.push(line);
-    }
-    lines
-}
-
-/// Pack pre-styled segments onto lines, breaking only between them (ANSI-aware widths).
-fn wrap_segments(segments: &[String], sep: &str, width: usize) -> Vec<String> {
-    let sep_w = console::measure_text_width(sep);
-    let mut lines = Vec::new();
-    let (mut line, mut used) = (String::new(), 0usize);
-    for seg in segments {
-        let w = console::measure_text_width(seg);
-        if !line.is_empty() && used + sep_w + w > width {
-            lines.push(std::mem::take(&mut line));
-            used = 0;
-        }
-        if !line.is_empty() {
-            line.push_str(sep);
-            used += sep_w;
-        }
-        line.push_str(seg);
-        used += w;
-    }
-    if !line.is_empty() {
-        lines.push(line);
-    }
-    lines
+    out.push('…');
+    out
 }
 
 /// Install-on-demand entry used by plugin dispatch when a known plugin is
@@ -1017,26 +955,11 @@ mod tests {
     }
 
     #[test]
-    fn wrap_plain_breaks_at_word_boundaries() {
-        assert_eq!(wrap_plain("alpha beta gamma", 11), ["alpha beta", "gamma"]);
-        assert_eq!(wrap_plain("unbreakable", 5), ["unbreakable"]);
-    }
-
-    #[test]
-    fn wrap_plain_breaks_cjk_by_display_width() {
-        assert_eq!(wrap_plain("点单点", 4), ["点单", "点"]);
-        assert_eq!(wrap_plain("aivo 提供模型", 9), ["aivo 提供", "模型"]);
-    }
-
-    #[test]
-    fn wrap_segments_breaks_between_segments_only() {
-        let segs = vec![
-            crate::style::dim("caps: endpoint"),
-            crate::style::dim("requires git ✓"),
-        ];
-        let lines = wrap_segments(&segs, "  ·  ", 20);
-        assert_eq!(lines.len(), 2, "{lines:?}");
-        assert_eq!(wrap_segments(&segs, "  ·  ", 40).len(), 1);
+    fn truncate_width_cuts_by_display_width() {
+        assert_eq!(truncate_width("hello world", 20), "hello world");
+        assert_eq!(truncate_width("hello world", 8), "hello w…");
+        assert_eq!(truncate_width("点单点单", 5), "点单…");
+        assert_eq!(truncate_width("abc", 0), "");
     }
 
     #[test]
