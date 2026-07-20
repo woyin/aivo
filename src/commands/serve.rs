@@ -5,10 +5,9 @@ use std::collections::HashMap;
 use std::net::IpAddr;
 
 use crate::errors::ExitCode;
-use crate::services::log_store::LogStore;
 use crate::services::request_log::RequestLogger;
 use crate::services::serve_router::{ServeRouter, ServeRouterConfig};
-use crate::services::session_store::ApiKey;
+use crate::services::session_store::{ApiKey, SessionStore};
 use crate::style;
 
 pub struct ServeParams {
@@ -24,12 +23,12 @@ pub struct ServeParams {
 }
 
 pub struct ServeCommand {
-    log_store: LogStore,
+    session_store: SessionStore,
 }
 
 impl ServeCommand {
-    pub fn new(log_store: LogStore) -> Self {
-        Self { log_store }
+    pub fn new(session_store: SessionStore) -> Self {
+        Self { session_store }
     }
 
     pub async fn execute(&self, params: ServeParams) -> ExitCode {
@@ -111,9 +110,13 @@ impl ServeCommand {
             );
         }
 
-        // No SessionStore here to resolve the sibling `xai` fallback key, so
-        // grok's 403 fallback is unavailable on `aivo serve` (OAuth path works).
-        let config = ServeRouterConfig::from_key(&key, cors, timeout, auth_token, aliases);
+        let grok_fallback = if key.is_grok_oauth() {
+            crate::services::serve_router::resolve_grok_fallback(&self.session_store).await
+        } else {
+            None
+        };
+        let config = ServeRouterConfig::from_key(&key, cors, timeout, auth_token, aliases)
+            .with_grok_fallback(grok_fallback);
 
         // Capture display info before moving key into the router
         let display_name = key.display_name().to_string();
@@ -143,7 +146,8 @@ impl ServeCommand {
         let failover_count = failover_keys.len();
         let log_display = logger.as_ref().map(|l| l.path_display().to_string());
         let auth_display = config.auth_token.clone();
-        let router = ServeRouter::new(config, key, self.log_store.clone())
+        let router = ServeRouter::new(config, key, self.session_store.logs())
+            .with_oauth_persist(self.session_store.clone())
             .with_logger(logger)
             .with_failover_keys(failover_keys);
 

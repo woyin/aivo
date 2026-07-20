@@ -26,10 +26,10 @@ use crate::errors::ExitCode;
 use crate::services::models_cache::ModelsCache;
 use crate::services::session_store::{ApiKey, SessionStore, SessionTokens};
 
-/// Whether `key` can drive the in-process agent. Provider OAuth (grok/codex)
-/// qualifies; other OAuth/copilot/cursor don't.
+/// Whether `key` can drive the in-process agent — anything the loopback
+/// `ServeRouter` can proxy. Launch-bound OAuth and Cursor (ACP) can't.
 pub(crate) fn key_is_agent_capable(key: &ApiKey) -> bool {
-    (!key.is_any_oauth() || key.is_provider_oauth()) && !key.is_cursor_acp() && !key.is_copilot()
+    (!key.is_any_oauth() || key.is_provider_oauth()) && !key.is_cursor_acp()
 }
 
 /// Unattended `-e` backstops (env-overridable, 0 disables) — the TUI relies on esc instead.
@@ -1202,6 +1202,31 @@ fn one_line(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn agent_capable_matches_serve_proxyable_keys() {
+        let make = |base: &str| {
+            ApiKey::new_with_protocol("id".into(), "n".into(), base.into(), None, "secret".into())
+        };
+        assert!(key_is_agent_capable(&make("https://openrouter.ai/api/v1")));
+        assert!(key_is_agent_capable(&make("copilot")));
+        assert!(key_is_agent_capable(&make(
+            crate::services::codex_oauth::CODEX_OAUTH_SENTINEL
+        )));
+        assert!(key_is_agent_capable(&make(
+            crate::services::grok_oauth::GROK_OAUTH_SENTINEL
+        )));
+        assert!(key_is_agent_capable(&make(
+            crate::services::kimi_oauth::KIMI_OAUTH_SENTINEL
+        )));
+        assert!(!key_is_agent_capable(&make(
+            crate::services::claude_oauth::CLAUDE_OAUTH_SENTINEL
+        )));
+        assert!(!key_is_agent_capable(&make(
+            crate::services::gemini_oauth::GEMINI_OAUTH_SENTINEL
+        )));
+        assert!(!key_is_agent_capable(&make("cursor")));
+    }
 
     #[test]
     fn classifies_terminal_error_to_the_exit_code_contract() {

@@ -975,7 +975,7 @@ pub async fn run() -> ! {
             // Snapshot aliases at startup; edits made while serve is running
             // require a restart (matches `aivo run`'s behavior).
             let aliases = session_store.get_aliases().await.unwrap_or_default();
-            let command = ServeCommand::new(session_store.logs());
+            let command = ServeCommand::new(session_store);
             command
                 .execute(ServeParams {
                     port: serve_args.port,
