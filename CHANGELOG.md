@@ -1,5 +1,15 @@
 # Changelog
 
+## v0.41.4
+
+Provider-OAuth routing gets unified and more reliable. Codex, Kimi, and Grok now share one loopback router, and refreshed OAuth tokens are persisted across `aivo serve` so rotated refresh tokens survive — OpenAI's are single-use, so a dropped rotation would have bricked the session. Plugins can bind per-mode keys through the extracted tier loopback router, `aivo models` takes a `[key::][search]` positional, `plugins list` prints one aligned line per plugin, and Copilot works in `code -e`.
+
+- feat(oauth): unify provider-OAuth loopback routers and persist codex refresh rotations (af345619)
+- fix(oauth): persist provider-OAuth rotations on `aivo serve` and allow copilot in `code -e` (b7cdf0ce)
+- feat(serve): extract pub `start_tier_loopback_router` for plugin per-mode keys (ea00c9a9)
+- feat(models): accept a `[key::][search]` positional (13939342)
+- feat(plugins): simplify `plugins list` to one aligned line per plugin (e455edd2)
+
 ## v0.41.3
 
 A stability-and-internals release. The code TUI stops corrupting the terminal — self-heal now repaints in place instead of clearing the screen — the prompt caret no longer blinks during streaming repaints, and `/rewind` checkpoints line up with compacted display turns and revert cleanly through boundary checkpoints. Copilot adopts the shared Enter-to-open-browser device login, and Kimi refreshes its OAuth token when listing models without a stored session. Under the hood, a large architecture-audit pass consolidates shared helpers and breaks `CodeTuiApp` into focused sub-structs.
