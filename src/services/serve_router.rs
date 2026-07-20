@@ -175,7 +175,8 @@ pub struct ServeRouter {
     /// protocol and read confirmed routes back. `aivo code` shares one across its
     /// per-turn serves.
     seed_route_cache: Option<Arc<RouteCache>>,
-    /// Persists grok refresh-token rotations; ignored for non-grok upstreams.
+    /// Persists provider-OAuth (grok/kimi/codex) refresh-token rotations;
+    /// ignored for other upstreams.
     oauth_persist_store: Option<SessionStore>,
 }
 
@@ -236,7 +237,8 @@ impl ServeRouter {
         }
     }
 
-    /// Persist grok refresh-token rotations. No-op for non-grok upstreams.
+    /// Persist provider-OAuth (grok/kimi/codex) refresh-token rotations.
+    /// No-op for other upstreams.
     pub fn with_oauth_persist(mut self, store: SessionStore) -> Self {
         self.oauth_persist_store = Some(store);
         self
@@ -340,7 +342,7 @@ impl ServeRouter {
         };
         let grok_tokens = build_grok_tokens(&self.config, self.oauth_persist_store.clone());
         let kimi_tokens = build_kimi_tokens(&self.config, self.oauth_persist_store.clone());
-        let codex_tokens = build_codex_tokens(&self.config);
+        let codex_tokens = build_codex_tokens(&self.config, self.oauth_persist_store.clone());
 
         let initial_protocol = self.config.upstream_protocol;
         let timeout = self.config.timeout;
@@ -1329,7 +1331,7 @@ fn build_upstream_entry(
     };
     let grok_tokens = build_grok_tokens(&config, oauth_persist.cloned());
     let kimi_tokens = build_kimi_tokens(&config, oauth_persist.cloned());
-    let codex_tokens = build_codex_tokens(&config);
+    let codex_tokens = build_codex_tokens(&config, oauth_persist.cloned());
     let route_cache = Arc::new(RouteCache::new(
         "serve",
         config.upstream_protocol,
@@ -1648,6 +1650,56 @@ pub(crate) async fn resolve_grok_fallback(session_store: &SessionStore) -> Optio
         .map(|k| k.key.as_str().to_string())
 }
 
+/// Starts a universal loopback ServeRouter for a provider-OAuth credential
+/// (Codex/Kimi/Grok) and returns its port; `None` if `creds_json` is none of
+/// those, so the caller falls back to its static-key path. Probes codex and
+/// kimi before grok — both also parse as the looser grok shape. Refreshed
+/// tokens persist back to the store. `pub` for sibling-binary plugins.
+pub async fn start_provider_oauth_loopback_router(
+    creds_json: &str,
+    auth_token: Option<String>,
+    session_store: &SessionStore,
+) -> Result<Option<u16>> {
+    use crate::services::codex_oauth::{CODEX_OAUTH_SENTINEL, CodexOAuthCredential};
+    use crate::services::grok_oauth::{GROK_OAUTH_SENTINEL, GrokOAuthCredential};
+    use crate::services::kimi_oauth::{KIMI_OAUTH_SENTINEL, KimiOAuthCredential};
+
+    let (provider, sentinel) = if CodexOAuthCredential::from_json(creds_json).is_ok() {
+        ("codex", CODEX_OAUTH_SENTINEL)
+    } else if KimiOAuthCredential::from_json(creds_json).is_ok() {
+        ("kimi", KIMI_OAUTH_SENTINEL)
+    } else if GrokOAuthCredential::from_json(creds_json).is_ok() {
+        ("grok", GROK_OAUTH_SENTINEL)
+    } else {
+        return Ok(None);
+    };
+
+    let key = ApiKey::new_with_protocol(
+        provider.to_string(),
+        provider.to_string(),
+        sentinel.to_string(),
+        None,
+        creds_json.to_string(),
+    );
+    let fallback = if key.is_grok_oauth() {
+        resolve_grok_fallback(session_store).await
+    } else {
+        None
+    };
+    let config = ServeRouterConfig::from_key(&key, false, 300, auth_token, HashMap::new())
+        .with_grok_fallback(fallback);
+    let (handle, _shutdown, port) = ServeRouter::new(config, key, session_store.logs())
+        .with_oauth_persist(session_store.clone())
+        .start_background_with_addr("127.0.0.1", 0)
+        .await?;
+    tokio::spawn(async move {
+        if let Ok(Err(e)) = handle.await {
+            eprintln!("aivo: {provider} serve router exited unexpectedly: {e}");
+        }
+    });
+    Ok(Some(port))
+}
+
 /// Builds the grok token manager from a grok-oauth config. `None` for non-grok
 /// configs or an unparseable credential.
 fn build_grok_tokens(
@@ -1694,13 +1746,20 @@ fn build_kimi_tokens(
 
 fn build_codex_tokens(
     config: &ServeRouterConfig,
+    persist_store: Option<SessionStore>,
 ) -> Option<Arc<crate::services::codex_oauth::CodexTokenManager>> {
     use crate::services::codex_oauth::{CodexOAuthCredential, CodexTokenManager};
     if !config.is_codex {
         return None;
     }
     match CodexOAuthCredential::from_json(&config.upstream_api_key) {
-        Ok(creds) => Some(Arc::new(CodexTokenManager::new(creds))),
+        Ok(creds) => {
+            let mut manager = CodexTokenManager::new(creds);
+            if let Some(store) = persist_store {
+                manager = manager.with_persist_store(store);
+            }
+            Some(Arc::new(manager))
+        }
         Err(_) => None,
     }
 }

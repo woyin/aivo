@@ -1052,127 +1052,20 @@ fn claude_oauth_token(key: &ApiKey) -> Result<String> {
         })
 }
 
-/// Starts a universal ServeRouter for a grok-oauth credential and returns its
-/// loopback port. It converts Anthropic `/v1/messages` → OpenAI and injects the
-/// grok token, so `aivo claude` reaches grok via the same path as `aivo code`.
-async fn start_grok_serve_router(
-    env: &HashMap<String, String>,
-    creds_json: String,
-    session_store: &SessionStore,
-) -> Result<u16> {
-    use crate::services::grok_oauth::GROK_OAUTH_SENTINEL;
-    use crate::services::serve_router::{ServeRouter, ServeRouterConfig, resolve_grok_fallback};
-
-    let key = ApiKey::new_with_protocol(
-        "grok".to_string(),
-        "grok".to_string(),
-        GROK_OAUTH_SENTINEL.to_string(),
-        None,
-        creds_json,
-    );
-    let fallback = resolve_grok_fallback(session_store).await;
-    let config =
-        ServeRouterConfig::from_key(&key, false, 300, loopback_auth_token(env), HashMap::new())
-            .with_grok_fallback(fallback);
-    let (handle, _shutdown, port) = ServeRouter::new(config, key, session_store.logs())
-        .with_oauth_persist(session_store.clone())
-        .start_background_with_addr("127.0.0.1", 0)
-        .await?;
-    tokio::spawn(async move {
-        if let Ok(Err(e)) = handle.await {
-            eprintln!("aivo: grok serve router exited unexpectedly: {e}");
-        }
-    });
-    Ok(port)
-}
-
-/// If `router_key` is a provider-OAuth credential (Codex/Kimi/Grok), starts the
-/// universal ServeRouter and returns its loopback port; `None` otherwise so the
-/// caller falls back to its tool-native static router. Probes codex and kimi
-/// before grok — both also parse as the looser grok shape (kimi's `provider`
-/// tag makes its own parse strict). Shared by every tool whose upstream is a
-/// local loopback router (claude/gemini/opencode/pi/codex).
+/// Provider-OAuth (Codex/Kimi/Grok) `router_key`: starts the universal loopback
+/// ServeRouter with this launch's auth token and returns its port; `None`
+/// otherwise so the caller falls back to its tool-native static router.
 async fn start_provider_oauth_router(
     env: &HashMap<String, String>,
     router_key: String,
     session_store: &SessionStore,
 ) -> Result<Option<u16>> {
-    if crate::services::codex_oauth::CodexOAuthCredential::from_json(&router_key).is_ok() {
-        Ok(Some(
-            start_codex_serve_router(env, router_key, session_store).await?,
-        ))
-    } else if crate::services::kimi_oauth::KimiOAuthCredential::from_json(&router_key).is_ok() {
-        Ok(Some(
-            start_kimi_serve_router(env, router_key, session_store).await?,
-        ))
-    } else if crate::services::grok_oauth::GrokOAuthCredential::from_json(&router_key).is_ok() {
-        Ok(Some(
-            start_grok_serve_router(env, router_key, session_store).await?,
-        ))
-    } else {
-        Ok(None)
-    }
-}
-
-/// Universal ServeRouter for a kimi-oauth credential, so `aivo claude` etc.
-/// reach Kimi Code via the same path as `aivo code`. Returns the loopback port.
-async fn start_kimi_serve_router(
-    env: &HashMap<String, String>,
-    creds_json: String,
-    session_store: &SessionStore,
-) -> Result<u16> {
-    use crate::services::kimi_oauth::KIMI_OAUTH_SENTINEL;
-    use crate::services::serve_router::{ServeRouter, ServeRouterConfig};
-
-    let key = ApiKey::new_with_protocol(
-        "kimi".to_string(),
-        "kimi".to_string(),
-        KIMI_OAUTH_SENTINEL.to_string(),
-        None,
-        creds_json,
-    );
-    let config =
-        ServeRouterConfig::from_key(&key, false, 300, loopback_auth_token(env), HashMap::new());
-    let (handle, _shutdown, port) = ServeRouter::new(config, key, session_store.logs())
-        .with_oauth_persist(session_store.clone())
-        .start_background_with_addr("127.0.0.1", 0)
-        .await?;
-    tokio::spawn(async move {
-        if let Ok(Err(e)) = handle.await {
-            eprintln!("aivo: kimi serve router exited unexpectedly: {e}");
-        }
-    });
-    Ok(port)
-}
-
-/// Universal ServeRouter for a codex-oauth credential, so `aivo claude` reaches
-/// Codex via the same path as `aivo code`. Returns the loopback port.
-async fn start_codex_serve_router(
-    env: &HashMap<String, String>,
-    creds_json: String,
-    session_store: &SessionStore,
-) -> Result<u16> {
-    use crate::services::codex_oauth::CODEX_OAUTH_SENTINEL;
-    use crate::services::serve_router::{ServeRouter, ServeRouterConfig};
-
-    let key = ApiKey::new_with_protocol(
-        "codex".to_string(),
-        "codex".to_string(),
-        CODEX_OAUTH_SENTINEL.to_string(),
-        None,
-        creds_json,
-    );
-    let config =
-        ServeRouterConfig::from_key(&key, false, 300, loopback_auth_token(env), HashMap::new());
-    let (handle, _shutdown, port) = ServeRouter::new(config, key, session_store.logs())
-        .start_background_with_addr("127.0.0.1", 0)
-        .await?;
-    tokio::spawn(async move {
-        if let Ok(Err(e)) = handle.await {
-            eprintln!("aivo: codex serve router exited unexpectedly: {e}");
-        }
-    });
-    Ok(port)
+    crate::services::serve_router::start_provider_oauth_loopback_router(
+        &router_key,
+        loopback_auth_token(env),
+        session_store,
+    )
+    .await
 }
 
 /// Multi-upstream ServeRouter for `aivo claude` per-tier routing: base = main

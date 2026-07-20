@@ -280,6 +280,33 @@ impl crate::services::oauth_credential::OAuthCredential for CodexOAuthCredential
     }
 }
 
+impl crate::services::oauth_credential::StoredOAuthCredential for CodexOAuthCredential {
+    fn key_matches(key: &crate::services::session_store::ApiKey) -> bool {
+        key.is_codex_oauth()
+    }
+    fn from_json(json: &str) -> Result<Self> {
+        CodexOAuthCredential::from_json(json)
+    }
+    fn to_json(&self) -> Result<String> {
+        CodexOAuthCredential::to_json(self)
+    }
+    fn refresh_token(&self) -> &str {
+        &self.refresh_token
+    }
+}
+
+/// Writes a rotated credential back to the store. OpenAI refresh tokens are
+/// single-use (reuse fails with "already been used to generate a new access
+/// token"), so a rotation left only in memory bricks the on-disk credential.
+pub async fn persist_rotated_credential(
+    store: &crate::services::session_store::SessionStore,
+    prev_refresh_token: &str,
+    creds: &CodexOAuthCredential,
+) {
+    crate::services::oauth_credential::persist_rotated_credential(store, prev_refresh_token, creds)
+        .await
+}
+
 /// Decodes the `payload` segment of a JWT and pulls out the email and
 /// ChatGPT account id. Does NOT verify the signature — the id_token comes
 /// straight from the token endpoint over TLS, so the JWT claims are trusted
@@ -554,19 +581,34 @@ pub struct CodexAuth {
 #[derive(Clone)]
 pub struct CodexTokenManager {
     creds: Arc<RwLock<CodexOAuthCredential>>,
+    persist_store: Option<crate::services::session_store::SessionStore>,
 }
 
 impl CodexTokenManager {
     pub fn new(creds: CodexOAuthCredential) -> Self {
         Self {
             creds: Arc::new(RwLock::new(creds)),
+            persist_store: None,
         }
+    }
+
+    /// Persist rotations to `store` so they survive process exit.
+    pub fn with_persist_store(
+        mut self,
+        store: crate::services::session_store::SessionStore,
+    ) -> Self {
+        self.persist_store = Some(store);
+        self
     }
 
     pub async fn authorize(&self) -> Result<CodexAuth> {
         let mut creds = self.creds.write().await;
         if creds.is_expired(REFRESH_SKEW_SECS) {
+            let prev_refresh = creds.refresh_token.clone();
             refresh(&mut creds).await?;
+            if let Some(store) = &self.persist_store {
+                persist_rotated_credential(store, &prev_refresh, &creds).await;
+            }
         }
         Ok(CodexAuth {
             access_token: creds.access_token.clone(),
