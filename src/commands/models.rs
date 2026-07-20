@@ -245,11 +245,18 @@ impl ModelsCommand {
     }
 
     pub fn print_help() {
-        println!("{} aivo models [options]", style::bold("Usage:"));
+        println!(
+            "{} aivo models [key::][search] [options]",
+            style::bold("Usage:")
+        );
         println!();
         println!(
             "{}",
             style::dim("List available models from the active API key's provider.")
+        );
+        println!(
+            "{}",
+            style::dim("A `key::` prefix selects the key; a search term filters by substring.")
         );
         println!();
         println!("{}", style::bold("Options:"));
@@ -268,6 +275,8 @@ impl ModelsCommand {
         println!("{}", style::bold("Examples:"));
         println!("  {}", style::dim("aivo models"));
         println!("  {}", style::dim("aivo models -s sonnet"));
+        println!("  {}", style::dim("aivo models openrouter::"));
+        println!("  {}", style::dim("aivo models openrouter::glm"));
         println!("  {}", style::dim("aivo models --json | jq '.models[].id'"));
     }
 }
@@ -408,6 +417,38 @@ pub(crate) fn tool_supports_default_model(tool: AIToolType, models: &[String]) -
     }
 }
 
+/// Folds the positional (`key::`, `key::search`, bare search term) into the
+/// `-k`/`-s` slots. Same policy as the run path's `-k` vs `-m key::…`: a half
+/// given twice with agreeing values collapses; differing values are an error,
+/// not a silent drop.
+pub(crate) fn merge_models_spec(
+    spec: Option<String>,
+    key: Option<String>,
+    search: Option<String>,
+) -> Result<(Option<String>, Option<String>), String> {
+    let Some(spec) = spec else {
+        return Ok((key, search));
+    };
+    let (spec_key, model) = crate::cli_args::split_tier_spec(&spec);
+    let model = model.trim();
+    let spec_search = (!model.is_empty()).then(|| model.to_string());
+    if let (Some(k), Some(f)) = (&spec_key, &key)
+        && k != f
+    {
+        return Err(format!(
+            "-k '{f}' conflicts with the key in '{k}::…' — pick the key once."
+        ));
+    }
+    if let (Some(q), Some(f)) = (&spec_search, &search)
+        && q != f
+    {
+        return Err(format!(
+            "-s '{f}' conflicts with the positional search '{q}' — pick the search once."
+        ));
+    }
+    Ok((spec_key.or(key), spec_search.or(search)))
+}
+
 /// Shows an interactive model picker. The "(leave it to the tool)" default option
 /// is conditionally shown based on whether the provider has models compatible with
 /// the selected tool. When `tool` is `None` (e.g. chat mode), the default option
@@ -542,6 +583,55 @@ pub(crate) fn model_display_label(model: Option<&str>) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn merge_models_spec_folds_positional_into_flags() {
+        let s = |v: &str| Some(v.to_string());
+        assert_eq!(
+            merge_models_spec(None, s("gapnet"), s("glm")),
+            Ok((s("gapnet"), s("glm")))
+        );
+        assert_eq!(
+            merge_models_spec(s("gapnet::"), None, None),
+            Ok((s("gapnet"), None))
+        );
+        assert_eq!(
+            merge_models_spec(s("gapnet::glm"), None, None),
+            Ok((s("gapnet"), s("glm")))
+        );
+        assert_eq!(
+            merge_models_spec(s("sonnet"), None, None),
+            Ok((None, s("sonnet")))
+        );
+        assert_eq!(
+            merge_models_spec(s("gapnet::"), None, s("glm")),
+            Ok((s("gapnet"), s("glm")))
+        );
+        assert_eq!(
+            merge_models_spec(s("glm"), s("gapnet"), None),
+            Ok((s("gapnet"), s("glm")))
+        );
+        assert_eq!(merge_models_spec(s("::"), None, None), Ok((None, None)));
+    }
+
+    #[test]
+    fn merge_models_spec_doubled_halves_collapse_or_error() {
+        let s = |v: &str| Some(v.to_string());
+        // Agreeing values collapse (run-path policy for -k vs -m key::…).
+        assert_eq!(
+            merge_models_spec(s("gapnet::"), s("gapnet"), None),
+            Ok((s("gapnet"), None))
+        );
+        assert_eq!(
+            merge_models_spec(s("glm"), None, s("glm")),
+            Ok((None, s("glm")))
+        );
+        assert!(merge_models_spec(s("gapnet::"), s("other"), None).is_err());
+        // Bare `-k` ("" = picker request) is a differing value, not absence.
+        assert!(merge_models_spec(s("gapnet::"), s(""), None).is_err());
+        assert!(merge_models_spec(s("gapnet::glm"), None, s("kimi")).is_err());
+        assert!(merge_models_spec(s("glm"), None, s("kimi")).is_err());
+    }
 
     #[test]
     fn test_tool_supports_default_pi_always_false() {

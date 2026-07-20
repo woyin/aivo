@@ -776,6 +776,10 @@ pub struct RunArgs {
 /// Arguments for the models command
 #[derive(Args, Debug, Clone)]
 pub struct ModelsArgs {
+    /// `key::`, `key::search`, or a bare search term
+    #[arg(value_name = "[KEY::][SEARCH]", value_parser = non_empty())]
+    pub spec: Option<String>,
+
     /// Select API key by ID or name
     #[arg(
         short = 'k',

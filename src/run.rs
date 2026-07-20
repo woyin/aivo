@@ -857,10 +857,21 @@ pub async fn run() -> ! {
         }
 
         Commands::Models(models_args) => {
+            let (key_flag, search) = match commands::models::merge_models_spec(
+                models_args.spec,
+                models_args.key,
+                models_args.search,
+            ) {
+                Ok(merged) => merged,
+                Err(msg) => {
+                    eprintln!("{} {msg}", style::red("Error:"));
+                    process::exit(ExitCode::UserError.code());
+                }
+            };
             let key_override = key_or_exit(
                 resolve_key_override_info(
                     &session_store,
-                    models_args.key.as_deref(),
+                    key_flag.as_deref(),
                     KeyLookupMode::RequireActiveOrPrompt,
                     KeyCompatContext::None,
                 )
@@ -868,12 +879,7 @@ pub async fn run() -> ! {
             );
             let command = ModelsCommand::new(session_store, models_cache);
             command
-                .execute(
-                    key_override,
-                    models_args.refresh,
-                    models_args.search,
-                    models_args.json,
-                )
+                .execute(key_override, models_args.refresh, search, models_args.json)
                 .await
         }
 
