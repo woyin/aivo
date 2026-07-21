@@ -2271,7 +2271,7 @@ fn scrub_ansi_and_controls(s: &str) -> Cow<'_, str> {
 /// what the user said. Short prompts like "hi" are kept as the row title;
 /// a length floor here would hide CJK sessions (a full sentence rarely
 /// reaches `MIN_TURN_CHARS`) and mistitle others with a later long turn.
-fn pick_first_user_turn(raw: &str) -> Option<String> {
+pub(crate) fn pick_first_user_turn(raw: &str) -> Option<String> {
     let cleaned = strip_aivo_context(raw);
     let cleaned = scrub_ansi_and_controls(cleaned);
     let trimmed = cleaned.trim();
@@ -2299,7 +2299,7 @@ fn is_substantive(text: &str) -> bool {
 
 /// Strip any echoed aivo-context payload, then cap at `MAX_TURN_CHARS`.
 /// Returns None if what's left after stripping isn't substantive.
-fn sanitize_turn(text: &str) -> Option<String> {
+pub(crate) fn sanitize_turn(text: &str) -> Option<String> {
     let cleaned = strip_aivo_context(text);
     let cleaned = scrub_ansi_and_controls(cleaned);
     let trimmed = cleaned.trim();

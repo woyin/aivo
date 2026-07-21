@@ -19,6 +19,7 @@ use crate::services::huggingface;
 use crate::services::models_cache::ModelsCache;
 use crate::services::project_id::Thread;
 use crate::services::session_store::{ApiKey, SessionStore};
+use crate::services::share_resolver::{PluginTranscript, resolve_plugin_run_thread};
 use crate::services::system_env;
 use crate::style;
 
@@ -796,6 +797,72 @@ pub(crate) enum ContextResolution {
     Unavailable(String),
 }
 
+/// Pre-rung for an explicit `--resume <id>`: a cheap logs.db probe that
+/// resolves plugin run records via the plugin's transcript source before the
+/// expensive native-session walk. `None` = not a plugin-run id; fall through
+/// to the normal ladder.
+pub(crate) async fn try_plugin_run_resume(
+    store: &SessionStore,
+    selector: &str,
+) -> Option<ContextResolution> {
+    let entry = plugin_run_log_entry(store, selector).await?;
+    let tool = entry.tool.clone().unwrap_or_default();
+    // Registry read + binary discovery aren't free — load only after the gate.
+    let sources = crate::commands::share::plugin_transcript_sources();
+    Some(plugin_run_resolution(store, &entry, &tool, selector.trim(), sources.get(&tool)).await)
+}
+
+/// The logs.db row for `selector`, when it names a plugin run record — the
+/// cheap gate for the pre-rung. Log ids are base32-ish, session ids UUID-hex,
+/// so a prefix hitting both is vanishingly rare; the aivo-session index check
+/// keeps saved sessions' precedence for that case anyway.
+async fn plugin_run_log_entry(
+    store: &SessionStore,
+    selector: &str,
+) -> Option<crate::services::log_store::LogEntry> {
+    let id = selector.trim();
+    if id.is_empty() {
+        return None;
+    }
+    let entries = store.logs().find_by_id_prefix(id, 1).await.ok()?;
+    let entry = entries.into_iter().next()?;
+    if entry.source != "run" {
+        return None;
+    }
+    let tool = entry.tool.as_deref()?;
+    if crate::constants::KNOWN_TOOLS.contains(&tool) {
+        return None;
+    }
+    if let Ok(index) = store.all_chat_sessions().await
+        && index.iter().any(|e| e.session_id.starts_with(id))
+    {
+        return None;
+    }
+    Some(entry)
+}
+
+/// Resolve a plugin run record through its declared transcript source into a
+/// digest thread, or a printable reason why it can't be resumed.
+async fn plugin_run_resolution(
+    store: &SessionStore,
+    entry: &crate::services::log_store::LogEntry,
+    tool: &str,
+    id: &str,
+    src: Option<&PluginTranscript>,
+) -> ContextResolution {
+    let Some(src) = src else {
+        return ContextResolution::Unavailable(format!(
+            "'{id}' is a launch record for plugin tool '{tool}'. This plugin doesn't expose its transcripts to aivo, so its sessions can't be resumed."
+        ));
+    };
+    match resolve_plugin_run_thread(entry, tool, src, store.config_dir()).await {
+        Ok(t) => ContextResolution::Selected(t),
+        Err(e) => ContextResolution::Unavailable(format!(
+            "'{id}' is a launch record for plugin tool '{tool}', but reading its transcript failed: {e}"
+        )),
+    }
+}
+
 /// Resolve a `--resume` selector into one past session: empty → interactive
 /// picker; else session-id prefix match. The scan runs under a spinner. Shared
 /// with `aivo code --resume`'s digest rung.
@@ -803,6 +870,9 @@ pub(crate) async fn resolve_context_thread(
     store: &SessionStore,
     selector: &str,
 ) -> ContextResolution {
+    if let Some(resolution) = try_plugin_run_resume(store, selector).await {
+        return resolution;
+    }
     let Some(cwd) = system_env::current_dir() else {
         return ContextResolution::Unavailable("Could not determine the current directory.".into());
     };
@@ -841,12 +911,89 @@ pub(crate) async fn resolve_context_thread(
             match select_thread(&global, id) {
                 SelectOutcome::Picked(t) => ContextResolution::Selected(t.clone()),
                 SelectOutcome::Cancelled => ContextResolution::Cancelled,
-                // No global hit → keep the in-project message; an ambiguous
-                // global prefix surfaces its own.
-                SelectOutcome::Err(_) if global.is_empty() => ContextResolution::Unavailable(msg),
+                // No global hit: the id may still name a logs.db row `aivo
+                // logs` displays (launch records, deleted sessions) — name it
+                // instead of the generic miss. An ambiguous global prefix
+                // surfaces its own message.
+                SelectOutcome::Err(_) if global.is_empty() => {
+                    let plugin_sources = crate::commands::share::plugin_transcript_sources();
+                    match explain_log_entry_id(store, &threads, id, &plugin_sources).await {
+                        LogIdExplanation::Redirected(t) => ContextResolution::Selected(t),
+                        LogIdExplanation::Explained(reason) => {
+                            ContextResolution::Unavailable(reason)
+                        }
+                        LogIdExplanation::NoMatch => ContextResolution::Unavailable(msg),
+                    }
+                }
                 SelectOutcome::Err(global_msg) => ContextResolution::Unavailable(global_msg),
             }
         }
+    }
+}
+
+/// Outcome of the logs.db rung: on `NoMatch` the caller keeps the generic
+/// miss message.
+enum LogIdExplanation {
+    Redirected(Thread),
+    Explained(String),
+    NoMatch,
+}
+
+/// Classify an id that missed every resume rung but may still name a logs.db
+/// row `aivo logs` displays: a plugin run with a declared transcript source
+/// becomes a digest thread; everything else gets named instead of "doesn't
+/// exist".
+async fn explain_log_entry_id(
+    store: &SessionStore,
+    threads: &[Thread],
+    id: &str,
+    plugin_sources: &HashMap<String, PluginTranscript>,
+) -> LogIdExplanation {
+    let entries = match store.logs().find_by_id_prefix(id, 1).await {
+        Ok(e) => e,
+        Err(_) => return LogIdExplanation::NoMatch,
+    };
+    let Some(entry) = entries.first() else {
+        return LogIdExplanation::NoMatch;
+    };
+    match entry.source.as_str() {
+        "run" => {
+            let Some(tool) = entry.tool.as_deref() else {
+                return LogIdExplanation::NoMatch;
+            };
+            if !crate::constants::KNOWN_TOOLS.contains(&tool) {
+                // Normally caught by the `try_plugin_run_resume` pre-rung;
+                // kept so a plugin run never degrades to the generic miss.
+                return match plugin_run_resolution(store, entry, tool, id, plugin_sources.get(tool))
+                    .await
+                {
+                    ContextResolution::Selected(t) => LogIdExplanation::Redirected(t),
+                    ContextResolution::Unavailable(reason) => LogIdExplanation::Explained(reason),
+                    ContextResolution::Cancelled => LogIdExplanation::NoMatch,
+                };
+            }
+            // Native run record: the conversation lives in the tool's own
+            // session, linked by id on the finish event.
+            if let Some(sid) = entry.session_id.as_deref() {
+                if let SelectOutcome::Picked(t) = select_thread(threads, sid) {
+                    return LogIdExplanation::Redirected(t.clone());
+                }
+                return LogIdExplanation::Explained(format!(
+                    "'{id}' is a launch record for a {tool} run; its session {} was not found (deleted, or filed under another directory).",
+                    &sid[..sid.len().min(8)]
+                ));
+            }
+            LogIdExplanation::Explained(format!(
+                "'{id}' is a launch record for a {tool} run with no linked session — nothing to resume."
+            ))
+        }
+        s if crate::commands::logs::is_code_source(s) => LogIdExplanation::Explained(format!(
+            "Session '{id}' is in the logs but its session file has been deleted — nothing left to resume."
+        )),
+        "serve" => LogIdExplanation::Explained(format!(
+            "'{id}' is a serve request log entry, not a session."
+        )),
+        _ => LogIdExplanation::NoMatch,
     }
 }
 
@@ -1166,6 +1313,226 @@ mod tests {
         // gemini resumes by list index, not id; codex-app has no hook.
         assert!(native_resume_args(AIToolType::Gemini, "x", &[]).is_none());
         assert!(native_resume_args(AIToolType::CodexApp, "x", &[]).is_none());
+    }
+
+    // ── explain_log_entry_id ───────────────────────────────────────────────
+
+    fn log_fixture_store() -> (tempfile::TempDir, SessionStore) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionStore::with_path(dir.path().join("config.json"));
+        (dir, store)
+    }
+
+    fn thread_fixture(cli: &str, session_id: &str) -> Thread {
+        Thread {
+            cli: cli.into(),
+            session_id: session_id.into(),
+            source_path: String::new(),
+            topic: "fix the bug".into(),
+            last_response: String::new(),
+            updated_at: chrono::Utc::now(),
+            cwd: None,
+        }
+    }
+
+    async fn append_run_event(store: &SessionStore, group_id: &str, tool: &str, sid: Option<&str>) {
+        store
+            .logs()
+            .append(crate::services::log_store::LogEvent {
+                source: "run".into(),
+                kind: "tool_run".into(),
+                event_group_id: Some(group_id.to_string()),
+                phase: Some("finished".into()),
+                tool: Some(tool.to_string()),
+                session_id: sid.map(str::to_string),
+                exit_code: Some(0),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn explain_log_entry_id_plugin_run_names_the_plugin() {
+        let (_dir, store) = log_fixture_store();
+        append_run_event(&store, "44fgh768abcd", "amp", None).await;
+        match explain_log_entry_id(&store, &[], "44fgh768", &HashMap::new()).await {
+            LogIdExplanation::Explained(msg) => {
+                assert!(msg.contains("launch record for plugin tool 'amp'"), "{msg}");
+                assert!(msg.contains("can't be resumed"), "{msg}");
+            }
+            _ => panic!("expected Explained for a plugin run row without a transcript source"),
+        }
+    }
+
+    /// A plugin declaring a `native` transcript source resolves its run record
+    /// into a digest thread via the plugin's exporter (faked with a script).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn explain_log_entry_id_plugin_run_with_transcript_redirects() {
+        use std::os::unix::fs::PermissionsExt;
+        let (dir, store) = log_fixture_store();
+        let bin = dir.path().join("aivo-amp");
+        let payload = r#"{"schema_version":"1","source_cli":"amp","session_id":"T-amp-1","project":{},"messages":[{"role":"user","content":[{"type":"text","text":"wire the webhook retries"}]},{"role":"assistant","content":[{"type":"text","text":"added exponential backoff to the retry queue and covered it with tests"}]}],"meta":{"aivo_version":"test","redacted":false,"live":false,"served_at":"2026-07-21T00:00:00Z"}}"#;
+        std::fs::write(&bin, format!("#!/bin/sh\ncat <<'JSON'\n{payload}\nJSON\n")).unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        store
+            .logs()
+            .append(crate::services::log_store::LogEvent {
+                source: "run".into(),
+                kind: "tool_run".into(),
+                event_group_id: Some("44fgh768abcd".into()),
+                phase: Some("finished".into()),
+                tool: Some("amp".into()),
+                cwd: Some(dir.path().to_string_lossy().to_string()),
+                exit_code: Some(0),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        let sources = HashMap::from([(
+            "amp".to_string(),
+            PluginTranscript {
+                format: "native".to_string(),
+                dir: std::path::PathBuf::new(),
+                bin: Some(bin),
+            },
+        )]);
+        match explain_log_entry_id(&store, &[], "44fgh768", &sources).await {
+            LogIdExplanation::Redirected(t) => {
+                assert_eq!(t.cli, "amp");
+                assert_eq!(t.session_id, "T-amp-1");
+                assert_eq!(t.topic, "wire the webhook retries");
+                assert!(t.last_response.contains("exponential backoff"));
+            }
+            LogIdExplanation::Explained(msg) => panic!("expected Redirected, got: {msg}"),
+            LogIdExplanation::NoMatch => panic!("expected Redirected, got NoMatch"),
+        }
+    }
+
+    /// Exporter failure surfaces as a reasoned error, not a generic miss.
+    #[tokio::test]
+    async fn explain_log_entry_id_plugin_transcript_failure_explains() {
+        let (_dir, store) = log_fixture_store();
+        append_run_event(&store, "44fgh768abcd", "amp", None).await;
+        let sources = HashMap::from([(
+            "amp".to_string(),
+            PluginTranscript {
+                format: "native".to_string(),
+                dir: std::path::PathBuf::new(),
+                // Declared but not locatable — the exporter can't run.
+                bin: None,
+            },
+        )]);
+        match explain_log_entry_id(&store, &[], "44fgh768", &sources).await {
+            LogIdExplanation::Explained(msg) => {
+                assert!(msg.contains("reading its transcript failed"), "{msg}");
+                assert!(msg.contains("couldn't locate its binary"), "{msg}");
+            }
+            _ => panic!("expected Explained when the transcript source is unusable"),
+        }
+    }
+
+    #[tokio::test]
+    async fn explain_log_entry_id_native_run_redirects_to_linked_session() {
+        let (_dir, store) = log_fixture_store();
+        append_run_event(&store, "abcd1234", "claude", Some("uuid-5678")).await;
+        let threads = vec![thread_fixture("claude", "uuid-5678")];
+        match explain_log_entry_id(&store, &threads, "abcd1234", &HashMap::new()).await {
+            LogIdExplanation::Redirected(t) => assert_eq!(t.session_id, "uuid-5678"),
+            _ => panic!("expected Redirected when the linked session is in the scan"),
+        }
+    }
+
+    #[tokio::test]
+    async fn explain_log_entry_id_native_run_missing_session_explains() {
+        let (_dir, store) = log_fixture_store();
+        append_run_event(&store, "abcd1234", "claude", Some("uuid-5678-long-tail")).await;
+        match explain_log_entry_id(&store, &[], "abcd1234", &HashMap::new()).await {
+            LogIdExplanation::Explained(msg) => {
+                assert!(msg.contains("launch record for a claude run"), "{msg}");
+                // Session id is shortened to the 8-char display prefix.
+                assert!(msg.contains("uuid-567"), "{msg}");
+                assert!(!msg.contains("uuid-5678-long-tail"), "{msg}");
+            }
+            _ => panic!("expected Explained for an unresolvable native run row"),
+        }
+    }
+
+    #[tokio::test]
+    async fn explain_log_entry_id_deleted_code_session_explains() {
+        let (_dir, store) = log_fixture_store();
+        store
+            .logs()
+            .append(crate::services::log_store::LogEvent {
+                source: "code".into(),
+                kind: "chat_turn".into(),
+                session_id: Some("dead-beef-session".into()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        match explain_log_entry_id(&store, &[], "dead-beef", &HashMap::new()).await {
+            LogIdExplanation::Explained(msg) => {
+                assert!(msg.contains("deleted"), "{msg}");
+            }
+            _ => panic!("expected Explained for a code row whose file is gone"),
+        }
+    }
+
+    #[tokio::test]
+    async fn explain_log_entry_id_no_log_row_is_no_match() {
+        let (_dir, store) = log_fixture_store();
+        assert!(matches!(
+            explain_log_entry_id(&store, &[], "zzzzzzzz", &HashMap::new()).await,
+            LogIdExplanation::NoMatch
+        ));
+    }
+
+    // ── try_plugin_run_resume pre-rung ─────────────────────────────────────
+
+    #[tokio::test]
+    async fn plugin_run_log_entry_gates_to_plugin_runs_only() {
+        let (_dir, store) = log_fixture_store();
+        append_run_event(&store, "44fgh768abcd", "amp", None).await;
+        append_run_event(&store, "abcd1234efgh", "claude", None).await;
+        store
+            .logs()
+            .append(crate::services::log_store::LogEvent {
+                source: "code".into(),
+                kind: "chat_turn".into(),
+                session_id: Some("dead-beef-session".into()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        let hit = plugin_run_log_entry(&store, "44fgh768").await.unwrap();
+        assert_eq!(hit.tool.as_deref(), Some("amp"));
+        // Native runs, code rows, misses, and empty selectors all fall through
+        // to the normal ladder.
+        assert!(plugin_run_log_entry(&store, "abcd1234").await.is_none());
+        assert!(plugin_run_log_entry(&store, "dead-beef").await.is_none());
+        assert!(plugin_run_log_entry(&store, "zzzzzzzz").await.is_none());
+        assert!(plugin_run_log_entry(&store, "  ").await.is_none());
+    }
+
+    /// The sandboxed registry has no plugins, so a plugin-run id resolves to
+    /// the "doesn't expose its transcripts" outcome — still `Some`, which
+    /// short-circuits the expensive session walks.
+    #[tokio::test]
+    async fn try_plugin_run_resume_short_circuits_plugin_run_ids() {
+        let (_dir, store) = log_fixture_store();
+        append_run_event(&store, "44fgh768abcd", "amp", None).await;
+        match try_plugin_run_resume(&store, "44fgh768").await {
+            Some(ContextResolution::Unavailable(msg)) => {
+                assert!(msg.contains("doesn't expose its transcripts"), "{msg}");
+            }
+            _ => panic!("expected Some(Unavailable) for a sourceless plugin run"),
+        }
+        assert!(try_plugin_run_resume(&store, "zzzzzzzz").await.is_none());
     }
 
     #[test]

@@ -25,7 +25,7 @@ use crate::style;
 /// Plugin tools that declared a transcript source aivo can read (`aivo share`
 /// reuses the matching built-in reader). Resolved here, where the plugin
 /// registry is reachable, and handed to the resolver as plain data.
-fn plugin_transcript_sources() -> HashMap<String, PluginTranscript> {
+pub(crate) fn plugin_transcript_sources() -> HashMap<String, PluginTranscript> {
     crate::plugin::installed_transcript_sources()
         .into_iter()
         .map(|(name, format, dir)| {

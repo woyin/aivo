@@ -30,8 +30,8 @@ use crate::services::log_store::LogEntry;
 use crate::services::project_id::Thread;
 use crate::services::session_store::SessionStore;
 use crate::services::share_payload::{
-    SharePayload, extract_chat_full, extract_claude_full, extract_codex_full, extract_gemini_full,
-    extract_opencode_full, extract_pi_full,
+    ContentBlock, ShareMessage, SharePayload, extract_chat_full, extract_claude_full,
+    extract_codex_full, extract_gemini_full, extract_opencode_full, extract_pi_full,
 };
 use crate::services::system_env;
 
@@ -757,6 +757,113 @@ async fn export_native_plugin_transcript(
         .map_err(|e| anyhow!("'{tool}' produced an invalid transcript: {e}"))
 }
 
+/// Resolve a plugin `run` event to a digest `Thread` for the resume ladder —
+/// the resume counterpart of `resolve_run_event`'s plugin arm. Readable
+/// formats reuse the built-in readers pointed at the plugin's dir; `native`
+/// invokes the plugin's exporter. `cli` is stamped with the plugin name so
+/// resume summaries say "amp", not the borrowed format label.
+pub async fn resolve_plugin_run_thread(
+    entry: &LogEntry,
+    tool: &str,
+    src: &PluginTranscript,
+    config_dir: &Path,
+) -> Result<Thread> {
+    let run_cwd = entry
+        .cwd
+        .clone()
+        .or_else(|| {
+            crate::services::system_env::current_dir().map(|p| p.to_string_lossy().to_string())
+        })
+        .ok_or_else(|| anyhow!("run event has no cwd to scope the lookup"))?;
+    let run_ts = parse_log_timestamp(&entry.ts_utc);
+
+    let payload = if src.format == NATIVE_TRANSCRIPT_FORMAT {
+        export_native_plugin_transcript(src, tool, &run_cwd, &entry.ts_utc, config_dir).await?
+    } else if SHAREABLE_PLUGIN_FORMATS.contains(&src.format.as_str()) {
+        let run_path = Path::new(&run_cwd);
+        let threads: Vec<Thread> = match src.format.as_str() {
+            "codex" => context_ingest::list_codex_sessions_for_cwd(&src.dir, run_path).await,
+            "pi" => context_ingest::list_pi_sessions_for_cwd(&src.dir, run_path).await,
+            "gemini" => context_ingest::list_gemini_sessions_for_cwd(&src.dir, run_path).await,
+            "opencode" => context_ingest::list_opencode_sessions_for_cwd(&src.dir, run_path).await,
+            _ => unreachable!("gated by SHAREABLE_PLUGIN_FORMATS"),
+        };
+        let mut candidates: Vec<&Thread> = threads.iter().collect();
+        if candidates.is_empty() {
+            return Err(anyhow!("no {tool} session found in {run_cwd}"));
+        }
+        candidates.sort_by_key(|t| {
+            run_ts
+                .map(|rt| (t.updated_at - rt).num_seconds().abs())
+                .unwrap_or(0)
+        });
+        extract_thread_full(candidates[0]).await?
+    } else {
+        return Err(anyhow!(
+            "'{tool}' declares transcript format '{}', which aivo can't read (readable formats: {})",
+            src.format,
+            SHAREABLE_PLUGIN_FORMATS.join(", ")
+        ));
+    };
+    thread_from_share_payload(payload, tool, entry)
+}
+
+/// Digest thread from a full payload: first substantive user turn as topic,
+/// last substantive assistant turn as the response — the same hygiene
+/// (context-echo stripping, length caps) every ingest source applies.
+fn thread_from_share_payload(
+    payload: SharePayload,
+    tool: &str,
+    entry: &LogEntry,
+) -> Result<Thread> {
+    if payload.messages.is_empty() {
+        return Err(anyhow!(
+            "'{tool}' exported an empty transcript for this run — it recorded no conversation to resume"
+        ));
+    }
+    let mut topic = None;
+    let mut last_response = None;
+    for msg in &payload.messages {
+        match msg.role.as_str() {
+            "user" if topic.is_none() => {
+                topic = context_ingest::pick_first_user_turn(&message_text(msg));
+            }
+            "assistant" => {
+                if let Some(t) = context_ingest::sanitize_turn(&message_text(msg)) {
+                    last_response = Some(t);
+                }
+            }
+            _ => {}
+        }
+    }
+    let topic = topic.ok_or_else(|| anyhow!("'{tool}' transcript has no user turn to digest"))?;
+    let updated_at = payload
+        .updated_at
+        .or_else(|| parse_log_timestamp(&entry.ts_utc))
+        .unwrap_or_else(Utc::now);
+    Ok(Thread {
+        cli: tool.to_string(),
+        session_id: payload.session_id,
+        source_path: format!("plugin://{tool}"),
+        topic,
+        last_response: last_response.unwrap_or_default(),
+        updated_at,
+        cwd: entry.cwd.clone(),
+    })
+}
+
+/// Text and code blocks of a message, joined; tool traffic is digest noise.
+fn message_text(msg: &ShareMessage) -> String {
+    msg.content
+        .iter()
+        .filter_map(|b| match b {
+            ContentBlock::Text { text } | ContentBlock::Code { text, .. } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 async fn infer_chat_session_id(entry: &LogEntry, ctx: &ResolverContext) -> Result<String> {
     let cwd = entry.cwd.as_deref().ok_or_else(|| {
         anyhow!(
@@ -1252,5 +1359,130 @@ mod tests {
         let event_id = append_run_event(&ctx, "myplugin", &temp.path().to_string_lossy()).await;
         let err = resolve_session(&event_id, &ctx).await.unwrap_err();
         assert!(err.to_string().contains("couldn't locate its binary"));
+    }
+
+    fn plugin_run_entry(cwd: &str) -> LogEntry {
+        LogEntry {
+            id: "log-1".into(),
+            ts_utc: "2026-06-06T04:56:45Z".into(),
+            source: "run".into(),
+            kind: "tool_run".into(),
+            event_group_id: Some("evt12345".into()),
+            tool: Some("omp".into()),
+            cwd: Some(cwd.to_string()),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn thread_from_share_payload_picks_digest_turns() {
+        let payload: SharePayload = serde_json::from_str(
+            r#"{"schema_version":"1","source_cli":"omp","session_id":"T-1","project":{},
+                "updated_at":"2026-06-06T05:00:00Z",
+                "messages":[
+                  {"role":"user","content":[{"type":"text","text":"wire the retries"}]},
+                  {"role":"assistant","content":[{"type":"text","text":"first answer that is long enough to count as substantive"}]},
+                  {"role":"user","content":[{"type":"text","text":"now add tests"}]},
+                  {"role":"assistant","content":[{"type":"text","text":"final answer that is long enough to count as substantive"}]}],
+                "meta":{"aivo_version":"t","redacted":false,"live":false,"served_at":"2026-06-06T05:00:00Z"}}"#,
+        )
+        .unwrap();
+        let entry = plugin_run_entry("/tmp/proj");
+        let t = thread_from_share_payload(payload, "omp", &entry).unwrap();
+        assert_eq!(t.cli, "omp");
+        assert_eq!(t.session_id, "T-1");
+        // First user turn titles the digest; the *last* assistant turn wins.
+        assert_eq!(t.topic, "wire the retries");
+        assert!(t.last_response.starts_with("final answer"));
+        assert_eq!(t.updated_at.to_rfc3339(), "2026-06-06T05:00:00+00:00");
+        assert_eq!(t.cwd.as_deref(), Some("/tmp/proj"));
+    }
+
+    #[test]
+    fn thread_from_share_payload_names_the_empty_transcript_case() {
+        let payload: SharePayload = serde_json::from_str(
+            r#"{"schema_version":"1","source_cli":"grok","session_id":"T-1","project":{},
+                "messages":[],
+                "meta":{"aivo_version":"t","redacted":false,"live":false,"served_at":"2026-06-06T05:00:00Z"}}"#,
+        )
+        .unwrap();
+        let err =
+            thread_from_share_payload(payload, "grok", &plugin_run_entry("/tmp/p")).unwrap_err();
+        assert!(err.to_string().contains("empty transcript"), "{err}");
+    }
+
+    #[test]
+    fn thread_from_share_payload_requires_a_user_turn() {
+        let payload: SharePayload = serde_json::from_str(
+            r#"{"schema_version":"1","source_cli":"omp","session_id":"T-1","project":{},
+                "messages":[{"role":"assistant","content":[{"type":"text","text":"unprompted words from the void, long enough to be substantive"}]}],
+                "meta":{"aivo_version":"t","redacted":false,"live":false,"served_at":"2026-06-06T05:00:00Z"}}"#,
+        )
+        .unwrap();
+        let err =
+            thread_from_share_payload(payload, "omp", &plugin_run_entry("/tmp/p")).unwrap_err();
+        assert!(err.to_string().contains("no user turn"));
+    }
+
+    // Same Unix gate as the other pi-format fixtures (encoded-cwd dir names).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn resolve_plugin_run_thread_via_declared_pi_transcript() {
+        let temp = TempDir::new().unwrap();
+        let project_root = temp.path().join("proj");
+        fs::create_dir_all(&project_root).await.unwrap();
+        let canonical = fs::canonicalize(&project_root).await.unwrap();
+        let canonical_str = canonical.to_string_lossy().to_string();
+
+        let omp_root = temp.path().join("omp-sessions");
+        let encoded = format!("--{}--", canonical_str.trim_matches('/').replace('/', "-"));
+        let session_dir = omp_root.join(encoded);
+        fs::create_dir_all(&session_dir).await.unwrap();
+        let full_id = "019e9b4a-5627-7000-ae0c-4854c916a807";
+        let lines = [
+            format!(
+                r#"{{"type":"session","id":"{full_id}","cwd":"{canonical_str}","timestamp":"2026-06-06T04:56:40.000Z","version":"1"}}"#
+            ),
+            r#"{"type":"message","timestamp":"2026-06-06T04:56:41.000Z","message":{"role":"user","content":[{"type":"text","text":"hi"}]}}"#.to_string(),
+            r#"{"type":"message","timestamp":"2026-06-06T04:56:42.000Z","message":{"role":"assistant","content":[{"type":"text","text":"a reply long enough to survive the substantive-turn filter"}]}}"#.to_string(),
+        ];
+        fs::write(
+            session_dir.join(format!("2026-06-06T04-56-40-743Z_{full_id}.jsonl")),
+            lines.join("\n"),
+        )
+        .await
+        .unwrap();
+
+        let src = PluginTranscript {
+            format: "pi".to_string(),
+            dir: omp_root,
+            bin: None,
+        };
+        let entry = plugin_run_entry(&canonical_str);
+        let t = resolve_plugin_run_thread(&entry, "omp", &src, temp.path())
+            .await
+            .unwrap();
+        assert_eq!(t.cli, "omp");
+        assert_eq!(t.session_id, full_id);
+        assert_eq!(t.topic, "hi");
+        assert!(
+            t.last_response
+                .contains("survive the substantive-turn filter")
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_plugin_run_thread_rejects_unreadable_format() {
+        let temp = TempDir::new().unwrap();
+        let src = PluginTranscript {
+            format: "claude".to_string(),
+            dir: temp.path().to_path_buf(),
+            bin: None,
+        };
+        let entry = plugin_run_entry(&temp.path().to_string_lossy());
+        let err = resolve_plugin_run_thread(&entry, "omp", &src, temp.path())
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("which aivo can't read"));
     }
 }

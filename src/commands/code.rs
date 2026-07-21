@@ -671,38 +671,60 @@ impl CodeCommand {
             .clone()
             .filter(|s| !s.trim().is_empty() && s != "last")
         {
-            use crate::services::session_import::{ResumeTarget, resolve_resume_target};
-            let cwd = crate::services::system_env::current_dir().unwrap_or_default();
-            match resolve_resume_target(&self.session_store, std::path::Path::new(&cwd), &sel).await
-            {
-                // Resolvable: keep the user's selector — the TUI/one-shot
-                // re-resolve it through the same ladder, and the LOAD path
-                // owns the fork-first collapse plus the source-diverged
-                // notice. This block only vets Ambiguous/Unknown up front.
-                ResumeTarget::AivoSession(_) | ResumeTarget::Foreign(_) => {}
-                ResumeTarget::Ambiguous(msg) => anyhow::bail!(msg),
-                ResumeTarget::Unknown => {
-                    use crate::commands::run::ContextResolution;
-                    match crate::commands::run::resolve_context_thread(&self.session_store, &sel)
-                        .await
+            use crate::commands::run::ContextResolution;
+            let mut inject_digest = |thread: &crate::services::project_id::Thread| {
+                let rendered = crate::services::context_render::render_for_aivo_code(thread);
+                let summary = format!(
+                    "{} (context digest — no {} importer)",
+                    crate::commands::run::context_injection_summary(&rendered, thread),
+                    thread.cli,
+                );
+                eprintln!("  {} {}", crate::style::arrow_symbol(), summary);
+                injected_context = Some(rendered.text);
+                injected_context_summary = Some(summary);
+            };
+            // Cheap logs.db probe first: resolving a plugin run here skips
+            // both expensive session walks (import scan + context ingest).
+            match crate::commands::run::try_plugin_run_resume(&self.session_store, &sel).await {
+                Some(ContextResolution::Selected(thread)) => {
+                    inject_digest(&thread);
+                    resume = None;
+                }
+                Some(ContextResolution::Cancelled) => return Ok(ExitCode::Success),
+                Some(ContextResolution::Unavailable(msg)) => anyhow::bail!(msg),
+                None => {
+                    use crate::services::session_import::{ResumeTarget, resolve_resume_target};
+                    let cwd = crate::services::system_env::current_dir().unwrap_or_default();
+                    match resolve_resume_target(
+                        &self.session_store,
+                        std::path::Path::new(&cwd),
+                        &sel,
+                    )
+                    .await
                     {
-                        ContextResolution::Selected(thread) => {
-                            let rendered =
-                                crate::services::context_render::render_for_aivo_code(&thread);
-                            let summary = format!(
-                                "{} (context digest — no {} importer)",
-                                crate::commands::run::context_injection_summary(&rendered, &thread),
-                                thread.cli,
-                            );
-                            eprintln!("  {} {}", crate::style::arrow_symbol(), summary);
-                            injected_context = Some(rendered.text);
-                            injected_context_summary = Some(summary);
-                            resume = None;
+                        // Resolvable: keep the user's selector — the TUI/one-shot
+                        // re-resolve it through the same ladder, and the LOAD path
+                        // owns the fork-first collapse plus the source-diverged
+                        // notice. This block only vets Ambiguous/Unknown up front.
+                        ResumeTarget::AivoSession(_) | ResumeTarget::Foreign(_) => {}
+                        ResumeTarget::Ambiguous(msg) => anyhow::bail!(msg),
+                        ResumeTarget::Unknown => {
+                            match crate::commands::run::resolve_context_thread(
+                                &self.session_store,
+                                &sel,
+                            )
+                            .await
+                            {
+                                ContextResolution::Selected(thread) => {
+                                    inject_digest(&thread);
+                                    resume = None;
+                                }
+                                // Unreachable today (explicit selectors never open a
+                                // picker), but a cancel means don't open at all.
+                                ContextResolution::Cancelled => return Ok(ExitCode::Success),
+                                ContextResolution::Unavailable(msg) => anyhow::bail!(msg),
+                            }
                         }
-                        // Unreachable today (explicit selectors never open a
-                        // picker), but a cancel means don't open at all.
-                        ContextResolution::Cancelled => return Ok(ExitCode::Success),
-                        ContextResolution::Unavailable(msg) => anyhow::bail!(msg),
                     }
                 }
             }
