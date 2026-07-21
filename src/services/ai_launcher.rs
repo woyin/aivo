@@ -105,12 +105,11 @@ impl AIToolType {
         }
     }
 
-    /// False when the tool cannot run on this OS (`codex-app` wraps the
-    /// macOS-only Codex desktop app). Pickers and the generic help hide
-    /// unsupported tools; an explicit `aivo run codex-app` still gets the
-    /// launch-time platform error.
+    /// False when the tool cannot run on this OS. Pickers and generic help
+    /// hide unsupported tools; an explicit `aivo run codex-app` still gets
+    /// the launch-time platform error.
     pub fn supported_on_current_platform(&self) -> bool {
-        !matches!(self, Self::CodexApp) || cfg!(target_os = "macos")
+        !matches!(self, Self::CodexApp) || cfg!(any(target_os = "macos", windows))
     }
 
     /// Best-effort "binary already on this machine" probe for picker hints.
@@ -118,6 +117,11 @@ impl AIToolType {
     /// negative only mislabels a row.
     pub fn looks_installed(&self) -> bool {
         if matches!(self, Self::CodexApp) {
+            // No readable bundle dir on Windows; the materialized codex is
+            // the cheap synchronous signal there.
+            #[cfg(windows)]
+            return crate::services::codex_app_wrapper::locate_bundled_codex().is_some();
+            #[cfg(not(windows))]
             return crate::services::codex_app_wrapper::locate_codex_app().is_some();
         }
         find_in_dirs(self.command_name(), &collect_path_dirs()).is_some()
@@ -281,30 +285,83 @@ impl AILauncher {
 
         self.output_key_info(&resolved.key);
 
-        // Preflight: codex-app needs Codex.app on disk to actually route. Bail
-        // BEFORE injecting the `app` subcommand into argv so the user gets a
-        // clear error instead of a downstream "unknown subcommand 'app'" from
-        // a stripped-down npm-installed codex binary.
+        // Preflight: resolve the codex-app GUI launcher and bundled codex
+        // once, failing closed with a clear error before any argv surgery.
+        #[cfg_attr(
+            not(any(target_os = "macos", windows)),
+            allow(unused_mut, unused_variables)
+        )]
+        let mut codex_app_desktop: Option<CodexAppDesktop> = None;
         if options.tool == AIToolType::CodexApp {
-            #[cfg(not(target_os = "macos"))]
+            #[cfg(not(any(target_os = "macos", windows)))]
             {
                 return Err(CLIError::new(
-                    "`aivo codex-app` is macOS-only \u{2014} the desktop Codex.app ships only for macOS.",
+                    "`aivo codex-app` requires the Codex desktop app, which ships only for macOS and Windows.",
                     ErrorCategory::User,
                     None::<String>,
-                    Some("Use `aivo codex` (CLI) instead on Linux/Windows."),
+                    Some("Use `aivo codex` (CLI) instead."),
                 )
                 .into());
             }
             #[cfg(target_os = "macos")]
-            if crate::services::codex_app_wrapper::locate_codex_app().is_none() {
-                return Err(CLIError::new(
-                    "Codex.app not found. `aivo codex-app` requires the Codex desktop app.",
-                    ErrorCategory::User,
-                    None::<String>,
-                    Some("Install Codex.app from https://chatgpt.com/codex (or set AIVO_CODEX_APP_PATH to its bundle path)"),
-                )
-                .into());
+            {
+                let Some(app) = crate::services::codex_app_wrapper::locate_codex_app() else {
+                    return Err(CLIError::new(
+                        "Codex desktop app not found. `aivo codex-app` requires it (ChatGPT.app, formerly Codex.app).",
+                        ErrorCategory::User,
+                        None::<String>,
+                        Some("Install it from https://chatgpt.com/codex (or set AIVO_CODEX_APP_PATH to its bundle path)"),
+                    )
+                    .into());
+                };
+                // Only reachable via an AIVO_CODEX_APP_PATH override; named
+                // locate candidates already require the bundled codex.
+                let Some(codex_bin) = crate::services::codex_app_wrapper::bundled_codex_in(&app)
+                else {
+                    return Err(CLIError::new(
+                        "Codex desktop app bundle has no Contents/Resources/codex.",
+                        ErrorCategory::User,
+                        None::<String>,
+                        Some("Check that AIVO_CODEX_APP_PATH points at the real app bundle."),
+                    )
+                    .into());
+                };
+                codex_app_desktop = Some(CodexAppDesktop {
+                    gui: app,
+                    codex_bin,
+                });
+            }
+            #[cfg(windows)]
+            {
+                let Some(pkg) = windows_codex_package().await else {
+                    return Err(CLIError::new(
+                        "Codex desktop app not found. `aivo codex-app` requires the Store package (OpenAI.Codex).",
+                        ErrorCategory::User,
+                        None::<String>,
+                        Some("Install it from the Microsoft Store: https://apps.microsoft.com/detail/9plm9xgg6vks"),
+                    )
+                    .into());
+                };
+                let Some(gui) = windows_codex_gui_exe(&pkg) else {
+                    return Err(CLIError::new(
+                        "Codex desktop app package found, but no launchable executable.",
+                        ErrorCategory::User,
+                        None::<String>,
+                        Some("aivo must spawn the app directly to route it; protocol activation would drop the key routing. Please report this with your app version."),
+                    )
+                    .into());
+                };
+                let Some(codex_bin) = crate::services::codex_app_wrapper::locate_bundled_codex()
+                else {
+                    return Err(CLIError::new(
+                        "Codex desktop app is installed but its codex runtime isn't materialized yet.",
+                        ErrorCategory::User,
+                        None::<String>,
+                        Some("Launch the desktop app once (it installs its codex runtime), quit it, then re-run `aivo codex-app`."),
+                    )
+                    .into());
+                };
+                codex_app_desktop = Some(CodexAppDesktop { gui, codex_bin });
             }
         }
 
@@ -346,18 +403,30 @@ impl AILauncher {
             if options.tool == AIToolType::CodexApp {
                 inject_codex_root_model(&mut runtime_args.args, resolved.model.as_deref());
                 crate::services::launch_args::inject_codex_app_subcommand(&mut runtime_args.args);
-                codex_app_wrapper_path = install_codex_app_wrapper(
-                    &mut runtime.env,
-                    &mut runtime_args.args,
-                    self.session_store.config_dir(),
-                    &resolved.key.id,
-                )
-                .await;
-                install_codex_app_models_cache(
-                    &runtime.env,
-                    runtime_args.codex_model_catalog_path.as_deref(),
-                )
-                .await;
+                if let Some(desktop) = codex_app_desktop.as_ref() {
+                    codex_app_wrapper_path = install_codex_app_wrapper(
+                        &mut runtime.env,
+                        &mut runtime_args.args,
+                        self.session_store.config_dir(),
+                        &resolved.key.id,
+                        &desktop.codex_bin,
+                    )
+                    .await;
+                    install_codex_app_models_cache(
+                        &runtime.env,
+                        runtime_args.codex_model_catalog_path.as_deref(),
+                    )
+                    .await;
+                    // Launch the GUI ourselves, not via `codex app`: stable
+                    // codex CLIs (≤0.144.x) still search only `Codex.app`
+                    // post-rename and auto-download a duplicate installer,
+                    // and upstream's Windows `codex://` protocol activation
+                    // drops aivo's env — with it the CODEX_CLI_PATH hook.
+                    // macOS mirrors upstream's open_codex_app (`open -a`).
+                    let (command, args) = codex_app_launch_invocation(desktop, &runtime_args.args);
+                    resolved.tool_config.command = command;
+                    runtime_args.args = args;
+                }
             }
         }
 
@@ -376,134 +445,139 @@ impl AILauncher {
         // spawn step picks up the correct extension on Windows — CreateProcessW
         // does not honor PATHEXT for non-.exe files, so a bare `claude` would
         // fail to spawn even when `claude.cmd` is on PATH.
-        let path_dirs = collect_path_dirs();
-        if let Some(found) = find_in_dirs(&resolved.tool_config.command, &path_dirs) {
-            resolved.tool_config.command = found.to_string_lossy().into_owned();
-        } else {
-            let tool = options.tool;
+        // Absolute commands (codex-app desktop launchers) spawn as-is: the
+        // Windows app-execution alias is a reparse point the executability
+        // probe can misjudge.
+        if !std::path::Path::new(&resolved.tool_config.command).is_absolute() {
+            let path_dirs = collect_path_dirs();
+            if let Some(found) = find_in_dirs(&resolved.tool_config.command, &path_dirs) {
+                resolved.tool_config.command = found.to_string_lossy().into_owned();
+            } else {
+                let tool = options.tool;
 
-            let not_installed = || -> Result<()> {
-                eprintln!(
-                    "{} '{}' is not installed or not found on PATH.",
-                    crate::style::red("Error:"),
-                    tool.as_str()
-                );
-                eprintln!();
-                eprintln!(
-                    "  {}",
-                    crate::style::dim(format!("Install: {}", tool.install_hint()))
-                );
-                anyhow::bail!("tool '{}' not found", tool.as_str());
-            };
-
-            if !std::io::stdin().is_terminal() {
-                not_installed()?;
-            }
-
-            eprint!(
-                "  {} '{}' is not installed. Install it? [Y/n] ",
-                crate::style::yellow("?"),
-                tool.as_str()
-            );
-            let _ = std::io::stderr().flush();
-
-            let mut input = String::new();
-            std::io::stdin().read_line(&mut input)?;
-            let trimmed = input.trim();
-
-            if !(trimmed.is_empty()
-                || trimmed.eq_ignore_ascii_case("y")
-                || trimmed.eq_ignore_ascii_case("yes"))
-            {
-                not_installed()?;
-            }
-
-            eprintln!(
-                "  {} Installing {}...",
-                crate::style::arrow_symbol(),
-                tool.as_str()
-            );
-
-            #[cfg(unix)]
-            let status = Command::new("sh")
-                .arg("-c")
-                .arg(tool.install_hint())
-                .stdin(Stdio::inherit())
-                .stdout(Stdio::inherit())
-                .stderr(Stdio::inherit())
-                .status()
-                .await;
-
-            #[cfg(not(unix))]
-            let status = Command::new("cmd")
-                .arg("/C")
-                .arg(tool.install_hint())
-                .stdin(Stdio::inherit())
-                .stdout(Stdio::inherit())
-                .stderr(Stdio::inherit())
-                .status()
-                .await;
-
-            let status = status.context(format!(
-                "Failed to run install command for '{}'",
-                tool.as_str()
-            ))?;
-
-            if !status.success() {
-                anyhow::bail!(
-                    "Installation of '{}' failed (exit code: {})",
-                    tool.as_str(),
-                    status.code().unwrap_or(-1)
-                );
-            }
-
-            // The installer may have added a new directory to PATH via shell
-            // profile. Re-read PATH from a login shell so we pick it up.
-            refresh_path_from_shell().await;
-
-            // Use the freshened PATH for the post-install lookup if available,
-            // otherwise fall back to the inherited PATH. Avoids mutating global
-            // env state.
-            let path_dirs = match freshened_path_for_lookup() {
-                Some(fresh) => collect_path_dirs_from(Some(fresh)),
-                None => collect_path_dirs(),
-            };
-            // Resolve the binary to a full path with extension. Required on
-            // Windows so .cmd/.bat npm shims can be spawned via CreateProcessW.
-            let resolved_path =
-                find_in_dirs(&resolved.tool_config.command, &path_dirs).or_else(|| {
-                    // PATH still doesn't see the binary (e.g. the installer
-                    // wrote to `~/.local/bin` and added an `export PATH=...`
-                    // line to a shell profile that this non-login shell hasn't
-                    // sourced). Try the installer's well-known drop locations.
-                    find_in_dirs(
-                        &resolved.tool_config.command,
-                        &tool.well_known_install_dirs(),
-                    )
-                });
-            match resolved_path {
-                Some(found) => {
+                let not_installed = || -> Result<()> {
                     eprintln!(
-                        "  {} Found at {}",
-                        crate::style::arrow_symbol(),
-                        crate::style::dim(found.display().to_string())
-                    );
-                    resolved.tool_config.command = found.to_string_lossy().into_owned();
-                }
-                None => {
-                    eprintln!(
-                        "  {} '{}' was installed but not found on PATH. You may need to restart your shell.",
-                        crate::style::yellow("!"),
+                        "{} '{}' is not installed or not found on PATH.",
+                        crate::style::red("Error:"),
                         tool.as_str()
                     );
-                    anyhow::bail!("tool '{}' not found on PATH after install", tool.as_str());
-                }
-            }
+                    eprintln!();
+                    eprintln!(
+                        "  {}",
+                        crate::style::dim(format!("Install: {}", tool.install_hint()))
+                    );
+                    anyhow::bail!("tool '{}' not found", tool.as_str());
+                };
 
-            eprintln!(
-                "  {} Installed successfully.\n",
-                crate::style::success_symbol()
-            );
+                if !std::io::stdin().is_terminal() {
+                    not_installed()?;
+                }
+
+                eprint!(
+                    "  {} '{}' is not installed. Install it? [Y/n] ",
+                    crate::style::yellow("?"),
+                    tool.as_str()
+                );
+                let _ = std::io::stderr().flush();
+
+                let mut input = String::new();
+                std::io::stdin().read_line(&mut input)?;
+                let trimmed = input.trim();
+
+                if !(trimmed.is_empty()
+                    || trimmed.eq_ignore_ascii_case("y")
+                    || trimmed.eq_ignore_ascii_case("yes"))
+                {
+                    not_installed()?;
+                }
+
+                eprintln!(
+                    "  {} Installing {}...",
+                    crate::style::arrow_symbol(),
+                    tool.as_str()
+                );
+
+                #[cfg(unix)]
+                let status = Command::new("sh")
+                    .arg("-c")
+                    .arg(tool.install_hint())
+                    .stdin(Stdio::inherit())
+                    .stdout(Stdio::inherit())
+                    .stderr(Stdio::inherit())
+                    .status()
+                    .await;
+
+                #[cfg(not(unix))]
+                let status = Command::new("cmd")
+                    .arg("/C")
+                    .arg(tool.install_hint())
+                    .stdin(Stdio::inherit())
+                    .stdout(Stdio::inherit())
+                    .stderr(Stdio::inherit())
+                    .status()
+                    .await;
+
+                let status = status.context(format!(
+                    "Failed to run install command for '{}'",
+                    tool.as_str()
+                ))?;
+
+                if !status.success() {
+                    anyhow::bail!(
+                        "Installation of '{}' failed (exit code: {})",
+                        tool.as_str(),
+                        status.code().unwrap_or(-1)
+                    );
+                }
+
+                // The installer may have added a new directory to PATH via shell
+                // profile. Re-read PATH from a login shell so we pick it up.
+                refresh_path_from_shell().await;
+
+                // Use the freshened PATH for the post-install lookup if available,
+                // otherwise fall back to the inherited PATH. Avoids mutating global
+                // env state.
+                let path_dirs = match freshened_path_for_lookup() {
+                    Some(fresh) => collect_path_dirs_from(Some(fresh)),
+                    None => collect_path_dirs(),
+                };
+                // Resolve the binary to a full path with extension. Required on
+                // Windows so .cmd/.bat npm shims can be spawned via CreateProcessW.
+                let resolved_path = find_in_dirs(&resolved.tool_config.command, &path_dirs)
+                    .or_else(|| {
+                        // PATH still doesn't see the binary (e.g. the installer
+                        // wrote to `~/.local/bin` and added an `export PATH=...`
+                        // line to a shell profile that this non-login shell hasn't
+                        // sourced). Try the installer's well-known drop locations.
+                        find_in_dirs(
+                            &resolved.tool_config.command,
+                            &tool.well_known_install_dirs(),
+                        )
+                    });
+                match resolved_path {
+                    Some(found) => {
+                        eprintln!(
+                            "  {} Found at {}",
+                            crate::style::arrow_symbol(),
+                            crate::style::dim(found.display().to_string())
+                        );
+                        resolved.tool_config.command = found.to_string_lossy().into_owned();
+                    }
+                    None => {
+                        eprintln!(
+                            "  {} '{}' was installed but not found on PATH. You may need to restart your shell.",
+                            crate::style::yellow("!"),
+                            tool.as_str()
+                        );
+                        anyhow::bail!("tool '{}' not found on PATH after install", tool.as_str());
+                    }
+                }
+
+                eprintln!(
+                    "  {} Installed successfully.\n",
+                    crate::style::success_symbol()
+                );
+            }
         }
 
         let base_event = || LogEvent {
@@ -586,13 +660,12 @@ impl AILauncher {
         let started_at = Instant::now();
         let result = self.wait_for_process(&mut child).await;
 
-        // `codex app /path` returns once the GUI is open; aivo's local router
-        // would otherwise be torn down while Codex.app is still using it.
-        // Block on the GUI's lifetime so the router survives the session.
+        // The launch child returns once the GUI is open; block on the GUI's
+        // lifetime so aivo's local router survives the session.
         if options.tool == AIToolType::CodexApp {
             wait_for_codex_app_gui_exit().await;
             if let Some(path) = codex_app_wrapper_path.as_deref() {
-                let _ = tokio::fs::remove_file(path).await;
+                crate::services::codex_app_wrapper::remove_wrapper(path).await;
             }
         }
 
@@ -690,7 +763,7 @@ impl AILauncher {
                 );
                 crate::services::launch_args::inject_codex_app_subcommand(&mut args);
                 notes.push(
-                    "installs a per-launch wrapper at $AIVO_CONFIG/codex-app-wrappers/<key>-<pid>-<nanos>.sh, points CODEX_CLI_PATH at it, and moves the global --config prefix into the wrapper so Codex.app's app-server subprocess inherits the overrides"
+                    "installs a per-launch wrapper at $AIVO_CONFIG/codex-app-wrappers/<key>-<pid>-<nanos>.sh (.exe shim on Windows), points CODEX_CLI_PATH at it, and moves the global --config prefix into the wrapper so the desktop app's app-server subprocess inherits the overrides"
                         .to_string(),
                 );
                 notes.push(
@@ -1459,7 +1532,7 @@ async fn handle_signal_quit_prompt(
     use std::time::Duration;
     use tokio::time::sleep;
     eprintln!(
-        "  {} press Ctrl-C again within 5s to quit Codex.app (and aivo). Wait to keep both running.",
+        "  {} press Ctrl-C again within 5s to quit the Codex app (and aivo). Wait to keep both running.",
         crate::style::yellow("aivo:")
     );
     tokio::select! {
@@ -1467,7 +1540,7 @@ async fn handle_signal_quit_prompt(
         _ = sigterm.recv() => {}
         _ = sleep(Duration::from_secs(5)) => {
             eprintln!(
-                "  {} keeping Codex.app open; resuming normal wait.",
+                "  {} keeping the app open; resuming normal wait.",
                 crate::style::dim("aivo:")
             );
             return false;
@@ -1478,7 +1551,7 @@ async fn handle_signal_quit_prompt(
     // instance LaunchServices currently knows about (some launches we tracked
     // a single MacOS/Codex pid, others use the lib's NSWorkspace bundle id).
     eprintln!(
-        "  {} quitting Codex.app gracefully...",
+        "  {} quitting the app gracefully...",
         crate::style::yellow("aivo:")
     );
     quit_codex_app(tracked).await;
@@ -1495,6 +1568,12 @@ async fn handle_signal_quit_prompt(
     true
 }
 
+#[cfg(target_os = "macos")]
+const CODEX_APP_QUIT_HINT: &str = "Quit ChatGPT.app manually (Cmd-Q) and re-run `aivo codex-app`.";
+#[cfg(not(target_os = "macos"))]
+const CODEX_APP_QUIT_HINT: &str =
+    "Quit the Codex desktop app manually and re-run `aivo codex-app`.";
+
 /// Detects an existing Codex.app instance and asks the user to restart it.
 /// Bails (or auto-aborts on a non-interactive stdin) if the user declines —
 /// continuing would silently leave the running GUI on its old wrapper / key.
@@ -1505,7 +1584,7 @@ async fn preflight_codex_app_running() -> Result<()> {
     }
 
     eprintln!(
-        "  {} Codex.app is already running (pid{} {}). aivo can't route a new key into an existing instance \u{2014} `CODEX_CLI_PATH` is captured at launch.",
+        "  {} the Codex app (ChatGPT.app) is already running (pid{} {}). aivo can't route a new key into an existing instance \u{2014} `CODEX_CLI_PATH` is captured at launch.",
         crate::style::yellow("aivo:"),
         if pids.len() == 1 { "" } else { "s" },
         pids.iter()
@@ -1516,16 +1595,16 @@ async fn preflight_codex_app_running() -> Result<()> {
 
     if !std::io::stdin().is_terminal() {
         return Err(CLIError::new(
-            "Codex.app is already running and stdin is not a TTY \u{2014} cannot prompt to restart.",
+            "The Codex app is already running and stdin is not a TTY \u{2014} cannot prompt to restart.",
             ErrorCategory::User,
             None::<String>,
-            Some("Quit Codex.app manually (Cmd-Q) and re-run `aivo codex-app`."),
+            Some(CODEX_APP_QUIT_HINT),
         )
         .into());
     }
 
     eprint!(
-        "  {} Quit Codex.app and relaunch via aivo? [Y/n] ",
+        "  {} Quit it and relaunch via aivo? [Y/n] ",
         crate::style::yellow("?")
     );
     let _ = std::io::stderr().flush();
@@ -1538,7 +1617,7 @@ async fn preflight_codex_app_running() -> Result<()> {
         || trimmed.eq_ignore_ascii_case("yes");
     if !consent {
         return Err(CLIError::new(
-            "Aborted by user; Codex.app left running with its existing routing.",
+            "Aborted by user; the Codex app left running with its existing routing.",
             ErrorCategory::User,
             None::<String>,
             None::<String>,
@@ -1547,31 +1626,26 @@ async fn preflight_codex_app_running() -> Result<()> {
     }
 
     eprintln!(
-        "  {} quitting Codex.app gracefully so the new key takes effect...",
+        "  {} quitting the app gracefully so the new key takes effect...",
         crate::style::yellow("aivo:")
     );
-    #[cfg(unix)]
-    {
-        quit_codex_app(&pids).await;
-    }
+    quit_codex_app(&pids).await;
     // Poll until the tracked pids are gone, with a hard cap so a hung GUI
     // doesn't trap the launch indefinitely.
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     while std::time::Instant::now() < deadline {
-        let still_running = codex_app_gui_pids()
-            .await
-            .into_iter()
-            .any(|p| pids.contains(&p));
-        if !still_running {
+        // Per-pid liveness, not a rescan — a full scan spawns powershell
+        // every 300ms on Windows. Pid reuse within 10s is not a concern.
+        if !pids.iter().any(|p| pid_alive(*p)) {
             return Ok(());
         }
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
     }
     Err(CLIError::new(
-        "Codex.app did not exit within 10s after the quit request.",
+        "The Codex app did not exit within 10s after the quit request.",
         ErrorCategory::User,
         None::<String>,
-        Some("Quit Codex.app manually (Cmd-Q) and re-run `aivo codex-app`."),
+        Some(CODEX_APP_QUIT_HINT),
     )
     .into())
 }
@@ -1600,6 +1674,19 @@ async fn quit_codex_app(tracked: &[i32]) {
     }
 }
 
+/// `taskkill` without `/F` posts WM_CLOSE — graceful; shutdown handlers run.
+#[cfg(not(unix))]
+async fn quit_codex_app(tracked: &[i32]) {
+    for pid in tracked {
+        let _ = Command::new("taskkill")
+            .args(["/PID", &pid.to_string()])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .await;
+    }
+}
+
 #[cfg(not(unix))]
 async fn wait_for_codex_app_gui_exit() {
     use std::time::{Duration, Instant};
@@ -1608,8 +1695,10 @@ async fn wait_for_codex_app_gui_exit() {
     let mut tracked: Vec<i32> = Vec::new();
     loop {
         sleep(Duration::from_millis(1500)).await;
-        let pids = codex_app_gui_pids().await;
         if tracked.is_empty() {
+            // Sighting needs the full (powershell-backed) process scan; once
+            // pids are tracked, per-tick liveness is a native syscall.
+            let pids = codex_app_gui_pids().await;
             if !pids.is_empty() {
                 tracked = pids;
             } else if Instant::now() >= gui_appear_deadline {
@@ -1624,10 +1713,9 @@ async fn wait_for_codex_app_gui_exit() {
     }
 }
 
-/// Returns the pids of running Codex.app GUI processes (Mach-O main on macOS,
-/// `Codex.exe` on Windows). Matches only the executable path (`comm`), never
-/// argv: a `tail -f` or `lldb` invocation naming a path inside
-/// `Codex.app/Contents/MacOS/` would otherwise pin us.
+/// Pids of running Codex desktop app GUI processes. Matches only the
+/// executable path, never argv: a `tail -f` or `lldb` invocation naming a
+/// path inside the bundle would otherwise pin us.
 async fn codex_app_gui_pids() -> Vec<i32> {
     #[cfg(unix)]
     {
@@ -1652,13 +1740,14 @@ async fn codex_app_gui_pids() -> Vec<i32> {
                 None => continue,
             };
             let exe = rest.trim();
-            // The Mach-O main lives under `Codex.app/Contents/MacOS/` — named
-            // `Codex` through v26.6xx, renamed `ChatGPT` in v26.707 — so match
-            // the bundle dir, not the binary name. Helper / framework /
-            // renderer processes live under `Contents/Frameworks/` and stay out.
-            if exe.contains("/Codex.app/Contents/MacOS/")
-                && let Ok(pid) = pid_str.parse::<i32>()
-            {
+            // Match the bundle dir, not the binary name (Codex→ChatGPT
+            // rename; see APP_NAMES). `Contents/Frameworks/` helpers stay
+            // out. `ChatGPT.app` alone is ambiguous with the legacy
+            // chat-only app — require the codex bundle id; we SIGTERM
+            // whatever matches.
+            let is_codex_gui = exe.contains("/Codex.app/Contents/MacOS/")
+                || (exe.contains("/ChatGPT.app/Contents/MacOS/") && bundle_is_codex(exe));
+            if is_codex_gui && let Ok(pid) = pid_str.parse::<i32>() {
                 pids.push(pid);
             }
         }
@@ -1666,8 +1755,11 @@ async fn codex_app_gui_pids() -> Vec<i32> {
     }
     #[cfg(not(unix))]
     {
-        let output = Command::new("tasklist")
-            .args(["/FI", "IMAGENAME eq Codex.exe", "/FO", "CSV", "/NH"])
+        // Image name alone is ambiguous (the legacy chat-only ChatGPT.exe
+        // shares it) — require the exe path inside the OpenAI.Codex package.
+        const PS: &str = r#"Get-CimInstance Win32_Process -Filter "Name='ChatGPT.exe' OR Name='Codex.exe'" | Where-Object { $_.ExecutablePath -like '*\WindowsApps\OpenAI.Codex_*' } | Select-Object -ExpandProperty ProcessId"#;
+        let output = Command::new("powershell.exe")
+            .args(["-NoProfile", "-NonInteractive", "-Command", PS])
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .output()
@@ -1676,18 +1768,24 @@ async fn codex_app_gui_pids() -> Vec<i32> {
             return Vec::new();
         };
         let text = String::from_utf8_lossy(&out.stdout);
-        let mut pids = Vec::new();
-        for line in text.lines() {
-            // tasklist CSV: `"Codex.exe","<pid>","Console",...`
-            let parts: Vec<&str> = line.split(',').collect();
-            if parts.len() >= 2
-                && let Ok(pid) = parts[1].trim_matches('"').parse::<i32>()
-            {
-                pids.push(pid);
-            }
-        }
-        pids
+        text.lines()
+            .filter_map(|line| line.trim().parse::<i32>().ok())
+            .collect()
     }
+}
+
+/// True when the bundle containing `exe` is the Codex app (`com.openai.codex`)
+/// vs the legacy chat-only app (`com.openai.chat`). Byte-scans Info.plist —
+/// the ASCII id is stored verbatim in both XML and binary plists.
+#[cfg(unix)]
+fn bundle_is_codex(exe: &str) -> bool {
+    let Some(idx) = exe.find("/Contents/MacOS/") else {
+        return false;
+    };
+    let plist = format!("{}/Contents/Info.plist", &exe[..idx]);
+    std::fs::read(plist)
+        .map(|bytes| String::from_utf8_lossy(&bytes).contains("com.openai.codex"))
+        .unwrap_or(false)
 }
 
 fn pid_alive(pid: i32) -> bool {
@@ -1705,13 +1803,145 @@ fn pid_alive(pid: i32) -> bool {
         // purposes.
         std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
     {
-        // No cheap equivalent of kill(0) on Windows that's available without
-        // pulling in `windows-sys`; re-poll via tasklist on the next tick.
+        pid >= 0 && crate::services::system_env::is_pid_alive(pid as u32)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
         let _ = pid;
         true
     }
+}
+
+/// Codex Store package identity via `Get-AppxPackage` — stable across Codex-
+/// and ChatGPT-branded builds.
+#[cfg(windows)]
+#[derive(Debug, Clone, serde::Deserialize)]
+struct WindowsCodexPackage {
+    install: String,
+    exe: String,
+    family: String,
+}
+
+/// One PowerShell round trip: install location, the manifest's GUI exe
+/// (package-relative), and the family name (app-execution-alias dir).
+#[cfg(windows)]
+async fn windows_codex_package() -> Option<WindowsCodexPackage> {
+    const PROBE: &str = r#"$p = Get-AppxPackage -Name 'OpenAI.Codex*' | Sort-Object -Property Version -Descending | Select-Object -First 1; if ($p) { $a = (Get-AppxPackageManifest -Package $p.PackageFullName).Package.Applications.Application; if ($a -is [array]) { $a = $a[0] }; @{ install = $p.InstallLocation; exe = [string]$a.Executable; family = $p.PackageFamilyName } | ConvertTo-Json -Compress }"#;
+    let probe = Command::new("powershell.exe")
+        .args(["-NoProfile", "-NonInteractive", "-Command", PROBE])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output();
+    let out = tokio::time::timeout(std::time::Duration::from_secs(15), probe)
+        .await
+        .ok()?
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    let pkg: WindowsCodexPackage = serde_json::from_str(text.trim()).ok()?;
+    (!pkg.install.is_empty() && !pkg.exe.is_empty()).then_some(pkg)
+}
+
+/// GUI exe to spawn: prefer the app-execution alias (alias launches inherit
+/// the caller's env), else the package exe (spawnable despite WindowsApps
+/// ACLs). `symlink_metadata` because aliases are appexeclink reparse points
+/// some metadata calls reject.
+#[cfg(windows)]
+fn windows_codex_gui_exe(pkg: &WindowsCodexPackage) -> Option<std::path::PathBuf> {
+    use std::path::{Path, PathBuf};
+    let exe_name = Path::new(&pkg.exe).file_name()?;
+    if let Some(lad) = std::env::var_os("LOCALAPPDATA") {
+        let alias = PathBuf::from(lad)
+            .join("Microsoft")
+            .join("WindowsApps")
+            .join(&pkg.family)
+            .join(exe_name);
+        if alias.symlink_metadata().is_ok() {
+            return Some(alias);
+        }
+    }
+    let direct = Path::new(&pkg.install).join(&pkg.exe);
+    direct.symlink_metadata().is_ok().then_some(direct)
+}
+
+/// Resolved once at the launch gate: the GUI launcher (macOS: bundle path
+/// for `open -a`; Windows: the exe) and the bundled codex the wrapper
+/// re-execs.
+#[cfg_attr(not(any(target_os = "macos", windows)), allow(dead_code))]
+struct CodexAppDesktop {
+    gui: std::path::PathBuf,
+    codex_bin: std::path::PathBuf,
+}
+
+fn codex_app_launch_invocation(
+    desktop: &CodexAppDesktop,
+    post_drain_args: &[String],
+) -> (String, Vec<String>) {
+    #[cfg(any(target_os = "macos", windows))]
+    let invocation = {
+        let (workspace, dropped) = codex_app_workspace_from_args(post_drain_args);
+        if !dropped.is_empty() {
+            eprintln!(
+                "  {} codex-app: extra args not forwarded to the desktop launch: {}",
+                crate::style::yellow("aivo:"),
+                dropped.join(" ")
+            );
+        }
+        let url = codex_app_new_thread_url(&workspace);
+        #[cfg(target_os = "macos")]
+        let invocation = (
+            "/usr/bin/open".to_string(),
+            vec![
+                "-a".to_string(),
+                desktop.gui.to_string_lossy().into_owned(),
+                url,
+            ],
+        );
+        #[cfg(windows)]
+        let invocation = (desktop.gui.to_string_lossy().into_owned(), vec![url]);
+        invocation
+    };
+    #[cfg(not(any(target_os = "macos", windows)))]
+    let invocation = {
+        let _ = (desktop, post_drain_args);
+        unreachable!("codex-app desktop launch is gated to macOS/Windows")
+    };
+    invocation
+}
+
+/// Splits post-drain argv (`["app", ...rest]`) into the workspace (first
+/// non-flag arg after `app`, made absolute — the deep link is resolved by
+/// the GUI process, not against our cwd) and args a direct launch can't
+/// forward.
+#[cfg(any(target_os = "macos", windows))]
+fn codex_app_workspace_from_args(args: &[String]) -> (std::path::PathBuf, Vec<String>) {
+    let mut workspace = None;
+    let mut dropped = Vec::new();
+    for arg in args.iter().skip_while(|a| *a != "app").skip(1) {
+        if workspace.is_none() && !arg.starts_with('-') {
+            workspace = Some(std::path::absolute(arg).unwrap_or_else(|_| arg.into()));
+        } else {
+            dropped.push(arg.clone());
+        }
+    }
+    let workspace = workspace
+        .or_else(|| std::env::current_dir().ok())
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    (workspace, dropped)
+}
+
+/// New-thread deep link the desktop app opens on launch — same URL upstream's
+/// `codex app` builds (codex_new_thread_url in codex-rs/cli/src/desktop_app/mac.rs).
+#[cfg(any(target_os = "macos", windows))]
+fn codex_app_new_thread_url(workspace: &std::path::Path) -> String {
+    let mut url = url::Url::parse("codex://threads/new").expect("static deep-link base parses");
+    url.query_pairs_mut()
+        .append_pair("path", &workspace.to_string_lossy());
+    url.to_string()
 }
 
 /// Moves codex's global `-c/--config/--enable/--disable` prefix into a wrapper
@@ -1721,27 +1951,23 @@ fn pid_alive(pid: i32) -> bool {
 /// inherited by that subprocess, so we move them where they'll actually be
 /// read.
 ///
-/// Best-effort: if Codex.app isn't installed, leaves args alone so the
-/// existing `codex` CLI receives the flags (and Codex.app's installer prompt
-/// will steer the user from there).
-/// Installs the per-launch wrapper script and returns its path so the caller
-/// can clean it up after the GUI exits. The path is also stored in
-/// `CODEX_CLI_PATH` for the child env.
+/// Installs the per-launch wrapper, stores its path in `CODEX_CLI_PATH`, and
+/// returns it so the caller can clean up after the GUI exits.
 async fn install_codex_app_wrapper(
     env: &mut HashMap<String, String>,
     args: &mut Vec<String>,
     config_dir: &std::path::Path,
     key_id: &str,
+    codex_bin: &std::path::Path,
 ) -> Option<std::path::PathBuf> {
     use crate::services::codex_app_wrapper;
-    let codex_bin = codex_app_wrapper::locate_bundled_codex()?;
     let prefix = crate::services::launch_args::drain_codex_global_prefix(args);
     if prefix.is_empty() {
         return None;
     }
     let dir = codex_app_wrapper::wrapper_dir(config_dir);
     codex_app_wrapper::cleanup_stale_wrappers(&dir).await;
-    match codex_app_wrapper::write_wrapper(&dir, key_id, &codex_bin, &prefix).await {
+    match codex_app_wrapper::write_wrapper(&dir, key_id, codex_bin, &prefix).await {
         Ok(path) => {
             env.insert(
                 "CODEX_CLI_PATH".to_string(),
@@ -1889,6 +2115,56 @@ fn is_opencode_zen_base(base_url: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn codex_app_workspace_split_and_deep_link() {
+        let args: Vec<String> = ["app", "/tmp/ws dir", "--force", "extra"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let (ws, dropped) = codex_app_workspace_from_args(&args);
+        assert_eq!(ws, std::path::PathBuf::from("/tmp/ws dir"));
+        assert_eq!(dropped, vec!["--force".to_string(), "extra".to_string()]);
+        // Space encoded as `+` — same form_urlencoded serialization upstream uses.
+        assert_eq!(
+            codex_app_new_thread_url(&ws),
+            "codex://threads/new?path=%2Ftmp%2Fws+dir"
+        );
+
+        let (ws, dropped) = codex_app_workspace_from_args(&["app".to_string()]);
+        assert_eq!(ws, std::env::current_dir().unwrap());
+        assert!(dropped.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bundle_is_codex_requires_codex_bundle_id() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app = tmp.path().join("ChatGPT.app");
+        std::fs::create_dir_all(app.join("Contents/MacOS")).unwrap();
+        let exe = app.join("Contents/MacOS/ChatGPT");
+        let exe = exe.to_string_lossy();
+        let plist = app.join("Contents/Info.plist");
+
+        std::fs::write(
+            &plist,
+            r#"<plist><dict><key>CFBundleIdentifier</key><string>com.openai.codex</string></dict></plist>"#,
+        )
+        .unwrap();
+        assert!(bundle_is_codex(&exe));
+
+        std::fs::write(
+            &plist,
+            r#"<plist><dict><key>CFBundleIdentifier</key><string>com.openai.chat</string></dict></plist>"#,
+        )
+        .unwrap();
+        assert!(!bundle_is_codex(&exe));
+
+        std::fs::remove_file(&plist).unwrap();
+        assert!(!bundle_is_codex(&exe));
+        assert!(!bundle_is_codex("/usr/bin/ChatGPT"));
+    }
 
     #[test]
     fn test_ai_tool_type_from_str() {

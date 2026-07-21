@@ -537,7 +537,7 @@ impl RunCommand {
             Some("codex-app") => println!(
                 "{}",
                 style::dim(
-                    "Launch Codex Desktop App with a local API key (experimental, macOS only)."
+                    "Launch Codex Desktop App with a local API key (experimental, macOS/Windows)."
                 )
             ),
             Some("gemini") => println!("{}", style::dim("Launch Gemini with a local API key.")),

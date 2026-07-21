@@ -10,6 +10,11 @@
 //! macOS default to 8 MiB; pinning the worker explicitly normalizes that
 //! across platforms.
 fn main() {
+    // Wrapper copies of aivo.exe re-exec the bundled codex here, before
+    // paying for the worker thread and tokio runtime.
+    #[cfg(windows)]
+    aivo::services::codex_app_wrapper::maybe_run_windows_shim();
+
     let worker = std::thread::Builder::new()
         .name("aivo-main".into())
         .stack_size(8 * 1024 * 1024)
