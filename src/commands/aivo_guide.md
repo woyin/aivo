@@ -247,9 +247,11 @@ Per-tool toggles within a connected server live in the TUI (`/mcp`, `Ctrl+T`).
 ### Subagents — named specialists the agent delegates to
 
 A subagent is a `<name>.md` file (frontmatter + instructions) the main agent can hand a
-self-contained task to — a "code reviewer", "software architect", "test writer". Two ship
-built-in: `explorer` (read-only codebase exploration) and `aivo-guide` (answers questions about
-aivo itself); shadow either by creating a same-named file. The rest are discovered from the repo
+self-contained task to — a "code reviewer", "software architect", "test writer". Five ship
+built-in: `explorer` (read-only codebase exploration), `aivo-guide` (answers questions about
+aivo itself), `verification` (adversarially checks a change works, PASS/FAIL), `advisor`
+(read-only second opinion on a hard call), and `evaluate` (code review with a verdict);
+shadow any by creating a same-named file. The rest are discovered from the repo
 (`.aivo/agents`, `.claude/agents`), `~/.config/aivo/agents`, and installed packs; an existing
 Claude Code `.claude/agents` fleet is picked up as-is (`model: inherit` honored — prefer full
 model ids over `sonnet`-style shorthands, which pass through verbatim). Just **ask the agent

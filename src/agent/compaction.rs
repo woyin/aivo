@@ -48,6 +48,12 @@ only when the new events explicitly supersede it. Output only the updated summar
 /// plan kept whole, touched-files trimmed oldest-first so pinning can't re-overflow.
 pub(crate) const PINNED_MAX_TOKENS: usize = 2_000;
 pub(crate) const SUMMARY_FOLD_PREFIX: &str = "[Summary of earlier conversation]";
+/// Percent of the compaction budget above which the preventive snip runs; below it
+/// there's ample headroom, so nothing is shed early.
+const SNIP_WATERMARK_PCT: usize = 60;
+/// Minimum reclaimable estimate before a snip fires: each snip forces a cache
+/// re-warm, so aged-out results batch until they pay for one.
+const SNIP_MIN_RECLAIM: usize = 5_000;
 const MIN_SUMMARY_CHARS: usize = 120;
 /// The degeneracy floor applies only above this transcript size.
 const DEGENERATE_TRANSCRIPT_FLOOR: usize = 2_000;
@@ -121,7 +127,10 @@ impl AgentEngine {
     /// intact. Returns tokens the summarization consumed (counted toward the turn, not a step).
     pub(crate) async fn maybe_compact(&mut self, ctx: &TurnCtx<'_>, ui: &mut dyn AgentUi) -> u64 {
         let budget = self.compaction_budget_estimate();
-        let total = estimate_tokens(&self.messages);
+        let mut total = estimate_tokens(&self.messages);
+        if self.maybe_preventive_snip(budget, total, ui) {
+            total = estimate_tokens(&self.messages);
+        }
         if total <= budget {
             return 0;
         }
@@ -158,7 +167,7 @@ impl AgentEngine {
         if cut <= 1 {
             return 0;
         }
-        let transcript = serialize_transcript(&self.messages[1..cut]);
+        let transcript = serialize_transcript(&self.restore_snipped_range(cut));
         let transcript_len = transcript.len();
         let request = self.build_summary_request(&transcript);
         ui.notify("compacting context…");
@@ -257,12 +266,17 @@ impl AgentEngine {
             .unwrap_or(&[])
             .iter()
             .filter(|m| role(m) == "tool")
-            .filter_map(|m| m.get("content").and_then(|c| c.as_str()))
+            .filter_map(|m| match m.get("content") {
+                Some(Value::String(s)) => Some(std::borrow::Cow::Borrowed(s.as_str())),
+                // Same array-of-parts ruler as `clear_stale_tool_results`.
+                Some(v @ Value::Array(_)) => Some(std::borrow::Cow::Owned(v.to_string())),
+                _ => None,
+            })
             .filter(|s| s.len() > TOOL_RESULT_CLEAR_MIN)
             .map(|s| {
                 let retained = estimate_str_tokens(TOOL_RESULT_CLEARED)
-                    + artifact_pointer_line(s).map_or(0, |p| estimate_str_tokens(p) + 1);
-                estimate_str_tokens(s).saturating_sub(retained)
+                    + artifact_pointer_line(&s).map_or(0, |p| estimate_str_tokens(p) + 1);
+                estimate_str_tokens(&s).saturating_sub(retained)
             })
             .sum()
     }
@@ -354,8 +368,40 @@ impl AgentEngine {
         }
     }
 
+    /// On a prefix-cached provider past the watermark, stub tool output that has aged
+    /// out of the recent window. Idempotent (via [`Self::clear_stale_tool_results`]),
+    /// so a message is snipped once and its bytes then stay frozen — the cache
+    /// re-warms once per snip instead of a full reset at the overflow fold.
+    /// Returns whether anything was cleared.
+    pub(crate) fn maybe_preventive_snip(
+        &mut self,
+        budget: usize,
+        total: usize,
+        ui: &mut dyn AgentUi,
+    ) -> bool {
+        if !self.prefix_cache_seen {
+            return false;
+        }
+        // A budget inside the keep-recent window can never age anything out; skip the scans.
+        if budget <= keep_recent_tokens() {
+            return false;
+        }
+        if total.saturating_mul(100) < budget.saturating_mul(SNIP_WATERMARK_PCT) {
+            return false;
+        }
+        let cut = find_cut(&self.messages, keep_recent_tokens());
+        if cut <= 1 || self.stale_tool_result_savings(cut) < SNIP_MIN_RECLAIM {
+            return false;
+        }
+        ui.notify("freed context — cleared older tool output");
+        self.clear_stale_tool_results(cut);
+        true
+    }
+
     /// Replace bulky OLD `tool` output with [`TOOL_RESULT_CLEARED`], reclaiming
-    /// context without a model call; message + `tool_call_id` stay (pairing intact). Idempotent.
+    /// context without a model call; message + `tool_call_id` stay (pairing intact).
+    /// Idempotent. Originals are parked in `snipped_originals` so a later summary
+    /// fold still sees the real content.
     pub(crate) fn clear_stale_tool_results(&mut self, cut: usize) {
         let Some(old) = self.messages.get_mut(1..cut) else {
             return;
@@ -364,23 +410,53 @@ impl AgentEngine {
             if role(m) != "tool" {
                 continue;
             }
-            let len = m
-                .get("content")
-                .and_then(|c| c.as_str())
-                .map_or(0, str::len);
-            if len > TOOL_RESULT_CLEAR_MIN {
-                // Keep any artifact-pointer line so the parent can re-read the saved report.
-                let pointer = m
-                    .get("content")
-                    .and_then(|c| c.as_str())
-                    .and_then(artifact_pointer_line)
-                    .map(str::to_string);
-                m["content"] = match pointer {
-                    Some(p) => json!(format!("{TOOL_RESULT_CLEARED}\n{p}")),
-                    None => json!(TOOL_RESULT_CLEARED),
-                };
+            // Imported transcripts may carry array-of-parts content; measure (and
+            // stub) those by serialized size so they can't dodge the clear.
+            let text = match m.get("content") {
+                Some(Value::String(s)) => Some(s.clone()),
+                Some(v @ Value::Array(_)) => Some(v.to_string()),
+                _ => None,
+            };
+            let Some(text) = text.filter(|t| t.len() > TOOL_RESULT_CLEAR_MIN) else {
+                continue;
+            };
+            if let Some(id) = m.get("tool_call_id").and_then(Value::as_str) {
+                self.snipped_originals
+                    .entry(id.to_string())
+                    .or_insert_with(|| text.clone());
+            }
+            // Keep any artifact-pointer line so the parent can re-read the saved report.
+            m["content"] = match artifact_pointer_line(&text) {
+                Some(p) => json!(format!("{TOOL_RESULT_CLEARED}\n{p}")),
+                None => json!(TOOL_RESULT_CLEARED),
+            };
+        }
+    }
+
+    /// `messages[1..cut]` with preventively-snipped stubs swapped back to their
+    /// parked originals, so the summary fold pays nothing for the snip.
+    fn restore_snipped_range(&self, cut: usize) -> Vec<Value> {
+        let mut range = self.messages.get(1..cut).unwrap_or(&[]).to_vec();
+        if self.snipped_originals.is_empty() {
+            return range;
+        }
+        for m in &mut range {
+            let stubbed = role(m) == "tool"
+                && m.get("content")
+                    .and_then(Value::as_str)
+                    .is_some_and(|c| c.starts_with(TOOL_RESULT_CLEARED));
+            if !stubbed {
+                continue;
+            }
+            if let Some(orig) = m
+                .get("tool_call_id")
+                .and_then(Value::as_str)
+                .and_then(|id| self.snipped_originals.get(id))
+            {
+                m["content"] = json!(orig);
             }
         }
+        range
     }
 
     /// Model-free stand-in for a failed/empty summary; preserves any running summary so the thread isn't lost.
@@ -499,6 +575,8 @@ impl AgentEngine {
     /// turn (a user message) rather than a standalone message before it — a standalone
     /// summary would be two consecutive users, which Anthropic 400s on (non-retryable → bricks after compaction).
     pub(crate) fn apply_compaction(&mut self, cut: usize, summary: &str) {
+        // The fold consumed the parked originals; surviving stubs summarize as stubs next time.
+        self.snipped_originals.clear();
         let mut folded = format!("{SUMMARY_FOLD_PREFIX}\n{summary}");
         // Pin plan + touched-files into the SAME fold so they never become a standalone same-role message.
         let pinned = self.render_pinned_block();
@@ -904,6 +982,95 @@ mod tests {
         );
         e.clear_stale_tool_results(4);
         assert_eq!(e.messages, once, "second clear must be a no-op");
+    }
+
+    #[test]
+    fn preventive_snip_gated_and_watermarked() {
+        // Varied text (the estimator run-classes repeated chars, so a `repeat`
+        // would count as ~nothing). The tail alone exceeds keep_recent (20k tok),
+        // so `find_cut` ages the earlier tool turn out; the old tool result is
+        // big enough to clear the SNIP_MIN_RECLAIM batching floor.
+        let tail: String = (0..8_500).map(|i| format!("token{i} ")).collect();
+        let old_tool: String = (0..2_800).map(|i| format!("value{i} ")).collect();
+        let transcript = |tool: &str| {
+            vec![
+                json!({"role":"system","content":"sys"}),
+                json!({"role":"user","content":"q1"}),
+                json!({"role":"assistant","content":"","tool_calls":[
+                    {"id":"a","type":"function","function":{"name":"read_file","arguments":"{}"}}]}),
+                json!({"role":"tool","tool_call_id":"a","content":tool}),
+                json!({"role":"user","content":"q2"}),
+                json!({"role":"assistant","content": tail.clone()}),
+            ]
+        };
+        let mut ui = NoopUi;
+        let mut e = engine();
+        e.messages = transcript(&old_tool);
+        e.prefix_cache_seen = true;
+
+        // Fixture must land inside the preventive band (watermark, budget]:
+        // over budget folds, under the watermark nothing fires.
+        e.context_window = 50_000;
+        let budget = e.compaction_budget_estimate();
+        let total = estimate_tokens(&e.messages);
+        assert!(
+            total.saturating_mul(100) >= budget.saturating_mul(SNIP_WATERMARK_PCT)
+                && total <= budget,
+            "fixture out of the preventive band: total {total}, budget {budget}"
+        );
+
+        // Below the watermark (bigger window, same transcript) nothing is shed.
+        e.context_window = 80_000;
+        let big_budget = e.compaction_budget_estimate();
+        assert!(total.saturating_mul(100) < big_budget.saturating_mul(SNIP_WATERMARK_PCT));
+        assert!(!e.maybe_preventive_snip(big_budget, total, &mut ui));
+
+        // Budget inside the keep-recent window: structurally inert, skipped outright.
+        e.context_window = 30_000;
+        let small_budget = e.compaction_budget_estimate();
+        assert!(small_budget <= keep_recent_tokens());
+        assert!(!e.maybe_preventive_snip(small_budget, total, &mut ui));
+
+        e.context_window = 50_000;
+        e.prefix_cache_seen = false;
+        let before = e.messages.clone();
+        assert!(!e.maybe_preventive_snip(budget, total, &mut ui));
+        assert_eq!(
+            e.messages, before,
+            "no snip without observed cache activity"
+        );
+
+        e.prefix_cache_seen = true;
+        assert!(e.maybe_preventive_snip(budget, total, &mut ui));
+        assert_eq!(
+            e.messages[3]["content"],
+            json!(TOOL_RESULT_CLEARED),
+            "old tool output snipped early"
+        );
+        assert_eq!(
+            e.messages[5]["content"],
+            json!(tail),
+            "recent turn untouched"
+        );
+        assert_eq!(
+            e.restore_snipped_range(4)[2]["content"],
+            json!(old_tool),
+            "summary path sees the parked original, not the stub"
+        );
+        let after = e.messages.clone();
+        assert!(!e.maybe_preventive_snip(budget, estimate_tokens(&e.messages), &mut ui));
+        assert_eq!(e.messages, after, "preventive snip is idempotent");
+
+        // Under the batching floor (small old result) nothing fires.
+        let crumb: String = (0..200).map(|i| format!("value{i} ")).collect();
+        assert!(crumb.len() > TOOL_RESULT_CLEAR_MIN);
+        e.messages = transcript(&crumb);
+        e.snipped_originals.clear();
+        let total = estimate_tokens(&e.messages);
+        assert!(total.saturating_mul(100) >= budget.saturating_mul(SNIP_WATERMARK_PCT));
+        let before = e.messages.clone();
+        assert!(!e.maybe_preventive_snip(budget, total, &mut ui));
+        assert_eq!(e.messages, before, "below SNIP_MIN_RECLAIM nothing is shed");
     }
 
     #[test]

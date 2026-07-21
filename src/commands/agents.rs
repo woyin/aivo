@@ -76,8 +76,9 @@ impl AgentsCommand {
         );
         println!(
             "  {}",
-            style::dim("built-in: explorer, aivo-guide    shadow with a same-named file")
+            style::dim("built-in (shadow with a same-named file): explorer, aivo-guide,")
         );
+        println!("  {}", style::dim("  verification, advisor, evaluate"));
     }
 }
 

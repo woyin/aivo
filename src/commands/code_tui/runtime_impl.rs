@@ -23,6 +23,8 @@ exactly `GOAL COMPLETE` and nothing else; otherwise do the next step."
 }
 
 /// The `/review` directive: a read-only, line-by-line review of a diff.
+/// Twin: `agent/builtin_agents/evaluate.md` (the delegatable review sub-agent) —
+/// keep review-policy changes in sync.
 const REVIEW_PREAMBLE: &str = "[Code review] Review the changes below as a senior engineer \
 would before a merge. This is READ-ONLY: do not modify, create, or delete any file.\n\
 \n\
@@ -694,11 +696,16 @@ impl CodeTuiApp {
             // agent_engine); skipped when a resume payload is pending (it wins).
             // Rewind state rides along: verbatim restore keeps checkpoint indices valid.
             let mut prior_rewind_state = None;
+            // A same-key rebuild stays on the same provider: carry the prefix-cache
+            // latch so the preventive snip doesn't silently disarm on a model switch.
+            let mut prior_prefix_cache = false;
             let prior_engine_messages: Option<Vec<serde_json::Value>> =
                 if self.pending_agent_messages.is_some() {
                     None
                 } else if let Some(prev) = self.agent_engine.as_ref() {
                     let mut prev_engine = prev.engine.lock().await;
+                    prior_prefix_cache =
+                        prev.key_id == self.key.id && prev_engine.prefix_cache_seen;
                     let msgs = prev_engine.export_conversation();
                     if msgs.is_empty() {
                         None
@@ -746,6 +753,7 @@ impl CodeTuiApp {
                 context_window,
                 0,
             );
+            engine.prefix_cache_seen = prior_prefix_cache;
             // The bundled aivo-starter provider is first-party: brand the agent so it
             // presents as aivo's assistant instead of disclosing the upstream model.
             // BYOK keys stay honest (no branding).

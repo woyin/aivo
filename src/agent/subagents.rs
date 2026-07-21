@@ -61,13 +61,16 @@ impl Subagent {
     }
 }
 
-/// The built-in profiles compiled into the binary, matching the roster every
-/// major CLI ships: a read-only explorer and a docs expert on aivo itself.
+/// The built-in profiles compiled into the binary: a read-only explorer, a docs
+/// expert on aivo itself, and the review trio (verification, advisor, evaluate).
 /// Lowest precedence — any same-named repo/user/pack file replaces them.
 pub fn builtin_subagents() -> Vec<Subagent> {
     [
         include_str!("builtin_agents/explorer.md"),
         include_str!("builtin_agents/aivo-guide.md"),
+        include_str!("builtin_agents/verification.md"),
+        include_str!("builtin_agents/advisor.md"),
+        include_str!("builtin_agents/evaluate.md"),
     ]
     .iter()
     .filter_map(|src| parse_subagent(src, String::new(), PathBuf::new()))
@@ -706,7 +709,19 @@ mod tests {
         let subs = discover_subagents(&cwd, &config);
         let names: Vec<&str> = subs.iter().map(|s| s.name.as_str()).collect();
         // Discovered files first (precedence order), compiled-in built-ins last.
-        assert_eq!(names, vec!["dup", "cc", "global", "explorer", "aivo-guide"]);
+        assert_eq!(
+            names,
+            vec![
+                "dup",
+                "cc",
+                "global",
+                "explorer",
+                "aivo-guide",
+                "verification",
+                "advisor",
+                "evaluate"
+            ]
+        );
         assert_eq!(subs[0].description, "from aivo", ".aivo shadows .claude");
         assert!(subs.iter().find(|s| s.name == "dup").unwrap().repo_local);
         assert!(subs.iter().find(|s| s.name == "cc").unwrap().repo_local);
@@ -720,17 +735,25 @@ mod tests {
     fn builtin_subagents_parse_and_are_shadowable() {
         let builtins = builtin_subagents();
         let names: Vec<&str> = builtins.iter().map(|s| s.name.as_str()).collect();
-        assert_eq!(names, vec!["explorer", "aivo-guide"]);
+        assert_eq!(
+            names,
+            vec![
+                "explorer",
+                "aivo-guide",
+                "verification",
+                "advisor",
+                "evaluate"
+            ]
+        );
         for b in &builtins {
             assert!(b.is_builtin());
             assert!(!b.repo_local);
             assert!(!b.body.is_empty());
             assert!(is_valid_name(&b.name));
-            assert!(
-                advert_description(&b.description).len() <= 161,
-                "{}",
-                b.name
-            );
+            let advert = advert_description(&b.description);
+            assert!(advert.len() <= 161, "{}", b.name);
+            // A built-in must never ship a clipped delegation hint.
+            assert!(!advert.ends_with('…'), "{} advert truncated", b.name);
         }
         // The explorer's read-only guarantee is tool-level, not just prose.
         let explorer = &builtins[0];

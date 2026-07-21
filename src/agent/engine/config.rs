@@ -91,6 +91,8 @@ impl AgentEngine {
             injected_context_tokens: 0,
             turn_cost_usd: 0.0,
             billed_model: None,
+            prefix_cache_seen: false,
+            snipped_originals: std::collections::HashMap::new(),
         }
     }
 

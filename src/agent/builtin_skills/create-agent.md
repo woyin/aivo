@@ -14,7 +14,7 @@ A subagent is a single `<name>.md` file with YAML frontmatter and a Markdown bod
 - Project: `./.aivo/agents`, `./.claude/agents`  (ship with the repo)
 - User: `~/.config/aivo/agents`  (available in every project — the dir aivo owns)
 - Packs: `agents/` inside installed extension packs
-- Built-in: `explorer` (read-only exploration) and `aivo-guide` (aivo docs expert) ship inside aivo, at the lowest precedence — creating a same-named file replaces them, and that's the supported way to customize one (start from `aivo code agents cat <name>`)
+- Built-in: `explorer` (read-only exploration), `aivo-guide` (aivo docs expert), `verification` (adversarial PASS/FAIL checks), `advisor` (read-only second opinion), and `evaluate` (code review) ship inside aivo, at the lowest precedence — creating a same-named file replaces them, and that's the supported way to customize one (start from `aivo code agents cat <name>`); warn before authoring a new agent under one of these names, since it silently shadows the built-in
 
 The main agent's `subagent` tool gains an `agent` parameter naming which specialist to run; delegating to a name loads that profile's instructions (and model/tools) for the sub-run. Discovery is progressive-disclosure: only each subagent's **name + first sentence of its description** ride in the system prompt, so the main agent knows what it can delegate to without paying for every full body.
 

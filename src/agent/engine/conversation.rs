@@ -15,6 +15,7 @@ impl AgentEngine {
         // `/rewind` checkpoints' `msg_index` pointed into the cleared transcript.
         self.checkpoints.clear();
         self.turn_unsend = None;
+        self.snipped_originals.clear();
     }
 
     /// Seed prior conversation into a fresh engine (resume / mid-chat switch) so it

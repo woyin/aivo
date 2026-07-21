@@ -464,6 +464,14 @@ pub struct AgentEngine {
     turn_cost_usd: f64,
     /// Upstream model echoed by responses — resolves aliases for pricing/stats.
     billed_model: Option<String>,
+    /// Latches true once the provider reports prompt-cache activity (read or
+    /// write); gates the preventive snip in `maybe_compact` (provider-agnostic —
+    /// no hardcoded names). Never reset: an engine never changes provider.
+    pub(crate) prefix_cache_seen: bool,
+    /// Original text of preventively-snipped tool results, keyed by
+    /// `tool_call_id`, so the summary fold sees real content instead of stubs.
+    /// In-memory only; dropped at each fold and on `/clear`.
+    pub(crate) snipped_originals: std::collections::HashMap<String, String>,
 }
 
 /// Calibrated chars/4 breakdown of what fills the context window, for `/context`.

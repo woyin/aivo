@@ -222,6 +222,10 @@ impl AgentEngine {
                         cache_read_tokens: split.cache_read_input_tokens,
                         cache_write_tokens: split.cache_creation_input_tokens,
                     });
+                    // A cache write proves prefix caching too — avoids a one-step lag on fresh engines.
+                    if split.cache_read_input_tokens > 0 || split.cache_creation_input_tokens > 0 {
+                        self.prefix_cache_seen = true;
+                    }
                     ui.turn_tokens(self.turn_usage.completion_tokens);
                 }
                 if let Some(cost) = u.get("cost").and_then(|x| x.as_f64())
