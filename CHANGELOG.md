@@ -1,5 +1,15 @@
 # Changelog
 
+## v0.41.5
+
+Codex desktop support goes cross-platform. aivo now locates the Codex bundle whether it ships as `Codex.app` or the renamed `ChatGPT.app`, launches the GUI itself via the `codex://` scheme, and gains Windows desktop support (MSIX probe plus a self-copy shim). Imported sessions carry a fidelity report so you can see how faithfully a foreign transcript was reconstructed, and plugin run records resolve through their manifest transcript sources on `--resume`. The coding agent adds built-in review sub-agents (verification/advisor/evaluate) and a preventive tool-result snip that keeps prefix caches warm.
+
+- feat(codex-app): survive the ChatGPT.app rename and add Windows desktop support (11b99189)
+- feat(resume): fidelity report for imported sessions (5e877af3)
+- feat(resume): resolve plugin run records via manifest transcript sources (85f3d6f4)
+- feat(agent): built-in review sub-agents + prefix-cache preventive snip (005b6eef)
+- fix(ci): codex-app picker/launch tests diverge cleanly across macOS/Windows/Linux (486dc733, 0befc4d7)
+
 ## v0.41.4
 
 Provider-OAuth routing gets unified and more reliable. Codex, Kimi, and Grok now share one loopback router, and refreshed OAuth tokens are persisted across `aivo serve` so rotated refresh tokens survive — OpenAI's are single-use, so a dropped rotation would have bricked the session. Plugins can bind per-mode keys through the extracted tier loopback router, `aivo models` takes a `[key::][search]` positional, `plugins list` prints one aligned line per plugin, and Copilot works in `code -e`.
