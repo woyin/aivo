@@ -1881,8 +1881,13 @@ fn codex_app_launch_invocation(
     desktop: &CodexAppDesktop,
     post_drain_args: &[String],
 ) -> (String, Vec<String>) {
+    #[cfg(not(any(target_os = "macos", windows)))]
+    {
+        let _ = (desktop, post_drain_args);
+        unreachable!("codex-app desktop launch is gated to macOS/Windows");
+    }
     #[cfg(any(target_os = "macos", windows))]
-    let invocation = {
+    {
         let (workspace, dropped) = codex_app_workspace_from_args(post_drain_args);
         if !dropped.is_empty() {
             eprintln!(
@@ -1893,7 +1898,7 @@ fn codex_app_launch_invocation(
         }
         let url = codex_app_new_thread_url(&workspace);
         #[cfg(target_os = "macos")]
-        let invocation = (
+        return (
             "/usr/bin/open".to_string(),
             vec![
                 "-a".to_string(),
@@ -1902,15 +1907,8 @@ fn codex_app_launch_invocation(
             ],
         );
         #[cfg(windows)]
-        let invocation = (desktop.gui.to_string_lossy().into_owned(), vec![url]);
-        invocation
-    };
-    #[cfg(not(any(target_os = "macos", windows)))]
-    let invocation = {
-        let _ = (desktop, post_drain_args);
-        unreachable!("codex-app desktop launch is gated to macOS/Windows")
-    };
-    invocation
+        return (desktop.gui.to_string_lossy().into_owned(), vec![url]);
+    }
 }
 
 /// Splits post-drain argv (`["app", ...rest]`) into the workspace (first
