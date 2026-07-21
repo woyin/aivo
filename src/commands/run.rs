@@ -891,10 +891,11 @@ async fn maybe_apply_resume(
         && let Some(rewritten) = native_resume_args(tool, &selected.session_id, &args)
     {
         eprintln!(
-            "  {} resuming {} session {} natively",
+            "  {} resuming {} session {} natively {}",
             style::arrow_symbol(),
             selected.cli,
             &selected.session_id[..selected.session_id.len().min(8)],
+            style::dim("(full fidelity)"),
         );
         return Some(rewritten);
     }
@@ -911,7 +912,7 @@ async fn maybe_apply_resume(
         "  {} {} {}",
         style::arrow_symbol(),
         context_injection_summary(&rendered, &selected),
-        style::dim("(context digest — no native resume for this session here)"),
+        style::dim("(context digest)"),
     );
 
     Some(match tool {

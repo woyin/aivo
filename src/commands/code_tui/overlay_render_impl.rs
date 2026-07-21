@@ -618,6 +618,15 @@ impl CodeTuiApp {
             ("Directory", self.display_cwd().to_string()),
             ("Messages", self.history.len().to_string()),
         ];
+        if let Some(fidelity) = &self.import_fidelity {
+            let notes = fidelity.notes();
+            let value = if notes.is_empty() {
+                format!("{} — nothing lost", fidelity.tier().label())
+            } else {
+                format!("{} — {}", fidelity.tier().label(), notes.join(", "))
+            };
+            rows.push(("Fidelity", value));
+        }
         if let Some(branch) = self.git_branch.as_deref().filter(|b| !b.is_empty()) {
             rows.push(("Branch", branch.to_string()));
         }

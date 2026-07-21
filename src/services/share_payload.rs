@@ -1285,6 +1285,7 @@ mod tests {
             model: "gpt-4o".into(),
             messages,
             engine_messages: None,
+            import_fidelity: None,
             updated_at: "2026-04-01T10:01:00Z".into(),
             created_at: "2026-04-01T09:55:00Z".into(),
         };
@@ -1350,6 +1351,7 @@ mod tests {
             model: "m".into(),
             messages,
             engine_messages: None,
+            import_fidelity: None,
             updated_at: String::new(),
             created_at: String::new(),
         };
@@ -1410,6 +1412,7 @@ mod tests {
             model: "model-b".into(),
             messages,
             engine_messages: None,
+            import_fidelity: None,
             updated_at: String::new(),
             created_at: String::new(),
         };
@@ -1486,6 +1489,7 @@ mod tests {
             model: "m".into(),
             messages,
             engine_messages: None,
+            import_fidelity: None,
             updated_at: String::new(),
             created_at: String::new(),
         };

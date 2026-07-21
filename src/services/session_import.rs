@@ -56,6 +56,118 @@ pub struct ImportedTranscript {
     /// The source agent's model (e.g. `claude-sonnet-4-…`), for a provenance badge.
     pub origin_model: Option<String>,
     pub updated_at: DateTime<Utc>,
+    pub fidelity: ImportFidelity,
+}
+
+/// Loss accounting for one conversion: every point where the importer drops,
+/// synthesizes, or flattens content increments a counter, so a resume can state
+/// its fidelity instead of degrading silently.
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct ImportFidelity {
+    pub user_turns: usize,
+    pub assistant_turns: usize,
+    pub tool_calls: usize,
+    /// Tool results paired with their call.
+    pub results_paired: usize,
+    /// Calls whose result never appeared — a placeholder was synthesized.
+    pub results_missing: usize,
+    /// Results whose call was never seen — dropped (unmatched `tool` messages 400).
+    pub results_orphaned: usize,
+    /// Unparseable transcript lines (torn/partial writes).
+    pub torn_lines: usize,
+    /// Claude subagent (sidechain) lines not imported; the Task tool's summary
+    /// survives on the main thread, so these don't degrade the tier.
+    pub sidechain_lines: usize,
+    /// Image blocks flattened to a text placeholder.
+    pub images_omitted: usize,
+}
+
+/// Qualitative fidelity: `Full` = nothing lost, `High` = placeholders stand in
+/// for tool results/images but the conversation is complete, `Partial` = source
+/// content was actually dropped.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FidelityTier {
+    Full,
+    High,
+    Partial,
+}
+
+impl FidelityTier {
+    pub fn label(self) -> &'static str {
+        match self {
+            FidelityTier::Full => "full",
+            FidelityTier::High => "high",
+            FidelityTier::Partial => "partial",
+        }
+    }
+}
+
+impl ImportFidelity {
+    pub fn tier(&self) -> FidelityTier {
+        if self.torn_lines > 0 || self.results_orphaned > 0 {
+            FidelityTier::Partial
+        } else if self.results_missing > 0 || self.images_omitted > 0 {
+            FidelityTier::High
+        } else {
+            FidelityTier::Full
+        }
+    }
+
+    /// One-line resume announcement:
+    /// `Imported from Claude · fidelity full · 42 turns · 20/20 tool calls`.
+    pub fn summary(&self, source: &str) -> String {
+        let mut s = format!(
+            "Imported from {source} · fidelity {} · {} turns",
+            self.tier().label(),
+            self.user_turns + self.assistant_turns,
+        );
+        if self.tool_calls > 0 {
+            s.push_str(&format!(
+                " · {}/{} tool calls",
+                self.results_paired, self.tool_calls
+            ));
+        }
+        s
+    }
+
+    /// Short degradation phrases, one per non-zero counter — empty at full
+    /// fidelity.
+    pub fn notes(&self) -> Vec<String> {
+        fn count(n: usize, noun: &str, detail: &str) -> String {
+            let s = if n == 1 { "" } else { "s" };
+            format!("{n} {noun}{s}{detail}")
+        }
+        let mut out = Vec::new();
+        if self.results_missing > 0 {
+            out.push(count(
+                self.results_missing,
+                "tool result",
+                " missing (placeholder inserted)",
+            ));
+        }
+        if self.results_orphaned > 0 {
+            out.push(count(
+                self.results_orphaned,
+                "orphaned tool result",
+                " dropped",
+            ));
+        }
+        if self.torn_lines > 0 {
+            out.push(count(self.torn_lines, "unparseable line", " skipped"));
+        }
+        if self.images_omitted > 0 {
+            out.push(count(self.images_omitted, "image", " omitted"));
+        }
+        if self.sidechain_lines > 0 {
+            out.push(count(
+                self.sidechain_lines,
+                "subagent line",
+                " not imported (task summaries retained)",
+            ));
+        }
+        out
+    }
 }
 
 /// The deterministic aivo session id a foreign session imports to: the source
@@ -351,6 +463,8 @@ struct TranscriptBuilder {
     engine: Vec<Value>,
     /// Unanswered tool-call ids from the most recent assistant, in order.
     pending: Vec<String>,
+    /// Builder-stage loss counters; importers seed the parse-stage ones.
+    fidelity: ImportFidelity,
 }
 
 impl TranscriptBuilder {
@@ -359,6 +473,7 @@ impl TranscriptBuilder {
     /// balanced by `tool` messages (unbalanced → provider 400 on replay).
     fn flush_pending(&mut self) {
         for id in std::mem::take(&mut self.pending) {
+            self.fidelity.results_missing += 1;
             self.engine
                 .push(json!({"role": "tool", "tool_call_id": id, "content": MISSING_RESULT}));
             self.display.push(display_row(
@@ -372,6 +487,7 @@ impl TranscriptBuilder {
 
     fn push_user(&mut self, text: String) {
         self.flush_pending();
+        self.fidelity.user_turns += 1;
         self.engine
             .push(json!({"role": "user", "content": text.clone()}));
         self.display.push(display_row("user", text, None, None));
@@ -390,6 +506,7 @@ impl TranscriptBuilder {
             if !text_present && thinking.is_none() {
                 return; // empty turn — nothing to replay or show
             }
+            self.fidelity.assistant_turns += 1;
             let content = text.unwrap_or_default();
             self.engine
                 .push(json!({"role": "assistant", "content": content.clone()}));
@@ -397,6 +514,8 @@ impl TranscriptBuilder {
                 .push(display_row("assistant", content, thinking, model));
             return;
         }
+        self.fidelity.assistant_turns += 1;
+        self.fidelity.tool_calls += calls.len();
         // Assistant with tool calls → one engine message (via `assistant_to_openai`
         // so `arguments` is stringified exactly as the live engine emits).
         let am = AssistantMessage {
@@ -433,10 +552,13 @@ impl TranscriptBuilder {
         // call was a filtered sidechain) — an unmatched `tool` message 400s.
         if let Some(pos) = self.pending.iter().position(|p| *p == id) {
             self.pending.remove(pos);
+            self.fidelity.results_paired += 1;
             self.engine
                 .push(json!({"role": "tool", "tool_call_id": id, "content": content.clone()}));
             self.display
                 .push(display_row("tool_result", content, None, None));
+        } else {
+            self.fidelity.results_orphaned += 1;
         }
     }
 
@@ -451,6 +573,7 @@ impl TranscriptBuilder {
             engine_messages: sanitize_alternation(self.engine),
             origin_model,
             updated_at,
+            fidelity: self.fidelity,
         }
     }
 }
@@ -503,6 +626,35 @@ fn sanitize_alternation(engine: Vec<Value>) -> Vec<Value> {
     out
 }
 
+/// `None` for blank separators (uncounted) and torn/partial lines (counted as lost).
+fn parse_transcript_line(line: &str, fidelity: &mut ImportFidelity) -> Option<Value> {
+    if line.trim().is_empty() {
+        return None;
+    }
+    match serde_json::from_str(line) {
+        Ok(v) => Some(v),
+        Err(_) => {
+            fidelity.torn_lines += 1;
+            None
+        }
+    }
+}
+
+/// `fidelity` seeds the parse-stage counters; the builder adds its own.
+fn build_transcript(
+    events: Vec<ImportEvent>,
+    fidelity: ImportFidelity,
+    origin_model: Option<String>,
+    updated_at: Option<DateTime<Utc>>,
+) -> ImportedTranscript {
+    let mut builder = TranscriptBuilder {
+        fidelity,
+        ..Default::default()
+    };
+    apply_events(&mut builder, events);
+    builder.finish(origin_model, updated_at.unwrap_or_else(Utc::now))
+}
+
 // ---------------------------------------------------------------------------
 // Claude Code: ~/.claude/projects/<enc-cwd>/*.jsonl
 // ---------------------------------------------------------------------------
@@ -518,16 +670,19 @@ pub async fn import_claude_session(path: &Path) -> Result<ImportedTranscript> {
     let mut events: Vec<ImportEvent> = Vec::new();
     let mut origin_model: Option<String> = None;
     let mut updated_at: Option<DateTime<Utc>> = None;
+    let mut fidelity = ImportFidelity::default();
 
     for line in data.lines() {
-        if line.trim().is_empty() {
+        let Some(v) = parse_transcript_line(line, &mut fidelity) else {
+            continue;
+        };
+        // Sidechains are subagent transcripts (counted — the Task summary on the
+        // main thread survives); meta lines are harness noise (not counted).
+        if flag(&v, "isSidechain") {
+            fidelity.sidechain_lines += 1;
             continue;
         }
-        let v: Value = match serde_json::from_str(line) {
-            Ok(v) => v,
-            Err(_) => continue, // torn/partial line
-        };
-        if flag(&v, "isSidechain") || flag(&v, "isMeta") {
+        if flag(&v, "isMeta") {
             continue;
         }
         let kind = v.get("type").and_then(|t| t.as_str()).unwrap_or("");
@@ -559,15 +714,12 @@ pub async fn import_claude_session(path: &Path) -> Result<ImportedTranscript> {
                     });
                 }
             }
-            "user" => parse_claude_user(message, &mut events),
+            "user" => parse_claude_user(message, &mut events, &mut fidelity),
             _ => {}
         }
     }
 
-    let updated_at = updated_at.unwrap_or_else(Utc::now);
-    let mut builder = TranscriptBuilder::default();
-    apply_events(&mut builder, events);
-    Ok(builder.finish(origin_model, updated_at))
+    Ok(build_transcript(events, fidelity, origin_model, updated_at))
 }
 
 /// Parse an assistant message's content into `(text, thinking, tool_calls)`.
@@ -616,7 +768,11 @@ fn parse_assistant_blocks(
 
 /// A Claude `user` line is either a real user turn (string content) or the
 /// carrier for tool outputs (an array of `tool_result` blocks) — often both.
-fn parse_claude_user(message: Option<&Value>, out: &mut Vec<ImportEvent>) {
+fn parse_claude_user(
+    message: Option<&Value>,
+    out: &mut Vec<ImportEvent>,
+    fidelity: &mut ImportFidelity,
+) {
     let Some(content) = message.and_then(|m| m.get("content")) else {
         return;
     };
@@ -634,7 +790,10 @@ fn parse_claude_user(message: Option<&Value>, out: &mut Vec<ImportEvent>) {
     for block in arr {
         match block.get("type").and_then(|t| t.as_str()).unwrap_or("") {
             "text" => append_block_text(&mut text, block, "text"),
-            "image" => push_joined(&mut text, IMAGE_PLACEHOLDER),
+            "image" => {
+                fidelity.images_omitted += 1;
+                push_joined(&mut text, IMAGE_PLACEHOLDER);
+            }
             "tool_result" => {
                 let id = block
                     .get("tool_use_id")
@@ -643,7 +802,7 @@ fn parse_claude_user(message: Option<&Value>, out: &mut Vec<ImportEvent>) {
                     .to_string();
                 out.push(ImportEvent::ToolResult {
                     id,
-                    content: claude_result_text(block.get("content")),
+                    content: claude_result_text(block.get("content"), fidelity),
                 });
             }
             _ => {}
@@ -656,7 +815,7 @@ fn parse_claude_user(message: Option<&Value>, out: &mut Vec<ImportEvent>) {
 }
 
 /// A `tool_result.content` is a string or an array of text/image blocks.
-fn claude_result_text(content: Option<&Value>) -> String {
+fn claude_result_text(content: Option<&Value>, fidelity: &mut ImportFidelity) -> String {
     match content {
         Some(Value::String(s)) => s.clone(),
         Some(Value::Array(arr)) => {
@@ -664,7 +823,10 @@ fn claude_result_text(content: Option<&Value>) -> String {
             for block in arr {
                 match block.get("type").and_then(|t| t.as_str()).unwrap_or("") {
                     "text" => append_block_text(&mut buf, block, "text"),
-                    "image" => push_joined(&mut buf, IMAGE_PLACEHOLDER),
+                    "image" => {
+                        fidelity.images_omitted += 1;
+                        push_joined(&mut buf, IMAGE_PLACEHOLDER);
+                    }
                     _ => {}
                 }
             }
@@ -701,14 +863,11 @@ pub async fn import_codex_session(path: &Path) -> Result<ImportedTranscript> {
     let mut events: Vec<ImportEvent> = Vec::new();
     let mut origin_model: Option<String> = None;
     let mut updated_at: Option<DateTime<Utc>> = None;
+    let mut fidelity = ImportFidelity::default();
 
     for line in data.lines() {
-        if line.trim().is_empty() {
+        let Some(v) = parse_transcript_line(line, &mut fidelity) else {
             continue;
-        }
-        let v: Value = match serde_json::from_str(line) {
-            Ok(v) => v,
-            Err(_) => continue,
         };
         capture_timestamp(&v, &mut updated_at);
         let kind = v.get("type").and_then(|t| t.as_str()).unwrap_or("");
@@ -791,10 +950,7 @@ pub async fn import_codex_session(path: &Path) -> Result<ImportedTranscript> {
         }
     }
 
-    let updated_at = updated_at.unwrap_or_else(Utc::now);
-    let mut builder = TranscriptBuilder::default();
-    apply_events(&mut builder, events);
-    Ok(builder.finish(origin_model, updated_at))
+    Ok(build_transcript(events, fidelity, origin_model, updated_at))
 }
 
 fn codex_call_id(payload: &Value) -> String {
@@ -850,12 +1006,10 @@ pub async fn import_pi_session(path: &Path) -> Result<ImportedTranscript> {
     let mut events: Vec<ImportEvent> = Vec::new();
     let mut origin_model: Option<String> = None;
     let mut updated_at: Option<DateTime<Utc>> = None;
+    let mut fidelity = ImportFidelity::default();
 
     for line in data.lines() {
-        if line.trim().is_empty() {
-            continue;
-        }
-        let Ok(v) = serde_json::from_str::<Value>(line) else {
+        let Some(v) = parse_transcript_line(line, &mut fidelity) else {
             continue;
         };
         capture_timestamp(&v, &mut updated_at);
@@ -908,10 +1062,7 @@ pub async fn import_pi_session(path: &Path) -> Result<ImportedTranscript> {
         }
     }
 
-    let updated_at = updated_at.unwrap_or_else(Utc::now);
-    let mut builder = TranscriptBuilder::default();
-    apply_events(&mut builder, events);
-    Ok(builder.finish(origin_model, updated_at))
+    Ok(build_transcript(events, fidelity, origin_model, updated_at))
 }
 
 fn apply_events(builder: &mut TranscriptBuilder, events: Vec<ImportEvent>) {
@@ -1090,6 +1241,23 @@ mod tests {
         // Provenance model carried on assistant rows.
         assert_eq!(t.origin_model.as_deref(), Some("claude-sonnet-4"));
         assert_eq!(t.messages[1].model.as_deref(), Some("claude-sonnet-4"));
+
+        let f = &t.fidelity;
+        assert_eq!(f.tier(), FidelityTier::Full);
+        assert_eq!(
+            (
+                f.user_turns,
+                f.assistant_turns,
+                f.tool_calls,
+                f.results_paired
+            ),
+            (1, 2, 1, 1)
+        );
+        assert!(f.notes().is_empty());
+        assert_eq!(
+            f.summary("Claude"),
+            "Imported from Claude · fidelity full · 3 turns · 1/1 tool calls"
+        );
     }
 
     #[tokio::test]
@@ -1103,6 +1271,10 @@ mod tests {
         }));
         let roles: Vec<&str> = t.messages.iter().map(|m| m.role.as_str()).collect();
         assert_eq!(roles, vec!["user", "assistant"]);
+        // Torn line = real loss → partial; sidechain is counted but informational.
+        assert_eq!(t.fidelity.torn_lines, 1);
+        assert_eq!(t.fidelity.sidechain_lines, 1);
+        assert_eq!(t.fidelity.tier(), FidelityTier::Partial);
     }
 
     #[tokio::test]
@@ -1124,6 +1296,9 @@ mod tests {
                 .count(),
             1
         );
+        assert_eq!(t.fidelity.results_orphaned, 1);
+        assert_eq!(t.fidelity.tier(), FidelityTier::Partial);
+        assert_eq!(t.fidelity.notes(), vec!["1 orphaned tool result dropped"]);
     }
 
     #[tokio::test]
@@ -1145,6 +1320,39 @@ mod tests {
             .collect();
         assert!(tool_ids.contains(&"a") && tool_ids.contains(&"b"));
         assert_eq!(role(t.engine_messages.last().unwrap()), "assistant");
+        // One call answered, one placeholder → high (conversation complete).
+        let f = &t.fidelity;
+        assert_eq!(
+            (f.tool_calls, f.results_paired, f.results_missing),
+            (2, 1, 1)
+        );
+        assert_eq!(f.tier(), FidelityTier::High);
+        assert_eq!(
+            f.summary("Claude"),
+            "Imported from Claude · fidelity high · 3 turns · 1/2 tool calls"
+        );
+    }
+
+    #[tokio::test]
+    async fn fidelity_counts_images_and_notes_read_cleanly() {
+        let jsonl = r#"
+{"type":"user","message":{"role":"user","content":[{"type":"text","text":"what is in this screenshot"},{"type":"image","source":{"type":"base64","data":"…"}}]}}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"a","name":"read_file","input":{}}]}}
+{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"a","content":[{"type":"text","text":"ok"},{"type":"image","source":{"type":"base64","data":"…"}}]}]}}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"a diagram"}]}}
+"#;
+        let t = import_claude_str(jsonl).await;
+        let f = &t.fidelity;
+        // One image in the user turn, one inside the tool result.
+        assert_eq!(f.images_omitted, 2);
+        assert_eq!(f.tier(), FidelityTier::High);
+        assert_eq!(f.notes(), vec!["2 images omitted"]);
+        // Torn/orphan loss outranks placeholder-only degradation.
+        let worse = ImportFidelity {
+            torn_lines: 1,
+            ..f.clone()
+        };
+        assert_eq!(worse.tier(), FidelityTier::Partial);
     }
 
     #[tokio::test]

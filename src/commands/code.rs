@@ -690,7 +690,7 @@ impl CodeCommand {
                             let rendered =
                                 crate::services::context_render::render_for_aivo_code(&thread);
                             let summary = format!(
-                                "{} (context digest — no importer for {} sessions)",
+                                "{} (context digest — no {} importer)",
                                 crate::commands::run::context_injection_summary(&rendered, &thread),
                                 thread.cli,
                             );

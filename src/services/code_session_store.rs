@@ -503,8 +503,11 @@ impl CodeSessionStore {
             .unwrap_or_else(|| cwd.to_string());
         // Preserve any durable agent-engine transcript across this (text-only) save
         // so a per-turn or heartbeat persist can't wipe it; `save_agent_messages`
-        // refreshes it after a turn (when the engine is lockable).
-        let engine_messages = existing.and_then(|s| s.engine_messages);
+        // refreshes it after a turn (when the engine is lockable). The import
+        // fidelity stamp is preserved the same way.
+        let (engine_messages, import_fidelity) = existing
+            .map(|s| (s.engine_messages, s.import_fidelity))
+            .unwrap_or_default();
         let state = CodeSessionState {
             session_id: session_id.to_string(),
             key_id: key_id.to_string(),
@@ -513,6 +516,7 @@ impl CodeSessionStore {
             model: model.to_string(),
             messages: messages.to_vec(),
             engine_messages,
+            import_fidelity,
             updated_at: now.clone(),
             created_at: created_at.clone(),
         };
@@ -580,6 +584,24 @@ impl CodeSessionStore {
         } else {
             Some(engine_messages.to_vec())
         };
+        self.save_session_file(&state).await
+    }
+
+    /// Write-once fidelity stamp; no-op when the session file is absent or
+    /// already stamped (the creating text save can't carry it).
+    pub(crate) async fn set_import_fidelity(
+        &self,
+        session_id: &str,
+        fidelity: &crate::services::session_import::ImportFidelity,
+    ) -> Result<()> {
+        let _lock = self.acquire_session_lock()?;
+        let Ok(mut state) = self.load_session_file(session_id).await else {
+            return Ok(());
+        };
+        if state.import_fidelity.is_some() {
+            return Ok(());
+        }
+        state.import_fidelity = Some(fidelity.clone());
         self.save_session_file(&state).await
     }
 

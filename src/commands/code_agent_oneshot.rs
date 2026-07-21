@@ -93,6 +93,8 @@ struct CapturedRun {
     conversation: Vec<Value>,
     session_id: String,
     resumed_messages: Vec<crate::services::session_store::StoredChatMessage>,
+    /// Conversion loss accounting to stamp onto a fresh fork's first persist.
+    import_fidelity: Option<crate::services::session_import::ImportFidelity>,
     cwd: String,
     model: String,
     prompt: String,
@@ -308,6 +310,7 @@ async fn run_agent_captured(
         .as_ref()
         .map(|s| s.session_id.clone())
         .unwrap_or_else(crate::commands::code::new_code_session_id);
+    let import_fidelity = resumed.as_ref().and_then(|s| s.import_fidelity.clone());
     let resumed_messages = resumed.map(|s| s.messages).unwrap_or_default();
 
     // Eval/CI hook: AIVO_AGENT_FAKE_SSE=<script> swaps the provider for a scripted
@@ -401,6 +404,7 @@ async fn run_agent_captured(
         conversation,
         session_id,
         resumed_messages,
+        import_fidelity,
         cwd,
         model: effective_model,
         prompt: prompt_for_log,
@@ -441,6 +445,12 @@ async fn finalize(
         let _ = session_store
             .save_agent_messages(&cap.session_id, &cap.conversation)
             .await;
+        // Write-once in the setter — a saved fork is already stamped.
+        if let Some(fidelity) = &cap.import_fidelity {
+            let _ = session_store
+                .set_import_fidelity(&cap.session_id, fidelity)
+                .await;
+        }
         if cap.ui.format == OutputFormat::Text {
             eprintln!("[session {0} — continue with --resume {0}]", cap.session_id);
         }
@@ -720,6 +730,15 @@ async fn resolve_resume_session(
                     Ok(state)
                 }
                 ForeignResume::Fresh(transcript) => {
+                    eprintln!(
+                        "  {} {}",
+                        crate::style::arrow_symbol(),
+                        transcript
+                            .fidelity
+                            .summary(crate::services::session_import::source_label(
+                                &imp.origin.cli
+                            )),
+                    );
                     let now = chrono::Utc::now().to_rfc3339();
                     Ok(crate::services::session_store::CodeSessionState {
                         session_id: imp.aivo_id,
@@ -730,6 +749,7 @@ async fn resolve_resume_session(
                         model: String::new(),
                         messages: transcript.messages,
                         engine_messages: Some(transcript.engine_messages),
+                        import_fidelity: Some(transcript.fidelity),
                         updated_at: now.clone(),
                         created_at: now,
                     })

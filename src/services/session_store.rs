@@ -904,6 +904,14 @@ pub struct CodeSessionState {
         skip_serializing_if = "Option::is_none"
     )]
     pub engine_messages: Option<Vec<serde_json::Value>>,
+    /// Loss accounting from the foreign-transcript conversion this fork began
+    /// as. Absent for native sessions and pre-feature forks.
+    #[serde(
+        rename = "importFidelity",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub import_fidelity: Option<crate::services::session_import::ImportFidelity>,
     #[serde(rename = "updatedAt")]
     pub updated_at: String,
     #[serde(rename = "createdAt", default)]
@@ -2378,6 +2386,17 @@ impl SessionStore {
     ) -> Result<()> {
         self.sessions
             .save_agent_messages(session_id, engine_messages)
+            .await
+    }
+
+    /// Write-once; no-op when the session is absent or already stamped.
+    pub async fn set_import_fidelity(
+        &self,
+        session_id: &str,
+        fidelity: &crate::services::session_import::ImportFidelity,
+    ) -> Result<()> {
+        self.sessions
+            .set_import_fidelity(session_id, fidelity)
             .await
     }
 

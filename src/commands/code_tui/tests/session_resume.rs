@@ -549,6 +549,7 @@ async fn test_resume_resets_plan_and_goal_state() {
         engine_messages: None,
         pristine_import: false,
         source_newer: false,
+        import_fidelity: None,
     };
     app.apply_loaded_session(session).await.unwrap();
 
@@ -563,6 +564,68 @@ async fn test_resume_resets_plan_and_goal_state() {
         "card index points at replaced history"
     );
     assert!(app.goal_mode.is_none());
+}
+
+#[tokio::test]
+async fn test_fresh_import_announces_fidelity_saved_fork_stays_silent() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    let fidelity = crate::services::session_import::ImportFidelity {
+        user_turns: 3,
+        assistant_turns: 4,
+        tool_calls: 2,
+        results_paired: 1,
+        results_missing: 1,
+        ..Default::default()
+    };
+
+    let session = LoadedSession {
+        key_id: app.key.id.clone(),
+        session_id: "claude-deadbeef".to_string(),
+        raw_model: "m1".to_string(),
+        messages: vec![],
+        engine_messages: None,
+        pristine_import: true,
+        source_newer: false,
+        import_fidelity: Some(fidelity.clone()),
+    };
+    app.apply_loaded_session(session).await.unwrap();
+
+    let notice = app.notice.as_ref().map(|(_, n)| n.clone()).unwrap();
+    assert_eq!(
+        notice,
+        "Imported from Claude · fidelity high · 7 turns · 1/2 tool calls"
+    );
+    assert_eq!(app.import_fidelity, Some(fidelity));
+
+    // A saved fork carries its stamp from disk — no announce on re-open.
+    let saved = LoadedSession {
+        key_id: app.key.id.clone(),
+        session_id: "claude-deadbeef".to_string(),
+        raw_model: "m1".to_string(),
+        messages: vec![],
+        engine_messages: None,
+        pristine_import: false,
+        source_newer: false,
+        import_fidelity: Some(crate::services::session_import::ImportFidelity::default()),
+    };
+    app.notice = None;
+    app.apply_loaded_session(saved).await.unwrap();
+    assert!(
+        app.notice.is_none(),
+        "fidelity announces only on first open"
+    );
+}
+
+#[tokio::test]
+async fn test_new_chat_clears_import_fidelity() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.import_fidelity = Some(crate::services::session_import::ImportFidelity::default());
+
+    app.start_new_chat();
+
+    assert!(app.import_fidelity.is_none());
 }
 
 #[tokio::test]
@@ -1113,6 +1176,7 @@ async fn test_resume_resets_agent_engine() {
         ]),
         pristine_import: false,
         source_newer: false,
+        import_fidelity: None,
     };
     app.apply_loaded_session(session).await.unwrap();
 
@@ -1165,6 +1229,7 @@ async fn test_resume_footer_estimate_uses_durable_transcript() {
         ]),
         pristine_import: false,
         source_newer: false,
+        import_fidelity: None,
     };
     app.apply_loaded_session(session).await.unwrap();
 
@@ -1223,6 +1288,7 @@ async fn test_resume_restores_session_cost_and_billed_model() {
         engine_messages: None,
         pristine_import: false,
         source_newer: false,
+        import_fidelity: None,
     };
     app.apply_loaded_session(session).await.unwrap();
 
@@ -1261,6 +1327,7 @@ async fn test_resume_does_not_overwrite_persisted_default_model() {
         engine_messages: None,
         pristine_import: false,
         source_newer: false,
+        import_fidelity: None,
     };
     app.apply_loaded_session(session).await.unwrap();
 

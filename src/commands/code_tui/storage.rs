@@ -80,6 +80,7 @@ pub(super) async fn load_or_import_resume_session(
                 engine_messages: Some(transcript.engine_messages),
                 pristine_import: true,
                 source_newer: false,
+                import_fidelity: Some(transcript.fidelity),
             }),
         };
     }

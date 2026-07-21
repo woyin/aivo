@@ -2783,6 +2783,7 @@ pieces and keep going"
         self.cancel_inflight_request(CancelKind::Discard);
         self.overlay = Overlay::None;
         self.pristine_import_len = None;
+        self.import_fidelity = None;
         self.history.clear();
         self.agent_turn_indices.clear();
         self.expanded_thinking.clear();

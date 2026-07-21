@@ -803,6 +803,9 @@ pub(super) struct LoadedSession {
     /// than the fork has seen (the histories diverged) — surfaced as a notice
     /// so loading the older fork is never silent.
     pub(super) source_newer: bool,
+    /// From the converter on a first-open import, from the persisted stamp on
+    /// a saved fork; `None` for native sessions and pre-feature forks.
+    pub(super) import_fidelity: Option<crate::services::session_import::ImportFidelity>,
 }
 
 impl LoadedSession {
@@ -815,6 +818,7 @@ impl LoadedSession {
             engine_messages: state.engine_messages,
             pristine_import: false,
             source_newer: false,
+            import_fidelity: state.import_fidelity,
         }
     }
 }
@@ -2758,6 +2762,9 @@ pub(super) struct CodeTuiApp {
     /// Claude/Codex session creates no aivo copy; the first real turn grows it
     /// past the baseline and it persists as a fork. `None` for every other session.
     pub(super) pristine_import_len: Option<usize>,
+    /// Fidelity of the foreign import this session began as, surfaced in
+    /// `/session`. Set on resume; cleared on `/new`.
+    pub(super) import_fidelity: Option<crate::services::session_import::ImportFidelity>,
     /// Active `/goal` autonomous loop, or `None`. Drives auto-continuation between
     /// agent turns; cleared on completion, the iteration cap, `/goal stop`, an
     /// interrupt, `/new`, resume, or a key/model switch.
@@ -3235,6 +3242,7 @@ impl CodeTuiApp {
             cursor_plan_mode: false,
             pending_agent_messages: None,
             pristine_import_len: None,
+            import_fidelity: None,
             goal_mode: None,
             goal_guard_stop: None,
             plan_mode: false,

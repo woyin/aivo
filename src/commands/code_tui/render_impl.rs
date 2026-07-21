@@ -2760,10 +2760,15 @@ impl CodeTuiApp {
         // this thread began in Claude/Codex/Pi (its id also stays `import-<cli>-…`).
         if let Some(source) = crate::services::session_import::import_source_label(&self.session_id)
         {
+            let fidelity = self
+                .import_fidelity
+                .as_ref()
+                .map(|f| format!(" · fidelity {}", f.tier().label()))
+                .unwrap_or_default();
             lines.push(line_with_plain(vec![
                 Span::styled("↳ ", Style::default().fg(ACCENT())),
                 Span::styled(
-                    format!("Forked from a {source} session · /session for details"),
+                    format!("Forked from a {source} session{fidelity} · /session for details"),
                     Style::default().fg(MUTED()),
                 ),
             ]));

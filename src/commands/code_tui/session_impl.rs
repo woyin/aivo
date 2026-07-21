@@ -2637,6 +2637,14 @@ is preserved."
                 .save_agent_messages(&self.session_id, &conversation)
                 .await;
         }
+        // After the text save (the setter no-ops without a session file);
+        // write-once, so every later persist is a no-op.
+        if let Some(fidelity) = &self.import_fidelity {
+            let _ = self
+                .session_store
+                .set_import_fidelity(&self.session_id, fidelity)
+                .await;
+        }
         Ok(())
     }
 
@@ -2739,6 +2747,7 @@ is preserved."
         // A freshly-opened foreign import lives in memory only until a real turn
         // grows the transcript past this baseline (then it persists as a fork).
         self.pristine_import_len = session.pristine_import.then_some(self.history.len());
+        self.import_fidelity = session.import_fidelity;
         self.draft.clear();
         self.cursor = 0;
         self.command_menu.reset();
@@ -2778,6 +2787,13 @@ is preserved."
             ));
         } else if let Some(msg) = key_fallback_notice {
             self.notice = Some((MUTED(), msg));
+        } else if session.pristine_import
+            && let Some(fidelity) = &self.import_fidelity
+        {
+            // Announce fidelity on first open only; a saved fork re-opens silently.
+            let label = crate::services::session_import::import_source_label(&self.session_id)
+                .unwrap_or("import");
+            self.notice = Some((MUTED(), fidelity.summary(label)));
         }
         // Session-local: no persist, so viewing an old chat can't reset the key's
         // default model. Only explicit `/model` and `/key` persist.
