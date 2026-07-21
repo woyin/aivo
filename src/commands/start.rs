@@ -680,12 +680,12 @@ mod tests {
     }
 
     #[test]
-    fn codex_app_offered_only_on_macos() {
+    fn codex_app_offered_only_where_the_desktop_app_ships() {
         let offered = AIToolType::all()
             .iter()
             .filter(|t| t.supported_on_current_platform())
             .any(|t| *t == AIToolType::CodexApp);
-        assert_eq!(offered, cfg!(target_os = "macos"));
+        assert_eq!(offered, cfg!(any(target_os = "macos", windows)));
     }
 
     #[test]
