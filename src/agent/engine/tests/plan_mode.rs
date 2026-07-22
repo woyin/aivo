@@ -348,10 +348,7 @@ async fn live_plan_exit_drops_floor_mid_turn() {
     let dir = tmp();
     // Write-redirect: not read-only, so the plan floor would prompt (see
     // `plan_mode_bash_always_prompts`).
-    let bash = tool_call_sse(
-        "run_bash",
-        json!({ "command": format!("cd {} && echo data > probe.txt", dir.display()) }),
-    );
+    let bash = tool_call_sse("run_bash", json!({ "command": "echo data > probe.txt" }));
     let port = spawn_sse_sequence(vec![bash, FINAL_TEXT_SSE.to_string()]);
     let client = reqwest::Client::builder().no_proxy().build().unwrap();
     let base = format!("http://127.0.0.1:{port}");
