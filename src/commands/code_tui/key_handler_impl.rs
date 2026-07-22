@@ -1366,6 +1366,7 @@ impl CodeTuiApp {
             }
             KeyCode::Enter => match self.queue_row_recall(&rows[selected]) {
                 Some(text) => {
+                    self.clear_queue_notice();
                     self.queue_focus = None;
                     self.draft = text;
                     self.cursor = self.draft.len();
@@ -1376,7 +1377,9 @@ impl CodeTuiApp {
                 }
             },
             KeyCode::Backspace | KeyCode::Delete => {
-                if !self.queue_row_remove(&rows[selected]) {
+                if self.queue_row_remove(&rows[selected]) {
+                    self.clear_queue_notice();
+                } else {
                     self.notice = Some((MUTED(), QUEUE_ROW_GONE_NOTICE.to_string()));
                 }
                 match self.queued_rows().len() {
@@ -1385,7 +1388,9 @@ impl CodeTuiApp {
                 }
             }
             KeyCode::Char('d') if ctrl => {
-                if !self.queue_row_remove(&rows[selected]) {
+                if self.queue_row_remove(&rows[selected]) {
+                    self.clear_queue_notice();
+                } else {
                     self.notice = Some((MUTED(), QUEUE_ROW_GONE_NOTICE.to_string()));
                 }
                 match self.queued_rows().len() {
@@ -1402,6 +1407,15 @@ impl CodeTuiApp {
             }
         }
         Some(false)
+    }
+
+    fn clear_queue_notice(&mut self) {
+        let stale = matches!(&self.notice, Some((_, text)) if text.starts_with("Queued")
+            || text.contains(" queued — ")
+            || text == QUEUE_ROW_GONE_NOTICE);
+        if stale {
+            self.notice = None;
+        }
     }
 
     async fn handle_global_key(&mut self, key: KeyEvent) -> Result<Option<bool>> {

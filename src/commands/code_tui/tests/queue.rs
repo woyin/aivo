@@ -318,6 +318,75 @@ async fn test_queue_focus_delete_clamps_and_exits_when_empty() {
     assert_eq!(app.queue_focus, None, "focus exits with the last row");
 }
 
+/// Deleting a queued row drops the stale "Queued …" tip with it.
+#[tokio::test]
+async fn test_queue_focus_delete_clears_stale_queue_tip() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.sending = true;
+    app.queued_messages = vec!["fix login".to_string()];
+    app.notice = Some((
+        MUTED(),
+        "Queued — sends when the current turn finishes".to_string(),
+    ));
+
+    app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE))
+        .await
+        .unwrap();
+    app.handle_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE))
+        .await
+        .unwrap();
+    assert!(app.queued_messages.is_empty());
+    assert_eq!(app.notice, None, "queue tip clears with the deleted row");
+}
+
+/// Recalling a steering row clears its "Queued —…" tip too.
+#[tokio::test]
+async fn test_queue_focus_recall_clears_steering_queue_tip() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.sending = true;
+    app.steering_queue
+        .lock()
+        .unwrap()
+        .push("steer it".to_string());
+    app.notice = Some((
+        MUTED(),
+        "Queued — the agent picks it up after the current tool step".to_string(),
+    ));
+
+    app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE))
+        .await
+        .unwrap();
+    app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        .await
+        .unwrap();
+    assert_eq!(app.draft, "steer it");
+    assert_eq!(app.notice, None, "queue tip clears with the recalled row");
+}
+
+/// A queue edit only clears queue tips — unrelated notices survive.
+#[tokio::test]
+async fn test_queue_focus_delete_keeps_unrelated_notice() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.sending = true;
+    app.queued_messages = vec!["fix login".to_string()];
+    app.notice = Some((ERROR(), "Copy failed: nope".to_string()));
+
+    app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE))
+        .await
+        .unwrap();
+    app.handle_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL))
+        .await
+        .unwrap();
+    assert!(app.queued_messages.is_empty());
+    assert!(
+        matches!(&app.notice, Some((_, msg)) if msg == "Copy failed: nope"),
+        "non-queue notice survives a queue edit"
+    );
+}
+
 /// Reorder stays within a segment — delivery semantics differ across them.
 #[tokio::test]
 async fn test_queue_focus_reorder_within_segment_not_across() {
