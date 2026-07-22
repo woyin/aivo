@@ -229,8 +229,9 @@ pub async fn refresh(creds: &mut KimiOAuthCredential) -> Result<()> {
     let status = resp.status();
     if !status.is_success() {
         let body = resp.text().await.unwrap_or_default();
-        let relogin_hint = if matches!(status.as_u16(), 401 | 403) {
-            " — run `aivo keys add kimi` to sign in again"
+        // 400..=404 mirrors `is_oauth_invalid_grant`.
+        let relogin_hint = if matches!(status.as_u16(), 400..=404) {
+            crate::services::oauth_credential::REAUTH_HINT
         } else {
             ""
         };
@@ -303,9 +304,16 @@ pub async fn fetch_models(
         );
     }
     if !status.is_success() {
+        // After ensure_fresh above, 401/403 means the sign-in itself is dead.
+        let relogin_hint = if matches!(status.as_u16(), 401 | 403) {
+            crate::services::oauth_credential::REAUTH_HINT
+        } else {
+            ""
+        };
         anyhow::bail!(
-            "kimi models request failed ({}): {}",
+            "kimi models request failed ({}){}: {}",
             status.as_u16(),
+            relogin_hint,
             redact_oauth_body(&body)
         );
     }

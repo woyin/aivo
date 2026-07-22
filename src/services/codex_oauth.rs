@@ -235,9 +235,16 @@ pub async fn refresh(creds: &mut CodexOAuthCredential) -> Result<()> {
     let status = resp.status();
     if !status.is_success() {
         let body = resp.text().await.unwrap_or_default();
+        // 400..=404 mirrors `is_oauth_invalid_grant`; serve/router paths can't re-login interactively.
+        let relogin_hint = if matches!(status.as_u16(), 400..=404) {
+            crate::services::oauth_credential::REAUTH_HINT
+        } else {
+            ""
+        };
         anyhow::bail!(
-            "refresh failed ({}): {}",
+            "refresh failed ({}){}: {}",
             status.as_u16(),
+            relogin_hint,
             redact_oauth_body(&body)
         );
     }

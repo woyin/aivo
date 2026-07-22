@@ -11,6 +11,10 @@ use anyhow::Result;
 
 use crate::services::session_store::{ApiKey, SessionStore};
 
+/// Appended to auth-shaped OAuth failures; `aivo keys reauth` re-runs the
+/// provider login in place (unlike `keys edit`, which is for plain API keys).
+pub(crate) const REAUTH_HINT: &str = " — run `aivo keys reauth` to sign in again";
+
 /// A refreshable OAuth credential. `refresh` is the provider's own token
 /// exchange (endpoint, headers, expiry default all provider-specific).
 pub(crate) trait OAuthCredential {

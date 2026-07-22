@@ -228,9 +228,16 @@ pub async fn refresh(creds: &mut GrokOAuthCredential) -> Result<()> {
     let status = resp.status();
     if !status.is_success() {
         let body = resp.text().await.unwrap_or_default();
+        // 400..=404 mirrors `is_oauth_invalid_grant`; xAI revokes rotated refresh tokens.
+        let relogin_hint = if matches!(status.as_u16(), 400..=404) {
+            crate::services::oauth_credential::REAUTH_HINT
+        } else {
+            ""
+        };
         anyhow::bail!(
-            "refresh failed ({}): {}",
+            "refresh failed ({}){}: {}",
             status.as_u16(),
+            relogin_hint,
             redact_oauth_body(&body)
         );
     }
@@ -292,9 +299,15 @@ pub async fn fetch_model_ids(
     let status = resp.status();
     let body = resp.text().await.unwrap_or_default();
     if !status.is_success() {
+        let relogin_hint = if matches!(status.as_u16(), 401 | 403) {
+            crate::services::oauth_credential::REAUTH_HINT
+        } else {
+            ""
+        };
         anyhow::bail!(
-            "grok models request failed ({}): {}",
+            "grok models request failed ({}){}: {}",
             status.as_u16(),
+            relogin_hint,
             redact_oauth_body(&body)
         );
     }

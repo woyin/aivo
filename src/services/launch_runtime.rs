@@ -1565,6 +1565,11 @@ mod tests {
         assert!(is_oauth_invalid_grant(&anyhow::anyhow!(
             "refresh failed (403): forbidden"
         )));
+        // The appended reauth hint must not break the status-prefix match.
+        assert!(is_oauth_invalid_grant(&anyhow::anyhow!(
+            "refresh failed (400){}: invalid_grant",
+            crate::services::oauth_credential::REAUTH_HINT
+        )));
     }
 
     #[test]

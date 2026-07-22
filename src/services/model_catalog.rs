@@ -332,13 +332,30 @@ fn format_token_count(n: u64) -> String {
 /// when present and dropping HTML payloads. Replaces the raw multi-KB HTML
 /// page that providers return for missing endpoints.
 fn friendly_api_error(status: reqwest::StatusCode, body: &str) -> anyhow::Error {
+    friendly_api_error_with_hint(status, body, status_hint(status))
+}
+
+/// `friendly_api_error` variant for OAuth endpoints: 401/403 points at `aivo
+/// keys reauth` instead of the API-key hint `status_hint` gives.
+fn friendly_oauth_api_error(status: reqwest::StatusCode, body: &str) -> anyhow::Error {
+    let hint = match status.as_u16() {
+        401 | 403 => Some("sign-in expired or revoked — run `aivo keys reauth` to sign in again"),
+        _ => status_hint(status),
+    };
+    friendly_api_error_with_hint(status, body, hint)
+}
+
+fn friendly_api_error_with_hint(
+    status: reqwest::StatusCode,
+    body: &str,
+    hint: Option<&str>,
+) -> anyhow::Error {
     let lead = if status == reqwest::StatusCode::NOT_FOUND {
         "No models found"
     } else {
         "Could not fetch models"
     };
     let detail = extract_error_detail(body);
-    let hint = status_hint(status);
     let reason = match (detail, hint) {
         (Some(d), Some(h)) => format!("{} ({})", d, h),
         (Some(d), None) => d,
@@ -755,7 +772,7 @@ pub(crate) async fn fetch_models_detailed_filtered(
         if !response.status().is_success() {
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
-            return Err(friendly_api_error(status, &body));
+            return Err(friendly_oauth_api_error(status, &body));
         }
         let resp: OpenAIModelsResponse = response.json().await?;
         let scale = infer_price_scale(&resp.data);
@@ -1505,6 +1522,27 @@ mod tests {
         assert!(s.contains("Invalid API key"));
         assert!(s.contains("aivo keys"));
         assert!(!s.contains("401"));
+    }
+
+    #[test]
+    fn friendly_oauth_api_error_401_points_at_reauth() {
+        let err = friendly_oauth_api_error(
+            reqwest::StatusCode::UNAUTHORIZED,
+            r#"{"error":{"message":"OAuth token expired"}}"#,
+        );
+        let s = err.to_string();
+        assert!(s.starts_with("Could not fetch models"));
+        assert!(s.contains("OAuth token expired"));
+        assert!(s.contains("aivo keys reauth"));
+        assert!(!s.contains("check the API key"));
+    }
+
+    #[test]
+    fn friendly_oauth_api_error_non_auth_status_keeps_generic_hint() {
+        let err = friendly_oauth_api_error(reqwest::StatusCode::INTERNAL_SERVER_ERROR, "");
+        let s = err.to_string();
+        assert!(s.contains("server error"));
+        assert!(!s.contains("reauth"));
     }
 
     #[test]
