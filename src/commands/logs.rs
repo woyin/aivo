@@ -275,7 +275,7 @@ impl LogsCommand {
     }
 
     /// `aivo logs prune` — delete chat events in logs.db whose session file
-    /// has been removed. Confirms unless `--force` is set.
+    /// has been removed. Confirms unless `-y`/`--yes` (alias `--force`) is set.
     async fn prune_orphans(&self, args: &LogsArgs) -> Result<ExitCode> {
         let orphan_ids = compute_orphan_code_ids(&self.session_store).await;
         if orphan_ids.is_empty() {
@@ -610,16 +610,16 @@ fn print_help_prune() {
     println!(
         "{}",
         style::dim(
-            "Delete logs.db code events whose session file is gone (prompts unless --force). Native session files are not touched."
+            "Delete logs.db code events whose session file is gone (prompts unless -y). Native session files are not touched."
         )
     );
     println!();
     println!("{}", style::bold("Options:"));
-    logs_help_row("-f, --force", "Skip the confirmation prompt and delete");
+    logs_help_row("-y, --yes", "Skip the confirmation prompt and delete");
     println!();
     println!("{}", style::bold("Examples:"));
     println!("  {}", style::dim("aivo logs prune"));
-    println!("  {}", style::dim("aivo logs prune --force"));
+    println!("  {}", style::dim("aivo logs prune -y"));
 }
 
 fn validate_args(args: &LogsArgs) -> Result<()> {

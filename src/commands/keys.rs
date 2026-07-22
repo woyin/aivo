@@ -730,6 +730,16 @@ impl PingStatus {
         }
     }
 
+    /// Exit status this ping contributes to, so scripts can gate on `keys ping`.
+    pub fn exit_code(&self) -> ExitCode {
+        match self {
+            PingStatus::Ok => ExitCode::Success,
+            PingStatus::AuthError => ExitCode::AuthError,
+            PingStatus::Unreachable | PingStatus::Timeout => ExitCode::NetworkError,
+            PingStatus::Error(_) => ExitCode::UserError,
+        }
+    }
+
     /// Machine-readable identifier used in structured output.
     pub fn json_key(&self) -> &'static str {
         match self {
@@ -1136,12 +1146,15 @@ impl KeysCommand {
             .max()
             .unwrap_or(0);
 
+        // Worst result across keys, so any failure yields a non-zero exit.
+        let mut worst = ExitCode::Success;
         ping_keys_streaming(keys, |_id, result| {
             print_ping_result(result, max_name_len);
+            worst = worst.worse_of(result.status.exit_code());
         })
         .await;
 
-        Ok(ExitCode::Success)
+        Ok(worst)
     }
 
     /// Lists all API keys
@@ -4259,6 +4272,19 @@ mod tests {
         assert_eq!(PingStatus::Unreachable.message(), "unreachable");
         assert_eq!(PingStatus::Timeout.icon(), "✗");
         assert_eq!(PingStatus::Timeout.message(), "timeout");
+    }
+
+    #[test]
+    fn test_ping_status_exit_code() {
+        use crate::errors::ExitCode;
+        assert_eq!(PingStatus::Ok.exit_code(), ExitCode::Success);
+        assert_eq!(PingStatus::AuthError.exit_code(), ExitCode::AuthError);
+        assert_eq!(PingStatus::Unreachable.exit_code(), ExitCode::NetworkError);
+        assert_eq!(PingStatus::Timeout.exit_code(), ExitCode::NetworkError);
+        assert_eq!(
+            PingStatus::Error("boom".into()).exit_code(),
+            ExitCode::UserError
+        );
     }
 
     #[test]

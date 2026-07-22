@@ -94,10 +94,13 @@ impl InfoCommand {
         let last_sel = self.session_store.get_last_selection().await?;
         let selected_key_id = last_sel.as_ref().map(|s| s.key_id.as_str());
         let mut has_problems = false;
+        // Keeps the auth/network distinction instead of collapsing every fail to 1.
+        let mut worst = ExitCode::Success;
 
         // 1. Config
-        if check {
-            has_problems |= self.check_config();
+        if check && self.check_config() {
+            has_problems = true;
+            worst = worst.worse_of(ExitCode::UserError);
         }
 
         // 2. Keys
@@ -121,6 +124,7 @@ impl InfoCommand {
             if check {
                 ping_keys_streaming(keys.clone(), |id, result| {
                     has_problems |= print_key_result(id, result, selected_key_id, max_name_len);
+                    worst = worst.worse_of(result.status.exit_code());
                 })
                 .await;
             } else {
@@ -214,7 +218,7 @@ impl InfoCommand {
                     "{}",
                     style::yellow("Some checks failed. See details above.")
                 );
-                return Ok(ExitCode::UserError);
+                return Ok(worst.worse_of(ExitCode::UserError));
             } else {
                 println!("{}", style::green("All checks passed."));
             }
@@ -234,6 +238,8 @@ impl InfoCommand {
         let config_path = self.session_store.get_config_path();
         let config_exists = config_path.exists();
 
+        // Mirrors the human path's auth/network exit distinction.
+        let mut worst = ExitCode::Success;
         let (has_problems, mut ping_by_id) = if check && !keys.is_empty() {
             let mut map: HashMap<String, Value> = HashMap::new();
             let mut any_failed = false;
@@ -242,6 +248,7 @@ impl InfoCommand {
                 if !matches!(result.status, PingStatus::Ok) {
                     any_failed = true;
                 }
+                worst = worst.worse_of(result.status.exit_code());
                 map.insert(id.to_string(), ping_result_json(result));
             })
             .await;
@@ -332,7 +339,7 @@ impl InfoCommand {
         println!("{}", serde_json::to_string_pretty(&payload)?);
 
         if check && (!config_exists || has_problems) {
-            return Ok(ExitCode::UserError);
+            return Ok(worst.worse_of(ExitCode::UserError));
         }
         Ok(ExitCode::Success)
     }

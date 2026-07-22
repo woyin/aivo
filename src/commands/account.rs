@@ -85,7 +85,14 @@ impl AccountCommand {
                 )
                 .await;
             }
-            return info_json(sync, usage);
+            // Unreachable with nothing to report: exit non-zero like the human path.
+            let unreachable_no_data = matches!(sync, AccountSync::Unverified(None))
+                && !matches!(usage, AccountUsage::Linked(_));
+            let code = info_json(sync, usage);
+            if code == ExitCode::Success && unreachable_no_data {
+                return ExitCode::NetworkError;
+            }
+            return code;
         }
 
         let sync = spin(" Checking account…", sync_account_status()).await;
@@ -98,13 +105,21 @@ impl AccountCommand {
                 a.display(),
                 style::dim("(unverified — couldn't reach the server)")
             ),
-            AccountSync::Unlinked { .. } | AccountSync::Unverified(None) => {
+            AccountSync::Unlinked { .. } => {
                 println!(
                     "{} {}",
                     style::bold("Account:"),
                     style::dim("not logged in (run `aivo account login`)")
                 );
                 return ExitCode::Success;
+            }
+            // Unreachable with nothing cached: a network failure, not "not logged in".
+            AccountSync::Unverified(None) => {
+                eprintln!(
+                    "{} Couldn't reach the aivo account service.",
+                    style::red("Error:")
+                );
+                return ExitCode::NetworkError;
             }
         }
 

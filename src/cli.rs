@@ -998,8 +998,9 @@ pub struct LogsArgs {
     #[arg(long, hide = true)]
     pub debug_local_only: bool,
 
-    /// `logs prune`: skip the interactive confirmation and delete immediately.
-    #[arg(short = 'f', long)]
+    /// `logs prune`: skip the confirmation and delete. `-f/--force` are
+    /// back-compat aliases for the project-wide `-y/--yes` convention.
+    #[arg(short = 'y', long = "yes", short_alias = 'f', alias = "force")]
     pub force: bool,
 }
 
@@ -1180,6 +1181,18 @@ pub fn parse_env_vars(env_strings: &[String]) -> HashMap<String, String> {
     }
 
     env_map
+}
+
+/// Warns about `--env` values that aren't `KEY=VALUE` (silently dropped by
+/// [`parse_env_vars`]) and nudges toward `code -e`, since a bare value is
+/// usually muscle memory of that flag's `--exec` meaning.
+pub fn warn_malformed_env(env_strings: &[String]) {
+    for raw in env_strings.iter().filter(|e| !e.contains('=')) {
+        eprintln!(
+            "{} ignoring --env {raw:?}: expected KEY=VALUE (for a one-shot prompt use `aivo code -e`)",
+            crate::style::yellow("Warning:"),
+        );
+    }
 }
 
 #[cfg(test)]
@@ -1483,6 +1496,20 @@ mod tests {
         } else {
             panic!("Expected Serve command");
         }
+    }
+
+    #[test]
+    fn test_logs_prune_skip_confirm_flag_and_aliases() {
+        let force_of = |args: &[&str]| match Cli::try_parse_from(args).unwrap().command {
+            Some(Commands::Logs(logs_args)) => logs_args.force,
+            _ => panic!("Expected Logs command"),
+        };
+        // Canonical -y/--yes plus the retained -f/--force back-compat aliases.
+        assert!(force_of(&["aivo", "logs", "prune", "-y"]));
+        assert!(force_of(&["aivo", "logs", "prune", "--yes"]));
+        assert!(force_of(&["aivo", "logs", "prune", "-f"]));
+        assert!(force_of(&["aivo", "logs", "prune", "--force"]));
+        assert!(!force_of(&["aivo", "logs", "prune"]));
     }
 
     /// Helper to simulate the 'use' alias rewriting done in main.rs

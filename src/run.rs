@@ -811,19 +811,8 @@ pub async fn run() -> ! {
                 };
 
                 let env = if !env_strings.is_empty() {
-                    let mut map = std::collections::HashMap::new();
-                    for env_str in &env_strings {
-                        if let Some((key, value)) = env_str.split_once('=') {
-                            map.insert(key.to_string(), value.to_string());
-                        } else {
-                            eprintln!(
-                                "{} Ignoring malformed env value '{}' (expected KEY=VALUE format)",
-                                style::yellow("Warning:"),
-                                env_str
-                            );
-                        }
-                    }
-                    Some(map)
+                    crate::cli::warn_malformed_env(&env_strings);
+                    Some(crate::cli::parse_env_vars(&env_strings))
                 } else {
                     None
                 };
@@ -1066,7 +1055,7 @@ pub async fn run() -> ! {
                     style::red("Error:"),
                     e
                 );
-                ExitCode::UserError
+                crate::errors::exit_code_for_error(&e)
             }
         },
     };

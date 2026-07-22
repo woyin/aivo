@@ -143,6 +143,7 @@ impl StartCommand {
 
         let launch_model = resolve_model_placeholder(model.value.clone());
 
+        crate::cli::warn_malformed_env(&args.envs);
         let env = parse_env_vars(&args.envs);
         let skip_confirm =
             last_sel.is_some() || (key.interactive && tool.interactive && model.interactive);

@@ -21,6 +21,26 @@ impl ExitCode {
             ExitCode::ToolExit(n) => n,
         }
     }
+
+    /// Severity rank (higher = worse) for [`worse_of`](Self::worse_of).
+    fn severity(self) -> u8 {
+        match self {
+            ExitCode::Success => 0,
+            ExitCode::UserError => 1,
+            ExitCode::NetworkError => 2,
+            ExitCode::AuthError => 3,
+            ExitCode::ToolExit(_) => 4,
+        }
+    }
+
+    /// The worse (higher-severity) of two codes.
+    pub fn worse_of(self, other: ExitCode) -> ExitCode {
+        if other.severity() > self.severity() {
+            other
+        } else {
+            self
+        }
+    }
 }
 
 impl From<ExitCode> for i32 {
@@ -230,5 +250,17 @@ mod tests {
     fn exit_code_for_error_defaults_to_user_error() {
         let err = anyhow::anyhow!("something else");
         assert_eq!(exit_code_for_error(&err), ExitCode::UserError);
+    }
+
+    #[test]
+    fn worse_of_picks_higher_severity() {
+        use ExitCode::*;
+        // Auth beats network beats user beats success, regardless of order.
+        assert_eq!(Success.worse_of(NetworkError), NetworkError);
+        assert_eq!(NetworkError.worse_of(Success), NetworkError);
+        assert_eq!(NetworkError.worse_of(AuthError), AuthError);
+        assert_eq!(AuthError.worse_of(NetworkError), AuthError);
+        assert_eq!(UserError.worse_of(NetworkError), NetworkError);
+        assert_eq!(Success.worse_of(Success), Success);
     }
 }
