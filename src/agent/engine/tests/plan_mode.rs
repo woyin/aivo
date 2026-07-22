@@ -119,6 +119,7 @@ async fn plan_mode_readonly_bash_skips_prompt() {
         auto_approve_all: false,
         auto_approve: None,
         review_edits: None,
+        plan_exit: None,
     };
     run_session(&mut engine, &ctx, Some("inspect".into()), &mut ui).await;
 
@@ -337,5 +338,81 @@ async fn exit_plan_mode_outside_plan_mode_errors() {
         tool_result_texts(&engine)
             .iter()
             .any(|c| c.contains("not in plan mode"))
+    );
+}
+
+/// A live mid-turn plan exit (Shift+Tab sets the shared flag) is picked up at the
+/// next tool-call boundary: the plan floor drops and the call runs unprompted.
+#[tokio::test]
+async fn live_plan_exit_drops_floor_mid_turn() {
+    let dir = tmp();
+    // Write-redirect: not read-only, so the plan floor would prompt (see
+    // `plan_mode_bash_always_prompts`).
+    let bash = tool_call_sse(
+        "run_bash",
+        json!({ "command": format!("cd {} && echo data > probe.txt", dir.display()) }),
+    );
+    let port = spawn_sse_sequence(vec![bash, FINAL_TEXT_SSE.to_string()]);
+    let client = reqwest::Client::builder().no_proxy().build().unwrap();
+    let base = format!("http://127.0.0.1:{port}");
+    let mut engine = AgentEngine::new(&dir.display().to_string(), "m", "", &[], &[], 0, 0);
+    engine.set_plan_mode(true);
+    let mut ui = CapturingUi::default();
+    let exit = std::sync::atomic::AtomicBool::new(true); // the chord already fired
+    let ctx = TurnCtx {
+        client: &client,
+        serve_base: &base,
+        auth: None,
+        cwd: &dir,
+        yes: true, // confirm tier waived — only the plan floor could prompt
+        auto_approve_all: false,
+        auto_approve: None,
+        review_edits: None,
+        plan_exit: Some(&exit),
+    };
+    run_session(&mut engine, &ctx, Some("go".into()), &mut ui).await;
+
+    assert_eq!(ui.asks, 0, "the plan floor dropped before the call");
+    assert!(!engine.read_only, "plan mode exited mid-turn");
+    assert!(dir.join("probe.txt").exists(), "the command ran");
+}
+
+/// The plan-mode reminder rides each request's latest user message — ephemeral,
+/// gone once plan mode exits, so post-approval turns see no stale reminder.
+#[test]
+fn plan_mode_reminder_rides_requests_not_history() {
+    let dir = tmp();
+    let mut engine = AgentEngine::new(&dir.display().to_string(), "m", "", &[], &[], 0, 0);
+    engine.set_plan_mode(true);
+    engine.begin_user_turn(
+        Value::String("start the task".into()),
+        "start the task".into(),
+    );
+
+    let outgoing = engine.outgoing_messages();
+    let last_user = outgoing.iter().rev().find(|m| role(m) == "user").unwrap();
+    assert!(
+        last_user["content"]
+            .as_str()
+            .unwrap()
+            .contains(plan_mode::PLAN_TURN_REMINDER),
+        "the request carries the reminder"
+    );
+    assert!(
+        !engine.messages.iter().any(|m| m["content"]
+            .as_str()
+            .is_some_and(|c| c.contains("<system-reminder>"))),
+        "the reminder must not fossilize in the durable transcript"
+    );
+
+    engine.set_plan_mode(false);
+    let outgoing = engine.outgoing_messages();
+    let last_user = outgoing.iter().rev().find(|m| role(m) == "user").unwrap();
+    assert!(
+        !last_user["content"]
+            .as_str()
+            .unwrap()
+            .contains("<system-reminder>"),
+        "no reminder once plan mode is off"
     );
 }

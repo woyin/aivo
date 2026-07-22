@@ -57,6 +57,26 @@ inspection. When your plan is ready, call `exit_plan_mode` with the complete pla
 use it instead of `ask_user` for plan approval. Do not implement anything until it returns \
 approval.";
 
+/// Rides every plan-mode request's latest user message (ephemeral, never
+/// persisted): the system-prompt directive decays over a long conversation, and
+/// a user "go ahead" otherwise tempts the model into executing while read-only.
+pub const PLAN_TURN_REMINDER: &str = "<system-reminder>Plan mode is still active — the session is \
+read-only. Investigate and refine the plan only; do not execute the task or mutate state (files, \
+configs, deployments), not even via run_bash. If the user asks you to start or execute, call \
+`exit_plan_mode` with the complete plan first and wait for approval.</system-reminder>";
+
+/// Append [`PLAN_TURN_REMINDER`] to outgoing user content (text or multimodal).
+pub fn append_turn_reminder(content: Value) -> Value {
+    match content {
+        Value::String(s) => Value::String(format!("{s}\n\n{PLAN_TURN_REMINDER}")),
+        Value::Array(mut parts) => {
+            parts.push(json!({"type": "text", "text": PLAN_TURN_REMINDER}));
+            Value::Array(parts)
+        }
+        other => other,
+    }
+}
+
 pub const PLAN_APPROVED_RESULT: &str = "Plan approved — implement it now. Plan mode is off and \
 your full tools are restored; make the edits, run the commands, and verify as you go.";
 

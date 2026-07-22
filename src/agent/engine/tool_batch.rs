@@ -57,6 +57,11 @@ impl AgentEngine {
         let mut sequential_idx: Vec<usize> = Vec::new();
 
         for (i, call) in tool_calls.iter().enumerate() {
+            // A live mid-turn plan exit (Shift+Tab), picked up at this call
+            // boundary so the rest of the turn runs unrestricted.
+            if self.read_only && ctx.plan_exit_requested() {
+                self.set_plan_mode(false);
+            }
             let n = subagents::normalize_tool_name(&call.name).unwrap_or(&call.name);
             // The plan tool renders as a checklist card and never needs permission —
             // resolve it up front; its result still joins history (call↔result invariant).
@@ -125,7 +130,7 @@ impl AgentEngine {
                 let preview = tools::preview(n, &call.arguments);
                 // Allow and AlwaysAllow both run it once only — never remembered.
                 !matches!(
-                    ui.ask_permission(n, preview.as_deref()).await,
+                    ui.ask_permission(n, preview.as_deref(), true).await,
                     Decision::Deny
                 )
             } else if remote_side_effect
@@ -133,7 +138,7 @@ impl AgentEngine {
                 && !self.grants.covers_remote(&remote_families)
             {
                 let preview = tools::preview(n, &call.arguments);
-                match ui.ask_permission(n, preview.as_deref()).await {
+                match ui.ask_permission(n, preview.as_deref(), false).await {
                     Decision::Allow => true,
                     Decision::AlwaysAllow => {
                         if remote_families.is_empty() {
@@ -152,7 +157,7 @@ impl AgentEngine {
                 true
             } else {
                 let preview = tools::preview(n, &call.arguments);
-                match ui.ask_permission(n, preview.as_deref()).await {
+                match ui.ask_permission(n, preview.as_deref(), false).await {
                     Decision::Allow => true,
                     Decision::AlwaysAllow => {
                         self.grants.remember(n, &call.arguments, ctx.cwd);
@@ -645,7 +650,7 @@ Re-run the full command without write confinement?",
                 ctx.cwd.display()
             );
             match ui
-                .ask_permission("run_bash_unsandboxed", Some(&preview))
+                .ask_permission("run_bash_unsandboxed", Some(&preview), false)
                 .await
             {
                 Decision::Allow => true,

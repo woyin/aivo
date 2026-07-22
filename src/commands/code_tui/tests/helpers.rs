@@ -28,6 +28,25 @@ pub(super) fn make_test_app(
     app
 }
 
+/// Pin dispatch to the plain-chat path (image in history + unknown vision), so
+/// tests don't touch the agent-engine build (real config/git).
+pub(super) fn pin_to_plain_chat(app: &mut CodeTuiApp) {
+    app.history.push(ChatMessage {
+        model: None,
+        role: "user".to_string(),
+        content: "look".to_string(),
+        reasoning_content: None,
+        attachments: vec![MessageAttachment {
+            name: "shot.png".to_string(),
+            mime_type: "image/png".to_string(),
+            storage: AttachmentStorage::Inline {
+                data: "iVBOR".to_string(),
+            },
+        }],
+    });
+    app.model_image_input = None;
+}
+
 pub(super) fn seed_two_exchanges(app: &mut CodeTuiApp) {
     for (role, content) in [
         ("user", "first question"),

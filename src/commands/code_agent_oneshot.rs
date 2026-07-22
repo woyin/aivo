@@ -362,6 +362,7 @@ async fn run_agent_captured(
         auto_approve_all: auto_approve,
         auto_approve: None,
         review_edits: None,
+        plan_exit: None,
     };
     let mut ui = HeadlessAgentUi::new(format, session_id.clone());
     ui.silent = opts.silent;
@@ -750,6 +751,7 @@ async fn resolve_resume_session(
                         messages: transcript.messages,
                         engine_messages: Some(transcript.engine_messages),
                         import_fidelity: Some(transcript.fidelity),
+                        plan_state: None,
                         updated_at: now.clone(),
                         created_at: now,
                     })
@@ -1202,6 +1204,7 @@ impl AgentUi for HeadlessAgentUi {
         &'a mut self,
         _tool: &'a str,
         _preview: Option<&'a str>,
+        _once_only: bool,
     ) -> BoxFuture<'a, Decision> {
         // Only catastrophic commands and remote side effects reach here (ctx.yes
         // auto-approves the rest); no human to confirm, so fail closed.

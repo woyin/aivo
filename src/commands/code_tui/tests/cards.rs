@@ -19,6 +19,7 @@ fn test_permission_card_anchored_above_composer() {
     app.cards.set_permission(PendingPermission {
         tool: "run_bash".to_string(),
         preview: Some("rm -rf build/".to_string()),
+        once_only: false,
         reply,
     });
 
@@ -91,6 +92,7 @@ fn test_permission_card_keys_always_visible_in_short_terminal() {
     app.cards.set_permission(PendingPermission {
         tool: "run_bash".to_string(),
         preview: Some(preview),
+        once_only: false,
         reply,
     });
 
@@ -152,6 +154,7 @@ async fn test_shift_tab_on_permission_card_approves_and_enables() {
     app.cards.set_permission(PendingPermission {
         tool: "run_bash".to_string(),
         preview: Some("rm -rf build".to_string()),
+        once_only: false,
         reply,
     });
 
@@ -189,6 +192,7 @@ async fn test_always_on_cursor_card_enables_auto_approve() {
     app.cards.set_permission(PendingPermission {
         tool: "cursor".to_string(),
         preview: Some("Cursor wants to run:\nedit main.rs".to_string()),
+        once_only: false,
         reply,
     });
 
@@ -221,6 +225,7 @@ async fn test_always_on_native_card_leaves_auto_approve_off() {
     app.cards.set_permission(PendingPermission {
         tool: "run_bash".to_string(),
         preview: Some("rm -rf build".to_string()),
+        once_only: false,
         reply,
     });
 
@@ -256,6 +261,7 @@ async fn test_permission_card_keys_do_not_decide_while_composing() {
     app.cards.set_permission(PendingPermission {
         tool: "run_bash".to_string(),
         preview: Some("rm -rf build".to_string()),
+        once_only: false,
         reply,
     });
 
@@ -297,6 +303,7 @@ async fn test_permission_card_y_approves_with_empty_composer() {
     app.cards.set_permission(PendingPermission {
         tool: "run_bash".to_string(),
         preview: Some("ls".to_string()),
+        once_only: false,
         reply,
     });
     app.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE))
@@ -318,6 +325,7 @@ fn test_permission_card_shows_composing_hint() {
     app.cards.set_permission(PendingPermission {
         tool: "run_bash".to_string(),
         preview: Some("ls".to_string()),
+        once_only: false,
         reply,
     });
     let (screen, _rows) = render_full_screen(&mut app, 70, 20);
@@ -338,6 +346,7 @@ fn test_permission_card_cursor_always_label_says_session() {
     app.cards.set_permission(PendingPermission {
         tool: "cursor".to_string(),
         preview: Some("edit main.rs".to_string()),
+        once_only: false,
         reply,
     });
     let (screen, _rows) = render_full_screen(&mut app, 70, 20);
@@ -357,6 +366,7 @@ fn test_permission_card_native_always_label_is_plain() {
     app.cards.set_permission(PendingPermission {
         tool: "run_bash".to_string(),
         preview: Some("ls".to_string()),
+        once_only: false,
         reply,
     });
     let (screen, _rows) = render_full_screen(&mut app, 70, 20);

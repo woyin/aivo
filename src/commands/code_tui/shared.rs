@@ -513,7 +513,7 @@ pub(super) const SLASH_COMMANDS: &[SlashCommandSpec] = &[
     SlashCommandSpec {
         name: "plan",
         help_label: "/plan [objective]",
-        description: "plan mode: investigate read-only, then approve the plan to execute it",
+        description: "plan mode: investigate read-only, then approve the plan to execute it (go [-y] / stop / resume)",
         takes_argument: true,
     },
     SlashCommandSpec {
@@ -610,7 +610,7 @@ pub(super) fn command_usage_hint(name: &str) -> Option<&'static str> {
         "agents" => Some("[rm <name>]"),
         "create-skill" => Some("[what the skill should do]"),
         "goal" => Some("<objective> | stop"),
-        "plan" => Some("[objective] | go [guidance] | stop"),
+        "plan" => Some("[objective] | go [-y] [guidance] | resume | stop"),
         "share" => Some("[stop]"),
         "compact" => Some("[fast]"),
         "model" => Some("[name]"),
@@ -806,6 +806,9 @@ pub(super) struct LoadedSession {
     /// From the converter on a first-open import, from the persisted stamp on
     /// a saved fork; `None` for native sessions and pre-feature forks.
     pub(super) import_fidelity: Option<crate::services::session_import::ImportFidelity>,
+    /// Unfinished plan-mode snapshot saved with the session (drafted plan +
+    /// plan-mode flag), restored on resume so `/plan go` keeps working.
+    pub(super) plan_state: Option<crate::services::session_store::PlanState>,
 }
 
 impl LoadedSession {
@@ -819,6 +822,7 @@ impl LoadedSession {
             pristine_import: false,
             source_newer: false,
             import_fidelity: state.import_fidelity,
+            plan_state: state.plan_state,
         }
     }
 }
@@ -1511,6 +1515,9 @@ pub(super) enum PickerValue {
     },
     /// A `/effort` reasoning level (e.g. `low`/`high`).
     Effort(String),
+    /// An unfinished plan from a saved session (`/plan resume`); the payload
+    /// rides in the row so activation needs no second load.
+    PlanResume(PlanCarry),
 }
 
 /// A model option ready for the picker: stable id and display label.
@@ -1533,6 +1540,14 @@ impl PickerEntry {
     }
 }
 
+/// What `/plan resume` carries: a draft awaiting approval (re-enters plan mode),
+/// or an approved plan mid-execution (its checklist JSON — continues directly).
+#[derive(Clone)]
+pub(super) enum PlanCarry {
+    Draft(String),
+    Continue(String),
+}
+
 #[derive(Clone)]
 #[allow(clippy::large_enum_variant)]
 pub(super) enum ModelSelectionTarget {
@@ -1551,6 +1566,7 @@ pub(super) enum PickerKind {
     Session,
     Rewind,
     Effort,
+    PlanResume,
 }
 
 #[derive(Clone)]
@@ -2317,9 +2333,11 @@ pub(super) enum RuntimeEvent {
     AgentTurnStop(crate::agent::engine::TurnStop),
     /// A mutating tool needs approval. The event loop shows a permission card
     /// and replies with the decision; the engine task awaits `reply`.
+    /// `once_only` = a floor prompt (never remembered); the card hides "always".
     AgentPermission {
         tool: String,
         preview: Option<String>,
+        once_only: bool,
         reply: tokio::sync::oneshot::Sender<crate::agent::protocol::Decision>,
     },
     /// The agent's `switch_model`/`set_effort` tools: apply the change and reply to the
@@ -2468,10 +2486,12 @@ pub(super) struct AgentSession {
 }
 
 /// A pending tool-permission prompt: shown as a card until the user answers,
-/// then `reply` delivers the decision to the waiting engine task.
+/// then `reply` delivers the decision to the waiting engine task. `once_only`
+/// hides "always" (never remembered).
 pub(super) struct PendingPermission {
     pub(super) tool: String,
     pub(super) preview: Option<String>,
+    pub(super) once_only: bool,
     pub(super) reply: tokio::sync::oneshot::Sender<crate::agent::protocol::Decision>,
 }
 
@@ -2849,6 +2869,14 @@ pub(super) struct CodeTuiApp {
     pub(super) agent_review_edits: bool,
     /// The same state as a shared atomic, read LIVE per batch by the running turn.
     pub(super) review_edits_flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Live mid-turn plan-mode exit signal: set when the user leaves plan mode with
+    /// a turn in flight; the running engine reads it per tool-call boundary and
+    /// restores its tools (`plan_exit_pending` is the turn-end fallback).
+    pub(super) plan_exit_flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Whether a planState snapshot is (or may be) in the session file — lets
+    /// `persist_plan_state` skip its round-trip for the common no-plan session.
+    /// `Cell`: flipped from the `&self` persist path.
+    pub(super) plan_state_written: std::cell::Cell<bool>,
     /// Whether the model reasons before answering. On (default): engine requests
     /// reasoning at the effective effort; off: engine sends the family's "off"
     /// floor, which the loopback bridge maps to `thinking:{type:"disabled"}` for
@@ -3265,6 +3293,8 @@ impl CodeTuiApp {
             auto_approve_flag: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             agent_review_edits: false,
             review_edits_flag: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            plan_exit_flag: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            plan_state_written: std::cell::Cell::new(false),
             thinking_enabled: true,
             web_search_enabled: true,
             agent_tools_enabled: true,

@@ -912,10 +912,27 @@ pub struct CodeSessionState {
         skip_serializing_if = "Option::is_none"
     )]
     pub import_fidelity: Option<crate::services::session_import::ImportFidelity>,
+    /// Unfinished plan-mode snapshot, so a resume picks the plan back up.
+    /// Absent once the plan is approved/discarded (and for legacy sessions).
+    #[serde(rename = "planState", default, skip_serializing_if = "Option::is_none")]
+    pub plan_state: Option<PlanState>,
     #[serde(rename = "updatedAt")]
     pub updated_at: String,
     #[serde(rename = "createdAt", default)]
     pub created_at: String,
+}
+
+/// Unfinished plan-mode snapshot saved with a code session: `mode` restores
+/// read-only planning; `draft` re-arms the approval card / `/plan go`; `steps` is
+/// the mid-execution `update_plan` checklist another session's `/plan resume` continues.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PlanState {
+    #[serde(default)]
+    pub mode: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub draft: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub steps: Option<serde_json::Value>,
 }
 
 /// Deserializes the `messages` field: a plain JSON array (current format), or a
@@ -2387,6 +2404,13 @@ impl SessionStore {
         self.sessions
             .save_agent_messages(session_id, engine_messages)
             .await
+    }
+
+    /// Refresh (or with `None` clear) the session's unfinished-plan snapshot.
+    /// No-op when the session file doesn't exist yet — a plan alone doesn't
+    /// create a session. Best-effort like `save_agent_messages`.
+    pub async fn set_plan_state(&self, session_id: &str, plan: Option<&PlanState>) -> Result<()> {
+        self.sessions.set_plan_state(session_id, plan).await
     }
 
     /// Write-once; no-op when the session is absent or already stamped.

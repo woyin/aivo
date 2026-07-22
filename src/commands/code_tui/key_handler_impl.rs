@@ -165,18 +165,17 @@ impl CodeTuiApp {
     /// user can keep typing a queued message while the card stays up).
     pub(super) fn handle_permission_key(&mut self, key: KeyEvent) -> bool {
         use crate::agent::protocol::Decision;
-        // Shift+Tab: allow this request AND turn on auto-approve, so the chord
-        // takes effect on the card in front of you. In plan mode there's no
-        // auto-approve — just allow this one call; the session stays read-only.
+        // Shift+Tab: allow this request and turn on auto-approve. In plan mode it
+        // also exits plan mode (cards arrive back-to-back, so this is the only
+        // reachable exit); the running turn picks the exit up at the next boundary.
         if is_auto_approve_toggle(key) {
             if self.plan_mode {
-                if let Some(pending) = self.cards.take_permission() {
-                    let _ = pending.reply.send(Decision::Allow);
-                }
-                self.show_toast("Allowed once — plan mode stays read-only");
-                return true;
+                self.request_plan_exit_live();
+                self.set_auto_quiet(true);
+                self.show_toast("Plan mode off — auto-approve on");
+            } else {
+                self.set_auto_approve(true);
             }
-            self.set_auto_approve(true);
             if let Some(pending) = self.cards.take_permission() {
                 let _ = pending.reply.send(Decision::Allow);
             }
@@ -199,7 +198,14 @@ impl CodeTuiApp {
         }
         let decision = match key.code {
             KeyCode::Char('y' | 'Y') => Decision::Allow,
-            KeyCode::Char('a' | 'A') => Decision::AlwaysAllow,
+            // A floor prompt hides "always" (never remembered), so `a` = allow once.
+            KeyCode::Char('a' | 'A') => {
+                if self.cards.permission().is_some_and(|p| p.once_only) {
+                    Decision::Allow
+                } else {
+                    Decision::AlwaysAllow
+                }
+            }
             KeyCode::Char('n' | 'N') => Decision::Deny,
             _ => return false,
         };

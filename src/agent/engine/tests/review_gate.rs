@@ -16,7 +16,12 @@ impl AgentUi for ReviewUi {
     fn tool_result(&mut self, _: &str, _: &Result<String, String>) {}
     fn notify(&mut self, _: &str) {}
     fn footer(&mut self, _: Option<&str>, _: usize, _: u64, _: u64, _: u64) {}
-    fn ask_permission<'a>(&'a mut self, _: &'a str, _: Option<&'a str>) -> BoxFuture<'a, Decision> {
+    fn ask_permission<'a>(
+        &'a mut self,
+        _: &'a str,
+        _: Option<&'a str>,
+        _: bool,
+    ) -> BoxFuture<'a, Decision> {
         Box::pin(async { Decision::Allow })
     }
     fn review_edits<'a>(
@@ -70,6 +75,7 @@ async fn review_gate_reject_skips_write_but_runs_sibling() {
         auto_approve_all: false,
         auto_approve: None,
         review_edits: Some(&flag),
+        plan_exit: None,
     };
     let mut e = AgentEngine::new(&dir.display().to_string(), "m", "", &[], &[], 0, 0);
     let mut ui = ReviewUi {
@@ -116,6 +122,7 @@ async fn review_gate_approve_writes_the_edit() {
         auto_approve_all: false,
         auto_approve: None,
         review_edits: Some(&flag),
+        plan_exit: None,
     };
     let mut e = AgentEngine::new(&dir.display().to_string(), "m", "", &[], &[], 0, 0);
     let mut ui = ReviewUi::default();
@@ -149,6 +156,7 @@ async fn review_gate_none_skips_the_card() {
         auto_approve_all: false,
         auto_approve: None,
         review_edits: None,
+        plan_exit: None,
     };
     let mut e = AgentEngine::new(&dir.display().to_string(), "m", "", &[], &[], 0, 0);
     let mut ui = ReviewUi {
@@ -182,6 +190,7 @@ async fn review_gate_skips_when_no_edits() {
         auto_approve_all: false,
         auto_approve: None,
         review_edits: Some(&flag),
+        plan_exit: None,
     };
     let mut e = AgentEngine::new(&dir.display().to_string(), "m", "", &[], &[], 0, 0);
     let mut ui = ReviewUi {

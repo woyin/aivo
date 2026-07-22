@@ -167,11 +167,13 @@ impl CodeTuiApp {
             RuntimeEvent::AgentPermission {
                 tool,
                 preview,
+                once_only,
                 reply,
             } => {
                 self.cards.set_permission(PendingPermission {
                     tool,
                     preview,
+                    once_only,
                     reply,
                 });
                 // The card floats above the composer (drawn every frame
@@ -994,6 +996,9 @@ impl CodeTuiApp {
         // If the tool set changed mid-turn, drop the engine now so the next turn
         // rebuilds with it (must happen while not sending).
         self.maybe_apply_engine_rebuild();
+        // Capture a drafted plan before the persist (and before a queued message
+        // flips `sending`) so it rides this turn-end save.
+        self.capture_plan_draft();
         self.persist_history().await?;
         // A compact adds no user/assistant message; logging would duplicate the prior row.
         if compact_before.is_none() {
@@ -1011,8 +1016,6 @@ impl CodeTuiApp {
             }
             self.plan_exit_pending = false;
         }
-        // Before a queued message can flip `sending` and skip the capture.
-        self.capture_plan_draft();
         self.reclaim_unsent_steering();
         // Commands queued mid-turn run first (a queued `/plan go` needs the plan
         // captured above; a queued `/compact` should fold before the next message).

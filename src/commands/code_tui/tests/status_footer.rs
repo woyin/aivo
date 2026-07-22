@@ -590,6 +590,7 @@ fn test_desired_status_names_decision_waits_and_stalls() {
     app.cards.set_permission(PendingPermission {
         tool: "run_bash".to_string(),
         preview: Some("rm -rf build".to_string()),
+        once_only: false,
         reply,
     });
     assert_eq!(app.desired_status(), "waiting for your approval");
@@ -615,6 +616,7 @@ fn test_decision_wait_freezes_step_and_turn_clocks() {
     app.cards.set_permission(PendingPermission {
         tool: "run_bash".to_string(),
         preview: None,
+        once_only: false,
         reply,
     });
     // Two ticks a real interval apart: the waiting span must be pushed out of

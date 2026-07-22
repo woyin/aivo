@@ -722,6 +722,7 @@ mod tests {
             &'a mut self,
             _: &'a str,
             _: Option<&'a str>,
+            _: bool,
         ) -> BoxFuture<'a, Decision> {
             Box::pin(async { Decision::Deny })
         }
@@ -737,6 +738,7 @@ mod tests {
             auto_approve_all: false,
             auto_approve: None,
             review_edits: None,
+            plan_exit: None,
         }
     }
 

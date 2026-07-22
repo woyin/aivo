@@ -78,6 +78,7 @@ async fn session_control_tools_route_to_ui_callbacks() {
             &'a mut self,
             _: &'a str,
             _: Option<&'a str>,
+            _: bool,
         ) -> BoxFuture<'a, Decision> {
             Box::pin(async { Decision::Allow })
         }

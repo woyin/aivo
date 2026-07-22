@@ -2498,6 +2498,9 @@ is preserved."
             (PickerKind::Effort, PickerValue::Effort(level)) => {
                 self.apply_reasoning_effort(level).await;
             }
+            (PickerKind::PlanResume, PickerValue::PlanResume(carry)) => {
+                self.resume_plan_from_session(carry).await;
+            }
             _ => {}
         }
 
@@ -2645,7 +2648,50 @@ is preserved."
                 .set_import_fidelity(&self.session_id, fidelity)
                 .await;
         }
+        self.persist_plan_state().await;
         Ok(())
+    }
+
+    /// Push the live plan-mode state into the session file so a resume picks the
+    /// plan back up. Turn ends reach this via `persist_history`; `/plan` enter/leave
+    /// call it directly for idle-time changes. Best-effort; no-ops before the
+    /// session first persists.
+    pub(super) async fn persist_plan_state(&self) {
+        let steps = self.unfinished_plan_steps();
+        let plan = (self.plan_mode || self.pending_plan.is_some() || steps.is_some()).then(|| {
+            crate::services::session_store::PlanState {
+                mode: self.plan_mode,
+                draft: self.pending_plan.clone(),
+                steps,
+            }
+        });
+        // Nothing to write or clear: skip the round-trip (`set_plan_state` loads
+        // the whole file before its own no-op check, and this runs every turn end).
+        if plan.is_none() && !self.plan_state_written.get() {
+            return;
+        }
+        let _ = self
+            .session_store
+            .set_plan_state(&self.session_id, plan.as_ref())
+            .await;
+        self.plan_state_written.set(plan.is_some());
+    }
+
+    /// The latest `update_plan` checklist from history, when steps are still open.
+    /// `None` for no checklist or an all-done one — a finished plan isn't resumable.
+    pub(super) fn unfinished_plan_steps(&self) -> Option<serde_json::Value> {
+        let content = &self
+            .history
+            .iter()
+            .rev()
+            .find(|m| m.role == "plan")?
+            .content;
+        let value: serde_json::Value = serde_json::from_str(content).ok()?;
+        let open = value
+            .as_array()?
+            .iter()
+            .any(|item| plan_status(item) != "completed");
+        open.then_some(value)
     }
 
     pub(super) fn begin_resume_load(&mut self, preview: SessionPreview) {
@@ -2776,6 +2822,25 @@ is preserved."
         // After model/window are set, so the preview mirrors the resumed session.
         self.context_tokens = self.estimated_context_used().await;
         self.context_is_estimate = true;
+        // An unfinished plan saved with the session comes back: draft re-armed (its
+        // card re-framed against the RESTORED history), plan mode restored — the
+        // next turn's mode sync puts the rebuilt engine into read-only planning.
+        // Seed the persist guard from the file's state so a later persist can clear
+        // a snapshot the restore skipped.
+        self.plan_state_written.set(session.plan_state.is_some());
+        let restored_plan = match session.plan_state.filter(|_| self.agent_capable()) {
+            Some(plan) => {
+                self.plan_mode = plan.mode;
+                self.pending_plan = plan.draft.filter(|d| !d.trim().is_empty());
+                self.plan_card_idx = self.pending_plan.as_deref().and_then(|p| {
+                    self.history
+                        .iter()
+                        .rposition(|m| m.role == "assistant" && m.content == p)
+                });
+                self.plan_mode || self.pending_plan.is_some()
+            }
+            None => false,
+        };
         if session.source_newer {
             let label = crate::services::session_import::import_source_label(&self.session_id)
                 .unwrap_or("source");
@@ -2794,6 +2859,26 @@ is preserved."
             let label = crate::services::session_import::import_source_label(&self.session_id)
                 .unwrap_or("import");
             self.notice = Some((MUTED(), fidelity.summary(label)));
+        } else if restored_plan {
+            self.notice = Some((
+                MUTED(),
+                if self.pending_plan.is_some() {
+                    "Resumed with an unfinished plan — approve on the card or /plan go; /plan stop to discard"
+                } else {
+                    "Resumed in plan mode — read-only until you approve a plan (/plan stop to leave)"
+                }
+                .to_string(),
+            ));
+        } else if let Some(steps) = self.unfinished_plan_steps() {
+            // The checklist and engine transcript both came back, so plain
+            // "continue" resumes execution in place.
+            self.notice = Some((
+                MUTED(),
+                format!(
+                    "Resumed with an in-progress plan ({}) — say continue to keep executing",
+                    plan_steps_progress(&steps)
+                ),
+            ));
         }
         // Session-local: no persist, so viewing an old chat can't reset the key's
         // default model. Only explicit `/model` and `/key` persist.

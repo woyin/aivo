@@ -2377,10 +2377,20 @@ pub(super) fn push_plan_card(
 
 pub(super) const PLAN_MAX_VISIBLE: usize = 5;
 
-fn plan_status(item: &serde_json::Value) -> &str {
+pub(super) fn plan_status(item: &serde_json::Value) -> &str {
     item.get("status")
         .and_then(|s| s.as_str())
         .unwrap_or("pending")
+}
+
+/// "3/7 steps done" for an `update_plan` checklist JSON array.
+pub(super) fn plan_steps_progress(steps: &serde_json::Value) -> String {
+    let items = steps.as_array().map(Vec::as_slice).unwrap_or_default();
+    let done = items
+        .iter()
+        .filter(|i| plan_status(i) == "completed")
+        .count();
+    format!("{done}/{} steps done", items.len())
 }
 
 /// `[start, end)` window of steps to show when a plan exceeds `max`: the active

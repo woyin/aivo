@@ -303,15 +303,26 @@ impl AgentEngine {
 
     /// Cloned per step; strips the leading system prompt in plain-chat mode, so the
     /// single-system-message invariant `restore_conversation` relies on stays intact.
+    /// In plan mode the read-only reminder rides the copy's latest user message —
+    /// ephemeral (never in `self.messages`), so it vanishes on plan exit.
     pub(super) fn outgoing_messages(&self) -> Vec<Value> {
-        if self.agent_tools_enabled {
-            return self.messages.clone();
+        let mut out: Vec<Value> = if self.agent_tools_enabled {
+            self.messages.clone()
+        } else {
+            self.messages
+                .iter()
+                .filter(|m| role(m) != "system")
+                .cloned()
+                .collect()
+        };
+        if self.read_only
+            && let Some(user) = out.iter_mut().rev().find(|m| role(m) == "user")
+            && let Some(content) = user.get_mut("content")
+        {
+            let owned = content.take();
+            *content = plan_mode::append_turn_reminder(owned);
         }
-        self.messages
-            .iter()
-            .filter(|m| role(m) != "system")
-            .cloned()
-            .collect()
+        out
     }
 
     /// Record the paths the turn's yet-unrecorded segment changed into its

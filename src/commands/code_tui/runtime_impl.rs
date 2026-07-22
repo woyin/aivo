@@ -70,6 +70,29 @@ pub(super) fn plan_go_message(guidance: &str) -> String {
     msg
 }
 
+/// The `/plan resume` kick-off: this engine has never seen the plan (drafted in
+/// another session), so the text rides along for re-validation before approval.
+pub(super) fn plan_carryover_message(draft: &str) -> String {
+    format!(
+        "An implementation plan carried over from a previous session is below. You are in plan \
+mode. Review it against the CURRENT state of the code — it may have drifted since the plan was \
+written, and parts may already be done. Revise as needed (investigate with read-only tools), \
+then call `exit_plan_mode` with the final plan.\n\n<carried-over-plan>\n{draft}\n</carried-over-plan>"
+    )
+}
+
+/// The `/plan resume` continuation for a mid-execution plan: the checklist rides
+/// along; already approved in its session, so execution continues — no re-approval.
+pub(super) fn plan_continue_message(steps: &str) -> String {
+    format!(
+        "An execution checklist carried over from a previous session is below — that session \
+approved the plan and completed the steps marked \"completed\" before running out of context. \
+Quickly verify the completed steps still hold in the current code, then continue from the first \
+non-completed step. Call `update_plan` with this checklist (keeping the completed marks) as you \
+start, and keep it updated as you go.\n\n<carried-over-checklist>\n{steps}\n</carried-over-checklist>"
+    )
+}
+
 fn goal_max_iterations() -> usize {
     crate::services::system_env::env_parse("AIVO_GOAL_MAX_ITERS")
         .filter(|n| *n > 0)
@@ -675,6 +698,9 @@ impl CodeTuiApp {
             engine.set_self_correct(self_correct);
         }
         self.plan_exit_pending = false;
+        // Clear any stale live exit request; the mode sync above is authoritative.
+        self.plan_exit_flag
+            .store(false, std::sync::atomic::Ordering::Relaxed);
         // The agent works in the real launch directory — NOT chat's sandbox
         // (`self.cwd`). It reads/edits the user's actual project.
         let real_cwd = if self.real_cwd.is_empty() {
@@ -879,10 +905,11 @@ impl CodeTuiApp {
 
         let tx = self.tx.clone();
         let cwd = real_cwd;
-        // Clone the shared LIVE flag (not a snapshot) so a mid-turn Shift+Tab
+        // Clone the shared LIVE flags (not snapshots) so a mid-turn Shift+Tab
         // toggle takes effect on this running turn's permission gate.
         let auto_approve = self.auto_approve_flag.clone();
         let review_edits = self.review_edits_flag.clone();
+        let plan_exit = self.plan_exit_flag.clone();
         let steering = self.steering_queue.clone();
         // The context window may have resolved AFTER the engine was built (a model
         // only known via the background catalog warm). Carry the latest value in
@@ -947,6 +974,7 @@ impl CodeTuiApp {
                 auto_approve_all: false, // the live toggle carries the mode
                 auto_approve: Some(&auto_approve),
                 review_edits: Some(&review_edits),
+                plan_exit: Some(&plan_exit),
             };
             let mut ui = ChatAgentUi {
                 tx,
@@ -1114,6 +1142,7 @@ impl CodeTuiApp {
                 auto_approve_all: false, // compaction runs no tools
                 auto_approve: None,
                 review_edits: None,
+                plan_exit: None,
             };
             let mut ui = ChatAgentUi {
                 tx,
@@ -1141,6 +1170,7 @@ impl CodeTuiApp {
                     .send(RuntimeEvent::AgentPermission {
                         tool: req.tool,
                         preview: Some(req.preview),
+                        once_only: false,
                         reply,
                     })
                     .is_err()
@@ -1497,7 +1527,12 @@ impl CodeTuiApp {
     pub(super) async fn execute_slash_command(&mut self, command: SlashCommand) -> Result<bool> {
         match command {
             SlashCommand::New => {
-                self.start_new_chat();
+                // A mid-execution plan auto-continues in the fresh session; an
+                // unapproved draft only hints (re-approval is a decision).
+                if let Some(steps) = self.start_new_chat() {
+                    self.resume_plan_from_session(PlanCarry::Continue(steps))
+                        .await;
+                }
                 Ok(false)
             }
             SlashCommand::Exit => Ok(true),
@@ -2478,6 +2513,9 @@ pieces and keep going"
         self.goal_mode = None;
         self.plan_mode = true;
         self.plan_exit_pending = false;
+        // A stale live exit request must not cancel the fresh plan mode.
+        self.plan_exit_flag
+            .store(false, std::sync::atomic::Ordering::Relaxed);
         self.pending_plan = None;
         // While sending, the turn task holds the lock — the restriction lands via
         // the mode sync at the next `spawn_agent_turn`.
@@ -2486,12 +2524,13 @@ pieces and keep going"
         {
             session.engine.lock().await.set_plan_mode(true);
         }
+        self.persist_plan_state().await;
         true
     }
 
-    /// Leave plan mode, restoring the engine's tools in place (no rebuild — history
-    /// stays intact for same-session execution). Deferred while a turn holds the
-    /// lock (`plan_exit_pending`). No toast — callers word their own.
+    /// Leave plan mode, restoring the engine's tools in place (no rebuild). Mid-turn
+    /// the turn task holds the lock, so the exit rides the live flag instead. No
+    /// toast — callers word their own.
     pub(super) async fn leave_plan_mode(&mut self, discard_draft: bool) {
         self.plan_mode = false;
         if discard_draft {
@@ -2499,18 +2538,195 @@ pieces and keep going"
             self.plan_card_idx = None;
         }
         if self.sending {
-            self.plan_exit_pending = true;
+            self.request_plan_exit_live();
+        } else {
+            if let Some(session) = self.agent_engine.as_ref() {
+                session.engine.lock().await.set_plan_mode(false);
+            }
+            self.plan_exit_pending = false;
+        }
+        self.persist_plan_state().await;
+    }
+
+    /// Mid-turn plan exit: flip TUI state and signal the running turn via the live
+    /// flag. `plan_exit_pending` is the fallback for a turn that makes no further
+    /// tool calls (applied at turn end).
+    pub(super) fn request_plan_exit_live(&mut self) {
+        self.plan_mode = false;
+        self.plan_exit_pending = true;
+        self.plan_exit_flag
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// `/plan resume`: pick an unfinished plan from another session in this
+    /// directory and carry it into the current one. The current session is skipped
+    /// — its plan is already armed.
+    pub(super) async fn open_plan_resume_picker(&mut self, query: String) {
+        let scope_cwd = (!self.real_cwd.is_empty()).then(|| self.real_cwd.clone());
+        let mut entries = match self.session_store.all_chat_sessions().await {
+            Ok(entries) => entries,
+            Err(e) => {
+                self.notice = Some((ERROR(), format!("Couldn't list sessions: {e}")));
+                return;
+            }
+        };
+        entries.sort_by(|left, right| right.updated_at.cmp(&left.updated_at));
+        let mut items = Vec::new();
+        for entry in entries {
+            if entry.session_id == self.session_id
+                || scope_cwd.as_deref().is_some_and(|dir| entry.cwd != dir)
+            {
+                continue;
+            }
+            let Ok(Some(state)) = self.session_store.get_code_session(&entry.session_id).await
+            else {
+                continue;
+            };
+            let Some(plan) = state.plan_state else {
+                continue;
+            };
+            // Mid-execution wins over a stale draft: continuing beats re-approving.
+            if let Some(steps) = plan.steps {
+                let progress = plan_steps_progress(&steps);
+                let next = steps
+                    .as_array()
+                    .and_then(|items| items.iter().find(|item| plan_status(item) != "completed"))
+                    .and_then(|item| item.get("step").and_then(|s| s.as_str()))
+                    .unwrap_or("")
+                    .to_string();
+                items.push(PickerEntry {
+                    label: format!("{} — {progress} · next: {next}", entry.title),
+                    search_text: format!("{} {} {steps}", entry.title, entry.session_id),
+                    value: PickerValue::PlanResume(PlanCarry::Continue(steps.to_string())),
+                });
+                continue;
+            }
+            // Mode-only planning (no draft yet) has nothing to carry over.
+            let Some(draft) = plan.draft.filter(|draft| !draft.trim().is_empty()) else {
+                continue;
+            };
+            let first_line = draft
+                .lines()
+                .find(|line| !line.trim().is_empty())
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            items.push(PickerEntry {
+                label: format!("{} — {}", entry.title, first_line),
+                search_text: format!("{} {} {}", entry.title, entry.session_id, draft),
+                value: PickerValue::PlanResume(PlanCarry::Draft(draft)),
+            });
+        }
+        if items.is_empty() {
+            self.notice = Some((
+                MUTED(),
+                "No unfinished plans in this directory — a plan saves with its session until finished or discarded"
+                    .to_string(),
+            ));
             return;
         }
-        if let Some(session) = self.agent_engine.as_ref() {
-            session.engine.lock().await.set_plan_mode(false);
+        // One candidate and no filter: skip the picker and carry it over (the
+        // common `/new` → `/plan resume` handoff).
+        if items.len() == 1 && query.is_empty() {
+            let PickerValue::PlanResume(carry) = items.remove(0).value else {
+                unreachable!("plan picker rows are PlanResume");
+            };
+            self.resume_plan_from_session(carry).await;
+            return;
         }
-        self.plan_exit_pending = false;
+        self.overlay = Overlay::Picker(Box::new(PickerState::ready(
+            "Unfinished plans",
+            query,
+            items,
+            PickerKind::PlanResume,
+        )));
+    }
+
+    /// Carry a picked plan into this session. A draft enters plan mode, arms
+    /// `/plan go`, and sends a re-validation kick-off ending in the approval card;
+    /// a mid-execution checklist continues straight into execution.
+    pub(super) async fn resume_plan_from_session(&mut self, carry: PlanCarry) {
+        if self.sending {
+            self.notice = Some((
+                MUTED(),
+                "A turn is running — /plan resume again when it finishes".to_string(),
+            ));
+            return;
+        }
+        match carry {
+            PlanCarry::Continue(steps) => {
+                let sent = self
+                    .dispatch_preserving_composer(
+                        plan_continue_message(&steps),
+                        Some("/plan resume".to_string()),
+                    )
+                    .await;
+                if let Err(e) = sent {
+                    self.notice = Some((ERROR(), e.to_string()));
+                    return;
+                }
+                self.notice = Some((
+                    MUTED(),
+                    "Continuing the carried-over plan — completed steps get a quick re-check first"
+                        .to_string(),
+                ));
+            }
+            PlanCarry::Draft(draft) => {
+                if !self.enter_plan_mode().await {
+                    self.notice = Some((
+                        ERROR(),
+                        "Plan mode needs the native agent (an API key or Copilot — not OAuth or cursor)"
+                            .to_string(),
+                    ));
+                    return;
+                }
+                // `enter_plan_mode` cleared any local draft; re-arm now so
+                // `/plan go` works before the model re-frames the plan.
+                self.pending_plan = Some(draft.clone());
+                self.plan_card_idx = None;
+                self.persist_plan_state().await;
+                let sent = self
+                    .dispatch_preserving_composer(
+                        plan_carryover_message(&draft),
+                        Some("/plan resume".to_string()),
+                    )
+                    .await;
+                if let Err(e) = sent {
+                    self.notice = Some((ERROR(), e.to_string()));
+                    return;
+                }
+                self.notice = Some((
+                    MUTED(),
+                    "Plan carried over — checking it against the current code; approve on the card (or /plan go)"
+                        .to_string(),
+                ));
+            }
+        }
+    }
+
+    /// Dispatch a machine-generated turn, stashing the composer so it can't swallow
+    /// a draft or attachment. `shown` = the compact command shown instead of the
+    /// machine text (`None` shows the text).
+    async fn dispatch_preserving_composer(
+        &mut self,
+        message: String,
+        shown: Option<String>,
+    ) -> Result<()> {
+        let stash = std::mem::take(&mut self.draft);
+        let cursor = self.cursor;
+        let attachments = std::mem::take(&mut self.draft_attachments);
+        let sent = self.dispatch_user_message_shown(message, None, shown).await;
+        self.draft = stash;
+        self.cursor = cursor;
+        self.draft_attachments = attachments;
+        self.sync_command_menu_state();
+        sent
     }
 
     /// `/plan`: `[objective]` enters plan mode; bare also sends a kick-off turn
     /// so the agent interviews for the objective; `go [guidance]` approves a
-    /// drafted plan and executes it in the same session; `stop` leaves.
+    /// drafted plan and executes it in the same session; `resume` carries an
+    /// unfinished plan over from a saved session; `stop` leaves.
     pub(super) async fn run_plan_command(&mut self, arg: Option<String>) {
         let arg = arg.as_deref().map(str::trim).unwrap_or("");
         // First word = action; the rest is `go`'s optional guidance.
@@ -2538,25 +2754,36 @@ pieces and keep going"
                     ));
                     return;
                 }
+                // Mirrors the approval card: `-y` = auto-approve, default = review.
+                let auto = rest == "-y" || rest.starts_with("-y ");
+                let guidance = rest.strip_prefix("-y").map(str::trim).unwrap_or(rest);
                 // Same session — the plan is already in the engine's history.
                 self.leave_plan_mode(true).await;
-                // Machine text — stash the composer so the dispatch can't swallow
-                // a mid-planning draft or staged attachment (as `/goal` does).
-                let draft = std::mem::take(&mut self.draft);
-                let cursor = self.cursor;
-                let attachments = std::mem::take(&mut self.draft_attachments);
-                let sent = self
-                    .dispatch_user_message(plan_go_message(rest), None)
-                    .await;
-                self.draft = draft;
-                self.cursor = cursor;
-                self.draft_attachments = attachments;
-                self.sync_command_menu_state();
-                if let Err(e) = sent {
+                self.set_auto_quiet(auto);
+                self.set_review_quiet(!auto);
+                if let Err(e) = self
+                    .dispatch_preserving_composer(plan_go_message(guidance), None)
+                    .await
+                {
                     self.notice = Some((ERROR(), e.to_string()));
                     return;
                 }
-                self.notice = Some((MUTED(), "Executing the approved plan".to_string()));
+                self.notice = Some((
+                    MUTED(),
+                    if auto {
+                        "Executing the approved plan with auto-approve".to_string()
+                    } else {
+                        "Executing the approved plan — each edit shows a diff to approve"
+                            .to_string()
+                    },
+                ));
+            }
+            "resume" | "list" => {
+                if self.sending {
+                    self.queue_command(SlashCommand::Plan(Some(arg.to_string())), "/plan resume");
+                    return;
+                }
+                self.open_plan_resume_picker(rest.to_string()).await;
             }
             "stop" | "cancel" | "discard" | "off" => {
                 if self.sending {
@@ -2599,23 +2826,13 @@ pieces and keep going"
                     ));
                     return;
                 }
-                // Stash the composer so the kick-off can't swallow a draft or
-                // staged attachment; the transcript shows the compact `/plan`.
-                let draft = std::mem::take(&mut self.draft);
-                let cursor = self.cursor;
-                let attachments = std::mem::take(&mut self.draft_attachments);
-                let sent = self
-                    .dispatch_user_message_shown(
+                if let Err(e) = self
+                    .dispatch_preserving_composer(
                         PLAN_KICKOFF_MESSAGE.to_string(),
-                        None,
                         Some("/plan".to_string()),
                     )
-                    .await;
-                self.draft = draft;
-                self.cursor = cursor;
-                self.draft_attachments = attachments;
-                self.sync_command_menu_state();
-                if let Err(e) = sent {
+                    .await
+                {
                     self.notice = Some((ERROR(), e.to_string()));
                     return;
                 }
@@ -2776,7 +2993,21 @@ pieces and keep going"
         ));
     }
 
-    pub(super) fn start_new_chat(&mut self) {
+    /// Returns the outgoing session's mid-execution checklist (JSON), if any, for
+    /// the `/new` handler to auto-continue. A draft only leaves the `/plan resume` hint.
+    pub(super) fn start_new_chat(&mut self) -> Option<String> {
+        // Scan for a leftover plan before the clears below (its planState is
+        // already on disk): an executing checklist hands off, a draft only hints,
+        // an empty history has no session file to point at.
+        let unfinished = (!self.history.is_empty())
+            .then(|| self.unfinished_plan_steps())
+            .flatten();
+        let leftover_plan = match &unfinished {
+            Some(steps) => Some(plan_steps_progress(steps)),
+            None => (!self.history.is_empty() && self.pending_plan.is_some())
+                .then(|| "unapproved draft".to_string()),
+        };
+        let handoff_steps = unfinished.map(|steps| steps.to_string());
         self.discard_resume_state();
         // The share is pinned to the current session; a new chat swaps it out.
         self.stop_live_share();
@@ -2802,6 +3033,8 @@ pieces and keep going"
         self.clear_tool_output();
         self.request_started_at = None;
         self.session_id = new_code_session_id();
+        // Fresh session file → no planState on disk yet.
+        self.plan_state_written.set(false);
         // New session → re-root NEW jobs' logs (running jobs keep their absolute paths).
         self.jobs.set_logs_root(
             self.session_store
@@ -2820,7 +3053,14 @@ pieces and keep going"
         self.plan_exit_pending = false;
         self.pending_plan = None;
         self.plan_card_idx = None;
-        self.notice = None;
+        self.notice = leftover_plan.map(|summary| {
+            (
+                MUTED(),
+                format!(
+                    "The previous session left an unfinished plan ({summary}) — /plan resume continues it here"
+                ),
+            )
+        });
         // Drop the cursor session (no context bleed across /new), then
         // re-prewarm so the next message's connect overlaps typing.
         self.cursor_acp_session = None;
@@ -2832,6 +3072,7 @@ pieces and keep going"
         self.pending_agent_messages = None;
         self.cards.clear_agent_cards();
         self.stop_agent_serve();
+        handoff_steps
     }
 
     /// `Unsend` (ESC before anything streamed) puts the cancelled submission back
@@ -3488,6 +3729,7 @@ impl crate::agent::engine::AgentUi for ChatAgentUi {
         &'a mut self,
         tool: &'a str,
         preview: Option<&'a str>,
+        once_only: bool,
     ) -> futures::future::BoxFuture<'a, Decision> {
         let tx = self.tx.clone();
         let tool = tool.to_string();
@@ -3498,6 +3740,7 @@ impl crate::agent::engine::AgentUi for ChatAgentUi {
                 .send(RuntimeEvent::AgentPermission {
                     tool,
                     preview,
+                    once_only,
                     reply,
                 })
                 .is_err()

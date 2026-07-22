@@ -536,25 +536,53 @@ async fn test_shift_tab_cycles_agent_modes() {
     assert!(app.plan_exit_pending, "engine restore deferred to turn end");
 }
 
-/// Shift+Tab on a permission card during plan mode allows that one call only —
-/// it must NOT silently enable auto-approve (plan mode has no auto-approve).
+/// Shift+Tab on a permission card during plan mode exits plan mode (live), enables
+/// auto-approve, and allows this call — the only reachable exit while back-to-back
+/// plan cards keep coming.
 #[tokio::test]
-async fn test_permission_card_shift_tab_in_plan_mode_allows_once() {
+async fn test_permission_card_shift_tab_in_plan_mode_exits_plan_into_auto() {
     use crate::agent::protocol::Decision;
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let mut app = make_test_app(tx, rx);
     app.plan_mode = true;
+    app.sending = true; // a card implies a turn in flight
     let (reply, mut rx1) = tokio::sync::oneshot::channel();
     app.cards.set_permission(super::super::PendingPermission {
         tool: "run_bash".to_string(),
         preview: Some("cargo build".to_string()),
+        once_only: true,
         reply,
     });
     let consumed = app.handle_permission_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT));
     assert!(consumed);
     assert_eq!(rx1.try_recv().unwrap(), Decision::Allow);
-    assert!(app.plan_mode, "still planning");
-    assert!(!app.agent_auto_approve, "auto-approve NOT enabled");
+    assert!(!app.plan_mode, "plan mode exited");
+    assert!(app.agent_auto_approve, "auto-approve enabled");
+    assert!(
+        app.plan_exit_flag
+            .load(std::sync::atomic::Ordering::Relaxed),
+        "live flag signals the running turn's engine"
+    );
+    assert!(app.plan_exit_pending, "turn-end fallback armed");
+}
+
+/// A floor prompt (`once_only`) never remembers its decision: a typed `a`
+/// resolves as allow-once, not AlwaysAllow.
+#[tokio::test]
+async fn test_once_only_permission_card_maps_always_to_allow() {
+    use crate::agent::protocol::Decision;
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    let (reply, mut rx1) = tokio::sync::oneshot::channel();
+    app.cards.set_permission(super::super::PendingPermission {
+        tool: "run_bash".to_string(),
+        preview: Some("rm -rf /".to_string()),
+        once_only: true,
+        reply,
+    });
+    let consumed = app.handle_permission_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE));
+    assert!(consumed);
+    assert_eq!(rx1.try_recv().unwrap(), Decision::Allow);
 }
 
 /// An `exit_plan_mode` tool call renders as the plan card (the plan is the
@@ -648,22 +676,7 @@ async fn test_plan_go_preserves_composer_draft() {
 async fn test_plan_bare_dispatches_kickoff() {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let mut app = make_test_app(tx, rx);
-    // Image in history + unknown vision pins the kick-off to plain chat — an
-    // agent engine build would touch real config/git.
-    app.history.push(ChatMessage {
-        model: None,
-        role: "user".to_string(),
-        content: "look".to_string(),
-        reasoning_content: None,
-        attachments: vec![MessageAttachment {
-            name: "shot.png".to_string(),
-            mime_type: "image/png".to_string(),
-            storage: AttachmentStorage::Inline {
-                data: "iVBOR".to_string(),
-            },
-        }],
-    });
-    app.model_image_input = None;
+    pin_to_plain_chat(&mut app);
     app.draft = "note to self".to_string();
     app.cursor = 4;
 
@@ -736,5 +749,367 @@ async fn test_shift_tab_cycles_modes_through_handle_key() {
     assert!(
         !app.agent_auto_approve,
         "Ctrl+O no longer toggles auto-approve"
+    );
+}
+
+/// `/plan resume` lists unfinished plans from other sessions in this directory (a
+/// draft and a mid-execution checklist), excluding no-plan/mode-only/other-dir/
+/// current sessions.
+#[tokio::test]
+async fn test_plan_resume_picker_lists_unfinished_plans() {
+    use crate::services::session_store::PlanState;
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.real_cwd = "/proj".to_string();
+
+    let save = |id: &str, cwd: &str, title: &str| {
+        let store = app.session_store.clone();
+        let (id, cwd, title) = (id.to_string(), cwd.to_string(), title.to_string());
+        async move {
+            store
+                .save_code_session_with_id(
+                    "test",
+                    "https://api.anthropic.com",
+                    &cwd,
+                    &id,
+                    "claude",
+                    None,
+                    &[],
+                    &title,
+                    "",
+                    Default::default(),
+                    0.0,
+                )
+                .await
+                .unwrap();
+        }
+    };
+    save("s-plan", "/proj", "fix the gate").await;
+    app.session_store
+        .set_plan_state(
+            "s-plan",
+            Some(&PlanState {
+                mode: true,
+                draft: Some("1. fix gate\n2. add tests".to_string()),
+                steps: None,
+            }),
+        )
+        .await
+        .unwrap();
+    save("s-executing", "/proj", "nginx cleanup").await;
+    app.session_store
+        .set_plan_state(
+            "s-executing",
+            Some(&PlanState {
+                mode: false,
+                draft: None,
+                steps: Some(serde_json::json!([
+                    {"step": "dedupe server blocks", "status": "completed"},
+                    {"step": "reload nginx", "status": "pending"}
+                ])),
+            }),
+        )
+        .await
+        .unwrap();
+    save("s-none", "/proj", "no plan here").await;
+    save("s-elsewhere", "/other", "different dir").await;
+    app.session_store
+        .set_plan_state(
+            "s-elsewhere",
+            Some(&PlanState {
+                mode: true,
+                draft: Some("out of scope".to_string()),
+                steps: None,
+            }),
+        )
+        .await
+        .unwrap();
+    save("s-modeonly", "/proj", "mode only").await;
+    app.session_store
+        .set_plan_state(
+            "s-modeonly",
+            Some(&PlanState {
+                mode: true,
+                draft: None,
+                steps: None,
+            }),
+        )
+        .await
+        .unwrap();
+
+    app.run_plan_command(Some("resume".to_string())).await;
+
+    let Overlay::Picker(picker) = &app.overlay else {
+        panic!(
+            "expected the unfinished-plans picker, got notice {:?}",
+            app.notice
+        );
+    };
+    assert!(matches!(picker.kind, PickerKind::PlanResume));
+    assert_eq!(picker.items.len(), 2, "the drafted + executing plans list");
+    let drafted = picker
+        .items
+        .iter()
+        .find(|item| item.label.contains("fix the gate"))
+        .expect("drafted plan row");
+    assert!(drafted.label.contains("1. fix gate"));
+    let PickerValue::PlanResume(PlanCarry::Draft(draft)) = &drafted.value else {
+        panic!("expected a draft PlanResume value");
+    };
+    assert_eq!(draft, "1. fix gate\n2. add tests");
+    let executing = picker
+        .items
+        .iter()
+        .find(|item| item.label.contains("nginx cleanup"))
+        .expect("executing plan row");
+    assert!(
+        executing.label.contains("1/2 steps done"),
+        "progress in the label: {:?}",
+        executing.label
+    );
+    assert!(executing.label.contains("next: reload nginx"));
+    let PickerValue::PlanResume(PlanCarry::Continue(steps)) = &executing.value else {
+        panic!("expected a continue PlanResume value");
+    };
+    assert!(steps.contains("reload nginx"));
+}
+
+/// `/plan resume` with nothing to pick up notices instead of an empty picker.
+#[tokio::test]
+async fn test_plan_resume_without_plans_notices() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.real_cwd = "/proj".to_string();
+
+    app.run_plan_command(Some("resume".to_string())).await;
+
+    assert!(matches!(app.overlay, Overlay::None));
+    assert!(
+        app.notice
+            .as_ref()
+            .unwrap()
+            .1
+            .contains("No unfinished plans")
+    );
+}
+
+/// Carrying over an unapproved draft enters plan mode, arms `/plan go`, and
+/// dispatches a kick-off embedding the plan while the transcript shows `/plan resume`.
+#[tokio::test]
+async fn test_plan_resume_activation_arms_and_dispatches() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    pin_to_plain_chat(&mut app);
+
+    app.resume_plan_from_session(PlanCarry::Draft("1. carried plan".to_string()))
+        .await;
+
+    assert!(app.plan_mode, "carry-over enters plan mode");
+    assert_eq!(
+        app.pending_plan.as_deref(),
+        Some("1. carried plan"),
+        "draft armed for /plan go before the model re-frames it"
+    );
+    assert!(app.sending, "the kick-off went out");
+    let content = &app.pending_submit.as_ref().unwrap().content;
+    assert!(
+        content.contains("<carried-over-plan>\n1. carried plan"),
+        "machine text embeds the plan: {content:?}"
+    );
+    assert_eq!(
+        app.history.last().unwrap().content,
+        "/plan resume",
+        "the transcript shows the compact command"
+    );
+}
+
+/// Carrying over a mid-execution checklist continues directly — no plan mode, no
+/// re-approval; the machine text embeds the checklist with its completed marks.
+#[tokio::test]
+async fn test_plan_resume_continues_executing_checklist() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    pin_to_plain_chat(&mut app);
+    let steps = r#"[{"step":"a","status":"completed"},{"step":"b","status":"pending"}]"#;
+
+    app.resume_plan_from_session(PlanCarry::Continue(steps.to_string()))
+        .await;
+
+    assert!(
+        !app.plan_mode,
+        "an approved plan continues without plan mode"
+    );
+    assert!(app.pending_plan.is_none(), "nothing to re-approve");
+    assert!(app.sending, "the continuation went out");
+    let content = &app.pending_submit.as_ref().unwrap().content;
+    assert!(
+        content.contains("<carried-over-checklist>") && content.contains("\"step\":\"b\""),
+        "machine text embeds the checklist: {content:?}"
+    );
+    assert_eq!(app.history.last().unwrap().content, "/plan resume");
+}
+
+/// `/plan resume` with exactly one candidate and no filter skips the picker and
+/// carries the plan over directly — the `/new` handoff stays one command.
+#[tokio::test]
+async fn test_plan_resume_single_candidate_carries_directly() {
+    use crate::services::session_store::PlanState;
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.real_cwd = "/proj".to_string();
+    app.session_store
+        .save_code_session_with_id(
+            "test",
+            "https://api.anthropic.com",
+            "/proj",
+            "s-only",
+            "claude",
+            None,
+            &[],
+            "the one plan",
+            "",
+            Default::default(),
+            0.0,
+        )
+        .await
+        .unwrap();
+    app.session_store
+        .set_plan_state(
+            "s-only",
+            Some(&PlanState {
+                mode: true,
+                draft: Some("1. only plan".to_string()),
+                steps: None,
+            }),
+        )
+        .await
+        .unwrap();
+    pin_to_plain_chat(&mut app);
+
+    app.run_plan_command(Some("resume".to_string())).await;
+
+    assert!(
+        matches!(app.overlay, Overlay::None),
+        "no picker for a single candidate"
+    );
+    assert!(app.plan_mode, "carried straight into plan mode");
+    assert_eq!(app.pending_plan.as_deref(), Some("1. only plan"));
+    assert!(app.sending, "the kick-off went out");
+}
+
+/// The turn-end persist snapshots an unfinished execution checklist into
+/// planState; an all-done checklist clears it (a finished plan isn't resumable).
+#[tokio::test]
+async fn test_persist_plan_state_tracks_execution_checklist() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.session_id = "s-exec".to_string();
+    app.session_store
+        .save_code_session_with_id(
+            "test",
+            "https://api.anthropic.com",
+            "/proj",
+            "s-exec",
+            "claude",
+            None,
+            &[],
+            "t",
+            "",
+            Default::default(),
+            0.0,
+        )
+        .await
+        .unwrap();
+    app.history.push(ChatMessage {
+        model: None,
+        role: "plan".to_string(),
+        content: r#"[{"step":"a","status":"completed"},{"step":"b","status":"in_progress"}]"#
+            .to_string(),
+        reasoning_content: None,
+        attachments: vec![],
+    });
+
+    app.persist_plan_state().await;
+    let saved = app
+        .session_store
+        .get_code_session("s-exec")
+        .await
+        .unwrap()
+        .unwrap();
+    let steps = saved
+        .plan_state
+        .expect("checklist persisted")
+        .steps
+        .unwrap();
+    assert_eq!(steps.as_array().unwrap().len(), 2);
+
+    // All steps done → the snapshot clears on the next persist.
+    app.history.last_mut().unwrap().content =
+        r#"[{"step":"a","status":"completed"},{"step":"b","status":"completed"}]"#.to_string();
+    app.persist_plan_state().await;
+    let saved = app
+        .session_store
+        .get_code_session("s-exec")
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        saved.plan_state.is_none(),
+        "a finished plan isn't resumable"
+    );
+}
+
+/// `/new` after a mid-execution plan returns the checklist for the automatic
+/// handoff; a fresh session with no plan returns nothing and leaves no hint.
+#[tokio::test]
+async fn test_new_chat_hands_off_leftover_plan() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.history.push(ChatMessage {
+        model: None,
+        role: "plan".to_string(),
+        content: r#"[{"step":"a","status":"completed"},{"step":"b","status":"pending"}]"#
+            .to_string(),
+        reasoning_content: None,
+        attachments: vec![],
+    });
+
+    let handoff = app.start_new_chat();
+
+    let steps = handoff.expect("executing checklist handed off for auto-continue");
+    assert!(
+        steps.contains("\"step\":\"b\""),
+        "checklist JSON: {steps:?}"
+    );
+    assert!(app.history.is_empty(), "the new session starts fresh");
+
+    // No plan left → nothing to hand off, no hint.
+    assert!(app.start_new_chat().is_none());
+    assert!(app.notice.is_none());
+}
+
+/// `/new` after an unapproved DRAFT does not auto-continue (re-approval is a
+/// decision) — it only hints at `/plan resume`.
+#[tokio::test]
+async fn test_new_chat_draft_hints_instead_of_auto() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.history.push(ChatMessage {
+        model: None,
+        role: "user".to_string(),
+        content: "plan something".to_string(),
+        reasoning_content: None,
+        attachments: vec![],
+    });
+    app.plan_mode = true;
+    app.pending_plan = Some("1. draft".to_string());
+
+    let handoff = app.start_new_chat();
+
+    assert!(handoff.is_none(), "a draft never auto-continues");
+    let notice = app.notice.as_ref().map(|(_, n)| n.as_str()).unwrap_or("");
+    assert!(
+        notice.contains("unapproved draft") && notice.contains("/plan resume"),
+        "draft hint: {notice:?}"
     );
 }

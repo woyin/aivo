@@ -313,6 +313,7 @@ const SOURCE_NEWER_SLACK_SECS: i64 = 5;
 
 /// Outcome of [`resume_foreign`]: the saved fork when one exists, else a
 /// fresh conversion of the source transcript.
+#[allow(clippy::large_enum_variant)]
 pub enum ForeignResume {
     Fork {
         state: crate::services::session_store::CodeSessionState,

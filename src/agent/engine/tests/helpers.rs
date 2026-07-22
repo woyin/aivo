@@ -74,6 +74,7 @@ impl AgentUi for CapturingUi {
         &'a mut self,
         tool: &'a str,
         _: Option<&'a str>,
+        _: bool,
     ) -> BoxFuture<'a, Decision> {
         self.asks += 1;
         self.ask_tools.push(tool.to_string());
@@ -203,6 +204,7 @@ pub(super) fn turn_ctx<'a>(
         auto_approve_all: false,
         auto_approve: None,
         review_edits: None,
+        plan_exit: None,
     }
 }
 

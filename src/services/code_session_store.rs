@@ -505,8 +505,8 @@ impl CodeSessionStore {
         // so a per-turn or heartbeat persist can't wipe it; `save_agent_messages`
         // refreshes it after a turn (when the engine is lockable). The import
         // fidelity stamp is preserved the same way.
-        let (engine_messages, import_fidelity) = existing
-            .map(|s| (s.engine_messages, s.import_fidelity))
+        let (engine_messages, import_fidelity, plan_state) = existing
+            .map(|s| (s.engine_messages, s.import_fidelity, s.plan_state))
             .unwrap_or_default();
         let state = CodeSessionState {
             session_id: session_id.to_string(),
@@ -517,6 +517,7 @@ impl CodeSessionStore {
             messages: messages.to_vec(),
             engine_messages,
             import_fidelity,
+            plan_state,
             updated_at: now.clone(),
             created_at: created_at.clone(),
         };
@@ -584,6 +585,25 @@ impl CodeSessionStore {
         } else {
             Some(engine_messages.to_vec())
         };
+        self.save_session_file(&state).await
+    }
+
+    /// Refresh (or with `None` clear) an existing session's unfinished-plan
+    /// snapshot. No-op when the file is absent or there's nothing to write or
+    /// clear. Best-effort like `save_agent_messages`.
+    pub(crate) async fn set_plan_state(
+        &self,
+        session_id: &str,
+        plan: Option<&crate::services::session_store::PlanState>,
+    ) -> Result<()> {
+        let _lock = self.acquire_session_lock()?;
+        let Ok(mut state) = self.load_session_file(session_id).await else {
+            return Ok(());
+        };
+        if state.plan_state.is_none() && plan.is_none() {
+            return Ok(());
+        }
+        state.plan_state = plan.cloned();
         self.save_session_file(&state).await
     }
 

@@ -550,6 +550,7 @@ async fn test_resume_resets_plan_and_goal_state() {
         pristine_import: false,
         source_newer: false,
         import_fidelity: None,
+        plan_state: None,
     };
     app.apply_loaded_session(session).await.unwrap();
 
@@ -564,6 +565,56 @@ async fn test_resume_resets_plan_and_goal_state() {
         "card index points at replaced history"
     );
     assert!(app.goal_mode.is_none());
+}
+
+/// A resumed session with a saved unfinished plan picks it back up: plan mode
+/// restored, draft `/plan go`-able, and the card re-framed at its message in the
+/// restored history.
+#[tokio::test]
+async fn test_resume_restores_unfinished_plan() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+
+    let plan_text = "1. refactor the gate\n2. add tests";
+    let msg = |role: &str, content: &str| ChatMessage {
+        model: None,
+        role: role.to_string(),
+        content: content.to_string(),
+        reasoning_content: None,
+        attachments: vec![],
+    };
+    let session = LoadedSession {
+        key_id: app.key.id.clone(),
+        session_id: "resumed".to_string(),
+        raw_model: "claude".to_string(),
+        messages: vec![
+            msg("user", "plan the refactor"),
+            msg("assistant", plan_text),
+        ],
+        engine_messages: None,
+        pristine_import: false,
+        source_newer: false,
+        import_fidelity: None,
+        plan_state: Some(crate::services::session_store::PlanState {
+            mode: true,
+            draft: Some(plan_text.to_string()),
+            steps: None,
+        }),
+    };
+    app.apply_loaded_session(session).await.unwrap();
+
+    assert!(app.plan_mode, "plan mode restored");
+    assert_eq!(app.pending_plan.as_deref(), Some(plan_text));
+    assert_eq!(
+        app.plan_card_idx,
+        Some(1),
+        "card re-framed at the plan's message in the restored history"
+    );
+    let notice = app.notice.as_ref().map(|(_, n)| n.as_str()).unwrap_or("");
+    assert!(
+        notice.contains("unfinished plan"),
+        "restore is announced: {notice:?}"
+    );
 }
 
 #[tokio::test]
@@ -588,6 +639,7 @@ async fn test_fresh_import_announces_fidelity_saved_fork_stays_silent() {
         pristine_import: true,
         source_newer: false,
         import_fidelity: Some(fidelity.clone()),
+        plan_state: None,
     };
     app.apply_loaded_session(session).await.unwrap();
 
@@ -608,6 +660,7 @@ async fn test_fresh_import_announces_fidelity_saved_fork_stays_silent() {
         pristine_import: false,
         source_newer: false,
         import_fidelity: Some(crate::services::session_import::ImportFidelity::default()),
+        plan_state: None,
     };
     app.notice = None;
     app.apply_loaded_session(saved).await.unwrap();
@@ -1177,6 +1230,7 @@ async fn test_resume_resets_agent_engine() {
         pristine_import: false,
         source_newer: false,
         import_fidelity: None,
+        plan_state: None,
     };
     app.apply_loaded_session(session).await.unwrap();
 
@@ -1230,6 +1284,7 @@ async fn test_resume_footer_estimate_uses_durable_transcript() {
         pristine_import: false,
         source_newer: false,
         import_fidelity: None,
+        plan_state: None,
     };
     app.apply_loaded_session(session).await.unwrap();
 
@@ -1289,6 +1344,7 @@ async fn test_resume_restores_session_cost_and_billed_model() {
         pristine_import: false,
         source_newer: false,
         import_fidelity: None,
+        plan_state: None,
     };
     app.apply_loaded_session(session).await.unwrap();
 
@@ -1328,6 +1384,7 @@ async fn test_resume_does_not_overwrite_persisted_default_model() {
         pristine_import: false,
         source_newer: false,
         import_fidelity: None,
+        plan_state: None,
     };
     app.apply_loaded_session(session).await.unwrap();
 

@@ -184,10 +184,12 @@ pub trait AgentUi: Send {
     );
     /// Decide whether a mutating tool may run. Async so a TUI can await a permission
     /// card; the terminal impl resolves synchronously. Must fail closed off a TTY.
+    /// `once_only` = a floor prompt (never remembered); the UI must not offer "always".
     fn ask_permission<'a>(
         &'a mut self,
         tool: &'a str,
         preview: Option<&'a str>,
+        once_only: bool,
     ) -> BoxFuture<'a, Decision>;
     /// The `switch_model` tool. Default declines — only the chat TUI drives it.
     fn switch_chat_model<'a>(
@@ -280,6 +282,9 @@ pub struct TurnCtx<'a> {
     /// Live edit-review toggle (chat `/config`), read fresh per batch. `None`
     /// outside the chat TUI — headless / `-y` / sub-agents never gate.
     pub review_edits: Option<&'a std::sync::atomic::AtomicBool>,
+    /// Live mid-turn plan-mode exit (chat TUI Shift+Tab), read per tool-call
+    /// boundary so the running turn drops the plan floor. `None` outside the TUI.
+    pub plan_exit: Option<&'a std::sync::atomic::AtomicBool>,
 }
 
 impl TurnCtx<'_> {
@@ -300,6 +305,11 @@ impl TurnCtx<'_> {
     /// True when edits should pause for review — the live toggle only (no `-y`).
     pub fn review_edits_enabled(&self) -> bool {
         self.review_edits
+            .is_some_and(|f| f.load(std::sync::atomic::Ordering::Relaxed))
+    }
+
+    pub fn plan_exit_requested(&self) -> bool {
+        self.plan_exit
             .is_some_and(|f| f.load(std::sync::atomic::Ordering::Relaxed))
     }
 }

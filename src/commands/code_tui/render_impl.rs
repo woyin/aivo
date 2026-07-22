@@ -1559,7 +1559,7 @@ impl CodeTuiApp {
         // row, so a short confirm reads as a compact card; never wider than the
         // composer. +4 = 2 borders + 1 col of padding on each side.
         let heading = permission_heading(&pending.tool);
-        let keys = permission_keys_line(&pending.tool, !self.draft.is_empty());
+        let keys = permission_keys_line(&pending.tool, pending.once_only, !self.draft.is_empty());
         let keys_w: usize = keys
             .spans
             .iter()
@@ -3311,11 +3311,11 @@ fn mcp_consent_keys_line() -> Line<'static> {
 /// The choices row: color-coded keycaps reading like a traffic light —
 /// green allow, amber always (it arms auto-approve), red deny. `tool` selects
 /// the "always" scope wording (a Cursor card's "always" is session-wide, unlike
-/// the native engine's, which is scoped to this one command/path), and
-/// `composing` swaps in a hint when a queued-message draft is in progress —
-/// there the letter keys type into the draft instead of deciding (see
-/// `handle_permission_key`).
-fn permission_keys_line(tool: &str, composing: bool) -> Line<'static> {
+/// the native engine's, which is scoped to this one command/path), `once_only`
+/// drops "always" entirely (never remembered), and `composing` swaps in a hint
+/// when a queued-message draft is in progress — there the letter keys type into
+/// the draft instead of deciding (see `handle_permission_key`).
+fn permission_keys_line(tool: &str, once_only: bool, composing: bool) -> Line<'static> {
     let keycap = |key: &str, color: Color| {
         Span::styled(
             key.to_string(),
@@ -3346,16 +3346,15 @@ fn permission_keys_line(tool: &str, composing: bool) -> Line<'static> {
     } else {
         " always"
     };
-    Line::from(vec![
-        keycap("y", ASSISTANT()),
-        label(" allow once"),
-        gap(),
-        keycap("a", WARNING()),
-        label(always_label),
-        gap(),
-        keycap("n", ERROR()),
-        label(" deny"),
-    ])
+    let mut spans = vec![keycap("y", ASSISTANT()), label(" allow once"), gap()];
+    if !once_only {
+        spans.push(keycap("a", WARNING()));
+        spans.push(label(always_label));
+        spans.push(gap());
+    }
+    spans.push(keycap("n", ERROR()));
+    spans.push(label(" deny"));
+    Line::from(spans)
 }
 
 /// The `ask_user` card's key-hint row: "space toggle · ↵ confirm" in multi-select,

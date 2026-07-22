@@ -230,6 +230,8 @@ impl AgentEngine {
             auto_approve_all: ctx.auto_approve_all,
             auto_approve: ctx.auto_approve,
             review_edits: ctx.review_edits,
+            // Sub-agents never run in plan mode (plan strips the subagent tool).
+            plan_exit: None,
         };
         // Box the recursive future (run_turn → subagent → run_turn) so it isn't infinitely-sized.
         Box::pin(sub.run_turn(&sub_ctx, &mut ui, task.to_string())).await;
@@ -504,13 +506,14 @@ impl AgentUi for SubagentUi<'_> {
         &'a mut self,
         tool: &'a str,
         preview: Option<&'a str>,
+        once_only: bool,
     ) -> BoxFuture<'a, Decision> {
         // Forward to the parent (card in the TUI, fail-closed when headless) rather than
         // auto-allowing, so the catastrophic-command floor holds for sub-agents too.
         // Detached (parallel batch): deny, but visibly — a silent deny reads as
         // the delegate just doing a bad job.
         match self.parent.as_deref_mut() {
-            Some(p) => p.ask_permission(tool, preview),
+            Some(p) => p.ask_permission(tool, preview, once_only),
             None => {
                 if let Some((s, slot)) = &self.sink {
                     s.denied(*slot, tool);

@@ -56,7 +56,7 @@ async fn subagent_forwards_permission_to_parent_and_fails_closed() {
         parent: Some(&mut parent),
         ..Default::default()
     };
-    let decision = sub.ask_permission("run_bash", Some("rm -rf /")).await;
+    let decision = sub.ask_permission("run_bash", Some("rm -rf /"), true).await;
     assert!(matches!(decision, Decision::Deny));
     drop(sub);
     assert_eq!(parent.ask_tools, vec!["run_bash"]);
@@ -64,7 +64,9 @@ async fn subagent_forwards_permission_to_parent_and_fails_closed() {
     // Detached (no parent) fails closed.
     let mut orphan = SubagentUi::default();
     assert!(matches!(
-        orphan.ask_permission("run_bash", Some("rm -rf /")).await,
+        orphan
+            .ask_permission("run_bash", Some("rm -rf /"), true)
+            .await,
         Decision::Deny
     ));
 }
@@ -538,7 +540,7 @@ async fn subagent_ui_sink_forwards_activity_and_denies_visibly() {
     };
     ui.turn_start();
     ui.tool_start("read_file", &json!({"path": "a.rs"}));
-    let decision = ui.ask_permission("run_bash", None).await;
+    let decision = ui.ask_permission("run_bash", None, false).await;
     assert!(matches!(decision, Decision::Deny));
     let events = sink.0.lock().unwrap().clone();
     assert_eq!(
