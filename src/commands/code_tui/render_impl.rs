@@ -155,7 +155,8 @@ impl CodeTuiApp {
             }
         }
 
-        let (inline_result, consumed_results) = self.parallel_batch_pairing(render_len);
+        let (inline_result, consumed_results, split_calls) =
+            self.parallel_batch_pairing(render_len);
 
         let mut idx = 0;
         while idx < render_len {
@@ -238,11 +239,10 @@ impl CodeTuiApp {
                         idx += 1;
                         continue;
                     }
-                    // Coalesce a run of adjacent same-verb calls into one line (see
-                    // `tool_group_key`). Subagents are the exception — each is a
-                    // distinct unit of work, so render it on its own line with its
-                    // task visible, never an opaque `subagent ×N`.
-                    let run = if name == "subagent" {
+                    // Coalesce adjacent same-verb calls into one line. Exceptions stay
+                    // split: subagents (never an opaque `subagent ×N`) and mixed-batch
+                    // calls, whose result inlines under them (`split_calls`).
+                    let run = if name == "subagent" || split_calls.contains(&idx) {
                         1
                     } else {
                         self.tool_call_run_len(idx, &name)
@@ -450,20 +450,21 @@ impl CodeTuiApp {
         (lines, bars)
     }
 
-    /// Pairs each `tool_call` in a parallel batch (a run of ≥2 calls followed by a
-    /// run of results) with its result: (`call idx → result idx`, `result idxs
-    /// drawn under a call`). Coalescing batches are skipped — interleaving one of
-    /// their results would reorder fold rows and desync the click-to-expand ordinal
-    /// map (`expandable_output_indices` is history-ordered).
+    /// Pairs each `tool_call` in a *mixed* parallel batch with its result:
+    /// (`call → result`, `results drawn under a call`, `calls to render split`). A
+    /// *pure* batch coalesces into a `verb ×N` header instead, so it's skipped —
+    /// interleaving its results would desync the history-ordered click-to-expand map.
     fn parallel_batch_pairing(
         &self,
         render_len: usize,
     ) -> (
         std::collections::HashMap<usize, usize>,
         std::collections::HashSet<usize>,
+        std::collections::HashSet<usize>,
     ) {
         let mut inline = std::collections::HashMap::new();
         let mut consumed = std::collections::HashSet::new();
+        let mut split = std::collections::HashSet::new();
         let role = |i: usize| self.history[i].role.as_str();
         let mut i = 0;
         while i < render_len {
@@ -481,21 +482,23 @@ impl CodeTuiApp {
             }
             let calls = res_start - call_start;
             let results = i - res_start;
-            if calls < 2
-                || results == 0
-                || (call_start..res_start - 1).any(|k| {
-                    tool_group_key(&decode_tool_call(&self.history[k].content).0)
-                        == tool_group_key(&decode_tool_call(&self.history[k + 1].content).0)
-                })
-            {
+            // Pure → coalesce + clump (standalone arm); mixed → split & inline.
+            let group0 =
+                tool_group_key(&decode_tool_call(&self.history[call_start].content).0).to_string();
+            let pure = (call_start + 1..res_start)
+                .all(|k| group0 == tool_group_key(&decode_tool_call(&self.history[k].content).0));
+            if calls < 2 || results == 0 || pure {
                 continue;
+            }
+            for j in 0..calls {
+                split.insert(call_start + j);
             }
             for j in 0..calls.min(results) {
                 inline.insert(call_start + j, res_start + j);
                 consumed.insert(res_start + j);
             }
         }
-        (inline, consumed)
+        (inline, consumed, split)
     }
 
     /// Length of the run of consecutive `tool_call` entries starting at `start`

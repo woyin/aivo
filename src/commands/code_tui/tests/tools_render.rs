@@ -628,9 +628,10 @@ fn test_batched_tool_results_resolve_unit_and_target_by_position() {
     assert!(plain.contains("2 matches"), "{plain}");
     assert!(plain.contains("3 matches"), "{plain}");
     assert!(plain.contains("4 matches"), "{plain}");
-    assert!(plain.contains("alpha · "), "{plain}");
-    assert!(plain.contains("beta · "), "{plain}");
-    assert!(plain.contains("gamma · "), "{plain}");
+    // Leading `· ` (the search preview that used to trail the label is gone).
+    assert!(plain.contains("· alpha"), "{plain}");
+    assert!(plain.contains("· beta"), "{plain}");
+    assert!(plain.contains("· gamma"), "{plain}");
     assert!(plain.contains("searched ×3"), "{plain}");
     assert!(!plain.contains("searched ×3: alpha"), "{plain}");
 }
@@ -667,8 +668,8 @@ fn test_adjacent_search_tools_merge_into_one_group() {
     assert!(plain.contains("3 files"), "{plain}");
     assert!(plain.contains("2 matches"), "{plain}");
     assert!(plain.contains("4 matches"), "{plain}");
-    assert!(plain.contains("**/*canary* · "), "{plain}");
-    assert!(plain.contains("gemini · "), "{plain}");
+    assert!(plain.contains("· **/*canary*"), "{plain}");
+    assert!(plain.contains("· gemini"), "{plain}");
 }
 
 #[test]
@@ -747,6 +748,54 @@ fn test_detached_results_in_batch_interleave_under_their_call() {
         "{}",
         lines.join("\n")
     );
+}
+
+#[test]
+fn test_mixed_batch_with_adjacent_pair_keeps_results_under_their_calls() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+
+    // A mixed batch with an adjacent same-tool pair (the two list_dirs) must not
+    // fold it into `list_dir ×2` and strand the results in a clump — each stays
+    // glued under its own call.
+    for (tool, key, arg) in [
+        ("glob", "pattern", "**/*"),
+        ("read_file", "path", "pkg.json"),
+        ("list_dir", "path", "src"),
+        ("list_dir", "path", "public"),
+    ] {
+        app.apply_agent_tool_call(
+            None,
+            tool.to_string(),
+            serde_json::json!({ key: arg }),
+            vec![],
+            None,
+        );
+    }
+    app.apply_agent_tool_result("a\nb\nc".to_string()); // glob -> 3 files
+    app.apply_agent_tool_result("1\n2".to_string()); // read_file -> 2 lines
+    app.apply_agent_tool_result("x/\ny/\nz/".to_string()); // list_dir src -> 3 entries
+    app.apply_agent_tool_result("m/\nn/".to_string()); // list_dir public -> 2 entries
+
+    let lines = app.build_transcript().plain_lines;
+    let plain = lines.join("\n");
+    // The stray adjacent pair never collapses in a mixed batch.
+    assert!(!plain.contains("list_dir ×"), "must not coalesce:\n{plain}");
+    // Every result hugs the call that produced it, in the right unit.
+    let under = |call: &str, result: &str| {
+        let i = lines
+            .iter()
+            .position(|l| l.contains(call))
+            .unwrap_or_else(|| panic!("no call {call:?} in:\n{plain}"));
+        assert!(
+            lines[i + 1].contains(result),
+            "expected {result:?} under {call:?}:\n{plain}"
+        );
+    };
+    under("→ glob(**/*)", "3 files");
+    under("→ read_file(pkg.json)", "2 lines");
+    under("→ list_dir(src)", "3 entries");
+    under("→ list_dir(public)", "2 entries");
 }
 
 #[test]

@@ -1666,8 +1666,9 @@ pub(super) fn render_tool_result(
                 Style::default().fg(MUTED()),
             ));
         }
-        // A search's or subagent's first line is the payoff — preview it.
-        if matches!(tool, Some("grep" | "glob" | "subagent")) {
+        // Preview a subagent's first line (its summary). Not a search's — that's a
+        // raw match: leaks source, and the pattern's already on the call line.
+        if tool == Some("subagent") {
             let first = result
                 .lines()
                 .map(str::trim)
