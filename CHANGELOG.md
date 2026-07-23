@@ -1,5 +1,19 @@
 # Changelog
 
+## v0.41.6
+
+A coding-agent and plan-mode quality release. Unfinished plans now resume across sessions and you can exit plan mode live, mid-turn — a plan no longer traps the turn it started in. The `keys add` flow gets friendlier: it suggests a short name when you omit one, and `--key` becomes `--api-key` (the old spelling still works). The code TUI keeps the model honest about still-running background jobs each turn, keeps tool results glued to their calls in mixed parallel batches, and clears the stale queued tip when a queue row is deleted or recalled. Rounding out the release: honest exit codes for `ping`/`serve`/`account` with a unified skip-confirm flag, and expired-credential errors now point you at `aivo keys reauth`.
+
+- feat(plan): resume unfinished plans + live mid-turn plan exit (0d3dff8e)
+- feat(keys): rename `keys add --key` to `--api-key`, keep `--key` alias (7aa52917)
+- feat(keys): auto-suggest a short key name when `keys add` gets none (0a8db8db)
+- fix(code): surface still-running jobs to the model each turn (6e41d11c)
+- fix(code): keep tool results glued to their calls in mixed parallel batches (76a8fcd5)
+- fix(code): clear stale queued tip when a queue row is deleted or recalled (669de9d5)
+- fix(cli): honest exit codes for ping/serve/account and unify skip-confirm flag (f33bd038)
+- fix(oauth): point expired-credential errors at `aivo keys reauth` (966fb82f)
+- fix(ci): make plan exit test path portable (045037bb)
+
 ## v0.41.5
 
 Codex desktop support goes cross-platform. aivo now locates the Codex bundle whether it ships as `Codex.app` or the renamed `ChatGPT.app`, launches the GUI itself via the `codex://` scheme, and gains Windows desktop support (MSIX probe plus a self-copy shim). Imported sessions carry a fidelity report so you can see how faithfully a foreign transcript was reconstructed, and plugin run records resolve through their manifest transcript sources on `--resume`. The coding agent adds built-in review sub-agents (verification/advisor/evaluate) and a preventive tool-result snip that keeps prefix caches warm.
