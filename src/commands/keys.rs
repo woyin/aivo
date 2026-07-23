@@ -2640,7 +2640,7 @@ impl KeysCommand {
 
         if !std::io::stderr().is_terminal() {
             eprintln!(
-                "{} Cursor needs an interactive terminal for sign-in. Pass `--key sk-…` or set CURSOR_API_KEY for non-interactive setup.",
+                "{} Cursor needs an interactive terminal for sign-in. Pass `--api-key sk-…` or set CURSOR_API_KEY for non-interactive setup.",
                 style::red("Error:")
             );
             return Err(ExitCode::UserError);
@@ -2898,8 +2898,8 @@ impl KeysCommand {
         };
 
         let is_starter_name = name == "aivo-starter" || name == "aivo starter";
-        // `aivo keys add cursor --key sk-…` is the non-interactive shortcut
-        // into the cursor flow. Without `--key`, "cursor" is treated as a
+        // `aivo keys add cursor --api-key sk-…` is the non-interactive shortcut
+        // into the cursor flow. Without `--api-key`, "cursor" is treated as a
         // plain key name — users who want OAuth / API-key sub-pickers run
         // `aivo keys add` (no args) and pick Cursor from the provider list.
         let is_cursor_shortcut = name.eq_ignore_ascii_case("cursor")
@@ -3054,7 +3054,7 @@ impl KeysCommand {
         if base_url == "ollama" {
             if add_options.key.is_some() {
                 eprintln!(
-                    "{} Ollama runs locally without authentication. Do not pass --key.",
+                    "{} Ollama runs locally without authentication. Do not pass --api-key.",
                     style::red("Error:")
                 );
                 return Ok(ExitCode::UserError);
@@ -3345,7 +3345,9 @@ fn print_help_overview() {
     println!();
     println!(
         "{}",
-        style::dim("Flags: --ping/--json (list), --name/--base-url/--key (add). See <cmd> --help.")
+        style::dim(
+            "Flags: --ping/--json (list), --name/--base-url/--api-key (add). See <cmd> --help."
+        )
     );
     println!();
     println!("{}", style::bold("Examples:"));
@@ -3353,7 +3355,7 @@ fn print_help_overview() {
     println!("  {}", style::dim("aivo keys use openrouter"));
     println!(
         "  {}",
-        style::dim("aivo keys add --name abc --base-url https://example.io --key sk-...")
+        style::dim("aivo keys add --name abc --base-url https://example.io --api-key sk-...")
     );
 }
 
@@ -3387,14 +3389,14 @@ fn print_help_add() {
         "--base-url <url>",
         "Provider base URL (e.g. https://openrouter.ai/api/v1)",
     );
-    keys_help_row("--key <api-key>", "Provider API key value");
+    keys_help_row("--api-key <key>", "Provider API key value");
     println!();
     println!("{}", style::bold("Examples:"));
     println!("  {}", style::dim("aivo keys add"));
     println!("  {}", style::dim("aivo keys add openrouter"));
     println!(
         "  {}",
-        style::dim("aivo keys add --name abc --base-url https://example.io --key sk-...")
+        style::dim("aivo keys add --name abc --base-url https://example.io --api-key sk-...")
     );
 }
 

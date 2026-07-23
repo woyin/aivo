@@ -48,7 +48,7 @@ aivo keys reset-route <id|name> # clear cached provider routing for a key
 One-liner add (non-interactive):
 
 ```bash
-aivo keys add --name groq --base-url https://api.groq.com/openai/v1 --key sk-xxx
+aivo keys add --name groq --base-url https://api.groq.com/openai/v1 --api-key sk-xxx
 ```
 
 Move keys between machines (password-encrypted file):
