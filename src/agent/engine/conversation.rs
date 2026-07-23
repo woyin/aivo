@@ -322,6 +322,17 @@ impl AgentEngine {
             let owned = content.take();
             *content = plan_mode::append_turn_reminder(owned);
         }
+        // Ephemeral running-jobs reminder (like the plan one), else the model claims a live server stopped.
+        if let Some(jobs) = &self.jobs {
+            let running = jobs.running_snapshot();
+            if !running.is_empty()
+                && let Some(user) = out.iter_mut().rev().find(|m| role(m) == "user")
+                && let Some(content) = user.get_mut("content")
+            {
+                let owned = content.take();
+                *content = append_running_jobs_reminder(owned, &running);
+            }
+        }
         out
     }
 
@@ -432,5 +443,24 @@ impl AgentEngine {
         self.turn_unsend = None;
         self.rebuild_working_set_from_log();
         outcome
+    }
+}
+
+/// Append a `<system-reminder>` listing still-running jobs to outgoing user content (text or multimodal).
+fn append_running_jobs_reminder(content: Value, running: &[String]) -> Value {
+    let block = format!(
+        "<system-reminder>Background jobs still running right now (you started these via run_bash \
+with background: true):\n{}\nBefore telling the user a job finished or was stopped, confirm with \
+check_job {{\"id\": \"…\"}} — don't assume. Stop one with check_job {{\"id\": \"…\", \"kill\": \
+true}}.</system-reminder>",
+        running.join("\n")
+    );
+    match content {
+        Value::String(s) => Value::String(format!("{s}\n\n{block}")),
+        Value::Array(mut parts) => {
+            parts.push(json!({"type": "text", "text": block}));
+            Value::Array(parts)
+        }
+        other => other,
     }
 }

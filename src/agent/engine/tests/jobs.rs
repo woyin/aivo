@@ -303,3 +303,54 @@ async fn subagent_engine_inherits_job_table() {
         "sub-agent should have killed the parent's job"
     );
 }
+
+/// Running jobs ride each outgoing request as an ephemeral reminder, never persisted.
+#[cfg(unix)]
+#[tokio::test]
+async fn running_jobs_ride_outgoing_as_reminder() {
+    let dir = tmp();
+    let table = jobs::JobTable::new(Some(dir.join("jobs")));
+    table.spawn("sleep 30", &dir).unwrap();
+    let mut engine = AgentEngine::new(&dir.display().to_string(), "m", "", &[], &[], 0, 0);
+    engine.set_jobs(table.clone());
+    engine.begin_user_turn(
+        Value::String("what are your jobs?".into()),
+        "what are your jobs?".into(),
+    );
+
+    let is_user = |m: &&Value| m.get("role").and_then(Value::as_str) == Some("user");
+    let out = engine.outgoing_messages();
+    let text = out
+        .iter()
+        .rev()
+        .find(is_user)
+        .and_then(|m| m.get("content").and_then(Value::as_str))
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        text.contains("<system-reminder>") && text.contains("still running"),
+        "running-jobs reminder missing: {text}"
+    );
+    assert!(text.contains("j1: sleep 30"), "job line missing: {text}");
+
+    assert!(
+        !engine.messages.iter().any(|m| m
+            .get("content")
+            .and_then(Value::as_str)
+            .is_some_and(|s| s.contains("<system-reminder>"))),
+        "reminder must not be stored in messages"
+    );
+
+    let _ = table.kill_all().await;
+    let out2 = engine.outgoing_messages();
+    let text2 = out2
+        .iter()
+        .rev()
+        .find(is_user)
+        .and_then(|m| m.get("content").and_then(Value::as_str))
+        .unwrap_or_default();
+    assert!(
+        !text2.contains("still running"),
+        "no reminder once no jobs run: {text2}"
+    );
+}

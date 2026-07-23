@@ -155,6 +155,19 @@ impl JobTable {
         inner.running_count()
     }
 
+    /// One `id: command` line per still-running job (reaps first); folded into each
+    /// request so the model doesn't claim a live server stopped.
+    pub fn running_snapshot(&self) -> Vec<String> {
+        let mut inner = self.inner.lock().unwrap();
+        inner.reap_all();
+        inner
+            .jobs
+            .iter()
+            .filter(|j| matches!(j.status, JobStatus::Running))
+            .map(|j| format!("{}: {}", j.id, j.command))
+            .collect()
+    }
+
     /// Spawn `command` detached; `Ok` is the formatted tool result (id + log + hint).
     pub fn spawn(&self, command: &str, cwd: &Path) -> Result<String, String> {
         let mut inner = self.inner.lock().unwrap();
