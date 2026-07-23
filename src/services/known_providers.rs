@@ -65,6 +65,54 @@ pub fn all() -> &'static [KnownProvider] {
     &KNOWN_PROVIDERS
 }
 
+/// Suggest a short `keys add` name from a base URL: a matching known provider's
+/// id (`api.groq.com` → `groq`), else the host label before the TLD. None for IPs.
+pub fn suggest_name_from_url(url: &str) -> Option<String> {
+    let host = host_of(url)?;
+    if let Some(p) = KNOWN_PROVIDERS
+        .iter()
+        .find(|p| host_of(&p.base_url).is_some_and(|h| h.eq_ignore_ascii_case(host)))
+    {
+        return Some(p.id.clone());
+    }
+    slug_from_host(host)
+}
+
+fn host_of(url: &str) -> Option<&str> {
+    let rest = url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))?;
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    let host = authority.rsplit('@').next().unwrap_or(authority);
+    (!host.is_empty()).then_some(host)
+}
+
+/// The host label before the TLD (`api.groq.com` → `groq`). None for IP literals.
+fn slug_from_host(host: &str) -> Option<String> {
+    // Strip :port; leave IPv6 (multiple ':') alone.
+    let host = if host.matches(':').count() == 1 {
+        host.split(':').next().unwrap_or(host)
+    } else {
+        host
+    };
+    let host = host.trim_matches(|c| c == '[' || c == ']');
+    if host.is_empty() || host.parse::<std::net::IpAddr>().is_ok() {
+        return None;
+    }
+    let labels: Vec<&str> = host.split('.').filter(|s| !s.is_empty()).collect();
+    let label = match labels.len() {
+        0 => return None,
+        1 => labels[0],
+        n => labels[n - 2],
+    };
+    let slug: String = label
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '-')
+        .map(|c| c.to_ascii_lowercase())
+        .collect();
+    (!slug.is_empty()).then_some(slug)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -82,6 +130,46 @@ mod tests {
     fn find_by_name_substring_no_match() {
         assert!(find_by_name_substring("random").is_none());
         assert!(find_by_name_substring("").is_none());
+    }
+
+    #[test]
+    fn suggest_name_known_provider_uses_canonical_id() {
+        assert_eq!(
+            suggest_name_from_url("https://api.groq.com/openai/v1").as_deref(),
+            Some("groq")
+        );
+        assert_eq!(
+            suggest_name_from_url("https://openrouter.ai/api/v1").as_deref(),
+            Some("openrouter")
+        );
+        assert_eq!(
+            suggest_name_from_url("https://api.openai.com").as_deref(),
+            Some("openai")
+        );
+    }
+
+    #[test]
+    fn suggest_name_unknown_host_falls_back_to_label() {
+        assert_eq!(
+            suggest_name_from_url("https://my-llm.acme.dev/v1").as_deref(),
+            Some("acme")
+        );
+        assert_eq!(
+            suggest_name_from_url("http://gateway.internal.corp:8080/v1").as_deref(),
+            Some("internal")
+        );
+        assert_eq!(
+            suggest_name_from_url("https://localhost:1234/v1").as_deref(),
+            Some("localhost")
+        );
+    }
+
+    #[test]
+    fn suggest_name_rejects_ip_and_garbage() {
+        assert_eq!(suggest_name_from_url("http://127.0.0.1:11434/v1"), None);
+        assert_eq!(suggest_name_from_url("https://192.168.1.5/v1"), None);
+        assert_eq!(suggest_name_from_url("not-a-url"), None);
+        assert_eq!(suggest_name_from_url("ftp://example.com"), None);
     }
 
     #[test]

@@ -106,7 +106,7 @@ aivo keys cat | edit | rm <name>
 One-liner.
 
 ```bash
-aivo keys add --name groq --base-url https://api.groq.com/openai/v1 --api-key sk-xxx
+aivo keys add --base-url https://api.groq.com/openai/v1 --api-key sk-xxx
 ```
 
 #### Export & import

@@ -606,7 +606,7 @@ pub struct KeysArgs {
     #[arg(long = "base-url", value_name = "URL", value_parser = non_empty())]
     pub base_url: Option<String>,
 
-    /// Provider API key for `keys add` (alias: --key)
+    /// Provider API key for `keys add`
     #[arg(long = "api-key", alias = "key", value_name = "API_KEY", value_parser = non_empty())]
     pub key: Option<String>,
 
@@ -1579,7 +1579,6 @@ mod tests {
 
     #[test]
     fn test_keys_add_api_key_flag() {
-        // `--api-key` is the canonical spelling; `--key` (above) is the alias.
         let cli = Cli::try_parse_from([
             "aivo",
             "keys",

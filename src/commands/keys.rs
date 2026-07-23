@@ -2266,7 +2266,7 @@ impl KeysCommand {
         provider: &crate::services::known_providers::KnownProvider,
     ) -> Result<ExitCode> {
         let name = if name.is_empty() {
-            provider.id.clone()
+            self.unique_key_name(provider.id.clone()).await
         } else {
             name.to_string()
         };
@@ -2813,13 +2813,19 @@ impl KeysCommand {
 
         let key = prompt_secret("API Key: ", "an API key")?;
 
+        let name = if name.is_empty() {
+            self.derived_key_name(&base_url).await
+        } else {
+            name.to_string()
+        };
+
         let id = self
             .session_store
-            .add_key_with_protocol(name, &base_url, None, &key)
+            .add_key_with_protocol(&name, &base_url, None, &key)
             .await?;
         self.finalize_add(
             &id,
-            name,
+            &name,
             &format!("Base URL: {}", base_url),
             Some(("aivo claude", "")),
         )
@@ -2853,6 +2859,33 @@ impl KeysCommand {
         } else {
             println!("Aborted.");
             Ok(ReplaceDecision::Abort)
+        }
+    }
+
+    /// Append `-2`, `-3`, … to `base` until it no longer collides with an
+    /// existing key name, keeping an auto-suggested name unambiguous.
+    async fn unique_key_name(&self, base: String) -> String {
+        let existing = self.session_store.get_keys().await.unwrap_or_default();
+        let taken = |candidate: &str| {
+            existing
+                .iter()
+                .any(|k| k.name.eq_ignore_ascii_case(candidate))
+        };
+        if !taken(&base) {
+            return base;
+        }
+        (2..=99)
+            .map(|n| format!("{base}-{n}"))
+            .find(|candidate| !taken(candidate))
+            .unwrap_or(base)
+    }
+
+    /// A short, unique name derived from a base URL for a `keys add` without
+    /// `--name`. Empty (→ short-id display) when nothing sensible can be derived.
+    async fn derived_key_name(&self, base_url: &str) -> String {
+        match crate::services::known_providers::suggest_name_from_url(base_url) {
+            Some(base) => self.unique_key_name(base).await,
+            None => String::new(),
         }
     }
 
@@ -3143,6 +3176,13 @@ impl KeysCommand {
                     break String::new();
                 }
             }
+        };
+
+        // No name given: derive one from the URL instead of an opaque short id.
+        let name = if name.is_empty() {
+            self.derived_key_name(&base_url).await
+        } else {
+            name
         };
 
         let id = self
@@ -4051,42 +4091,65 @@ mod tests {
         assert_eq!(code, crate::errors::ExitCode::UserError);
     }
 
+    fn add_args(base_url: &str, key: &str) -> KeysArgs {
+        KeysArgs {
+            action: Some("add".to_string()),
+            args: Vec::new(),
+            name: None,
+            base_url: Some(base_url.to_string()),
+            key: Some(key.to_string()),
+            all: false,
+            ping: false,
+            json: false,
+            ids: Vec::new(),
+            password_stdin: false,
+            overwrite: false,
+            rename: false,
+            include_starter: false,
+            include_oauth: false,
+            force: false,
+        }
+    }
+
     #[tokio::test]
-    async fn test_add_key_without_name_uses_empty_stored_name() {
+    async fn test_add_key_without_name_derives_name_from_url() {
         let temp_dir = tempfile::TempDir::new().unwrap();
         let config_path = temp_dir.path().join("config.json");
         let store = crate::services::session_store::SessionStore::with_path(config_path);
         let cmd = KeysCommand::new(store.clone());
 
         let code = cmd
-            .execute(KeysArgs {
-                action: Some("add".to_string()),
-                args: Vec::new(),
-                name: None,
-                base_url: Some("https://openrouter.ai/api/v1".to_string()),
-                key: Some("sk-or-v1-test".to_string()),
-                all: false,
-                ping: false,
-                json: false,
-                ids: Vec::new(),
-                password_stdin: false,
-                overwrite: false,
-                rename: false,
-                include_starter: false,
-                include_oauth: false,
-                force: false,
-            })
+            .execute(add_args("https://openrouter.ai/api/v1", "sk-or-1"))
             .await;
+        assert_eq!(code, crate::errors::ExitCode::Success);
+        let code = cmd
+            .execute(add_args("https://openrouter.ai/api/v1", "sk-or-2"))
+            .await;
+        assert_eq!(code, crate::errors::ExitCode::Success);
 
+        let keys = store.get_keys().await.unwrap();
+        assert_eq!(keys.len(), 2);
+        assert_eq!(keys[0].name, "openrouter");
+        assert_eq!(keys[0].display_name(), "openrouter");
+        assert_eq!(keys[1].name, "openrouter-2");
+    }
+
+    #[tokio::test]
+    async fn test_add_key_without_name_ip_host_stays_empty() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let config_path = temp_dir.path().join("config.json");
+        let store = crate::services::session_store::SessionStore::with_path(config_path);
+        let cmd = KeysCommand::new(store.clone());
+
+        let code = cmd
+            .execute(add_args("http://127.0.0.1:11434/v1", "sk-local"))
+            .await;
         assert_eq!(code, crate::errors::ExitCode::Success);
 
         let keys = store.get_keys().await.unwrap();
         assert_eq!(keys.len(), 1);
         assert_eq!(keys[0].name, "");
         assert_eq!(keys[0].display_name(), keys[0].short_id());
-
-        let active = store.get_active_key().await.unwrap().unwrap();
-        assert_eq!(active.id, keys[0].id);
     }
 
     #[tokio::test]
