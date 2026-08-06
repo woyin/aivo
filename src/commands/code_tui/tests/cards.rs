@@ -404,6 +404,7 @@ async fn test_ask_card_arrow_then_enter_selects_option() {
         multi_select: false,
         checked: Vec::new(),
         selected: 0,
+        record_history: false,
         reply,
     });
 
@@ -416,6 +417,63 @@ async fn test_ask_card_arrow_then_enter_selects_option() {
 
     assert!(app.cards.ask().is_none(), "answering resolves the card");
     assert_eq!(answer_rx.await.unwrap(), Ok("You add them".to_string()));
+}
+
+#[tokio::test]
+async fn test_ask_card_records_out_of_band_exchange() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    let (reply, _answer_rx) =
+        tokio::sync::oneshot::channel::<std::result::Result<String, String>>();
+    app.cards.set_ask(PendingAskUser {
+        question: "Which palette?".to_string(),
+        options: ask_options(&["Garnet", "Cobalt"]),
+        allow_free_text: false,
+        multi_select: false,
+        checked: Vec::new(),
+        selected: 0,
+        record_history: true,
+        reply,
+    });
+    let before = app.history.len();
+
+    app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        .await
+        .unwrap();
+
+    let rows = &app.history[before..];
+    assert_eq!(rows.len(), 2, "one call row and one result row");
+    assert_eq!(rows[0].role, "tool_call");
+    let call: serde_json::Value = serde_json::from_str(&rows[0].content).unwrap();
+    assert_eq!(call["name"], "ask_user");
+    assert_eq!(call["args"]["question"], "Which palette?");
+    assert_eq!(rows[1].role, "tool_result");
+    assert_eq!(rows[1].content, "The user answered: Garnet");
+}
+
+#[tokio::test]
+async fn test_ask_card_skips_history_for_engine_asks() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    let (reply, _answer_rx) =
+        tokio::sync::oneshot::channel::<std::result::Result<String, String>>();
+    app.cards.set_ask(PendingAskUser {
+        question: "Pick one".to_string(),
+        options: ask_options(&["a", "b"]),
+        allow_free_text: false,
+        multi_select: false,
+        checked: Vec::new(),
+        selected: 0,
+        record_history: false,
+        reply,
+    });
+    let before = app.history.len();
+
+    app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        .await
+        .unwrap();
+
+    assert_eq!(app.history.len(), before);
 }
 
 /// A digit key jumps straight to that option and picks it (numbered-menu style).
@@ -431,6 +489,7 @@ async fn test_ask_card_digit_picks_option() {
         multi_select: false,
         checked: Vec::new(),
         selected: 0,
+        record_history: false,
         reply,
     });
 
@@ -456,6 +515,7 @@ async fn test_ask_card_free_text_answer() {
         multi_select: false,
         checked: Vec::new(),
         selected: 0,
+        record_history: false,
         reply,
     });
 
@@ -484,6 +544,7 @@ async fn test_ask_card_esc_dismisses() {
         multi_select: false,
         checked: Vec::new(),
         selected: 0,
+        record_history: false,
         reply,
     });
 
@@ -508,6 +569,7 @@ fn test_ask_card_renders_question_and_options() {
         multi_select: false,
         checked: Vec::new(),
         selected: 0,
+        record_history: false,
         reply,
     });
     // A transcript pushes the composer to the bottom so the floating card has room
@@ -554,6 +616,7 @@ fn test_ask_card_long_description_wraps() {
         multi_select: false,
         checked: Vec::new(),
         selected: 0,
+        record_history: false,
         reply,
     });
     app.history.push(ChatMessage {
@@ -595,6 +658,7 @@ fn test_ask_card_long_description_compact_fallback() {
         multi_select: false,
         checked: Vec::new(),
         selected: 0,
+        record_history: false,
         reply,
     });
     app.history.push(ChatMessage {
@@ -632,6 +696,7 @@ async fn test_ask_card_multi_select_space_toggles_and_enter_joins() {
         multi_select: true,
         checked: vec![false; 3],
         selected: 0,
+        record_history: false,
         reply,
     });
 
@@ -677,6 +742,7 @@ async fn test_ask_card_multi_select_digit_toggles_box() {
         multi_select: true,
         checked: vec![false; 3],
         selected: 0,
+        record_history: false,
         reply,
     });
 

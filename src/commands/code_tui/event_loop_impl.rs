@@ -231,6 +231,7 @@ impl CodeTuiApp {
                 options,
                 allow_free_text,
                 multi_select,
+                record_history,
                 reply,
             } => {
                 let checked = vec![false; options.len()];
@@ -241,6 +242,7 @@ impl CodeTuiApp {
                     multi_select,
                     checked,
                     selected: 0,
+                    record_history,
                     reply,
                 });
             }

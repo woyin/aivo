@@ -2670,6 +2670,7 @@ pub(super) enum RuntimeEvent {
         options: Vec<crate::agent::ask::AskOption>,
         allow_free_text: bool,
         multi_select: bool,
+        record_history: bool,
         reply: tokio::sync::oneshot::Sender<std::result::Result<String, String>>,
     },
     /// The agent's edit-review gate: show the pending edits, reply with the verdict.
@@ -2833,6 +2834,7 @@ pub(super) struct PendingAskUser {
     pub(super) multi_select: bool,
     pub(super) checked: Vec<bool>,
     pub(super) selected: usize,
+    pub(super) record_history: bool,
     pub(super) reply: tokio::sync::oneshot::Sender<std::result::Result<String, String>>,
 }
 

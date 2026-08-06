@@ -1343,6 +1343,7 @@ impl CodeTuiApp {
                             options,
                             allow_free_text: false,
                             multi_select: q.allow_multiple,
+                            record_history: true,
                             reply,
                         })
                         .is_err()
@@ -4398,6 +4399,7 @@ impl crate::agent::engine::AgentUi for ChatAgentUi {
                     options,
                     allow_free_text,
                     multi_select,
+                    record_history: false,
                     reply,
                 })
                 .is_err()

@@ -369,6 +369,7 @@ impl CodeTuiApp {
             .get(idx)
             .map(|o| o.label.clone())
             .unwrap_or_default();
+        self.record_ask_exchange(&ask, &crate::agent::ask::confirmation(&answer));
         let _ = ask.reply.send(Ok(answer));
     }
 
@@ -399,13 +400,42 @@ impl CodeTuiApp {
         } else {
             picked.join(", ")
         };
+        self.record_ask_exchange(&ask, &crate::agent::ask::confirmation(&answer));
         let _ = ask.reply.send(Ok(answer));
     }
 
     /// Send a free-text answer back to the waiting engine task.
     fn answer_ask_user(&mut self, answer: String) {
         if let Some(ask) = self.cards.take_ask() {
+            self.record_ask_exchange(&ask, &crate::agent::ask::confirmation(&answer));
             let _ = ask.reply.send(Ok(answer));
+        }
+    }
+
+    fn record_ask_exchange(&mut self, ask: &PendingAskUser, result: &str) {
+        if !ask.record_history {
+            return;
+        }
+        let options: Vec<serde_json::Value> = ask
+            .options
+            .iter()
+            .map(|o| serde_json::json!({ "label": o.label }))
+            .collect();
+        let call = serde_json::json!({
+            "name": "ask_user",
+            "args": { "question": ask.question, "options": options },
+        });
+        for (role, content) in [
+            ("tool_call", call.to_string()),
+            ("tool_result", result.to_string()),
+        ] {
+            self.history.push(ChatMessage {
+                model: None,
+                role: role.to_string(),
+                content,
+                reasoning_content: None,
+                attachments: vec![],
+            });
         }
     }
 
@@ -413,6 +443,7 @@ impl CodeTuiApp {
     /// directive as the tool result.
     fn dismiss_ask_user(&mut self) {
         if let Some(ask) = self.cards.take_ask() {
+            self.record_ask_exchange(&ask, crate::agent::ask::DISMISSED_DIRECTIVE);
             let _ = ask
                 .reply
                 .send(Err(crate::agent::ask::DISMISSED_DIRECTIVE.to_string()));

@@ -174,10 +174,65 @@ fn merge_tool_result_turns(messages: Vec<ShareMessage>) -> Vec<ShareMessage> {
     out
 }
 
-fn split_ask_user_answers(messages: Vec<ShareMessage>) -> Vec<ShareMessage> {
+pub struct AskDialect {
+    tool: &'static str,
+    answers: fn(&str) -> Option<String>,
+}
+
+pub const AIVO_ASK: AskDialect = AskDialect {
+    tool: "ask_user",
+    answers: |body| crate::agent::ask::answer_from_result(body).map(str::to_string),
+};
+
+pub const CLAUDE_ASK: AskDialect = AskDialect {
+    tool: "AskUserQuestion",
+    answers: |body| quoted_answer_pairs(body, "Your questions have been answered: "),
+};
+
+pub const OPENCODE_ASK: AskDialect = AskDialect {
+    tool: "question",
+    answers: |body| quoted_answer_pairs(body, "User has answered your questions: "),
+};
+
+const PAIR_SEP: &str = "\"=\"";
+
+fn quoted_answer_pairs(body: &str, prefix: &str) -> Option<String> {
+    let mut rest = body.strip_prefix(prefix)?;
+    let mut answers = Vec::new();
+    while let Some(at) = rest.find(PAIR_SEP) {
+        let after = &rest[at + PAIR_SEP.len()..];
+        let end = answer_end(after)?;
+        let answer = after[..end].trim();
+        if !answer.is_empty() {
+            answers.push(answer);
+        }
+        rest = &after[end..];
+    }
+    (!answers.is_empty()).then(|| answers.join("\n"))
+}
+
+fn answer_end(s: &str) -> Option<usize> {
+    let mut from = 0;
+    while let Some(rel) = s[from..].find('"') {
+        let i = from + rel;
+        let tail = &s[i + 1..];
+        if tail.is_empty()
+            || tail == "."
+            || tail.starts_with(". ")
+            || tail.starts_with(", \"")
+            || tail.starts_with(" selected preview:")
+        {
+            return Some(i);
+        }
+        from = i + 1;
+    }
+    None
+}
+
+fn split_ask_user_answers(messages: Vec<ShareMessage>, dialect: &AskDialect) -> Vec<ShareMessage> {
     let mut out = Vec::with_capacity(messages.len());
     for msg in messages {
-        let answers = ask_user_answers(&msg.content);
+        let answers = ask_user_answers(&msg.content, dialect);
         let timestamp = msg.timestamp;
         out.push(msg);
         out.extend(answers.into_iter().map(|answer| ShareMessage {
@@ -191,13 +246,13 @@ fn split_ask_user_answers(messages: Vec<ShareMessage>) -> Vec<ShareMessage> {
     out
 }
 
-fn ask_user_answers(content: &[ContentBlock]) -> Vec<String> {
+fn ask_user_answers(content: &[ContentBlock], dialect: &AskDialect) -> Vec<String> {
     let mut answers = Vec::new();
     let mut open: Option<Option<&str>> = None;
     for block in content {
         match block {
             ContentBlock::ToolCall { id, name, .. } => {
-                open = (name == "ask_user").then_some(id.as_deref());
+                open = (name == dialect.tool).then_some(id.as_deref());
             }
             ContentBlock::ToolResult { id, ok, output, .. } => {
                 let Some(call_id) = open else { continue };
@@ -207,8 +262,8 @@ fn ask_user_answers(content: &[ContentBlock]) -> Vec<String> {
                     continue;
                 }
                 open = None;
-                if *ok && let Some(answer) = crate::agent::ask::answer_from_result(output) {
-                    answers.push(answer.to_string());
+                if *ok && let Some(answer) = (dialect.answers)(output) {
+                    answers.push(answer);
                 }
             }
             _ => {}
@@ -280,7 +335,7 @@ pub fn extract_chat_full(
         .collect();
     // No-op for a tool-free chat; folds agent tool results inline otherwise.
     let share_messages = merge_tool_result_turns(share_messages);
-    let share_messages = split_ask_user_answers(share_messages);
+    let share_messages = split_ask_user_answers(share_messages, &AIVO_ASK);
 
     let project = ProjectInfo {
         root: project_root
@@ -505,7 +560,7 @@ pub async fn extract_claude_full(
         model,
         created_at: None,
         updated_at: latest_ts,
-        messages: merge_tool_result_turns(messages),
+        messages: split_ask_user_answers(merge_tool_result_turns(messages), &CLAUDE_ASK),
         meta: SharePayload::new_meta(false),
     })
 }
@@ -996,6 +1051,51 @@ pub async fn extract_opencode_full(
         .map_err(|e| anyhow!("opencode extractor task panicked: {e}"))?
 }
 
+fn opencode_tool_blocks(part: &Value) -> Vec<ContentBlock> {
+    let state = part.get("state");
+    let id = ["callID", "id", "call_id"]
+        .iter()
+        .find_map(|k| part.get(*k).and_then(Value::as_str))
+        .map(str::to_string);
+    let name = ["name", "tool"]
+        .iter()
+        .find_map(|k| part.get(*k).and_then(Value::as_str))
+        .unwrap_or("tool")
+        .to_string();
+    let arguments = ["input", "arguments"]
+        .iter()
+        .find_map(|k| state.and_then(|s| s.get(*k)).or_else(|| part.get(*k)))
+        .cloned()
+        .unwrap_or(Value::Null);
+    let mut blocks = vec![ContentBlock::ToolCall {
+        id: id.clone(),
+        name,
+        arguments,
+    }];
+
+    let Some(state) = state else { return blocks };
+    let error = state
+        .get("error")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    let output = state
+        .get("output")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    if error.is_none() && output.is_empty() {
+        return blocks;
+    }
+    blocks.push(ContentBlock::ToolResult {
+        id,
+        ok: error.is_none() && state.get("status").and_then(Value::as_str) != Some("error"),
+        output,
+        error,
+    });
+    blocks
+}
+
 fn opencode_query_one(
     db_path: &std::path::Path,
     session_id: &str,
@@ -1045,35 +1145,23 @@ fn opencode_query_one(
             Ok(v) => v,
             Err(_) => continue,
         };
-        let block = match part.get("type").and_then(|t| t.as_str()).unwrap_or("") {
+        let blocks = match part.get("type").and_then(|t| t.as_str()).unwrap_or("") {
             "text" => part
                 .get("text")
                 .and_then(|t| t.as_str())
                 .filter(|s| !s.is_empty())
-                .map(|s| ContentBlock::Text {
-                    text: s.to_string(),
-                }),
-            "tool" | "tool_call" | "tool_use" => Some(ContentBlock::ToolCall {
-                id: part
-                    .get("id")
-                    .or_else(|| part.get("call_id"))
-                    .and_then(|v| v.as_str())
-                    .map(str::to_string),
-                name: part
-                    .get("name")
-                    .or_else(|| part.get("tool"))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("tool")
-                    .to_string(),
-                arguments: part
-                    .get("input")
-                    .or_else(|| part.get("arguments"))
-                    .cloned()
-                    .unwrap_or(Value::Null),
-            }),
-            _ => None,
+                .map(|s| {
+                    vec![ContentBlock::Text {
+                        text: s.to_string(),
+                    }]
+                })
+                .unwrap_or_default(),
+            "tool" | "tool_call" | "tool_use" => opencode_tool_blocks(&part),
+            _ => Vec::new(),
         };
-        let Some(block) = block else { continue };
+        if blocks.is_empty() {
+            continue;
+        }
 
         let timestamp = chrono::DateTime::<Utc>::from_timestamp_millis(time_ms);
         if Some(&msg_id) != current_msg_id.as_ref() {
@@ -1082,13 +1170,14 @@ fn opencode_query_one(
                 timestamp,
                 model: None,
                 reasoning: None,
-                content: vec![block],
+                content: blocks,
             });
             current_msg_id = Some(msg_id);
         } else if let Some(last) = messages.last_mut() {
-            last.content.push(block);
+            last.content.extend(blocks);
         }
     }
+    let messages = split_ask_user_answers(messages, &OPENCODE_ASK);
 
     let updated_at = updated_ms.and_then(chrono::DateTime::<Utc>::from_timestamp_millis);
 
@@ -1182,7 +1271,7 @@ mod tests {
             ),
             msg("assistant", vec![tool_call("b"), tool_result("b", "ok")]),
         ];
-        let out = split_ask_user_answers(input);
+        let out = split_ask_user_answers(input, &AIVO_ASK);
         assert_eq!(out.len(), 4);
         assert_eq!(out[2].role, "user");
         assert!(matches!(&out[2].content[0], ContentBlock::Text { text } if text == "对齐一点"));
@@ -1196,7 +1285,7 @@ mod tests {
             "assistant",
             vec![ask_call(None, "q"), answer_result(None, "yes")],
         )];
-        let out = split_ask_user_answers(input);
+        let out = split_ask_user_answers(input, &AIVO_ASK);
         assert_eq!(out.len(), 2);
         assert_eq!(out[1].role, "user");
     }
@@ -1216,7 +1305,7 @@ mod tests {
                 vec![tool_call("b"), tool_result("b", "The user answered: nope")],
             ),
         ];
-        let out = split_ask_user_answers(input);
+        let out = split_ask_user_answers(input, &AIVO_ASK);
         assert_eq!(out.len(), 2);
         assert!(out.iter().all(|m| m.role == "assistant"));
     }
@@ -1231,9 +1320,144 @@ mod tests {
                 answer_result(Some("t1"), "picked"),
             ],
         )];
-        let out = split_ask_user_answers(input);
+        let out = split_ask_user_answers(input, &AIVO_ASK);
         assert_eq!(out.len(), 2);
         assert!(matches!(&out[1].content[0], ContentBlock::Text { text } if text == "picked"));
+    }
+
+    fn ask_pair(tool: &str, id: &str, output: &str) -> Vec<ContentBlock> {
+        vec![
+            ContentBlock::ToolCall {
+                id: Some(id.into()),
+                name: tool.into(),
+                arguments: json!({}),
+            },
+            ContentBlock::ToolResult {
+                id: Some(id.into()),
+                ok: true,
+                output: output.into(),
+                error: None,
+            },
+        ]
+    }
+
+    fn split_one(tool: &str, output: &str, dialect: &AskDialect) -> Vec<ShareMessage> {
+        split_ask_user_answers(
+            vec![msg("assistant", ask_pair(tool, "t1", output))],
+            dialect,
+        )
+    }
+
+    fn answer_of(messages: &[ShareMessage]) -> Option<&str> {
+        let m = messages.get(1)?;
+        match m.content.first()? {
+            ContentBlock::Text { text } => Some(text),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn claude_ask_splits_single_answer_with_preview() {
+        let out = split_one(
+            "AskUserQuestion",
+            "Your questions have been answered: \"Which direction?\"=\"New single accent\" \
+selected preview:\nSINGLE ACCENT\n\n  accent #00e5a0.. You can now continue with these answers in mind.",
+            &CLAUDE_ASK,
+        );
+        assert_eq!(out.len(), 2);
+        assert_eq!(answer_of(&out), Some("New single accent"));
+    }
+
+    #[test]
+    fn claude_ask_joins_multi_question_answers() {
+        let out = split_one(
+            "AskUserQuestion",
+            "Your questions have been answered: \"谁付费？\"=\"服务端统一用你的 key（推荐）\", \
+\"部署到哪？\"=\"Cloudflare Workers + R2（推荐）\". You can now continue with these answers in mind.",
+            &CLAUDE_ASK,
+        );
+        assert_eq!(
+            answer_of(&out),
+            Some("服务端统一用你的 key（推荐）\nCloudflare Workers + R2（推荐）")
+        );
+    }
+
+    #[test]
+    fn quoted_answer_keeps_an_inner_quoted_phrase() {
+        let out = split_one(
+            "AskUserQuestion",
+            "Your questions have been answered: \"Pick one (or \"Other\" to retry)\"=\"Garnet\". \
+You can now continue with these answers in mind.",
+            &CLAUDE_ASK,
+        );
+        assert_eq!(answer_of(&out), Some("Garnet"));
+    }
+
+    #[test]
+    fn opencode_question_splits_its_answer() {
+        let out = split_one(
+            "question",
+            "User has answered your questions: \"What type of extension?\"=\"Array support\". \
+You can now continue with the user's answers in mind.",
+            &OPENCODE_ASK,
+        );
+        assert_eq!(answer_of(&out), Some("Array support"));
+    }
+
+    #[test]
+    fn ask_dialects_dont_answer_for_each_other() {
+        assert_eq!(
+            split_one(
+                "ask_user",
+                "Your questions have been answered: \"q\"=\"a\".",
+                &AIVO_ASK
+            )
+            .len(),
+            1
+        );
+        assert_eq!(
+            split_one("AskUserQuestion", "The user answered: yes", &CLAUDE_ASK).len(),
+            1
+        );
+    }
+
+    #[test]
+    fn opencode_tool_blocks_reads_callid_and_state() {
+        let part = json!({
+            "type": "tool", "callID": "call_1", "tool": "bash",
+            "state": {"status": "completed", "input": {"command": "ls"}, "output": "a\nb"}
+        });
+        let blocks = opencode_tool_blocks(&part);
+        assert_eq!(blocks.len(), 2);
+        assert!(
+            matches!(&blocks[0], ContentBlock::ToolCall { id, name, arguments }
+                if id.as_deref() == Some("call_1")
+                    && name == "bash"
+                    && arguments["command"] == "ls")
+        );
+        assert!(
+            matches!(&blocks[1], ContentBlock::ToolResult { id, ok, output, .. }
+            if id.as_deref() == Some("call_1") && *ok && output == "a\nb")
+        );
+    }
+
+    #[test]
+    fn opencode_tool_blocks_marks_errors_and_skips_running() {
+        let failed = json!({
+            "type": "tool", "callID": "c", "tool": "question",
+            "state": {"status": "error", "input": {}, "error": "Error: The user dismissed this question"}
+        });
+        let blocks = opencode_tool_blocks(&failed);
+        assert!(
+            matches!(&blocks[1], ContentBlock::ToolResult { ok, error, .. }
+            if !*ok && error.as_deref() == Some("Error: The user dismissed this question"))
+        );
+
+        let running = json!({
+            "type": "tool", "callID": "c", "tool": "bash",
+            "state": {"status": "running", "input": {"command": "sleep 1"}}
+        });
+        assert_eq!(opencode_tool_blocks(&running).len(), 1);
     }
 
     #[test]
