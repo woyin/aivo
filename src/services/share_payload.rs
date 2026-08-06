@@ -174,6 +174,49 @@ fn merge_tool_result_turns(messages: Vec<ShareMessage>) -> Vec<ShareMessage> {
     out
 }
 
+fn split_ask_user_answers(messages: Vec<ShareMessage>) -> Vec<ShareMessage> {
+    let mut out = Vec::with_capacity(messages.len());
+    for msg in messages {
+        let answers = ask_user_answers(&msg.content);
+        let timestamp = msg.timestamp;
+        out.push(msg);
+        out.extend(answers.into_iter().map(|answer| ShareMessage {
+            role: "user".to_string(),
+            timestamp,
+            model: None,
+            reasoning: None,
+            content: vec![ContentBlock::Text { text: answer }],
+        }));
+    }
+    out
+}
+
+fn ask_user_answers(content: &[ContentBlock]) -> Vec<String> {
+    let mut answers = Vec::new();
+    let mut open: Option<Option<&str>> = None;
+    for block in content {
+        match block {
+            ContentBlock::ToolCall { id, name, .. } => {
+                open = (name == "ask_user").then_some(id.as_deref());
+            }
+            ContentBlock::ToolResult { id, ok, output, .. } => {
+                let Some(call_id) = open else { continue };
+                if let (Some(call_id), Some(result_id)) = (call_id, id.as_deref())
+                    && call_id != result_id
+                {
+                    continue;
+                }
+                open = None;
+                if *ok && let Some(answer) = crate::agent::ask::answer_from_result(output) {
+                    answers.push(answer.to_string());
+                }
+            }
+            _ => {}
+        }
+    }
+    answers
+}
+
 /// Mint a synthetic id for the next id-less `ToolCall` in `content` and return
 /// it, so a freshly-folded `ToolResult` can reference the same id.
 fn next_unpaired_call_id(content: &mut [ContentBlock], counter: &mut u64) -> Option<String> {
@@ -237,6 +280,7 @@ pub fn extract_chat_full(
         .collect();
     // No-op for a tool-free chat; folds agent tool results inline otherwise.
     let share_messages = merge_tool_result_turns(share_messages);
+    let share_messages = split_ask_user_answers(share_messages);
 
     let project = ProjectInfo {
         root: project_root
@@ -1107,6 +1151,89 @@ mod tests {
             reasoning: None,
             content,
         }
+    }
+
+    fn ask_call(id: Option<&str>, question: &str) -> ContentBlock {
+        ContentBlock::ToolCall {
+            id: id.map(Into::into),
+            name: "ask_user".into(),
+            arguments: json!({ "question": question, "options": ["a", "b"] }),
+        }
+    }
+    fn answer_result(id: Option<&str>, answer: &str) -> ContentBlock {
+        ContentBlock::ToolResult {
+            id: id.map(Into::into),
+            ok: true,
+            output: crate::agent::ask::confirmation(answer),
+            error: None,
+        }
+    }
+
+    #[test]
+    fn split_ask_user_answers_emits_a_user_turn() {
+        let input = vec![
+            msg("user", vec![text("draw it")]),
+            msg(
+                "assistant",
+                vec![
+                    ask_call(Some("t1"), "tighter?"),
+                    answer_result(Some("t1"), "对齐一点"),
+                ],
+            ),
+            msg("assistant", vec![tool_call("b"), tool_result("b", "ok")]),
+        ];
+        let out = split_ask_user_answers(input);
+        assert_eq!(out.len(), 4);
+        assert_eq!(out[2].role, "user");
+        assert!(matches!(&out[2].content[0], ContentBlock::Text { text } if text == "对齐一点"));
+        assert_eq!(out[3].role, "assistant");
+        assert_eq!(out[1].content.len(), 2);
+    }
+
+    #[test]
+    fn split_ask_user_answers_pairs_idless_blocks() {
+        let input = vec![msg(
+            "assistant",
+            vec![ask_call(None, "q"), answer_result(None, "yes")],
+        )];
+        let out = split_ask_user_answers(input);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[1].role, "user");
+    }
+
+    #[test]
+    fn split_ask_user_answers_ignores_dismissals_and_other_tools() {
+        let dismissed = ContentBlock::ToolResult {
+            id: Some("t1".into()),
+            ok: true,
+            output: crate::agent::ask::DISMISSED_DIRECTIVE.to_string(),
+            error: None,
+        };
+        let input = vec![
+            msg("assistant", vec![ask_call(Some("t1"), "q"), dismissed]),
+            msg(
+                "assistant",
+                vec![tool_call("b"), tool_result("b", "The user answered: nope")],
+            ),
+        ];
+        let out = split_ask_user_answers(input);
+        assert_eq!(out.len(), 2);
+        assert!(out.iter().all(|m| m.role == "assistant"));
+    }
+
+    #[test]
+    fn split_ask_user_answers_skips_mismatched_result_ids() {
+        let input = vec![msg(
+            "assistant",
+            vec![
+                ask_call(Some("t1"), "q"),
+                tool_result("other", "unrelated"),
+                answer_result(Some("t1"), "picked"),
+            ],
+        )];
+        let out = split_ask_user_answers(input);
+        assert_eq!(out.len(), 2);
+        assert!(matches!(&out[1].content[0], ContentBlock::Text { text } if text == "picked"));
     }
 
     #[test]

@@ -126,9 +126,16 @@ pub fn parse_ask(args: &Value) -> Result<(String, Vec<AskOption>, bool, bool), S
     Ok((question, options, allow_free_text, multi_select))
 }
 
+const ANSWER_PREFIX: &str = "The user answered: ";
+
 /// The tool result echoing the user's answer back to the model.
 pub fn confirmation(answer: &str) -> String {
-    format!("The user answered: {answer}")
+    format!("{ANSWER_PREFIX}{answer}")
+}
+
+pub fn answer_from_result(output: &str) -> Option<&str> {
+    let answer = output.trim().strip_prefix(ANSWER_PREFIX)?.trim();
+    (!answer.is_empty()).then_some(answer)
 }
 
 /// The `ask_user` result when the user dismisses the card (Esc) — a directive to
