@@ -10,7 +10,9 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use crate::constants::CONTENT_TYPE_JSON;
-use crate::services::anthropic_chat_request::AnthropicToOpenAIConfig;
+use crate::services::anthropic_chat_request::{
+    AnthropicToOpenAIConfig, ensure_assistant_reasoning_content_in_chat_request,
+};
 use crate::services::anthropic_chat_response::{OpenAIToAnthropicConfig, UsageValueMode};
 use crate::services::copilot_auth::CopilotTokenManager;
 use crate::services::http_utils::{self, router_http_client_with_timeout};
@@ -1844,6 +1846,11 @@ async fn handle_chat_openai(
     client_wants_stream: bool,
     state: &ServeState,
 ) -> Result<RouterResponse> {
+    // DeepSeek/Moonshot thinking mode 400s when a replayed assistant message
+    // lacks `reasoning_content`; clients strip it, so stub it on passthrough.
+    if state.config.requires_reasoning_content {
+        ensure_assistant_reasoning_content_in_chat_request(body);
+    }
     send_openai_chat(body, client_wants_stream, &upstream_context(state)).await
 }
 

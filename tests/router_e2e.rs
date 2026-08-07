@@ -80,7 +80,7 @@ impl FakeProvider {
         self.hits().iter().filter(|e| **e == endpoint).count()
     }
 
-    /// Raw request heads (request line + headers) in arrival order.
+    /// Raw requests (request line + headers + body) in arrival order.
     fn heads(&self) -> Vec<String> {
         self.heads.lock().unwrap().clone()
     }
@@ -124,7 +124,8 @@ fn sse_body(endpoint: Endpoint) -> String {
     }
 }
 
-/// Drains the body so the client never sees a closed pipe mid-write.
+/// Reads the full request (head + body) so the client never sees a closed
+/// pipe mid-write and tests can assert on the forwarded body.
 fn read_request_head(stream: &mut std::net::TcpStream) -> String {
     let mut request = Vec::new();
     let mut buf = [0u8; 4096];
@@ -151,12 +152,15 @@ fn read_request_head(stream: &mut std::net::TcpStream) -> String {
         while have < len {
             match stream.read(&mut buf) {
                 Ok(0) => break,
-                Ok(n) => have += n,
+                Ok(n) => {
+                    request.extend_from_slice(&buf[..n]);
+                    have += n;
+                }
                 Err(_) => break,
             }
         }
     }
-    head
+    String::from_utf8_lossy(&request).into_owned()
 }
 
 fn request_endpoint(head: &str) -> Endpoint {
@@ -710,6 +714,46 @@ async fn serve_router_seeded_route_skips_probe() {
         0,
         "seeded route must skip the chat probe: {:?}",
         fake.hits()
+    );
+}
+
+/// The chat passthrough must stub `reasoning_content` onto replayed assistant
+/// messages when the provider profile flags the quirk (DeepSeek thinking mode).
+#[tokio::test]
+async fn serve_chat_passthrough_stubs_reasoning_content_when_quirk_set() {
+    no_proxy();
+    let fake = spawn_fake(&[(Endpoint::Chat, Mode::Ok)]);
+    let tmp = tempfile::tempdir().unwrap();
+    let log_store = LogStore::new(tmp.path().to_path_buf());
+    std::mem::forget(tmp);
+    let mut config = serve_config(fake.base_url(), ProviderProtocol::Openai);
+    config.requires_reasoning_content = true;
+    let router = ServeRouter::new(config, test_key(&fake.base_url()), log_store);
+    let (_handle, _shutdown, port) = router
+        .start_background_with_addr("127.0.0.1", 0)
+        .await
+        .unwrap();
+
+    let req = r#"{"model":"test-model","messages":[{"role":"user","content":"hi"},{"role":"assistant","content":null,"tool_calls":[{"id":"c1","type":"function","function":{"name":"t","arguments":"{}"}}]},{"role":"tool","tool_call_id":"c1","content":"ok"}]}"#;
+    let resp = raw_post(port, "/v1/chat/completions", req).await;
+    assert_eq!(response_status(&resp), 200, "{resp}");
+
+    let sent = fake
+        .heads()
+        .into_iter()
+        .find(|h| request_endpoint(h) == Endpoint::Chat)
+        .expect("chat request must reach the fake upstream");
+    let body: Value = serde_json::from_str(&sent[sent.find("\r\n\r\n").unwrap() + 4..]).unwrap();
+    let assistant = body["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["role"] == "assistant")
+        .expect("assistant turn forwarded");
+    let reasoning = assistant["reasoning_content"].as_str().unwrap_or_default();
+    assert!(
+        !reasoning.is_empty(),
+        "assistant turn must carry a non-empty reasoning_content stub: {assistant}"
     );
 }
 
