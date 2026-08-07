@@ -66,6 +66,12 @@ pub fn plans_dir(base: &Path) -> PathBuf {
     base.join("plans")
 }
 
+// ── images/ (user content: tool-generated images, content-addressed) ──────
+
+pub fn images_dir(base: &Path) -> PathBuf {
+    base.join("images")
+}
+
 // ── secrets/ ──────────────────────────────────────────────────────────────
 
 pub fn device_key(base: &Path) -> PathBuf {

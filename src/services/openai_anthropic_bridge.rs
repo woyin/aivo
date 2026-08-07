@@ -112,9 +112,16 @@ pub fn convert_openai_chat_to_anthropic_request(
     let mut messages: Vec<Value> = Vec::new();
 
     if let Some(msgs) = body.get("messages").and_then(|m| m.as_array()) {
-        // Whether the last entry pushed to `messages` is the user message
-        // accumulating tool_results for the current run of tool messages.
-        let mut prev_was_tool = false;
+        // ONE user message per stretch between assistant turns: strict upstreams
+        // (DeepSeek /anthropic) 400 on split tool_results AND on consecutive
+        // user turns, so both fold into the trailing user message.
+        let last_is_user = |messages: &[Value]| {
+            messages
+                .last()
+                .and_then(|m| m.get("role"))
+                .and_then(|r| r.as_str())
+                == Some("user")
+        };
         for msg in msgs {
             let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or("user");
             match role {
@@ -126,26 +133,22 @@ pub fn convert_openai_chat_to_anthropic_request(
                 }
                 "assistant" => messages.push(openai_assistant_to_anthropic(msg)),
                 "tool" => {
-                    // A parallel-tool turn arrives as consecutive tool
-                    // messages; Anthropic wants all their tool_results in the
-                    // single user message after the assistant turn, and strict
-                    // Anthropic-compat upstreams (DeepSeek /anthropic) 400 on
-                    // the split one-result-per-message form.
                     let block = openai_tool_result_block(msg);
-                    match messages.last_mut() {
-                        Some(prev) if prev_was_tool => {
-                            if let Some(content) =
-                                prev.get_mut("content").and_then(|c| c.as_array_mut())
-                            {
-                                content.push(block);
-                            }
-                        }
-                        _ => messages.push(json!({"role": "user", "content": [block]})),
+                    if last_is_user(&messages) {
+                        insert_anthropic_tool_result(messages.last_mut().expect("checked"), block);
+                    } else {
+                        messages.push(json!({"role": "user", "content": [block]}));
+                    }
+                }
+                "user" if last_is_user(&messages) => {
+                    let blocks = extract_openai_anthropic_text_blocks(msg.get("content"));
+                    // Empty content: drop it — strict upstreams reject empty blocks.
+                    if !blocks.is_empty() {
+                        append_anthropic_user_blocks(messages.last_mut().expect("checked"), blocks);
                     }
                 }
                 _ => messages.push(openai_user_to_anthropic(msg, role)),
             }
-            prev_was_tool = role == "tool";
         }
     }
 
@@ -785,6 +788,38 @@ fn openai_content_to_anthropic_content(content: Option<&Value>) -> Value {
     anthropic_text_blocks_to_content(extract_openai_anthropic_text_blocks(content))
 }
 
+/// Content as a mutable block array, coercing plain-string content first.
+fn anthropic_user_blocks_mut(prev: &mut Value) -> Option<&mut Vec<Value>> {
+    let content = &mut prev["content"];
+    if let Some(s) = content.as_str() {
+        let mut arr: Vec<Value> = Vec::new();
+        if !s.is_empty() {
+            arr.push(json!({"type": "text", "text": s}));
+        }
+        *content = Value::Array(arr);
+    }
+    content.as_array_mut()
+}
+
+/// Append non-tool blocks to an existing Anthropic user message.
+fn append_anthropic_user_blocks(prev: &mut Value, blocks: Vec<Value>) {
+    if let Some(arr) = anthropic_user_blocks_mut(prev) {
+        arr.extend(blocks);
+    }
+}
+
+/// Insert keeping tool_results grouped FIRST — Anthropic expects them before
+/// other content in the answering user message.
+fn insert_anthropic_tool_result(prev: &mut Value, block: Value) {
+    if let Some(arr) = anthropic_user_blocks_mut(prev) {
+        let pos = arr
+            .iter()
+            .rposition(|b| b.get("type").and_then(|t| t.as_str()) == Some("tool_result"))
+            .map_or(0, |p| p + 1);
+        arr.insert(pos, block);
+    }
+}
+
 fn extract_openai_anthropic_text_blocks(content: Option<&Value>) -> Vec<Value> {
     match content {
         Some(Value::String(s)) => {
@@ -979,15 +1014,99 @@ mod tests {
             },
         );
         let msgs = converted["messages"].as_array().unwrap();
-        assert_eq!(msgs.len(), 3);
+        assert_eq!(msgs.len(), 2);
         assert_eq!(msgs[1]["role"], "user");
         let results = msgs[1]["content"].as_array().unwrap();
-        assert_eq!(results.len(), 2);
+        assert_eq!(results.len(), 3);
         assert_eq!(results[0]["tool_use_id"], "call_a");
         assert_eq!(results[0]["content"], "A done");
         assert_eq!(results[1]["tool_use_id"], "call_b");
         assert_eq!(results[1]["content"], "B done");
-        assert_eq!(msgs[2]["role"], "user");
+        assert_eq!(results[2]["type"], "text");
+        assert_eq!(results[2]["text"], "next");
+    }
+
+    #[test]
+    fn test_convert_openai_chat_to_anthropic_request_folds_image_user_after_tools() {
+        let body = json!({
+            "model": "m",
+            "messages": [
+                {"role": "assistant", "content": null, "tool_calls": [
+                    {"id": "c1", "type": "function", "function": {"name": "gen", "arguments": "{}"}}
+                ]},
+                {"role": "tool", "tool_call_id": "c1", "content": "[image saved: /tmp/x.png]"},
+                {"role": "user", "content": [
+                    {"type": "text", "text": "Image generated by `gen`:"},
+                    {"type": "image_url", "image_url": {"url": "data:image/png;base64,aGk="}}
+                ]}
+            ]
+        });
+        let converted = convert_openai_chat_to_anthropic_request(
+            &body,
+            &OpenAIToAnthropicChatConfig { default_model: "m" },
+        );
+        let msgs = converted["messages"].as_array().unwrap();
+        assert_eq!(
+            msgs.len(),
+            2,
+            "image user turn folded into tool_result turn"
+        );
+        let blocks = msgs[1]["content"].as_array().unwrap();
+        assert_eq!(blocks[0]["type"], "tool_result");
+        assert_eq!(blocks[1]["type"], "text");
+        assert_eq!(blocks[2]["type"], "image");
+        assert_eq!(blocks[2]["source"]["type"], "base64");
+        assert_eq!(blocks[2]["source"]["media_type"], "image/png");
+    }
+
+    #[test]
+    fn test_convert_openai_chat_to_anthropic_request_regroups_tool_after_user() {
+        // The late result must not split into its own user turn, and must
+        // regroup BEFORE the text (tool_results first).
+        let body = json!({
+            "model": "m",
+            "messages": [
+                {"role": "assistant", "content": null, "tool_calls": [
+                    {"id": "a", "type": "function", "function": {"name": "fa", "arguments": "{}"}},
+                    {"id": "b", "type": "function", "function": {"name": "fb", "arguments": "{}"}}
+                ]},
+                {"role": "tool", "tool_call_id": "a", "content": "A"},
+                {"role": "user", "content": "note"},
+                {"role": "tool", "tool_call_id": "b", "content": "B"}
+            ]
+        });
+        let converted = convert_openai_chat_to_anthropic_request(
+            &body,
+            &OpenAIToAnthropicChatConfig { default_model: "m" },
+        );
+        let msgs = converted["messages"].as_array().unwrap();
+        assert_eq!(msgs.len(), 2);
+        let blocks = msgs[1]["content"].as_array().unwrap();
+        let kinds: Vec<&str> = blocks.iter().map(|b| b["type"].as_str().unwrap()).collect();
+        assert_eq!(kinds, ["tool_result", "tool_result", "text"]);
+        assert_eq!(blocks[0]["tool_use_id"], "a");
+        assert_eq!(blocks[1]["tool_use_id"], "b");
+    }
+
+    #[test]
+    fn test_convert_openai_chat_to_anthropic_request_merges_consecutive_user_turns() {
+        let body = json!({
+            "model": "m",
+            "messages": [
+                {"role": "user", "content": "first"},
+                {"role": "user", "content": "second"}
+            ]
+        });
+        let converted = convert_openai_chat_to_anthropic_request(
+            &body,
+            &OpenAIToAnthropicChatConfig { default_model: "m" },
+        );
+        let msgs = converted["messages"].as_array().unwrap();
+        assert_eq!(msgs.len(), 1);
+        let blocks = msgs[0]["content"].as_array().unwrap();
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0]["text"], "first");
+        assert_eq!(blocks[1]["text"], "second");
     }
 
     #[test]

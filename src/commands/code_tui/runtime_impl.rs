@@ -356,7 +356,7 @@ impl CodeTuiApp {
                 self.notice = Some((ERROR(), self.image_refusal_base()));
                 return Ok(());
             }
-            if has_image_draft || self.history_has_image() {
+            if has_image_draft || self.history_has_image() || self.engine_history_has_images() {
                 match self.resolve_describer().await {
                     Ok(src) => vision_shim = Some(src),
                     Err(refusal) if has_image_draft => {
@@ -432,6 +432,8 @@ impl CodeTuiApp {
         self.turn_model = (!self.raw_model.is_empty()).then(|| self.raw_model.clone());
         self.follow_output = true;
 
+        // TUI-history images only: plain chat never carries engine-internal images,
+        // so they must not force the plain route (would strand the session tool-less).
         let conversation_has_image = self.history_has_image();
         let all_images = !attachments.is_empty() && attachments.iter().all(|a| a.is_image());
         let shim_active = vision_shim.is_some();
@@ -567,6 +569,16 @@ impl CodeTuiApp {
         self.history
             .iter()
             .any(|m| m.attachments.iter().any(|a| a.is_image()))
+    }
+
+    /// Image parts in the engine transcript. `try_lock`: a held lock (post-cancel
+    /// checkpoint task) skips shim arming for that message — blocking could
+    /// deadlock the current-thread runtime; 400-recovery catches the miss.
+    pub(super) fn engine_history_has_images(&self) -> bool {
+        self.agent_engine
+            .as_ref()
+            .and_then(|s| s.engine.try_lock().ok())
+            .is_some_and(|e| e.history_has_images())
     }
 
     /// True when the current key can drive the in-process agent (see `key_is_agent_capable`).
@@ -1045,6 +1057,7 @@ impl CodeTuiApp {
             Some(_) => self.vision_descriptions.clone(),
             None => std::collections::HashMap::new(),
         };
+        let model_reads_images = self.model_image_input == Some(true);
         self.response_task = Some(tokio::spawn(async move {
             let client = crate::services::http_utils::router_http_client();
             let ctx = TurnCtx {
@@ -1075,6 +1088,7 @@ impl CodeTuiApp {
             // Before the first request: a failure returns here, where the engine
             // hasn't consumed the turn, so the composer restores cleanly.
             engine.set_image_substitution(vision_shim.is_some());
+            engine.set_model_reads_images(model_reads_images);
             if let Some(src) = &vision_shim {
                 engine.merge_image_descriptions(&vision_descriptions);
                 let todo = engine.undescribed_images(multimodal.as_ref());

@@ -250,6 +250,37 @@ pub trait AgentUi: Send {
     }
 }
 
+/// Marks an engine-synthesized message (value = kind); stripped pre-request in
+/// `outgoing_messages` — new synthesized kinds ride this ONE key.
+pub(crate) const SYNTHETIC_MARKER_KEY: &str = "aivo";
+/// Marker value for the user message that surfaces tool-generated images.
+pub(crate) const SYNTHETIC_TOOL_IMAGES: &str = "tool_images";
+
+/// An image a tool call produced, already saved locally; `data_b64` is the clean payload.
+#[derive(Debug)]
+pub struct ToolImage {
+    pub path: std::path::PathBuf,
+    pub mime: String,
+    pub data_b64: String,
+}
+
+/// A tool call's outcome. Images ride out-of-band: paths derived from the
+/// untrusted text would let an injected result exfiltrate arbitrary local files.
+#[derive(Debug)]
+pub struct ToolOutput {
+    pub text: String,
+    pub images: Vec<ToolImage>,
+}
+
+impl From<String> for ToolOutput {
+    fn from(text: String) -> Self {
+        Self {
+            text,
+            images: Vec::new(),
+        }
+    }
+}
+
 /// Extra tools beyond the built-ins — currently MCP servers. The engine advertises
 /// `specs()` and routes any call it `handles()` to `call()`. Abstract to keep the
 /// engine free of process/transport knowledge; `Send + Sync` so it can be shared.
@@ -263,8 +294,12 @@ pub trait ExternalTools: Send + Sync {
     fn requires_approval(&self, _name: &str) -> bool {
         false
     }
-    /// Execute one tool call; the result string is fed back as the tool result (Err continues the loop).
-    fn call<'a>(&'a self, name: &'a str, args: &'a Value) -> BoxFuture<'a, Result<String, String>>;
+    /// Execute one tool call; `text` is fed back as the tool result (Err continues the loop).
+    fn call<'a>(
+        &'a self,
+        name: &'a str,
+        args: &'a Value,
+    ) -> BoxFuture<'a, Result<ToolOutput, String>>;
 }
 
 /// Per-turn I/O: the loopback serve to reach the provider and the working dir tools
@@ -496,6 +531,8 @@ pub struct AgentEngine {
     /// Set per turn when the active model can't see images. `self.messages` keeps
     /// the real images, so switching to a vision model resends them untouched.
     pub(crate) substitute_images: bool,
+    /// Per turn: model KNOWN to read images (a text-only provider would 400 mid-turn).
+    pub(crate) model_reads_images: bool,
 }
 
 /// Calibrated chars/4 breakdown of what fills the context window, for `/context`.

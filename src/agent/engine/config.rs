@@ -96,6 +96,7 @@ impl AgentEngine {
             snipped_originals: std::collections::HashMap::new(),
             image_descriptions: std::collections::HashMap::new(),
             substitute_images: false,
+            model_reads_images: false,
         }
     }
 
@@ -312,6 +313,10 @@ plan-approval card — suggest it when a task deserves real design discussion.",
 
     pub fn set_image_substitution(&mut self, on: bool) {
         self.substitute_images = on;
+    }
+
+    pub fn set_model_reads_images(&mut self, on: bool) {
+        self.model_reads_images = on;
     }
 
     pub fn insert_image_description(&mut self, hash: String, text: String) {

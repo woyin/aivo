@@ -342,6 +342,12 @@ impl AgentEngine {
                 .cloned()
                 .collect()
         };
+        // Synthesized-message markers stay local; strict providers reject unknown fields.
+        for m in &mut out {
+            if let Some(obj) = m.as_object_mut() {
+                obj.remove(super::SYNTHETIC_MARKER_KEY);
+            }
+        }
         if self.read_only
             && let Some(user) = out.iter_mut().rev().find(|m| role(m) == "user")
             && let Some(content) = user.get_mut("content")
@@ -364,6 +370,15 @@ impl AgentEngine {
             substitute_image_parts(&mut out, &self.image_descriptions);
         }
         out
+    }
+
+    /// Any image part in the transcript — tool images live only here, never as TUI attachments.
+    pub fn history_has_images(&self) -> bool {
+        self.messages.iter().any(|m| {
+            m.get("content")
+                .and_then(|c| c.as_array())
+                .is_some_and(|parts| parts.iter().any(tokens::is_image_part))
+        })
     }
 
     /// Uncached image parts in the history plus `pending`, deduped by hash.

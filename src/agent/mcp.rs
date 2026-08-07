@@ -49,6 +49,8 @@ const MAX_SKIPPED_MESSAGES: usize = 256;
 /// Cap on an MCP tool result's character length (matches the built-in tools'
 /// bounded output) so one big result can't swamp the conversation context.
 const MAX_MCP_RESULT_CHARS: usize = 30_000;
+/// Cap on one image block's base64 (~10 MiB decoded).
+const MAX_MCP_IMAGE_B64_CHARS: usize = 14 * 1024 * 1024;
 /// Hard cap on a single MCP response line (bytes), so a server can't OOM us with
 /// one giant message. Generous (a large file-read result still fits) but bounded;
 /// the extracted text is then capped to MAX_MCP_RESULT_CHARS for the model.
@@ -973,7 +975,11 @@ impl ExternalTools for McpClient {
         self.lookup(name).is_some_and(|(s, _)| !s.trust)
     }
 
-    fn call<'a>(&'a self, name: &'a str, args: &'a Value) -> BoxFuture<'a, Result<String, String>> {
+    fn call<'a>(
+        &'a self,
+        name: &'a str,
+        args: &'a Value,
+    ) -> BoxFuture<'a, Result<crate::agent::engine::ToolOutput, String>> {
         Box::pin(async move {
             let (server, tool) = self
                 .lookup(name)
@@ -1013,19 +1019,27 @@ impl ExternalTools for McpClient {
                             "MCP tool `{name}` asked for additional input rounds (resultType \"input_required\"), which aivo doesn't support yet"
                         ));
                     }
-                    let text = extract_text(&result);
-                    if result
+                    // Error results skip persistence — saved files would be orphans.
+                    let is_error = result
                         .get("isError")
                         .and_then(|e| e.as_bool())
-                        .unwrap_or(false)
-                    {
+                        .unwrap_or(false);
+                    let (text, images) = extract_result(&result, !is_error).await;
+                    if is_error {
                         Err(text)
                     } else {
                         // Frame external MCP output as untrusted (prompt-injection).
-                        Ok(crate::agent::tools::wrap_untrusted(
-                            &format!("mcp:{name}"),
-                            &text,
-                        ))
+                        let mut out =
+                            crate::agent::tools::wrap_untrusted(&format!("mcp:{name}"), &text);
+                        // Path notes go OUTSIDE the untrusted frame: aivo wrote these files.
+                        for img in &images {
+                            out.push_str(&format!(
+                                "\n[image saved: {} ({})]",
+                                img.path.display(),
+                                img.mime
+                            ));
+                        }
+                        Ok(crate::agent::engine::ToolOutput { text: out, images })
                     }
                 }
                 // The server answered, just with an error — it's healthy, so leave
@@ -1118,7 +1132,11 @@ impl ExternalTools for FilteredTools {
         !self.disabled.contains(name) && self.inner.requires_approval(name)
     }
 
-    fn call<'a>(&'a self, name: &'a str, args: &'a Value) -> BoxFuture<'a, Result<String, String>> {
+    fn call<'a>(
+        &'a self,
+        name: &'a str,
+        args: &'a Value,
+    ) -> BoxFuture<'a, Result<crate::agent::engine::ToolOutput, String>> {
         if self.disabled.contains(name) {
             let msg = format!("MCP tool `{name}` is disabled — re-enable it in /mcp (Ctrl+T)");
             return Box::pin(async move { Err(msg) });
@@ -2350,27 +2368,146 @@ fn parse_tools_stateless(list: &Value) -> (Vec<McpTool>, Vec<String>) {
     (tools, warnings)
 }
 
-/// Concatenate the text parts of an MCP `tools/call` result; fall back to the raw
-/// JSON when there's no text content (e.g. an image-only result). Capped like the
-/// built-in tools (which all bound their output) so a server returning a huge blob
-/// — a big file read, a giant diff — can't swamp the conversation context.
-fn extract_text(result: &Value) -> String {
-    let parts: Vec<&str> = result
-        .get("content")
-        .and_then(|c| c.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter(|i| i.get("type").and_then(|t| t.as_str()) == Some("text"))
-                .filter_map(|i| i.get("text").and_then(|t| t.as_str()))
-                .collect()
-        })
-        .unwrap_or_default();
-    let joined = if parts.is_empty() {
+/// Extract a `tools/call` result: capped text parts, plus (with `save_images`)
+/// decoded-and-saved image parts; raw-JSON fallback when nothing was extracted.
+async fn extract_result(
+    result: &Value,
+    save_images: bool,
+) -> (String, Vec<crate::agent::engine::ToolImage>) {
+    let mut texts: Vec<&str> = Vec::new();
+    let mut pending: Vec<(String, &'static str, String)> = Vec::new();
+    let mut notes: Vec<String> = Vec::new();
+    if let Some(arr) = result.get("content").and_then(|c| c.as_array()) {
+        for item in arr {
+            match item.get("type").and_then(|t| t.as_str()) {
+                Some("text") => {
+                    if let Some(t) = item.get("text").and_then(|t| t.as_str()) {
+                        texts.push(t);
+                    }
+                }
+                Some("image") if save_images => {
+                    let mime = item
+                        .get("mimeType")
+                        .and_then(|m| m.as_str())
+                        .unwrap_or("image/png");
+                    match (image_ext(mime), item.get("data").and_then(|d| d.as_str())) {
+                        (Some(ext), Some(data)) => {
+                            pending.push((mime.to_string(), ext, data.to_string()));
+                        }
+                        (None, _) => {
+                            notes.push(format!(
+                                "[image content not saved: unsupported image type `{mime}`]"
+                            ));
+                        }
+                        (_, None) => {
+                            notes.push("[image content not saved: missing base64 data]".into());
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    let had_pending = !pending.is_empty();
+    let mut joined = if texts.is_empty() && !had_pending && notes.is_empty() {
         result.to_string()
     } else {
-        parts.join("\n")
+        texts.join("\n")
     };
-    cap_chars(&joined, MAX_MCP_RESULT_CHARS)
+    let mut images = Vec::new();
+    if had_pending {
+        // Multi-MB decode+hash+write would freeze the current-thread runtime.
+        let saved = tokio::task::spawn_blocking(move || {
+            let dir = default_images_dir();
+            pending
+                .into_iter()
+                .map(|(mime, ext, data)| save_image_block(mime, ext, &data, &dir))
+                .collect::<Vec<_>>()
+        })
+        .await
+        .unwrap_or_default();
+        for item in saved {
+            match item {
+                Ok(img) => images.push(img),
+                Err(e) => notes.push(format!("[image content not saved: {e}]")),
+            }
+        }
+    }
+    for note in notes {
+        if !joined.is_empty() {
+            joined.push('\n');
+        }
+        joined.push_str(&note);
+    }
+    (cap_chars(&joined, MAX_MCP_RESULT_CHARS), images)
+}
+
+fn default_images_dir() -> PathBuf {
+    crate::services::paths::images_dir(&crate::services::paths::config_dir())
+}
+
+fn image_ext(mime: &str) -> Option<&'static str> {
+    match mime {
+        "image/png" => Some("png"),
+        "image/jpeg" => Some("jpg"),
+        "image/webp" => Some("webp"),
+        "image/gif" => Some("gif"),
+        _ => None,
+    }
+}
+
+/// Tolerant base64 cleanup: strip wrapping, map URL-safe, restore padding.
+fn normalize_base64(data: &str) -> String {
+    let mut out = if data
+        .bytes()
+        .any(|b| b.is_ascii_whitespace() || b == b'-' || b == b'_')
+    {
+        data.chars()
+            .filter(|c| !c.is_whitespace())
+            .map(|c| match c {
+                '-' => '+',
+                '_' => '/',
+                c => c,
+            })
+            .collect()
+    } else {
+        data.to_owned()
+    };
+    while out.len() % 4 != 0 {
+        out.push('=');
+    }
+    out
+}
+
+/// Content-addressed by `vision_describe::image_hash` (the vision-shim cache
+/// key). Atomic write: a torn file at a content address dedups onto forever.
+fn save_image_block(
+    mime: String,
+    ext: &str,
+    data: &str,
+    dir: &Path,
+) -> Result<crate::agent::engine::ToolImage, String> {
+    let cleaned = normalize_base64(data);
+    if cleaned.len() > MAX_MCP_IMAGE_B64_CHARS {
+        return Err(format!(
+            "image exceeds the ~{} MiB limit",
+            MAX_MCP_IMAGE_B64_CHARS / 4 * 3 / (1024 * 1024)
+        ));
+    }
+    let bytes = BASE64
+        .decode(cleaned.as_bytes())
+        .map_err(|e| format!("invalid base64: {e}"))?;
+    let hash = crate::services::vision_describe::image_hash(&cleaned);
+    let path = dir.join(format!("mcp-{}.{ext}", &hash[..12]));
+    if !path.exists() {
+        crate::services::atomic_write::atomic_write_secure_blocking(&path, &bytes)
+            .map_err(|e| format!("write {}: {e}", path.display()))?;
+    }
+    Ok(crate::agent::engine::ToolImage {
+        path,
+        mime,
+        data_b64: cleaned,
+    })
 }
 
 /// Truncate to `max` characters with a marker, doing only `O(max)` work (never
@@ -2496,8 +2633,8 @@ mod tests {
             &'a self,
             name: &'a str,
             _args: &'a Value,
-        ) -> BoxFuture<'a, Result<String, String>> {
-            Box::pin(async move { Ok(format!("ran {name}")) })
+        ) -> BoxFuture<'a, Result<crate::agent::engine::ToolOutput, String>> {
+            Box::pin(async move { Ok(format!("ran {name}").into()) })
         }
     }
 
@@ -2518,7 +2655,7 @@ mod tests {
         let err = f.call("mcp__s__b", &json!({})).await.unwrap_err();
         assert!(err.contains("disabled"), "stray call refused: {err}");
         assert_eq!(
-            f.call("mcp__s__a", &json!({})).await.unwrap(),
+            f.call("mcp__s__a", &json!({})).await.unwrap().text,
             "ran mcp__s__a"
         );
     }
@@ -2831,23 +2968,78 @@ mod tests {
         assert_eq!(sanitize_fn_name(&long).len(), 64);
     }
 
-    #[test]
-    fn extract_text_joins_text_parts() {
+    #[tokio::test]
+    async fn extract_result_joins_text_parts() {
         let r = json!({"content":[{"type":"text","text":"a"},{"type":"image"},{"type":"text","text":"b"}]});
-        assert_eq!(extract_text(&r), "a\nb");
-        // No text content → raw JSON fallback (never empty).
-        let r2 = json!({"content":[{"type":"image"}]});
-        assert!(extract_text(&r2).contains("image"));
+        let (text, images) = extract_result(&r, true).await;
+        assert_eq!(text, "a\nb\n[image content not saved: missing base64 data]");
+        assert!(images.is_empty());
+        // No recognized content at all → raw JSON fallback (never empty).
+        let r2 = json!({"content":[{"type":"widget"}]});
+        let (text2, _) = extract_result(&r2, true).await;
+        assert!(text2.contains("widget"));
     }
 
-    #[test]
-    fn extract_text_caps_huge_results() {
+    #[tokio::test]
+    async fn extract_result_caps_huge_results() {
         let huge = "x".repeat(MAX_MCP_RESULT_CHARS + 5_000);
         let r = json!({"content":[{"type":"text","text": huge}]});
-        let out = extract_text(&r);
+        let (out, _) = extract_result(&r, true).await;
         assert!(out.contains("truncated"), "huge result not capped");
         // Bounded near the cap (cap + the short marker), not the full input.
         assert!(out.chars().count() < MAX_MCP_RESULT_CHARS + 200);
+    }
+
+    /// isError results never touch the disk and keep the raw-JSON fallback.
+    #[tokio::test]
+    async fn extract_result_error_path_skips_images_and_keeps_fallback() {
+        let r = json!({"isError": true, "content":[{"type":"image","mimeType":"image/png","data":"aGk="}]});
+        let (text, images) = extract_result(&r, false).await;
+        assert!(images.is_empty(), "no image persisted for an error result");
+        assert!(text.contains("isError"), "raw-JSON fallback kept: {text}");
+    }
+
+    #[test]
+    fn normalize_base64_tolerates_wrapping_and_urlsafe() {
+        assert_eq!(normalize_base64("aGk="), "aGk=", "clean input untouched");
+        assert_eq!(normalize_base64("aG\nk="), "aGk=", "whitespace stripped");
+        assert_eq!(normalize_base64("a-b_"), "a+b/", "URL-safe alphabet mapped");
+        assert_eq!(normalize_base64("aGk"), "aGk=", "padding restored");
+    }
+
+    #[test]
+    fn save_image_block_writes_content_addressed_file() {
+        let dir = std::env::temp_dir().join(format!("aivo-mcp-img-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        // 1x1 PNG, with whitespace wrapping that servers sometimes emit.
+        let b64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGNg\nYGAAAAAEAAH2FzhVAAAAAElFTkSuQmCC";
+        let img = save_image_block("image/png".into(), "png", b64, &dir).unwrap();
+        assert!(img.path.exists());
+        assert!(
+            img.path
+                .file_name()
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .starts_with("mcp-")
+        );
+        assert_eq!(img.mime, "image/png");
+        assert!(
+            !img.data_b64.contains('\n'),
+            "payload cleaned for data: URIs"
+        );
+        // Filename = image_hash of the cleaned base64 (the vision-shim cache key).
+        let cleaned: String = b64.chars().filter(|c| !c.is_whitespace()).collect();
+        let expected = &crate::services::vision_describe::image_hash(&cleaned)[..12];
+        assert_eq!(
+            img.path.file_name().unwrap().to_str().unwrap(),
+            format!("mcp-{expected}.png")
+        );
+        // Same bytes again → same path, no error (content-addressed dedup).
+        let img2 = save_image_block("image/png".into(), "png", b64, &dir).unwrap();
+        assert_eq!(img.path, img2.path);
+        assert_eq!(image_ext("image/tiff"), None);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A server whose command can't be spawned is recorded as a connect error
@@ -3256,12 +3448,14 @@ for line in sys.stdin:
         let out = client
             .call("mcp__fake__echo", &json!({"text": "hi"}))
             .await
-            .unwrap();
+            .unwrap()
+            .text;
         assert!(out.contains("echoed: hi"), "got: {out}");
         let out2 = client
             .call("mcp__a__b__echo", &json!({"text": "yo"}))
             .await
-            .unwrap();
+            .unwrap()
+            .text;
         assert!(
             out2.contains("echoed: yo"),
             "underscored call failed: {out2}"
@@ -3273,7 +3467,8 @@ for line in sys.stdin:
         let out3 = client
             .call("mcp__fake__weird_name", &json!({"text": "zz"}))
             .await
-            .unwrap();
+            .unwrap()
+            .text;
         assert!(out3.contains("echoed: zz"), "sanitized call failed: {out3}");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -3559,7 +3754,8 @@ for line in sys.stdin:
         let ok = client
             .call("mcp__p__echo", &json!({"text":"again"}))
             .await
-            .unwrap();
+            .unwrap()
+            .text;
         assert!(
             ok.contains("echoed: again"),
             "server wrongly disabled: {ok}"
@@ -3627,7 +3823,8 @@ for line in sys.stdin:
         let out = client
             .call("mcp__s__slow", &json!({}))
             .await
-            .expect("a call slower than the handshake timeout must still succeed");
+            .expect("a call slower than the handshake timeout must still succeed")
+            .text;
         assert!(out.contains("finally"), "got: {out}");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -4043,7 +4240,8 @@ for line in sys.stdin:
                 &json!({"region": "us-west1", "q": "x"}),
             )
             .await
-            .expect("call should succeed");
+            .expect("call should succeed")
+            .text;
         assert!(out.contains("sunny"), "result text missing: {out}");
         assert_eq!(mock.header(1, "Mcp-Method").as_deref(), Some("tools/call"));
         assert_eq!(mock.header(1, "Mcp-Name").as_deref(), Some("get_weather"));
@@ -4133,7 +4331,8 @@ for line in sys.stdin:
         let out = client
             .call("mcp__m__echo", &json!({}))
             .await
-            .expect("legacy call");
+            .expect("legacy call")
+            .text;
         assert!(out.contains("legacy-ok"));
         assert_eq!(mock.header(4, "Mcp-Session-Id").as_deref(), Some("s1"));
         assert!(
@@ -4199,7 +4398,8 @@ for line in sys.stdin:
         let out = client
             .call("mcp__m__t", &json!({"region": "eu"}))
             .await
-            .expect("retry after HeaderMismatch should succeed");
+            .expect("retry after HeaderMismatch should succeed")
+            .text;
         assert!(out.contains("retried-ok"));
         assert_eq!(
             mock.header(1, "Mcp-Param-Region").as_deref(),
@@ -4243,7 +4443,8 @@ for line in sys.stdin:
         let out = client
             .call("mcp__m__t", &json!({}))
             .await
-            .expect("server stays usable");
+            .expect("server stays usable")
+            .text;
         assert!(out.contains("plain"));
         assert!(mock.count() >= 3);
         let _ = std::fs::remove_dir_all(&dir);

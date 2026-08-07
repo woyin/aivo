@@ -21,8 +21,8 @@ async fn external_tools_are_offered_and_routed() {
             &'a self,
             _name: &'a str,
             _args: &'a Value,
-        ) -> BoxFuture<'a, Result<String, String>> {
-            Box::pin(async { Ok("pong".to_string()) })
+        ) -> BoxFuture<'a, Result<crate::agent::engine::ToolOutput, String>> {
+            Box::pin(async { Ok("pong".to_string().into()) })
         }
     }
 
@@ -96,8 +96,8 @@ impl crate::agent::engine::ExternalTools for BigExt {
         &'a self,
         name: &'a str,
         _args: &'a Value,
-    ) -> BoxFuture<'a, Result<String, String>> {
-        Box::pin(async move { Ok(format!("ran {name}")) })
+    ) -> BoxFuture<'a, Result<crate::agent::engine::ToolOutput, String>> {
+        Box::pin(async move { Ok(format!("ran {name}").into()) })
     }
 }
 
@@ -269,8 +269,8 @@ async fn external_tool_requiring_approval_is_gated() {
             &'a self,
             _name: &'a str,
             _args: &'a Value,
-        ) -> BoxFuture<'a, Result<String, String>> {
-            Box::pin(async { Ok("WIPED".to_string()) })
+        ) -> BoxFuture<'a, Result<crate::agent::engine::ToolOutput, String>> {
+            Box::pin(async { Ok("WIPED".to_string().into()) })
         }
     }
 
@@ -304,4 +304,103 @@ async fn external_tool_requiring_approval_is_gated() {
         !engine.messages.iter().any(|m| content_str(m) == "WIPED"),
         "denied tool must not have executed"
     );
+}
+
+/// Vision-capable model → images surface as a marked user message after the
+/// tool results; otherwise the saved-path note is all the model gets.
+#[tokio::test]
+async fn external_tool_images_are_surfaced_only_for_vision_models() {
+    struct ImgExt;
+    impl crate::agent::engine::ExternalTools for ImgExt {
+        fn specs(&self) -> Vec<Value> {
+            vec![json!({
+                "type": "function",
+                "function": {"name": "mcp__img__gen", "description": "d", "parameters": {"type": "object"}}
+            })]
+        }
+        fn handles(&self, name: &str) -> bool {
+            name == "mcp__img__gen"
+        }
+        fn call<'a>(
+            &'a self,
+            _name: &'a str,
+            _args: &'a Value,
+        ) -> BoxFuture<'a, Result<crate::agent::engine::ToolOutput, String>> {
+            Box::pin(async {
+                Ok(crate::agent::engine::ToolOutput {
+                    text: "[image saved: /tmp/x.png (image/png)]".to_string(),
+                    images: vec![crate::agent::engine::ToolImage {
+                        path: "/tmp/x.png".into(),
+                        mime: "image/png".to_string(),
+                        data_b64: "aGk=".to_string(),
+                    }],
+                })
+            })
+        }
+    }
+
+    for reads_images in [true, false] {
+        let expect_injection = reads_images;
+        let dir = tmp();
+        let call = tool_call_sse("mcp__img__gen", json!({}));
+        let port = spawn_sse_sequence(vec![call, FINAL_TEXT_SSE.to_string()]);
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let base = format!("http://127.0.0.1:{port}");
+        let mut engine = AgentEngine::new(&dir.display().to_string(), "m", "", &[], &[], 0, 0);
+        engine.set_external_tools(std::sync::Arc::new(ImgExt));
+        engine.set_model_reads_images(reads_images);
+
+        let mut ui = CapturingUi::default();
+        run_session(
+            &mut engine,
+            &turn_ctx(&client, &base, &dir),
+            Some("draw".into()),
+            &mut ui,
+        )
+        .await;
+
+        let injected: Vec<&Value> = engine
+            .messages
+            .iter()
+            .filter(|m| m.get("aivo").and_then(|v| v.as_str()) == Some("tool_images"))
+            .collect();
+        if expect_injection {
+            assert_eq!(injected.len(), 1, "one image turn expected");
+            let parts = injected[0]["content"].as_array().unwrap();
+            assert_eq!(parts[0]["type"], "text");
+            assert!(
+                parts[0]["text"].as_str().unwrap().contains("/tmp/x.png"),
+                "text names the saved path"
+            );
+            assert_eq!(parts[1]["type"], "image_url");
+            assert_eq!(parts[1]["image_url"]["url"], "data:image/png;base64,aGk=");
+            assert_eq!(injected[0]["role"], "user");
+            assert!(
+                engine
+                    .outgoing_messages()
+                    .iter()
+                    .all(|m| m.get("aivo").is_none()),
+                "aivo marker must be stripped from outgoing requests"
+            );
+        } else {
+            assert!(
+                injected.is_empty(),
+                "no image turn for a non-vision model without the shim"
+            );
+            assert!(
+                !engine.messages.iter().any(|m| {
+                    m.get("content")
+                        .and_then(|c| c.as_array())
+                        .is_some_and(|p| p.iter().any(crate::agent::tokens::is_image_part))
+                }),
+                "no image parts may reach a text-only conversation"
+            );
+        }
+        assert!(
+            engine
+                .messages
+                .iter()
+                .any(|m| role(m) == "tool" && content_str(m).contains("[image saved: /tmp/x.png")),
+        );
+    }
 }

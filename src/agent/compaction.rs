@@ -727,7 +727,12 @@ pub(crate) fn find_cut(messages: &[Value], keep_recent_tokens: usize) -> usize {
     let mut cut = messages.len();
     for i in (1..messages.len()).rev() {
         acc += estimate_tokens(&messages[i..=i]);
-        if role(&messages[i]) == "user" {
+        // A cut at a synthesized user turn would clobber its content array.
+        if role(&messages[i]) == "user"
+            && messages[i]
+                .get(super::engine::SYNTHETIC_MARKER_KEY)
+                .is_none()
+        {
             cut = i;
             if acc >= keep_recent_tokens {
                 break;
@@ -1182,6 +1187,23 @@ mod tests {
                 .map(|c| c.msg_index)
                 .collect::<Vec<_>>(),
             vec![2]
+        );
+    }
+
+    #[test]
+    fn find_cut_skips_engine_synthesized_user_turns() {
+        let messages = vec![
+            json!({"role": "system", "content": "sys"}),
+            json!({"role": "user", "content": "u1"}),
+            json!({"role": "assistant", "content": "a"}),
+            json!({"role": "user", "aivo": "tool_images",
+                   "content": [{"type": "text", "text": "img"}]}),
+            json!({"role": "assistant", "content": "a2"}),
+        ];
+        assert_eq!(
+            find_cut(&messages, 0),
+            1,
+            "synthetic turn is not a boundary"
         );
     }
 

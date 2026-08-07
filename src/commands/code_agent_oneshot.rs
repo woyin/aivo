@@ -199,12 +199,11 @@ async fn run_agent_captured(
     };
     let model: &str = &effective_model;
 
+    let resolved =
+        crate::services::model_metadata::resolve_limits(cache, Some(&key.base_url), model).await;
     let context_window = match context_window_override {
         Some(w) => w,
-        None => crate::services::model_metadata::resolve_limits(cache, Some(&key.base_url), model)
-            .await
-            .context
-            .unwrap_or(0),
+        None => resolved.context.unwrap_or(0),
     }
     .min(u32::MAX as u64) as u32;
 
@@ -233,6 +232,7 @@ async fn run_agent_captured(
         "AIVO_AGENT_MAX_OUTPUT_TOKENS",
         DEFAULT_MAX_OUTPUT_TOKENS,
     ));
+    engine.set_model_reads_images(resolved.caps.is_some_and(|c| c.image_input));
     // A cost estimate needs both input and output prices; fail closed otherwise.
     if let Some(usd) = limits.max_cost.filter(|c| *c > 0.0) {
         let pricing = crate::services::model_metadata::model_pricing(model)

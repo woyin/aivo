@@ -477,8 +477,8 @@ impl AgentEngine {
         self.record_turn_changes().await;
     }
 
-    /// Fold interjections into the last tool result — a fresh user turn after
-    /// tool results 400s the Anthropic bridge.
+    /// Fold interjections into the last tool result — keeps the steering text
+    /// attached to the step it interrupted.
     pub(super) fn inject_steering(&mut self, ui: &mut dyn AgentUi) {
         let steering = ui.drain_steering();
         if steering.is_empty() {
@@ -525,8 +525,7 @@ you were working. If the outcome matters to the task, inspect the log; otherwise
         line
     }
 
-    /// Append `block` to the last tool result, or push a user turn when there is
-    /// none — a fresh user turn straight after tool results 400s the Anthropic bridge.
+    /// Append `block` to the last tool result, or push a user turn when there is none.
     pub(super) fn fold_into_last_tool_result(&mut self, block: String) {
         if let Some(last) = self.messages.last_mut()
             && last.get("role").and_then(Value::as_str) == Some("tool")

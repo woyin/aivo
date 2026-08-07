@@ -1542,6 +1542,21 @@ fn basename(path: &str) -> String {
         .to_string()
 }
 
+/// Basenames from the aivo-authored `[image saved: …]` trailer — only text after
+/// the last `</untrusted>` counts (in-frame text could fake the marker).
+pub(super) fn saved_image_names(result: &str) -> Vec<String> {
+    let Some((_, tail)) = result.rsplit_once("</untrusted>") else {
+        return Vec::new();
+    };
+    tail.lines()
+        .filter_map(|l| {
+            let inner = l.trim().strip_prefix("[image saved: ")?.strip_suffix(']')?;
+            let path = inner.rsplit_once(" (").map_or(inner, |(p, _)| p);
+            Some(basename(path))
+        })
+        .collect()
+}
+
 /// Max display columns for a status-line action target (room for verb + tail).
 const ACTION_TARGET_MAX_COLS: usize = 40;
 
@@ -1927,6 +1942,17 @@ pub(super) fn tool_result_spans(
                 format!(" · {}", truncate_chars(label, 40)),
                 Style::default().fg(MUTED()),
             ));
+        }
+        if tool.is_some_and(|t| t.starts_with("mcp__")) {
+            let names = saved_image_names(result);
+            let note = match names.as_slice() {
+                [] => None,
+                [one] => Some(format!(" · saved {one}")),
+                many => Some(format!(" · saved {} images", many.len())),
+            };
+            if let Some(note) = note {
+                spans.push(Span::styled(note, Style::default().fg(MUTED())));
+            }
         }
         // Preview a subagent's first line (its summary). Not a search's — that's a
         // raw match: leaks source, and the pattern's already on the call line.
