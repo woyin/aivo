@@ -606,20 +606,43 @@ pub fn extract_content_text(content: Option<&Value>) -> String {
     }
 }
 
-/// Top-level `tools` plus tools from `additional_tools` input items — where
-/// codex ≥0.143 (sol models) declares them.
+/// Top-level `tools` plus tools from `additional_tools` input items (codex
+/// ≥0.143 sol). Flattens the `functions` namespace group codex ≥0.147 wraps
+/// them in; other namespaces use prefixed call names chat can't round-trip.
 fn responses_request_tools(body: &Value) -> Vec<&Value> {
-    let mut out: Vec<&Value> = body
+    fn flatten<'a>(tool: &'a Value, out: &mut Vec<&'a Value>) {
+        if tool.get("type").and_then(|v| v.as_str()) == Some("namespace")
+            && tool.get("name").and_then(|v| v.as_str()) == Some("functions")
+        {
+            for nested in tool
+                .get("tools")
+                .and_then(|t| t.as_array())
+                .into_iter()
+                .flatten()
+            {
+                flatten(nested, out);
+            }
+        } else {
+            out.push(tool);
+        }
+    }
+    let mut out = Vec::new();
+    for tool in body
         .get("tools")
         .and_then(|t| t.as_array())
-        .map(|a| a.iter().collect())
-        .unwrap_or_default();
+        .into_iter()
+        .flatten()
+    {
+        flatten(tool, &mut out);
+    }
     if let Some(input) = body.get("input").and_then(|v| v.as_array()) {
         for item in input {
             if item.get("type").and_then(|v| v.as_str()) == Some("additional_tools")
                 && let Some(tools) = item.get("tools").and_then(|t| t.as_array())
             {
-                out.extend(tools.iter());
+                for tool in tools {
+                    flatten(tool, &mut out);
+                }
             }
         }
     }
@@ -2534,6 +2557,37 @@ mod tests {
         let messages = chat["messages"].as_array().unwrap();
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0]["role"], "user");
+
+        let custom = collect_custom_tool_names(&body);
+        assert_eq!(custom.len(), 1);
+        assert!(custom.contains("exec"));
+    }
+
+    #[test]
+    fn test_convert_request_flattens_functions_namespace() {
+        let body = json!({
+            "model": "gpt-5.6-sol",
+            "input": [
+                {"type": "additional_tools", "role": "developer", "tools": [
+                    {"type": "namespace", "name": "functions", "description": "", "tools": [
+                        {"type": "custom", "name": "exec", "description": "Run JavaScript code",
+                         "format": {"type": "grammar", "syntax": "lark", "definition": "start: /.*/"}},
+                        {"type": "function", "name": "wait", "description": "Wait",
+                         "parameters": {"type": "object", "properties": {"cell_id": {"type": "string"}}}}
+                    ]},
+                    {"type": "namespace", "name": "collaboration", "tools": [
+                        {"type": "function", "name": "spawn_agent", "parameters": {}}
+                    ]}
+                ]},
+                {"type": "message", "role": "user", "content": "hi"}
+            ]
+        });
+        let chat = convert_responses_to_chat_request(&body, &openai_router_config());
+
+        let tools = chat["tools"].as_array().unwrap();
+        assert_eq!(tools.len(), 2, "functions namespace flattens, others drop");
+        assert_eq!(tools[0]["function"]["name"], "exec");
+        assert_eq!(tools[1]["function"]["name"], "wait");
 
         let custom = collect_custom_tool_names(&body);
         assert_eq!(custom.len(), 1);
