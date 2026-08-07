@@ -1,5 +1,15 @@
 # Changelog
 
+## v0.43.5
+
+An MCP and compatibility patch. MCP image results are saved to disk and handed to vision models instead of collapsing into a truncated base64 blob, and the transport adopts the 2026-07-28 stateless revision with a fallback to the legacy session handshake. Also: codex 0.147's namespaced tool envelope no longer strips every tool on the way to chat-format providers, shared transcripts show `ask_user` answers as real user turns, and Windows opens OAuth URLs in a browser again.
+
+- feat(mcp): save image tool results to disk and show them to vision models (60bd2cfc)
+- feat(mcp): adopt the 2026-07-28 stateless MCP revision with legacy fallback (77497cc2)
+- fix(codex): flatten the `functions` namespace group codex 0.147 wraps tools in (510b4380)
+- fix(share): render `ask_user` answers as real user turns (c215f9ef, 28e9896e)
+- fix(windows): open URLs via `ShellExecuteW` instead of explorer.exe (74163f50)
+
 ## v0.43.4
 
 A transparency patch. `--transparent` now forces a direct upstream connection for `claude`, `codex`, `gemini`, and `opencode`, not just pi, and the code agent's self-verification is backed by the actual tool log instead of recall. Also: tool results render on their call rows, and glob/grep walks no longer freeze the TUI.
