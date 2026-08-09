@@ -14,6 +14,20 @@ pub(crate) struct RuntimeArgs {
     pub(crate) claude_settings_pin_path: Option<String>,
 }
 
+/// Codex per-slot model overrides, injected as `--config` pairs
+/// (`review_model`, `agents.default_subagent_model`).
+#[derive(Debug, Clone, Default)]
+pub struct CodexSlotModels {
+    pub review: Option<String>,
+    pub subagent: Option<String>,
+}
+
+impl CodexSlotModels {
+    pub fn any_set(&self) -> bool {
+        self.review.is_some() || self.subagent.is_some()
+    }
+}
+
 pub(crate) fn merge_preview_env(
     tool_env: &HashMap<String, String>,
     manual_env: Option<&HashMap<String, String>>,
@@ -33,6 +47,7 @@ pub(crate) fn preview_args(
     model: Option<&str>,
     env: &HashMap<String, String>,
     codex_effort: Option<&str>,
+    codex_slots: &CodexSlotModels,
 ) -> Vec<String> {
     let args = inject_claude_teammate_mode(tool, raw_args);
     if tool == AIToolType::Pi {
@@ -50,7 +65,8 @@ pub(crate) fn preview_args(
         uses_responses_to_chat_router(env) || env.contains_key("OPENAI_BASE_URL");
     let args = inject_codex_model(model, &args, raw_model_upstream);
     let args = inject_codex_reasoning_effort(codex_effort, &args);
-    let args = if should_preview_codex_model_catalog(model, raw_model_upstream) {
+    let args = inject_codex_slot_models(codex_slots, &args, raw_model_upstream);
+    let args = if should_preview_codex_model_catalog(model, raw_model_upstream, codex_slots) {
         let mut preview = vec![
             "--config".to_string(),
             "model_catalog_json=\"<temp:aivo-codex-model-catalog.json>\"".to_string(),
@@ -69,6 +85,7 @@ pub(crate) fn build_preview_notes(
     model: Option<&str>,
     env: &HashMap<String, String>,
     codex_effort: Option<&str>,
+    codex_slots: &CodexSlotModels,
 ) -> Vec<String> {
     let mut notes = Vec::new();
 
@@ -165,7 +182,23 @@ pub(crate) fn build_preview_notes(
     {
         notes.push("injects `--config model_reasoning_effort` for Codex".to_string());
     }
-    if tool.is_codex_family() && should_preview_codex_model_catalog(model, raw_model_upstream) {
+    if tool.is_codex_family()
+        && codex_slots.review.is_some()
+        && !raw_args.iter().any(|a| a.contains("review_model"))
+    {
+        notes.push("injects `--config review_model` for Codex".to_string());
+    }
+    if tool.is_codex_family()
+        && codex_slots.subagent.is_some()
+        && !raw_args
+            .iter()
+            .any(|a| a.contains("agents.default_subagent_model"))
+    {
+        notes.push("injects `--config agents.default_subagent_model` for Codex".to_string());
+    }
+    if tool.is_codex_family()
+        && should_preview_codex_model_catalog(model, raw_model_upstream, codex_slots)
+    {
         notes.push("writes a temporary Codex model catalog file at launch time".to_string());
     }
     if tool.is_codex_family() && env.contains_key("OPENAI_BASE_URL") {
@@ -195,6 +228,7 @@ pub(crate) async fn build_runtime_args(
     cache: &ModelsCache,
     upstream_base_url: Option<&str>,
     codex_effort: Option<&str>,
+    codex_slots: &CodexSlotModels,
 ) -> Result<RuntimeArgs> {
     let args = inject_claude_teammate_mode(tool, raw_args);
     if tool == AIToolType::Pi {
@@ -227,10 +261,12 @@ pub(crate) async fn build_runtime_args(
         raw_model_upstream,
         cache,
         upstream_base_url,
+        codex_slots,
     )
     .await?;
     let args = inject_codex_model(model, &args, raw_model_upstream);
     let args = inject_codex_reasoning_effort(codex_effort, &args);
+    let args = inject_codex_slot_models(codex_slots, &args, raw_model_upstream);
     let args = inject_codex_model_catalog(codex_model_catalog_path.as_deref(), &args);
     let args = inject_codex_cursor_tui_reasoning(use_responses_router, &args);
 
@@ -501,17 +537,12 @@ fn maybe_push_router_note(
     }
 }
 
-fn should_preview_codex_model_catalog(model: Option<&str>, raw_model_upstream: bool) -> bool {
-    let model = match model {
-        Some(model) if !model.is_empty() => model,
-        _ => return false,
-    };
-
-    if !raw_model_upstream {
-        return false;
-    }
-
-    !is_openai_shaped_slug(model)
+fn should_preview_codex_model_catalog(
+    model: Option<&str>,
+    raw_model_upstream: bool,
+    codex_slots: &CodexSlotModels,
+) -> bool {
+    !catalog_slugs(model, None, raw_model_upstream, codex_slots).is_empty()
 }
 
 /// Path shown by `--dry-run` in place of the real pin file: previews must
@@ -690,6 +721,41 @@ fn inject_codex_reasoning_effort(effort: Option<&str>, args: &[String]) -> Vec<S
     new_args
 }
 
+/// Prepended so a user-supplied `-c <key>=...` parses later and wins; for
+/// codex-app the pairs ride the global prefix into the wrapper.
+fn inject_codex_slot_models(
+    slots: &CodexSlotModels,
+    args: &[String],
+    raw_model_upstream: bool,
+) -> Vec<String> {
+    let mut args = args.to_vec();
+    for (config_key, model) in [
+        ("review_model", slots.review.as_deref()),
+        ("agents.default_subagent_model", slots.subagent.as_deref()),
+    ] {
+        let model = match model {
+            Some(m) if !m.is_empty() => m,
+            _ => continue,
+        };
+        if args.iter().any(|a| a.contains(config_key)) {
+            continue;
+        }
+        let codex_model = if raw_model_upstream {
+            model.to_string()
+        } else {
+            map_model_for_codex_cli(model)
+        };
+        let escaped = codex_model.replace('\\', "\\\\").replace('"', "\\\"");
+        let mut new_args = vec![
+            "--config".to_string(),
+            format!("{config_key}=\"{escaped}\""),
+        ];
+        new_args.extend_from_slice(&args);
+        args = new_args;
+    }
+    args
+}
+
 /// Sets root `model = "<X>"` in the codex config via `-c`. The codex CLI's
 /// `-m` flag only seeds the current launch's model; codex-app's GUI picks its
 /// per-thread default from the resolved config's `model` field. Without this,
@@ -771,8 +837,9 @@ async fn maybe_write_codex_model_catalog(
     raw_model_upstream: bool,
     cache: &ModelsCache,
     upstream_base_url: Option<&str>,
+    codex_slots: &CodexSlotModels,
 ) -> Result<Option<String>> {
-    let slugs = catalog_slugs(model, codex_app_models, raw_model_upstream);
+    let slugs = catalog_slugs(model, codex_app_models, raw_model_upstream, codex_slots);
     if slugs.is_empty() {
         return Ok(None);
     }
@@ -816,15 +883,25 @@ fn catalog_slugs(
     model: Option<&str>,
     codex_app_models: Option<&[String]>,
     raw_model_upstream: bool,
+    codex_slots: &CodexSlotModels,
 ) -> Vec<String> {
-    // CodexApp: discovered provider models plus the explicit `-m`, for the GUI
-    // dropdown. Reject control-byte slugs — they'd break out of the TOML
-    // basic-string in `inject_codex_root_model` / catalog JSON.
+    let slot_models = [
+        codex_slots.review.as_deref(),
+        codex_slots.subagent.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .filter(|m| !m.is_empty());
+    // CodexApp: discovered provider models plus the explicit `-m` and slot
+    // overrides, for the GUI dropdown. Reject control-byte slugs — they'd
+    // break out of the TOML basic-string in `inject_codex_root_model` /
+    // catalog JSON.
     if let Some(list) = codex_app_models {
         let mut slugs: Vec<String> = list
             .iter()
             .map(String::as_str)
             .chain(model)
+            .chain(slot_models.clone())
             .filter(|&m| is_safe_codex_slug(m))
             .map(str::to_string)
             .collect();
@@ -844,20 +921,24 @@ fn catalog_slugs(
         }
     }
 
-    // CLI single-model path: only write when the model is non-OpenAI-shaped
-    // and the upstream resolves raw slugs (else codex's built-in catalog
-    // serves the user without aivo interference).
-    let model = match model {
-        Some(m) if !m.is_empty() && is_safe_codex_slug(m) => m,
-        _ => return Vec::new(),
-    };
+    // CLI path: `model_catalog_json` replaces the whole catalog, so a mixed
+    // set keeps the OpenAI-shaped slugs too — dropping them would make codex
+    // reject its own main model.
     if !raw_model_upstream {
         return Vec::new();
     }
-    if is_openai_shaped_slug(model) {
+    let mut slugs: Vec<String> = model
+        .into_iter()
+        .filter(|m| !m.is_empty())
+        .chain(slot_models)
+        .filter(|&m| is_safe_codex_slug(m))
+        .map(str::to_string)
+        .collect();
+    slugs.dedup();
+    if slugs.iter().all(|m| is_openai_shaped_slug(m)) {
         return Vec::new();
     }
-    vec![model.to_string()]
+    slugs
 }
 
 /// True when the slug's local name (after any `provider/` prefix) starts with
@@ -1043,6 +1124,7 @@ mod tests {
             &cache,
             None,
             None,
+            &CodexSlotModels::default(),
         )
         .await
         .unwrap();
@@ -1091,6 +1173,7 @@ mod tests {
             &cache,
             None,
             None,
+            &CodexSlotModels::default(),
         )
         .await
         .unwrap();
@@ -1125,6 +1208,7 @@ mod tests {
             &cache,
             None,
             None,
+            &CodexSlotModels::default(),
         )
         .await
         .unwrap();
@@ -1132,6 +1216,161 @@ mod tests {
         let m_idx = runtime.args.iter().position(|a| a == "-m").unwrap();
         assert_eq!(runtime.args[m_idx + 1], "gpt-4o");
         assert!(runtime.codex_model_catalog_path.is_none());
+    }
+
+    #[tokio::test]
+    async fn codex_slot_models_injected_and_ride_catalog() {
+        let env = HashMap::from([
+            (
+                "OPENAI_BASE_URL".to_string(),
+                "https://api.deepseek.com".to_string(),
+            ),
+            ("OPENAI_API_KEY".to_string(), "sk-test".to_string()),
+        ]);
+        let (_dir, cache) = empty_cache();
+        let slots = CodexSlotModels {
+            review: Some("deepseek-chat".to_string()),
+            subagent: Some("deepseek-reasoner".to_string()),
+        };
+        let runtime = build_runtime_args(
+            AIToolType::Codex,
+            &["prompt".to_string()],
+            Some("deepseek-v4-pro"),
+            None,
+            &env,
+            &env,
+            &cache,
+            None,
+            None,
+            &slots,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            runtime
+                .args
+                .iter()
+                .any(|a| a == "review_model=\"deepseek-chat\""),
+            "review_model --config pair must be injected: {:?}",
+            runtime.args
+        );
+        assert!(
+            runtime
+                .args
+                .iter()
+                .any(|a| a == "agents.default_subagent_model=\"deepseek-reasoner\""),
+            "subagent --config pair must be injected: {:?}",
+            runtime.args
+        );
+        let path = runtime.codex_model_catalog_path.expect("catalog written");
+        let catalog = tokio::fs::read_to_string(&path).await.unwrap();
+        assert!(catalog.contains("deepseek-chat"));
+        assert!(catalog.contains("deepseek-reasoner"));
+        let _ = tokio::fs::remove_file(path).await;
+    }
+
+    #[tokio::test]
+    async fn codex_slot_models_remap_on_oauth_path() {
+        // No base URL and no router = native ChatGPT auth; slugs still remap.
+        let env: HashMap<String, String> = HashMap::new();
+        let (_dir, cache) = empty_cache();
+        let slots = CodexSlotModels {
+            review: Some("deepseek-chat".to_string()),
+            subagent: None,
+        };
+        let runtime = build_runtime_args(
+            AIToolType::Codex,
+            &[],
+            None,
+            None,
+            &env,
+            &env,
+            &cache,
+            None,
+            None,
+            &slots,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            runtime
+                .args
+                .iter()
+                .any(|a| a.starts_with("review_model=\"gpt-")),
+            "slot model must remap through map_model_for_codex_cli: {:?}",
+            runtime.args
+        );
+        assert!(runtime.codex_model_catalog_path.is_none());
+    }
+
+    #[tokio::test]
+    async fn codex_slot_injection_respects_user_override() {
+        let env: HashMap<String, String> = HashMap::new();
+        let (_dir, cache) = empty_cache();
+        let slots = CodexSlotModels {
+            review: Some("deepseek-chat".to_string()),
+            subagent: Some("deepseek-reasoner".to_string()),
+        };
+        let user_args = vec![
+            "--config".to_string(),
+            "review_model=\"mine\"".to_string(),
+            "--config".to_string(),
+            "agents.default_subagent_model=\"mine\"".to_string(),
+        ];
+        let runtime = build_runtime_args(
+            AIToolType::Codex,
+            &user_args,
+            None,
+            None,
+            &env,
+            &env,
+            &cache,
+            None,
+            None,
+            &slots,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            runtime
+                .args
+                .iter()
+                .filter(|a| a.contains("review_model"))
+                .count(),
+            1,
+            "user-supplied review_model must win: {:?}",
+            runtime.args
+        );
+        assert_eq!(
+            runtime
+                .args
+                .iter()
+                .filter(|a| a.contains("default_subagent_model"))
+                .count(),
+            1,
+            "user-supplied subagent model must win: {:?}",
+            runtime.args
+        );
+    }
+
+    #[test]
+    fn catalog_keeps_openai_shaped_main_model_alongside_slot_slug() {
+        let slots = CodexSlotModels {
+            review: Some("deepseek-chat".to_string()),
+            subagent: None,
+        };
+        let slugs = catalog_slugs(Some("gpt-5.2"), None, true, &slots);
+        assert_eq!(slugs, vec!["gpt-5.2", "deepseek-chat"]);
+
+        // All OpenAI-shaped → defer to codex's bundled catalog.
+        let slots = CodexSlotModels {
+            review: Some("gpt-5.2-mini".to_string()),
+            subagent: None,
+        };
+        assert!(catalog_slugs(Some("gpt-5.2"), None, true, &slots).is_empty());
     }
 
     #[tokio::test]
@@ -1154,6 +1393,7 @@ mod tests {
             &cache,
             None,
             None,
+            &CodexSlotModels::default(),
         )
         .await
         .unwrap();
@@ -1382,6 +1622,7 @@ mod tests {
             &cache,
             None,
             None,
+            &CodexSlotModels::default(),
         )
         .await
         .unwrap();
@@ -1638,7 +1879,12 @@ mod tests {
 
     #[test]
     fn catalog_slugs_falls_back_to_single_model_when_no_app_list() {
-        let slugs = catalog_slugs(Some("composer-2.5"), None, true);
+        let slugs = catalog_slugs(
+            Some("composer-2.5"),
+            None,
+            true,
+            &CodexSlotModels::default(),
+        );
         assert_eq!(slugs, vec!["composer-2.5"]);
     }
 
@@ -1647,7 +1893,7 @@ mod tests {
         // CodexApp path: catalog gets written even on the OpenAI router so
         // the GUI dropdown is populated with provider's models.
         let app_models = vec!["deepseek-chat".to_string(), "deepseek-reasoner".to_string()];
-        let slugs = catalog_slugs(None, Some(&app_models), false);
+        let slugs = catalog_slugs(None, Some(&app_models), false, &CodexSlotModels::default());
         assert_eq!(slugs, vec!["deepseek-chat", "deepseek-reasoner"]);
     }
 
@@ -1662,7 +1908,7 @@ mod tests {
             "gpt-5-codex".to_string(),
             "o3-mini".to_string(),
         ];
-        let slugs = catalog_slugs(None, Some(&app_models), true);
+        let slugs = catalog_slugs(None, Some(&app_models), true, &CodexSlotModels::default());
         assert!(
             slugs.is_empty(),
             "all-OpenAI list should defer to codex's bundled catalog"
@@ -1672,14 +1918,19 @@ mod tests {
     #[test]
     fn catalog_slugs_writes_when_mixed_with_non_openai() {
         let app_models = vec!["gpt-5".to_string(), "deepseek-chat".to_string()];
-        let slugs = catalog_slugs(None, Some(&app_models), false);
+        let slugs = catalog_slugs(None, Some(&app_models), false, &CodexSlotModels::default());
         assert_eq!(slugs, vec!["deepseek-chat", "gpt-5"]);
     }
 
     #[test]
     fn catalog_slugs_merges_explicit_model_into_app_list() {
         let app_models = vec!["deepseek-chat".to_string()];
-        let slugs = catalog_slugs(Some("my-custom-model"), Some(&app_models), false);
+        let slugs = catalog_slugs(
+            Some("my-custom-model"),
+            Some(&app_models),
+            false,
+            &CodexSlotModels::default(),
+        );
         assert_eq!(slugs, vec!["deepseek-chat", "my-custom-model"]);
     }
 
@@ -1688,14 +1939,24 @@ mod tests {
         // Non-OpenAI `-m` forces a catalog even when all discovered slugs are
         // OpenAI-shaped — else the custom model stays invisible.
         let app_models = vec!["gpt-5".to_string(), "o3-mini".to_string()];
-        let slugs = catalog_slugs(Some("deepseek-chat"), Some(&app_models), true);
+        let slugs = catalog_slugs(
+            Some("deepseek-chat"),
+            Some(&app_models),
+            true,
+            &CodexSlotModels::default(),
+        );
         assert_eq!(slugs, vec!["deepseek-chat", "gpt-5", "o3-mini"]);
     }
 
     #[test]
     fn catalog_slugs_dedups_explicit_model_already_in_app_list() {
         let app_models = vec!["deepseek-chat".to_string(), "deepseek-reasoner".to_string()];
-        let slugs = catalog_slugs(Some("deepseek-chat"), Some(&app_models), false);
+        let slugs = catalog_slugs(
+            Some("deepseek-chat"),
+            Some(&app_models),
+            false,
+            &CodexSlotModels::default(),
+        );
         assert_eq!(slugs, vec!["deepseek-chat", "deepseek-reasoner"]);
     }
 
@@ -1703,7 +1964,12 @@ mod tests {
     fn catalog_slugs_rejects_control_bytes_in_explicit_model() {
         // The chained `-m` is filtered too, not just the discovered list.
         let app_models = vec!["deepseek-chat".to_string()];
-        let slugs = catalog_slugs(Some("evil\n[features]\nfoo=true"), Some(&app_models), false);
+        let slugs = catalog_slugs(
+            Some("evil\n[features]\nfoo=true"),
+            Some(&app_models),
+            false,
+            &CodexSlotModels::default(),
+        );
         assert_eq!(slugs, vec!["deepseek-chat"]);
     }
 
@@ -1715,7 +1981,7 @@ mod tests {
             "good-model".to_string(),
             "evil\n[features]\nfoo=true".to_string(),
         ];
-        let slugs = catalog_slugs(None, Some(&app_models), false);
+        let slugs = catalog_slugs(None, Some(&app_models), false, &CodexSlotModels::default());
         assert_eq!(slugs, vec!["good-model"]);
     }
 
@@ -1775,6 +2041,7 @@ mod tests {
             &cache,
             None,
             None,
+            &CodexSlotModels::default(),
         )
         .await
         .unwrap();

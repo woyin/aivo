@@ -8,7 +8,7 @@ use crate::commands::code_tui_format::format_time_ago_short_dt;
 use crate::commands::models::resolve_model_placeholder;
 use crate::commands::{print_launch_preview, trim_to_one_line};
 use crate::errors::ExitCode;
-use crate::services::ai_launcher::{AILauncher, AIToolType, LaunchOptions};
+use crate::services::ai_launcher::{AILauncher, AIToolType, CodexSlotModels, LaunchOptions};
 use crate::services::context_ingest::{
     IngestOptions, code_threads_by_id_global, ingest_project_with_code,
 };
@@ -220,6 +220,73 @@ impl RunCommand {
         }))
     }
 
+    /// Resolves the codex slot flags (`--review-model`, `--subagent-model`).
+    /// The `-c` injection targets one provider, so `<key>::` routing is
+    /// rejected. `None` = cancelled.
+    #[allow(clippy::too_many_arguments)]
+    async fn resolve_codex_slots(
+        &self,
+        client: &Client,
+        key: &ApiKey,
+        tool: AIToolType,
+        review: Option<String>,
+        subagent: Option<String>,
+        refresh: bool,
+        main_model: Option<&str>,
+    ) -> Result<Option<CodexSlotModels>> {
+        let slots = [
+            ("review", "review model", review),
+            ("subagent", "subagent model", subagent),
+        ];
+        let aliases = self.session_store.get_aliases().await.unwrap_or_default();
+        let mut resolved: [Option<String>; 2] = [None, None];
+        let mut summary_rows: Vec<(String, String, String, bool)> = Vec::new();
+        for (idx, (stem, label, value)) in slots.into_iter().enumerate() {
+            let Some(raw) = value else { continue };
+            let (key_ref, model_part) = crate::cli_args::split_tier_spec(&raw);
+            let (key_ref, model_part) =
+                crate::cli_args::resolve_alias_with_tier(&aliases, key_ref, model_part);
+            if let Some(kr) = key_ref {
+                anyhow::bail!(
+                    "--{stem}-model doesn't support `{kr}::` provider routing for codex — the slot always uses the main key (-k)"
+                );
+            }
+
+            let model_empty = model_part.is_empty(); // empty → picker
+            let prompt = if model_empty {
+                format!(
+                    "Select {} ({})",
+                    highlight_slot_label(label),
+                    key.display_name()
+                )
+            } else {
+                String::new()
+            };
+            let outcome = self
+                .resolve_model(client, key, Some(model_part), true, refresh, tool, &prompt)
+                .await?;
+            let model = match outcome {
+                ModelOutcome::Cancelled => return Ok(None),
+                ModelOutcome::UseDefault => continue,
+                ModelOutcome::Model(m) => m,
+            };
+            resolved[idx] = Some(model.clone());
+            summary_rows.push((
+                stem.to_string(),
+                model,
+                key.display_name().to_string(),
+                false,
+            ));
+        }
+
+        if !summary_rows.is_empty() {
+            print_routing_summary(key, main_model, &summary_rows);
+        }
+
+        let [review, subagent] = resolved;
+        Ok(Some(CodexSlotModels { review, subagent }))
+    }
+
     /// Executes the run command with the specified AI tool
     #[allow(clippy::too_many_arguments)]
     pub async fn execute(
@@ -236,6 +303,7 @@ impl RunCommand {
         resume_selector: Option<String>,
         max_context: Option<String>,
         effort: Option<String>,
+        review_model: Option<String>,
     ) -> ExitCode {
         match self
             .execute_internal(
@@ -251,6 +319,7 @@ impl RunCommand {
                 resume_selector,
                 max_context,
                 effort,
+                review_model,
             )
             .await
         {
@@ -277,6 +346,7 @@ impl RunCommand {
         resume_selector: Option<String>,
         max_context: Option<String>,
         effort: Option<String>,
+        review_model: Option<String>,
     ) -> anyhow::Result<ExitCode> {
         let mut model = model;
         let tool = match tool {
@@ -397,6 +467,14 @@ impl RunCommand {
                 .await;
         }
 
+        // Codex consumes the subagent slot; the rest stay Claude-only.
+        let mut slots = slots;
+        let codex_subagent = if ai_tool.is_codex_family() {
+            slots.subagent.take()
+        } else {
+            None
+        };
+
         let mut claude_overrides = match ai_tool {
             AIToolType::Claude if slots.any_set() => {
                 let key = key_override
@@ -426,6 +504,40 @@ impl RunCommand {
                 ClaudeModelOverrides::default()
             }
         };
+
+        let codex_slots =
+            if ai_tool.is_codex_family() && (review_model.is_some() || codex_subagent.is_some()) {
+                let key = key_override
+                    .as_ref()
+                    .expect("key_override is required (validated above)");
+                match self
+                    .resolve_codex_slots(
+                        &client,
+                        key,
+                        ai_tool,
+                        review_model,
+                        codex_subagent,
+                        refresh,
+                        resolved_model.as_deref(),
+                    )
+                    .await?
+                {
+                    Some(s) => s,
+                    None => {
+                        eprintln!("{}", style::dim("Cancelled."));
+                        return Ok(ExitCode::Success);
+                    }
+                }
+            } else {
+                if review_model.is_some() {
+                    eprintln!(
+                        "  {} --review-model is ignored for {}",
+                        style::yellow("!"),
+                        ai_tool.as_str(),
+                    );
+                }
+                CodexSlotModels::default()
+            };
 
         // `--max-context` is Claude-only; other tools get context from limits.
         claude_overrides.max_context = match ai_tool {
@@ -544,6 +656,7 @@ impl RunCommand {
             env,
             key_override,
             codex_effort,
+            codex_slots,
         };
 
         if dry_run {
@@ -563,8 +676,9 @@ impl RunCommand {
     /// flags that actually apply to that CLI are listed; bare `aivo run --help`
     /// (no tool) shows the union. Each option's visibility is gated on which
     /// tools the run pipeline actually honors:
-    ///   - Claude slot flags (`--fable-model`, `--{haiku,sonnet,opus}-model`,
-    ///     `--subagent-model`) → claude
+    ///   - Claude slot flags (`--fable-model`, `--{haiku,sonnet,opus}-model`)
+    ///     → claude; `--subagent-model` → claude + codex/codex-app;
+    ///     `--review-model` → codex/codex-app
     ///   - `--max-context`/`--1m`/`--2m` → claude
     ///   - `--relogin` → claude, codex/codex-app, gemini (the OAuth-backed keys)
     ///   - `--resume [<id>]` → every tool but codex-app (native resume or digest)
@@ -625,6 +739,7 @@ impl RunCommand {
             } else {
                 s.trim_start_matches("Claude only: ")
                     .trim_start_matches("Codex only: ")
+                    .trim_start_matches("Claude/Codex: ")
                     .to_string()
             }
         };
@@ -643,6 +758,17 @@ impl RunCommand {
                 "--effort [level]",
                 &label("Codex only: reasoning effort, e.g. medium/high/xhigh/max (bare = picker)"),
             );
+            print_opt(
+                "--review-model [model]",
+                &label("Codex only: /review + auto-review slot (bare = picker)"),
+            );
+            // Generic view lists --subagent-model once, in the Claude block.
+            if !generic {
+                print_opt(
+                    "--subagent-model [model]",
+                    "Subagent slot (experimental codex subagents)",
+                );
+            }
         }
         if is("claude") {
             print_opt(
@@ -663,7 +789,7 @@ impl RunCommand {
             );
             print_opt(
                 "--subagent-model [key::]m",
-                &label("Claude only: subagent tier"),
+                &label("Claude/Codex: subagent tier"),
             );
             print_opt(
                 "",

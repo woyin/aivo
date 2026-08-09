@@ -595,9 +595,14 @@ pub struct RunArgs {
     #[arg(short, long, value_name = "[KEY::]MODEL", num_args = 0..=1, default_missing_value = "")]
     pub model: Option<String>,
 
-    /// Claude only: subagent slot (CLAUDE_CODE_SUBAGENT_MODEL).
+    /// Claude/Codex: subagent slot (CLAUDE_CODE_SUBAGENT_MODEL /
+    /// `agents.default_subagent_model`).
     #[arg(long = "subagent-model", value_name = "[KEY::]MODEL", num_args = 0..=1, default_missing_value = "")]
     pub subagent_model: Option<String>,
+
+    /// Codex only: `/review` + auto-review slot (config `review_model`).
+    #[arg(long = "review-model", value_name = "MODEL", num_args = 0..=1, default_missing_value = "")]
+    pub review_model: Option<String>,
 
     /// Claude only: `/model haiku` slot (ANTHROPIC_DEFAULT_HAIKU_MODEL).
     #[arg(long = "haiku-model", value_name = "[KEY::]MODEL", num_args = 0..=1, default_missing_value = "")]

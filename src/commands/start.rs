@@ -189,6 +189,7 @@ impl StartCommand {
                     env: (!env.is_empty()).then_some(env),
                     key_override: Some(key.value),
                     codex_effort: None,
+                    codex_slots: Default::default(),
                 })
                 .await?;
             print_launch_preview(&plan);
@@ -221,6 +222,7 @@ impl StartCommand {
                 env: (!env.is_empty()).then_some(env),
                 key_override: Some(key.value),
                 codex_effort: None,
+                codex_slots: Default::default(),
             })
             .await?;
 

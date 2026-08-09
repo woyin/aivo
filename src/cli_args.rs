@@ -283,6 +283,8 @@ pub(crate) struct ExtractedFlags {
     pub(crate) resume: Option<String>,
     /// Codex only: `Some("")` = bare `--effort` (picker).
     pub(crate) effort: Option<String>,
+    /// Codex only: `Some("")` = bare `--review-model` (picker).
+    pub(crate) review_model: Option<String>,
     /// `None` = flag absent. `Some("1m")` = activate the 1M-context spoof.
     pub(crate) max_context: Option<String>,
     pub(crate) transform: bool,
@@ -335,6 +337,7 @@ pub(crate) fn extract_aivo_flags(
     initial_envs: Vec<String>,
     initial_max_context: Option<String>,
     initial_effort: Option<String>,
+    initial_review_model: Option<String>,
     passthrough_args: &[String],
 ) -> ExtractedFlags {
     // Clap may have consumed a following flag as the value of -m/-k (e.g. `-m --resume`
@@ -361,6 +364,7 @@ pub(crate) fn extract_aivo_flags(
     let mut resume: Option<String> = None;
     let mut max_context: Option<String> = initial_max_context;
     let mut effort: Option<String> = initial_effort;
+    let mut review_model: Option<String> = initial_review_model;
     let mut transform = false;
     let mut transparent = false;
     let mut env_strings = initial_envs;
@@ -399,6 +403,7 @@ pub(crate) fn extract_aivo_flags(
     sanitize_slot(&mut haiku_model);
     sanitize_slot(&mut sonnet_model);
     sanitize_slot(&mut opus_model);
+    sanitize_slot(&mut review_model);
     // A level never starts with `-`; degrade a clap-eaten flag to the picker.
     if let Some(ref v) = effort
         && v.starts_with('-')
@@ -548,6 +553,19 @@ pub(crate) fn extract_aivo_flags(
             } else {
                 opus_model = Some(String::new());
             }
+        } else if let Some(value) = arg.strip_prefix("--review-model=") {
+            if !value.is_empty() && review_model.is_none() {
+                review_model = Some(value.to_string());
+            } else {
+                remaining_args.push(arg.clone());
+            }
+        } else if arg == "--review-model" && review_model.is_none() {
+            if i + 1 < passthrough_args.len() && !passthrough_args[i + 1].starts_with('-') {
+                review_model = Some(passthrough_args[i + 1].clone());
+                i += 1;
+            } else {
+                review_model = Some(String::new());
+            }
         } else if let Some(value) = arg.strip_prefix("--effort=") {
             if !value.is_empty() && effort.is_none() {
                 effort = Some(value.to_string());
@@ -609,6 +627,7 @@ pub(crate) fn extract_aivo_flags(
         remaining_args,
         resume,
         effort,
+        review_model,
         max_context,
         transform,
         transparent,
@@ -712,6 +731,7 @@ mod tests {
             vec![],
             None,
             None,
+            None,
             &args(&["--model=gpt-4o", "file.ts"]),
         );
         assert_eq!(r.model, Some("gpt-4o".to_string()));
@@ -731,6 +751,7 @@ mod tests {
             vec![],
             None,
             None,
+            None,
             &args(&["--effort", "xhigh", "prompt"]),
         );
         assert_eq!(r.effort.as_deref(), Some("xhigh"));
@@ -747,6 +768,7 @@ mod tests {
             vec![],
             None,
             None,
+            None,
             &args(&["--effort=max"]),
         );
         assert_eq!(r.effort.as_deref(), Some("max"));
@@ -761,6 +783,7 @@ mod tests {
             false,
             false,
             vec![],
+            None,
             None,
             None,
             &args(&["--effort", "--json"]),
@@ -783,9 +806,84 @@ mod tests {
             vec![],
             None,
             Some("--json".to_string()),
+            None,
             &args(&[]),
         );
         assert_eq!(r.effort.as_deref(), Some(""));
+        assert_eq!(r.remaining_args, args(&["--json"]));
+    }
+
+    #[test]
+    fn review_model_flag_forms() {
+        let r = extract_aivo_flags(
+            None,
+            ClaudeSlotFlags::default(),
+            None,
+            None,
+            false,
+            false,
+            false,
+            vec![],
+            None,
+            None,
+            None,
+            &args(&["--review-model", "gpt-5.2", "prompt"]),
+        );
+        assert_eq!(r.review_model.as_deref(), Some("gpt-5.2"));
+        assert_eq!(r.remaining_args, args(&["prompt"]));
+
+        let r = extract_aivo_flags(
+            None,
+            ClaudeSlotFlags::default(),
+            None,
+            None,
+            false,
+            false,
+            false,
+            vec![],
+            None,
+            None,
+            None,
+            &args(&["--review-model=deepseek-chat"]),
+        );
+        assert_eq!(r.review_model.as_deref(), Some("deepseek-chat"));
+
+        // Bare flag → picker sentinel; the following flag stays passthrough.
+        let r = extract_aivo_flags(
+            None,
+            ClaudeSlotFlags::default(),
+            None,
+            None,
+            false,
+            false,
+            false,
+            vec![],
+            None,
+            None,
+            None,
+            &args(&["--review-model", "--json"]),
+        );
+        assert_eq!(r.review_model.as_deref(), Some(""));
+        assert_eq!(r.remaining_args, args(&["--json"]));
+    }
+
+    #[test]
+    fn review_model_flag_lookalike_value_degrades_to_picker() {
+        let r = extract_aivo_flags(
+            None,
+            ClaudeSlotFlags::default(),
+            None,
+            None,
+            false,
+            false,
+            false,
+            vec![],
+            None,
+            None,
+            Some("--json".to_string()),
+            &args(&[]),
+        );
+        assert_eq!(r.review_model.as_deref(), Some(""));
         assert_eq!(r.remaining_args, args(&["--json"]));
     }
 
@@ -800,6 +898,7 @@ mod tests {
             false,
             false,
             vec![],
+            None,
             None,
             None,
             &args(&["--transform", "--transparent"]),
@@ -824,6 +923,7 @@ mod tests {
             vec![],
             None,
             None,
+            None,
             &args(&["hf:Qwen/Qwen2.5-0.5B-Instruct-GGUF"]),
         );
         assert_eq!(
@@ -844,6 +944,7 @@ mod tests {
             false,
             false,
             vec![],
+            None,
             None,
             None,
             &args(&["https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct-GGUF"]),
@@ -870,6 +971,7 @@ mod tests {
             vec![],
             None,
             None,
+            None,
             &args(&["hf:Qwen/Qwen2.5-0.5B-Instruct-GGUF"]),
         );
         assert_eq!(r.model.as_deref(), Some("gpt-4o"));
@@ -890,6 +992,7 @@ mod tests {
             false,
             false,
             vec![],
+            None,
             None,
             None,
             &args(&["hf:Qwen/Qwen2.5-0.5B-Instruct-GGUF", "tell me about rust"]),
@@ -915,6 +1018,7 @@ mod tests {
             vec![],
             None,
             None,
+            None,
             &args(&["file.ts", "do the thing"]),
         );
         assert_eq!(r.model, None);
@@ -932,6 +1036,7 @@ mod tests {
             false,
             false,
             vec![],
+            None,
             None,
             None,
             &args(&["--model", "gpt-4o", "file.ts"]),
@@ -953,6 +1058,7 @@ mod tests {
             vec![],
             None,
             None,
+            None,
             &args(&["-m", "gpt-4o"]),
         );
         assert_eq!(r.model, Some("gpt-4o".to_string()));
@@ -972,6 +1078,7 @@ mod tests {
             vec![],
             None,
             None,
+            None,
             &args(&["--model"]),
         );
         assert_eq!(r.model, Some(String::new()));
@@ -989,6 +1096,7 @@ mod tests {
             false,
             false,
             vec![],
+            None,
             None,
             None,
             &[],
@@ -1011,6 +1119,7 @@ mod tests {
                 vec![],
                 None,
                 None,
+                None,
                 &args(argv),
             );
             assert_eq!(r.resume, Some("abc123".to_string()));
@@ -1026,6 +1135,7 @@ mod tests {
             false,
             false,
             vec![],
+            None,
             None,
             None,
             &args(&["--resume", "abc", "-c"]),
@@ -1048,6 +1158,7 @@ mod tests {
             vec![],
             None,
             None,
+            None,
             &args(&["--resume", "--dry-run"]),
         );
         assert_eq!(r.resume, Some(String::new()));
@@ -1060,6 +1171,7 @@ mod tests {
             false,
             false,
             vec![],
+            None,
             None,
             None,
             &args(&["--resume=", "--resume=zzz"]),
@@ -1082,6 +1194,7 @@ mod tests {
             vec![],
             None,
             None,
+            None,
             &args(&["--model", "other"]),
         );
         assert_eq!(r.model, Some("gpt-4o".to_string()));
@@ -1099,6 +1212,7 @@ mod tests {
             false,
             false,
             vec![],
+            None,
             None,
             None,
             &args(&["--key=mykey"]),
@@ -1119,6 +1233,7 @@ mod tests {
             vec![],
             None,
             None,
+            None,
             &args(&["--key", "mykey"]),
         );
         assert_eq!(r.key_flag, Some("mykey".to_string()));
@@ -1137,6 +1252,7 @@ mod tests {
             vec![],
             None,
             None,
+            None,
             &args(&["-k", "mykey"]),
         );
         assert_eq!(r.key_flag, Some("mykey".to_string()));
@@ -1153,6 +1269,7 @@ mod tests {
             false,
             false,
             vec![],
+            None,
             None,
             None,
             &[],
@@ -1174,6 +1291,7 @@ mod tests {
             vec![],
             None,
             None,
+            None,
             &args(&["-k"]),
         );
         assert_eq!(r.key_flag, Some(String::new()));
@@ -1190,6 +1308,7 @@ mod tests {
             false,
             false,
             vec![],
+            None,
             None,
             None,
             &args(&["--debug", "file.ts"]),
@@ -1211,6 +1330,7 @@ mod tests {
             vec![],
             None,
             None,
+            None,
             &[],
         );
         assert_eq!(r.debug, Some(String::new()));
@@ -1227,6 +1347,7 @@ mod tests {
             false,
             false,
             vec![],
+            None,
             None,
             None,
             &args(&["--dry-run"]),
@@ -1247,6 +1368,7 @@ mod tests {
             vec![],
             None,
             None,
+            None,
             &args(&["--env=FOO=bar"]),
         );
         assert_eq!(r.env_strings, vec!["FOO=bar"]);
@@ -1263,6 +1385,7 @@ mod tests {
             false,
             false,
             vec![],
+            None,
             None,
             None,
             &args(&["-e=FOO=bar"]),
@@ -1283,6 +1406,7 @@ mod tests {
             vec![],
             None,
             None,
+            None,
             &args(&["--env", "FOO=bar"]),
         );
         assert_eq!(r.env_strings, vec!["FOO=bar"]);
@@ -1299,6 +1423,7 @@ mod tests {
             false,
             false,
             vec![],
+            None,
             None,
             None,
             &args(&["-e", "FOO=bar"]),
@@ -1322,6 +1447,7 @@ mod tests {
             vec![],
             None,
             None,
+            None,
             &args(&["--relogin"]),
         );
         assert!(r.relogin);
@@ -1339,6 +1465,7 @@ mod tests {
             false,
             true, // initial_relogin from clap
             vec![],
+            None,
             None,
             None,
             &args(&[]),
@@ -1359,6 +1486,7 @@ mod tests {
             vec!["PRE=1".to_string()],
             None,
             None,
+            None,
             &args(&["-e", "POST=2"]),
         );
         assert_eq!(r.env_strings, vec!["PRE=1", "POST=2"]);
@@ -1375,6 +1503,7 @@ mod tests {
             false,
             false,
             vec![],
+            None,
             None,
             None,
             &args(&["--max-context=1m", "file.ts"]),
@@ -1396,6 +1525,7 @@ mod tests {
             vec![],
             None,
             None,
+            None,
             &args(&["--max-context", "1m"]),
         );
         assert_eq!(r.max_context, Some("1m".to_string()));
@@ -1415,6 +1545,7 @@ mod tests {
             false,
             vec![],
             Some("1m".to_string()),
+            None,
             None,
             &args(&["file.ts"]),
         );
@@ -1469,6 +1600,7 @@ mod tests {
             vec![],
             None,
             None,
+            None,
             &args(&["--1m", "file.ts"]),
         );
         assert_eq!(r.max_context, Some("1m".to_string()));
@@ -1486,6 +1618,7 @@ mod tests {
             false,
             false,
             vec![],
+            None,
             None,
             None,
             &args(&["--2m", "file.ts"]),
@@ -1507,6 +1640,7 @@ mod tests {
             vec![],
             None,
             None,
+            None,
             &args(&["--12m", "file.ts"]),
         );
         assert_eq!(r.max_context, Some("12m".to_string()));
@@ -1524,6 +1658,7 @@ mod tests {
             false,
             false,
             vec![],
+            None,
             None,
             None,
             &args(&["--3M"]),
@@ -1544,6 +1679,7 @@ mod tests {
             false,
             false,
             vec![],
+            None,
             None,
             None,
             &args(&["--foo", "--ma", "--m", "--1mb"]),
@@ -1584,6 +1720,7 @@ mod tests {
             vec![],
             None,
             None,
+            None,
             &args(&["--agent-name", "foo", "--resume"]),
         );
         assert_eq!(r.remaining_args, args(&["--agent-name", "foo"]));
@@ -1602,6 +1739,7 @@ mod tests {
             false,
             false,
             vec![],
+            None,
             None,
             None,
             &args(&[
@@ -2058,6 +2196,7 @@ mod tests {
             vec![],
             None,
             None,
+            None,
             &args(&["fix the login bug"]),
         );
         assert_eq!(r.remaining_args, args(&["fix the login bug"]));
@@ -2077,6 +2216,7 @@ mod tests {
             vec![],
             None,
             None,
+            None,
             &args(&["--model", "gpt-4o", "fix the login bug"]),
         );
         assert_eq!(r.model, Some("gpt-4o".to_string()));
@@ -2094,6 +2234,7 @@ mod tests {
             false,
             false,
             vec![],
+            None,
             None,
             None,
             &args(&["fix", "the", "bug"]),

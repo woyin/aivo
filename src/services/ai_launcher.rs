@@ -12,6 +12,7 @@ use tokio::signal;
 
 use crate::errors::{CLIError, ErrorCategory};
 use crate::services::environment_injector::{ClaudeModelOverrides, EnvironmentInjector};
+pub use crate::services::launch_args::CodexSlotModels;
 use crate::services::launch_args::{
     build_preview_notes, build_runtime_args, inject_codex_provider_config, inject_codex_root_model,
     merge_preview_env, preview_args, rewrite_codex_preview_env,
@@ -231,6 +232,8 @@ pub struct LaunchOptions {
     pub key_override: Option<ApiKey>,
     /// Codex-family only: injected as `model_reasoning_effort`.
     pub codex_effort: Option<String>,
+    /// Codex-family only: per-slot model overrides injected as `--config` pairs.
+    pub codex_slots: CodexSlotModels,
 }
 
 /// Tool configuration including command and environment variables
@@ -397,6 +400,7 @@ impl AILauncher {
             &self.cache,
             Some(resolved.key.base_url.as_str()),
             options.codex_effort.as_deref(),
+            &options.codex_slots,
         )
         .await?;
 
@@ -735,6 +739,7 @@ impl AILauncher {
             resolved.model.as_deref(),
             &resolved.tool_config.env_vars,
             options.codex_effort.as_deref(),
+            &options.codex_slots,
         );
         let mut notes = build_preview_notes(
             options.tool,
@@ -742,6 +747,7 @@ impl AILauncher {
             resolved.model.as_deref(),
             &resolved.tool_config.env_vars,
             options.codex_effort.as_deref(),
+            &options.codex_slots,
         );
 
         if options.tool.is_codex_family() {
