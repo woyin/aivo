@@ -1,5 +1,16 @@
 # Changelog
 
+## v0.44.0
+
+Grok goes native, deprecating the `aivo-grok` plugin, and codex gets `--review-model` / `--subagent-model` slot flags.
+
+- feat(grok): native grok support, deprecating the aivo-grok plugin (bb9dcfd7)
+- feat(codex): `--review-model` and `--subagent-model` slot flags (c0320954)
+- fix(http): don't glue the hardcoded `v1` prefix onto version-suffixed bases (36732d68)
+- fix(codex): preserve namespaced tools through chat-format routes (#33) (a10f3df1)
+- fix(serve): stub `reasoning_content` on the OpenAI-chat passthrough (190fd4a8)
+- fix(models): keep the fixed-temperature verdict across dot/dash id spellings
+
 ## v0.43.5
 
 An MCP and compatibility patch. MCP image results are saved to disk and handed to vision models instead of collapsing into a truncated base64 blob, and the transport adopts the 2026-07-28 stateless revision with a fallback to the legacy session handshake. Also: codex 0.147's namespaced tool envelope no longer strips every tool on the way to chat-format providers, shared transcripts show `ask_user` answers as real user turns, and Windows opens OAuth URLs in a browser again.
