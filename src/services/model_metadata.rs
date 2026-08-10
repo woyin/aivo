@@ -164,11 +164,18 @@ fn fold_rows(rows: std::collections::BTreeMap<String, LimitRow>) -> HashMap<Stri
                 // The loser may know prices the winner lacks — a zero-priced
                 // ':free' pool must not shadow the vendor's list price.
                 merge_pricing(prev, limits.pricing);
+                prev.temperature &= limits.temperature;
             }
             Some(prev) => {
                 let keep = prev.pricing;
+                let fixed_temp = !prev.temperature;
                 *prev = limits;
                 merge_pricing(prev, keep);
+                // Sampling params 400 on models that reject them, while omitting
+                // them is harmless — so on a fold collision (`gpt-5.4` vs
+                // `gpt-5-4`) the restrictive spelling wins regardless of which
+                // side the context tie-break picked.
+                prev.temperature &= !fixed_temp;
             }
             None => {
                 map.insert(key, limits);
@@ -617,6 +624,23 @@ mod tests {
         assert!(!rejects_temperature("totally-unknown-model-xyz"));
         // Some model in the snapshot carries the deprecated flag.
         assert!(SNAPSHOT.values().any(|l| l.deprecated));
+    }
+
+    #[test]
+    fn fixed_temperature_survives_fold_collisions() {
+        // `gpt-5.4` and `gpt-5-4` fold to one key with equal context, so the
+        // tie-break alone would let whichever sorts first decide sampling
+        // support. Upstream disagrees per spelling; the restrictive side wins.
+        for id in [
+            "gpt-5.1",
+            "gpt-5.2",
+            "gpt-5.3-codex",
+            "gpt-5.4",
+            "gpt-5.4-nano",
+            "anthropic.claude-opus-4-8",
+        ] {
+            assert!(rejects_temperature(id), "{id} must reject sampling params");
+        }
     }
 
     #[test]
