@@ -829,11 +829,32 @@ pub fn build_target_url(base_url: &str, path: &str) -> String {
     }
 
     let trimmed = &stripped_path[overlap_end..];
+    let trimmed = if overlap_end == 0 {
+        strip_superseded_version_segment(base, trimmed)
+    } else {
+        trimmed
+    };
     if trimmed.is_empty() {
         base.to_string()
     } else {
         format!("{}/{}", base, trimmed)
     }
+}
+
+/// Drops the path's leading version segment when the base already ends with
+/// one (zhipu `/paas/v4` + `/v1/chat/completions` must not glue to `/v4/v1/…`).
+fn strip_superseded_version_segment<'a>(base: &str, path: &'a str) -> &'a str {
+    let base_last = base.rsplit('/').next().unwrap_or("");
+    if !is_version_segment(base_last) {
+        return path;
+    }
+    let (head, rest) = path.split_once('/').unwrap_or((path, ""));
+    if is_version_segment(head) { rest } else { path }
+}
+
+/// `v<digits>` only — `v1beta` is a distinct namespace, not a version.
+fn is_version_segment(seg: &str) -> bool {
+    seg.len() > 1 && seg.starts_with('v') && seg[1..].bytes().all(|b| b.is_ascii_digit())
 }
 
 /// True iff `base` ends with `/<seg>` on a segment boundary (i.e. preceded by
@@ -1643,6 +1664,63 @@ mod tests {
         assert_eq!(
             build_target_url("https://api.example.com/foo", "/v1/messages"),
             "https://api.example.com/foo/v1/messages"
+        );
+    }
+
+    #[test]
+    fn test_build_target_url_versioned_base_drops_v1_prefix() {
+        assert_eq!(
+            build_target_url(
+                "https://open.bigmodel.cn/api/paas/v4",
+                "/v1/chat/completions"
+            ),
+            "https://open.bigmodel.cn/api/paas/v4/chat/completions"
+        );
+        assert_eq!(
+            build_target_url(
+                "https://api.lkeap.cloud.tencent.com/coding/v3",
+                "/v1/models"
+            ),
+            "https://api.lkeap.cloud.tencent.com/coding/v3/models"
+        );
+        assert_eq!(
+            build_target_url("https://api.z.ai/api/coding/paas/v4/", "/v1/messages"),
+            "https://api.z.ai/api/coding/paas/v4/messages"
+        );
+    }
+
+    #[test]
+    fn test_build_target_url_base_version_supersedes_path_version() {
+        assert_eq!(
+            build_target_url("https://api.example.com/v4", "/v2/embeddings"),
+            "https://api.example.com/v4/embeddings"
+        );
+    }
+
+    #[test]
+    fn test_build_target_url_versioned_base_keeps_non_v1_paths() {
+        assert_eq!(
+            build_target_url("https://api.example.com/v2", "/chat/completions"),
+            "https://api.example.com/v2/chat/completions"
+        );
+    }
+
+    #[test]
+    fn test_build_target_url_v1beta_base_is_not_versioned() {
+        assert_eq!(
+            build_target_url(
+                "https://generativelanguage.googleapis.com/v1beta",
+                "/v1/chat/completions"
+            ),
+            "https://generativelanguage.googleapis.com/v1beta/v1/chat/completions"
+        );
+    }
+
+    #[test]
+    fn test_build_target_url_versioned_host_label_is_not_versioned() {
+        assert_eq!(
+            build_target_url("https://v2.example.com", "/v1/messages"),
+            "https://v2.example.com/v1/messages"
         );
     }
 
