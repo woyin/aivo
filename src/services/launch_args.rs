@@ -163,6 +163,18 @@ pub(crate) fn build_preview_notes(
         &["AIVO_USE_PI_COPILOT_ROUTER"],
         "starts a Copilot-backed Pi router on a random local port",
     );
+    maybe_push_router_note(
+        &mut notes,
+        env,
+        &["AIVO_USE_GROK_ROUTER"],
+        "starts a universal serve router (any upstream → OpenAI chat) on a random local port",
+    );
+    maybe_push_router_note(
+        &mut notes,
+        env,
+        &["AIVO_GROK_MANAGE_HOME"],
+        "prepares the managed grok home (sessions, folder trust, model limits pin)",
+    );
 
     let raw_model_upstream =
         uses_responses_to_chat_router(env) || env.contains_key("OPENAI_BASE_URL");

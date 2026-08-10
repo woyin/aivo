@@ -140,6 +140,7 @@ async fn recent_session_entries(
             )
             .await
         }
+        AIToolType::Grok => grok_entries(cwd, cutoff).await,
     }
 }
 
@@ -315,6 +316,38 @@ async fn pi_entries(
                 .and_then(|stem| stem.split_once('_').map(|(_, id)| id.to_string()))
         })
         .await;
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------
+// Grok — dir layout documented on the grok section of context_ingest; id is
+// the uuid session-dir name
+// ---------------------------------------------------------------------------
+
+async fn grok_entries(cwd: Option<&str>, cutoff: SystemTime) -> Vec<(SystemTime, String)> {
+    use crate::services::grok_home;
+    // `cwd` arrives canonicalized (snapshot's contract), matching how grok
+    // records it (macOS: /tmp → /private/tmp).
+    let encoded = cwd.map(grok_home::encode_cwd_dir);
+    let mut out = Vec::new();
+    for root in grok_home::session_roots_from_system() {
+        let cwd_dirs: Vec<PathBuf> = match &encoded {
+            Some(enc) => vec![root.join(enc)],
+            None => collect_subdirs(&root).await,
+        };
+        for dir in cwd_dirs {
+            for session in collect_subdirs(&dir).await {
+                let Some(id) = session.file_name().and_then(|s| s.to_str()) else {
+                    continue;
+                };
+                if let Some(mtime) =
+                    file_mtime_within(&session.join("chat_history.jsonl"), cutoff).await
+                {
+                    out.push((mtime, id.to_string()));
+                }
+            }
+        }
     }
     out
 }

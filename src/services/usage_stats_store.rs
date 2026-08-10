@@ -40,6 +40,20 @@ impl RunTokenTally {
             self.cache_creation.load(Ordering::Relaxed),
         )
     }
+
+    /// Snapshot shaped for a finished `tool_launch` row:
+    /// `[input, output, cache_read, cache_creation]`, zeros as `None` so a
+    /// tally-less run leaves the columns null.
+    pub(crate) fn finished_row_tokens(&self) -> [Option<i64>; 4] {
+        let (prompt, completion, cache_read, cache_creation) = self.snapshot();
+        let positive = |v: u64| (v > 0).then_some(v as i64);
+        [
+            positive(prompt),
+            positive(completion),
+            positive(cache_read),
+            positive(cache_creation),
+        ]
+    }
 }
 
 #[derive(Debug, Clone)]

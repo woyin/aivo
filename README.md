@@ -1,6 +1,6 @@
 [![aivo](https://getaivo.dev/banner.webp)](https://getaivo.dev)
 
-Aivo `/ˈeɪ.voʊ/` lets you use Claude Code, Codex, Gemini, OpenCode, Pi, and other coding agents with the model and provider you choose. It also includes Aivo Code, a built-in terminal coding agent.
+Aivo `/ˈeɪ.voʊ/` lets you use Claude Code, Codex, Gemini, OpenCode, Pi, Grok, and other coding agents with the model and provider you choose. It also includes Aivo Code, a built-in terminal coding agent.
 
 ![CI](https://github.com/yuanchuan/aivo/actions/workflows/ci.yml/badge.svg)
 ![Release](https://img.shields.io/github/v/tag/yuanchuan/aivo?label=release&color=brightgreen)
@@ -63,6 +63,7 @@ aivo codex
 aivo gemini
 aivo opencode
 aivo pi
+aivo grok
 ```
 
 ## Aivo Code

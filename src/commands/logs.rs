@@ -1626,7 +1626,8 @@ impl SourcePlan {
             // event view ask for `--by run` explicitly. Strict-logs callers
             // (errors/key/model) bypass this and get the logs.db rows for
             // that tool.
-            Some("claude") | Some("codex") | Some("gemini") | Some("opencode") | Some("pi") => {
+            Some("claude") | Some("codex") | Some("gemini") | Some("opencode") | Some("pi")
+            | Some("grok") => {
                 logs = strict_logs;
                 logs_by = if strict_logs { args.by.clone() } else { None };
                 native = !strict_logs;
@@ -1698,7 +1699,7 @@ fn native_passes_filters(t: &Thread, args: &LogsArgs, cwd_filter: Option<&str>) 
         let by = by.to_ascii_lowercase();
         match by.as_str() {
             "native" => {} // accepts every native cli
-            "claude" | "codex" | "gemini" | "opencode" | "pi" => {
+            "claude" | "codex" | "gemini" | "opencode" | "pi" | "grok" => {
                 if t.cli != by {
                     return false;
                 }
@@ -2325,6 +2326,7 @@ mod tests {
             gemini_tmp_root: temp.path().join("gemini"),
             pi_sessions_root: temp.path().join("pi"),
             opencode_db_path: temp.path().join("opencode.db"),
+            grok_session_roots: vec![temp.path().join("grok-sessions")],
             plugin_transcripts: std::collections::HashMap::new(),
         };
         let mut entry = test_entry("c1", "2026-05-24T09:00:00Z", "chat");

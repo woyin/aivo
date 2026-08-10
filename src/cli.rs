@@ -41,7 +41,7 @@ pub struct Cli {
 #[derive(Subcommand, Debug, Clone)]
 #[allow(clippy::large_enum_variant)]
 pub enum Commands {
-    /// Run AI tools (claude, codex, codex-app, gemini, opencode, pi) - all args passed through
+    /// Run AI tools (claude, codex, codex-app, gemini, opencode, pi, grok) - all args passed through
     Run(RunArgs),
 
     /// Manage API keys (use <id|name>, rm <id|name>, add, cat, edit)
@@ -182,7 +182,7 @@ pub struct AccountUsageArgs {
 /// Arguments for `aivo logs share` (and the hidden top-level `aivo share` alias).
 #[derive(Args, Debug, Clone)]
 pub struct ShareArgs {
-    /// Session id from `aivo logs` (claude / codex / gemini / pi / opencode / code).
+    /// Session id from `aivo logs` (claude / codex / gemini / pi / opencode / grok / code).
     #[arg(value_name = "SESSION_ID")]
     pub session_id: Option<String>,
 
@@ -584,10 +584,10 @@ pub struct KeysArgs {
 /// Arguments for the run command
 #[derive(Args, Debug, Clone)]
 pub struct RunArgs {
-    /// The AI tool to run (claude, codex, codex-app, gemini, opencode, pi)
+    /// The AI tool to run (claude, codex, codex-app, gemini, opencode, pi, grok)
     #[arg(
         value_name = "TOOL",
-        help = "AI tool to run: claude, codex, codex-app, gemini, opencode, or pi"
+        help = "AI tool to run: claude, codex, codex-app, gemini, opencode, pi, or grok"
     )]
     pub tool: Option<String>,
 
@@ -794,7 +794,7 @@ pub struct ServeArgs {
 /// Arguments for the stats command
 #[derive(Args, Debug, Clone)]
 pub struct StatsArgs {
-    /// Filter to one tool: claude, codex, gemini, opencode, pi, code, or an
+    /// Filter to one tool: claude, codex, gemini, opencode, pi, grok, code, or an
     /// installed coding-agent plugin (e.g. omp). Mirrors `aivo logs --by`.
     #[arg(long, value_name = "NAME", value_parser = non_empty())]
     pub by: Option<String>,
@@ -1346,7 +1346,15 @@ mod tests {
 
     /// Helper to simulate the alias rewriting done in main.rs
     fn rewrite_alias(args: &[&str]) -> Vec<String> {
-        let aliases = ["claude", "codex", "codex-app", "gemini", "opencode", "pi"];
+        let aliases = [
+            "claude",
+            "codex",
+            "codex-app",
+            "gemini",
+            "opencode",
+            "pi",
+            "grok",
+        ];
         let raw: Vec<String> = args.iter().map(|s| s.to_string()).collect();
         if raw.len() > 1 && aliases.contains(&raw[1].as_str()) {
             let mut rewritten = vec![raw[0].clone(), "run".to_string()];
@@ -1987,6 +1995,15 @@ mod tests {
         let cli = Cli::try_parse_from(&args).unwrap();
         assert!(
             matches!(cli.command, Some(Commands::Run(ref a)) if a.tool == Some("pi".to_string()))
+        );
+    }
+
+    #[test]
+    fn test_tool_alias_grok() {
+        let args = rewrite_alias(&["aivo", "grok"]);
+        let cli = Cli::try_parse_from(&args).unwrap();
+        assert!(
+            matches!(cli.command, Some(Commands::Run(ref a)) if a.tool == Some("grok".to_string()))
         );
     }
 

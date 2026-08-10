@@ -29,7 +29,15 @@ pub const AIVO_WEBSITE_BASE_URL: &str = "https://getaivo.dev";
 /// first token of a Bundle alias's launch line (e.g. `aivo alias quick claude
 /// --key work`). Also doubles as the top-level shortcut list (`aivo claude
 /// ...` → `aivo run claude ...`).
-pub const KNOWN_TOOLS: &[&str] = &["claude", "codex", "codex-app", "gemini", "opencode", "pi"];
+pub const KNOWN_TOOLS: &[&str] = &[
+    "claude",
+    "codex",
+    "codex-app",
+    "gemini",
+    "opencode",
+    "pi",
+    "grok",
+];
 
 /// Names a user must not register as an alias because they collide with
 /// built-in commands or shortcuts and would shadow `aivo <name>` / `aivo run
@@ -75,4 +83,5 @@ pub const RESERVED_ALIAS_NAMES: &[&str] = &[
     "gemini",
     "opencode",
     "pi",
+    "grok",
 ];

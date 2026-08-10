@@ -28,7 +28,8 @@ pub fn render_single_session(tool: AIToolType, thread: &Thread) -> RenderedConte
         | AIToolType::CodexApp
         | AIToolType::Gemini
         | AIToolType::Opencode
-        | AIToolType::Pi => format_markdown_single(thread),
+        | AIToolType::Pi
+        | AIToolType::Grok => format_markdown_single(thread),
     };
     let tokens = estimate_tokens(&text);
     RenderedContext { text, tokens }

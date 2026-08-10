@@ -3,6 +3,7 @@
 //! Gemini (`~/.gemini/tmp/`), Pi (`~/.pi/agent/sessions/`), OpenCode (`~/.local/share/opencode/opencode.db`).
 
 use std::borrow::Cow;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
@@ -161,7 +162,7 @@ async fn ingest_project_inner(
     // the post-extraction age filter below still applies either way).
     let walk_cutoff = effective_cutoff(&opts).map(SystemTime::from);
 
-    let (claude, codex, gemini, pi, opencode, code) = tokio::join!(
+    let (claude, codex, gemini, pi, grok, opencode, code) = tokio::join!(
         ingest_claude(&canonical_root, opts, walk_cutoff),
         ingest_codex(&canonical_str, opts, walk_cutoff),
         async {
@@ -172,6 +173,7 @@ async fn ingest_project_inner(
             }
         },
         ingest_pi(&canonical_str, opts, walk_cutoff),
+        ingest_grok(&canonical_str, opts, walk_cutoff),
         async {
             match opts.headline {
                 // Nor for opencode's sqlite rows.
@@ -188,12 +190,19 @@ async fn ingest_project_inner(
     );
 
     let mut threads: Vec<Thread> = Vec::with_capacity(
-        claude.len() + codex.len() + gemini.len() + pi.len() + opencode.len() + code.len(),
+        claude.len()
+            + codex.len()
+            + gemini.len()
+            + pi.len()
+            + grok.len()
+            + opencode.len()
+            + code.len(),
     );
     threads.extend(claude);
     threads.extend(codex);
     threads.extend(gemini);
     threads.extend(pi);
+    threads.extend(grok);
     threads.extend(opencode);
     threads.extend(code);
 
@@ -214,20 +223,23 @@ pub async fn ingest_native_sessions_global(
     let headline = !need_last_response;
     let cutoff = effective_cutoff(&opts);
     let cutoff_st = cutoff.map(SystemTime::from);
-    let (claude, codex, gemini, pi, opencode) = tokio::join!(
+    let (claude, codex, gemini, pi, grok, opencode) = tokio::join!(
         ingest_claude_global(cap, cutoff_st, headline),
         ingest_codex_global(cap, cutoff_st, headline),
         ingest_gemini_global(cap, cutoff_st),
         ingest_pi_global(cap, cutoff_st, headline),
+        ingest_grok_global(cap, cutoff_st, headline),
         ingest_opencode_global(cap, cutoff),
     );
 
-    let mut threads: Vec<Thread> =
-        Vec::with_capacity(claude.len() + codex.len() + gemini.len() + pi.len() + opencode.len());
+    let mut threads: Vec<Thread> = Vec::with_capacity(
+        claude.len() + codex.len() + gemini.len() + pi.len() + grok.len() + opencode.len(),
+    );
     threads.extend(claude);
     threads.extend(codex);
     threads.extend(gemini);
     threads.extend(pi);
+    threads.extend(grok);
     threads.extend(opencode);
 
     // Re-check thread updated_at (mtime may lag behind last message ts).
@@ -1551,6 +1563,457 @@ pub(crate) fn extract_pi_text(message: &Value) -> Option<String> {
         }
     }
     if buf.is_empty() { None } else { Some(buf) }
+}
+
+// ---------------------------------------------------------------------------
+// Grok: <sessions root>/<encodeURIComponent(cwd)>/<uuid>/{summary.json,
+// chat_history.jsonl}. Chat lines carry no timestamps — times come from
+// summary.json.
+// ---------------------------------------------------------------------------
+
+pub(crate) struct GrokSummary {
+    pub(crate) session_id: String,
+    pub(crate) cwd: Option<String>,
+    pub(crate) created_at: Option<DateTime<Utc>>,
+    pub(crate) updated_at: Option<DateTime<Utc>>,
+}
+
+/// Best-effort summary.json read; the session id falls back to the dir name.
+pub(crate) async fn read_grok_summary(session_dir: &Path) -> GrokSummary {
+    let parse_ts = |v: Option<&Value>| {
+        v.and_then(Value::as_str)
+            .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+            .map(|d| d.with_timezone(&Utc))
+    };
+    let v: Value = fs::read_to_string(session_dir.join("summary.json"))
+        .await
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or(Value::Null);
+    let dir_id = session_dir
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or_default()
+        .to_string();
+    let info = v.get("info");
+    GrokSummary {
+        session_id: info
+            .and_then(|i| i.get("id"))
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .unwrap_or(dir_id),
+        cwd: info
+            .and_then(|i| i.get("cwd"))
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        created_at: parse_ts(v.get("created_at")),
+        updated_at: parse_ts(v.get("updated_at"))
+            .or_else(|| parse_ts(v.get("last_active_at")))
+            .or_else(|| parse_ts(v.get("created_at"))),
+    }
+}
+
+/// Unwraps grok's `<user_query>…</user_query>` envelope around real prompts.
+/// Text without the envelope passes through unchanged; an empty inner is None.
+pub(crate) fn grok_unwrap_user_query(text: &str) -> Option<String> {
+    let t = text.trim();
+    let inner = t
+        .strip_prefix("<user_query>")
+        .and_then(|rest| rest.strip_suffix("</user_query>"))
+        .map(str::trim)
+        .unwrap_or(t);
+    (!inner.is_empty()).then(|| inner.to_string())
+}
+
+/// grok env-context envelopes it injects as their own user turns; a turn made
+/// only of these carries no user content. Tag names compare case-insensitively
+/// with `-`/`_` folded (`<system-reminder>` vs `<user_info>` spellings both
+/// occur).
+const GROK_ENV_CONTEXT_TAGS: &[&str] = &[
+    "user_info",
+    "system_reminder",
+    "environment_info",
+    "project_layout",
+    "project_info",
+    "git_status",
+    "workspace_info",
+    "directory_structure",
+];
+
+/// True when the whole text is a run of env-context envelopes (grok >=0.2.9x
+/// bundles several sections into one user turn).
+pub(crate) fn grok_is_pure_env_context(text: &str) -> bool {
+    // ASCII-lowercase keeps byte offsets valid; the tags are ASCII.
+    let lowered = text.trim().to_ascii_lowercase();
+    let mut rest = lowered.as_str();
+    let mut consumed_any = false;
+    while !rest.is_empty() {
+        let Some(tag_end) = rest.strip_prefix('<').and_then(|r| r.find('>')) else {
+            return false;
+        };
+        let tag = &rest[1..1 + tag_end];
+        if !GROK_ENV_CONTEXT_TAGS.contains(&tag.replace('-', "_").as_str()) {
+            return false;
+        }
+        // Either `-`/`_` spelling may close the envelope; take the earlier.
+        let after_open = &rest[tag_end + 2..];
+        let close = format!("</{tag}>");
+        let close_alt = format!("</{}>", swap_dash_underscore(tag));
+        let hit = [close, close_alt]
+            .into_iter()
+            .filter_map(|c| after_open.find(&c).map(|pos| (pos, c.len())))
+            .min();
+        let Some((pos, len)) = hit else {
+            return false;
+        };
+        rest = after_open[pos + len..].trim_start();
+        consumed_any = true;
+    }
+    consumed_any
+}
+
+fn swap_dash_underscore(tag: &str) -> String {
+    tag.chars()
+        .map(|c| match c {
+            '-' => '_',
+            '_' => '-',
+            other => other,
+        })
+        .collect()
+}
+
+/// Message text: a plain string, or text blocks of a block array joined.
+pub(crate) fn grok_text_content(v: &Value) -> String {
+    match v.get("content") {
+        Some(Value::String(s)) => s.clone(),
+        // Same block shape as pi's content arrays.
+        Some(Value::Array(_)) => extract_pi_text(v).unwrap_or_default(),
+        _ => String::new(),
+    }
+}
+
+/// Per-message times for grok >=1.0 sessions, from `updates.jsonl` (absent on
+/// older sessions → every anchor misses). chat_history.jsonl lines carry no
+/// times but join to this stream: prompts by index, calls/results by tool-call
+/// id, plain assistant messages by chunk order.
+pub(crate) enum GrokUpdateEvent {
+    UserPrompt(Option<u64>),
+    AgentChunk,
+    ToolCall(String),
+    ToolUpdate(String),
+}
+
+pub(crate) struct GrokUpdatesTimeline {
+    events: Vec<(DateTime<Utc>, GrokUpdateEvent)>,
+    /// Last update per id: parallel calls interleave, a forward scan would
+    /// misfile their results.
+    last_update: HashMap<String, (usize, DateTime<Utc>)>,
+    cursor: usize,
+}
+
+impl GrokUpdatesTimeline {
+    pub(crate) async fn load(session_dir: &Path) -> Self {
+        let text = fs::read_to_string(session_dir.join("updates.jsonl"))
+            .await
+            .unwrap_or_default();
+        let mut events: Vec<(DateTime<Utc>, GrokUpdateEvent)> = Vec::new();
+        let mut seen_prompts = HashSet::new();
+        for line in text.lines() {
+            let Ok(v) = serde_json::from_str::<Value>(line) else {
+                continue;
+            };
+            let Some(ts) = v
+                .get("timestamp")
+                .and_then(Value::as_i64)
+                .and_then(|s| DateTime::<Utc>::from_timestamp(s, 0))
+            else {
+                continue;
+            };
+            let Some(update) = v.pointer("/params/update") else {
+                continue;
+            };
+            let tool_id = || {
+                update
+                    .get("toolCallId")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            };
+            let event = match update.get("sessionUpdate").and_then(Value::as_str) {
+                Some("user_message_chunk") => {
+                    // One event per prompt, not per streamed chunk.
+                    let idx = update.pointer("/_meta/promptIndex").and_then(Value::as_u64);
+                    let new_prompt = match idx {
+                        Some(i) => seen_prompts.insert(i),
+                        None => {
+                            !matches!(events.last(), Some((_, GrokUpdateEvent::UserPrompt(None))))
+                        }
+                    };
+                    if !new_prompt {
+                        continue;
+                    }
+                    GrokUpdateEvent::UserPrompt(idx)
+                }
+                Some("agent_message_chunk") => GrokUpdateEvent::AgentChunk,
+                Some("tool_call") => match tool_id() {
+                    Some(id) => GrokUpdateEvent::ToolCall(id),
+                    None => continue,
+                },
+                Some("tool_call_update") => match tool_id() {
+                    Some(id) => GrokUpdateEvent::ToolUpdate(id),
+                    None => continue,
+                },
+                _ => continue,
+            };
+            events.push((ts, event));
+        }
+        let mut last_update = HashMap::new();
+        for (i, (ts, e)) in events.iter().enumerate() {
+            if let GrokUpdateEvent::ToolUpdate(id) = e {
+                last_update.insert(id.clone(), (i, *ts));
+            }
+        }
+        Self {
+            events,
+            last_update,
+            cursor: 0,
+        }
+    }
+
+    fn seek(&mut self, wanted: impl Fn(&GrokUpdateEvent) -> bool) -> Option<DateTime<Utc>> {
+        let (idx, ts) = self
+            .events
+            .iter()
+            .enumerate()
+            .skip(self.cursor)
+            .find_map(|(i, (ts, e))| wanted(e).then_some((i, *ts)))?;
+        self.cursor = idx + 1;
+        Some(ts)
+    }
+
+    pub(crate) fn user_prompt(&mut self, index: Option<u64>) -> Option<DateTime<Utc>> {
+        self.seek(
+            |e| matches!(e, GrokUpdateEvent::UserPrompt(i) if index.is_none() || i.is_none() || *i == index),
+        )
+    }
+
+    pub(crate) fn tool_call(&mut self, id: &str) -> Option<DateTime<Utc>> {
+        self.seek(|e| matches!(e, GrokUpdateEvent::ToolCall(i) if i == id))
+    }
+
+    pub(crate) fn tool_result(&mut self, id: &str) -> Option<DateTime<Utc>> {
+        let (idx, ts) = *self.last_update.get(id)?;
+        self.cursor = self.cursor.max(idx + 1);
+        Some(ts)
+    }
+
+    /// First chunk of the next assistant run; the rest of the run is consumed
+    /// so a following text message anchors to a later run.
+    pub(crate) fn agent_message(&mut self) -> Option<DateTime<Utc>> {
+        let ts = self.seek(|e| matches!(e, GrokUpdateEvent::AgentChunk))?;
+        while matches!(
+            self.events.get(self.cursor),
+            Some((_, GrokUpdateEvent::AgentChunk))
+        ) {
+            self.cursor += 1;
+        }
+        Some(ts)
+    }
+}
+
+async fn extract_grok_thread(session_dir: &Path, headline: bool) -> Option<Thread> {
+    let history = session_dir.join("chat_history.jsonl");
+    let file = match fs::File::open(&history).await {
+        Ok(f) => f,
+        Err(err) => {
+            warn_unreadable_session(&history, &err.to_string());
+            return None;
+        }
+    };
+    let summary = read_grok_summary(session_dir).await;
+    let mut lines = BufReader::new(file).lines();
+    let mut first_user: Option<String> = None;
+    let mut last_assistant: Option<String> = None;
+    while let Ok(Some(line)) = lines.next_line().await {
+        if line.is_empty() {
+            continue;
+        }
+        let v: Value = match serde_json::from_str(&line) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        match v.get("type").and_then(Value::as_str) {
+            Some("user") if v.get("synthetic_reason").is_none() => {
+                if first_user.is_none() {
+                    let raw = grok_text_content(&v);
+                    if !grok_is_pure_env_context(&raw)
+                        && let Some(q) = grok_unwrap_user_query(&raw)
+                    {
+                        first_user = pick_first_user_turn(&q);
+                    }
+                }
+            }
+            Some("assistant") => {
+                if headline {
+                    continue;
+                }
+                if let Some(t) = sanitize_turn(&grok_text_content(&v)) {
+                    last_assistant = Some(t);
+                }
+            }
+            _ => {}
+        }
+        if headline && first_user.is_some() {
+            break;
+        }
+    }
+    let updated_at = match summary.updated_at {
+        Some(ts) => ts,
+        None => DateTime::<Utc>::from(file_mtime(&history).await),
+    };
+    Some(Thread {
+        cli: "grok".into(),
+        session_id: summary.session_id,
+        source_path: session_dir.to_string_lossy().to_string(),
+        topic: first_user?,
+        last_response: last_assistant.unwrap_or_default(),
+        updated_at,
+        cwd: summary.cwd,
+    })
+}
+
+/// Session dirs (each containing chat_history.jsonl) under a cwd-encoded dir,
+/// newest first by history mtime, filtered by `after`.
+async fn grok_session_dirs_newest_first(
+    cwd_dir: &Path,
+    after: Option<SystemTime>,
+) -> Vec<(PathBuf, SystemTime)> {
+    let mut out = Vec::new();
+    let Ok(mut rd) = fs::read_dir(cwd_dir).await else {
+        return out;
+    };
+    while let Ok(Some(entry)) = rd.next_entry().await {
+        let dir = entry.path();
+        // The metadata probe below also rejects non-dir entries.
+        let history = dir.join("chat_history.jsonl");
+        let Ok(meta) = fs::metadata(&history).await else {
+            continue;
+        };
+        let mtime = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+        if let Some(c) = after
+            && mtime < c
+        {
+            continue;
+        }
+        out.push((dir, mtime));
+    }
+    out.sort_by_key(|e| std::cmp::Reverse(e.1));
+    out
+}
+
+async fn ingest_grok(
+    canonical_root: &str,
+    opts: IngestOptions,
+    walk_cutoff: Option<SystemTime>,
+) -> Vec<Thread> {
+    ingest_grok_from_roots(
+        &crate::services::grok_home::session_roots_from_system(),
+        canonical_root,
+        opts.max_per_source,
+        walk_cutoff,
+        opts.headline,
+    )
+    .await
+}
+
+async fn ingest_grok_from_roots(
+    roots: &[PathBuf],
+    canonical_root: &str,
+    cap: Option<usize>,
+    walk_cutoff: Option<SystemTime>,
+    headline: bool,
+) -> Vec<Thread> {
+    let encoded = crate::services::grok_home::encode_cwd_dir(canonical_root);
+    // Collect across every root before capping, else a full `~/.grok` history
+    // crowds out today's managed-home sessions.
+    let mut all_dirs: Vec<(PathBuf, SystemTime)> = Vec::new();
+    for root in roots {
+        all_dirs.extend(grok_session_dirs_newest_first(&root.join(&encoded), walk_cutoff).await);
+    }
+    all_dirs.sort_by_key(|e| std::cmp::Reverse(e.1));
+    let mut out = Vec::new();
+    for (dir, _) in all_dirs {
+        if let Some(n) = cap
+            && out.len() >= n
+        {
+            break;
+        }
+        if let Some(thread) = extract_grok_thread(&dir, headline).await {
+            out.push(thread);
+        }
+    }
+    out
+}
+
+async fn ingest_grok_global(
+    cap: Option<usize>,
+    after: Option<SystemTime>,
+    headline: bool,
+) -> Vec<Thread> {
+    let mut all_dirs: Vec<(PathBuf, SystemTime)> = Vec::new();
+    for root in crate::services::grok_home::session_roots_from_system() {
+        let Ok(mut rd) = fs::read_dir(&root).await else {
+            continue;
+        };
+        while let Ok(Some(cwd_entry)) = rd.next_entry().await {
+            // Non-dir entries fail the inner read_dir harmlessly.
+            all_dirs.extend(grok_session_dirs_newest_first(&cwd_entry.path(), after).await);
+        }
+    }
+    all_dirs.sort_by_key(|e| std::cmp::Reverse(e.1));
+    let mut out = Vec::new();
+    for (dir, _) in all_dirs {
+        if let Some(n) = cap
+            && out.len() >= n
+        {
+            break;
+        }
+        if let Some(thread) = extract_grok_thread(&dir, headline).await {
+            out.push(thread);
+        }
+    }
+    out
+}
+
+/// Stub enumerator for the share resolver's run-event path: one `Thread` per
+/// grok session dir under the project's encoded cwd dir, keeping sessions
+/// with no extractable user turn that `extract_grok_thread` would drop —
+/// else a brand-new run resolves to a stale older session in the same cwd.
+/// `roots` is parameterized so tests can inject temp dirs.
+pub async fn list_grok_sessions_for_cwd(roots: &[PathBuf], project_root: &Path) -> Vec<Thread> {
+    let canonical_root =
+        std::fs::canonicalize(project_root).unwrap_or_else(|_| project_root.to_path_buf());
+    let encoded = crate::services::grok_home::encode_cwd_dir(&canonical_root.to_string_lossy());
+    let mut out = Vec::new();
+    for root in roots {
+        for (dir, mtime) in grok_session_dirs_newest_first(&root.join(&encoded), None).await {
+            // Dir name = session uuid, history mtime = last turn — no need to
+            // read N summary.json files (extract_grok_full re-reads anyway).
+            out.push(Thread {
+                cli: "grok".into(),
+                session_id: dir
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or_default()
+                    .to_string(),
+                source_path: dir.to_string_lossy().to_string(),
+                topic: String::new(),
+                last_response: String::new(),
+                updated_at: DateTime::<Utc>::from(mtime),
+                cwd: Some(canonical_root.to_string_lossy().to_string()),
+            });
+        }
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -3202,6 +3665,201 @@ mod tests {
             threads.is_empty(),
             "session in a different cwd must not appear; got {:?}",
             threads.iter().map(|t| &t.session_id).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn grok_user_query_and_env_context_normalization() {
+        assert_eq!(
+            grok_unwrap_user_query("<user_query>\nhello\n</user_query>").as_deref(),
+            Some("hello")
+        );
+        assert_eq!(
+            grok_unwrap_user_query("plain text").as_deref(),
+            Some("plain text")
+        );
+        assert!(grok_unwrap_user_query("<user_query>  </user_query>").is_none());
+
+        assert!(grok_is_pure_env_context("<user_info>os</user_info>"));
+        // Bundled multi-envelope turn, mixed -/_ spellings.
+        assert!(grok_is_pure_env_context(
+            "<user_info>os</user_info>\n<system-reminder>x</system-reminder><git_status>clean</git_status>"
+        ));
+        assert!(!grok_is_pure_env_context(
+            "<user_info>os</user_info> trailing prose"
+        ));
+        assert!(!grok_is_pure_env_context("just a prompt"));
+        assert!(!grok_is_pure_env_context(""));
+        // Tag matching is case-insensitive (the JS original lowercased).
+        assert!(grok_is_pure_env_context("<User_Info>os</User_Info>"));
+        // An alt-spelling close BEFORE the exact-spelling close must win —
+        // else the real prompt between two envelopes gets swallowed.
+        assert!(!grok_is_pure_env_context(
+            "<user_info>a</user-info>REAL PROMPT<user_info>b</user_info>"
+        ));
+    }
+
+    #[tokio::test]
+    async fn grok_updates_timeline_anchors_interleaved_parallel_calls() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let updates = [
+            r#"{"timestamp":10,"method":"session/update","params":{"update":{"sessionUpdate":"user_message_chunk","_meta":{"promptIndex":0}}}}"#,
+            r#"{"timestamp":11,"method":"session/update","params":{"update":{"sessionUpdate":"user_message_chunk","_meta":{"promptIndex":0}}}}"#,
+            r#"{"timestamp":12,"method":"session/update","params":{"update":{"sessionUpdate":"tool_call","toolCallId":"a"}}}"#,
+            r#"{"timestamp":12,"method":"session/update","params":{"update":{"sessionUpdate":"tool_call","toolCallId":"b"}}}"#,
+            r#"{"timestamp":13,"method":"session/update","params":{"update":{"sessionUpdate":"tool_call_update","toolCallId":"b"}}}"#,
+            r#"{"timestamp":14,"method":"session/update","params":{"update":{"sessionUpdate":"tool_call_update","toolCallId":"a"}}}"#,
+            r#"{"timestamp":15,"method":"session/update","params":{"update":{"sessionUpdate":"tool_call_update","toolCallId":"b"}}}"#,
+            r#"{"timestamp":16,"method":"session/update","params":{"update":{"sessionUpdate":"agent_message_chunk"}}}"#,
+        ];
+        std::fs::write(temp.path().join("updates.jsonl"), updates.join("\n")).unwrap();
+
+        let mut tl = GrokUpdatesTimeline::load(temp.path()).await;
+        let secs = |ts: Option<DateTime<Utc>>| ts.map(|t| t.timestamp());
+        assert_eq!(secs(tl.user_prompt(Some(0))), Some(10));
+        assert_eq!(secs(tl.tool_call("a")), Some(12));
+        assert_eq!(secs(tl.tool_result("a")), Some(14));
+        assert_eq!(secs(tl.tool_result("b")), Some(15), "last update per id");
+        assert_eq!(secs(tl.agent_message()), Some(16));
+        assert_eq!(tl.agent_message(), None, "stream exhausted");
+        assert_eq!(tl.tool_result("missing"), None);
+
+        let empty = tempfile::TempDir::new().unwrap();
+        let mut none = GrokUpdatesTimeline::load(empty.path()).await;
+        assert_eq!(none.user_prompt(Some(0)), None);
+    }
+
+    fn write_grok_session(root: &Path, cwd: &str, id: &str, updated_at: &str) {
+        let dir = root
+            .join(crate::services::grok_home::encode_cwd_dir(cwd))
+            .join(id);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("summary.json"),
+            serde_json::json!({
+                "info": {"id": id, "cwd": cwd},
+                "created_at": updated_at,
+                "updated_at": updated_at,
+            })
+            .to_string(),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("chat_history.jsonl"),
+            concat!(
+                r#"{"type":"user","content":[{"type":"text","text":"<user_query>do the thing</user_query>"}]}"#,
+                "\n",
+                r#"{"type":"assistant","content":"I fixed the login flow by correcting the token refresh order."}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn list_grok_sessions_for_cwd_includes_own_and_skips_other_cwds() {
+        let root = TempDir::new().unwrap();
+        let mine = TempDir::new().unwrap();
+        let theirs = TempDir::new().unwrap();
+        let mine_str = std::fs::canonicalize(mine.path())
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        let theirs_str = std::fs::canonicalize(theirs.path())
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        write_grok_session(root.path(), &mine_str, "uuid-mine", "2026-07-24T06:31:54Z");
+        write_grok_session(
+            root.path(),
+            &theirs_str,
+            "uuid-theirs",
+            "2026-07-24T06:31:54Z",
+        );
+
+        let roots = vec![root.path().to_path_buf()];
+        let threads = list_grok_sessions_for_cwd(&roots, mine.path()).await;
+        assert_eq!(
+            threads
+                .iter()
+                .map(|t| t.session_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["uuid-mine"]
+        );
+        assert_eq!(threads[0].cli, "grok");
+        assert_eq!(threads[0].cwd.as_deref(), Some(mine_str.as_str()));
+        // The stub reads no summary.json: recency comes from the history
+        // mtime (the fixture was just written).
+        let age = Utc::now() - threads[0].updated_at;
+        assert!(age.num_seconds().abs() < 60, "mtime-derived: {age}");
+    }
+
+    #[tokio::test]
+    async fn ingest_grok_cap_keeps_newest_across_roots() {
+        let old_root = TempDir::new().unwrap();
+        let new_root = TempDir::new().unwrap();
+        let proj = TempDir::new().unwrap();
+        let proj_str = std::fs::canonicalize(proj.path())
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        write_grok_session(
+            old_root.path(),
+            &proj_str,
+            "uuid-old",
+            "2026-07-01T00:00:00Z",
+        );
+        // The newer session lives in the LATER root; a per-root cap would
+        // return the old one and drop it.
+        write_grok_session(
+            new_root.path(),
+            &proj_str,
+            "uuid-new",
+            "2026-07-24T00:00:00Z",
+        );
+        let new_history = new_root
+            .path()
+            .join(crate::services::grok_home::encode_cwd_dir(&proj_str))
+            .join("uuid-new")
+            .join("chat_history.jsonl");
+        // Recency comes from the history mtime; bump the new session's.
+        let now = std::time::SystemTime::now();
+        let f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&new_history)
+            .unwrap();
+        f.set_modified(now + std::time::Duration::from_secs(5))
+            .unwrap();
+
+        let roots = vec![old_root.path().to_path_buf(), new_root.path().to_path_buf()];
+        let threads = ingest_grok_from_roots(&roots, &proj_str, Some(1), None, false).await;
+        assert_eq!(
+            threads
+                .iter()
+                .map(|t| t.session_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["uuid-new"]
+        );
+    }
+
+    #[tokio::test]
+    async fn ingest_grok_extracts_topic_and_response_from_fixture() {
+        let root = TempDir::new().unwrap();
+        let proj = TempDir::new().unwrap();
+        let proj_str = std::fs::canonicalize(proj.path())
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        write_grok_session(root.path(), &proj_str, "uuid-1", "2026-07-24T06:31:54Z");
+
+        let threads =
+            ingest_grok_from_roots(&[root.path().to_path_buf()], &proj_str, None, None, false)
+                .await;
+        assert_eq!(threads.len(), 1);
+        assert_eq!(threads[0].topic, "do the thing");
+        assert_eq!(
+            threads[0].last_response,
+            "I fixed the login flow by correcting the token refresh order."
         );
     }
 

@@ -395,13 +395,14 @@ pub(crate) async fn fetch_models_for_select(
 /// Determines whether the "(leave it to the tool)" default option should be
 /// shown in the model picker for the given tool type and model list.
 ///
-/// - Pi, Opencode: never (these tools require explicit model selection)
+/// - Pi, Opencode, Grok: never (these tools require explicit model selection;
+///   grok's built-in default model 400s on non-xAI keys)
 /// - Claude: only if the list contains Claude-family models
 /// - Codex: only if the list contains gpt- prefixed models
 /// - Gemini: only if the list contains Gemini-family models
 pub(crate) fn tool_supports_default_model(tool: AIToolType, models: &[String]) -> bool {
     match tool {
-        AIToolType::Pi | AIToolType::Opencode => false,
+        AIToolType::Pi | AIToolType::Opencode | AIToolType::Grok => false,
         AIToolType::Claude => models
             .iter()
             .any(|m| m.to_ascii_lowercase().contains("claude")),
@@ -635,6 +636,12 @@ mod tests {
     fn test_tool_supports_default_pi_always_false() {
         let models = vec!["claude-sonnet-4-6".into(), "gpt-4o".into()];
         assert!(!tool_supports_default_model(AIToolType::Pi, &models));
+    }
+
+    #[test]
+    fn test_tool_supports_default_grok_always_false() {
+        let models = vec!["grok-4".to_string()];
+        assert!(!tool_supports_default_model(AIToolType::Grok, &models));
     }
 
     #[test]

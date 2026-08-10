@@ -368,7 +368,7 @@ impl RunCommand {
             Some(t) => t,
             None => {
                 eprintln!(
-                    "{} Unknown tool '{}'. Valid tools: chat, claude, codex, codex-app, gemini, opencode, pi.",
+                    "{} Unknown tool '{}'. Valid tools: chat, claude, codex, codex-app, gemini, opencode, pi, grok.",
                     style::red("Error:"),
                     tool
                 );
@@ -376,6 +376,10 @@ impl RunCommand {
                 return Ok(ExitCode::UserError);
             }
         };
+
+        if ai_tool == AIToolType::Grok {
+            maybe_print_grok_plugin_deprecation();
+        }
 
         // OAuth keys carry serialized tokens only the matching native CLI can consume.
         let mut key_override = key_override;
@@ -555,6 +559,15 @@ impl RunCommand {
 
         let launch_model = resolve_model_placeholder(resolved_model);
 
+        // Friendlier front for the launcher's grok model guard.
+        if ai_tool == AIToolType::Grok && launch_model.is_none() && !dry_run {
+            eprintln!(
+                "{} grok needs a model. Pass `-m <id>`, or `-k <key>` to pick one interactively.",
+                style::red("Error:")
+            );
+            return Ok(ExitCode::UserError);
+        }
+
         // `--max-context` / `--1m` is a model-name suffix: Claude Code parses it
         // and adds the beta header. If no model resolved, flag silently no-ops.
         // Surface before Claude takes over and gate launch on Enter.
@@ -706,6 +719,7 @@ impl RunCommand {
             Some("gemini") => println!("{}", style::dim("Launch Gemini with a local API key.")),
             Some("opencode") => println!("{}", style::dim("Launch OpenCode with a local API key.")),
             Some("pi") => println!("{}", style::dim("Launch Pi with a local API key.")),
+            Some("grok") => println!("{}", style::dim("Launch Grok with a local API key.")),
             _ => {
                 println!(
                     "{}",
@@ -833,10 +847,13 @@ impl RunCommand {
         print_opt("-r, --refresh", "Bypass cache and fetch fresh model list");
         print_opt("--env <k=v>", "Inject environment variable");
         print_opt("--dry-run", "Print the resolved command without launching");
-        print_opt(
-            "--transparent",
-            "Bypass aivo's local router; the endpoint must speak the tool's native protocol",
-        );
+        // grok is always routed — no --transparent.
+        if tool != Some("grok") {
+            print_opt(
+                "--transparent",
+                "Bypass aivo's local router; the endpoint must speak the tool's native protocol",
+            );
+        }
 
         if generic {
             println!();
@@ -891,6 +908,16 @@ impl RunCommand {
                 println!("  {}", style::dim("aivo pi -k mykey"));
                 println!("  {}", style::dim("aivo pi --transparent -k openrouter"));
             }
+            Some("grok") => {
+                println!("  {}", style::dim("aivo grok -k mykey -m grok-4"));
+                println!("  {}", style::dim("aivo grok \"fix the login bug\""));
+                println!(
+                    "  {}",
+                    style::dim(
+                        "aivo grok --disable-web-search   (web search needs the Responses API; disable it on non-xAI keys)"
+                    )
+                );
+            }
             _ => {
                 println!("  {}", style::dim("aivo run claude"));
                 println!(
@@ -902,6 +929,21 @@ impl RunCommand {
             }
         }
     }
+}
+
+/// One-time notice: `grok` is reserved now, so the native tool unconditionally
+/// shadows an installed aivo-grok plugin.
+fn maybe_print_grok_plugin_deprecation() {
+    let marker = crate::services::paths::grok_plugin_notice(&crate::services::paths::config_dir());
+    if marker.exists() || crate::plugin::discover("grok").is_none() {
+        return;
+    }
+    eprintln!(
+        "  {} grok is now built into aivo; the installed aivo-grok plugin is no longer used.",
+        style::yellow("Note:")
+    );
+    eprintln!("  Remove it with `aivo plugins remove grok`.");
+    let _ = crate::services::atomic_write::atomic_write_secure_blocking(&marker, b"shown\n");
 }
 
 /// Prints the resolved per-tier routing to stderr before launch. `rows` =
@@ -1242,19 +1284,23 @@ async fn maybe_apply_resume(
 
     Some(match tool {
         AIToolType::Claude | AIToolType::Pi => inject_append_system_prompt(&rendered, args),
-        AIToolType::Codex | AIToolType::CodexApp => inject_codex(&rendered, args),
+        // grok takes the same interactive [PROMPT] positional as codex.
+        AIToolType::Codex | AIToolType::CodexApp | AIToolType::Grok => {
+            inject_codex(&rendered, args)
+        }
         AIToolType::Gemini => inject_via_flag(&rendered, args, "-i"),
         AIToolType::Opencode => inject_via_flag(&rendered, args, "--prompt"),
     })
 }
 
 /// Argv rewrite for a tool's native resume-by-id, when it has one: claude
-/// `--resume <id>`, codex `resume <id>` (subcommand, so it must lead), pi and
-/// opencode `--session <id>`. Gemini's `--resume` takes a list index, not a
-/// session id → no rung 1. Verified against each CLI's `--help` (2026-07).
+/// and grok `--resume <id>`, codex `resume <id>` (subcommand, so it must
+/// lead), pi and opencode `--session <id>`. Gemini's `--resume` takes a list
+/// index, not a session id → no rung 1. Verified against each CLI's `--help`
+/// (2026-07; grok 0.2.112 2026-08).
 fn native_resume_args(tool: AIToolType, session_id: &str, args: &[String]) -> Option<Vec<String>> {
     let lead: Vec<String> = match tool {
-        AIToolType::Claude => vec!["--resume".into(), session_id.into()],
+        AIToolType::Claude | AIToolType::Grok => vec!["--resume".into(), session_id.into()],
         AIToolType::Codex => vec!["resume".into(), session_id.into()],
         AIToolType::Pi | AIToolType::Opencode => vec!["--session".into(), session_id.into()],
         AIToolType::Gemini | AIToolType::CodexApp => return None,
@@ -1575,6 +1621,11 @@ mod tests {
             native_resume_args(AIToolType::Opencode, "s9", &[]).unwrap(),
             vec!["--session", "s9"],
         );
+        // grok: `--resume <id>` like claude (grok 0.2.112).
+        assert_eq!(
+            native_resume_args(AIToolType::Grok, "g-1", &[]).unwrap(),
+            vec!["--resume", "g-1"],
+        );
         // gemini resumes by list index, not id; codex-app has no hook.
         assert!(native_resume_args(AIToolType::Gemini, "x", &[]).is_none());
         assert!(native_resume_args(AIToolType::CodexApp, "x", &[]).is_none());
@@ -1890,6 +1941,7 @@ mod tests {
         assert!(AIToolType::parse("gemini").is_some());
         assert!(AIToolType::parse("opencode").is_some());
         assert!(AIToolType::parse("pi").is_some());
+        assert!(AIToolType::parse("grok").is_some());
     }
 
     #[test]
@@ -1902,21 +1954,22 @@ mod tests {
     #[test]
     fn test_ai_tool_type_display_names() {
         // Ensure all tools have valid string representations
-        let tools = ["claude", "codex", "codex-app", "gemini", "opencode", "pi"];
+        let tools = [
+            "claude",
+            "codex",
+            "codex-app",
+            "gemini",
+            "opencode",
+            "pi",
+            "grok",
+        ];
         for tool in &tools {
             let parsed = AIToolType::parse(tool).unwrap();
-            // Roundtrip: parsing should give a valid tool type
-            assert!(
-                matches!(
-                    parsed,
-                    AIToolType::Claude
-                        | AIToolType::Codex
-                        | AIToolType::CodexApp
-                        | AIToolType::Gemini
-                        | AIToolType::Opencode
-                        | AIToolType::Pi
-                ),
-                "Tool {} should parse to a valid AIToolType",
+            // Roundtrip: parsing should give back the same name.
+            assert_eq!(
+                parsed.as_str(),
+                *tool,
+                "Tool {} should round-trip through AIToolType",
                 tool
             );
         }

@@ -49,6 +49,7 @@ pub mod fake_model;
 pub mod gemini_oauth;
 pub mod gemini_router;
 pub mod global_stats;
+pub mod grok_home;
 pub mod grok_oauth;
 pub mod http_debug;
 pub mod http_utils;

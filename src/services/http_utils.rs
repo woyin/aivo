@@ -970,6 +970,18 @@ pub fn router_http_client() -> reqwest::Client {
     router_http_client_with_timeout(300)
 }
 
+/// The HTTP proxy env vars (both casings) that child processes honor. Callers
+/// clear or unset these when the child must talk to an aivo loopback and its
+/// HTTP stack ignores `NO_PROXY` (Node grok client, gemini's undici agent).
+pub(crate) const PROXY_ENV_VARS: &[&str; 6] = &[
+    "HTTP_PROXY",
+    "http_proxy",
+    "HTTPS_PROXY",
+    "https_proxy",
+    "ALL_PROXY",
+    "all_proxy",
+];
+
 /// Like [`router_http_client`] but never routes through an env proxy — for the
 /// in-process loopback serve (`127.0.0.1`), which an `http_proxy`/`ALL_PROXY` set
 /// for external traffic can't reach (the request would hang).

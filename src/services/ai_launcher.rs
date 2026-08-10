@@ -59,6 +59,7 @@ pub enum AIToolType {
     Gemini,
     Opencode,
     Pi,
+    Grok,
 }
 
 impl AIToolType {
@@ -71,6 +72,7 @@ impl AIToolType {
             "gemini" => Some(Self::Gemini),
             "opencode" => Some(Self::Opencode),
             "pi" => Some(Self::Pi),
+            "grok" => Some(Self::Grok),
             _ => None,
         }
     }
@@ -83,6 +85,7 @@ impl AIToolType {
             Self::Gemini => "gemini",
             Self::Opencode => "opencode",
             Self::Pi => "pi",
+            Self::Grok => "grok",
         }
     }
 
@@ -103,6 +106,7 @@ impl AIToolType {
             Self::Gemini => "Google's official Gemini CLI.",
             Self::Opencode => "An open-source coding agent.",
             Self::Pi => "A terminal coding agent from the pi-mono toolkit.",
+            Self::Grok => "xAI's official terminal coding agent.",
         }
     }
 
@@ -141,6 +145,7 @@ impl AIToolType {
             Self::Gemini,
             Self::Opencode,
             Self::Pi,
+            Self::Grok,
         ]
     }
 
@@ -166,6 +171,7 @@ impl AIToolType {
             Self::Gemini => "npm install -g @google/gemini-cli",
             Self::Opencode => "curl -fsSL https://opencode.ai/install | bash",
             Self::Pi => "npm install -g @earendil-works/pi-coding-agent",
+            Self::Grok => "curl -fsSL https://x.ai/cli/install.sh | bash",
         }
         #[cfg(not(unix))]
         match self {
@@ -174,6 +180,7 @@ impl AIToolType {
             Self::Gemini => "npm install -g @google/gemini-cli",
             Self::Opencode => "npm install -g opencode-ai",
             Self::Pi => "npm install -g @earendil-works/pi-coding-agent",
+            Self::Grok => "see https://x.ai/cli for the Windows installer",
         }
     }
 
@@ -195,6 +202,7 @@ impl AIToolType {
             match self {
                 Self::Claude => dirs.push(home.join(".claude").join("local")),
                 Self::Opencode => dirs.push(home.join(".opencode").join("bin")),
+                Self::Grok => dirs.push(home.join(".grok").join("bin")),
                 _ => {}
             }
             #[cfg(windows)]
@@ -711,6 +719,13 @@ impl AILauncher {
 
         let exit_code = result.as_ref().ok().copied();
         let detected_session_id = probe.detect_new().await;
+        // Stamp the grok router's per-run token tally onto the row (see
+        // LaunchRuntimeState::run_tally).
+        let [input_tokens, output_tokens, cache_read, cache_creation] = runtime
+            .run_tally
+            .as_ref()
+            .map(|t| t.finished_row_tokens())
+            .unwrap_or_default();
         let _ = self
             .session_store
             .logs()
@@ -719,6 +734,10 @@ impl AILauncher {
                 exit_code: exit_code.map(i64::from),
                 duration_ms: Some(started_at.elapsed().as_millis() as i64),
                 session_id: detected_session_id,
+                input_tokens,
+                output_tokens,
+                cache_read_input_tokens: cache_read,
+                cache_creation_input_tokens: cache_creation,
                 payload_json: Some(serde_json::json!({
                     "command": resolved.tool_config.command,
                     "args": runtime_args.args,
@@ -904,6 +923,18 @@ impl AILauncher {
         } else {
             model
         };
+        // Every launch frontend funnels through here — the one place to
+        // enforce grok's model requirement (its built-in default 400s on
+        // non-xAI keys). Dry-run (`!persist`) still previews without one.
+        if options.tool == AIToolType::Grok && model.is_none() && persist {
+            return Err(CLIError::new(
+                "grok needs a model.",
+                ErrorCategory::User,
+                None::<String>,
+                Some("Pass `-m <id>`, or `-k <key>` to pick one interactively."),
+            )
+            .into());
+        }
         // Pi's /model picker only lists what's in its models.json; fetch the
         // provider catalog so it shows the whole list, not just the pinned
         // model. Soft-fails to empty (build_pi_models_json then writes the
@@ -927,7 +958,7 @@ impl AILauncher {
         };
         let model_limits = if matches!(
             options.tool,
-            AIToolType::Pi | AIToolType::Opencode | AIToolType::Claude
+            AIToolType::Pi | AIToolType::Opencode | AIToolType::Claude | AIToolType::Grok
         ) {
             let cache_base = crate::services::model_catalog::model_cache_key_for_key(&key);
             let mut limits = HashMap::new();
@@ -1215,6 +1246,7 @@ impl AILauncher {
             AIToolType::Pi => self
                 .env_injector
                 .for_pi(key, model, pi_models, model_limits),
+            AIToolType::Grok => self.env_injector.for_grok(key, model, model_limits),
         };
 
         ToolConfig {

@@ -60,6 +60,11 @@ pub fn gemini_thought_signatures(base: &Path) -> PathBuf {
     base.join(STATE_DIR).join("gemini_thought_signatures.json")
 }
 
+/// Marker: the one-time "aivo-grok plugin is deprecated" notice was shown.
+pub fn grok_plugin_notice(base: &Path) -> PathBuf {
+    base.join(STATE_DIR).join("grok-plugin-notice")
+}
+
 // ── plans/ (user content: `/plan save` markdown) ──────────────────────────
 
 pub fn plans_dir(base: &Path) -> PathBuf {

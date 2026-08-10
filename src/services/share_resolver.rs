@@ -31,7 +31,8 @@ use crate::services::project_id::Thread;
 use crate::services::session_store::SessionStore;
 use crate::services::share_payload::{
     ContentBlock, ShareMessage, SharePayload, extract_chat_full, extract_claude_full,
-    extract_codex_full, extract_gemini_full, extract_opencode_full, extract_pi_full,
+    extract_codex_full, extract_gemini_full, extract_grok_full, extract_opencode_full,
+    extract_pi_full,
 };
 use crate::services::system_env;
 
@@ -57,6 +58,9 @@ pub struct ResolverContext {
     pub gemini_tmp_root: PathBuf,
     pub pi_sessions_root: PathBuf,
     pub opencode_db_path: PathBuf,
+    /// Grok session roots (managed home, ~/.grok or a user GROK_HOME, legacy
+    /// plugin-era homes) — several because grok's home moved across versions.
+    pub grok_session_roots: Vec<PathBuf>,
     /// Plugin tools that declared a transcript source (tool name → source).
     /// Populated by the caller, which has plugin-registry access.
     pub plugin_transcripts: HashMap<String, PluginTranscript>,
@@ -82,6 +86,7 @@ impl ResolverContext {
                 .join("share")
                 .join("opencode")
                 .join("opencode.db"),
+            grok_session_roots: crate::services::grok_home::session_roots_from_system(),
             plugin_transcripts: HashMap::new(),
         }
     }
@@ -196,12 +201,13 @@ pub async fn resolve_session(session_id: &str, ctx: &ResolverContext) -> Result<
     // can hit several files inside one source, so within-source collisions
     // count too — flatten everything before deciding.
     let project_root_str = ctx.project_root.to_string_lossy().to_string();
-    let (chat_hits, claude_hits, codex_hits, gemini_hits, pi_hits, opencode_hits) = tokio::join!(
+    let (chat_hits, claude_hits, codex_hits, gemini_hits, pi_hits, grok_hits, opencode_hits) = tokio::join!(
         find_chat(&ctx.session_store, &ctx.chat_sessions_dir, session_id),
         find_claude(&ctx.claude_projects_root, &ctx.project_root, session_id),
         find_codex(&ctx.codex_sessions_root, session_id),
         find_gemini(&ctx.gemini_tmp_root, &project_root_str, session_id),
         find_pi(&ctx.pi_sessions_root, &project_root_str, session_id),
+        find_grok(&ctx.grok_session_roots, &project_root_str, session_id),
         find_opencode(&ctx.opencode_db_path, session_id),
     );
 
@@ -211,6 +217,7 @@ pub async fn resolve_session(session_id: &str, ctx: &ResolverContext) -> Result<
     hits.extend(codex_hits);
     hits.extend(gemini_hits);
     hits.extend(pi_hits);
+    hits.extend(grok_hits);
     hits.extend(opencode_hits);
 
     if hits.len() > 1 {
@@ -268,6 +275,8 @@ pub async fn resolve_session(session_id: &str, ctx: &ResolverContext) -> Result<
             extract_pi_full(&path, cwd.as_deref()).await?
         }
         "opencode" => extract_opencode_full(&ctx.opencode_db_path, &hit.full_id, p_root).await?,
+        // full_id is the session dir; the extractor reads cwd from summary.json.
+        "grok" => extract_grok_full(&PathBuf::from(&hit.full_id), None).await?,
         other => return Err(anyhow!("internal error: unknown source '{other}'")),
     };
 
@@ -537,6 +546,57 @@ async fn find_pi(pi_root: &Path, project_root: &str, session_id: &str) -> Vec<Ma
     hits
 }
 
+async fn find_grok(roots: &[PathBuf], project_root: &str, session_id: &str) -> Vec<Match> {
+    let canonical = std::fs::canonicalize(project_root)
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_else(|_| project_root.to_string());
+    let encoded = crate::services::grok_home::encode_cwd_dir(&canonical);
+
+    // A session dir counts only when it holds a chat history.
+    async fn session_dirs_by_prefix(cwd_dir: &Path, prefix: &str) -> Vec<Match> {
+        let mut hits = Vec::new();
+        let Ok(mut rd) = fs::read_dir(cwd_dir).await else {
+            return hits;
+        };
+        while let Ok(Some(entry)) = rd.next_entry().await {
+            let dir = entry.path();
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else { continue };
+            if name.starts_with(prefix) && dir.is_dir() && dir.join("chat_history.jsonl").exists() {
+                hits.push(Match {
+                    source: "grok",
+                    full_id: dir.to_string_lossy().to_string(),
+                });
+            }
+        }
+        hits
+    }
+
+    // Cheap path: probe the cwd-encoded dir in each root.
+    let mut local = Vec::new();
+    for root in roots {
+        local.extend(session_dirs_by_prefix(&root.join(&encoded), session_id).await);
+    }
+    if !local.is_empty() {
+        return local;
+    }
+
+    // Global fallback — same rationale as find_claude.
+    let mut hits = Vec::new();
+    for root in roots {
+        let Ok(mut rd) = fs::read_dir(root).await else {
+            continue;
+        };
+        while let Ok(Some(entry)) = rd.next_entry().await {
+            let dir = entry.path();
+            if dir.is_dir() {
+                hits.extend(session_dirs_by_prefix(&dir, session_id).await);
+            }
+        }
+    }
+    hits
+}
+
 async fn find_opencode(db_path: &Path, session_id: &str) -> Vec<Match> {
     if fs::metadata(db_path).await.is_err() {
         return Vec::new();
@@ -687,6 +747,9 @@ async fn resolve_run_event(entry: &LogEntry, ctx: &ResolverContext) -> Result<Sh
         "opencode" => {
             let root = reader_root(plugin_src, &ctx.opencode_db_path);
             context_ingest::list_opencode_sessions_for_cwd(root, run_path).await
+        }
+        "grok" => {
+            context_ingest::list_grok_sessions_for_cwd(&ctx.grok_session_roots, run_path).await
         }
         _ => {
             let opts = IngestOptions {
@@ -900,6 +963,7 @@ async fn extract_thread_full(t: &Thread) -> Result<SharePayload> {
         "gemini" => extract_gemini_full(Path::new(&t.source_path), cwd).await,
         "pi" => extract_pi_full(Path::new(&t.source_path), cwd).await,
         "opencode" => extract_opencode_full(Path::new(&t.source_path), &t.session_id, cwd).await,
+        "grok" => extract_grok_full(Path::new(&t.source_path), cwd).await,
         other => Err(anyhow!("unexpected cli '{other}' for run-event resolve")),
     }
 }
@@ -927,6 +991,7 @@ mod tests {
             gemini_tmp_root: temp.path().join("gemini"),
             pi_sessions_root: temp.path().join("pi"),
             opencode_db_path: temp.path().join("opencode.db"),
+            grok_session_roots: vec![temp.path().join("grok-sessions")],
             plugin_transcripts: HashMap::new(),
         }
     }

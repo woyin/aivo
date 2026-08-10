@@ -125,6 +125,17 @@ const CLAUDE_DEFAULT_MODEL_SLOTS: [&str; 6] = [
     "CLAUDE_CODE_SUBAGENT_MODEL",
 ];
 
+/// grok's auxiliary-feature model slots (title/suggestions/web-search/image),
+/// pinned so they don't fall back to the built-in `grok-build` — a 400 on
+/// non-xAI keys. Covers both the pre- and post-0.2.9x suggestion-slot names.
+const GROK_AUX_MODEL_VARS: &[&str] = &[
+    "GROK_SESSION_SUMMARY_MODEL",
+    "GROK_SUGGESTIONS_AI_MODEL",
+    "GROK_PROMPT_SUGGESTIONS_MODEL",
+    "GROK_WEB_SEARCH_MODEL",
+    "GROK_IMAGE_DESCRIPTION_MODEL",
+];
+
 /// Strips the API version suffix (`/v1beta`, `/v1`) and trailing slashes from
 /// a Google base URL.  Tools whose SDKs append their own `apiVersion` path
 /// (Gemini CLI) would produce a double path like `/v1beta/v1beta/models/…`
@@ -1149,6 +1160,100 @@ impl EnvironmentInjector {
             env.insert("AIVO_SETUP_PI_AGENT_DIR".to_string(), "1".to_string());
         }
 
+        env
+    }
+
+    /// grok is always routed: with `GROK_MODELS_BASE_URL` set it speaks plain
+    /// OpenAI chat-completions, which the loopback ServeRouter serves for any
+    /// upstream protocol — no direct mode, no cascade. Only the key id
+    /// travels in env; the launch runtime resolves the secret.
+    pub fn for_grok(
+        &self,
+        key: &ApiKey,
+        model: Option<&str>,
+        limits: &HashMap<String, crate::services::model_metadata::ResolvedLimits>,
+    ) -> HashMap<String, String> {
+        let mut env = HashMap::new();
+        let loopback_token = crate::services::serve_router::random_auth_token();
+        env.insert(
+            "GROK_MODELS_BASE_URL".to_string(),
+            PLACEHOLDER_LOOPBACK_URL.to_string(),
+        );
+        // XAI_API_KEY is grok's bearer; the loopback gate expects this token.
+        env.insert("XAI_API_KEY".to_string(), loopback_token.clone());
+        env.insert(AIVO_ROUTER_AUTH_TOKEN.to_string(), loopback_token);
+        if key.is_cursor_acp() {
+            env.insert("AIVO_USE_CURSOR_ROUTER".to_string(), "1".to_string());
+            env.insert(
+                "AIVO_CURSOR_KEY_SECRET".to_string(),
+                key.key.as_str().to_string(),
+            );
+            env.insert(
+                "AIVO_CURSOR_BASE_URL_ENV".to_string(),
+                "GROK_MODELS_BASE_URL".to_string(),
+            );
+        } else {
+            env.insert("AIVO_USE_GROK_ROUTER".to_string(), "1".to_string());
+            env.insert("AIVO_GROK_ROUTER_KEY_ID".to_string(), key.id.clone());
+        }
+
+        let user_set = |var: &str| std::env::var(var).is_ok_and(|v| !v.trim().is_empty());
+        // A self-update would install a grok aivo didn't pick.
+        if !user_set("GROK_DISABLE_AUTOUPDATER") {
+            env.insert("GROK_DISABLE_AUTOUPDATER".to_string(), "1".to_string());
+        }
+        if let Some(model) = model {
+            // GROK_DEFAULT_MODEL rather than `-m`: grok validates `-m`
+            // eagerly, before it has fetched our /models list.
+            env.insert("GROK_DEFAULT_MODEL".to_string(), model.to_string());
+            for var in GROK_AUX_MODEL_VARS {
+                if !user_set(var) {
+                    env.insert((*var).to_string(), model.to_string());
+                }
+            }
+            if !user_set("GROK_GOAL_USE_CURRENT_MODEL_ONLY") {
+                env.insert(
+                    "GROK_GOAL_USE_CURRENT_MODEL_ONLY".to_string(),
+                    "1".to_string(),
+                );
+            }
+            // A user-set GROK_HOME opts out of all home management.
+            if !user_set("GROK_HOME") {
+                let home = crate::services::grok_home::grok_home_dir(
+                    &crate::services::paths::config_dir(),
+                );
+                env.insert("GROK_HOME".to_string(), home.display().to_string());
+                if !user_set("GROK_LEADER_SOCKET") {
+                    env.insert(
+                        "GROK_LEADER_SOCKET".to_string(),
+                        crate::services::grok_home::launch_leader_socket(&home)
+                            .display()
+                            .to_string(),
+                    );
+                }
+                env.insert("AIVO_GROK_MANAGE_HOME".to_string(), "1".to_string());
+            }
+            // Carriers for the config.toml limit pin; stripped by the runtime.
+            if let Some(resolved) = limits.get(model) {
+                if let Some(context) = resolved.context {
+                    env.insert(
+                        "AIVO_GROK_MODEL_CONTEXT_WINDOW".to_string(),
+                        context.to_string(),
+                    );
+                }
+                if let Some(output) = resolved.output {
+                    env.insert(
+                        "AIVO_GROK_MODEL_MAX_OUTPUT_TOKENS".to_string(),
+                        output.to_string(),
+                    );
+                }
+            }
+        }
+        // grok ignores NO_PROXY — genuinely unset the proxy vars in the child.
+        env.insert(
+            AIVO_INTERNAL_ENV_UNSET.to_string(),
+            crate::services::http_utils::PROXY_ENV_VARS.join(","),
+        );
         env
     }
 
@@ -4021,5 +4126,121 @@ mod tests {
         let env = injector.for_claude(&key, None);
 
         assert!(!env.contains_key("ANTHROPIC_MODEL"));
+    }
+
+    #[test]
+    fn for_grok_routes_through_serve_router_with_key_id_only() {
+        let injector = EnvironmentInjector::new();
+        let key = test_key();
+        let env = injector.for_grok(&key, Some("deepseek-v4-flash"), &HashMap::new());
+
+        assert_eq!(
+            env.get("GROK_MODELS_BASE_URL").map(String::as_str),
+            Some(PLACEHOLDER_LOOPBACK_URL)
+        );
+        assert_eq!(
+            env.get("AIVO_USE_GROK_ROUTER").map(String::as_str),
+            Some("1")
+        );
+        assert_eq!(env.get("AIVO_GROK_ROUTER_KEY_ID"), Some(&key.id));
+        assert_auth_is_loopback_token(&env, "XAI_API_KEY");
+        // The real secret must never reach the child env.
+        assert!(env.values().all(|v| !v.contains(key.key.as_str())));
+    }
+
+    #[test]
+    fn for_grok_pins_default_aux_models_and_managed_home() {
+        let injector = EnvironmentInjector::new();
+        let env = injector.for_grok(&test_key(), Some("m1"), &HashMap::new());
+
+        assert_eq!(
+            env.get("GROK_DEFAULT_MODEL").map(String::as_str),
+            Some("m1")
+        );
+        for var in GROK_AUX_MODEL_VARS {
+            assert_eq!(env.get(*var).map(String::as_str), Some("m1"), "{var}");
+        }
+        assert_eq!(
+            env.get("GROK_GOAL_USE_CURRENT_MODEL_ONLY")
+                .map(String::as_str),
+            Some("1")
+        );
+        assert_eq!(
+            env.get("GROK_DISABLE_AUTOUPDATER").map(String::as_str),
+            Some("1")
+        );
+        let home = env.get("GROK_HOME").expect("managed home is set");
+        assert!(home.ends_with("grok-home"), "{home}");
+        let sock = env.get("GROK_LEADER_SOCKET").expect("per-launch socket");
+        assert!(
+            sock.starts_with(home.as_str()) && sock.ends_with(".sock"),
+            "{sock}"
+        );
+        assert_eq!(
+            env.get("AIVO_GROK_MANAGE_HOME").map(String::as_str),
+            Some("1")
+        );
+    }
+
+    #[test]
+    fn for_grok_without_model_omits_model_and_home_vars() {
+        let injector = EnvironmentInjector::new();
+        let env = injector.for_grok(&test_key(), None, &HashMap::new());
+
+        assert!(!env.contains_key("GROK_DEFAULT_MODEL"));
+        assert!(!env.contains_key("GROK_HOME"));
+        assert!(!env.contains_key("AIVO_GROK_MANAGE_HOME"));
+        // Base routing still stands so a defensive launch can't leak upstream.
+        assert!(env.contains_key("AIVO_USE_GROK_ROUTER"));
+    }
+
+    #[test]
+    fn for_grok_carries_limit_pins_and_proxy_unset() {
+        let injector = EnvironmentInjector::new();
+        let mut limits = HashMap::new();
+        limits.insert(
+            "m1".to_string(),
+            crate::services::model_metadata::ResolvedLimits {
+                context: Some(200_000),
+                output: Some(8_192),
+                ..Default::default()
+            },
+        );
+        let env = injector.for_grok(&test_key(), Some("m1"), &limits);
+
+        assert_eq!(
+            env.get("AIVO_GROK_MODEL_CONTEXT_WINDOW")
+                .map(String::as_str),
+            Some("200000")
+        );
+        assert_eq!(
+            env.get("AIVO_GROK_MODEL_MAX_OUTPUT_TOKENS")
+                .map(String::as_str),
+            Some("8192")
+        );
+        let unset = env
+            .get(AIVO_INTERNAL_ENV_UNSET)
+            .expect("proxy unset carrier");
+        for var in ["HTTP_PROXY", "https_proxy", "ALL_PROXY"] {
+            assert!(unset.contains(var), "{var} missing from {unset}");
+        }
+    }
+
+    #[test]
+    fn for_grok_cursor_key_uses_cursor_router() {
+        let injector = EnvironmentInjector::new();
+        let key = test_api_key(crate::services::cursor_acp::CURSOR_ACP_SENTINEL);
+        let env = injector.for_grok(&key, Some("m1"), &HashMap::new());
+
+        assert_eq!(
+            env.get("AIVO_USE_CURSOR_ROUTER").map(String::as_str),
+            Some("1")
+        );
+        assert_eq!(
+            env.get("AIVO_CURSOR_BASE_URL_ENV").map(String::as_str),
+            Some("GROK_MODELS_BASE_URL")
+        );
+        assert!(!env.contains_key("AIVO_USE_GROK_ROUTER"));
+        assert_auth_is_loopback_token(&env, "XAI_API_KEY");
     }
 }

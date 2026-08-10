@@ -1285,7 +1285,8 @@ fn print_help_json() {
             { "alias": "codex-app", "expands_to": ["run", "codex-app"] },
             { "alias": "gemini", "expands_to": ["run", "gemini"] },
             { "alias": "opencode", "expands_to": ["run", "opencode"] },
-            { "alias": "pi", "expands_to": ["run", "pi"] }
+            { "alias": "pi", "expands_to": ["run", "pi"] },
+            { "alias": "grok", "expands_to": ["run", "grok"] }
         ],
         "environment": [
             { "name": "AIVO_REDUCE_MOTION", "desc": "Disable code TUI motion effects (=1)" },

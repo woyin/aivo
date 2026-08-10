@@ -36,7 +36,6 @@ pub(crate) fn probe_timeout(default: std::time::Duration) -> std::time::Duration
 const KNOWN_PLUGINS: &[(&str, &str)] = &[
     ("amp", "github:yuanchuan/aivo-amp"),
     ("copilot", "github:yuanchuan/aivo-copilot"),
-    ("grok", "github:yuanchuan/aivo-grok"),
     ("omp", "github:yuanchuan/aivo-omp"),
 ];
 
@@ -203,6 +202,10 @@ pub fn coding_agent_plugin_names() -> std::collections::HashSet<String> {
         .into_iter()
         .filter(|(_, rec)| rec.manifest.as_ref().is_some_and(|m| m.is_coding_agent()))
         .map(|(name, _)| name)
+        // A plugin shadowed by a built-in (e.g. an installed aivo-grok after
+        // grok went native) never dispatches — keep it out of pickers and
+        // per-tool listings so `grok` can't appear twice.
+        .filter(|name| !is_reserved_plugin_name(name))
         .collect()
 }
 
@@ -213,7 +216,6 @@ fn known_coding_agent_description(name: &str) -> Option<&'static str> {
     match name {
         "amp" => Some("Sourcegraph's coding agent."),
         "copilot" => Some("GitHub's official terminal coding agent."),
-        "grok" => Some("An open-source coding agent for the Grok API."),
         "omp" => Some("Oh My Pi, a terminal coding agent built on pi-mono."),
         _ => None,
     }
@@ -689,7 +691,7 @@ mod tests {
     fn known_plugins_have_install_sources() {
         // An uninstalled well-known plugin is offered its install source
         // rather than rejected by clap.
-        for name in ["amp", "copilot", "grok", "omp"] {
+        for name in ["amp", "copilot", "omp"] {
             assert_eq!(
                 known_plugin_source(name),
                 Some(format!("github:yuanchuan/aivo-{name}")).as_deref(),
@@ -700,14 +702,19 @@ mod tests {
                 "{name} must be dispatchable"
             );
         }
-        // Live native tools and genuinely unknown names get no offer.
+        // Native tools (incl. grok, whose plugin is deprecated) and genuinely
+        // unknown names get no offer.
         assert_eq!(known_plugin_source("claude"), None);
+        assert_eq!(known_plugin_source("grok"), None);
         assert_eq!(known_plugin_source("foobar"), None);
     }
 
     #[test]
     fn reserved_names_are_rejected() {
-        for n in ["keys", "code", "chat", "run", "claude", "help", "plugins"] {
+        // `grok` reserved = the native tool shadows any installed aivo-grok.
+        for n in [
+            "keys", "code", "chat", "run", "claude", "grok", "help", "plugins",
+        ] {
             assert!(is_reserved_plugin_name(n), "{n} should be reserved");
         }
         assert!(!is_reserved_plugin_name("amp"));

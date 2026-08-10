@@ -100,8 +100,8 @@ aivo alias rm fast                          # remove either kind
 tool name opens a picker. All extra args pass straight through to the tool.
 
 Built-in tools: `claude` (Claude Code), `codex`, `codex-app` (desktop, experimental, macOS),
-`gemini`, `opencode`, `pi`. Plugin tools (install via `aivo plugins`): `amp`, `omp` (oh-my-pi),
-`copilot`, `grok`.
+`gemini`, `opencode`, `pi`, `grok`. Plugin tools (install via `aivo plugins`): `amp`,
+`omp` (oh-my-pi), `copilot`.
 
 Key flags:
 

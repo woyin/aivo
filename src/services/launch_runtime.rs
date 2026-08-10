@@ -44,6 +44,9 @@ pub(crate) struct LaunchRuntimeState {
     /// override file; must outlive the spawned gemini process.
     #[allow(dead_code)] // kept alive solely for its Drop impl
     pub(crate) gemini_system_settings: Option<tempfile::TempDir>,
+    /// Per-run tally from the grok ServeRouter, stamped onto the finished
+    /// row — grok has no on-disk accounting for `aivo stats` to scrape.
+    pub(crate) run_tally: Option<Arc<crate::services::usage_stats_store::RunTokenTally>>,
 }
 
 pub(crate) async fn prepare_runtime_env(
@@ -176,6 +179,31 @@ pub(crate) async fn prepare_runtime_env(
         }
     }
 
+    let mut run_tally: Option<Arc<crate::services::usage_stats_store::RunTokenTally>> = None;
+    if tool == AIToolType::Grok {
+        // Unconditional: cursor-key launches (routed above) need the home too.
+        prepare_grok_home(&mut env).await;
+        if env.remove("AIVO_USE_GROK_ROUTER").is_some() {
+            let key_id = env.remove("AIVO_GROK_ROUTER_KEY_ID").unwrap_or_default();
+            let mut key = session_store
+                .get_keys()
+                .await?
+                .into_iter()
+                .find(|k| k.id == key_id)
+                .ok_or_else(|| anyhow::anyhow!("grok launch: key '{key_id}' not found"))?;
+            SessionStore::decrypt_key_secret(&mut key)?;
+            let tally = Arc::new(crate::services::usage_stats_store::RunTokenTally::default());
+            let port = start_grok_serve_router(key, &env, session_store, tally.clone()).await?;
+            run_tally = Some(tally);
+            set_local_base_url(&mut env, "GROK_MODELS_BASE_URL", port);
+            // grok appends bare `/models` + `/chat/completions`; the serve
+            // router mounts them under `/v1`.
+            if let Some(url) = env.get_mut("GROK_MODELS_BASE_URL") {
+                url.push_str("/v1");
+            }
+        }
+    }
+
     if tool == AIToolType::Pi && env.contains_key("AIVO_SETUP_PI_AGENT_DIR") {
         // Direct connection — no router needed, just write the temp agent dir.
         write_pi_agent_dir(&mut env, None).await?;
@@ -262,7 +290,66 @@ pub(crate) async fn prepare_runtime_env(
         pi_agent_dir,
         codex_oauth_sync,
         gemini_system_settings,
+        run_tally,
     })
+}
+
+/// Consumes the grok home carriers and prepares the managed home; without
+/// `AIVO_GROK_MANAGE_HOME` (user-pinned `GROK_HOME`) it only strips them.
+async fn prepare_grok_home(env: &mut HashMap<String, String>) {
+    let manage = env.remove("AIVO_GROK_MANAGE_HOME").is_some();
+    let context = env
+        .remove("AIVO_GROK_MODEL_CONTEXT_WINDOW")
+        .and_then(|v| v.parse::<u64>().ok());
+    let max_output = env
+        .remove("AIVO_GROK_MODEL_MAX_OUTPUT_TOKENS")
+        .and_then(|v| v.parse::<u64>().ok());
+    if !manage {
+        return;
+    }
+    let model = env.get("GROK_DEFAULT_MODEL").cloned();
+    let config_dir = crate::services::paths::config_dir();
+    let _ = tokio::task::spawn_blocking(move || {
+        crate::services::grok_home::prepare_managed_home(
+            &config_dir,
+            model.as_deref(),
+            context,
+            max_output,
+        )
+    })
+    .await;
+}
+
+/// Loopback ServeRouter for `aivo grok`: bridges any upstream protocol (incl.
+/// provider OAuth) to grok's OpenAI surface, with usage accounting + tally.
+async fn start_grok_serve_router(
+    key: ApiKey,
+    env: &HashMap<String, String>,
+    session_store: &SessionStore,
+    run_tally: Arc<crate::services::usage_stats_store::RunTokenTally>,
+) -> Result<u16> {
+    use crate::services::serve_router::{ServeRouter, ServeRouterConfig};
+
+    let fallback = if key.is_grok_oauth() {
+        crate::services::serve_router::resolve_grok_fallback(session_store).await
+    } else {
+        None
+    };
+    let config =
+        ServeRouterConfig::from_key(&key, false, 300, loopback_auth_token(env), HashMap::new())
+            .with_grok_fallback(fallback);
+    let (handle, _shutdown, port) = ServeRouter::new(config, key, session_store.logs())
+        .with_oauth_persist(session_store.clone())
+        .with_usage_accounting(session_store.clone(), "grok".to_string())
+        .with_run_tally(run_tally)
+        .start_background_with_addr("127.0.0.1", 0)
+        .await?;
+    tokio::spawn(async move {
+        if let Ok(Err(e)) = handle.await {
+            eprintln!("aivo: grok serve router exited unexpectedly: {e}");
+        }
+    });
+    Ok(port)
 }
 
 /// Parses `AIVO_CODEX_OAUTH_CREDS` (set by `environment_injector::for_codex`
@@ -970,14 +1057,7 @@ fn patch_opencode_config_content(env: &mut HashMap<String, String>, port: u16) {
 /// bundled `proxy-from-env` library and various sub-deps (gaxios,
 /// googleapis) do consult it, so we clear it too for defense in depth.
 fn clear_node_proxy_env(env: &mut HashMap<String, String>) {
-    for var in [
-        "HTTP_PROXY",
-        "HTTPS_PROXY",
-        "ALL_PROXY",
-        "http_proxy",
-        "https_proxy",
-        "all_proxy",
-    ] {
+    for var in crate::services::http_utils::PROXY_ENV_VARS {
         env.insert(var.to_string(), String::new());
     }
 }
@@ -1481,9 +1561,11 @@ async fn start_cursor_router(env: &mut HashMap<String, String>, tool: AIToolType
     let mcp_prewarm_id_style = Some(match tool {
         AIToolType::Claude => ToolUseIdStyle::Anthropic,
         AIToolType::Gemini => ToolUseIdStyle::Gemini,
-        AIToolType::Codex | AIToolType::CodexApp | AIToolType::Opencode | AIToolType::Pi => {
-            ToolUseIdStyle::OpenAi
-        }
+        AIToolType::Codex
+        | AIToolType::CodexApp
+        | AIToolType::Opencode
+        | AIToolType::Pi
+        | AIToolType::Grok => ToolUseIdStyle::OpenAi,
     });
     let router = CursorModelRouter::new(CursorRouterConfig {
         key,

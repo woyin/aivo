@@ -1033,6 +1033,307 @@ fn stringify_pi_content(v: Option<&Value>) -> String {
 }
 
 // ---------------------------------------------------------------------------
+// Grok extractor
+// ---------------------------------------------------------------------------
+
+/// Extract from a grok session dir. Chat lines carry no timestamps (times
+/// come from summary.json); `model` stays None — aivo overrides it from the
+/// logged run.
+pub async fn extract_grok_full(
+    session_dir: &std::path::Path,
+    project_root: Option<&str>,
+) -> Result<SharePayload> {
+    use crate::services::context_ingest::read_grok_summary;
+
+    let summary = read_grok_summary(session_dir).await;
+    let history = session_dir.join("chat_history.jsonl");
+    let file = fs::File::open(&history)
+        .await
+        .with_context(|| format!("opening grok session {}", history.display()))?;
+    let mut lines = BufReader::new(file).lines();
+
+    let mut timeline =
+        crate::services::context_ingest::GrokUpdatesTimeline::load(session_dir).await;
+    let mut messages: Vec<ShareMessage> = Vec::new();
+    while let Ok(Some(line)) = lines.next_line().await {
+        if line.is_empty() {
+            continue;
+        }
+        let v: Value = match serde_json::from_str(&line) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        if let Some(mut msg) = grok_message_to_share(&v) {
+            msg.timestamp = grok_line_timestamp(&mut timeline, &v);
+            messages.push(msg);
+        }
+    }
+
+    let project_root = project_root.or(summary.cwd.as_deref());
+    Ok(SharePayload {
+        schema_version: SHARE_SCHEMA_VERSION.to_string(),
+        source_cli: "grok".to_string(),
+        session_id: summary.session_id,
+        project: project_info(project_root),
+        model: None,
+        created_at: summary.created_at,
+        updated_at: summary.updated_at,
+        messages: merge_tool_result_turns(messages),
+        meta: SharePayload::new_meta(false),
+    })
+}
+
+/// One chat_history.jsonl line → a share message. Drops the system prompt,
+/// synthetic env-context turns, and turns left with no content.
+fn grok_message_to_share(v: &Value) -> Option<ShareMessage> {
+    let kind = v
+        .get("type")
+        .or_else(|| v.get("role"))
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    if kind == "system" || v.get("synthetic_reason").is_some() {
+        return None;
+    }
+    // grok >=1.0 persists results as their own `tool_result` lines keyed by
+    // top-level `tool_call_id`.
+    if kind == "tool_result" {
+        let mut block = grok_tool_result(v);
+        // grok_tool_result's raw candidates only cover string content here.
+        if v.get("content").is_some_and(Value::is_array)
+            && let ContentBlock::ToolResult { output, .. } = &mut block
+        {
+            *output = crate::services::context_ingest::grok_text_content(v);
+        }
+        return Some(ShareMessage {
+            role: "tool".to_string(),
+            timestamp: None,
+            model: None,
+            reasoning: None,
+            content: vec![block],
+        });
+    }
+    let role = match kind {
+        "assistant" => "assistant",
+        "tool" => "tool",
+        _ => "user",
+    };
+
+    let (mut blocks, mut reasoning_parts) = grok_content_to_blocks(v.get("content"));
+    // OpenAI-shaped top-level tool_calls ride alongside the content.
+    if let Some(calls) = v.get("tool_calls").and_then(Value::as_array) {
+        for tc in calls {
+            let f = tc.get("function");
+            blocks.push(ContentBlock::ToolCall {
+                id: tc.get("id").and_then(Value::as_str).map(str::to_string),
+                name: f
+                    .and_then(|f| f.get("name"))
+                    .and_then(Value::as_str)
+                    .or_else(|| tc.get("name").and_then(Value::as_str))
+                    .unwrap_or("tool")
+                    .to_string(),
+                arguments: grok_norm_args(f.and_then(|f| f.get("arguments"))),
+            });
+        }
+    }
+    for key in ["reasoning", "reasoning_content", "thinking"] {
+        if let Some(r) = v.get(key).and_then(Value::as_str)
+            && !r.is_empty()
+        {
+            reasoning_parts.push(r.to_string());
+        }
+    }
+
+    if role == "user" {
+        blocks = grok_normalize_user_blocks(blocks);
+    }
+    let reasoning = (!reasoning_parts.is_empty()).then(|| reasoning_parts.join("\n"));
+    if blocks.is_empty() && reasoning.is_none() {
+        return None;
+    }
+    Some(ShareMessage {
+        role: role.to_string(),
+        timestamp: None,
+        model: v
+            .get("model_id")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        reasoning,
+        content: blocks,
+    })
+}
+
+/// Anchor one chat_history line to the `updates.jsonl` stream; lines the
+/// stream can't place (older sessions, env-context turns) stay untimed.
+fn grok_line_timestamp(
+    timeline: &mut crate::services::context_ingest::GrokUpdatesTimeline,
+    v: &Value,
+) -> Option<chrono::DateTime<chrono::Utc>> {
+    let kind = v
+        .get("type")
+        .or_else(|| v.get("role"))
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    match kind {
+        // Only prompt-indexed lines consume an anchor: env-context user turns
+        // have no ACP event and would steal the next prompt's.
+        "user" => timeline.user_prompt(Some(v.get("prompt_index").and_then(Value::as_u64)?)),
+        "assistant" => {
+            let first_call = v
+                .get("tool_calls")
+                .and_then(Value::as_array)
+                .and_then(|a| a.first())
+                .and_then(|tc| tc.get("id"))
+                .and_then(Value::as_str);
+            match first_call {
+                Some(id) => timeline.tool_call(id),
+                None => timeline.agent_message(),
+            }
+        }
+        "tool_result" | "tool" => {
+            let id = v.get("tool_call_id").and_then(Value::as_str).or_else(|| {
+                v.get("content")
+                    .and_then(Value::as_array)
+                    .and_then(|a| a.first())
+                    .and_then(|b| b.get("id"))
+                    .and_then(Value::as_str)
+            })?;
+            timeline.tool_result(id)
+        }
+        _ => None,
+    }
+}
+
+/// grok content (string or block array) → share blocks + reasoning fragments.
+fn grok_content_to_blocks(content: Option<&Value>) -> (Vec<ContentBlock>, Vec<String>) {
+    let mut blocks = Vec::new();
+    let mut reasoning = Vec::new();
+    match content {
+        Some(Value::String(s)) => {
+            if !s.is_empty() {
+                blocks.push(ContentBlock::Text { text: s.clone() });
+            }
+        }
+        Some(Value::Array(arr)) => {
+            for b in arr {
+                match b.get("type").and_then(Value::as_str) {
+                    Some("text") => {
+                        if let Some(t) = b.get("text").and_then(Value::as_str)
+                            && !t.is_empty()
+                        {
+                            blocks.push(ContentBlock::Text {
+                                text: t.to_string(),
+                            });
+                        }
+                    }
+                    Some("reasoning") | Some("thinking") => {
+                        for key in ["text", "thinking", "reasoning"] {
+                            if let Some(t) = b.get(key).and_then(Value::as_str)
+                                && !t.is_empty()
+                            {
+                                reasoning.push(t.to_string());
+                                break;
+                            }
+                        }
+                    }
+                    Some("tool_call") | Some("tool_use") => {
+                        blocks.push(ContentBlock::ToolCall {
+                            id: ["id", "tool_call_id"]
+                                .iter()
+                                .find_map(|k| b.get(*k).and_then(Value::as_str))
+                                .map(str::to_string),
+                            name: b
+                                .get("name")
+                                .and_then(Value::as_str)
+                                .or_else(|| {
+                                    b.get("function")
+                                        .and_then(|f| f.get("name"))
+                                        .and_then(Value::as_str)
+                                })
+                                .unwrap_or("tool")
+                                .to_string(),
+                            arguments: grok_norm_args(
+                                ["arguments", "args", "input"]
+                                    .iter()
+                                    .find_map(|k| b.get(*k))
+                                    .or_else(|| b.get("function").and_then(|f| f.get("arguments"))),
+                            ),
+                        });
+                    }
+                    Some("tool_result") => blocks.push(grok_tool_result(b)),
+                    _ => {}
+                }
+            }
+        }
+        _ => {}
+    }
+    (blocks, reasoning)
+}
+
+fn grok_norm_args(v: Option<&Value>) -> Value {
+    match v {
+        Some(Value::String(s)) => {
+            serde_json::from_str(s).unwrap_or_else(|_| Value::String(s.clone()))
+        }
+        Some(Value::Null) | None => Value::Object(serde_json::Map::new()),
+        Some(other) => other.clone(),
+    }
+}
+
+fn grok_tool_result(b: &Value) -> ContentBlock {
+    let status = b
+        .get("status")
+        .and_then(Value::as_str)
+        .or_else(|| {
+            b.get("run")
+                .and_then(|r| r.get("status"))
+                .and_then(Value::as_str)
+        })
+        .unwrap_or("");
+    let ok = !status.to_ascii_lowercase().contains("error")
+        && b.get("is_error").and_then(Value::as_bool) != Some(true);
+    // An explicit JSON null falls through to the next candidate.
+    let output = ["output", "content", "text"]
+        .iter()
+        .find_map(|k| b.get(*k).filter(|v| !v.is_null()))
+        .or_else(|| b.get("run").and_then(|r| r.get("result")))
+        .map(|v| match v {
+            Value::String(s) => s.clone(),
+            other => other.to_string(),
+        })
+        .unwrap_or_default();
+    ContentBlock::ToolResult {
+        id: ["id", "tool_use_id", "toolUseID", "tool_call_id"]
+            .iter()
+            .find_map(|k| b.get(*k).and_then(Value::as_str))
+            .map(str::to_string),
+        ok,
+        output,
+        error: None,
+    }
+}
+
+/// Unwrap `<user_query>` envelopes and drop pure env-context blocks; an
+/// emptied turn falls to the caller's no-content-no-reasoning check.
+fn grok_normalize_user_blocks(blocks: Vec<ContentBlock>) -> Vec<ContentBlock> {
+    use crate::services::context_ingest::{grok_is_pure_env_context, grok_unwrap_user_query};
+    let mut out = Vec::with_capacity(blocks.len());
+    for b in blocks {
+        match b {
+            ContentBlock::Text { text } => {
+                if grok_is_pure_env_context(&text) {
+                    continue;
+                }
+                if let Some(t) = grok_unwrap_user_query(&text) {
+                    out.push(ContentBlock::Text { text: t });
+                }
+            }
+            other => out.push(other),
+        }
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------
 // OpenCode extractor
 // ---------------------------------------------------------------------------
 
@@ -2100,6 +2401,166 @@ You can now continue with the user's answers in mind.",
             .await
             .unwrap_err();
         assert!(err.to_string().contains("not found"));
+    }
+
+    #[tokio::test]
+    async fn extract_grok_full_maps_the_plugin_shape() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let dir = temp.path().join("019f-uuid");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("summary.json"),
+            r#"{"info":{"id":"019f-uuid","cwd":"/private/tmp/proj"},
+                "created_at":"2026-07-24T06:31:54.642020Z",
+                "updated_at":"2026-07-24T06:40:00Z"}"#,
+        )
+        .unwrap();
+        let lines = [
+            // System prompt and synthetic env turns are dropped.
+            r#"{"type":"system","content":"You are Grok"}"#,
+            r#"{"type":"user","content":[{"type":"text","text":"<system-reminder>skills</system-reminder>"}],"synthetic_reason":"system_reminder"}"#,
+            // A non-synthetic pure-env turn (grok >=0.2.9x bundles several) is dropped too.
+            r#"{"type":"user","content":[{"type":"text","text":"<user_info>os</user_info><git-status>clean</git-status>"}]}"#,
+            // The real prompt unwraps its envelope.
+            r#"{"type":"user","content":[{"type":"text","text":"<user_query>\nfix the bug\n</user_query>"}],"prompt_index":0}"#,
+            // Assistant with block reasoning + msg reasoning + a tool call carrying string args.
+            r#"{"type":"assistant","content":[{"type":"reasoning","text":"think1"},{"type":"text","text":"on it"}],"reasoning":"think2","model_id":"deepseek-v4-flash","tool_calls":[{"id":"c1","function":{"name":"bash","arguments":"{\"cmd\":\"ls\"}"}}]}"#,
+            // Tool result folds onto the call turn (merge_tool_result_turns).
+            r#"{"type":"tool","content":[{"type":"tool_result","id":"c1","status":"ok","output":"src\n"}]}"#,
+        ];
+        std::fs::write(dir.join("chat_history.jsonl"), lines.join("\n")).unwrap();
+
+        let payload = extract_grok_full(&dir, None).await.unwrap();
+        assert_eq!(payload.source_cli, "grok");
+        assert_eq!(payload.session_id, "019f-uuid");
+        assert_eq!(payload.project.root.as_deref(), Some("/private/tmp/proj"));
+        assert!(payload.created_at.is_some());
+        assert!(
+            payload.model.is_none(),
+            "aivo overrides model from the run row"
+        );
+
+        assert_eq!(payload.messages.len(), 2, "{:#?}", payload.messages);
+        let user = &payload.messages[0];
+        assert_eq!(user.role, "user");
+        assert!(matches!(&user.content[0], ContentBlock::Text { text } if text == "fix the bug"));
+
+        let asst = &payload.messages[1];
+        assert_eq!(asst.role, "assistant");
+        assert_eq!(asst.model.as_deref(), Some("deepseek-v4-flash"));
+        assert_eq!(asst.reasoning.as_deref(), Some("think1\nthink2"));
+        let call = asst
+            .content
+            .iter()
+            .find_map(|b| match b {
+                ContentBlock::ToolCall {
+                    id,
+                    name,
+                    arguments,
+                    ..
+                } => Some((id.clone(), name.clone(), arguments.clone())),
+                _ => None,
+            })
+            .expect("tool call present");
+        assert_eq!(call.0.as_deref(), Some("c1"));
+        assert_eq!(call.1, "bash");
+        assert_eq!(call.2["cmd"], "ls");
+        let result = asst
+            .content
+            .iter()
+            .find_map(|b| match b {
+                ContentBlock::ToolResult { id, ok, output, .. } => {
+                    Some((id.clone(), *ok, output.clone()))
+                }
+                _ => None,
+            })
+            .expect("tool result folded onto the call turn");
+        assert_eq!(result.0.as_deref(), Some("c1"));
+        assert!(result.1);
+        assert_eq!(result.2, "src\n");
+    }
+
+    #[tokio::test]
+    async fn extract_grok_full_maps_the_grok1_shape_with_timestamps() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let dir = temp.path().join("019f-uuid");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("summary.json"),
+            r#"{"info":{"id":"019f-uuid","cwd":"/private/tmp/proj"},
+                "created_at":"2026-08-11T00:18:45Z","updated_at":"2026-08-11T00:21:01Z"}"#,
+        )
+        .unwrap();
+        let history = [
+            r#"{"type":"system","content":"You are Grok"}"#,
+            r#"{"type":"user","content":"<user_info>os</user_info>"}"#,
+            r#"{"type":"user","content":"<user_query>weather?</user_query>","prompt_index":0}"#,
+            r#"{"type":"assistant","content":"I'll search.","tool_calls":[{"id":"c1","name":"web_search","arguments":"{\"query\":\"w\"}"}],"model_id":"deepseek-v4-flash"}"#,
+            r#"{"type":"tool_result","tool_call_id":"c1","content":"sunny"}"#,
+            r#"{"type":"assistant","content":"It is sunny.","model_id":"deepseek-v4-flash"}"#,
+        ];
+        std::fs::write(dir.join("chat_history.jsonl"), history.join("\n")).unwrap();
+        let updates = [
+            r#"{"timestamp":100,"method":"session/update","params":{"update":{"sessionUpdate":"user_message_chunk","content":{"type":"text","text":"weather?"},"_meta":{"promptIndex":0}}}}"#,
+            r#"{"timestamp":101,"method":"session/update","params":{"update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"I'll"}}}}"#,
+            r#"{"timestamp":101,"method":"session/update","params":{"update":{"sessionUpdate":"tool_call","toolCallId":"c1","title":"web_search"}}}"#,
+            r#"{"timestamp":103,"method":"session/update","params":{"update":{"sessionUpdate":"tool_call_update","toolCallId":"c1"}}}"#,
+            r#"{"timestamp":105,"method":"session/update","params":{"update":{"sessionUpdate":"tool_call_update","toolCallId":"c1","status":"completed"}}}"#,
+            r#"{"timestamp":107,"method":"session/update","params":{"update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"It"}}}}"#,
+            r#"{"timestamp":108,"method":"session/update","params":{"update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":" is"}}}}"#,
+        ];
+        std::fs::write(dir.join("updates.jsonl"), updates.join("\n")).unwrap();
+
+        let payload = extract_grok_full(&dir, None).await.unwrap();
+        let ts = |i: usize| payload.messages[i].timestamp.map(|t| t.timestamp());
+        assert_eq!(payload.messages.len(), 3, "{:#?}", payload.messages);
+
+        assert_eq!(payload.messages[0].role, "user");
+        assert_eq!(ts(0), Some(100));
+
+        let asst = &payload.messages[1];
+        assert_eq!(asst.role, "assistant");
+        assert_eq!(ts(1), Some(101), "call turn anchors to the tool_call event");
+        let result = asst
+            .content
+            .iter()
+            .find_map(|b| match b {
+                ContentBlock::ToolResult { id, output, .. } => Some((id.clone(), output.clone())),
+                _ => None,
+            })
+            .expect("tool_result line folded onto the call turn");
+        assert_eq!(result.0.as_deref(), Some("c1"));
+        assert_eq!(result.1, "sunny");
+
+        assert_eq!(payload.messages[2].role, "assistant");
+        assert_eq!(
+            ts(2),
+            Some(107),
+            "final text anchors to the run after the tool events"
+        );
+    }
+
+    #[tokio::test]
+    async fn extract_grok_full_keeps_untimed_messages_without_updates_file() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let dir = temp.path().join("019f-uuid");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("summary.json"), r#"{"info":{"id":"019f-uuid"}}"#).unwrap();
+        std::fs::write(
+            dir.join("chat_history.jsonl"),
+            r#"{"type":"user","content":"<user_query>hi</user_query>","prompt_index":0}"#,
+        )
+        .unwrap();
+        let payload = extract_grok_full(&dir, None).await.unwrap();
+        assert_eq!(payload.messages.len(), 1);
+        assert!(payload.messages[0].timestamp.is_none());
+    }
+
+    #[tokio::test]
+    async fn extract_grok_full_errors_on_missing_history() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let err = extract_grok_full(temp.path(), None).await.unwrap_err();
+        assert!(err.to_string().contains("grok session"));
     }
 
     #[test]

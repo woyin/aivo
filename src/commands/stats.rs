@@ -468,10 +468,12 @@ impl StatsCommand {
         let tool = tool.to_lowercase();
         let plugins = crate::plugin::coding_agent_plugin_names();
         if !is_valid_tool(&tool, &plugins) {
-            let mut valid: Vec<String> = ["claude", "codex", "gemini", "opencode", "pi", "code"]
-                .iter()
-                .map(|s| s.to_string())
-                .collect();
+            let mut valid: Vec<String> = [
+                "claude", "codex", "gemini", "opencode", "pi", "grok", "code",
+            ]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
             let mut names: Vec<String> = plugins.into_iter().collect();
             names.sort();
             valid.extend(names);
@@ -2009,6 +2011,7 @@ mod tests {
         assert!(is_valid_tool("gemini", &none));
         assert!(is_valid_tool("opencode", &none));
         assert!(is_valid_tool("pi", &none));
+        assert!(is_valid_tool("grok", &none));
         assert!(is_valid_tool("chat", &none));
         assert!(!is_valid_tool("unknown", &none));
         assert!(!is_valid_tool("", &none));

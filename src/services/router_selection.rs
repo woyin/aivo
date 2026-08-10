@@ -115,6 +115,13 @@ pub(crate) fn transparent_conflict(
     profile: &ProviderProfile,
 ) -> Option<String> {
     use crate::services::ai_launcher::AIToolType;
+    if tool == AIToolType::Grok {
+        return Some(
+            "grok is always served through aivo's local router — token accounting and protocol \
+             bridging live there"
+                .to_string(),
+        );
+    }
     if key.is_cursor_acp() {
         return Some(
             "cursor keys speak ACP, not HTTP — there is no upstream to talk to directly"

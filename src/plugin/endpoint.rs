@@ -1127,21 +1127,14 @@ fn apply_endpoint(
             extra_env.push(("AIVO_ENDPOINT_TOKEN".to_string(), ep.token.clone()));
             // The plugin only talks to this loopback endpoint (aivo proxies real
             // upstream itself). A system proxy would route the 127.0.0.1 request
-            // through it, and plugins that ignore NO_PROXY (e.g. the Node grok
-            // client) then fail. Neutralize the proxy vars so it connects direct.
-            const PROXY_VARS: &[&str] = &[
-                "HTTP_PROXY",
-                "http_proxy",
-                "HTTPS_PROXY",
-                "https_proxy",
-                "ALL_PROXY",
-                "all_proxy",
-            ];
-            let proxy_set = PROXY_VARS
+            // through it, and plugins that ignore NO_PROXY then fail.
+            // Neutralize the proxy vars so it connects direct.
+            let proxy_vars = crate::services::http_utils::PROXY_ENV_VARS;
+            let proxy_set = proxy_vars
                 .iter()
                 .any(|v| std::env::var(v).is_ok_and(|s| !s.is_empty()));
             if proxy_set {
-                for var in PROXY_VARS {
+                for var in proxy_vars {
                     extra_env.push(((*var).to_string(), String::new()));
                 }
                 extra_env.push(("NO_PROXY".to_string(), "*".to_string()));
@@ -1388,18 +1381,18 @@ async fn finish_accounting(store: &SessionStore, acct: Accounting, code: i32, du
     // Stamp the run's endpoint token usage onto the finished row (a no-op zero for
     // Cursor/OAuth runs), so a probe-less coding-agent plugin is windowable under
     // `aivo stats --since` — its lifetime per-key counters carry no timestamp.
-    let (prompt, completion, cache_read, cache_creation) = acct.run_tally.snapshot();
-    let some_positive = |v: u64| (v > 0).then_some(v as i64);
+    let [input_tokens, output_tokens, cache_read, cache_creation] =
+        acct.run_tally.finished_row_tokens();
     let _ = store
         .logs()
         .append(LogEvent {
             phase: Some("finished".to_string()),
             exit_code: Some(code as i64),
             duration_ms: Some(duration.as_millis() as i64),
-            input_tokens: some_positive(prompt),
-            output_tokens: some_positive(completion),
-            cache_read_input_tokens: some_positive(cache_read),
-            cache_creation_input_tokens: some_positive(cache_creation),
+            input_tokens,
+            output_tokens,
+            cache_read_input_tokens: cache_read,
+            cache_creation_input_tokens: cache_creation,
             ..acct.base
         })
         .await;
