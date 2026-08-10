@@ -98,6 +98,18 @@ fn success_body(endpoint: Endpoint) -> String {
 
 fn sse_body(endpoint: Endpoint) -> String {
     match endpoint {
+        // Comment line + [DONE] would not survive a bridge — passthrough acid.
+        Endpoint::Chat => concat!(
+            ": keepalive\n\n",
+            r#"data: {"id":"chatcmpl-1","object":"chat.completion.chunk","created":1,"model":"test-model","choices":[{"index":0,"delta":{"role":"assistant","content":""},"finish_reason":null}]}"#,
+            "\n\n",
+            r#"data: {"id":"chatcmpl-1","object":"chat.completion.chunk","created":1,"model":"test-model","choices":[{"index":0,"delta":{"content":"hello from openai"},"finish_reason":null}]}"#,
+            "\n\n",
+            r#"data: {"id":"chatcmpl-1","object":"chat.completion.chunk","created":1,"model":"test-model","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}"#,
+            "\n\n",
+            "data: [DONE]\n\n",
+        )
+        .to_string(),
         Endpoint::Messages => concat!(
             "event: message_start\n",
             r#"data: {"type":"message_start","message":{"id":"msg_1","type":"message","role":"assistant","content":[],"model":"test-model","stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":1,"output_tokens":0}}}"#,
@@ -370,26 +382,29 @@ fn response_status(response: &str) -> u16 {
         .unwrap_or(0)
 }
 
-fn response_json(response: &str) -> Value {
-    let body = response.split("\r\n\r\n").nth(1).unwrap_or("");
-    // Strip chunked transfer-encoding framing if present.
-    if response.contains("Transfer-Encoding: chunked") {
-        let mut out = String::new();
-        let mut rest = body;
-        while let Some(nl) = rest.find("\r\n") {
-            let (size_line, tail) = rest.split_at(nl);
-            let size = usize::from_str_radix(size_line.trim(), 16).unwrap_or(0);
-            if size == 0 {
-                break;
-            }
-            let tail = &tail[2..];
-            out.push_str(&tail[..size.min(tail.len())]);
-            rest = tail.get(size + 2..).unwrap_or("");
-        }
-        serde_json::from_str(&out).unwrap_or(Value::Null)
-    } else {
-        serde_json::from_str(body).unwrap_or(Value::Null)
+/// Body with chunked transfer-encoding framing stripped.
+fn response_body(response: &str) -> String {
+    let body = response.split_once("\r\n\r\n").map(|x| x.1).unwrap_or("");
+    if !response.contains("Transfer-Encoding: chunked") {
+        return body.to_string();
     }
+    let mut out = String::new();
+    let mut rest = body;
+    while let Some(nl) = rest.find("\r\n") {
+        let (size_line, tail) = rest.split_at(nl);
+        let size = usize::from_str_radix(size_line.trim(), 16).unwrap_or(0);
+        if size == 0 {
+            break;
+        }
+        let tail = &tail[2..];
+        out.push_str(&tail[..size.min(tail.len())]);
+        rest = tail.get(size + 2..).unwrap_or("");
+    }
+    out
+}
+
+fn response_json(response: &str) -> Value {
+    serde_json::from_str(&response_body(response)).unwrap_or(Value::Null)
 }
 
 fn no_proxy() {
@@ -783,6 +798,20 @@ async fn serve_streams_gemini_sse_as_chat_sse() {
     assert!(resp.contains("chat.completion.chunk"), "{resp}");
     assert!(resp.contains("hello from gemini"), "{resp}");
     assert!(resp.contains("data: [DONE]"), "{resp}");
+}
+
+/// OpenAI→OpenAI SSE is a raw passthrough — the de-chunked body must equal
+/// the upstream bytes exactly.
+#[tokio::test]
+async fn serve_chat_openai_sse_passthrough_is_byte_exact() {
+    no_proxy();
+    let fake = spawn_fake(&[(Endpoint::Chat, Mode::OkSse)]);
+    let port = start_serve(&fake, ProviderProtocol::Openai).await;
+
+    let resp = raw_post(port, "/v1/chat/completions", CHAT_REQ_STREAM).await;
+    assert_eq!(response_status(&resp), 200, "{resp}");
+    assert!(resp.contains("text/event-stream"), "{resp}");
+    assert_eq!(response_body(&resp), sse_body(Endpoint::Chat), "{resp}");
 }
 
 /// First chunk must reach the client while the upstream SSE stream is still open — pins incremental forwarding against a buffer-to-EOF regression.
@@ -1501,8 +1530,7 @@ async fn serve_router_claude_oauth_main_streams_sse_passthrough() {
     .await;
     assert_eq!(response_status(&r), 200, "{r}");
     assert!(r.contains("text/event-stream"), "{r}");
-    assert!(r.contains("event: message_start"), "{r}");
-    assert!(r.contains("hello from anthropic"), "{r}");
+    assert_eq!(response_body(&r), sse_body(Endpoint::Messages), "{r}");
 }
 
 #[tokio::test]
