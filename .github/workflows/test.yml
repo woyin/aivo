@@ -27,10 +27,3 @@ jobs:
           AIVO_REQUIRE_LANDLOCK: ${{ matrix.runs-on == 'ubuntu-latest' && '1' || '' }}
 
       - run: cargo clippy -- -D warnings
-
-      - uses: actions/setup-node@v5
-        with:
-          node-version: 24
-
-      - run: npm test
-        working-directory: npm

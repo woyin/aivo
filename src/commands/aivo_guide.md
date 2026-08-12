@@ -394,7 +394,7 @@ aivo plugins rm amp -y
 ## Update — `aivo update`
 
 ```bash
-aivo update                    # update to the latest (delegates to Homebrew/npm if managed)
+aivo update                    # update to the latest (delegates to Homebrew/Cargo if managed)
 aivo update --force            # force even if package-managed
 aivo update --rollback         # restore the previous version
 aivo update --sync-model-data  # refresh model metadata from models.dev

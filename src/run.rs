@@ -146,12 +146,6 @@ pub async fn run() -> ! {
     }
 
     fast_crypto_guard();
-    // One-time self-heal for npm installs on Windows: a pre-0.31.1 launcher shim
-    // hijacks `aivo update` into npm and can't replace itself. Every command but
-    // bare `aivo update` reaches this binary, so fix the shim from here (no-op
-    // once healed or on a clean install). Best-effort; never blocks startup.
-    #[cfg(windows)]
-    crate::commands::update::repair_npm_shim();
     // Must run before any reqwest client is built or `spawn_blocking` is
     // launched — reqwest snapshots proxy env at construction, and env
     // mutation is only race-free while the current-thread runtime is idle.

@@ -1,7 +1,7 @@
 # Makefile for aivo CLI
 # Quick commands for development
 
-.PHONY: build build-debug build-release test test-release npm-test check clippy clean install install-cargo fmt dev release eval-fake
+.PHONY: build build-debug build-release test test-release check clippy clean install install-cargo fmt dev release eval-fake
 
 # Default target
 .DEFAULT_GOAL := help
@@ -23,9 +23,6 @@ build-release: ## Build optimized release binary
 # keys encrypted by the normal build can't be decrypted by the test binary.
 test: ## Run all tests (isolated target dir; won't clobber target/debug/aivo)
 	CARGO_TARGET_DIR=target/test cargo test --features __internal_test_fast_crypto
-
-npm-test: ## Run npm wrapper tests
-	npm test --prefix npm
 
 test-release: ## Run tests on release build (isolated target dir)
 	CARGO_TARGET_DIR=target/test cargo test --release --features __internal_test_fast_crypto
@@ -52,8 +49,8 @@ install-cargo: ## Install debug binary to ~/.cargo/bin via cargo +1.97.0
 eval-fake: install ## Deterministic behavior eval (scripted model, no live provider)
 	AIVO_EVAL_KEY=$(AIVO_EVAL_KEY) AIVO_EVAL_MODEL=$(AIVO_EVAL_MODEL) eval/fake/run.sh
 
-dev: check test clippy npm-test ## Run all checks (check, test, clippy, npm-test)
+dev: check test clippy ## Run all checks (check, test, clippy)
 
-release: test clippy npm-test build ## Full release workflow (test, lint, npm-test, build)
+release: test clippy build ## Full release workflow (test, lint, build)
 	@echo "Release binary ready at: target/release/aivo"
 	@ls -lh target/release/aivo | awk '{print "Size:", $$5}'

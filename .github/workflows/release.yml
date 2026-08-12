@@ -171,32 +171,6 @@ jobs:
 
           echo -n "${VERSION#v}" | wrangler r2 object put "aivo-releases/latest" --pipe --remote
 
-  update-npm:
-    needs: upload-r2
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v5
-
-      - uses: actions/setup-node@v5
-        with:
-          node-version: 24
-          registry-url: https://registry.npmjs.org
-
-      - name: Set npm package version
-        run: |
-          VERSION="${{ github.ref_name }}"
-          VERSION="${VERSION#v}"
-          cd npm
-          npm pkg set version="$VERSION"
-
-      - name: Run tests
-        run: cd npm && npm test
-
-      - name: Publish to npm
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-        run: cd npm && npm publish --access public
-
   update-homebrew:
     needs: upload-r2
     runs-on: ubuntu-latest

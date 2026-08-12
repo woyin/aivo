@@ -31,10 +31,10 @@ Tests are hermetic: a pre-main sandbox (`tests/support/mod.rs`, included by ever
 > [!IMPORTANT]
 > **Tag only after CI is green on main.** `ci.yml` runs the test matrix on every `main` push. Tagging before tests pass burns the version number — a failed release can't be re-cut on the same tag, and any `chore: release vX.Y.Z` commit becomes a zombie. Push main, wait for the green check, then tag.
 
-1. Bump version in `Cargo.toml` and `npm/package.json` — never tag without bumping.
+1. Bump version in `Cargo.toml` — never tag without bumping.
 2. `cargo fmt`, `cargo clippy -- -D warnings`, `cargo test`.
 3. `cargo build --release && cargo install --path .` to verify.
-4. Stage exactly the release files (`Cargo.toml`, `Cargo.lock`, `npm/package.json`; never `git add -A`), commit `chore: release vX.Y.Z`, push main.
+4. Stage exactly the release files (`Cargo.toml`, `Cargo.lock`; never `git add -A`), commit `chore: release vX.Y.Z`, push main.
 5. Wait for CI to pass on **all three runners** (Linux, macOS, Windows) — `#[cfg(windows)]` code is invisible to Linux/macOS clippy. `gh run watch $(gh run list --workflow=ci.yml --branch=main --limit=1 --json databaseId --jq '.[0].databaseId') --exit-status`
 6. `git tag vX.Y.Z && git push origin vX.Y.Z` (triggers `release.yml`).
 
