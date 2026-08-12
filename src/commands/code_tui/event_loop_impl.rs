@@ -1841,6 +1841,12 @@ impl CodeTuiApp {
                 }
             }
 
+            match self.tick_session_mail().await {
+                Ok(true) => needs_redraw = true,
+                Ok(false) => {}
+                Err(err) => break Err(err),
+            }
+
             // Rotate the welcome tip on its interval (cheap at the idle cadence).
             if self.tick_welcome_tip() {
                 needs_redraw = true;

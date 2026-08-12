@@ -86,6 +86,7 @@ impl AgentEngine {
             file_tracker: crate::agent::file_tracker::FileTracker::default(),
             lsp: None,
             jobs: None,
+            session_mail: None,
             hooks: None,
             max_cost_usd: 0.0,
             cost_pricing: None,
@@ -147,6 +148,19 @@ impl AgentEngine {
         if first {
             self.tools_openai
                 .push(tool_to_openai(crate::agent::jobs::check_job_tool_spec()));
+        }
+    }
+
+    /// Wire the open-session mailbox and advertise `list_sessions` /
+    /// `send_session` (top-level engine only). Idempotent.
+    pub fn set_session_mail(&mut self, mail: crate::services::session_mail::SessionMail) {
+        let first = self.session_mail.is_none();
+        self.session_mail = Some(mail);
+        if first {
+            self.tools_openai
+                .push(tool_to_openai(list_sessions_tool_spec()));
+            self.tools_openai
+                .push(tool_to_openai(send_session_tool_spec()));
         }
     }
 

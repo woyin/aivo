@@ -313,6 +313,14 @@ async fn run_agent_captured(
     let import_fidelity = resumed.as_ref().and_then(|s| s.import_fidelity.clone());
     let resumed_messages = resumed.map(|s| s.messages).unwrap_or_default();
 
+    // Open-session comms: a headless run is an open session too — register
+    // presence so a peer it messages can address a reply back, and take the tools.
+    let mail =
+        crate::services::session_mail::SessionMail::new(session_store.config_dir(), &session_id);
+    let _mail_presence = crate::services::session_mail::PresenceGuard::new(mail.clone());
+    let _ = mail.register(Some(cwd.clone()), Some(model.to_string()));
+    engine.set_session_mail(mail);
+
     // Eval/CI hook: AIVO_AGENT_FAKE_SSE=<script> swaps the provider for a scripted
     // loopback model, so the real loop + real tool execution run deterministically.
     let (base, auth_opt, router_cleanup) = if let Ok(script) = std::env::var("AIVO_AGENT_FAKE_SSE")

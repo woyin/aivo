@@ -387,6 +387,9 @@ pub(super) async fn run_chat_tui(params: CodeTuiParams) -> Result<()> {
     // `--resume` could still be loading a different session id here).
     app.share.requested = share;
     let result = app.run().await;
+    // Presence off before anything else — a peer must not message a closed
+    // session. (A hard kill skips this; readers sweep by pid.)
+    app.mail_presence = None;
     // The public link dies with the chat.
     app.stop_live_share();
     app.persist_draft_history();

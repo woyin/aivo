@@ -1406,6 +1406,7 @@ pub(super) fn tool_call_target(name: &str, args: &serde_json::Value) -> String {
         "run_bash" => pick("command").to_string(),
         "web_fetch" => pick("url").to_string(),
         "web_search" => pick("query").to_string(),
+        "send_session" => pick("target").to_string(),
         _ => String::new(),
     }
 }
@@ -1449,6 +1450,14 @@ pub(super) fn tool_action_label(name: &str, args: &serde_json::Value, cwd: &str)
     }
     if name == "update_plan" {
         return "updating tasks".to_string();
+    }
+    if name == "send_session" {
+        let target = args.get("target").and_then(|v| v.as_str()).unwrap_or("");
+        return if target.is_empty() {
+            "messaging another session".to_string()
+        } else {
+            format!("messaging session {target}")
+        };
     }
     if name == "skill" {
         let s = args.get("name").and_then(|v| v.as_str()).unwrap_or("");
@@ -3091,6 +3100,17 @@ fn tool_arg_summary(name: &str, args: &serde_json::Value, cwd: &str) -> String {
         "skill" => truncate_chars(pick("name"), 60),
         // The question is the salient detail; the answer lands on the `⎿` result line.
         "ask_user" => truncate_chars(pick("question"), 72),
+        // Target session + the message itself — the exchange should read as a
+        // conversation, not a tool log.
+        "send_session" => {
+            let target = pick("target");
+            let text = pick("text");
+            if target.is_empty() {
+                truncate_chars(text, 72)
+            } else {
+                truncate_chars(&format!("{target} — {text}"), 72)
+            }
+        }
         // "subagent" is jargon — the short `label`, else the task (preamble
         // stripped), renders as the label itself (see `render_tool_call`).
         // `description`/`prompt` are Claude Code's names for the same args.

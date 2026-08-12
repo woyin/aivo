@@ -3269,6 +3269,9 @@ pub(super) struct CodeTuiApp {
     /// auto-sent (one per turn) as the preceding turn finishes — a real FIFO so
     /// a second queued message doesn't silently clobber the first.
     pub(super) queued_messages: Vec<String>,
+    /// Session-mail messages seen waiting while a turn ran; the "arrives when
+    /// this turn ends" notice fires only when this count grows.
+    pub(super) mail_waiting_seen: usize,
     /// Mid-turn steering handoff to the engine task; leftovers reclaim into
     /// `queued_messages` at turn end, cleared with it on interrupt/cancel.
     pub(super) steering_queue: SteeringQueue,
@@ -3289,6 +3292,11 @@ pub(super) struct CodeTuiApp {
     pub(super) jobs_running: usize,
     /// Last job-table poll — bounds the reap sweep to ~4Hz (the input-repaint tick is ~1ms).
     pub(super) last_jobs_poll: std::time::Instant,
+    /// Throttle for the open-session mailbox poll (`tick_session_mail`).
+    pub(super) last_mail_poll: std::time::Instant,
+    /// Holds this session's presence record on disk; dropping deregisters
+    /// (also on panic-unwind). Replaced when `/resume`//new` switches ids.
+    pub(super) mail_presence: Option<crate::services::session_mail::PresenceGuard>,
     /// FULL output of each finished `!cmd`, keyed by the history index of its
     /// `local_command` entry — the source an expanded block renders from (the
     /// transcript and on-disk session keep only a bounded preview). In-memory only,
@@ -3680,6 +3688,7 @@ impl CodeTuiApp {
             reasoning_effort: None,
             model_reasoning_efforts: Vec::new(),
             queued_messages: Vec::new(),
+            mail_waiting_seen: 0,
             steering_queue: SteeringQueue::default(),
             queued_commands: Vec::new(),
             queue_focus: None,
@@ -3687,6 +3696,8 @@ impl CodeTuiApp {
             local_command: None,
             jobs: crate::agent::jobs::JobTable::new(None),
             last_jobs_poll: std::time::Instant::now(),
+            last_mail_poll: std::time::Instant::now(),
+            mail_presence: None,
             jobs_running: 0,
             local_outputs: std::collections::HashMap::new(),
             expanded_output: std::collections::HashSet::new(),

@@ -506,6 +506,8 @@ pub struct AgentEngine {
     lsp: Option<crate::agent::lsp::LspManager>,
     /// App-owned background-job table; `None` → `check_job` unadvertised.
     jobs: Option<crate::agent::jobs::SharedJobs>,
+    /// Open-session mailbox; `None` → `list_sessions`/`send_session` unadvertised.
+    session_mail: Option<crate::services::session_mail::SessionMail>,
     /// User lifecycle hooks; `None` = none configured. Shared with sub-engines.
     hooks: Option<std::sync::Arc<crate::agent::hooks::HookSet>>,
     /// `--max-cost`: stop the turn at this estimated spend (USD; 0 = off).
@@ -611,11 +613,13 @@ fn default_reasoning_effort(model: &str) -> Option<String> {
 
 mod config;
 mod conversation;
+mod session_comms;
 mod subagent;
 mod tool_batch;
 mod turn;
 
 pub(crate) use conversation::substitute_image_parts;
+use session_comms::*;
 use subagent::*;
 
 /// Drive one agent session: a one-shot task, or an interactive REPL when none is

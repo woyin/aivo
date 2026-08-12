@@ -15,6 +15,7 @@ mod rewind;
 mod secrets_sandbox;
 mod selfcorrect;
 mod session;
+mod session_comms;
 mod subagent_profiles;
 mod subagents;
 mod thinking;

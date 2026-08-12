@@ -542,6 +542,56 @@ impl CodeTuiApp {
         Ok(())
     }
 
+    /// Poll the open-session mailbox (~700ms). Mail is claimed only when idle,
+    /// one message per tick (each becomes its own turn), so undelivered mail
+    /// survives interrupts and exits; replies always stay on disk for the
+    /// in-turn `send_session` wait polling for them.
+    pub(super) async fn tick_session_mail(&mut self) -> Result<bool> {
+        if self.last_mail_poll.elapsed() < Duration::from_millis(700) {
+            return Ok(false);
+        }
+        self.last_mail_poll = std::time::Instant::now();
+        let config_dir = self.session_store.config_dir().to_path_buf();
+        let mail = crate::services::session_mail::SessionMail::new(&config_dir, &self.session_id);
+        // Presence follows the current session id (`/resume`/`/new` switch ids);
+        // replacing the guard deregisters the old id.
+        if self.mail_presence.as_ref().map(|g| g.own_id()) != Some(self.session_id.as_str()) {
+            self.mail_presence = None;
+            let cwd = crate::services::system_env::current_dir_string();
+            if mail.register(cwd, Some(self.model.clone())).is_ok() {
+                self.mail_presence = Some(crate::services::session_mail::PresenceGuard::new(
+                    mail.clone(),
+                ));
+            }
+        }
+        if self.sending {
+            let waiting = mail.peek_count();
+            let newly_arrived = waiting > self.mail_waiting_seen;
+            if newly_arrived {
+                self.notice = Some((
+                    MUTED(),
+                    "Message from another session — arrives when this turn ends".to_string(),
+                ));
+            }
+            self.mail_waiting_seen = waiting;
+            return Ok(newly_arrived);
+        }
+        self.mail_waiting_seen = 0;
+        let Some(msg) = mail.claim_next() else {
+            return Ok(false);
+        };
+        self.notice = Some((
+            MUTED(),
+            format!(
+                "Incoming message from session {}",
+                crate::services::session_mail::short_sid(&msg.from)
+            ),
+        ));
+        self.dispatch_user_message_shown(msg.agent_frame(), None, Some(msg.transcript_display()))
+            .await?;
+        Ok(true)
+    }
+
     /// Stash a slash command typed mid-turn that needs the engine idle; it runs
     /// when the turn finishes (see `drain_queued_commands`).
     fn queue_command(&mut self, command: SlashCommand, label: &str) {
@@ -903,6 +953,10 @@ impl CodeTuiApp {
             // Durable sub-agent reports under this session's artifacts dir (survive compaction).
             engine.set_artifacts_dir(self.session_store.session_artifacts_dir(&self.session_id));
             engine.set_jobs(self.jobs.clone());
+            engine.set_session_mail(crate::services::session_mail::SessionMail::new(
+                self.session_store.config_dir(),
+                &self.session_id,
+            ));
             // LSP diagnostics-after-edit (default on; AIVO_AGENT_LSP=0 opts out).
             engine.maybe_enable_lsp(std::path::Path::new(&real_cwd));
             // User lifecycle hooks (~/.config/aivo/hooks.json).

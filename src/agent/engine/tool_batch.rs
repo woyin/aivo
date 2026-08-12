@@ -348,6 +348,10 @@ impl AgentEngine {
                 self.turn_usage.completion_tokens =
                     self.turn_usage.completion_tokens.saturating_add(sub_tokens);
                 res
+            } else if n == "list_sessions" {
+                self.list_sessions_result()
+            } else if n == "send_session" {
+                self.send_session(&call.arguments).await
             } else if n == "take_note" {
                 // Durable scratchpad (deterministic merge, capped oldest-first). Held in the engine, so it runs in the ordered pass.
                 match notes::parse_note(&call.arguments) {

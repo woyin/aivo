@@ -110,6 +110,11 @@ pub fn env_parse<T: std::str::FromStr>(var: &str) -> Option<T> {
 /// Returns true if a process with `pid` is still alive on this system. Used
 /// to prune stale registry entries and detect orphaned helper processes.
 pub fn is_pid_alive(pid: u32) -> bool {
+    // A zeroed record must read as dead — `kill(0, 0)` would probe the whole
+    // process group and answer "alive".
+    if pid == 0 {
+        return false;
+    }
     #[cfg(unix)]
     {
         // SAFETY: `kill(pid, 0)` sends no signal; it only checks whether the
