@@ -3366,7 +3366,8 @@ impl CodeTuiApp {
         tail.push(Span::styled(meter_label, Style::default().fg(meter_color)));
         let tail_w: usize = tail.iter().map(|s| display_width(s.content.as_ref())).sum();
         let live = self.share.handle.is_some();
-        let plain_chat = !self.agent_tools_enabled;
+        let plain_chat =
+            !self.agent_tools_enabled || (self.agent_capable() && self.vision_pins_plain());
         let live_badge_w = display_width(LIVE_BADGE);
         let badge_w = if live { live_badge_w + glue_w } else { 0 }
             + if plain_chat {

@@ -143,6 +143,11 @@ fn test_footer_shows_plain_chat_badge_when_agent_tools_off() {
     // Off: the badge marks plain-chat mode in the footer.
     app.agent_tools_enabled = false;
     assert!(footer_text(&mut app).contains("plain chat"));
+
+    // Tools on but an uncovered history image pins dispatch plain.
+    app.agent_tools_enabled = true;
+    pin_to_plain_chat(&mut app);
+    assert!(footer_text(&mut app).contains("plain chat"));
 }
 
 #[test]

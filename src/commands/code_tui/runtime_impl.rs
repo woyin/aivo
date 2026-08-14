@@ -453,11 +453,20 @@ impl CodeTuiApp {
         } else if route_agent {
             self.spawn_agent_turn(input, attachments, vision_shim).await;
         } else {
-            if self.agent_capable() && !attachments.is_empty() && !all_images {
+            // Warn once, on the turn that drops tools; the footer badge covers
+            // the pinned follow-ups.
+            if self.agent_capable() && !attachments.is_empty() {
                 self.notice = Some((
                     MUTED(),
-                    "Attachment sent as plain chat — agent tools are off for this message"
-                        .to_string(),
+                    if all_images {
+                        format!(
+                            "Image sent as plain chat — {} isn't known to read images, so agent tools are off from here (/new restores them)",
+                            self.model
+                        )
+                    } else {
+                        "Attachment sent as plain chat — agent tools are off for this message"
+                            .to_string()
+                    },
                 ));
             }
             // Plain chat's finish path never auto-continues — a goal falling back
@@ -634,6 +643,17 @@ impl CodeTuiApp {
     /// True when the current key can drive the in-process agent (see `key_is_agent_capable`).
     pub(super) fn agent_capable(&self) -> bool {
         crate::commands::code_agent_oneshot::key_is_agent_capable(&self.key)
+    }
+
+    /// Render-time mirror of dispatch's `stay_plain_for_vision`.
+    pub(super) fn vision_pins_plain(&self) -> bool {
+        self.model_image_input != Some(true)
+            && self.history_has_image()
+            && !(self.model_image_input == Some(false)
+                && matches!(
+                    self.describer_status(),
+                    DescriberStatus::Gateway | DescriberStatus::OwnKey { .. }
+                ))
     }
 
     pub(super) fn describer_status(&self) -> DescriberStatus {

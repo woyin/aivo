@@ -99,6 +99,22 @@ async fn mixed_attachments_keep_plain_refusal() {
 }
 
 #[tokio::test]
+async fn unknown_vision_image_turn_warns_about_tool_loss() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.model_image_input = None;
+    app.draft_attachments.push(image_attachment());
+
+    app.dispatch_user_message("look".to_string(), None)
+        .await
+        .unwrap();
+
+    assert!(app.sending, "plain-chat turn went out");
+    let msg = notice_text(&app);
+    assert!(msg.contains("agent tools are off"), "got: {msg}");
+}
+
+#[tokio::test]
 async fn known_vision_and_unknown_models_bypass_the_shim() {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let mut app = make_test_app(tx, rx);
