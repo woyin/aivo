@@ -369,12 +369,12 @@ async fn mixed_batch_orders_results_and_runs_write() {
     );
 }
 
-/// An empty completion converges the turn but isn't recorded as an assistant message (empty → invalid Anthropic content array).
+/// An empty completion is retried once; a second empty fails the turn without
+/// recording an assistant message (empty → invalid Anthropic content array).
 #[tokio::test]
 async fn empty_completion_is_not_recorded_as_assistant_turn() {
     let dir = tmp();
-    let empty = "data: {\"choices\":[{\"delta\":{}}]}\n\ndata: [DONE]\n\n".to_string();
-    let port = spawn_sse_sequence(vec![empty]);
+    let port = spawn_sse_sequence(vec![EMPTY_SSE.to_string(), EMPTY_SSE.to_string()]);
     let client = reqwest::Client::builder().no_proxy().build().unwrap();
     let base = format!("http://127.0.0.1:{port}");
     let mut engine = AgentEngine::new(&dir.display().to_string(), "m", "", &[], &[], 0, 0);
@@ -405,6 +405,165 @@ async fn empty_completion_is_not_recorded_as_assistant_turn() {
         ui.errors.iter().any(|e| e.contains("empty response")),
         "empty response must use notify_error: {:?} / {:?}",
         ui.errors,
+        ui.notices
+    );
+    assert!(
+        ui.notices.iter().any(|n| n.contains("retrying")),
+        "expected an empty-response retry notice: {:?}",
+        ui.notices
+    );
+}
+
+/// A single empty completion recovers on the retry — no error, answer intact.
+#[tokio::test]
+async fn empty_completion_retry_recovers() {
+    let dir = tmp();
+    let port = spawn_sse_sequence(vec![EMPTY_SSE.to_string(), FINAL_TEXT_SSE.to_string()]);
+    let client = reqwest::Client::builder().no_proxy().build().unwrap();
+    let base = format!("http://127.0.0.1:{port}");
+    let mut engine = AgentEngine::new(&dir.display().to_string(), "m", "", &[], &[], 0, 0);
+    let mut ui = CapturingUi::default();
+    run_session(
+        &mut engine,
+        &turn_ctx(&client, &base, &dir),
+        Some("hi".into()),
+        &mut ui,
+    )
+    .await;
+
+    assert_eq!(ui.text, "done");
+    assert!(
+        ui.errors.is_empty(),
+        "recovered turn must not error: {:?}",
+        ui.errors
+    );
+    assert!(ui.notices.iter().any(|n| n.contains("empty response")));
+    assert_eq!(engine.messages.last().unwrap()["content"], "done");
+}
+
+/// A kept text-only partial gets one continue nudge; the follow-up completes the answer.
+#[tokio::test]
+async fn truncated_reply_is_continued_with_a_nudge() {
+    let dir = tmp();
+    let partial = "data: {\"choices\":[{\"delta\":{\"content\":\"part one\"}}]}\n\n".to_string();
+    let port = spawn_sse_sequence_cut(vec![(partial, true), (FINAL_TEXT_SSE.to_string(), false)]);
+    let client = reqwest::Client::builder().no_proxy().build().unwrap();
+    let base = format!("http://127.0.0.1:{port}");
+    let mut engine = AgentEngine::new(&dir.display().to_string(), "m", "", &[], &[], 0, 0);
+    let mut ui = CapturingUi::default();
+    run_session(
+        &mut engine,
+        &turn_ctx(&client, &base, &dir),
+        Some("explain".into()),
+        &mut ui,
+    )
+    .await;
+
+    let nudge_idx = engine
+        .messages
+        .iter()
+        .position(|m| {
+            m["content"]
+                .as_str()
+                .is_some_and(|c| c.contains("cut off mid-stream"))
+        })
+        .expect("expected a truncated-continue nudge in history");
+    assert_eq!(engine.messages[nudge_idx]["role"], "user");
+    assert_eq!(engine.messages[nudge_idx - 1]["role"], "assistant");
+    assert_eq!(engine.messages[nudge_idx - 1]["content"], "part one");
+    assert_no_consecutive_user(&engine.messages);
+    assert!(
+        ui.notices
+            .iter()
+            .any(|n| n.contains("asking the model to continue")),
+        "expected a continue notice: {:?}",
+        ui.notices
+    );
+    assert!(
+        ui.errors.is_empty(),
+        "a continued reply must not raise the incomplete error: {:?}",
+        ui.errors
+    );
+    assert_eq!(engine.messages.last().unwrap()["content"], "done");
+}
+
+/// SSE body meant to be cut short: a text delta plus a mid-assembly tool call,
+/// so the drop surfaces as a retryable `Err` (not a kept `Ok(truncated)`).
+fn cut_partial_tool(text: &str) -> String {
+    format!(
+        "data: {}\n\ndata: {}\n\n",
+        json!({"choices":[{"delta":{"content": text}}]}),
+        json!({"choices":[{"delta":{"tool_calls":[{
+            "index": 0, "id": "c1",
+            "function": {"name": "read_file", "arguments": "{\"pa"}
+        }]}}]}),
+    )
+}
+
+/// A retryable failure after a small streamed partial discards it and retries.
+#[tokio::test]
+async fn small_streamed_partial_is_discarded_and_retried() {
+    unsafe { std::env::set_var("AIVO_AGENT_RETRY_BASE_MS", "1") };
+    let dir = tmp();
+    let port = spawn_sse_sequence_cut(vec![
+        (cut_partial_tool("chk"), true),
+        (FINAL_TEXT_SSE.to_string(), false),
+    ]);
+    let client = reqwest::Client::builder().no_proxy().build().unwrap();
+    let base = format!("http://127.0.0.1:{port}");
+    let mut engine = AgentEngine::new(&dir.display().to_string(), "m", "", &[], &[], 0, 0);
+    let mut ui = CapturingUi::default();
+    run_session(
+        &mut engine,
+        &turn_ctx(&client, &base, &dir),
+        Some("check the file".into()),
+        &mut ui,
+    )
+    .await;
+
+    assert_eq!(
+        ui.discards, 1,
+        "the small partial must be discarded pre-retry"
+    );
+    // CapturingUi clears streamed text on discard, so only the retry's answer remains.
+    assert_eq!(ui.text, "done");
+    assert!(ui.notices.iter().any(|n| n.contains("retrying")));
+    assert!(ui.errors.is_empty(), "retry must succeed: {:?}", ui.errors);
+    assert!(
+        !engine
+            .messages
+            .iter()
+            .any(|m| m["content"].as_str().is_some_and(|c| c.contains("chk"))),
+        "the discarded partial must not be recorded"
+    );
+}
+
+/// A retryable failure after a LARGE streamed partial stays terminal (no re-render).
+#[tokio::test]
+async fn large_streamed_partial_is_not_retried() {
+    let dir = tmp();
+    let big = "x".repeat(DISCARD_RETRY_MAX_STREAMED + 1);
+    let port = spawn_sse_sequence_cut(vec![(cut_partial_tool(&big), true)]);
+    let client = reqwest::Client::builder().no_proxy().build().unwrap();
+    let base = format!("http://127.0.0.1:{port}");
+    let mut engine = AgentEngine::new(&dir.display().to_string(), "m", "", &[], &[], 0, 0);
+    let mut ui = CapturingUi::default();
+    run_session(
+        &mut engine,
+        &turn_ctx(&client, &base, &dir),
+        Some("check the file".into()),
+        &mut ui,
+    )
+    .await;
+
+    assert_eq!(ui.discards, 0, "a large partial must not be discarded");
+    assert!(
+        !ui.errors.is_empty(),
+        "the failure must surface as a terminal error"
+    );
+    assert!(
+        !ui.notices.iter().any(|n| n.contains("retrying")),
+        "no retry after a large partial: {:?}",
         ui.notices
     );
 }

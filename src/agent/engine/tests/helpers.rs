@@ -176,21 +176,31 @@ pub(super) fn drain_request(sock: &mut std::net::TcpStream) {
 }
 
 pub(super) fn spawn_sse_sequence(bodies: Vec<String>) -> u16 {
+    spawn_sse_sequence_cut(bodies.into_iter().map(|b| (b, false)).collect())
+}
+
+/// Like [`spawn_sse_sequence`], but a body flagged `true` over-claims its
+/// Content-Length then closes — a mid-stream drop (cf. `serve_client`'s
+/// `keeps_partial_text_on_midstream_error` mock).
+pub(super) fn spawn_sse_sequence_cut(bodies: Vec<(String, bool)>) -> u16 {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
     std::thread::spawn(move || {
-        for body in bodies {
+        for (body, cut) in bodies {
             let Ok((mut sock, _)) = listener.accept() else {
                 break;
             };
             drain_request(&mut sock);
+            let claimed = body.len() + if cut { 200 } else { 0 };
             let resp = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                body.len(),
-                body
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {claimed}\r\nConnection: close\r\n\r\n{body}"
             );
             let _ = sock.write_all(resp.as_bytes());
             let _ = sock.flush();
+            if cut {
+                // Let reqwest deliver the partial chunk before the short close.
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
         }
     });
     port
@@ -218,6 +228,9 @@ pub(super) const WRITE_TOOL_SSE: &str = "data: {\"choices\":[{\"delta\":{\"tool_
 
 pub(super) const FINAL_TEXT_SSE: &str =
     "data: {\"choices\":[{\"delta\":{\"content\":\"done\"}}]}\n\ndata: [DONE]\n\n";
+
+/// A completion with no content and no tool calls.
+pub(super) const EMPTY_SSE: &str = "data: {\"choices\":[{\"delta\":{}}]}\n\ndata: [DONE]\n\n";
 
 /// Tool-result message contents from history, in order.
 pub(super) fn tool_result_texts(engine: &AgentEngine) -> Vec<String> {

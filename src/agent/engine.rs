@@ -44,6 +44,16 @@ const LEAKED_TOOL_CALL_PLACEHOLDER: &str =
     "(I wrote a tool call as text by mistake; reissuing it properly.)";
 /// Auto-retry budget for transient LLM/network failures.
 const MAX_RETRIES: usize = 3;
+/// Retry cap on visible streamed chars (reasoning excluded): up to this much, the UI
+/// discards the partial and the step re-runs; more would re-render text already read.
+const DISCARD_RETRY_MAX_STREAMED: usize = 200;
+/// Retry budget for an empty completion (usually a transient provider/bridge glitch).
+const MAX_EMPTY_RETRIES: usize = 1;
+/// Cap on continue-after-truncation nudges per turn.
+const MAX_TRUNCATED_NUDGES: usize = 1;
+const TRUNCATED_CONTINUE_NUDGE: &str = "Your reply was cut off mid-stream by a dropped \
+connection; everything above the cut was kept. Continue from exactly where it stopped — don't \
+repeat what you already wrote and don't restart the answer.";
 /// Step cap for a `subagent` run — below the top-level budget so a delegated subtask can't run away.
 const SUBAGENT_MAX_STEPS: u32 = 20;
 /// Max sub-agents run concurrently when the model fans out several in one batch — a
@@ -159,7 +169,8 @@ pub trait AgentUi: Send {
     fn assistant_text(&mut self, delta: &str);
     /// A streamed reasoning/thinking delta (separate from the visible reply). Default no-op.
     fn assistant_reasoning(&mut self, _delta: &str) {}
-    /// Drop the just-streamed segment — it was a tool call written as text (stripped + retried). Default no-op.
+    /// Drop the just-streamed segment before the step retries (leaked tool-call
+    /// markup, or a small partial before a retryable failure). Default no-op.
     fn discard_streamed_segment(&mut self) {}
     /// The agent set/updated its plan via `update_plan`; rendered as a checklist card. Default no-op.
     fn plan_updated(&mut self, _items: &[PlanItem]) {}

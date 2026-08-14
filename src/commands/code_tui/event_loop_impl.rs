@@ -437,9 +437,8 @@ impl CodeTuiApp {
         total
     }
 
-    /// Drop the in-flight segment's streamed text (typed + buffered) before it
-    /// commits; the engine flagged it as a tool call written as text. Reasoning is
-    /// left to commit with the retry's segment.
+    /// Drop the in-flight segment's streamed text (typed + buffered) before the
+    /// engine retries the step; reasoning is left to commit with the retry's segment.
     pub(super) fn discard_streamed_segment(&mut self) {
         self.incoming_buffer.clear();
         self.pending_response.clear();

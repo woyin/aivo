@@ -70,6 +70,8 @@ impl AgentEngine {
         let mut leaked_nudges = 0usize;
         let mut completion_nudges = 0usize;
         let mut plan_nudges = 0usize;
+        let mut truncated_nudges = 0usize;
+        let mut empty_retries = 0usize;
         // Keeps a stale plan from an earlier turn from triggering the nudge.
         let mut plan_set_this_turn = false;
         // Post-edit self-verification (opt-in): the project's validator, detected once.
@@ -127,22 +129,25 @@ impl AgentEngine {
             ui.turn_start();
             // Seed the live context-fill; the measured total replaces it once the step returns.
             ui.context_usage(self.estimated_context_tokens(), false);
-            // Auto-retry transient failures with backoff — only when nothing streamed yet (re-streaming double-renders).
+            // Auto-retry transient failures with backoff.
             let mut retries = 0usize;
             let mut forced_compactions = 0usize;
             let mut terminal_error = false;
             let message = loop {
-                let mut streamed = false;
+                let mut streamed_any = false;
+                let mut streamed_text = 0usize;
                 let result = serve_client::complete(
                     ctx.client,
                     ctx.serve_base,
                     ctx.auth,
                     &request,
                     &mut |delta| {
-                        // Any streamed output means a retry would double-render.
-                        streamed = true;
+                        streamed_any = true;
                         match delta {
-                            serve_client::StreamDelta::Text(t) => ui.assistant_text(t),
+                            serve_client::StreamDelta::Text(t) => {
+                                streamed_text += t.chars().count();
+                                ui.assistant_text(t);
+                            }
                             serve_client::StreamDelta::Reasoning(r) => ui.assistant_reasoning(r),
                         }
                     },
@@ -150,8 +155,16 @@ impl AgentEngine {
                 .await;
                 match result {
                     Ok(m) => break m,
-                    Err(e) if retries < MAX_RETRIES && !streamed && error_is_retryable(&e) => {
+                    Err(e)
+                        if retries < MAX_RETRIES
+                            && streamed_text <= DISCARD_RETRY_MAX_STREAMED
+                            && error_is_retryable(&e) =>
+                    {
                         retries += 1;
+                        // Drop the partial so the retry's stream doesn't render twice.
+                        if streamed_any {
+                            ui.discard_streamed_segment();
+                        }
                         // Show the wait so a Retry-After pause doesn't read as a frozen UI.
                         let delay = retry_delay(retries, e.retry_after);
                         let wait = if delay.as_secs() >= 2 {
@@ -169,7 +182,7 @@ impl AgentEngine {
                     // rejection, force-fit, retry — else the 400 is terminal and re-sends every turn.
                     Err(e)
                         if forced_compactions < MAX_FORCED_COMPACTIONS
-                            && !streamed
+                            && !streamed_any
                             && is_context_overflow_error(&e.message) =>
                     {
                         forced_compactions += 1;
@@ -198,12 +211,12 @@ impl AgentEngine {
                 converged = true;
                 break;
             }
-            if message.truncated {
-                // The kept partial must not pass for a complete answer.
-                ui.notify_error(
-                    "the connection dropped mid-reply — the answer above may be incomplete",
-                );
-            }
+            // The truncated gate below relies on `serve_client` bailing to Err on a
+            // mid-assembly tool call.
+            debug_assert!(
+                !message.truncated || message.tool_calls.is_empty(),
+                "truncated message carries tool calls — update the truncated gate"
+            );
             steps += 1;
             if let Some(m) = &message.model {
                 self.billed_model = Some(m.clone());
@@ -268,6 +281,12 @@ impl AgentEngine {
             let no_output = message.tool_calls.is_empty()
                 && message.content.as_deref().is_none_or(str::is_empty);
             if no_output {
+                // Nothing was recorded, so re-sending the identical request is safe.
+                if empty_retries < MAX_EMPTY_RETRIES {
+                    empty_retries += 1;
+                    ui.notify("the model returned an empty response — retrying…");
+                    continue;
+                }
                 // No answer = a failed turn: the error channel persists it, skips
                 // the `✻ Done` marker, and fails a headless run closed.
                 ui.notify_error("the model returned an empty response — no answer produced");
@@ -305,10 +324,27 @@ impl AgentEngine {
             self.messages.push(assistant_to_openai(&message));
 
             if message.tool_calls.is_empty() {
+                // A kept truncated partial isn't a finished answer — nudge the model
+                // to continue (bounded).
+                if message.truncated {
+                    if truncated_nudges < MAX_TRUNCATED_NUDGES {
+                        truncated_nudges += 1;
+                        ui.notify(
+                            "the connection dropped mid-reply — asking the model to continue",
+                        );
+                        self.push_text_turn("user", TRUNCATED_CONTINUE_NUDGE.to_string());
+                        continue;
+                    }
+                    ui.notify_error(
+                        "the connection dropped mid-reply — the answer above may be incomplete",
+                    );
+                }
                 // A text-only turn that isn't actually done shouldn't be accepted as the
                 // final answer — nudge once (bounded). The assistant turn is already
                 // recorded above, so the user nudge keeps role alternation.
+                // Truncation is exempt: the gate above already charged that cause.
                 if self.require_completion
+                    && !message.truncated
                     && completion_nudges < MAX_COMPLETION_NUDGES
                     && message.content.as_deref().is_some_and(|c| {
                         guards::is_incomplete_answer(c) || guards::ends_with_continuation_cue(c)

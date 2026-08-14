@@ -235,7 +235,9 @@ async fn subagent_no_answer_is_a_failed_tool_result() {
     let call = tool_call_sse("subagent", json!({"task": "do a thing"}));
     let port = spawn_sse_sequence(vec![
         call,
-        "data: [DONE]\n\n".to_string(), // sub converges with no text at all
+        // Sub converges with no text at all — twice, past the empty-retry.
+        "data: [DONE]\n\n".to_string(),
+        "data: [DONE]\n\n".to_string(),
         FINAL_TEXT_SSE.to_string(),
     ]);
     let client = reqwest::Client::builder().no_proxy().build().unwrap();
