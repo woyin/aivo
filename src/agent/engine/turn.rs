@@ -408,7 +408,7 @@ impl AgentEngine {
                 }
                 // Unattended: don't silently accept a text answer over an unfinished
                 // plan — bounded nudge toward honest closure, then convergence
-                // (and the plan auto-complete below) proceeds as before.
+                // proceeds as before.
                 if self.require_completion
                     && !self.read_only
                     && completion_nudges < MAX_COMPLETION_NUDGES
@@ -436,11 +436,8 @@ impl AgentEngine {
                     continue;
                 }
                 converged = true; // answered without calling tools
-                // Finalize a started plan on real convergence so it can't linger as
-                // "0/N done". Gated on `started` — an all-pending plan (planned then converged) is left alone.
-                if plan::started(&self.plan) && plan::complete_all(&mut self.plan) {
-                    ui.plan_updated(&self.plan);
-                }
+                // No plan auto-complete: `update_plan` is the only source of step
+                // status, so a step the model never finished stays visibly unfinished.
                 break;
             }
 

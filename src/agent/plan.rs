@@ -142,20 +142,6 @@ pub fn normalize_progress(items: &mut [PlanItem]) -> bool {
     changed
 }
 
-/// Mark every step `completed`. Returns whether anything changed. The engine
-/// calls this when a turn converges so a plan can't linger as "0/N done" because
-/// the model produced its final answer but forgot to flip the last steps.
-pub fn complete_all(items: &mut [PlanItem]) -> bool {
-    let mut changed = false;
-    for item in items.iter_mut() {
-        if item.status != PlanStatus::Completed {
-            item.status = PlanStatus::Completed;
-            changed = true;
-        }
-    }
-    changed
-}
-
 /// Render the plan as a bare checklist for the compaction "pinned working set"
 /// (no count header — that's `confirmation`'s job). Empty slice → empty string
 /// so the caller can omit the section entirely.
@@ -262,17 +248,10 @@ mod tests {
     }
 
     #[test]
-    fn started_and_complete_all() {
-        use PlanStatus::*;
+    fn started_detects_any_non_pending_step() {
         assert!(!started(&plan(&["pending", "pending"])));
         assert!(started(&plan(&["pending", "in_progress"])));
         assert!(started(&plan(&["completed"])));
-
-        let mut p = plan(&["completed", "in_progress", "pending"]);
-        assert!(complete_all(&mut p));
-        assert_eq!(statuses(&p), [Completed, Completed, Completed]);
-        // Idempotent: an already-finished plan reports no change.
-        assert!(!complete_all(&mut p));
     }
 
     #[test]

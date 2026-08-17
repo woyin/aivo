@@ -30,12 +30,12 @@ async fn engine_handles_update_plan() {
     )
     .await;
 
-    // Model's update (2 steps), then the engine's finalization on convergence.
-    assert_eq!(ui.plans, vec![2, 2], "plan_updated should fire twice");
+    // Only the model's update fires — convergence never rewrites step status.
+    assert_eq!(ui.plans, vec![2], "plan_updated should fire once");
     assert_eq!(
         ui.last_plan,
-        vec![PlanStatus::Completed, PlanStatus::Completed],
-        "a converged turn finalizes a started plan to all-completed"
+        vec![PlanStatus::Completed, PlanStatus::InProgress],
+        "statuses stay as the model set them"
     );
     assert!(
         !ui.tools.contains(&"update_plan".to_string()),
@@ -52,9 +52,10 @@ async fn engine_handles_update_plan() {
     );
 }
 
-/// A started plan the model never finished is finalized by the engine on convergence (the "0/N done" stuck-card bug).
+/// A started plan the model never finished stays honestly unfinished on
+/// convergence — `update_plan` is the only source of step status.
 #[tokio::test]
-async fn engine_finalizes_started_plan_on_convergence() {
+async fn engine_leaves_unfinished_plan_honest_on_convergence() {
     let dir = tmp();
     let plan = tool_call_sse(
         "update_plan",
@@ -77,15 +78,15 @@ async fn engine_finalizes_started_plan_on_convergence() {
     )
     .await;
 
-    assert_eq!(ui.plans, vec![3, 3]);
+    assert_eq!(ui.plans, vec![3]);
     assert_eq!(
         ui.last_plan,
         vec![
-            PlanStatus::Completed,
-            PlanStatus::Completed,
-            PlanStatus::Completed
+            PlanStatus::InProgress,
+            PlanStatus::Pending,
+            PlanStatus::Pending
         ],
-        "every step is completed once the turn converges"
+        "no step is fabricated as completed on convergence"
     );
 }
 
