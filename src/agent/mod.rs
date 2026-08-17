@@ -10,6 +10,7 @@ pub mod checkpoint;
 pub mod compaction;
 pub mod engine;
 pub mod file_tracker;
+pub mod finish;
 pub mod grant_store;
 pub mod guards;
 pub mod hooks;

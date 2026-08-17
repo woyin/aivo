@@ -278,8 +278,9 @@ async fn subagent_early_stop_with_text_is_flagged_partial() {
         }}]});
         format!("data: {delta}\n\ndata: [DONE]\n\n")
     };
+    // Twice the limit: the first trip is a strategy reset; the relapse stops.
     let mut bodies = vec![call];
-    bodies.extend(std::iter::repeat_n(looping_sub_turn, REPEAT_LIMIT));
+    bodies.extend(std::iter::repeat_n(looping_sub_turn, REPEAT_LIMIT * 2));
     bodies.push(FINAL_TEXT_SSE.to_string());
     let port = spawn_sse_sequence(bodies);
     let client = reqwest::Client::builder().no_proxy().build().unwrap();
@@ -303,6 +304,85 @@ async fn subagent_early_stop_with_text_is_flagged_partial() {
     assert!(
         report.contains("partial findings so far"),
         "the partial answer must still reach the parent: {report}"
+    );
+}
+
+/// A delegate inherits the parent turn's remaining output-token budget: one that
+/// burns past it comes back a flagged partial, not an unbounded green success.
+#[tokio::test]
+async fn subagent_inherits_parent_output_budget_and_stops() {
+    let dir = tmp();
+    // The sub's first step reports usage far past the parent's cap.
+    let over_budget_sub_turn = {
+        let delta = json!({"choices":[{"delta":{
+            "content": "partial investigation",
+            "tool_calls":[{
+                "index": 0, "id": "c1",
+                "function": {"name": "run_bash", "arguments": json!({"command": "echo probe"}).to_string()}
+            }]
+        }}], "usage": {"prompt_tokens": 10, "completion_tokens": 5000}});
+        format!("data: {delta}\n\ndata: [DONE]\n\n")
+    };
+    let port = spawn_sse_sequence(vec![
+        tool_call_sse("subagent", json!({"task": "investigate"})),
+        over_budget_sub_turn,
+        FINAL_TEXT_SSE.to_string(),
+    ]);
+    let client = reqwest::Client::builder().no_proxy().build().unwrap();
+    let base = format!("http://127.0.0.1:{port}");
+    let mut engine = AgentEngine::new(&dir.display().to_string(), "m", "", &[], &[], 0, 0);
+    engine.set_output_budget(100);
+    let mut ui = CapturingUi::default();
+    run_session(
+        &mut engine,
+        &turn_ctx(&client, &base, &dir),
+        Some("delegate it".into()),
+        &mut ui,
+    )
+    .await;
+    assert_eq!(ui.tool_errors, vec!["subagent"], "must render as a failure");
+    let texts = tool_result_texts(&engine);
+    let report = texts
+        .iter()
+        .find(|t| t.contains("[stopped: reached the per-turn output-token budget"))
+        .unwrap_or_else(|| panic!("budget-stop flag missing from history: {texts:?}"));
+    assert!(report.contains("partial investigation"), "{report}");
+}
+
+/// A delegate that self-reports blocked via `finish_turn` is a FAILED result —
+/// there is no user down there, so the parent must reroute or surface it.
+#[tokio::test]
+async fn subagent_blocked_finish_is_a_failed_tool_result() {
+    let dir = tmp();
+    let port = spawn_sse_sequence(vec![
+        tool_call_sse("subagent", json!({"task": "deploy it"})),
+        tool_call_sse(
+            "finish_turn",
+            json!({"status": "blocked", "summary": "cannot deploy", "blocker": "missing credentials"}),
+        ),
+        FINAL_TEXT_SSE.to_string(),
+    ]);
+    let client = reqwest::Client::builder().no_proxy().build().unwrap();
+    let base = format!("http://127.0.0.1:{port}");
+    let mut engine = AgentEngine::new(&dir.display().to_string(), "m", "", &[], &[], 0, 0);
+    let mut ui = CapturingUi::default();
+    run_session(
+        &mut engine,
+        &turn_ctx(&client, &base, &dir),
+        Some("delegate it".into()),
+        &mut ui,
+    )
+    .await;
+    assert_eq!(ui.tool_errors, vec!["subagent"], "must render as a failure");
+    let texts = tool_result_texts(&engine);
+    let report = texts
+        .iter()
+        .find(|t| t.contains("[delegate reported blocked:"))
+        .unwrap_or_else(|| panic!("blocked flag missing from history: {texts:?}"));
+    assert!(report.contains("missing credentials"), "{report}");
+    assert!(
+        report.contains("cannot deploy"),
+        "the summary must still reach the parent: {report}"
     );
 }
 

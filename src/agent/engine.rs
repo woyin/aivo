@@ -62,6 +62,8 @@ const SUBAGENT_MAX_STEPS: u32 = 20;
 const SUBAGENT_PARALLEL_CAP: usize = 4;
 /// Cap on completion-gate re-nudges (unattended `-e`), so a stubborn model can't loop.
 const MAX_COMPLETION_NUDGES: usize = 2;
+/// Cap on premature-`finish_turn(done)` rejections per turn; then fail open.
+const MAX_FINISH_REJECTIONS: usize = 2;
 /// Cap on self-correct verify→fix rounds, so a stubborn failure can't loop the run.
 const MAX_SELFCORRECT_ATTEMPTS: usize = 3;
 const VERIFY_FAILED_PREFIX: &str = "The project's checks are failing, so the task isn't done. \
@@ -73,6 +75,14 @@ to continue. Address the following, then finish:";
 /// Prefix of the artifact-pointer line; compaction preserves it so the parent can
 /// `read_file` a cleared sub-agent report back.
 pub(crate) const ARTIFACT_POINTER_PREFIX: &str = "[full report saved: ";
+/// A→B→A→B cycles count as no-progress too (≈ [`REPEAT_LIMIT`] sightings per side).
+const ALT_REPEAT_LIMIT: usize = 4;
+/// The first no-progress trip nudges a change of approach; only a relapse stops.
+const MAX_STRATEGY_RESETS: usize = 1;
+const STRATEGY_RESET: &str = "[no-progress guard] You are repeating actions without gaining new \
+information. Stop and reset: record what you tried and what it showed (take_note the dead ends), \
+then take a genuinely different approach — a different tool, target, or strategy. If no \
+alternative exists, state exactly what's blocking you and finish (finish_turn status \"blocked\").";
 /// Guard-stop notice text (display only — drivers get the typed [`TurnStop`]).
 pub(crate) const STOP_NO_PROGRESS: &str =
     "stopping: the model repeated the same action with no progress";
@@ -80,6 +90,10 @@ pub(crate) const STOP_TOOL_FAILURE: &str = "stopping: a tool call kept failing t
 const COMPLETION_NUDGE: &str = "That may not be finished. If the task is genuinely complete, \
 briefly confirm what you did and verified, then stop. Otherwise keep going — don't stop until \
 it's done or you're truly blocked (then say exactly what's blocking you).";
+const FINISH_NUDGE: &str = "The plan still has unfinished steps. Finish them now, or make the \
+record honest: update the plan (mark steps blocked, or remove them with a reason) and call \
+`finish_turn` with the real status — `done` only if the task is truly complete, otherwise \
+`blocked` or `needs_user` with specifics.";
 /// Cap on unstarted-plan nudges per turn.
 const MAX_PLAN_NUDGES: usize = 1;
 const PLAN_NUDGE: &str = "You set a plan this turn but haven't started any of its steps. \
@@ -208,6 +222,8 @@ pub trait AgentUi: Send {
     /// The turn ended early for `stop` (also announced via `notify` for display).
     /// Default no-op.
     fn turn_stopped(&mut self, _stop: TurnStop) {}
+    /// The turn converged via an accepted `finish_turn` report. Default no-op.
+    fn turn_finished(&mut self, _report: &crate::agent::finish::FinishReport) {}
     /// Like [`notify`](Self::notify) but for a genuine error (error hue). Default delegates to `notify`.
     fn notify_error(&mut self, text: &str) {
         self.notify(text);
@@ -527,6 +543,10 @@ pub struct AgentEngine {
     /// also stales pinned pass evidence. Starts true (tree state unknown);
     /// [`Self::set_verified_baseline`] clears it.
     pub(crate) dirty_since_verify: bool,
+    /// Accepted `finish_turn` report for the current turn; reset at turn start.
+    finish_report: Option<crate::agent::finish::FinishReport>,
+    /// Premature-`done` rejections this turn; at the cap the next finish is accepted.
+    finish_rejections: usize,
     /// Interactive chat only (off for headless/sub-agents): see [`CONFIRM_BEFORE_BUILD`].
     confirm_before_build: bool,
     /// First-party branding (aivo-starter): present as aivo, not the upstream model.

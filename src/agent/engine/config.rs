@@ -26,6 +26,7 @@ impl AgentEngine {
             specs.push(skills::skill_tool_spec(skills));
         }
         specs.push(plan::plan_tool_spec());
+        specs.push(crate::agent::finish::finish_tool_spec());
         specs.push(notes::note_tool_spec());
         specs.push(crate::agent::memory::memory_tool_spec());
         specs.push(crate::agent::memory::memory_search_tool_spec());
@@ -79,6 +80,8 @@ impl AgentEngine {
             require_completion: false,
             self_correct: false,
             dirty_since_verify: true,
+            finish_report: None,
+            finish_rejections: 0,
             confirm_before_build: false,
             first_party: false,
             session_controls: false,
@@ -472,6 +475,11 @@ plan-approval card — suggest it when a task deserves real design discussion.",
     /// the chat TUI folds it into the chat session index for `aivo stats`.
     pub fn take_turn_usage(&mut self) -> SessionTokens {
         std::mem::take(&mut self.turn_usage)
+    }
+
+    /// The turn's accepted `finish_turn` report, if the model ended it with one.
+    pub fn take_finish_report(&mut self) -> Option<crate::agent::finish::FinishReport> {
+        self.finish_report.take()
     }
 
     /// Upstream model echoed by this session's responses, when any step carried one.

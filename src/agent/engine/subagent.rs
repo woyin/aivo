@@ -69,8 +69,9 @@ impl AgentEngine {
             self.tools_openai.retain(|t| {
                 let name = t["function"]["name"].as_str().unwrap_or("");
                 let is_editor = matches!(name, "edit_file" | "multi_edit" | "apply_patch");
-                // update_plan/take_note have no side effects, so a scoped specialist always keeps them.
+                // update_plan/finish_turn/take_note have no side effects, so a scoped specialist always keeps them.
                 name == "update_plan"
+                    || name == "finish_turn"
                     || name == "take_note"
                     || allowed.contains(&name)
                     || (is_editor && editor_allowed)
@@ -97,6 +98,7 @@ impl AgentEngine {
     /// can run concurrently without sharing the UI. `require_isolation` (parallel
     /// batches): a delegate that asked for a worktree fails instead of falling
     /// back to the shared workspace, where concurrent writers would collide.
+    #[allow(clippy::too_many_arguments)]
     pub(super) async fn run_subagent(
         &self,
         ctx: &TurnCtx<'_>,
@@ -105,6 +107,7 @@ impl AgentEngine {
         base: u64,
         args: &Value,
         require_isolation: bool,
+        budget_share: usize,
     ) -> (Result<String, String>, u64) {
         // Fallback keys are Claude Code's names, so a Task-vocabulary call still delegates.
         let str_arg = |keys: &[&str]| {
@@ -225,6 +228,24 @@ Fix the repo state or run it alone."
         {
             sub.set_reasoning_effort(effort.clone());
         }
+        // A delegate is capped at the parent turn's remaining budget, split across a
+        // parallel batch; its own breaker then stops it typed instead of burning unbounded.
+        let share = budget_share.max(1) as u64;
+        if self.max_output_tokens > 0 {
+            let remaining = self.max_output_tokens.saturating_sub(base).max(1);
+            sub.set_output_budget((remaining / share).max(1));
+        }
+        // Cost only when the delegate runs the parent's model — pricing wouldn't transfer.
+        if self.max_cost_usd > 0.0
+            && model == self.model
+            && let Some(p) = self.cost_pricing
+        {
+            let spent = p.cost_usd(&self.turn_usage).unwrap_or(0.0);
+            let remaining = self.max_cost_usd - spent;
+            if remaining > 0.0 {
+                sub.set_cost_budget(remaining / share as f64, p);
+            }
+        }
         // Share the parent's external tools (MCP), reusing the already-connected servers.
         if let Some(ext) = &self.external {
             sub.set_external_tools(ext.clone());
@@ -262,7 +283,12 @@ Fix the repo state or run it alone."
         // Box the recursive future (run_turn → subagent → run_turn) so it isn't infinitely-sized.
         Box::pin(sub.run_turn(&sub_ctx, &mut ui, task.to_string())).await;
         // An early stop fails the run even with text — the report may be partial.
-        let failed = ui.answer().is_empty() || ui.stop.is_some();
+        // So does a self-reported blocked/needs_user finish (there's no user here).
+        let finish_not_done = ui
+            .finish
+            .as_ref()
+            .is_some_and(|f| f.status != crate::agent::finish::FinishStatus::Done);
+        let failed = ui.answer().is_empty() || ui.stop.is_some() || finish_not_done;
         if let Some((s, slot)) = &ui.sink {
             s.done(*slot, !failed, ui.steps, ui.tokens);
         }
@@ -271,6 +297,14 @@ Fix the repo state or run it alone."
             msg = format!(
                 "[stopped: {} — result may be partial]\n\n{msg}",
                 stop.describe()
+            );
+        } else if let Some(f) = ui.finish.as_ref().filter(|f| {
+            f.status != crate::agent::finish::FinishStatus::Done && !ui.answer().is_empty()
+        }) {
+            msg = format!(
+                "[delegate reported {}: {}]\n\n{msg}",
+                f.status.wire_name(),
+                f.blocker.as_deref().unwrap_or("no blocker given")
             );
         }
         if let Some(g) = guard {
@@ -471,6 +505,8 @@ pub(super) struct SubagentUi<'a> {
     pub(super) last_forwarded: u64,
     /// Why the sub-run stopped early (budget/guard), if it did.
     pub(super) stop: Option<TurnStop>,
+    /// The sub-run's accepted `finish_turn` report, if it ended with one.
+    pub(super) finish: Option<crate::agent::finish::FinishReport>,
 }
 
 /// Streamed growth must move the estimate this much before it forwards again,
@@ -585,6 +621,13 @@ impl AgentUi for SubagentUi<'_> {
     }
     fn turn_stopped(&mut self, stop: TurnStop) {
         self.stop.get_or_insert(stop);
+    }
+    fn turn_finished(&mut self, report: &crate::agent::finish::FinishReport) {
+        // A finish with no streamed text still yields an answer: the summary.
+        if self.answer().is_empty() {
+            self.cur_text = report.summary.clone();
+        }
+        self.finish = Some(report.clone());
     }
     fn ask_permission<'a>(
         &'a mut self,

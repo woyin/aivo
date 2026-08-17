@@ -80,6 +80,15 @@ impl AgentEngine {
                 outcomes[i] = Some(Ok(content));
                 continue;
             }
+            // Engine-handled convergence report; a rejection is a normal tool error.
+            if n == "finish_turn" {
+                ui.tool_start(n, &call.arguments);
+                outcomes[i] = Some(
+                    self.handle_finish_request(ctx, ui, tool_calls.len(), &call.arguments)
+                        .await,
+                );
+                continue;
+            }
             ui.tool_start(n, &call.arguments);
             // Backstop for a hallucinated mutating tool (also hidden from the schema).
             if self.read_only && tools::is_mutating(n) && n != "run_bash" {
@@ -257,7 +266,15 @@ impl AgentEngine {
                         };
                         let s = sink.clone().map(|s| (s, slot));
                         let (res, toks) = this
-                            .run_subagent(ctx, None, s, base, &tool_calls[i].arguments, true)
+                            .run_subagent(
+                                ctx,
+                                None,
+                                s,
+                                base,
+                                &tool_calls[i].arguments,
+                                true,
+                                subagent_idx.len(),
+                            )
                             .await;
                         done.lock().unwrap().push((i, res, toks));
                     }
@@ -342,7 +359,7 @@ impl AgentEngine {
                 // Fresh sub-engine on the same serve/cwd; tokens fold in even on failure.
                 let base = self.turn_usage.completion_tokens;
                 let (res, sub_tokens) = self
-                    .run_subagent(ctx, Some(&mut *ui), None, base, &call.arguments, false)
+                    .run_subagent(ctx, Some(&mut *ui), None, base, &call.arguments, false, 1)
                     .await;
                 extra_tokens += sub_tokens;
                 self.turn_usage.completion_tokens =
@@ -755,6 +772,85 @@ Re-run the full command without write confinement?",
             cwd.join(path)
         };
         full.exists()
+    }
+
+    /// Validate a `finish_turn` call: store an accepted report (the turn loop
+    /// converges on it); reject a premature `done` (unfinished plan steps,
+    /// unverified changes) back to the model, bounded then fail-open.
+    async fn handle_finish_request(
+        &mut self,
+        ctx: &TurnCtx<'_>,
+        ui: &mut dyn AgentUi,
+        batch_len: usize,
+        args: &Value,
+    ) -> Result<String, String> {
+        if batch_len > 1 {
+            return Err(
+                "finish_turn must be the only call in its step — finish the other \
+work first, then call it alone."
+                    .to_string(),
+            );
+        }
+        let report = crate::agent::finish::parse_finish(args)?;
+        if report.status == crate::agent::finish::FinishStatus::Done
+            && self.finish_rejections < MAX_FINISH_REJECTIONS
+        {
+            if plan::started(&self.plan)
+                && self
+                    .plan
+                    .iter()
+                    .any(|i| i.status != plan::PlanStatus::Completed)
+            {
+                self.finish_rejections += 1;
+                return Err(format!(
+                    "finish_turn(done) rejected — the plan still has unfinished steps:\n{}\n\
+Complete them, or update the plan to reflect reality (mark blocked / remove with a reason), \
+or finish with status \"blocked\".",
+                    plan::pinned_block(&self.plan)
+                ));
+            }
+            if self.dirty_since_verify
+                && let Some(v) = self.self_correct.then(|| verify::detect(ctx.cwd)).flatten()
+            {
+                match verify::run(v.clone(), ctx.cwd).await {
+                    verify::Outcome::Fail(summary) => {
+                        self.finish_rejections += 1;
+                        ui.notify(&format!("{} failed — rejecting finish_turn(done)", v.label));
+                        let line = self.record_verify_evidence(
+                            &v.label,
+                            verify::EvidenceStatus::Fail,
+                            verify::failure_detail(&summary),
+                        );
+                        return Err(format!(
+                            "finish_turn(done) rejected — {} is failing:\n{summary}\n{line}\n\
+Fix the cause, or finish with status \"blocked\".",
+                            v.label
+                        ));
+                    }
+                    verify::Outcome::Pass => {
+                        self.dirty_since_verify = false;
+                        ui.notify(&format!("verified: {} passed", v.label));
+                        self.record_verify_evidence(
+                            &v.label,
+                            verify::EvidenceStatus::Pass,
+                            String::new(),
+                        );
+                    }
+                    verify::Outcome::Inconclusive(reason) => {
+                        // Accepted (don't hammer a hanging suite) but never claimed verified.
+                        self.dirty_since_verify = false;
+                        self.record_verify_evidence(
+                            &v.label,
+                            verify::EvidenceStatus::Inconclusive,
+                            reason.to_string(),
+                        );
+                    }
+                }
+            }
+        }
+        let confirmation = format!("Finish recorded (status: {}).", report.status.wire_name());
+        self.finish_report = Some(report);
+        Ok(confirmation)
     }
 
     pub(super) fn record_touched_file(&mut self, name: &str, args: &Value) {

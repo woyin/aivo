@@ -509,3 +509,56 @@ fn exec_output_budget_stop_emits_a_stopped_event_and_exits_1() {
     assert!(stopped < fin, "stopped must precede final: {types:?}");
     assert_eq!(events.last().unwrap()["exit"], 1);
 }
+
+#[test]
+fn exec_finish_turn_premature_done_is_rejected_then_accepted() {
+    let env = ExecEnv::new();
+    let out = env.code_exec(
+        r#"[
+            {"tools": [{"name": "update_plan", "args": {"plan": [{"step": "fix bug", "status": "in_progress"}]}}]},
+            {"tools": [{"name": "finish_turn", "args": {"status": "done", "summary": "fixed the bug"}}]},
+            {"tools": [{"name": "update_plan", "args": {"plan": [{"step": "fix bug", "status": "completed"}]}}]},
+            {"tools": [{"name": "finish_turn", "args": {"status": "done", "summary": "fixed the bug"}}]}
+        ]"#,
+        "fix the bug",
+        &["--output-format", "json"],
+    );
+    assert!(out.status.success(), "stderr:\n{}", stderr_str(&out));
+
+    let doc: Value = serde_json::from_str(stdout_str(&out).trim()).unwrap();
+    assert_eq!(doc["exit"], 0);
+    assert_eq!(doc["finishStatus"], "done");
+    // No streamed text: the report's summary becomes the answer.
+    assert!(doc["answer"].as_str().unwrap().contains("fixed the bug"));
+    let err = stderr_str(&out);
+    assert!(
+        err.contains("rejected"),
+        "the premature done must bounce off the unfinished plan:\n{err}"
+    );
+}
+
+#[test]
+fn exec_finish_turn_blocked_exits_1_with_a_finished_event() {
+    let env = ExecEnv::new();
+    let out = env.code_exec(
+        r#"[
+            {"tools": [{"name": "finish_turn", "args":
+                {"status": "blocked", "summary": "cannot proceed", "blocker": "missing API key"}}]}
+        ]"#,
+        "do the thing",
+        &["--output-format", "stream-json"],
+    );
+    assert_eq!(out.status.code(), Some(1), "stderr:\n{}", stderr_str(&out));
+
+    let events: Vec<Value> = stdout_str(&out)
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap_or_else(|e| panic!("bad event line ({e}): {l}")))
+        .collect();
+    let finished = events
+        .iter()
+        .find(|e| e["type"] == "finished")
+        .expect("finished event");
+    assert_eq!(finished["status"], "blocked");
+    assert_eq!(finished["blocker"], "missing API key");
+    assert_eq!(events.last().unwrap()["exit"], 1);
+}

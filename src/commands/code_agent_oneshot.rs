@@ -20,6 +20,7 @@ use futures::future::BoxFuture;
 use serde_json::{Value, json};
 
 use crate::agent::engine::{AgentEngine, AgentUi, TurnCtx, TurnStop};
+use crate::agent::finish::{FinishReport, FinishStatus};
 use crate::agent::protocol::Decision;
 use crate::agent::system_prompt::discover_project_guides;
 use crate::errors::ExitCode;
@@ -432,8 +433,12 @@ async fn run_agent_captured(
     // corrective turns becomes the run's terminal error (exit 1).
     if let Some(schema) = opts.validate_schema.as_ref() {
         let mut retries = SCHEMA_RETRIES;
-        // No corrective turns on a stopped run — the budget is already spent.
-        while completed && ui.last_error.is_none() && ui.stop_reason.is_none() {
+        // No corrective turns on a stopped or blocked run — it already failed.
+        while completed
+            && ui.last_error.is_none()
+            && ui.stop_reason.is_none()
+            && ui.finish_completed()
+        {
             let err = match crate::agent::json_schema::validate_answer(&ui.answer, schema) {
                 Ok(()) => break,
                 Err(e) => e,
@@ -468,8 +473,8 @@ no prose, no markdown fences, nothing else."
     } else {
         match &ui.last_error {
             Some(msg) => classify_agent_error(msg),
-            // A stop means the task wasn't completed — only a clean convergence is a success.
-            None if ui.stop_reason.is_some() => ExitCode::UserError,
+            // Stopped or finished non-done — only a clean convergence is a success.
+            None if ui.stop_reason.is_some() || !ui.finish_completed() => ExitCode::UserError,
             None => ExitCode::Success,
         }
     };
@@ -1084,6 +1089,8 @@ struct HeadlessAgentUi {
     /// Why the engine stopped the turn early (budget/guard) — a stopped run
     /// converged but is not a success.
     stop_reason: Option<TurnStop>,
+    /// The turn's accepted `finish_turn` report; blocked/needs_user is not a success.
+    finish: Option<FinishReport>,
     /// Footer stats, kept for the single-document `json` result.
     stats: (usize, u64, u64),
     /// Best-of-n candidate: capture but emit nothing (the winner emits via
@@ -1111,6 +1118,7 @@ impl HeadlessAgentUi {
             answer: String::new(),
             last_error: None,
             stop_reason: None,
+            finish: None,
             stats: (0, 0, 0),
             silent: false,
             pending_warnings: Vec::new(),
@@ -1156,6 +1164,13 @@ impl HeadlessAgentUi {
         self.wrote_answer = false;
     }
 
+    /// No finish report counts as completed (hybrid: clean text convergence is fine).
+    fn finish_completed(&self) -> bool {
+        self.finish
+            .as_ref()
+            .is_none_or(|f| f.status == FinishStatus::Done)
+    }
+
     /// Emit the answer withheld during schema validation. No-op for a silent
     /// candidate — the winner replays through [`Self::emit_final`].
     fn emit_deferred_answer(&mut self) {
@@ -1199,13 +1214,26 @@ impl HeadlessAgentUi {
         }
     }
 
-    /// Text/Json: mark an early-stopped run as not-done on stderr.
+    /// Text/Json: mark a not-completed run (early stop, or a blocked/needs_user
+    /// finish) on stderr.
     fn print_stop_error(&self) {
         if let Some(stop) = self.stop_reason {
             eprintln!(
                 "{} run stopped early: {} — result may be partial",
                 crate::style::red("Error:"),
                 stop.describe()
+            );
+        }
+        if let Some(f) = self
+            .finish
+            .as_ref()
+            .filter(|f| f.status != FinishStatus::Done)
+        {
+            eprintln!(
+                "{} run finished {}: {}",
+                crate::style::red("Error:"),
+                f.status.wire_name(),
+                f.blocker.as_deref().unwrap_or("no blocker given")
             );
         }
     }
@@ -1233,6 +1261,15 @@ impl HeadlessAgentUi {
                 );
                 if let Some(stop) = self.stop_reason {
                     self.emit("stopped", json!({ "reason": stop.wire_name() }));
+                }
+                if let Some(f) = &self.finish {
+                    self.emit(
+                        "finished",
+                        json!({
+                            "status": f.status.wire_name(),
+                            "blocker": f.blocker.as_deref().map(redact),
+                        }),
+                    );
                 }
                 self.emit(
                     "final",
@@ -1288,6 +1325,8 @@ impl HeadlessAgentUi {
                         "answer": redact(&self.answer),
                         "error": self.last_error.as_deref().map(redact),
                         "stopReason": self.stop_reason.map(TurnStop::wire_name),
+                        "finishStatus": self.finish.as_ref().map(|f| f.status.wire_name()),
+                        "blocker": self.finish.as_ref().and_then(|f| f.blocker.as_deref()).map(redact),
                         "sessionSaved": self.session_saved,
                         "steps": steps,
                         "tokens": tokens,
@@ -1403,6 +1442,23 @@ impl AgentUi for HeadlessAgentUi {
         if self.format == OutputFormat::StreamJson {
             self.emit("stopped", json!({ "reason": stop.wire_name() }));
         }
+    }
+    fn turn_finished(&mut self, report: &FinishReport) {
+        // No streamed text: the summary becomes the answer (drop whitespace-only streaming).
+        if self.answer.trim().is_empty() && self.seg.trim().is_empty() {
+            self.answer.clear();
+            self.seg = report.summary.clone();
+        }
+        if self.format == OutputFormat::StreamJson {
+            self.emit(
+                "finished",
+                json!({
+                    "status": report.status.wire_name(),
+                    "blocker": report.blocker.as_deref().map(redact),
+                }),
+            );
+        }
+        self.finish = Some(report.clone());
     }
     fn footer(
         &mut self,

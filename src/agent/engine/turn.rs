@@ -80,11 +80,17 @@ impl AgentEngine {
         let mut tokens = 0u64;
         // Real provider-measured split, summed across steps (drained by the TUI for stats). Reset per turn.
         self.turn_usage = SessionTokens::default();
+        self.finish_report = None;
+        self.finish_rejections = 0;
         // Last step's prompt+completion — the real context fill (`tokens` re-counts the prompt each step).
         let mut context_tokens = 0u64;
         let started = Instant::now();
         let mut last_batch = String::new();
         let mut repeats = 0usize;
+        // One batch further back, for A→B→A→B oscillation (fix/revert, two-file ping-pong).
+        let mut prev_batch = String::new();
+        let mut alt_repeats = 0usize;
+        let mut strategy_resets = 0usize;
         // Track the effective file region separately — a paging loop varies junk args,
         // defeating `batch_sig`.
         let mut last_page: Option<(String, u64)> = None;
@@ -418,6 +424,23 @@ impl AgentEngine {
                         }
                     }
                 }
+                // Unattended: don't silently accept a text answer over an unfinished
+                // plan — bounded nudge toward honest closure, then convergence
+                // (and the plan auto-complete below) proceeds as before.
+                if self.require_completion
+                    && !self.read_only
+                    && completion_nudges < MAX_COMPLETION_NUDGES
+                    && plan::started(&self.plan)
+                    && self
+                        .plan
+                        .iter()
+                        .any(|i| i.status != plan::PlanStatus::Completed)
+                {
+                    completion_nudges += 1;
+                    ui.notify("the plan has unfinished steps — asking the model to close out");
+                    self.push_text_turn("user", FINISH_NUDGE.to_string());
+                    continue;
+                }
                 // A Stop hook may refuse the stop; the turn continues with its guidance.
                 if stop_hook_continues < MAX_STOP_HOOK_CONTINUES
                     && let Some(hooks) = self.hooks.clone()
@@ -439,14 +462,20 @@ impl AgentEngine {
                 break;
             }
 
-            // No-progress guard: identical consecutive batches, plus a paging loop that
-            // re-reads one region while varying junk args (which `batch_sig` misses).
+            // No-progress guard: identical consecutive batches, two-step oscillation,
+            // plus a paging loop that re-reads one region while varying junk args
+            // (which `batch_sig` misses).
             let batch = batch_sig(&message.tool_calls);
             if batch == last_batch {
                 repeats += 1;
             } else {
+                if !batch.is_empty() && batch == prev_batch {
+                    alt_repeats += 1;
+                } else {
+                    alt_repeats = 0;
+                }
+                prev_batch = std::mem::replace(&mut last_batch, batch);
                 repeats = 0;
-                last_batch = batch;
             }
             let page = page_read_key(&message.tool_calls);
             if page.is_some() && page == last_page {
@@ -466,11 +495,35 @@ impl AgentEngine {
                 self.execute_tool_batch(ctx, ui, &message.tool_calls).await;
             tokens += batch_tokens;
 
-            if repeats + 1 >= REPEAT_LIMIT || page_repeats + 1 >= REPEAT_LIMIT {
-                ui.notify(STOP_NO_PROGRESS);
-                ui.turn_stopped(TurnStop::NoProgress);
+            // Structured convergence. No plan auto-complete here: a blocked/needs_user
+            // finish honestly leaves it unfinished.
+            if let Some(report) = self.finish_report.clone() {
+                ui.turn_finished(&report);
                 converged = true;
                 break;
+            }
+
+            if repeats + 1 >= REPEAT_LIMIT
+                || page_repeats + 1 >= REPEAT_LIMIT
+                || alt_repeats + 1 >= ALT_REPEAT_LIMIT
+            {
+                // A loop the model can break out of shouldn't hard-stop the turn.
+                if strategy_resets < MAX_STRATEGY_RESETS {
+                    strategy_resets += 1;
+                    ui.notify("no progress detected — asking the model to change approach");
+                    self.fold_into_last_tool_result(STRATEGY_RESET.to_string());
+                    repeats = 0;
+                    page_repeats = 0;
+                    alt_repeats = 0;
+                    last_batch.clear();
+                    prev_batch.clear();
+                    last_page = None;
+                } else {
+                    ui.notify(STOP_NO_PROGRESS);
+                    ui.turn_stopped(TurnStop::NoProgress);
+                    converged = true;
+                    break;
+                }
             }
 
             // Same-signature tool-failure guard: hint the schema, then hard-stop a loop.
@@ -547,7 +600,7 @@ you were working. If the outcome matters to the task, inspect the log; otherwise
 
     /// Merge an outcome into the evidence digest; returns its `[self-verify]`
     /// marker line, the digest's durable form in the log.
-    fn record_verify_evidence(
+    pub(super) fn record_verify_evidence(
         &mut self,
         command: &str,
         status: verify::EvidenceStatus,

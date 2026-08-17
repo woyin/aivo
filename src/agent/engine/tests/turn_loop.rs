@@ -157,11 +157,12 @@ async fn leaked_tool_call_nudges_are_capped() {
 
 /// A paging loop varying an ignored arg (`limit`) makes a distinct `batch_sig` each
 /// step, so only the page-read guard can stop it — the read_file runaway shape.
+/// The first trip is a strategy-reset nudge; the relapse stops the turn.
 #[tokio::test]
 async fn paging_loop_with_varying_junk_args_is_stopped() {
     let dir = tmp();
     std::fs::write(dir.join("big.txt"), "x\n".repeat(200)).unwrap();
-    let mut seq: Vec<String> = (0..8)
+    let mut seq: Vec<String> = (0..12)
         .map(|i| {
             tool_call_sse(
                 "read_file",
@@ -188,13 +189,115 @@ async fn paging_loop_with_varying_junk_args_is_stopped() {
         .filter(|t| t.as_str() == "read_file")
         .count();
     assert!(
-        reads <= REPEAT_LIMIT,
-        "page guard should stop the loop; ran {reads} reads"
+        reads <= REPEAT_LIMIT * 2,
+        "page guard should stop the loop after one reset; ran {reads} reads"
     );
+    assert!(ui.notices.iter().any(|n| n.contains("change approach")));
     assert!(
         ui.notices
             .iter()
             .any(|n| n.contains("repeated the same action"))
+    );
+}
+
+/// A two-step oscillation (A→B→A→B, e.g. fix/revert or two-file ping-pong) defeats
+/// the identical-batch check but trips the alternation guard: one reset, then stop.
+#[tokio::test]
+async fn alternating_batches_trip_the_no_progress_guard() {
+    let dir = tmp();
+    std::fs::write(dir.join("a.txt"), "a\n").unwrap();
+    std::fs::write(dir.join("b.txt"), "b\n").unwrap();
+    let mut seq = Vec::new();
+    for _ in 0..8 {
+        seq.push(tool_call_sse("read_file", json!({ "path": "a.txt" })));
+        seq.push(tool_call_sse("read_file", json!({ "path": "b.txt" })));
+    }
+    seq.push(FINAL_TEXT_SSE.to_string());
+    let port = spawn_sse_sequence(seq);
+    let client = reqwest::Client::builder().no_proxy().build().unwrap();
+    let base = format!("http://127.0.0.1:{port}");
+    let mut engine = AgentEngine::new(&dir.display().to_string(), "m", "", &[], &[], 0, 0);
+    let mut ui = CapturingUi::default();
+    run_session(
+        &mut engine,
+        &turn_ctx(&client, &base, &dir),
+        Some("compare the files".into()),
+        &mut ui,
+    )
+    .await;
+    let reads = ui
+        .tools
+        .iter()
+        .filter(|t| t.as_str() == "read_file")
+        .count();
+    assert!(
+        reads < 16,
+        "alternation guard should stop the ping-pong; ran {reads} reads"
+    );
+    assert!(
+        ui.notices
+            .iter()
+            .any(|n| n.contains("repeated the same action")),
+        "notices: {:?}",
+        ui.notices
+    );
+}
+
+/// A loop the model breaks out of after the strategy reset converges normally —
+/// the guard nudges first; it doesn't punish a recoverable detour.
+#[tokio::test]
+async fn strategy_reset_lets_a_recovered_loop_converge() {
+    let dir = tmp();
+    std::fs::write(dir.join("a.txt"), "a\n").unwrap();
+    std::fs::write(dir.join("other.txt"), "other\n").unwrap();
+    // Unique call ids (like a real provider) so read-dedupe supersedes cleanly.
+    let mut seq: Vec<String> = (0..REPEAT_LIMIT)
+        .map(|i| {
+            let id = format!("r{i}");
+            batch_tool_call_sse(&[(id.as_str(), "read_file", json!({ "path": "a.txt" }))])
+        })
+        .collect();
+    // Post-reset: a different action, then a clean answer.
+    seq.push(batch_tool_call_sse(&[(
+        "r9",
+        "read_file",
+        json!({ "path": "other.txt" }),
+    )]));
+    seq.push(FINAL_TEXT_SSE.to_string());
+    let port = spawn_sse_sequence(seq);
+    let client = reqwest::Client::builder().no_proxy().build().unwrap();
+    let base = format!("http://127.0.0.1:{port}");
+    let mut engine = AgentEngine::new(&dir.display().to_string(), "m", "", &[], &[], 0, 0);
+    let mut ui = CapturingUi::default();
+    run_session(
+        &mut engine,
+        &turn_ctx(&client, &base, &dir),
+        Some("investigate".into()),
+        &mut ui,
+    )
+    .await;
+    assert!(ui.notices.iter().any(|n| n.contains("change approach")));
+    assert!(
+        !ui.notices
+            .iter()
+            .any(|n| n.contains("repeated the same action")),
+        "a recovered loop must not be stopped: {:?}",
+        ui.notices
+    );
+    assert!(
+        ui.text.contains("done"),
+        "the turn should converge on the scripted final answer: {}",
+        ui.text
+    );
+    // Survives dedupe here because the post-reset read hits a different key.
+    assert!(
+        engine
+            .messages
+            .iter()
+            .filter_map(|m| m.get("content").and_then(Value::as_str))
+            .any(|c| c.contains("[no-progress guard]")),
+        "strategy-reset nudge missing from history: {:#?}",
+        engine.messages
     );
 }
 
