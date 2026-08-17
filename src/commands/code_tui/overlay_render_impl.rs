@@ -310,9 +310,7 @@ impl CodeTuiApp {
     ) -> u16 {
         let inner = overlay_shell(frame, area, "Help", Some(("esc".to_string(), MUTED())));
 
-        let cmd_style = Style::default()
-            .fg(ASSISTANT())
-            .add_modifier(Modifier::BOLD);
+        let cmd_style = Style::default().fg(TEXT()).add_modifier(Modifier::BOLD);
         let key_style = Style::default().fg(ACCENT()).add_modifier(Modifier::BOLD);
         let section_style = Style::default().fg(MUTED()).add_modifier(Modifier::BOLD);
         let group_style = Style::default().fg(FAINT());

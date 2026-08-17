@@ -269,6 +269,23 @@ fn test_render_command_menu_rows_aligns_description_column() {
 }
 
 #[test]
+fn test_command_menu_selected_row_uses_brand_selection_system() {
+    let selected = command_menu_item_line("/model", "switch model", true, 36, 10);
+    assert!(
+        selected
+            .spans
+            .iter()
+            .all(|span| span.style.bg == Some(SELECT_BG()))
+    );
+    assert_eq!(selected.spans[0].style.fg, Some(SELECT_ACCENT()));
+    assert_eq!(selected.spans[1].style.fg, Some(SELECT_TEXT()));
+
+    let idle = command_menu_item_line("/model", "switch model", false, 36, 10);
+    assert!(idle.spans.iter().all(|span| span.style.bg.is_none()));
+    assert_eq!(idle.spans[1].style.fg, Some(TEXT()));
+}
+
+#[test]
 fn test_command_menu_uses_rounded_border() {
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;

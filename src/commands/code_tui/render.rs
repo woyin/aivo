@@ -254,14 +254,18 @@ pub(super) fn role_bar_color(role: &str) -> Color {
     }
 }
 
-/// A turn-level error persisted into the transcript: `✗ message` in the error hue.
+/// A turn-level error persisted into the transcript: a red marker with readable
+/// warm text, rather than an entire high-saturation paragraph.
 pub(super) fn render_error_message(lines: &mut Vec<StyledLine>, content: &str) {
     for (i, line) in content.lines().enumerate() {
         let prefix = if i == 0 { "✗ " } else { "  " };
-        lines.push(line_with_plain(vec![Span::styled(
-            format!("{prefix}{line}"),
-            Style::default().fg(ERROR()),
-        )]));
+        lines.push(line_with_plain(vec![
+            Span::styled(prefix.to_string(), Style::default().fg(ERROR())),
+            Span::styled(
+                line.to_string(),
+                Style::default().fg(if i == 0 { TEXT() } else { MUTED() }),
+            ),
+        ]));
     }
 }
 
@@ -468,23 +472,36 @@ fn brand_wordmark_for(width: u16) -> (&'static [&'static str; 2], u16) {
     }
 }
 
-/// Brand wordmark as accent styled lines, version trailing the baseline when it
-/// fits. Shared by the empty state and transcript intro so both start at the
-/// same column (see `test_intro_column_stable_*`); `width` is the inset column.
+/// Brand lockup: acid-lime `aivo`, warm-white `code`, and a quiet version. Shared
+/// by the empty state and transcript intro so neither position nor hierarchy jumps.
 pub(super) fn brand_wordmark_lines(width: u16) -> Vec<StyledLine> {
-    let mark_style = Style::default().fg(ACCENT()).add_modifier(Modifier::BOLD);
+    let aivo_style = Style::default().fg(ACCENT()).add_modifier(Modifier::BOLD);
+    let code_style = Style::default().fg(TEXT()).add_modifier(Modifier::BOLD);
     let (mark, mark_width) = brand_wordmark_for(width);
+    let styled_mark = |line: &str| {
+        if mark_width == BRAND_WORDMARK_WIDTH {
+            let code_start = line
+                .char_indices()
+                .nth(usize::from(BRAND_WORDMARK_NARROW_WIDTH))
+                .map(|(index, _)| index)
+                .unwrap_or(line.len());
+            let (aivo, code) = line.split_at(code_start);
+            vec![
+                Span::styled(aivo.to_string(), aivo_style),
+                Span::styled(code.to_string(), code_style),
+            ]
+        } else {
+            vec![Span::styled(line.to_string(), aivo_style)]
+        }
+    };
     // Shares the baseline row, so the banner stays two lines tall either way.
     let version = format!("  v{}", crate::version::VERSION);
-    let bottom = if width >= mark_width + version.chars().count() as u16 {
-        line_with_plain(vec![
-            Span::styled(mark[1].to_string(), mark_style),
-            Span::styled(version, Style::default().fg(FAINT())),
-        ])
-    } else {
-        line_plain(mark[1].to_string(), mark_style)
-    };
-    vec![line_plain(mark[0].to_string(), mark_style), bottom]
+    let top = styled_mark(mark[0]);
+    let mut bottom = styled_mark(mark[1]);
+    if width >= mark_width + version.chars().count() as u16 {
+        bottom.push(Span::styled(version, Style::default().fg(FAINT())));
+    }
+    vec![line_with_plain(top), line_with_plain(bottom)]
 }
 
 pub(super) fn push_transcript_intro(lines: &mut Vec<StyledLine>, width: u16) {
@@ -660,7 +677,7 @@ pub(super) fn render_user_message(
         block,
         width.saturating_sub(TURN_MARKER_W),
         "❯ ",
-        Style::default().fg(USER()).add_modifier(Modifier::BOLD),
+        Style::default().fg(USER()),
     ));
     render_user_attachment_lines(lines, attachments);
 }

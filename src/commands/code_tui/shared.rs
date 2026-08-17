@@ -37,8 +37,8 @@ pub(super) fn ui_theme() -> UiTheme {
     }
 }
 
-/// Semantic colors for the chat TUI. Dark mirrors getaivo.dev's warm-night
-/// tokens; light mirrors the site's light theme so CLI and web read as one product.
+/// Semantic colors for the chat TUI. Warm neutrals carry the structure; acid lime
+/// is reserved for the aivo mark, focus, and active choices.
 #[derive(Clone, Copy)]
 pub(super) struct Palette {
     pub text: Color,
@@ -68,6 +68,9 @@ pub(super) struct Palette {
     pub select_accent: Color,
     pub select_wash: Color,
     pub select_flash: Color,
+    pub delete_bg: Color,
+    pub delete_text: Color,
+    pub delete_accent: Color,
     /// Full-screen canvas fill. `None` keeps the terminal's default background
     /// (dark theme); light paints the brand warm paper so dark ink stays readable
     /// even on a dark terminal.
@@ -79,19 +82,18 @@ pub(super) struct Palette {
 }
 
 impl Palette {
-    /// Warm-night: warm off-white ink on warm near-black, brand yellow accent.
+    /// Warm night: terminal black, paper-white ink, and the full acid-lime mark.
     pub const DARK: Self = Self {
         text: Color::Rgb(237, 233, 226),
-        muted: Color::Rgb(158, 152, 140),
-        faint: Color::Rgb(109, 103, 93),
-        // Brand yellow (#DEFC09), toned down so it marks without the neon punch.
-        accent: Color::Rgb(206, 226, 70),
-        assistant: Color::Rgb(140, 190, 176),
-        user: Color::Rgb(181, 164, 235),
-        tool: Color::Rgb(110, 170, 188),
-        shell: Color::Rgb(204, 112, 176),
+        muted: Color::Rgb(163, 156, 143),
+        faint: Color::Rgb(112, 105, 93),
+        accent: Color::Rgb(222, 252, 9), // #DEFC09
+        assistant: Color::Rgb(171, 193, 116),
+        user: Color::Rgb(201, 192, 176),
+        tool: Color::Rgb(142, 164, 159),
+        shell: Color::Rgb(215, 172, 80),
         link: Color::Rgb(143, 178, 222),
-        quote: Color::Rgb(150, 150, 128),
+        quote: Color::Rgb(154, 148, 126),
         error: Color::Rgb(228, 128, 114),
         warning: Color::Rgb(224, 180, 104),
         info: Color::Rgb(126, 184, 212),
@@ -104,29 +106,32 @@ impl Palette {
         diff_del_sign: Color::Rgb(230, 120, 112),
         diff_add_hl_bg: Color::Rgb(33, 84, 50),
         diff_del_hl_bg: Color::Rgb(92, 38, 38),
-        select_bg: Color::Rgb(58, 62, 76),
-        select_text: Color::Rgb(242, 243, 246),
-        select_accent: Color::Rgb(196, 200, 210),
+        select_bg: Color::Rgb(94, 102, 126),
+        select_text: Color::Rgb(243, 239, 231),
+        select_accent: Color::Rgb(222, 252, 9),
         select_wash: Color::Rgb(48, 52, 64),
         select_flash: Color::Rgb(86, 92, 110),
+        delete_bg: Color::Rgb(82, 42, 36),
+        delete_text: Color::Rgb(255, 235, 226),
+        delete_accent: Color::Rgb(255, 174, 146),
         canvas: None,
         code: Color::Rgb(154, 205, 185),
-        toast_bg: Color::Rgb(24, 21, 17),
+        toast_bg: Color::Rgb(23, 20, 15),
         jump_fg: Color::Rgb(26, 23, 18),
         jump_bg: Color::Rgb(231, 227, 219),
     };
 
-    /// Light brand paper: site `--text-primary` ink on `--bg-canvas`, role hues
-    /// from light syntax tokens (`--code-op`, `--code-var`, …).
+    /// Light brand paper: dark warm ink and an olive form of the lime that keeps
+    /// contrast without losing the brand hue.
     pub const LIGHT: Self = Self {
-        text: Color::Rgb(22, 20, 26),        // --text-primary #16141A
-        muted: Color::Rgb(74, 70, 81),       // --text-secondary
-        faint: Color::Rgb(117, 112, 123),    // --text-muted
-        accent: Color::Rgb(140, 155, 20),    // brand lime, darkened for light bg
-        assistant: Color::Rgb(44, 110, 104), // --code-op
-        user: Color::Rgb(90, 63, 160),       // --code-var
-        tool: Color::Rgb(40, 120, 140),
-        shell: Color::Rgb(160, 60, 130),
+        text: Color::Rgb(27, 24, 19),
+        muted: Color::Rgb(102, 95, 85),
+        faint: Color::Rgb(122, 114, 102),
+        accent: Color::Rgb(102, 116, 0),
+        assistant: Color::Rgb(73, 103, 36),
+        user: Color::Rgb(75, 69, 60),
+        tool: Color::Rgb(67, 91, 87),
+        shell: Color::Rgb(126, 87, 15),
         link: Color::Rgb(60, 110, 180),
         quote: Color::Rgb(120, 120, 100),
         error: Color::Rgb(185, 72, 46),   // --code-flag
@@ -141,14 +146,17 @@ impl Palette {
         diff_del_sign: Color::Rgb(180, 50, 45),
         diff_add_hl_bg: Color::Rgb(190, 230, 200),
         diff_del_hl_bg: Color::Rgb(240, 200, 195),
-        select_bg: Color::Rgb(230, 228, 222),
-        select_text: Color::Rgb(22, 20, 26),
-        select_accent: Color::Rgb(74, 70, 81),
+        select_bg: Color::Rgb(184, 181, 174),
+        select_text: Color::Rgb(27, 24, 19),
+        select_accent: Color::Rgb(89, 102, 0),
         select_wash: Color::Rgb(220, 218, 212),
         select_flash: Color::Rgb(200, 198, 190),
+        delete_bg: Color::Rgb(250, 226, 218),
+        delete_text: Color::Rgb(116, 38, 24),
+        delete_accent: Color::Rgb(166, 58, 35),
         canvas: Some(Color::Rgb(251, 250, 247)), // --bg-canvas #FBFAF7
         code: Color::Rgb(38, 105, 98),
-        toast_bg: Color::Rgb(255, 255, 255),
+        toast_bg: Color::Rgb(243, 240, 232),
         jump_fg: Color::Rgb(251, 250, 247),
         jump_bg: Color::Rgb(22, 20, 26),
     };
@@ -320,6 +328,21 @@ pub(super) fn SELECT_WASH() -> Color {
 #[inline]
 pub(super) fn SELECT_FLASH() -> Color {
     palette().select_flash
+}
+#[allow(non_snake_case)]
+#[inline]
+pub(super) fn DELETE_BG() -> Color {
+    palette().delete_bg
+}
+#[allow(non_snake_case)]
+#[inline]
+pub(super) fn DELETE_TEXT() -> Color {
+    palette().delete_text
+}
+#[allow(non_snake_case)]
+#[inline]
+pub(super) fn DELETE_ACCENT() -> Color {
+    palette().delete_accent
 }
 
 /// Share URL notice prefix; `notice_spans` matches it to color the line.

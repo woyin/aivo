@@ -1150,7 +1150,7 @@ impl CodeTuiApp {
                 cwd: std::path::PathBuf::from(&cwd),
                 steering,
                 seg_has_text: false,
-                answer_has_text: false,
+                text_before_finish: false,
             };
             let mut engine = engine.lock().await;
             engine.set_context_window(context_window);
@@ -1372,7 +1372,7 @@ impl CodeTuiApp {
                 cwd: std::path::PathBuf::from(&cwd),
                 steering: SteeringQueue::default(),
                 seg_has_text: false,
-                answer_has_text: false,
+                text_before_finish: false,
             };
             let started = Instant::now();
             let mut engine = engine.lock().await;
@@ -4210,11 +4210,10 @@ struct ChatAgentUi {
     /// Workspace root, for resolving an edit's `path` in the pre-edit probe.
     cwd: std::path::PathBuf,
     steering: SteeringQueue,
-    /// Non-whitespace text in the current streamed segment / committed earlier
-    /// this turn. Mirrors the transcript's commit-at-tool-boundary model so
-    /// `turn_finished` knows whether the finish summary is the only answer.
+    /// Non-whitespace prose in the current streamed segment.
     seg_has_text: bool,
-    answer_has_text: bool,
+    /// Prose directly preceded `finish_turn` — the model wrote its own wrap-up.
+    text_before_finish: bool,
 }
 
 /// Bridges parallel sub-agent progress to the event loop's per-delegate rows.
@@ -4360,8 +4359,10 @@ impl crate::agent::engine::AgentUi for ChatAgentUi {
     }
 
     fn tool_start(&mut self, name: &str, args: &serde_json::Value) {
-        // Tool step = commit boundary: prose streamed before it can no longer be discarded.
-        self.answer_has_text |= std::mem::take(&mut self.seg_has_text);
+        let seg = std::mem::take(&mut self.seg_has_text);
+        if name == "finish_turn" {
+            self.text_before_finish = seg;
+        }
         // Runs on the engine thread before the edit applies, so the probe sees
         // the pre-edit file.
         let line_starts = compute_line_starts(&self.cwd, name, args);
@@ -4406,9 +4407,7 @@ impl crate::agent::engine::AgentUi for ChatAgentUi {
     }
 
     fn turn_finished(&mut self, report: &crate::agent::finish::FinishReport) {
-        // No streamed text this turn: the finish summary is the only place the
-        // answer lives — render it so the turn doesn't end silently.
-        if self.answer_has_text || self.seg_has_text {
+        if self.text_before_finish || self.seg_has_text {
             return;
         }
         let mut text = report.summary.trim().to_string();
@@ -5024,7 +5023,7 @@ mod finish_summary_tests {
             cwd: std::env::temp_dir(),
             steering: SteeringQueue::default(),
             seg_has_text: false,
-            answer_has_text: false,
+            text_before_finish: false,
         };
         (ui, rx)
     }
@@ -5064,15 +5063,37 @@ mod finish_summary_tests {
     }
 
     #[test]
-    fn streamed_text_suppresses_summary() {
+    fn text_directly_before_finish_suppresses_summary() {
         let (mut ui, mut rx) = ui();
         ui.assistant_text("the answer is 42");
-        // Committed at the tool boundary; a later discard must not resurrect it.
-        ui.tool_start("run_bash", &serde_json::json!({}));
-        ui.discard_streamed_segment();
+        ui.tool_start("finish_turn", &serde_json::json!({}));
         content_deltas(&mut rx);
         ui.turn_finished(&report("dup summary", None));
         assert!(content_deltas(&mut rx).is_empty());
+    }
+
+    #[test]
+    fn mid_turn_text_before_a_tool_tail_still_renders_summary() {
+        let (mut ui, mut rx) = ui();
+        ui.assistant_text("investigating the theme regression");
+        ui.tool_start("run_bash", &serde_json::json!({}));
+        ui.tool_start("apply_patch", &serde_json::json!({}));
+        ui.tool_start("finish_turn", &serde_json::json!({}));
+        content_deltas(&mut rx);
+        ui.turn_finished(&report("fixed the faint color", None));
+        assert_eq!(content_deltas(&mut rx), vec!["fixed the faint color"]);
+    }
+
+    #[test]
+    fn rejected_finish_lead_text_does_not_suppress_later_silent_finish() {
+        let (mut ui, mut rx) = ui();
+        ui.assistant_text("done, wrapping up");
+        ui.tool_start("finish_turn", &serde_json::json!({})); // rejected attempt
+        ui.tool_start("run_bash", &serde_json::json!({}));
+        ui.tool_start("finish_turn", &serde_json::json!({})); // accepted, silent
+        content_deltas(&mut rx);
+        ui.turn_finished(&report("all steps verified", None));
+        assert_eq!(content_deltas(&mut rx), vec!["all steps verified"]);
     }
 
     #[test]

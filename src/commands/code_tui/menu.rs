@@ -152,9 +152,6 @@ pub(super) fn command_menu_item_line(
     width: u16,
     label_column_width: usize,
 ) -> Line<'static> {
-    // The selected-row chevron sits on the transcript canvas, not on SELECT_BG, so
-    // it uses a visible gray rather than the dim SELECT_WASH color.
-    let select_text = MUTED();
     const COLUMN_GAP: usize = 2;
 
     let content_width = picker_content_width(width);
@@ -182,24 +179,25 @@ pub(super) fn command_menu_item_line(
     );
     let fill_width = content_width.saturating_sub(display_width(&plain));
 
-    let prefix_style = if selected {
-        Style::default()
-            .fg(select_text)
-            .add_modifier(Modifier::BOLD)
+    let row_style = if selected {
+        Style::default().bg(SELECT_BG())
     } else {
-        Style::default().fg(FAINT())
+        Style::default()
+    };
+    let prefix_style = if selected {
+        row_style.fg(SELECT_ACCENT()).add_modifier(Modifier::BOLD)
+    } else {
+        row_style.fg(FAINT())
     };
     let label_style = if selected {
-        Style::default().fg(ACCENT()).add_modifier(Modifier::BOLD)
+        row_style.fg(SELECT_TEXT()).add_modifier(Modifier::BOLD)
     } else {
-        Style::default()
-            .fg(ASSISTANT())
-            .add_modifier(Modifier::BOLD)
+        row_style.fg(TEXT()).add_modifier(Modifier::BOLD)
     };
     let description_style = if selected {
-        Style::default().fg(TEXT())
+        row_style.fg(SELECT_ACCENT())
     } else {
-        Style::default().fg(MUTED())
+        row_style.fg(MUTED())
     };
 
     let mut spans = vec![Span::styled(
@@ -399,9 +397,6 @@ pub(super) fn session_picker_item_lines(
     width: u16,
 ) -> Vec<Line<'static>> {
     let select_time = SELECT_ACCENT();
-    const DELETE_BG: Color = Color::Rgb(102, 58, 52);
-    const DELETE_TEXT: Color = Color::Rgb(255, 240, 230);
-    const DELETE_TIME: Color = Color::Rgb(255, 194, 170);
 
     let content_width = picker_content_width(width);
     // A narrow (split-left) pane can't spare 8 cols for "12:42 PM" — use the "5m" stamp.
@@ -426,7 +421,7 @@ pub(super) fn session_picker_item_lines(
         .max(1);
 
     let (active_bg, active_text, active_time) = if armed_delete {
-        (DELETE_BG, DELETE_TEXT, DELETE_TIME)
+        (DELETE_BG(), DELETE_TEXT(), DELETE_ACCENT())
     } else {
         (SELECT_BG(), SELECT_TEXT(), select_time)
     };

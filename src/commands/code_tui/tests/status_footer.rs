@@ -1179,6 +1179,17 @@ fn test_transcript_intro_is_brand_only() {
 }
 
 #[test]
+fn test_brand_lockup_separates_aivo_from_code() {
+    let _theme = theme_lock();
+    set_ui_theme(UiTheme::Dark);
+    let lines = brand_wordmark_lines(80);
+    assert_eq!(lines[0].line.spans.len(), 2);
+    assert_eq!(lines[0].line.spans[0].style.fg, Some(ACCENT()));
+    assert_eq!(lines[0].line.spans[1].style.fg, Some(TEXT()));
+    assert_eq!(lines[1].line.spans.last().unwrap().style.fg, Some(FAINT()));
+}
+
+#[test]
 fn test_transcript_intro_narrow_falls_back_to_aivo() {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let app = make_test_app(tx, rx);

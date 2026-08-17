@@ -2642,9 +2642,8 @@ impl CodeTuiApp {
         composer_area
     }
 
-    /// Hue shared by the composer's rounded border: shell mode tints
-    /// magenta (shell wins, matching the tinted draft), plan mode tints ACCENT,
-    /// else quiet FAINT.
+    /// Hue shared by the composer's rounded border: shell gets functional amber,
+    /// plan gets brand lime, and the ordinary input stays quiet.
     pub(super) fn composer_rule_style(&self) -> Style {
         if self.draft_is_shell_command() {
             Style::default().fg(SHELL())
@@ -2671,7 +2670,7 @@ impl CodeTuiApp {
         } else if self.agent_auto_approve {
             ("↯ auto-approve", Style::default().fg(WARNING()))
         } else if self.agent_review_edits {
-            ("✎ review", Style::default().fg(TOOL()))
+            ("✎ review", Style::default().fg(MUTED()))
         } else {
             ("normal", Style::default().fg(MUTED()))
         };
@@ -2729,7 +2728,7 @@ impl CodeTuiApp {
             spans.push(Span::styled(left_text, left_style));
         }
         if !jobs_text.is_empty() {
-            spans.push(Span::styled(jobs_text, Style::default().fg(TOOL())));
+            spans.push(Span::styled(jobs_text, Style::default().fg(MUTED())));
         }
         spans.push(Span::styled("─".repeat(fill), rule_style));
         spans.push(Span::styled(format!(" {badge}"), badge_style));
@@ -3196,7 +3195,10 @@ impl CodeTuiApp {
             ]));
         }
         if let Some(chip) = self.welcome_capabilities_label() {
-            lines.push(line_plain(chip, Style::default().fg(MUTED())));
+            lines.push(line_with_plain(vec![
+                Span::styled("◈  ", Style::default().fg(ACCENT())),
+                Span::styled(chip, Style::default().fg(MUTED())),
+            ]));
         }
         let tip = WELCOME_TIPS[self.welcome_tip_index % WELCOME_TIPS.len()];
         lines.push(line_with_plain(vec![
@@ -3234,13 +3236,9 @@ impl CodeTuiApp {
         // Ghost hint trailing a bare slash command (Claude-Code style), e.g.
         // `> /mcp [add … | rm <name>]`. Only set when the draft is a single line.
         let ghost = self.composer_command_hint();
-        // A `!cmd` draft is tinted in the magenta shell hue, so shell mode reads at
-        // a glance — the prompt and border pick up the same magenta color.
-        let draft_color = if self.draft_is_shell_command() {
-            SHELL()
-        } else {
-            TEXT()
-        };
+        // The prompt and border carry shell state; long command text remains calm
+        // and readable instead of becoming a saturated block.
+        let draft_color = TEXT();
         // Row 0 carries the in-box `❯ ` prompt; wrapped rows get a same-width
         // hanging indent so text aligns under the first character.
         let rows = composer_visual_rows(&self.draft, self.composer_text_width());
@@ -3286,7 +3284,7 @@ impl CodeTuiApp {
         } else if self.draft_is_shell_command() {
             SHELL()
         } else {
-            USER()
+            ACCENT()
         };
         Style::default().fg(color).add_modifier(Modifier::BOLD)
     }
@@ -3403,7 +3401,7 @@ impl CodeTuiApp {
         }
         if plain_chat {
             right_spans.push(Span::styled(" · ", Style::default().fg(FAINT())));
-            right_spans.push(Span::styled(PLAIN_CODE_BADGE, Style::default().fg(USER())));
+            right_spans.push(Span::styled(PLAIN_CODE_BADGE, Style::default().fg(MUTED())));
         }
         if let Some(host) = host {
             right_spans.push(Span::styled(" · ", Style::default().fg(FAINT())));

@@ -118,11 +118,12 @@ fn test_composer_highlights_shell_command_draft() {
     let line = app.render_composer_text().lines[0].clone();
     assert_eq!(line.spans[1].style.fg, Some(TEXT()));
 
-    // A `!cmd` draft is tinted in the magenta shell hue to signal shell mode.
+    // Shell state stays on the prompt and border; long command text remains calm.
     app.draft = "!ls -la".to_string();
     app.cursor = app.draft.len();
     let line = app.render_composer_text().lines[0].clone();
-    assert_eq!(line.spans[1].style.fg, Some(SHELL()));
+    assert_eq!(line.spans[0].style.fg, Some(SHELL()));
+    assert_eq!(line.spans[1].style.fg, Some(TEXT()));
 
     // `!!` is the literal-`!` escape (sent to the model), not shell mode.
     app.draft = "!!not a command".to_string();
