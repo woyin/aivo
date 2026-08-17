@@ -105,6 +105,24 @@ then finish.";
 /// such models never compact and resend the whole transcript. A real window wins.
 pub(crate) const DEFAULT_CONTEXT_WINDOW: usize = 128_000;
 
+/// One verification-plan run; `lines` are the `[self-verify]` marker lines of
+/// the checks that ran.
+pub(crate) enum VerifyRun {
+    Clean {
+        lines: Vec<String>,
+    },
+    /// A check was inconclusive: accepted, but never reported as verified.
+    Unverified {
+        lines: Vec<String>,
+    },
+    /// The first failing check; later checks didn't run.
+    Fail {
+        label: String,
+        summary: String,
+        lines: Vec<String>,
+    },
+}
+
 /// Why a turn ended early, surfaced via [`AgentUi::turn_stopped`]. Typed so a
 /// driver like the `/goal` loop must handle each variant in a `match`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -224,6 +242,8 @@ pub trait AgentUi: Send {
     fn turn_stopped(&mut self, _stop: TurnStop) {}
     /// The turn converged via an accepted `finish_turn` report. Default no-op.
     fn turn_finished(&mut self, _report: &crate::agent::finish::FinishReport) {}
+    /// A self-verification check finished (engine-observed, not model-claimed). Default no-op.
+    fn verify_evidence(&mut self, _record: &verify::EvidenceRecord) {}
     /// Like [`notify`](Self::notify) but for a genuine error (error hue). Default delegates to `notify`.
     fn notify_error(&mut self, text: &str) {
         self.notify(text);
@@ -540,9 +560,9 @@ pub struct AgentEngine {
     /// on for headless `-e` (`AIVO_AGENT_SELF_CORRECT=0` opts out), opt-in (`=1`) interactive.
     self_correct: bool,
     /// Gates self-correct so investigate-only turns don't re-run the whole suite;
-    /// also stales pinned pass evidence. Starts true (tree state unknown);
-    /// [`Self::set_verified_baseline`] clears it.
-    pub(crate) dirty_since_verify: bool,
+    /// `Dirty` also stales pinned pass evidence. Starts `Dirty` (tree state
+    /// unknown); [`Self::set_verified_baseline`] clears it.
+    pub(crate) verify_state: verify::VerifyState,
     /// Accepted `finish_turn` report for the current turn; reset at turn start.
     finish_report: Option<crate::agent::finish::FinishReport>,
     /// Premature-`done` rejections this turn; at the cap the next finish is accepted.

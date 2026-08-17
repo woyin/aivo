@@ -79,7 +79,7 @@ impl AgentEngine {
             plan_mode_stash: Vec::new(),
             require_completion: false,
             self_correct: false,
-            dirty_since_verify: true,
+            verify_state: verify::VerifyState::Dirty,
             finish_report: None,
             finish_rejections: 0,
             confirm_before_build: false,
@@ -315,7 +315,7 @@ plan-approval card — suggest it when a task deserves real design discussion.",
     /// Treat the current tree as verified — only a mutation re-arms self-verify, so
     /// the default-on headless path doesn't pay a suite run for investigate-only work.
     pub fn set_verified_baseline(&mut self) {
-        self.dirty_since_verify = false;
+        self.verify_state = verify::VerifyState::Clean;
     }
 
     /// Set the `reasoning_effort` level (`/effort`). Only meaningful for reasoning models.

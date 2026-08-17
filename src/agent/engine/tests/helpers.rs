@@ -35,6 +35,8 @@ pub(super) struct CapturingUi {
     /// The plan text of each `approve_plan` call, in order.
     pub(super) approved_plans: Vec<String>,
     pub(super) steering: Vec<String>,
+    /// Every `verify_evidence` record, in arrival order (not merged).
+    pub(super) verify_records: Vec<crate::agent::verify::EvidenceRecord>,
 }
 
 impl AgentUi for CapturingUi {
@@ -62,6 +64,9 @@ impl AgentUi for CapturingUi {
     }
     fn notify(&mut self, t: &str) {
         self.notices.push(t.to_string());
+    }
+    fn verify_evidence(&mut self, record: &crate::agent::verify::EvidenceRecord) {
+        self.verify_records.push(record.clone());
     }
     fn notify_error(&mut self, t: &str) {
         self.errors.push(t.to_string());

@@ -74,8 +74,12 @@ impl AgentEngine {
         let mut empty_retries = 0usize;
         // Keeps a stale plan from an earlier turn from triggering the nudge.
         let mut plan_set_this_turn = false;
-        // Post-edit self-verification (opt-in): the project's validator, detected once.
-        let validator = self.self_correct.then(|| verify::detect(ctx.cwd)).flatten();
+        // Post-edit self-verification (opt-in): the project's checks, detected once.
+        let vplan = if self.self_correct {
+            verify::detect_plan(ctx.cwd)
+        } else {
+            Vec::new()
+        };
         let mut selfcorrect_attempts = 0usize;
         let mut tokens = 0u64;
         // Real provider-measured split, summed across steps (drained by the TUI for stats). Reset per turn.
@@ -376,51 +380,29 @@ impl AgentEngine {
                     self.push_text_turn("user", PLAN_NUDGE.to_string());
                     continue;
                 }
-                // A declared-done turn isn't accepted while the validator fails — feed
+                // A declared-done turn isn't accepted while a check fails — feed
                 // the failure back (bounded) so the model fixes the cause. Every run
-                // leaves a `[self-verify]` marker line for the log-derived digest.
-                if let Some(v) = &validator
-                    && self.dirty_since_verify
+                // leaves `[self-verify]` marker lines for the log-derived digest.
+                if !vplan.is_empty()
+                    && self.verify_state == verify::VerifyState::Dirty
                     && selfcorrect_attempts < MAX_SELFCORRECT_ATTEMPTS
                 {
-                    match verify::run(v.clone(), ctx.cwd).await {
-                        verify::Outcome::Fail(summary) => {
+                    match self.run_verify_plan(ctx.cwd, ui, &vplan).await {
+                        VerifyRun::Fail {
+                            label,
+                            summary,
+                            lines,
+                        } => {
                             selfcorrect_attempts += 1;
-                            ui.notify(&format!("{} failed — asking the model to fix", v.label));
-                            let line = self.record_verify_evidence(
-                                &v.label,
-                                verify::EvidenceStatus::Fail,
-                                verify::failure_detail(&summary),
-                            );
+                            ui.notify(&format!("{label} failed — asking the model to fix"));
                             self.push_text_turn(
                                 "user",
-                                format!("{VERIFY_FAILED_PREFIX}\n{summary}\n{line}"),
+                                format!("{VERIFY_FAILED_PREFIX}\n{summary}\n{}", lines.join("\n")),
                             );
                             continue;
                         }
-                        verify::Outcome::Pass => {
-                            self.dirty_since_verify = false;
-                            ui.notify(&format!("verified: {} passed", v.label));
-                            let line = self.record_verify_evidence(
-                                &v.label,
-                                verify::EvidenceStatus::Pass,
-                                String::new(),
-                            );
-                            self.push_text_turn("user", line);
-                        }
-                        verify::Outcome::Inconclusive(reason) => {
-                            // Accepted (don't hammer a hanging suite) but never claimed verified.
-                            self.dirty_since_verify = false;
-                            ui.notify(&format!(
-                                "verification inconclusive: {} {reason} — result not verified",
-                                v.label
-                            ));
-                            let line = self.record_verify_evidence(
-                                &v.label,
-                                verify::EvidenceStatus::Inconclusive,
-                                reason.to_string(),
-                            );
-                            self.push_text_turn("user", line);
+                        VerifyRun::Clean { lines } | VerifyRun::Unverified { lines } => {
+                            self.push_text_turn("user", lines.join("\n"));
                         }
                     }
                 }
@@ -602,6 +584,7 @@ you were working. If the outcome matters to the task, inspect the log; otherwise
     /// marker line, the digest's durable form in the log.
     pub(super) fn record_verify_evidence(
         &mut self,
+        ui: &mut dyn AgentUi,
         command: &str,
         status: verify::EvidenceStatus,
         detail: String,
@@ -612,8 +595,71 @@ you were working. If the outcome matters to the task, inspect the log; otherwise
             detail,
         };
         let line = verify::evidence_line(&record);
+        ui.verify_evidence(&record);
         verify::merge_evidence(&mut self.evidence, record, MAX_EVIDENCE);
         line
+    }
+
+    /// Run the verification plan in order, stopping at the first `Fail` (the
+    /// state stays `Dirty`). An inconclusive check taints the run `Unverified`
+    /// while the remaining checks still run.
+    pub(super) async fn run_verify_plan(
+        &mut self,
+        cwd: &Path,
+        ui: &mut dyn AgentUi,
+        plan: &[verify::Validator],
+    ) -> VerifyRun {
+        let mut lines = Vec::new();
+        let mut inconclusive = false;
+        for v in plan {
+            match verify::run(v.clone(), cwd).await {
+                verify::Outcome::Fail(summary) => {
+                    lines.push(self.record_verify_evidence(
+                        ui,
+                        &v.label,
+                        verify::EvidenceStatus::Fail,
+                        verify::failure_detail(&summary),
+                    ));
+                    return VerifyRun::Fail {
+                        label: v.label.clone(),
+                        summary,
+                        lines,
+                    };
+                }
+                verify::Outcome::Pass => {
+                    ui.notify(&format!("verified: {} passed", v.label));
+                    lines.push(self.record_verify_evidence(
+                        ui,
+                        &v.label,
+                        verify::EvidenceStatus::Pass,
+                        String::new(),
+                    ));
+                }
+                verify::Outcome::Inconclusive(reason) => {
+                    inconclusive = true;
+                    ui.notify(&format!(
+                        "verification inconclusive: {} {reason} — result not verified",
+                        v.label
+                    ));
+                    lines.push(self.record_verify_evidence(
+                        ui,
+                        &v.label,
+                        verify::EvidenceStatus::Inconclusive,
+                        reason.to_string(),
+                    ));
+                }
+            }
+        }
+        self.verify_state = if inconclusive {
+            verify::VerifyState::Unverified
+        } else {
+            verify::VerifyState::Clean
+        };
+        if inconclusive {
+            VerifyRun::Unverified { lines }
+        } else {
+            VerifyRun::Clean { lines }
+        }
     }
 
     /// Append `block` to the last tool result, or push a user turn when there is none.

@@ -57,6 +57,16 @@ impl AgentEngine {
         let mut parallel_idx: Vec<usize> = Vec::new();
         let mut sequential_idx: Vec<usize> = Vec::new();
 
+        // A read placed after a mutation must see its effects: parallel-safe calls
+        // past the first workspace-touching call run in the ordered pass instead.
+        // Inline-resolved calls never reach the executor, so they don't count.
+        let barrier = tool_calls.iter().position(|c| {
+            let n = subagents::normalize_tool_name(&c.name).unwrap_or(&c.name);
+            !matches!(n, "update_plan" | "finish_turn")
+                && (!tools::is_read_only(n)
+                    || self.external.as_ref().is_some_and(|e| e.handles(&c.name)))
+        });
+
         for (i, call) in tool_calls.iter().enumerate() {
             // A live mid-turn plan exit (Shift+Tab), picked up at this call
             // boundary so the rest of the turn runs unrestricted.
@@ -186,7 +196,7 @@ impl AgentEngine {
                 .external
                 .as_ref()
                 .is_some_and(|e| e.handles(&call.name));
-            if tools::is_parallel_safe(n) && !shadowed {
+            if tools::is_parallel_safe(n) && !shadowed && barrier.is_none_or(|b| i < b) {
                 parallel_idx.push(i);
             } else {
                 sequential_idx.push(i);
@@ -220,10 +230,12 @@ impl AgentEngine {
         let subagent_idx: Vec<usize> = if self.read_only {
             Vec::new()
         } else {
+            // Only the leading run of delegates pools — the pool runs before the
+            // ordered pass, so a delegate behind a write must run in order.
             sequential_idx
                 .iter()
                 .copied()
-                .filter(|&i| {
+                .take_while(|&i| {
                     let c = &tool_calls[i];
                     subagents::normalize_tool_name(&c.name).unwrap_or(&c.name) == "subagent"
                 })
@@ -604,14 +616,14 @@ command in the foreground (drop `background`)."
                 self.record_touched_file(n, &call.arguments);
                 // A successful mutation (or delegated work) invalidates the last green verify.
                 if tools::is_mutating(n) || n == "subagent" {
-                    self.dirty_since_verify = true;
+                    self.verify_state = verify::VerifyState::Dirty;
                 }
                 if let Some(k) = tools::read_dedupe_key(n, &call.arguments, ctx.cwd) {
                     repeated_reads.push((k, call.id.clone()));
                 }
             } else if n == "subagent" {
                 // A failed delegate may still have edited files (step limit mid-work).
-                self.dirty_since_verify = true;
+                self.verify_state = verify::VerifyState::Dirty;
             }
             let raw = match result {
                 Ok(c) => c,
@@ -809,41 +821,24 @@ or finish with status \"blocked\".",
                     plan::pinned_block(&self.plan)
                 ));
             }
-            if self.dirty_since_verify
-                && let Some(v) = self.self_correct.then(|| verify::detect(ctx.cwd)).flatten()
-            {
-                match verify::run(v.clone(), ctx.cwd).await {
-                    verify::Outcome::Fail(summary) => {
-                        self.finish_rejections += 1;
-                        ui.notify(&format!("{} failed — rejecting finish_turn(done)", v.label));
-                        let line = self.record_verify_evidence(
-                            &v.label,
-                            verify::EvidenceStatus::Fail,
-                            verify::failure_detail(&summary),
-                        );
-                        return Err(format!(
-                            "finish_turn(done) rejected — {} is failing:\n{summary}\n{line}\n\
+            if self.verify_state == verify::VerifyState::Dirty && self.self_correct {
+                let vplan = verify::detect_plan(ctx.cwd);
+                if !vplan.is_empty() {
+                    match self.run_verify_plan(ctx.cwd, ui, &vplan).await {
+                        VerifyRun::Fail {
+                            label,
+                            summary,
+                            lines,
+                        } => {
+                            self.finish_rejections += 1;
+                            ui.notify(&format!("{label} failed — rejecting finish_turn(done)"));
+                            return Err(format!(
+                                "finish_turn(done) rejected — {label} is failing:\n{summary}\n{}\n\
 Fix the cause, or finish with status \"blocked\".",
-                            v.label
-                        ));
-                    }
-                    verify::Outcome::Pass => {
-                        self.dirty_since_verify = false;
-                        ui.notify(&format!("verified: {} passed", v.label));
-                        self.record_verify_evidence(
-                            &v.label,
-                            verify::EvidenceStatus::Pass,
-                            String::new(),
-                        );
-                    }
-                    verify::Outcome::Inconclusive(reason) => {
-                        // Accepted (don't hammer a hanging suite) but never claimed verified.
-                        self.dirty_since_verify = false;
-                        self.record_verify_evidence(
-                            &v.label,
-                            verify::EvidenceStatus::Inconclusive,
-                            reason.to_string(),
-                        );
+                                lines.join("\n")
+                            ));
+                        }
+                        VerifyRun::Clean { .. } | VerifyRun::Unverified { .. } => {}
                     }
                 }
             }

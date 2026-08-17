@@ -566,7 +566,7 @@ impl AgentEngine {
     pub(crate) fn render_pinned_block(&self) -> String {
         let plan_block = plan::pinned_block(&self.plan);
         // A pass is only current while nothing mutated since the run.
-        let evidence = if self.dirty_since_verify {
+        let evidence = if self.verify_state == crate::agent::verify::VerifyState::Dirty {
             crate::agent::verify::annotate_stale(&self.evidence)
         } else {
             self.evidence.clone()
@@ -1284,7 +1284,7 @@ mod tests {
         // dirty starts true (tree unknown) — a restored pass must not read as current.
         let block = e.render_pinned_block();
         assert!(block.contains("→ pass — stale"), "{block}");
-        e.dirty_since_verify = false;
+        e.verify_state = crate::agent::verify::VerifyState::Clean;
         let block = e.render_pinned_block();
         assert!(
             block.contains("→ pass") && !block.contains("stale"),

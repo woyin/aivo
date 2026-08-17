@@ -1103,6 +1103,8 @@ struct HeadlessAgentUi {
     /// `--json-schema`: buffer the answer so only the validated (or last)
     /// attempt reaches stdout / the `final` event.
     defer_answer: bool,
+    /// Engine-observed self-verification records (not model claims), latest per command.
+    verification: Vec<crate::agent::verify::EvidenceRecord>,
 }
 
 impl HeadlessAgentUi {
@@ -1124,7 +1126,31 @@ impl HeadlessAgentUi {
             pending_warnings: Vec::new(),
             session_saved: None,
             defer_answer: false,
+            verification: Vec::new(),
         }
+    }
+
+    fn verify_event_fields(r: &crate::agent::verify::EvidenceRecord) -> Value {
+        json!({
+            "command": r.command,
+            "status": r.status.as_str(),
+            "detail": redact(&r.detail),
+        })
+    }
+
+    /// `true` only when checks ran, all passed, and the run wasn't stopped early
+    /// (a stop can leave edits after the last green run); `null` when none ran.
+    fn verified_flag(&self) -> Value {
+        if self.verification.is_empty() {
+            return Value::Null;
+        }
+        json!(
+            self.stop_reason.is_none()
+                && self
+                    .verification
+                    .iter()
+                    .all(|r| r.status == crate::agent::verify::EvidenceStatus::Pass)
+        )
     }
 
     /// Warn before a corrective retry, or record the terminal error (→ exit 1).
@@ -1254,7 +1280,8 @@ impl HeadlessAgentUi {
             }
             OutputFormat::Json => self.run_end(exit_code),
             OutputFormat::StreamJson => {
-                // The full envelope a stream consumer expects: run_start → [stopped] → final → run_end.
+                // The full envelope a stream consumer expects:
+                // run_start → [stopped] → [finished] → [verify…] → final → run_end.
                 self.emit(
                     "run_start",
                     json!({ "model": self.model, "cwd": self.cwd, "sessionId": self.session_id }),
@@ -1270,6 +1297,9 @@ impl HeadlessAgentUi {
                             "blocker": f.blocker.as_deref().map(redact),
                         }),
                     );
+                }
+                for r in &self.verification {
+                    self.emit("verify", Self::verify_event_fields(r));
                 }
                 self.emit(
                     "final",
@@ -1328,6 +1358,8 @@ impl HeadlessAgentUi {
                         "finishStatus": self.finish.as_ref().map(|f| f.status.wire_name()),
                         "blocker": self.finish.as_ref().and_then(|f| f.blocker.as_deref()).map(redact),
                         "sessionSaved": self.session_saved,
+                        "verification": self.verification.iter().map(Self::verify_event_fields).collect::<Vec<_>>(),
+                        "verified": self.verified_flag(),
                         "steps": steps,
                         "tokens": tokens,
                         "elapsedSecs": elapsed_secs,
@@ -1441,6 +1473,12 @@ impl AgentUi for HeadlessAgentUi {
         self.stop_reason = Some(stop);
         if self.format == OutputFormat::StreamJson {
             self.emit("stopped", json!({ "reason": stop.wire_name() }));
+        }
+    }
+    fn verify_evidence(&mut self, record: &crate::agent::verify::EvidenceRecord) {
+        crate::agent::verify::merge_evidence(&mut self.verification, record.clone(), 8);
+        if self.format == OutputFormat::StreamJson {
+            self.emit("verify", Self::verify_event_fields(record));
         }
     }
     fn turn_finished(&mut self, report: &FinishReport) {

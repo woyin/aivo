@@ -178,6 +178,75 @@ fn exec_json_emits_one_result_document() {
     assert!(!doc["sessionId"].as_str().unwrap().is_empty());
 }
 
+/// With self-correct on (the `-e` default) and a green suite, the engine's
+/// verification evidence rides the json result.
+#[cfg(unix)]
+#[test]
+fn exec_json_reports_engine_verification_evidence() {
+    let env = ExecEnv::new();
+    std::fs::write(env.proj.path().join("run_tests.sh"), "exit 0\n").unwrap();
+    let script_path = env.home.path().join("fake-script.json");
+    std::fs::write(&script_path, WRITE_SCRIPT).unwrap();
+    let mut cmd = env.cmd();
+    cmd.env("AIVO_AGENT_FAKE_SSE", &script_path)
+        .env("AIVO_AGENT_LSP", "0")
+        .args([
+            "code",
+            "-e",
+            "write hello.txt",
+            "--model",
+            "gpt-4o",
+            "--output-format",
+            "json",
+        ]);
+    let out = cmd.output().expect("spawn aivo code -e");
+    assert!(out.status.success(), "stderr:\n{}", stderr_str(&out));
+
+    let doc: Value = serde_json::from_str(stdout_str(&out).trim()).unwrap();
+    assert_eq!(doc["verified"], true, "{doc}");
+    let records = doc["verification"].as_array().unwrap();
+    assert_eq!(records.len(), 1, "{doc}");
+    assert_eq!(records[0]["command"], "run_tests.sh");
+    assert_eq!(records[0]["status"], "pass");
+}
+
+/// Stream mode surfaces each engine verification as a `verify` event, before `final`.
+#[cfg(unix)]
+#[test]
+fn exec_stream_json_emits_verify_events() {
+    let env = ExecEnv::new();
+    std::fs::write(env.proj.path().join("run_tests.sh"), "exit 0\n").unwrap();
+    let script_path = env.home.path().join("fake-script.json");
+    std::fs::write(&script_path, WRITE_SCRIPT).unwrap();
+    let mut cmd = env.cmd();
+    cmd.env("AIVO_AGENT_FAKE_SSE", &script_path)
+        .env("AIVO_AGENT_LSP", "0")
+        .args([
+            "code",
+            "-e",
+            "write hello.txt",
+            "--model",
+            "gpt-4o",
+            "--output-format",
+            "stream-json",
+        ]);
+    let out = cmd.output().expect("spawn aivo code -e");
+    assert!(out.status.success(), "stderr:\n{}", stderr_str(&out));
+
+    let events: Vec<Value> = stdout_str(&out)
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap_or_else(|e| panic!("bad event line ({e}): {l}")))
+        .collect();
+    let verify = events
+        .iter()
+        .position(|e| e["type"] == "verify")
+        .expect("verify event");
+    assert_eq!(events[verify]["command"], "run_tests.sh");
+    assert_eq!(events[verify]["status"], "pass");
+    let fin = events.iter().position(|e| e["type"] == "final").unwrap();
+    assert!(verify < fin, "verify must precede final");
+}
+
 #[test]
 fn exec_stream_json_emits_the_full_event_envelope() {
     let env = ExecEnv::new();

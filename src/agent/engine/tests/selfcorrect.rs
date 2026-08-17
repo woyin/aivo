@@ -90,7 +90,7 @@ async fn selfcorrect_blocks_done_until_green() {
 
     // A mutation (or a resume, where dirty starts true) stales the pinned pass.
     assert!(!engine.render_pinned_block().contains("stale"));
-    engine.dirty_since_verify = true;
+    engine.verify_state = crate::agent::verify::VerifyState::Dirty;
     assert!(engine.render_pinned_block().contains("→ pass — stale"));
     assert!(resumed.render_pinned_block().contains("→ pass — stale"));
 }
@@ -168,6 +168,107 @@ async fn selfcorrect_verified_baseline_skips_investigate_only_runs() {
     run_session(&mut engine, &ctx, Some("now edit".into()), &mut ui).await;
     let runs = std::fs::read_to_string(dir.join("runs.log")).unwrap_or_default();
     assert_eq!(runs.lines().count(), 1, "mutation re-arms verification");
+}
+
+/// Multi-check plan: the first failing check blocks done and later checks
+/// don't run; once green, every check runs.
+#[cfg(unix)]
+#[tokio::test]
+async fn selfcorrect_plan_stops_at_first_failing_check() {
+    let dir = tmp();
+    std::fs::write(
+        dir.join("Makefile"),
+        "check:\n\t@[ -f passing ]\ntest:\n\t@echo t >> test.log\n",
+    )
+    .unwrap();
+
+    let write = tool_call_sse("write_file", json!({"path": "passing", "content": "ok"}));
+    let port = spawn_sse_sequence(vec![
+        FINAL_TEXT_SSE.to_string(), // done → make check fails → fed back
+        write,                      // fix
+        FINAL_TEXT_SSE.to_string(), // done → check passes, test runs
+    ]);
+    let client = reqwest::Client::builder().no_proxy().build().unwrap();
+    let base = format!("http://127.0.0.1:{port}");
+    let mut engine = AgentEngine::new(&dir.display().to_string(), "m", "", &[], &[], 0, 0);
+    engine.set_self_correct(true);
+    let mut ui = CapturingUi::default();
+    run_session(
+        &mut engine,
+        &turn_ctx(&client, &base, &dir),
+        Some("make the checks pass".into()),
+        &mut ui,
+    )
+    .await;
+
+    let runs = std::fs::read_to_string(dir.join("test.log")).unwrap_or_default();
+    assert_eq!(
+        runs.lines().count(),
+        1,
+        "make test must not run while make check is red"
+    );
+    let digest: Vec<(String, crate::agent::verify::EvidenceStatus)> = engine
+        .evidence
+        .iter()
+        .map(|r| (r.command.clone(), r.status))
+        .collect();
+    assert_eq!(
+        digest,
+        vec![
+            (
+                "make check".to_string(),
+                crate::agent::verify::EvidenceStatus::Pass
+            ),
+            (
+                "make test".to_string(),
+                crate::agent::verify::EvidenceStatus::Pass
+            ),
+        ]
+    );
+    assert_eq!(
+        engine.verify_state,
+        crate::agent::verify::VerifyState::Clean
+    );
+    assert_eq!(
+        ui.verify_records[0].status,
+        crate::agent::verify::EvidenceStatus::Fail
+    );
+    assert_eq!(ui.verify_records.len(), 3);
+}
+
+/// An inconclusive check taints the run `Unverified` — never `Clean` — while
+/// the remaining checks still run.
+#[tokio::test]
+async fn verify_plan_inconclusive_taints_unverified() {
+    use crate::agent::verify;
+    let dir = tmp();
+    let mut engine = AgentEngine::new(&dir.display().to_string(), "m", "", &[], &[], 0, 0);
+    let mut ui = CapturingUi::default();
+    let plan = vec![
+        verify::Validator::new("ghost", &["aivo-definitely-not-a-real-binary"]),
+        verify::Validator::new(
+            "truth",
+            if cfg!(windows) {
+                &["cmd", "/c", "exit", "0"][..]
+            } else {
+                &["true"][..]
+            },
+        ),
+    ];
+    let out = engine.run_verify_plan(&dir, &mut ui, &plan).await;
+    assert!(matches!(out, VerifyRun::Unverified { .. }));
+    assert_eq!(engine.verify_state, verify::VerifyState::Unverified);
+    assert_eq!(engine.evidence.len(), 2);
+    assert_eq!(
+        engine.evidence[0].status,
+        verify::EvidenceStatus::Inconclusive
+    );
+    assert_eq!(engine.evidence[1].status, verify::EvidenceStatus::Pass);
+    assert!(
+        ui.notices.iter().any(|n| n.contains("result not verified")),
+        "{:?}",
+        ui.notices
+    );
 }
 
 // --- background jobs (Phase 4) ---

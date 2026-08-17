@@ -472,6 +472,41 @@ async fn mixed_batch_orders_results_and_runs_write() {
     );
 }
 
+/// A read placed after a write in the same batch sees the written content.
+#[tokio::test]
+async fn read_after_write_in_same_batch_sees_new_content() {
+    let dir = tmp();
+    let batch = batch_tool_call_sse(&[
+        (
+            "c0",
+            "write_file",
+            json!({"path": "out.txt", "content": "FRESH"}),
+        ),
+        ("c1", "read_file", json!({"path": "out.txt"})),
+    ]);
+    let port = spawn_sse_sequence(vec![batch, FINAL_TEXT_SSE.to_string()]);
+    let client = reqwest::Client::builder().no_proxy().build().unwrap();
+    let base = format!("http://127.0.0.1:{port}");
+    let mut engine = AgentEngine::new(&dir.display().to_string(), "m", "", &[], &[], 0, 0);
+    let mut ui = CapturingUi::default();
+    run_session(
+        &mut engine,
+        &turn_ctx(&client, &base, &dir),
+        Some("write then read".into()),
+        &mut ui,
+    )
+    .await;
+
+    let results = tool_result_texts(&engine);
+    assert_eq!(results.len(), 2);
+    assert!(
+        results[1].contains("FRESH"),
+        "read after same-batch write must see the write: {:?}",
+        results[1]
+    );
+    assert!(ui.tool_errors.is_empty(), "errors: {:?}", ui.tool_errors);
+}
+
 /// An empty completion is retried once; a second empty fails the turn without
 /// recording an assistant message (empty → invalid Anthropic content array).
 #[tokio::test]

@@ -17,7 +17,7 @@ pub struct Validator {
 }
 
 impl Validator {
-    fn new(label: &str, command: &[&str]) -> Self {
+    pub(crate) fn new(label: &str, command: &[&str]) -> Self {
         Self {
             label: label.to_string(),
             command: command.iter().map(|s| (*s).to_string()).collect(),
@@ -28,6 +28,16 @@ impl Validator {
 /// A validator that overruns this is treated as inconclusive, not a failure —
 /// better to accept the answer than to loop the agent on a hanging suite.
 const VERIFY_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// The engine's verification standing. `Unverified` (a check timed out or could
+/// not launch) converges like `Clean` — don't hammer a hanging suite — but must
+/// never be reported as verified.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VerifyState {
+    Clean,
+    Dirty,
+    Unverified,
+}
 
 /// Distinct from `Pass` so a timeout or missing tool is never reported as verified.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -56,7 +66,7 @@ pub enum EvidenceStatus {
 }
 
 impl EvidenceStatus {
-    fn as_str(self) -> &'static str {
+    pub fn as_str(self) -> &'static str {
         match self {
             Self::Pass => "pass",
             Self::Fail => "fail",
@@ -185,32 +195,46 @@ fn sanitize_detail(s: &str) -> String {
     out
 }
 
-/// The project's primary validator, or `None` if the workspace isn't recognized.
-/// Ordered cheapest / most-explicit first so a repo's own entrypoint wins over a
-/// heavier language default.
-pub fn detect(cwd: &Path) -> Option<Validator> {
+/// The project's verification plan, cheapest first; empty when unrecognized.
+/// A project-declared driver (entrypoint script, Makefile) replaces language
+/// defaults it conventionally wraps; otherwise checks union across the
+/// ecosystems present. Only project-declared extras join — no implicit linters
+/// like clippy, which would force fixing pre-existing warnings.
+pub fn detect_plan(cwd: &Path) -> Vec<Validator> {
     if cwd.join("run_tests.sh").is_file() {
-        return Some(Validator::new("run_tests.sh", &["sh", "run_tests.sh"]));
+        return vec![Validator::new("run_tests.sh", &["sh", "run_tests.sh"])];
+    }
+    let mut plan = Vec::new();
+    if makefile_has_target(cwd, "check") {
+        plan.push(Validator::new("make check", &["make", "check"]));
     }
     if makefile_has_target(cwd, "test") {
-        return Some(Validator::new("make test", &["make", "test"]));
+        plan.push(Validator::new("make test", &["make", "test"]));
     }
-    if makefile_has_target(cwd, "check") {
-        return Some(Validator::new("make check", &["make", "check"]));
+    if !plan.is_empty() {
+        return plan;
+    }
+    for script in ["lint", "typecheck"] {
+        if package_json_has_script(cwd, script) {
+            plan.push(Validator::new(
+                &format!("npm run {script}"),
+                &["npm", "run", script, "--silent"],
+            ));
+        }
     }
     if package_json_has_test(cwd) {
-        return Some(Validator::new("npm test", &["npm", "test", "--silent"]));
+        plan.push(Validator::new("npm test", &["npm", "test", "--silent"]));
     }
     if cwd.join("Cargo.toml").is_file() {
-        return Some(Validator::new("cargo test", &["cargo", "test"]));
+        plan.push(Validator::new("cargo test", &["cargo", "test"]));
     }
     if cwd.join("go.mod").is_file() {
-        return Some(Validator::new("go test", &["go", "test", "./..."]));
+        plan.push(Validator::new("go test", &["go", "test", "./..."]));
     }
     if cwd.join("pytest.ini").is_file() || pyproject_has_pytest(cwd) {
-        return Some(Validator::new("pytest", &["pytest", "-q"]));
+        plan.push(Validator::new("pytest", &["pytest", "-q"]));
     }
-    None
+    plan
 }
 
 /// Run `v` in `cwd`. `Inconclusive` never blocks the agent, but is NOT a pass —
@@ -271,16 +295,17 @@ fn makefile_has_target(cwd: &Path, target: &str) -> bool {
 
 /// Whether `package.json` defines a real `scripts.test` (not npm's default stub).
 fn package_json_has_test(cwd: &Path) -> bool {
-    let Ok(text) = std::fs::read_to_string(cwd.join("package.json")) else {
-        return false;
-    };
-    let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) else {
-        return false;
-    };
-    v.get("scripts")
-        .and_then(|s| s.get("test"))
-        .and_then(|t| t.as_str())
-        .is_some_and(|t| !t.contains("no test specified"))
+    package_json_script(cwd, "test").is_some_and(|t| !t.contains("no test specified"))
+}
+
+fn package_json_has_script(cwd: &Path, name: &str) -> bool {
+    package_json_script(cwd, name).is_some()
+}
+
+fn package_json_script(cwd: &Path, name: &str) -> Option<String> {
+    let text = std::fs::read_to_string(cwd.join("package.json")).ok()?;
+    let v = serde_json::from_str::<serde_json::Value>(&text).ok()?;
+    v.get("scripts")?.get(name)?.as_str().map(str::to_string)
 }
 
 /// Whether `pyproject.toml` configures pytest.
@@ -304,17 +329,42 @@ mod tests {
         dir
     }
 
+    fn labels(cwd: &Path) -> Vec<String> {
+        detect_plan(cwd).into_iter().map(|v| v.label).collect()
+    }
+
     #[test]
-    fn detect_prefers_explicit_entrypoints_and_reads_makefile_targets() {
+    fn detect_plan_prefers_explicit_entrypoints_and_reads_makefile_targets() {
         let d = tmp();
-        assert!(detect(&d).is_none()); // empty workspace → nothing
+        assert!(labels(&d).is_empty()); // empty workspace → nothing
 
         std::fs::write(d.join("Cargo.toml"), "[package]").unwrap();
-        assert_eq!(detect(&d).unwrap().label, "cargo test");
+        assert_eq!(labels(&d), ["cargo test"]);
 
-        // A run_tests.sh wins over the Cargo default.
+        // A Makefile replaces the Cargo default; check runs before test.
+        std::fs::write(d.join("Makefile"), "test:\n\techo t\ncheck:\n\techo c\n").unwrap();
+        assert_eq!(labels(&d), ["make check", "make test"]);
+
+        // run_tests.sh wins over everything, alone.
         std::fs::write(d.join("run_tests.sh"), "exit 0").unwrap();
-        assert_eq!(detect(&d).unwrap().label, "run_tests.sh");
+        assert_eq!(labels(&d), ["run_tests.sh"]);
+    }
+
+    #[test]
+    fn detect_plan_unions_ecosystems_and_declared_scripts() {
+        let d = tmp();
+        std::fs::write(
+            d.join("package.json"),
+            r#"{"scripts":{"lint":"eslint .","test":"vitest run"}}"#,
+        )
+        .unwrap();
+        std::fs::write(d.join("Cargo.toml"), "[package]").unwrap();
+        std::fs::write(d.join("go.mod"), "module x").unwrap();
+        assert_eq!(
+            labels(&d),
+            ["npm run lint", "npm test", "cargo test", "go test"]
+        );
+        assert!(!labels(&d).iter().any(|l| l.contains("typecheck")));
     }
 
     #[test]
@@ -351,11 +401,11 @@ mod tests {
     async fn run_returns_typed_pass_and_fail() {
         let d = tmp();
         std::fs::write(d.join("run_tests.sh"), "exit 0\n").unwrap();
-        let v = detect(&d).unwrap();
+        let v = detect_plan(&d).remove(0);
         assert_eq!(run(v, &d).await, Outcome::Pass);
 
         std::fs::write(d.join("run_tests.sh"), "echo boom >&2; exit 1\n").unwrap();
-        let v = detect(&d).unwrap();
+        let v = detect_plan(&d).remove(0);
         match run(v, &d).await {
             Outcome::Fail(summary) => assert!(summary.contains("boom"), "{summary}"),
             other => panic!("expected Fail, got {other:?}"),

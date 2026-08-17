@@ -424,6 +424,77 @@ async fn parallel_subagents_refuse_shared_workspace_when_isolation_unavailable()
     assert_eq!(refused, 2, "both delegates must refuse: {results:?}");
 }
 
+/// Delegates behind a same-batch mutation don't pool — they run in call order,
+/// after the write. A leading run of delegates still pools.
+#[tokio::test]
+async fn subagents_after_write_run_in_order_not_pooled() {
+    // Control: an all-delegate batch pools.
+    let dir = tmp();
+    let batch = batch_tool_call_sse(&[
+        ("c1", "subagent", json!({"task": "scout a"})),
+        ("c2", "subagent", json!({"task": "scout b"})),
+    ]);
+    let port = spawn_sse_sequence(vec![
+        batch,
+        FINAL_TEXT_SSE.to_string(),
+        FINAL_TEXT_SSE.to_string(),
+        FINAL_TEXT_SSE.to_string(),
+    ]);
+    let client = reqwest::Client::builder().no_proxy().build().unwrap();
+    let base = format!("http://127.0.0.1:{port}");
+    let mut engine = AgentEngine::new(&dir.display().to_string(), "m", "", &[], &[], 0, 0);
+    let mut ui = CapturingUi::default();
+    run_session(
+        &mut engine,
+        &turn_ctx(&client, &base, &dir),
+        Some("delegate both".into()),
+        &mut ui,
+    )
+    .await;
+    assert!(
+        ui.notices.iter().any(|n| n.contains("in parallel")),
+        "leading delegates must pool: {:?}",
+        ui.notices
+    );
+
+    let dir = tmp();
+    let batch = batch_tool_call_sse(&[
+        (
+            "c1",
+            "write_file",
+            json!({"path": "out.txt", "content": "FRESH"}),
+        ),
+        ("c2", "subagent", json!({"task": "scout a"})),
+        ("c3", "subagent", json!({"task": "scout b"})),
+    ]);
+    let port = spawn_sse_sequence(vec![
+        batch,
+        FINAL_TEXT_SSE.to_string(),
+        FINAL_TEXT_SSE.to_string(),
+        FINAL_TEXT_SSE.to_string(),
+    ]);
+    let base = format!("http://127.0.0.1:{port}");
+    let mut engine = AgentEngine::new(&dir.display().to_string(), "m", "", &[], &[], 0, 0);
+    let mut ui = CapturingUi::default();
+    run_session(
+        &mut engine,
+        &turn_ctx(&client, &base, &dir),
+        Some("write then delegate".into()),
+        &mut ui,
+    )
+    .await;
+    assert!(
+        !ui.notices.iter().any(|n| n.contains("in parallel")),
+        "delegates after a mutation must not pool: {:?}",
+        ui.notices
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.join("out.txt")).unwrap(),
+        "FRESH"
+    );
+    assert_eq!(tool_result_texts(&engine).len(), 3, "all three calls ran");
+}
+
 /// Isolation requested outside a git repo falls back to the shared workspace
 /// with a note, rather than failing the delegation.
 #[tokio::test]
