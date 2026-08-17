@@ -261,6 +261,51 @@ async fn subagent_no_answer_is_a_failed_tool_result() {
     );
 }
 
+/// A delegate stopped early by an engine guard is a FAILED result even with text —
+/// the parent gets the partial answer flagged `[stopped: …]`, never a green success.
+#[tokio::test]
+async fn subagent_early_stop_with_text_is_flagged_partial() {
+    let dir = tmp();
+    let call = tool_call_sse("subagent", json!({"task": "investigate"}));
+    // Text + an identical tool call every sub turn → no-progress stop with an answer.
+    let looping_sub_turn = {
+        let delta = json!({"choices":[{"delta":{
+            "content": "partial findings so far",
+            "tool_calls":[{
+                "index": 0, "id": "c1",
+                "function": {"name": "run_bash", "arguments": json!({"command": "echo probe"}).to_string()}
+            }]
+        }}]});
+        format!("data: {delta}\n\ndata: [DONE]\n\n")
+    };
+    let mut bodies = vec![call];
+    bodies.extend(std::iter::repeat_n(looping_sub_turn, REPEAT_LIMIT));
+    bodies.push(FINAL_TEXT_SSE.to_string());
+    let port = spawn_sse_sequence(bodies);
+    let client = reqwest::Client::builder().no_proxy().build().unwrap();
+    let base = format!("http://127.0.0.1:{port}");
+    let mut engine = AgentEngine::new(&dir.display().to_string(), "m", "", &[], &[], 0, 0);
+    let mut ui = CapturingUi::default();
+    run_session(
+        &mut engine,
+        &turn_ctx(&client, &base, &dir),
+        Some("delegate it".into()),
+        &mut ui,
+    )
+    .await;
+    assert_eq!(ui.tool_errors, vec!["subagent"], "must render as a failure");
+    let texts = tool_result_texts(&engine);
+    let report = texts
+        .iter()
+        .find(|t| t.contains("[stopped:"))
+        .unwrap_or_else(|| panic!("stop flag missing from history: {texts:?}"));
+    assert!(report.contains("result may be partial"), "{report}");
+    assert!(
+        report.contains("partial findings so far"),
+        "the partial answer must still reach the parent: {report}"
+    );
+}
+
 /// In a parallel batch, a delegate that asked for worktree isolation FAILS when
 /// isolation is unavailable — never a silent fallback that would put concurrent
 /// writers in the same tree. (A lone delegate still falls back with a note.)

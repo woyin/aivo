@@ -4,7 +4,8 @@
 //! sequence of model turns — no tokens, no flakiness, gate-able in CI.
 //!
 //! Script format: a JSON array of turns, each either a tool-call batch or a final
-//! answer. Turns are replayed one per model call, in order; once exhausted a
+//! answer, optionally carrying an OpenAI-style `"usage"` object (scripts budget
+//! breakers). Turns are replayed one per model call, in order; once exhausted a
 //! terminal answer is repeated so an over-long loop converges instead of erroring.
 //!
 //! ```json
@@ -26,13 +27,11 @@ use serde_json::{Value, json};
 
 /// Convert one scripted turn to an OpenAI chat-completions SSE body the engine
 /// consumes: `{"text": ...}` → a content delta, `{"tools": [...]}` → a tool-call
-/// batch (each entry at its own `index`).
+/// batch (each entry at its own `index`), optional `"usage"` riding the same chunk.
 fn sse_body(turn: &Value) -> Result<String, String> {
-    if let Some(text) = turn.get("text").and_then(Value::as_str) {
-        let delta = json!({"choices": [{"delta": {"content": text}}]});
-        return Ok(format!("data: {delta}\n\ndata: [DONE]\n\n"));
-    }
-    if let Some(tools) = turn.get("tools").and_then(Value::as_array) {
+    let mut chunk = if let Some(text) = turn.get("text").and_then(Value::as_str) {
+        json!({"choices": [{"delta": {"content": text}}]})
+    } else if let Some(tools) = turn.get("tools").and_then(Value::as_array) {
         if tools.is_empty() {
             return Err("fake_model: `tools` turn has no calls".to_string());
         }
@@ -49,12 +48,21 @@ fn sse_body(turn: &Value) -> Result<String, String> {
                 })
             })
             .collect();
-        let delta = json!({"choices": [{"delta": {"tool_calls": entries}}]});
-        return Ok(format!("data: {delta}\n\ndata: [DONE]\n\n"));
+        json!({"choices": [{"delta": {"tool_calls": entries}}]})
+    } else {
+        return Err(format!(
+            "fake_model: each turn needs `text` or `tools`, got: {turn}"
+        ));
+    };
+    if let Some(usage) = turn.get("usage") {
+        if !usage.is_object() {
+            return Err(format!(
+                "fake_model: `usage` must be an object, got: {usage}"
+            ));
+        }
+        chunk["usage"] = usage.clone();
     }
-    Err(format!(
-        "fake_model: each turn needs `text` or `tools`, got: {turn}"
-    ))
+    Ok(format!("data: {chunk}\n\ndata: [DONE]\n\n"))
 }
 
 /// Served after the script is exhausted so an extra model call converges cleanly.
@@ -208,6 +216,18 @@ mod tests {
         assert!(body.contains(r#""index":1"#));
         // args are serialized as a JSON string, as the OpenAI wire expects.
         assert!(body.contains(r#""arguments":"{\"command\":\"ls\"}""#));
+    }
+
+    #[test]
+    fn usage_rides_the_turn_chunk() {
+        let body = sse_body(&json!({
+            "tools": [{"name": "run_bash", "args": {"command": "ls"}}],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 42},
+        }))
+        .unwrap();
+        assert!(body.contains(r#""completion_tokens":42"#));
+        assert!(body.contains(r#""name":"run_bash""#));
+        assert!(sse_body(&json!({"text": "x", "usage": 5})).is_err());
     }
 
     /// Drive the real server over a loopback socket and read back the raw response.

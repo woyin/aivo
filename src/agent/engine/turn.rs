@@ -258,6 +258,7 @@ impl AgentEngine {
                     "stopping: reached the per-turn output-token budget ({})",
                     self.max_output_tokens
                 ));
+                ui.turn_stopped(TurnStop::OutputBudget);
                 converged = true;
                 break;
             }
@@ -273,6 +274,7 @@ impl AgentEngine {
                     "stopping: reached the cost budget (~${cost:.2} of ${:.2})",
                     self.max_cost_usd
                 ));
+                ui.turn_stopped(TurnStop::CostBudget);
                 converged = true;
                 break;
             }

@@ -449,3 +449,63 @@ fn persist_failure_warns_and_withholds_the_resume_hint() {
     assert_eq!(doc["exit"], 0);
     assert_eq!(doc["sessionSaved"], false);
 }
+
+#[test]
+fn exec_step_limit_exits_1_with_a_typed_stop_reason() {
+    let env = ExecEnv::new();
+    let out = env.code_exec(
+        r#"[
+            {"tools": [{"name": "run_bash", "args": {"command": "echo step1"}}]},
+            {"tools": [{"name": "run_bash", "args": {"command": "echo step2"}}]},
+            {"text": "done"}
+        ]"#,
+        "loop forever",
+        &["--output-format", "json", "--max-steps", "1"],
+    );
+    assert_eq!(out.status.code(), Some(1), "stderr:\n{}", stderr_str(&out));
+
+    let doc: Value = serde_json::from_str(stdout_str(&out).trim()).unwrap();
+    assert_eq!(doc["exit"], 1);
+    assert_eq!(doc["stopReason"], "stepLimit");
+    assert_eq!(doc["error"], Value::Null, "a stop is not an engine error");
+    let err = stderr_str(&out);
+    assert!(err.contains("run stopped early"), "stderr:\n{err}");
+}
+
+#[test]
+fn exec_output_budget_stop_emits_a_stopped_event_and_exits_1() {
+    let env = ExecEnv::new();
+    // Scripted usage pushes the turn past --max-output-tokens on step 1.
+    let out = env.code_exec(
+        r#"[
+            {"tools": [{"name": "run_bash", "args": {"command": "echo hi"}}],
+             "usage": {"prompt_tokens": 10, "completion_tokens": 500}},
+            {"text": "done"}
+        ]"#,
+        "burn the budget",
+        &[
+            "--output-format",
+            "stream-json",
+            "--max-output-tokens",
+            "100",
+        ],
+    );
+    assert_eq!(out.status.code(), Some(1), "stderr:\n{}", stderr_str(&out));
+
+    let events: Vec<Value> = stdout_str(&out)
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap_or_else(|e| panic!("bad event line ({e}): {l}")))
+        .collect();
+    let types: Vec<&str> = events.iter().map(|e| e["type"].as_str().unwrap()).collect();
+    let stopped = types
+        .iter()
+        .position(|t| *t == "stopped")
+        .expect("stopped event");
+    assert_eq!(events[stopped]["reason"], "outputBudget");
+    let fin = types
+        .iter()
+        .position(|t| *t == "final")
+        .expect("final event");
+    assert!(stopped < fin, "stopped must precede final: {types:?}");
+    assert_eq!(events.last().unwrap()["exit"], 1);
+}

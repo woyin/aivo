@@ -98,6 +98,31 @@ pub enum TurnStop {
     NoProgress,
     ToolFailureLoop,
     StepLimit,
+    OutputBudget,
+    CostBudget,
+}
+
+impl TurnStop {
+    /// Stable name for machine consumers (`stopReason` field, `stopped` event).
+    pub fn wire_name(self) -> &'static str {
+        match self {
+            TurnStop::NoProgress => "noProgress",
+            TurnStop::ToolFailureLoop => "toolFailureLoop",
+            TurnStop::StepLimit => "stepLimit",
+            TurnStop::OutputBudget => "outputBudget",
+            TurnStop::CostBudget => "costBudget",
+        }
+    }
+
+    pub fn describe(self) -> &'static str {
+        match self {
+            TurnStop::NoProgress => "the model repeated the same action with no progress",
+            TurnStop::ToolFailureLoop => "a tool call kept failing the same way",
+            TurnStop::StepLimit => "reached the step limit",
+            TurnStop::OutputBudget => "reached the per-turn output-token budget",
+            TurnStop::CostBudget => "reached the cost budget",
+        }
+    }
 }
 
 /// Cap on force-compact-and-retry attempts per step after an input-overflow rejection.

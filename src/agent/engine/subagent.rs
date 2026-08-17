@@ -261,11 +261,18 @@ Fix the repo state or run it alone."
         };
         // Box the recursive future (run_turn → subagent → run_turn) so it isn't infinitely-sized.
         Box::pin(sub.run_turn(&sub_ctx, &mut ui, task.to_string())).await;
+        // An early stop fails the run even with text — the report may be partial.
+        let failed = ui.answer().is_empty() || ui.stop.is_some();
         if let Some((s, slot)) = &ui.sink {
-            s.done(*slot, !ui.answer().is_empty(), ui.steps, ui.tokens);
+            s.done(*slot, !failed, ui.steps, ui.tokens);
         }
-        let failed = ui.answer().is_empty();
         let mut msg = ui.result_message();
+        if let Some(stop) = ui.stop.filter(|_| !ui.answer().is_empty()) {
+            msg = format!(
+                "[stopped: {} — result may be partial]\n\n{msg}",
+                stop.describe()
+            );
+        }
         if let Some(g) = guard {
             msg.push_str(&g.finalize());
         } else if let Some(note) = isolation_note {
@@ -462,6 +469,8 @@ pub(super) struct SubagentUi<'a> {
     pub(super) measured_output: u64,
     /// Last estimate forwarded; streamed growth below the quantum is skipped.
     pub(super) last_forwarded: u64,
+    /// Why the sub-run stopped early (budget/guard), if it did.
+    pub(super) stop: Option<TurnStop>,
 }
 
 /// Streamed growth must move the estimate this much before it forwards again,
@@ -573,6 +582,9 @@ impl AgentUi for SubagentUi<'_> {
         self.measured_output = output;
         self.unmeasured_chars = 0;
         self.forward_live_tokens(true);
+    }
+    fn turn_stopped(&mut self, stop: TurnStop) {
+        self.stop.get_or_insert(stop);
     }
     fn ask_permission<'a>(
         &'a mut self,

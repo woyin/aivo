@@ -2788,6 +2788,14 @@ fix the input or pick another route, and record the dead end with take_note"
                         "it ran out of steps mid-work. Break the remaining work into smaller \
 pieces and keep going"
                     }
+                    TurnStop::OutputBudget => {
+                        "it hit the per-turn output-token budget mid-work. Pick up where it \
+stopped and keep each turn's work small"
+                    }
+                    TurnStop::CostBudget => {
+                        "it hit the per-turn cost budget mid-work. Pick up where it stopped \
+and keep each turn's work small"
+                    }
                 };
                 format!(
                     "[Previous turn stopped early: {steer}.]\n\n{}",

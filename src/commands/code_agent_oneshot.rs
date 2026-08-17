@@ -19,7 +19,7 @@ use std::path::Path;
 use futures::future::BoxFuture;
 use serde_json::{Value, json};
 
-use crate::agent::engine::{AgentEngine, AgentUi, TurnCtx};
+use crate::agent::engine::{AgentEngine, AgentUi, TurnCtx, TurnStop};
 use crate::agent::protocol::Decision;
 use crate::agent::system_prompt::discover_project_guides;
 use crate::errors::ExitCode;
@@ -432,7 +432,8 @@ async fn run_agent_captured(
     // corrective turns becomes the run's terminal error (exit 1).
     if let Some(schema) = opts.validate_schema.as_ref() {
         let mut retries = SCHEMA_RETRIES;
-        while completed && ui.last_error.is_none() {
+        // No corrective turns on a stopped run — the budget is already spent.
+        while completed && ui.last_error.is_none() && ui.stop_reason.is_none() {
             let err = match crate::agent::json_schema::validate_answer(&ui.answer, schema) {
                 Ok(()) => break,
                 Err(e) => e,
@@ -467,6 +468,8 @@ no prose, no markdown fences, nothing else."
     } else {
         match &ui.last_error {
             Some(msg) => classify_agent_error(msg),
+            // A stop means the task wasn't completed — only a clean convergence is a success.
+            None if ui.stop_reason.is_some() => ExitCode::UserError,
             None => ExitCode::Success,
         }
     };
@@ -1078,6 +1081,9 @@ struct HeadlessAgentUi {
     answer: String,
     /// The last terminal error the engine reported, for exit-code classification.
     last_error: Option<String>,
+    /// Why the engine stopped the turn early (budget/guard) — a stopped run
+    /// converged but is not a success.
+    stop_reason: Option<TurnStop>,
     /// Footer stats, kept for the single-document `json` result.
     stats: (usize, u64, u64),
     /// Best-of-n candidate: capture but emit nothing (the winner emits via
@@ -1104,6 +1110,7 @@ impl HeadlessAgentUi {
             wrote_answer: false,
             answer: String::new(),
             last_error: None,
+            stop_reason: None,
             stats: (0, 0, 0),
             silent: false,
             pending_warnings: Vec::new(),
@@ -1192,6 +1199,17 @@ impl HeadlessAgentUi {
         }
     }
 
+    /// Text/Json: mark an early-stopped run as not-done on stderr.
+    fn print_stop_error(&self) {
+        if let Some(stop) = self.stop_reason {
+            eprintln!(
+                "{} run stopped early: {} — result may be partial",
+                crate::style::red("Error:"),
+                stop.describe()
+            );
+        }
+    }
+
     /// Emit a captured (silently-run) answer as the final output, per format.
     fn emit_final(&mut self, exit_code: i64) {
         self.silent = false;
@@ -1204,14 +1222,18 @@ impl HeadlessAgentUi {
                 let (steps, tokens, secs) = self.stats;
                 eprintln!("[{steps} step(s) · {tokens} tok · {secs}s]");
                 self.drain_warnings();
+                self.print_stop_error();
             }
             OutputFormat::Json => self.run_end(exit_code),
             OutputFormat::StreamJson => {
-                // The full envelope a stream consumer expects: run_start → final → run_end.
+                // The full envelope a stream consumer expects: run_start → [stopped] → final → run_end.
                 self.emit(
                     "run_start",
                     json!({ "model": self.model, "cwd": self.cwd, "sessionId": self.session_id }),
                 );
+                if let Some(stop) = self.stop_reason {
+                    self.emit("stopped", json!({ "reason": stop.wire_name() }));
+                }
                 self.emit(
                     "final",
                     json!({ "text": redact(&self.answer), "sessionId": self.session_id }),
@@ -1253,6 +1275,7 @@ impl HeadlessAgentUi {
         match self.format {
             OutputFormat::StreamJson => self.emit("run_end", json!({ "exit": exit_code })),
             OutputFormat::Json => {
+                self.print_stop_error();
                 let (steps, tokens, elapsed_secs) = self.stats;
                 let doc = stream_event(
                     &self.run_id,
@@ -1264,6 +1287,7 @@ impl HeadlessAgentUi {
                         "exit": exit_code,
                         "answer": redact(&self.answer),
                         "error": self.last_error.as_deref().map(redact),
+                        "stopReason": self.stop_reason.map(TurnStop::wire_name),
                         "sessionSaved": self.session_saved,
                         "steps": steps,
                         "tokens": tokens,
@@ -1273,7 +1297,7 @@ impl HeadlessAgentUi {
                 println!("{doc}");
                 let _ = std::io::stdout().flush();
             }
-            OutputFormat::Text => {}
+            OutputFormat::Text => self.print_stop_error(),
         }
     }
 
@@ -1368,6 +1392,16 @@ impl AgentUi for HeadlessAgentUi {
         match self.format {
             OutputFormat::Text | OutputFormat::Json => eprintln!("{text}"),
             OutputFormat::StreamJson => self.emit("error", json!({ "text": redact(text) })),
+        }
+    }
+    fn turn_stopped(&mut self, stop: TurnStop) {
+        // First stop wins: a later corrective turn can't relabel why the run failed.
+        if self.stop_reason.is_some() {
+            return;
+        }
+        self.stop_reason = Some(stop);
+        if self.format == OutputFormat::StreamJson {
+            self.emit("stopped", json!({ "reason": stop.wire_name() }));
         }
     }
     fn footer(
