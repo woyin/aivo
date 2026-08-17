@@ -1,6 +1,6 @@
 use super::super::*;
 use super::helpers::*;
-use crate::agent::compaction::{COMPACT_RESERVE, TOOL_RESULT_CLEARED};
+use crate::agent::compaction::TOOL_RESULT_CLEARED;
 use crate::agent::request::content_str;
 use crate::agent::tokens::MAX_CALIBRATION;
 use serde_json::json;
@@ -40,11 +40,38 @@ fn compaction_window_falls_back_to_default_when_unknown() {
     );
 }
 
+/// The reserve is measured (response floor + actual tool schemas) and capped
+/// for small windows, so a 16k local model keeps usable history.
+#[test]
+fn compact_reserve_measures_schemas_and_caps_for_small_windows() {
+    let mut engine = AgentEngine::new("/tmp", "m", "", &[], &[], 0, 0);
+    engine.context_window = 262_144;
+    let base = engine.compact_reserve();
+    assert!(base > 12_000, "schemas add on top of the response floor");
+
+    engine.tools_openai.push(
+        json!({"type":"function","function":{"name":"extra","description":"d".repeat(4_000)}}),
+    );
+    assert!(engine.compact_reserve() > base);
+    engine.tools_openai.pop();
+
+    engine.context_window = 16_000;
+    assert_eq!(
+        engine.compact_reserve(),
+        4_800,
+        "capped at 30% of the window"
+    );
+    assert!(
+        engine.compaction_budget_estimate() >= 11_000,
+        "a 16k window keeps usable history"
+    );
+}
+
 #[test]
 fn token_calibration_deflates_compaction_budget() {
     let mut engine = AgentEngine::new("/tmp", "m", "", &[], &[], 0, 0);
     engine.context_window = 262_144;
-    let raw = engine.compaction_window() - COMPACT_RESERVE;
+    let raw = engine.compaction_window() - engine.compact_reserve();
     assert_eq!(
         engine.compaction_budget_estimate(),
         raw,
@@ -117,7 +144,7 @@ fn enforce_budget_shrinks_oversized_tool_call_arguments() {
 fn overflow_recovery_calibrates_from_rejection_and_fits() {
     let mut engine = AgentEngine::new("/tmp", "m", "", &[], &[], 0, 0);
     engine.context_window = 262_144;
-    let raw_budget = engine.compaction_window() - COMPACT_RESERVE;
+    let raw_budget = engine.compaction_window() - engine.compact_reserve();
     let pad = "x".repeat(4 * (raw_budget - 20_000));
     engine.messages = vec![
         json!({"role":"system","content":"sys"}),
@@ -164,7 +191,7 @@ fn overflow_recovery_calibrates_from_rejection_and_fits() {
 #[test]
 fn force_fit_recovery_keeps_prior_context_on_single_long_turn() {
     let mut engine = AgentEngine::new("/tmp", "m", "", &[], &[], 0, 0);
-    engine.context_window = 20_000; // budget = 20_000 − COMPACT_RESERVE = 4_000
+    engine.context_window = 20_000; // reserve caps at 30% → budget = 14_000
     let big = "reasoning ".repeat(4_000);
     let mut messages = vec![
         json!({"role": "system", "content": "sys"}),
@@ -254,7 +281,7 @@ async fn forced_tiny_window_compacts_at_boundary_without_a_model_call() {
     unsafe { std::env::set_var("AIVO_AGENT_KEEP_RECENT", "0") };
 
     let mut engine = AgentEngine::new("/tmp", "m", "", &[], &[], 0, 0);
-    engine.context_window = 20_000; // budget = 20_000 − COMPACT_RESERVE = 4_000
+    engine.context_window = 20_000; // reserve caps at 30% → budget = 14_000
     let huge = "x".repeat(200_000);
     engine.messages = vec![
         json!({"role": "system", "content": "sys"}),
@@ -268,7 +295,7 @@ async fn forced_tiny_window_compacts_at_boundary_without_a_model_call() {
         json!({"role": "tool", "tool_call_id": "b", "content": huge}),
         json!({"role": "user", "content": "now"}),
     ];
-    let budget = engine.compaction_window() - COMPACT_RESERVE;
+    let budget = engine.compaction_window() - engine.compact_reserve();
     assert!(
         estimate_tokens(&engine.messages) > budget,
         "transcript must start over budget so the boundary is actually crossed"
@@ -309,7 +336,7 @@ async fn forced_tiny_window_compacts_at_boundary_without_a_model_call() {
 #[tokio::test]
 async fn resume_single_long_turn_keeps_prior_context_on_compaction() {
     let mut engine = AgentEngine::new("/tmp", "m", "", &[], &[], 0, 0);
-    engine.context_window = 20_000; // budget = 20_000 − COMPACT_RESERVE = 4_000
+    engine.context_window = 20_000; // reserve caps at 30% → budget = 14_000
     // Assistant-only run: no tool results for the cheap clear path to reclaim.
     let big = "reasoning ".repeat(4_000);
     let mut messages = vec![
@@ -321,7 +348,7 @@ async fn resume_single_long_turn_keeps_prior_context_on_compaction() {
     }
     messages.push(json!({"role": "user", "content": "continue"}));
     engine.messages = messages;
-    let budget = engine.compaction_window() - COMPACT_RESERVE;
+    let budget = engine.compaction_window() - engine.compact_reserve();
     assert!(
         estimate_tokens(&engine.messages) > budget,
         "transcript must start over budget"

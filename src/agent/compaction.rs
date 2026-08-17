@@ -16,8 +16,10 @@ use crate::agent::tokens::{
     estimate_tokens, keep_recent_tokens, usage_tokens,
 };
 
-/// Tokens held back from the window for the response + tool schemas.
-pub(crate) const COMPACT_RESERVE: usize = 16_000;
+/// Response floor (visible + reasoning tokens); measured tool schemas add on top.
+const RESPONSE_RESERVE: usize = 12_000;
+/// Reserve cap for small (local-model) windows so usable history never collapses to zero.
+const RESERVE_MAX_WINDOW_PCT: usize = 30;
 /// A `tool` result longer than this (chars) is eligible for clearing once it ages
 /// out of the recent window. Also the engine's "worth saving to an artifact" threshold.
 pub(crate) const TOOL_RESULT_CLEAR_MIN: usize = 1_000;
@@ -71,10 +73,22 @@ impl AgentEngine {
         }
     }
 
+    /// Tokens held back from the window for the response + the tool schemas actually being sent.
+    pub(crate) fn compact_reserve(&self) -> usize {
+        let schemas: usize = self
+            .tools_openai
+            .iter()
+            .map(|t| estimate_str_tokens(&t.to_string()))
+            .sum();
+        (RESPONSE_RESERVE + schemas).min(self.compaction_window() * RESERVE_MAX_WINDOW_PCT / 100)
+    }
+
     /// Compaction budget in chars/4-estimate space: `(window - reserve) / calibration`,
     /// so `estimate <= budget` implies the calibrated real size fits.
     pub(crate) fn compaction_budget_estimate(&self) -> usize {
-        let real = self.compaction_window().saturating_sub(COMPACT_RESERVE);
+        let real = self
+            .compaction_window()
+            .saturating_sub(self.compact_reserve());
         ((real as f64) / self.token_calibration).floor() as usize
     }
 
@@ -1071,7 +1085,7 @@ mod tests {
         assert!(!e.maybe_preventive_snip(big_budget, total, &mut ui));
 
         // Budget inside the keep-recent window: structurally inert, skipped outright.
-        e.context_window = 30_000;
+        e.context_window = 28_000;
         let small_budget = e.compaction_budget_estimate();
         assert!(small_budget <= keep_recent_tokens());
         assert!(!e.maybe_preventive_snip(small_budget, total, &mut ui));
@@ -1131,7 +1145,7 @@ mod tests {
     #[test]
     fn force_fit_fold_carries_running_summary_forward() {
         let mut e = engine();
-        e.context_window = 20_000; // budget = 20_000 − COMPACT_RESERVE = 4_000
+        e.context_window = 20_000; // reserve caps at 30% → budget = 14_000
         e.last_summary = Some("KEYFACT: db is postgres".to_string());
         e.messages = vec![
             json!({"role":"system","content":"sys"}),

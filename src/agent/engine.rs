@@ -466,7 +466,7 @@ pub struct RewindOutcome {
 /// No rendering or direct provider knowledge — those flow through `TurnCtx`/`AgentUi`.
 pub struct AgentEngine {
     pub(crate) model: String,
-    tools_openai: Vec<Value>,
+    pub(crate) tools_openai: Vec<Value>,
     pub(crate) messages: Vec<Value>,
     pub(crate) context_window: u32,
     /// Multiplier (>= 1.0) correcting the chars/4 [`estimate_tokens`] undershoot toward
