@@ -1055,8 +1055,9 @@ pub struct CodeArgs {
     pub best_of_n: Option<u32>,
 
     /// Constrain the final answer to a JSON Schema (inline JSON, or `@path` to a
-    /// file). Instructs the agent to emit one conforming JSON value. Requires
-    /// -e/--exec; best paired with `--output-format json`.
+    /// file). The answer is validated locally; on mismatch the agent gets up to
+    /// two corrective turns, then the run fails with exit 1. Requires -e/--exec;
+    /// best paired with `--output-format json`.
     #[arg(long = "json-schema", value_name = "SCHEMA", requires = "exec")]
     pub json_schema: Option<String>,
 

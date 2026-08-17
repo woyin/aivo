@@ -14,6 +14,7 @@ pub mod grant_store;
 pub mod guards;
 pub mod hooks;
 pub mod jobs;
+pub mod json_schema;
 pub mod lsp;
 pub mod mcp;
 pub mod mcp_import;
