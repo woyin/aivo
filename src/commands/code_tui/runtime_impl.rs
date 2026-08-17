@@ -1149,6 +1149,8 @@ impl CodeTuiApp {
                 tx,
                 cwd: std::path::PathBuf::from(&cwd),
                 steering,
+                seg_has_text: false,
+                answer_has_text: false,
             };
             let mut engine = engine.lock().await;
             engine.set_context_window(context_window);
@@ -1369,6 +1371,8 @@ impl CodeTuiApp {
                 tx,
                 cwd: std::path::PathBuf::from(&cwd),
                 steering: SteeringQueue::default(),
+                seg_has_text: false,
+                answer_has_text: false,
             };
             let started = Instant::now();
             let mut engine = engine.lock().await;
@@ -4206,6 +4210,11 @@ struct ChatAgentUi {
     /// Workspace root, for resolving an edit's `path` in the pre-edit probe.
     cwd: std::path::PathBuf,
     steering: SteeringQueue,
+    /// Non-whitespace text in the current streamed segment / committed earlier
+    /// this turn. Mirrors the transcript's commit-at-tool-boundary model so
+    /// `turn_finished` knows whether the finish summary is the only answer.
+    seg_has_text: bool,
+    answer_has_text: bool,
 }
 
 /// Bridges parallel sub-agent progress to the event loop's per-delegate rows.
@@ -4277,6 +4286,7 @@ impl crate::agent::engine::SubagentSink for ChatSubagentSink {
 
 impl crate::agent::engine::AgentUi for ChatAgentUi {
     fn assistant_text(&mut self, delta: &str) {
+        self.seg_has_text |= !delta.trim().is_empty();
         self.tx
             .send(RuntimeEvent::Delta(ChatResponseChunk::Content(
                 delta.to_string(),
@@ -4293,6 +4303,7 @@ impl crate::agent::engine::AgentUi for ChatAgentUi {
     }
 
     fn discard_streamed_segment(&mut self) {
+        self.seg_has_text = false;
         self.tx.send(RuntimeEvent::AgentDiscardSegment).ok();
     }
 
@@ -4349,6 +4360,8 @@ impl crate::agent::engine::AgentUi for ChatAgentUi {
     }
 
     fn tool_start(&mut self, name: &str, args: &serde_json::Value) {
+        // Tool step = commit boundary: prose streamed before it can no longer be discarded.
+        self.answer_has_text |= std::mem::take(&mut self.seg_has_text);
         // Runs on the engine thread before the edit applies, so the probe sees
         // the pre-edit file.
         let line_starts = compute_line_starts(&self.cwd, name, args);
@@ -4389,6 +4402,25 @@ impl crate::agent::engine::AgentUi for ChatAgentUi {
     fn notify_error(&mut self, text: &str) {
         self.tx
             .send(RuntimeEvent::AgentError(text.to_string()))
+            .ok();
+    }
+
+    fn turn_finished(&mut self, report: &crate::agent::finish::FinishReport) {
+        // No streamed text this turn: the finish summary is the only place the
+        // answer lives — render it so the turn doesn't end silently.
+        if self.answer_has_text || self.seg_has_text {
+            return;
+        }
+        let mut text = report.summary.trim().to_string();
+        if let Some(blocker) = &report.blocker {
+            text.push_str("\n\n");
+            text.push_str(blocker);
+        }
+        if text.is_empty() {
+            return;
+        }
+        self.tx
+            .send(RuntimeEvent::Delta(ChatResponseChunk::Content(text)))
             .ok();
     }
 
@@ -4975,6 +5007,83 @@ mod ask_id_tests {
         // "none" (empty multi-select sentinel) and typos map to no id.
         assert!(select_ids_for_answer("none", &opts(), true).is_empty());
         assert!(select_ids_for_answer("nonexistent", &opts(), false).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod finish_summary_tests {
+    use super::{ChatAgentUi, ChatResponseChunk, RuntimeEvent, SteeringQueue};
+    use crate::agent::engine::AgentUi;
+    use crate::agent::finish::{FinishReport, FinishStatus};
+    use tokio::sync::mpsc::UnboundedReceiver;
+
+    fn ui() -> (ChatAgentUi, UnboundedReceiver<RuntimeEvent>) {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let ui = ChatAgentUi {
+            tx,
+            cwd: std::env::temp_dir(),
+            steering: SteeringQueue::default(),
+            seg_has_text: false,
+            answer_has_text: false,
+        };
+        (ui, rx)
+    }
+
+    fn report(summary: &str, blocker: Option<&str>) -> FinishReport {
+        FinishReport {
+            status: if blocker.is_some() {
+                FinishStatus::Blocked
+            } else {
+                FinishStatus::Done
+            },
+            summary: summary.to_string(),
+            verification: vec![],
+            remaining: vec![],
+            blocker: blocker.map(str::to_string),
+        }
+    }
+
+    fn content_deltas(rx: &mut UnboundedReceiver<RuntimeEvent>) -> Vec<String> {
+        let mut out = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            if let RuntimeEvent::Delta(ChatResponseChunk::Content(t)) = ev {
+                out.push(t);
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn silent_turn_renders_summary_and_blocker() {
+        let (mut ui, mut rx) = ui();
+        ui.turn_finished(&report("root cause: DNS", Some("need the zone password")));
+        assert_eq!(
+            content_deltas(&mut rx),
+            vec!["root cause: DNS\n\nneed the zone password"]
+        );
+    }
+
+    #[test]
+    fn streamed_text_suppresses_summary() {
+        let (mut ui, mut rx) = ui();
+        ui.assistant_text("the answer is 42");
+        // Committed at the tool boundary; a later discard must not resurrect it.
+        ui.tool_start("run_bash", &serde_json::json!({}));
+        ui.discard_streamed_segment();
+        content_deltas(&mut rx);
+        ui.turn_finished(&report("dup summary", None));
+        assert!(content_deltas(&mut rx).is_empty());
+    }
+
+    #[test]
+    fn discarded_or_blank_segments_still_render_summary() {
+        let (mut ui, mut rx) = ui();
+        ui.assistant_text("  \n"); // whitespace never counts as an answer
+        ui.assistant_text("partial that got discarded");
+        ui.discard_streamed_segment();
+        content_deltas(&mut rx);
+        ui.turn_finished(&report("the real answer", None));
+        assert_eq!(content_deltas(&mut rx), vec!["the real answer"]);
     }
 }
 
