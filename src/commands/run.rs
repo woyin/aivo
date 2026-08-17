@@ -10,7 +10,7 @@ use crate::commands::{print_launch_preview, trim_to_one_line};
 use crate::errors::ExitCode;
 use crate::services::ai_launcher::{AILauncher, AIToolType, CodexSlotModels, LaunchOptions};
 use crate::services::context_ingest::{
-    IngestOptions, code_threads_by_id_global, ingest_project_with_code,
+    IngestOptions, claude_threads_by_id_global, code_threads_by_id_global, ingest_project_with_code,
 };
 use crate::services::context_render::{RenderedContext, render_single_session};
 use crate::services::environment_injector::{ClaudeModelOverrides, ClaudeSlotFlags, TierUpstream};
@@ -1121,13 +1121,14 @@ pub(crate) async fn resolve_context_thread(
         SelectOutcome::Picked(t) => ContextResolution::Selected(t.clone()),
         SelectOutcome::Cancelled => ContextResolution::Cancelled,
         SelectOutcome::Err(msg) => {
-            // An explicit id missing here may name a session filed under another
-            // dir — retry globally before giving up (parity with `/resume <id>`).
+            // An explicit id may name a session filed under another dir
+            // (other cwd, claude worktree) — retry globally before giving up.
             let id = selector.trim();
             if id.is_empty() {
                 return ContextResolution::Unavailable(msg);
             }
-            let global = code_threads_by_id_global(store, id).await;
+            let mut global = code_threads_by_id_global(store, id).await;
+            global.extend(claude_threads_by_id_global(id).await);
             match select_thread(&global, id) {
                 SelectOutcome::Picked(t) => ContextResolution::Selected(t.clone()),
                 SelectOutcome::Cancelled => ContextResolution::Cancelled,

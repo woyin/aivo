@@ -2318,6 +2318,54 @@ pub async fn code_threads_by_id_global(store: &SessionStore, id_prefix: &str) ->
     out
 }
 
+/// Claude sessions by id prefix across every cwd-encoded dir — reaches
+/// sessions the project scan misses (e.g. worktrees). Filename = session id,
+/// so only hits are parsed.
+pub async fn claude_threads_by_id_global(id_prefix: &str) -> Vec<Thread> {
+    let Some(home) = system_env::home_dir() else {
+        return Vec::new();
+    };
+    claude_threads_by_id_in(&home.join(".claude").join("projects"), id_prefix).await
+}
+
+async fn claude_threads_by_id_in(projects_root: &Path, id_prefix: &str) -> Vec<Thread> {
+    // Empty prefix = parse every session on disk.
+    if id_prefix.is_empty() {
+        return Vec::new();
+    }
+    let Ok(mut rd) = fs::read_dir(projects_root).await else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    while let Ok(Some(entry)) = rd.next_entry().await {
+        let dir = entry.path();
+        if !dir.is_dir() {
+            continue;
+        }
+        let Ok(mut sub) = fs::read_dir(&dir).await else {
+            continue;
+        };
+        while let Ok(Some(f)) = sub.next_entry().await {
+            let p = f.path();
+            if p.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+                continue;
+            }
+            let hit = p
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .is_some_and(|s| s.starts_with(id_prefix));
+            if !hit {
+                continue;
+            }
+            if let Some(t) = extract_claude_thread(&p).await {
+                out.push(t);
+            }
+        }
+    }
+    out.sort_by_key(|t| std::cmp::Reverse(t.updated_at));
+    out
+}
+
 // ---------------------------------------------------------------------------
 // Filesystem walking — newest-first
 // ---------------------------------------------------------------------------
@@ -3100,6 +3148,47 @@ mod tests {
         assert!(thread.topic.starts_with("Please explain how the cursor"));
         assert!(thread.last_response.starts_with("Final recommendation"));
         assert!(!thread.last_response.contains("SHOULD NOT APPEAR"));
+    }
+
+    #[tokio::test]
+    async fn claude_threads_by_id_global_reaches_mismatched_storage_dirs() {
+        let root = TempDir::new().unwrap();
+        let wt_dir = root.path().join("-repo--claude-worktrees-x");
+        std::fs::create_dir_all(&wt_dir).unwrap();
+        std::fs::write(
+            wt_dir.join("5e9b7813-07b0-4508-8f79-ad8c18e1e9a2.jsonl"),
+            concat!(
+                r#"{"type":"user","sessionId":"5e9b7813-07b0-4508-8f79-ad8c18e1e9a2","isSidechain":false,"timestamp":"2026-04-01T10:00:00Z","cwd":"/repo","message":{"content":"deprecate the nodejs installation"}}"#,
+                "\n",
+                r#"{"type":"assistant","sessionId":"5e9b7813-07b0-4508-8f79-ad8c18e1e9a2","isSidechain":false,"timestamp":"2026-04-01T10:00:05Z","message":{"content":[{"type":"text","text":"Removed the nodejs bootstrap."}]}}"#,
+            ),
+        )
+        .unwrap();
+        let other_dir = root.path().join("-repo");
+        std::fs::create_dir_all(&other_dir).unwrap();
+        std::fs::write(
+            other_dir.join("aaaa1111-0000-0000-0000-000000000000.jsonl"),
+            r#"{"type":"user","sessionId":"aaaa1111-0000-0000-0000-000000000000","isSidechain":false,"timestamp":"2026-04-01T11:00:00Z","cwd":"/repo","message":{"content":"something else"}}"#,
+        )
+        .unwrap();
+
+        let hits = claude_threads_by_id_in(root.path(), "5e9b7813").await;
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].cli, "claude");
+        assert_eq!(hits[0].session_id, "5e9b7813-07b0-4508-8f79-ad8c18e1e9a2");
+        assert_eq!(hits[0].cwd.as_deref(), Some("/repo"));
+        assert!(hits[0].topic.contains("nodejs"));
+
+        assert!(
+            claude_threads_by_id_in(root.path(), "ffff")
+                .await
+                .is_empty(),
+            "unknown prefix matches nothing"
+        );
+        assert!(
+            claude_threads_by_id_in(root.path(), "").await.is_empty(),
+            "empty prefix must not sweep every session"
+        );
     }
 
     #[tokio::test]
