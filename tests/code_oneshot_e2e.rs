@@ -71,15 +71,20 @@ impl ExecEnv {
         cmd
     }
 
-    /// Self-correct and LSP are off so the script's turn sequence is exact.
     fn code_exec(&self, script: &str, task: &str, extra: &[&str]) -> Output {
+        self.code_exec_model(script, task, "gpt-4o", extra)
+    }
+
+    /// Self-correct and LSP are off so the script's turn sequence is exact.
+    fn code_exec_model(&self, script: &str, task: &str, model: &str, extra: &[&str]) -> Output {
         let script_path = self.home.path().join("fake-script.json");
         std::fs::write(&script_path, script).unwrap();
         let mut cmd = self.cmd();
         cmd.env("AIVO_AGENT_FAKE_SSE", &script_path)
+            .env("AIVO_FAKE_CAPTURE", self.home.path().join("capture.jsonl"))
             .env("AIVO_AGENT_SELF_CORRECT", "0")
             .env("AIVO_AGENT_LSP", "0")
-            .args(["code", "-e", task, "--model", "gpt-4o"])
+            .args(["code", "-e", task, "--model", model])
             .args(extra);
         cmd.output().expect("spawn aivo code -e")
     }
@@ -87,6 +92,22 @@ impl ExecEnv {
     fn session_file(&self, id: &str) -> PathBuf {
         self.config.join("sessions").join(format!("{id}.json"))
     }
+
+    fn first_capture(&self) -> Value {
+        let raw = std::fs::read_to_string(self.home.path().join("capture.jsonl")).unwrap();
+        serde_json::from_str(raw.lines().next().expect("captured request")).unwrap()
+    }
+}
+
+fn last_user_content(req: &Value) -> &Value {
+    let msg = req["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .rev()
+        .find(|m| m["role"] == "user")
+        .expect("user message");
+    &msg["content"]
 }
 
 fn stdout_str(out: &Output) -> String {
@@ -289,6 +310,110 @@ fn json_schema_never_valid_fails_the_run_with_validation_errors() {
     let end = events.last().unwrap();
     assert_eq!(end["type"], "run_end");
     assert_eq!(end["exit"], 1);
+}
+
+const PNG_1X1: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==";
+
+fn write_png(dir: &std::path::Path) -> PathBuf {
+    use base64::Engine as _;
+    let path = dir.join("shot.png");
+    std::fs::write(
+        &path,
+        base64::engine::general_purpose::STANDARD
+            .decode(PNG_1X1)
+            .unwrap(),
+    )
+    .unwrap();
+    path
+}
+
+#[test]
+fn exec_attach_text_file_rides_the_opening_message() {
+    let env = ExecEnv::new();
+    let notes = env.proj.path().join("notes.txt");
+    std::fs::write(&notes, "the deploy failed at step 7\n").unwrap();
+    let out = env.code_exec(
+        r#"[{"text": "diagnosed"}]"#,
+        "read the attached log",
+        &[
+            "--attach",
+            notes.to_str().unwrap(),
+            "--output-format",
+            "json",
+        ],
+    );
+    assert!(out.status.success(), "stderr:\n{}", stderr_str(&out));
+
+    let req = env.first_capture();
+    let parts = last_user_content(&req)
+        .as_array()
+        .expect("multimodal parts");
+    assert!(
+        parts.iter().any(|p| p["type"] == "text"
+            && p["text"]
+                .as_str()
+                .unwrap()
+                .contains("the deploy failed at step 7")),
+        "attachment text must reach the wire: {parts:?}"
+    );
+    assert!(
+        parts
+            .iter()
+            .any(|p| p["type"] == "text" && p["text"].as_str().unwrap().contains("attached log")),
+        "prompt text must reach the wire: {parts:?}"
+    );
+
+    let doc: Value = serde_json::from_str(stdout_str(&out).trim()).unwrap();
+    let id = doc["sessionId"].as_str().unwrap();
+    let session: Value =
+        serde_json::from_str(&std::fs::read_to_string(env.session_file(id)).unwrap()).unwrap();
+    assert_eq!(
+        session["messages"][0]["attachments"][0]["name"],
+        "notes.txt"
+    );
+}
+
+#[test]
+fn exec_attach_image_becomes_an_image_part() {
+    let env = ExecEnv::new();
+    let img = write_png(env.proj.path());
+    let out = env.code_exec(
+        r#"[{"text": "described"}]"#,
+        "describe the screenshot",
+        &["--attach", img.to_str().unwrap()],
+    );
+    assert!(out.status.success(), "stderr:\n{}", stderr_str(&out));
+
+    let req = env.first_capture();
+    let parts = last_user_content(&req)
+        .as_array()
+        .expect("multimodal parts");
+    assert!(
+        parts.iter().any(|p| p["type"] == "image_url"
+            && p["image_url"]["url"]
+                .as_str()
+                .unwrap()
+                .starts_with("data:image/")),
+        "image must reach the wire as a data URL: {parts:?}"
+    );
+}
+
+#[test]
+fn exec_attach_image_rejected_for_a_known_non_vision_model() {
+    let env = ExecEnv::new();
+    let img = write_png(env.proj.path());
+    let out = env.code_exec_model(
+        r#"[{"text": "unreachable"}]"#,
+        "describe the screenshot",
+        "deepseek-chat",
+        &["--attach", img.to_str().unwrap()],
+    );
+    assert!(!out.status.success());
+    assert!(
+        stderr_str(&out).contains("can't read images"),
+        "stderr:\n{}",
+        stderr_str(&out)
+    );
 }
 
 #[cfg(unix)]

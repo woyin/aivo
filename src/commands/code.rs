@@ -738,16 +738,14 @@ impl CodeCommand {
                 let stdin_context = read_stdin_if_piped()?;
                 compose_one_shot_prompt(&input, stdin_context.as_deref())
             };
-            // -e runs the agent (text-only, serve-reachable keys); -p falls through to plain.
+            // -e runs the agent (serve-reachable keys only); -p falls through to plain.
             if agent_mode {
                 if !code_agent_oneshot::key_is_agent_capable(&key) {
                     anyhow::bail!(
                         "-e/--exec needs a standard API key; this key can't run the in-process agent"
                     );
                 }
-                if !attachments.is_empty() {
-                    anyhow::bail!("-e/--exec is text-only — drop --attach");
-                }
+                let one_shot_attachments = materialize_attachments(&pending_attachments).await?;
                 self.session_store
                     .record_selection(&key.id, "code", Some(&raw_model))
                     .await?;
@@ -757,6 +755,7 @@ impl CodeCommand {
                     &key,
                     &raw_model,
                     one_shot_input,
+                    one_shot_attachments,
                     injected_context,
                     max_context,
                     code_agent_oneshot::OutputFormat::parse(output_format.as_deref()),
