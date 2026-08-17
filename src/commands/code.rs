@@ -974,7 +974,7 @@ impl CodeCommand {
 
         if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
             anyhow::bail!(
-                "The interactive coding agent uses a full-screen TUI. Run it in a terminal, or use -p/--prompt for non-interactive mode."
+                "The interactive coding agent uses a full-screen TUI. Run it in a terminal, or go non-interactive: -e/--exec runs the agent (tools), -p/--prompt gets a plain reply."
             );
         }
 
@@ -1027,15 +1027,32 @@ impl CodeCommand {
         println!();
         println!(
             "{}",
-            style::dim("Interactive coding agent TUI, or one prompt with -p (plain) / -e (agent).")
-        );
-        println!(
-            "{}",
-            style::dim("Positional text opens the TUI with it sent as the first message.")
+            style::dim("Interactive coding agent TUI, or one-shot from the shell.")
         );
         println!(
             "{}",
             style::dim("Type /help inside the TUI for slash commands and keybindings.")
+        );
+        println!();
+        println!("{}", style::bold("Modes:"));
+        let print_mode = |flag: &str, desc: &str| {
+            println!(
+                "  {}{}",
+                style::cyan(format!("{:<26}", flag)),
+                style::dim(desc)
+            );
+        };
+        print_mode(
+            "aivo code [text]",
+            "Full-screen TUI; positional text is sent as the first message",
+        );
+        print_mode(
+            "-e \"task\"",
+            "Run the agent headlessly: tools + file edits, then exit",
+        );
+        print_mode(
+            "-p \"prompt\"",
+            "One plain reply: no tools, no project access",
         );
         println!();
         println!("{}", style::bold("Subcommands:"));

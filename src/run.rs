@@ -362,7 +362,7 @@ pub async fn run() -> ! {
                     eprintln!(
                         "  {}",
                         style::dim(
-                            "A bare word reads as a subcommand — for a prompt use `aivo code -p \"...\"` or `aivo \"...\"`."
+                            "A bare word reads as a subcommand — use -e \"...\" (agent), -p \"...\" (plain reply), or `aivo \"...\"` to open the TUI."
                         ),
                     );
                     process::exit(ExitCode::UserError.code());
