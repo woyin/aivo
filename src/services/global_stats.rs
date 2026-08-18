@@ -1154,6 +1154,14 @@ pub fn normalize_model_for_display(model: &str) -> String {
     normalized.to_lowercase()
 }
 
+/// Strip a `model[opts]` launch-option suffix down to the base model id.
+pub fn fold_model_options(model: &str) -> &str {
+    match model.find('[') {
+        Some(pos) if pos > 0 && model.ends_with(']') => &model[..pos],
+        _ => model,
+    }
+}
+
 /// Display name for each tool.
 pub fn tool_display_name(tool: &str) -> &str {
     match tool {
@@ -1717,6 +1725,24 @@ mod tests {
             normalize_model_for_display("claude-haiku-4-5-20251001"),
             "claude-haiku-4-5-20251001"
         );
+    }
+
+    #[test]
+    fn fold_model_options_strips_bracket_suffix() {
+        assert_eq!(
+            fold_model_options(
+                "claude-opus-4.8[thinking=true,context=300k,effort=high,fast=false]"
+            ),
+            "claude-opus-4.8"
+        );
+        assert_eq!(
+            fold_model_options("grok-4.5[effort=high,fast=true]"),
+            "grok-4.5"
+        );
+        assert_eq!(fold_model_options("default[]"), "default");
+        assert_eq!(fold_model_options("claude-opus-4.8"), "claude-opus-4.8");
+        assert_eq!(fold_model_options("foo[bar"), "foo[bar");
+        assert_eq!(fold_model_options("[weird]"), "[weird]");
     }
 
     #[test]

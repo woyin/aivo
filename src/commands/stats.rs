@@ -372,6 +372,7 @@ impl StatsCommand {
                 model_tokens.entry(key).or_default();
             }
         }
+        let model_tokens = fold_model_variants(model_tokens);
         // Under --since, every entry in `model_tokens` represents real activity
         // (either real tokens, or a `tool_launch` row); count them all so the
         // header tally matches the rendered table. Without --since, keep the
@@ -602,6 +603,7 @@ impl StatsCommand {
                 view.models.entry(key).or_default();
             }
         }
+        view.models = fold_model_variants(view.models);
 
         let window = args.since.as_deref().zip(cutoff);
 
@@ -659,6 +661,7 @@ impl StatsCommand {
             }
             Some(c) => self.windowed_run_usage(c, tool).await,
         };
+        let models = fold_model_variants(models);
         let (input, output, cache_read, cache_write) = sum_model_totals(&models);
         if input + output + cache_read + cache_write > 0 {
             let view = ToolView {
@@ -717,12 +720,18 @@ impl StatsCommand {
         fmt: fn(u64) -> String,
     ) -> ExitCode {
         let since = cutoff.unwrap_or_else(epoch_utc);
-        let model_counts = self
+        let raw_counts = self
             .store
             .logs()
             .aggregate_run_models_since(since, Some(tool))
             .await
             .unwrap_or_default();
+        let mut model_counts: HashMap<String, u64> = HashMap::new();
+        for (model, count) in raw_counts {
+            *model_counts
+                .entry(global_stats::fold_model_options(&model).to_string())
+                .or_default() += count;
+        }
         let launches: u64 = model_counts.values().sum();
 
         if args.json {
@@ -1013,8 +1022,9 @@ fn aggregate_plugin_sessions(
         }
         count += 1;
         for m in &session.models {
+            let name = global_stats::normalize_model_for_display(&m.name);
             models
-                .entry(global_stats::normalize_model_for_display(&m.name))
+                .entry(global_stats::fold_model_options(&name).to_string())
                 .or_default()
                 .add(
                     m.input_tokens,
@@ -1272,6 +1282,20 @@ fn run_model_tokens_to_totals(
             .add(t.input, t.output, t.cache_read, t.cache_creation);
     }
     models
+}
+
+/// Merge `model[opts]` variants into their base model's row. Display-only,
+/// applied after `combine_model_tokens` — folding before the dedup would let
+/// a native variant spelling swallow separately-recorded aivo usage.
+fn fold_model_variants(models: HashMap<String, ModelTotals>) -> HashMap<String, ModelTotals> {
+    let mut folded: HashMap<String, ModelTotals> = HashMap::new();
+    for (name, t) in models {
+        folded
+            .entry(global_stats::fold_model_options(&name).to_string())
+            .or_default()
+            .add(t.input, t.output, t.cache_read, t.cache_write);
+    }
+    folded
 }
 
 /// Aggregate `(input, output, cache_read, cache_write)` across a per-model map.
@@ -2555,6 +2579,84 @@ mod tests {
         assert!(result.contains_key("claude-opus"));
         assert!(result.contains_key("kimi-k2.6"));
         assert_eq!(result.get("kimi-k2.6").unwrap().input, 132);
+    }
+
+    #[test]
+    fn fold_model_variants_merges_option_suffixes_into_base() {
+        let models = HashMap::from([
+            (
+                "grok-4.5".to_string(),
+                ModelTotals {
+                    input: 100,
+                    output: 10,
+                    cache_read: 1_000,
+                    cache_write: 0,
+                },
+            ),
+            (
+                "grok-4.5[effort=high,fast=true]".to_string(),
+                ModelTotals {
+                    input: 50,
+                    output: 5,
+                    cache_read: 0,
+                    cache_write: 7,
+                },
+            ),
+            (
+                "claude-opus-4.8[thinking=true,context=300k,effort=high,fast=false]".to_string(),
+                ModelTotals {
+                    input: 30,
+                    output: 3,
+                    cache_read: 0,
+                    cache_write: 0,
+                },
+            ),
+        ]);
+
+        let folded = fold_model_variants(models);
+        assert_eq!(folded.len(), 2);
+        let grok = folded.get("grok-4.5").unwrap();
+        assert_eq!(grok.input, 150);
+        assert_eq!(grok.output, 15);
+        assert_eq!(grok.cache_read, 1_000);
+        assert_eq!(grok.cache_write, 7);
+        assert_eq!(folded.get("claude-opus-4.8").unwrap().input, 30);
+    }
+
+    /// Folding before the dedup would let a small native variant swallow the
+    /// separately-recorded aivo total for the base name.
+    #[test]
+    fn fold_after_combine_keeps_aivo_usage_distinct_from_native_variant() {
+        let mut global = HashMap::new();
+        global.insert(
+            "grok".to_string(),
+            global_stats::GlobalToolStats {
+                models: HashMap::from([(
+                    "grok-4.5[effort=high,fast=true]".to_string(),
+                    global_stats::ModelTokens {
+                        input_tokens: 50,
+                        output_tokens: 5,
+                        cache_read_tokens: 0,
+                        cache_write_tokens: 0,
+                    },
+                )]),
+                ..Default::default()
+            },
+        );
+        let aivo = HashMap::from([(
+            "grok-4.5".to_string(),
+            ModelTotals {
+                input: 1_000,
+                output: 100,
+                cache_read: 0,
+                cache_write: 0,
+            },
+        )]);
+
+        let folded = fold_model_variants(combine_model_tokens(&global, &aivo));
+        let grok = folded.get("grok-4.5").unwrap();
+        assert_eq!(grok.input, 1_050);
+        assert_eq!(grok.output, 105);
     }
 
     #[test]
