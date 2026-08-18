@@ -44,6 +44,8 @@ impl CodeTuiApp {
             "Esc close · Enter submit"
         } else if menu.kind == MenuKind::AttachPath {
             "Esc close · Enter/Tab insert · ↑/↓ navigate"
+        } else if menu.kind == MenuKind::Effort {
+            "Esc close · Enter apply · Tab insert · ↑/↓ navigate"
         } else {
             "Esc close · Enter run · Tab insert · ↑/↓ navigate"
         };

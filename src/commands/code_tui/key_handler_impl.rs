@@ -170,6 +170,11 @@ impl CodeTuiApp {
             return Ok(should_exit);
         }
 
+        // Close the dropdown without interrupting a live turn.
+        if matches!(key.code, KeyCode::Esc) && self.dismiss_command_menu() {
+            return Ok(false);
+        }
+
         if let Some(should_exit) = self.handle_global_key(key).await? {
             return Ok(should_exit);
         }

@@ -40,53 +40,30 @@ async fn effort_command_sets_level_enables_thinking_and_validates() {
     assert_eq!(app.reasoning_effort.as_deref(), Some("high"));
     assert!(app.notice.as_ref().is_some_and(|(c, _)| *c == ERROR()));
 
-    // Bare `/effort` opens the picker of the model's levels.
     app.run_effort_command(None).await;
-    assert!(
-        matches!(&app.overlay, Overlay::Picker(p) if matches!(p.kind, PickerKind::Effort)),
-        "bare /effort opens the effort picker"
-    );
+    assert!(matches!(app.overlay, Overlay::None));
+    assert_eq!(app.draft, "/effort ");
+    let menu = app.visible_command_menu().expect("effort menu");
+    assert_eq!(menu.kind, MenuKind::Effort);
+    assert_eq!(menu.entries.len(), 3);
 }
 
 #[tokio::test]
-async fn effort_picker_preselects_active_level_or_middle() {
+async fn effort_command_bare_does_not_clobber_unrelated_draft() {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let mut app = make_test_app(tx, rx);
     app.model_reasoning_efforts = vec!["low".into(), "medium".into(), "high".into()];
+    app.draft = "still typing".to_string();
+    app.cursor = app.draft.len();
 
-    // Nothing chosen → the default ("medium") is in effect: highlighted + marked.
-    app.reasoning_effort = None;
     app.run_effort_command(None).await;
-    let Overlay::Picker(p) = &app.overlay else {
-        panic!("expected effort picker");
-    };
-    assert_eq!(p.selected, 1);
-    assert!(p.items[1].label.contains("(current)"));
 
-    // A saved choice wins over the default.
-    app.reasoning_effort = Some("high".into());
-    app.run_effort_command(None).await;
-    let Overlay::Picker(p) = &app.overlay else {
-        panic!("expected effort picker");
-    };
-    assert_eq!(p.selected, 2);
-    assert!(p.items[2].label.contains("(current)"));
-
-    // No "medium" in the list → the middle level stands in.
-    app.reasoning_effort = None;
-    app.model_reasoning_efforts = vec![
-        "none".into(),
-        "low".into(),
-        "high".into(),
-        "xhigh".into(),
-        "max".into(),
-    ];
-    app.run_effort_command(None).await;
-    let Overlay::Picker(p) = &app.overlay else {
-        panic!("expected effort picker");
-    };
-    assert_eq!(p.selected, 2);
-    assert!(p.items[2].label.contains("(current)"));
+    assert_eq!(app.draft, "still typing");
+    assert!(
+        app.notice
+            .as_ref()
+            .is_some_and(|(_, text)| text.contains("choose an effort inline"))
+    );
 }
 
 #[tokio::test]
@@ -97,7 +74,7 @@ async fn effort_command_noop_when_model_has_no_levels() {
     app.run_effort_command(None).await;
     assert!(
         matches!(app.overlay, Overlay::None),
-        "no picker without levels"
+        "no dropdown or overlay without levels"
     );
     assert!(app.notice.as_ref().is_some_and(|(c, _)| *c == MUTED()));
 }
@@ -152,8 +129,7 @@ async fn test_cursor_model_refresh_sets_window_and_effort_badge() {
     assert_eq!(app.cursor_effort_label, None);
 }
 
-/// A level not offered by the current model is refused at apply time — a stale
-/// effort picker across an agent-driven model switch must not 400 later turns.
+/// A stale menu after a model switch must not apply a foreign level.
 #[tokio::test]
 async fn test_apply_reasoning_effort_rejects_foreign_level() {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();

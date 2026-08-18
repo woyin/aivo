@@ -83,9 +83,7 @@ impl CodeTuiApp {
         };
     }
 
-    /// `/effort [level]`: bare opens a picker of the model's reasoning levels,
-    /// `<level>` sets it directly. No-op (with a notice) for models that expose
-    /// no levels.
+    /// `/effort [level]`. Bare reopens the inline menu; no levels → notice.
     pub(super) async fn run_effort_command(&mut self, arg: Option<String>) {
         if self.model_reasoning_efforts.is_empty() {
             // Cursor has no effort param — the tier is part of the model id.
@@ -113,30 +111,27 @@ impl CodeTuiApp {
                     ),
                 ));
             }
-            None => self.open_effort_picker(),
+            None => self.restore_effort_menu(),
         }
     }
 
-    fn open_effort_picker(&mut self) {
-        // Marker + highlight follow the in-effect level (matches footer badge).
-        let current = self.effective_reasoning_effort();
-        let items: Vec<PickerEntry> = self
-            .model_reasoning_efforts
-            .iter()
-            .map(|level| PickerEntry {
-                label: picker_current_label(level.clone(), current.as_deref() == Some(level)),
-                search_text: level.clone(),
-                value: PickerValue::Effort(level.clone()),
-            })
-            .collect();
-        let selected = current
-            .as_deref()
-            .and_then(|c| self.model_reasoning_efforts.iter().position(|l| l == c))
-            .unwrap_or(0);
-        let mut state =
-            PickerState::ready("Reasoning effort", String::new(), items, PickerKind::Effort);
-        state.selected = selected;
-        self.overlay = Overlay::Picker(Box::new(state));
+    /// Reopen the level menu. Don't clobber a draft the user is already typing.
+    fn restore_effort_menu(&mut self) {
+        let draft = self.draft.trim();
+        if !draft.is_empty() && draft != "/effort" {
+            self.notice = Some((
+                MUTED(),
+                format!(
+                    "choose an effort inline (available: {})",
+                    self.model_reasoning_efforts.join(", ")
+                ),
+            ));
+            return;
+        }
+        self.draft = "/effort ".to_string();
+        self.cursor = self.draft.len();
+        self.command_menu.reset();
+        self.sync_command_menu_state();
     }
 
     /// Set the reasoning effort: remember it (per-model) and persist it. The
@@ -2670,9 +2665,6 @@ is preserved."
             ) => {
                 self.rewind_to_turn(history_index, ordinal, keep_engine)
                     .await?;
-            }
-            (PickerKind::Effort, PickerValue::Effort(level)) => {
-                self.apply_reasoning_effort(level).await;
             }
             (PickerKind::PlanResume, PickerValue::PlanResume(carry)) => {
                 self.resume_plan_from_session(carry).await;

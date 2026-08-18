@@ -229,6 +229,7 @@ pub(super) fn render_command_menu_rows(
             match menu.kind {
                 MenuKind::Commands => "No matching command",
                 MenuKind::AttachPath => "No matching path",
+                MenuKind::Effort => "No matching effort level",
                 MenuKind::Mention => "No matching sub-agent",
             },
             Style::default().fg(MUTED()),
@@ -272,23 +273,12 @@ pub(super) fn render_command_menu_rows(
         .collect()
 }
 
-/// Append a ` (current)` marker to a picker label for the in-effect option.
-/// Shared by the pickers that highlight the active choice (`/effort`).
-pub(super) fn picker_current_label(label: String, is_current: bool) -> String {
-    if is_current {
-        format!("{label}  (current)")
-    } else {
-        label
-    }
-}
-
 pub(super) fn picker_kind_noun(kind: &PickerKind) -> &'static str {
     match kind {
         PickerKind::Key { .. } => "keys",
         PickerKind::Model { .. } => "models",
         PickerKind::Session => "sessions",
         PickerKind::Rewind => "turns",
-        PickerKind::Effort => "levels",
         PickerKind::PlanResume => "plans",
     }
 }
@@ -299,7 +289,6 @@ pub(super) fn picker_search_placeholder(kind: &PickerKind) -> &'static str {
         PickerKind::Model { .. } => "filter model names",
         PickerKind::Session => "filter saved sessions",
         PickerKind::Rewind => "filter turns",
-        PickerKind::Effort => "filter levels",
         PickerKind::PlanResume => "filter unfinished plans",
     }
 }

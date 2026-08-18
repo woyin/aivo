@@ -389,6 +389,24 @@ impl CodeTuiApp {
         Some(&self.draft["/attach ".len()..])
     }
 
+    /// `/effort` arg filter. Off when the model has no levels, so the command
+    /// notice stays instead of an empty menu.
+    pub(super) fn active_effort_query(&self) -> Option<&str> {
+        if self.overlay.blocks_input()
+            || self.model_reasoning_efforts.is_empty()
+            || self.cursor != self.draft.len()
+            || self.draft.contains('\n')
+        {
+            return None;
+        }
+        let rest = self.draft.strip_prefix("/effort")?;
+        if !rest.is_empty() && !rest.starts_with(char::is_whitespace) {
+            return None;
+        }
+        let query = rest.trim();
+        (!query.chars().any(char::is_whitespace)).then_some(query)
+    }
+
     /// An `@name` sub-agent mention being typed at the cursor: the byte offset
     /// of the `@` and the partial name after it. Only at a word boundary (start
     /// of draft or after whitespace) so emails and paths don't trigger it, and
@@ -467,6 +485,45 @@ impl CodeTuiApp {
         entries
     }
 
+    pub(super) fn matching_effort_entries(&self, query: &str) -> Vec<ComposerMenuEntry> {
+        let query = query.to_ascii_lowercase();
+        let current = self.effective_reasoning_effort();
+        let mut prefix = Vec::new();
+        let mut fuzzy = Vec::new();
+        for level in &self.model_reasoning_efforts {
+            let entry = ComposerMenuEntry::Effort(EffortMenuEntry {
+                level: level.clone(),
+                current: current.as_deref() == Some(level),
+            });
+            if level.to_ascii_lowercase().starts_with(&query) {
+                prefix.push(entry);
+            } else if matches_fuzzy(&query, level) {
+                fuzzy.push(entry);
+            }
+        }
+        prefix.extend(fuzzy);
+        prefix
+    }
+
+    fn slash_command_opens_inline_menu(&self, command: &SlashCommandSpec) -> bool {
+        match command.name {
+            "effort" => !self.model_reasoning_efforts.is_empty(),
+            "attach" => true,
+            _ => false,
+        }
+    }
+
+    fn complete_inline_arg_command(&mut self, command: &SlashCommandSpec) -> bool {
+        if !self.slash_command_opens_inline_menu(command) {
+            return false;
+        }
+        self.draft = command.insertion_text();
+        self.cursor = self.draft.len();
+        self.command_menu.reset();
+        self.sync_command_menu_state();
+        true
+    }
+
     pub(super) fn visible_command_menu(&self) -> Option<VisibleCommandMenu> {
         // While recalling input history (↑/↓), keep arrows driving history
         // navigation — don't pop the dropdown for a recalled `/command` and let
@@ -478,12 +535,11 @@ impl CodeTuiApp {
         if self.command_menu.dismissed {
             return None;
         }
-        // The command is fully typed and showing its inline arg ghost — the
-        // single-row dropdown would just echo it, so drop it (Claude-Code style).
-        if self.composer_command_hint().is_some() {
+        let (kind, entries) = if let Some(query) = self.active_effort_query() {
+            (MenuKind::Effort, self.matching_effort_entries(query))
+        } else if self.composer_command_hint().is_some() {
             return None;
-        }
-        let (kind, entries) = if let Some(query) = self.active_command_query() {
+        } else if let Some(query) = self.active_command_query() {
             (MenuKind::Commands, self.matching_command_entries(query))
         } else if let Some(query) = self.active_attach_query() {
             (
@@ -517,27 +573,40 @@ impl CodeTuiApp {
     }
 
     pub(super) fn sync_command_menu_state(&mut self) {
-        let query = if let Some(query) = self.active_command_query() {
-            query.to_string()
+        let (kind, query) = if let Some(query) = self.active_effort_query() {
+            (MenuKind::Effort, query.to_string())
+        } else if let Some(query) = self.active_command_query() {
+            (MenuKind::Commands, query.to_string())
         } else if let Some(query) = self.active_attach_query() {
-            query.to_string()
+            (MenuKind::AttachPath, query.to_string())
         } else if let Some((_, query)) = self.active_mention_query() {
-            query
+            (MenuKind::Mention, query)
         } else {
             self.command_menu.reset();
             return;
         };
 
-        if self.command_menu.query != query {
+        if self.command_menu.kind != Some(kind) || self.command_menu.query != query {
             if self.command_menu.dismissed {
                 self.command_menu.placement = None;
             }
+            self.command_menu.kind = Some(kind);
             self.command_menu.query = query.clone();
-            self.command_menu.selected = 0;
+            self.command_menu.selected = if kind == MenuKind::Effort && query.is_empty() {
+                let current = self.effective_reasoning_effort();
+                self.model_reasoning_efforts
+                    .iter()
+                    .position(|level| current.as_deref() == Some(level))
+                    .unwrap_or(0)
+            } else {
+                0
+            };
             self.command_menu.dismissed = false;
         }
 
-        let matches = if self.active_command_query().is_some() {
+        let matches = if self.active_effort_query().is_some() {
+            self.matching_effort_entries(&query).len()
+        } else if self.active_command_query().is_some() {
             self.matching_command_entries(&query).len()
         } else if self.active_attach_query().is_some() {
             collect_attach_path_suggestions(self.persist_cwd(), &query).len()
@@ -582,6 +651,7 @@ impl CodeTuiApp {
     pub(super) fn dismiss_command_menu(&mut self) -> bool {
         if (self.active_command_query().is_none()
             && self.active_attach_query().is_none()
+            && self.active_effort_query().is_none()
             && self.active_mention_query().is_none())
             || self.command_menu.dismissed
         {
@@ -605,10 +675,12 @@ impl CodeTuiApp {
         self.command_menu.selected = 0;
         match entry {
             ComposerMenuEntry::Command(command) => {
-                self.draft = command.insertion_text();
-                self.cursor = self.draft.len();
-                self.command_menu.dismissed = true;
-                self.command_menu.placement = None;
+                if !self.complete_inline_arg_command(command) {
+                    self.draft = command.insertion_text();
+                    self.cursor = self.draft.len();
+                    self.command_menu.dismissed = true;
+                    self.command_menu.placement = None;
+                }
             }
             ComposerMenuEntry::Skill(skill) => {
                 self.draft = skill.insertion_text();
@@ -626,6 +698,12 @@ impl CodeTuiApp {
                 if !path.is_dir {
                     self.command_menu.placement = None;
                 }
+            }
+            ComposerMenuEntry::Effort(effort) => {
+                self.draft = format!("/effort {}", effort.level);
+                self.cursor = self.draft.len();
+                self.command_menu.dismissed = true;
+                self.command_menu.placement = None;
             }
             ComposerMenuEntry::Agent(agent) => {
                 self.insert_mention(&agent.name);
@@ -648,10 +726,13 @@ impl CodeTuiApp {
 
     pub(super) async fn execute_selected_command(&mut self) -> Result<bool> {
         let Some(entry) = self.selected_menu_entry() else {
-            return Ok(false);
+            return self.submit_draft().await;
         };
         match entry {
             ComposerMenuEntry::Command(command) => {
+                if self.complete_inline_arg_command(command) {
+                    return Ok(false);
+                }
                 self.draft = command.command_label();
                 self.cursor = self.draft.len();
                 self.command_menu.reset();
@@ -672,6 +753,17 @@ impl CodeTuiApp {
                 } else {
                     self.submit_draft().await
                 }
+            }
+            ComposerMenuEntry::Effort(effort) => {
+                let typed = format!("/effort {}", effort.level);
+                self.record_draft_history(&typed);
+                self.draft.clear();
+                self.cursor = 0;
+                self.command_menu.reset();
+                self.draft_history_index = None;
+                self.draft_history_stash = None;
+                self.apply_reasoning_effort(effort.level).await;
+                Ok(false)
             }
             // Enter completes the mention like Tab — the user still has the
             // actual request to type around it.

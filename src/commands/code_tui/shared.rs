@@ -610,7 +610,7 @@ pub(super) const SLASH_COMMANDS: &[SlashCommandSpec] = &[
     SlashCommandSpec {
         name: "effort",
         help_label: "/effort [level]",
-        description: "set reasoning effort (bare opens a picker)",
+        description: "set how hard the model thinks",
         takes_argument: true,
     },
     SlashCommandSpec {
@@ -1718,8 +1718,6 @@ pub(super) enum PickerValue {
         ordinal: Option<usize>,
         keep_engine: bool,
     },
-    /// A `/effort` reasoning level (e.g. `low`/`high`).
-    Effort(String),
     /// An unfinished plan from a saved session (`/plan resume`); the payload
     /// rides in the row so activation needs no second load.
     PlanResume(PlanCarry),
@@ -1786,7 +1784,6 @@ pub(super) enum PickerKind {
     },
     Session,
     Rewind,
-    Effort,
     PlanResume,
 }
 
@@ -1880,6 +1877,7 @@ pub(super) struct PendingSubmission {
 
 #[derive(Clone, Default)]
 pub(super) struct CommandMenuState {
+    pub(super) kind: Option<MenuKind>,
     pub(super) query: String,
     pub(super) selected: usize,
     pub(super) dismissed: bool,
@@ -1888,6 +1886,7 @@ pub(super) struct CommandMenuState {
 
 impl CommandMenuState {
     pub(super) fn reset(&mut self) {
+        self.kind = None;
         self.query.clear();
         self.selected = 0;
         self.dismissed = false;
@@ -1907,6 +1906,7 @@ pub(super) struct PathMenuEntry {
 pub(super) enum MenuKind {
     Commands,
     AttachPath,
+    Effort,
     /// `@name` sub-agent mentions in the composer.
     Mention,
 }
@@ -1943,10 +1943,17 @@ pub(super) struct AgentMention {
 }
 
 #[derive(Clone)]
+pub(super) struct EffortMenuEntry {
+    pub(super) level: String,
+    pub(super) current: bool,
+}
+
+#[derive(Clone)]
 pub(super) enum ComposerMenuEntry {
     Command(&'static SlashCommandSpec),
     Skill(SkillCommand),
     Path(PathMenuEntry),
+    Effort(EffortMenuEntry),
     Agent(AgentMention),
 }
 
@@ -1956,6 +1963,13 @@ impl ComposerMenuEntry {
             Self::Command(command) => command.command_label(),
             Self::Skill(skill) => skill.command_label(),
             Self::Path(path) => path.label.clone(),
+            Self::Effort(effort) => {
+                if effort.current {
+                    format!("{}  (current)", effort.level)
+                } else {
+                    effort.level.clone()
+                }
+            }
             Self::Agent(agent) => format!("@{}", agent.name),
         }
     }
@@ -1965,6 +1979,7 @@ impl ComposerMenuEntry {
             Self::Command(command) => command.description,
             Self::Skill(skill) => &skill.description,
             Self::Path(path) => &path.description,
+            Self::Effort(_) => "",
             Self::Agent(agent) => &agent.description,
         }
     }
@@ -2443,8 +2458,7 @@ pub(super) enum SlashCommand {
     Memory {
         dream: bool,
     },
-    /// Reasoning effort: bare opens a picker of the model's levels, `<level>`
-    /// sets it directly.
+    /// `/effort [level]` — inline menu, or set the level directly.
     Effort(Option<String>),
     /// Built-in `create-skill` command: starts the guided create/improve-a-skill
     /// workflow. The optional argument is the initial intent (what the skill
