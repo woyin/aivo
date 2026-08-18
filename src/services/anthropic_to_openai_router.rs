@@ -51,6 +51,7 @@ use crate::services::responses_chat_conversion::{
 };
 use crate::services::route_cache::{PersistedRoute, RouteCache};
 use crate::services::serve_upstream::disable_stream_for_inception_with_tools;
+use crate::services::token_usage::{StreamUsageSniffer, UsageAccounting, parse_token_usage};
 use crate::services::wire_format::{
     RequestOptions, ResponseOptions, translate_request, translate_response,
 };
@@ -85,11 +86,14 @@ pub struct AnthropicToOpenAIRouter {
     /// local processes can't spend the key through this router. On the router
     /// (not config) so existing config literals stay untouched.
     expected_token: Option<String>,
+    /// When set, 2xx token usage is recorded against the launching key.
+    usage: Option<UsageAccounting>,
 }
 
 struct AnthropicToOpenAIRouterState {
     config: Arc<AnthropicToOpenAIRouterConfig>,
     expected_token: Option<String>,
+    usage: Option<UsageAccounting>,
     client: reqwest::Client,
     /// Per-model learned routes; each request resolves its slot and runs the
     /// cascade against it. A confirmed slot persists on exit via `dirty_routes`.
@@ -232,12 +236,40 @@ impl AnthropicToOpenAIRouter {
         Self {
             config,
             expected_token: None,
+            usage: None,
         }
     }
 
     /// Requires loopback clients to present this token (Bearer/x-api-key).
     pub fn with_auth_token(mut self, token: String) -> Self {
         self.expected_token = Some(token);
+        self
+    }
+
+    /// Record 2xx token usage against `key_id` in stats, attributed to `tool`.
+    pub fn with_usage_accounting(
+        mut self,
+        store: crate::services::session_store::SessionStore,
+        key_id: String,
+        tool: String,
+    ) -> Self {
+        self.usage = Some(UsageAccounting {
+            store,
+            key_id,
+            tool,
+            run_tally: None,
+        });
+        self
+    }
+
+    /// Fold accounted usage into a per-run tally; no-op without accounting.
+    pub fn with_run_tally(
+        mut self,
+        tally: Arc<crate::services::usage_stats_store::RunTokenTally>,
+    ) -> Self {
+        if let Some(usage) = self.usage.as_mut() {
+            usage.run_tally = Some(tally);
+        }
         self
     }
 
@@ -263,6 +295,7 @@ impl AnthropicToOpenAIRouter {
         let state = AnthropicToOpenAIRouterState {
             config: Arc::new(self.config.clone()),
             expected_token: self.expected_token.clone(),
+            usage: self.usage.clone(),
             client: router_http_client(),
             route_cache: route_cache.clone(),
             probe: ProbeState::new(),
@@ -300,6 +333,7 @@ async fn handle_router_request(
         return;
     }
 
+    let mut sniffer = StreamUsageSniffer::new(state.usage.is_some());
     let response = match handle_anthropic_to_upstream(
         &request,
         &state.config,
@@ -308,6 +342,7 @@ async fn handle_router_request(
         &state.probe,
         &state.learned_requires_reasoning,
         &mut socket,
+        &mut sniffer,
     )
     .await
     {
@@ -319,7 +354,33 @@ async fn handle_router_request(
         }
     };
 
+    // Peek usage before the body moves; record after the write so the
+    // stats-file lock never delays the response.
+    let usage = if state.usage.is_some() {
+        match &response {
+            RouterResponse::Buffered { status, body, .. } if (200..300).contains(status) => {
+                parse_token_usage(body)
+            }
+            RouterResponse::AlreadyStreamed => sniffer.finish(),
+            _ => None,
+        }
+    } else {
+        None
+    };
+
     let _ = write_router_response(&mut socket, response).await;
+
+    if let (Some(acct), Some(u)) = (&state.usage, usage) {
+        let model = http_utils::extract_request_body(&request)
+            .ok()
+            .and_then(|b| serde_json::from_str::<Value>(b).ok())
+            .and_then(|v| {
+                v.get("model")
+                    .and_then(|m| m.as_str())
+                    .map(|s| strip_context_suffix(s).to_string())
+            });
+        acct.record(model.as_deref(), &u).await;
+    }
 }
 
 async fn write_router_response(
@@ -606,6 +667,7 @@ async fn handle_anthropic_to_upstream(
     probe: &ProbeState,
     learned_requires_reasoning: &Arc<AtomicBool>,
     socket: &mut tokio::net::TcpStream,
+    sniffer: &mut StreamUsageSniffer,
 ) -> Result<RouterResponse> {
     let mut passthrough_headers = http_utils::extract_passthrough_headers(request)?;
     if probe.beta_header_rejected.load(Ordering::Relaxed) {
@@ -874,6 +936,8 @@ async fn handle_anthropic_to_upstream(
                         socket.write_all(headers.as_bytes()).await?;
                         let mut converter = OpenAIStreamConverter::new("claude");
                         while let Some(chunk) = response.chunk().await? {
+                            // Raw SSE carries usage — include_usage is always set.
+                            sniffer.observe(&chunk);
                             let converted = converter.push_bytes(&chunk)?;
                             if !converted.is_empty() {
                                 let formatted = http_utils::format_http_chunk(converted.as_bytes());

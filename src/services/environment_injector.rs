@@ -195,6 +195,8 @@ impl EnvironmentInjector {
         let loopback_token = crate::services::serve_router::random_auth_token();
 
         let mut env = HashMap::new();
+        // Router-backed modes carry the key id for usage accounting; Direct has
+        // no router to account.
         match mode {
             ConnectionMode::Ollama => {
                 env.insert(
@@ -216,6 +218,7 @@ impl EnvironmentInjector {
                     format!("{}_UPSTREAM_PROTOCOL", cfg.router_prefix),
                     "openai".to_string(),
                 );
+                env.insert(format!("{}_KEY_ID", cfg.router_prefix), key.id.clone());
             }
             ConnectionMode::Copilot => {
                 env.insert(
@@ -226,6 +229,7 @@ impl EnvironmentInjector {
                 env.insert(AIVO_ROUTER_AUTH_TOKEN.to_string(), loopback_token);
                 env.insert(cfg.copilot_flag.to_string(), "1".to_string());
                 env.insert("AIVO_COPILOT_GITHUB_TOKEN".to_string(), key.key.to_string());
+                env.insert("AIVO_COPILOT_KEY_ID".to_string(), key.id.clone());
             }
             ConnectionMode::OpenRouter => {
                 env.insert(
@@ -237,6 +241,7 @@ impl EnvironmentInjector {
                 env.insert("AIVO_USE_ROUTER".to_string(), "1".to_string());
                 env.insert("AIVO_ROUTER_API_KEY".to_string(), auth_value);
                 env.insert("AIVO_ROUTER_BASE_URL".to_string(), resolved_base_url);
+                env.insert("AIVO_ROUTER_KEY_ID".to_string(), key.id.clone());
             }
             ConnectionMode::Direct { base_url } => {
                 let url = if base_url == AIVO_STARTER_SENTINEL {
@@ -257,6 +262,7 @@ impl EnvironmentInjector {
                 env.insert(cfg.router_flag.to_string(), "1".to_string());
                 env.insert(format!("{}_API_KEY", cfg.router_prefix), auth_value);
                 env.insert(format!("{}_BASE_URL", cfg.router_prefix), resolved_base_url);
+                env.insert(format!("{}_KEY_ID", cfg.router_prefix), key.id.clone());
                 env.insert(
                     format!("{}_UPSTREAM_PROTOCOL", cfg.router_prefix),
                     protocol.as_str().to_string(),
@@ -855,6 +861,7 @@ impl EnvironmentInjector {
                 "1".to_string(),
             );
             env.insert("AIVO_COPILOT_GITHUB_TOKEN".to_string(), key.key.to_string());
+            env.insert("AIVO_COPILOT_KEY_ID".to_string(), key.id.clone());
             env.insert(AIVO_ROUTER_AUTH_TOKEN.to_string(), loopback_token.clone());
             (PLACEHOLDER_LOOPBACK_URL.to_string(), loopback_token)
         } else if use_router_for_opencode(key) || profile.serve_flags.is_starter {
@@ -867,6 +874,10 @@ impl EnvironmentInjector {
             env.insert(
                 "AIVO_RESPONSES_TO_CHAT_ROUTER_BASE_URL".to_string(),
                 resolved_url.clone(),
+            );
+            env.insert(
+                "AIVO_RESPONSES_TO_CHAT_ROUTER_KEY_ID".to_string(),
+                key.id.clone(),
             );
             env.insert(
                 "AIVO_RESPONSES_TO_CHAT_ROUTER_UPSTREAM_PROTOCOL".to_string(),
@@ -1066,6 +1077,7 @@ impl EnvironmentInjector {
             env.insert("AIVO_PI_MODELS_JSON".to_string(), models_json);
             env.insert("AIVO_USE_PI_COPILOT_ROUTER".to_string(), "1".to_string());
             env.insert("AIVO_COPILOT_GITHUB_TOKEN".to_string(), key.key.to_string());
+            env.insert("AIVO_COPILOT_KEY_ID".to_string(), key.id.clone());
         } else if profile.serve_flags.is_starter {
             // Starter provider: route through a local router so device fingerprint
             // headers are attached (Pi's native HTTP client can't add them).
@@ -1090,6 +1102,10 @@ impl EnvironmentInjector {
             env.insert(
                 "AIVO_RESPONSES_TO_CHAT_ROUTER_BASE_URL".to_string(),
                 AIVO_STARTER_REAL_URL.to_string(),
+            );
+            env.insert(
+                "AIVO_RESPONSES_TO_CHAT_ROUTER_KEY_ID".to_string(),
+                key.id.clone(),
             );
         } else if crate::services::transform_mode::is_active()
             || crate::services::http_debug::is_debug_active()
@@ -1117,6 +1133,10 @@ impl EnvironmentInjector {
             env.insert(
                 "AIVO_RESPONSES_TO_CHAT_ROUTER_BASE_URL".to_string(),
                 key.base_url.clone(),
+            );
+            env.insert(
+                "AIVO_RESPONSES_TO_CHAT_ROUTER_KEY_ID".to_string(),
+                key.id.clone(),
             );
             env.insert(
                 "AIVO_RESPONSES_TO_CHAT_ROUTER_UPSTREAM_PROTOCOL".to_string(),
@@ -2860,6 +2880,10 @@ mod tests {
             env.get("AIVO_RESPONSES_TO_CHAT_ROUTER_BASE_URL"),
             Some(&"http://localhost:8080".to_string())
         );
+        assert_eq!(
+            env.get("AIVO_RESPONSES_TO_CHAT_ROUTER_KEY_ID"),
+            Some(&key.id)
+        );
     }
 
     #[test]
@@ -3170,6 +3194,7 @@ mod tests {
             env.get("AIVO_GEMINI_ROUTER_BASE_URL"),
             Some(&"http://localhost:8080".to_string())
         );
+        assert_eq!(env.get("AIVO_GEMINI_ROUTER_KEY_ID"), Some(&key.id));
         // Placeholder — launcher overwrites with actual port
         assert_eq!(
             env.get("GOOGLE_GEMINI_BASE_URL"),
@@ -3616,6 +3641,10 @@ mod tests {
             env.get("AIVO_ANTHROPIC_TO_OPENAI_ROUTER_BASE_URL")
                 .unwrap()
                 .contains("11434")
+        );
+        assert_eq!(
+            env.get("AIVO_ANTHROPIC_TO_OPENAI_ROUTER_KEY_ID"),
+            Some(&key.id)
         );
         assert_eq!(env.get("ANTHROPIC_MODEL"), Some(&"llama3.2".to_string()));
         // Should NOT use Copilot or OpenRouter routers

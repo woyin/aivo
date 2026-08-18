@@ -719,13 +719,8 @@ impl AILauncher {
 
         let exit_code = result.as_ref().ok().copied();
         let detected_session_id = probe.detect_new().await;
-        // Stamp the grok router's per-run token tally onto the row (see
-        // LaunchRuntimeState::run_tally).
-        let [input_tokens, output_tokens, cache_read, cache_creation] = runtime
-            .run_tally
-            .as_ref()
-            .map(|t| t.finished_row_tokens())
-            .unwrap_or_default();
+        let [input_tokens, output_tokens, cache_read, cache_creation] =
+            runtime.run_tally.finished_row_tokens();
         let _ = self
             .session_store
             .logs()

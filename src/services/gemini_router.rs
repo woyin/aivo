@@ -24,6 +24,7 @@ use crate::services::responses_chat_conversion::{
     try_convert_chat_to_responses_request, try_convert_responses_json_to_chat,
 };
 use crate::services::route_cache::{PersistedRoute, RouteCache, RouteSlot};
+use crate::services::token_usage::{UsageAccounting, parse_http_response_usage};
 use crate::services::wire_format::{
     RequestOptions, ResponseOptions, translate_request, translate_response,
 };
@@ -54,6 +55,8 @@ pub struct GeminiRouter {
     /// Per-launch loopback token; `Some` rejects requests without it so other
     /// local processes can't spend the key through this router.
     expected_token: Option<String>,
+    /// When set, 2xx token usage is recorded against the launching key.
+    usage: Option<UsageAccounting>,
 }
 
 enum ForwardResult {
@@ -68,6 +71,7 @@ enum ForwardResult {
 struct GeminiRouterState {
     config: Arc<GeminiRouterConfig>,
     expected_token: Option<String>,
+    usage: Option<UsageAccounting>,
     client: Arc<reqwest::Client>,
     /// Per-(model) learned routes; the cascade reads/writes the resolved slot's
     /// atom and `slot.confirm()` marks authoritative outcomes for write-behind.
@@ -84,7 +88,35 @@ impl GeminiRouter {
             config,
             seed_routes: BTreeMap::new(),
             expected_token: None,
+            usage: None,
         }
+    }
+
+    /// Record 2xx token usage against `key_id` in stats, attributed to `tool`.
+    pub fn with_usage_accounting(
+        mut self,
+        store: crate::services::session_store::SessionStore,
+        key_id: String,
+        tool: String,
+    ) -> Self {
+        self.usage = Some(UsageAccounting {
+            store,
+            key_id,
+            tool,
+            run_tally: None,
+        });
+        self
+    }
+
+    /// Fold accounted usage into a per-run tally; no-op without accounting.
+    pub fn with_run_tally(
+        mut self,
+        tally: Arc<crate::services::usage_stats_store::RunTokenTally>,
+    ) -> Self {
+        if let Some(usage) = self.usage.as_mut() {
+            usage.run_tally = Some(tally);
+        }
+        self
     }
 
     pub fn with_seed_routes(mut self, seed_routes: BTreeMap<String, PersistedRoute>) -> Self {
@@ -126,6 +158,7 @@ impl GeminiRouter {
         let state = GeminiRouterState {
             config: Arc::new(self.config.clone()),
             expected_token: self.expected_token.clone(),
+            usage: self.usage.clone(),
             client: Arc::new(http_utils::router_http_client()),
             route_cache: route_cache.clone(),
             learned_requires_reasoning: learned_requires_reasoning.clone(),
@@ -146,7 +179,7 @@ async fn handle_router_request(request: String, state: Arc<GeminiRouterState>) -
             "Invalid or missing auth token (expected Authorization: Bearer or x-api-key)",
         );
     }
-    match handle_request(
+    let response = match handle_request(
         &request,
         &state.config,
         &state.client,
@@ -157,7 +190,16 @@ async fn handle_router_request(request: String, state: Arc<GeminiRouterState>) -
     {
         Ok(r) => r,
         Err(e) => http_utils::http_error_response(500, &e.to_string()),
+    };
+    if let Some(acct) = &state.usage
+        && let Some(u) = parse_http_response_usage(&response)
+    {
+        // Model rides in the Gemini URL path, not the body.
+        let path = http_utils::extract_request_path(&request);
+        let model = parse_gemini_path(path.split('?').next().unwrap_or("")).map(|(m, _)| m);
+        acct.record(model.as_deref(), &u).await;
     }
+    response
 }
 
 async fn handle_request(

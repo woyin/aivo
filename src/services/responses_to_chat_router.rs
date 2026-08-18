@@ -54,7 +54,7 @@ pub use responses_chat_conversion::{
 };
 
 // Internal re-exports used within this router
-use crate::services::token_usage::{StreamUsageSniffer, TokenUsage, parse_token_usage};
+use crate::services::token_usage::{StreamUsageSniffer, UsageAccounting, parse_token_usage};
 use responses_chat_conversion::{
     apply_max_tokens_cap_to_fields, cap_reasoning_effort, convert_chat_to_responses_request,
     convert_responses_json_to_chat, sanitize_input_content,
@@ -119,26 +119,12 @@ pub struct ResponsesToChatRouter {
     /// Learned per-model seed for the `RouteCache`. On the router (not the
     /// config) so the conversion-test config literals don't need a new field.
     seed_routes: BTreeMap<String, PersistedRoute>,
-    /// When set, buffered 2xx token usage is recorded against this key in stats
-    /// (the plugin endpoint opts in; native launches don't). Streaming is
-    /// uncounted, matching `ServeRouter`.
+    /// When set, 2xx token usage is recorded against this key in stats.
     usage: Option<UsageAccounting>,
     /// When set, every request must carry this bearer (`Authorization: Bearer`
     /// or `x-api-key`). The plugin endpoint sets it; native launches leave it
     /// `None` (trusted local env).
     expected_token: Option<String>,
-}
-
-/// Records buffered-response token usage against a key, for the plugin endpoint.
-#[derive(Clone)]
-pub struct UsageAccounting {
-    pub store: crate::services::session_store::SessionStore,
-    pub key_id: String,
-    /// Launching plugin name, for per-(tool, model) stats attribution.
-    pub tool: String,
-    /// Per-run tally so the run's finished log row carries timestamped tokens
-    /// (windowable by `aivo stats --since`). Fed alongside the lifetime sink.
-    pub run_tally: Option<Arc<crate::services::usage_stats_store::RunTokenTally>>,
 }
 
 enum ForwardedChatResponse {
@@ -342,33 +328,6 @@ async fn handle_router_request_streaming(
     }
 }
 
-/// Record one usage report against the plugin-endpoint key, tagged with the
-/// launching tool. Shared by the buffered and streamed accounting paths.
-async fn record_endpoint_usage(acct: &UsageAccounting, model: Option<&str>, u: &TokenUsage) {
-    let _ = acct
-        .store
-        .record_tokens(
-            &acct.key_id,
-            Some(acct.tool.as_str()),
-            model,
-            u.prompt_tokens,
-            u.completion_tokens,
-            u.cache_read_input_tokens,
-            u.cache_creation_input_tokens,
-        )
-        .await;
-    // Same totals into the per-run tally, so the finished log row is windowable
-    // by `aivo stats --since` (lifetime per-key counters aren't timestamped).
-    if let Some(tally) = &acct.run_tally {
-        tally.add(
-            u.prompt_tokens,
-            u.completion_tokens,
-            u.cache_read_input_tokens,
-            u.cache_creation_input_tokens,
-        );
-    }
-}
-
 /// Quick check on a buffered HTTP/1.1 response string: status starts at byte
 /// offset 9 (after "HTTP/1.1 "). 2xx → success.
 fn response_is_2xx(http_response: &str) -> bool {
@@ -466,12 +425,12 @@ async fn handle_router_request(
                 && let Some(body) = resp.split_once("\r\n\r\n").map(|(_, b)| b)
                 && let Some(u) = parse_token_usage(body.as_bytes())
             {
-                record_endpoint_usage(acct, model_label, &u).await;
+                acct.record(model_label, &u).await;
             }
         } else if let (Some(acct), Some(u)) = (&state.usage, sniffer.finish()) {
             // Streamed path (None): account usage sniffed off the SSE stream.
             // Success was already recorded via `slot.confirm()` in the streamer.
-            record_endpoint_usage(acct, model_label, &u).await;
+            acct.record(model_label, &u).await;
         }
         response
     } else {

@@ -21,11 +21,51 @@
 //! INCLUSIVE total input (cache counts folded in); `cache_read_input_tokens`
 //! and `cache_creation_input_tokens` are informational subsets.
 
+use std::sync::Arc;
+
 use serde::Serialize;
 use serde_json::Value;
 
 use crate::services::http_utils::{self, parse_token_u64};
 use crate::services::openai_models::extract_cached_prompt_tokens;
+
+/// Records token usage against a key. Shared by every loopback router that
+/// accounts a launch or plugin run.
+#[derive(Clone)]
+pub struct UsageAccounting {
+    pub store: crate::services::session_store::SessionStore,
+    pub key_id: String,
+    /// Launching tool or plugin name, for per-(tool, model) stats attribution.
+    pub tool: String,
+    /// Per-run tally for the finished log row (windowable by `aivo stats --since`).
+    pub run_tally: Option<Arc<crate::services::usage_stats_store::RunTokenTally>>,
+}
+
+impl UsageAccounting {
+    /// Record one usage report; best-effort, never fails the request path.
+    pub async fn record(&self, model: Option<&str>, u: &TokenUsage) {
+        let _ = self
+            .store
+            .record_tokens(
+                &self.key_id,
+                Some(self.tool.as_str()),
+                model,
+                u.prompt_tokens,
+                u.completion_tokens,
+                u.cache_read_input_tokens,
+                u.cache_creation_input_tokens,
+            )
+            .await;
+        if let Some(tally) = &self.run_tally {
+            tally.add(
+                u.prompt_tokens,
+                u.completion_tokens,
+                u.cache_read_input_tokens,
+                u.cache_creation_input_tokens,
+            );
+        }
+    }
+}
 
 /// Token counts pulled from a response `usage` block.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
@@ -235,6 +275,20 @@ pub fn extract_usage_from_value(v: &Value) -> Option<TokenUsage> {
         return (!usage.is_zero()).then_some(usage);
     }
     None
+}
+
+/// Extract 2xx token usage from a full buffered HTTP/1.1 response string.
+pub fn parse_http_response_usage(http_response: &str) -> Option<TokenUsage> {
+    let status: u16 = http_response.as_bytes().get(9..12).and_then(|b| {
+        std::str::from_utf8(b)
+            .ok()
+            .and_then(|s| s.parse::<u16>().ok())
+    })?;
+    if !(200..300).contains(&status) {
+        return None;
+    }
+    let (_, body) = http_response.split_once("\r\n\r\n")?;
+    parse_token_usage(body.as_bytes())
 }
 
 /// Extract token usage from a buffered JSON response body.

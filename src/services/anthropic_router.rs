@@ -14,6 +14,9 @@ use crate::services::anthropic_route_pipeline::{RequestContext, RouterPipeline};
 use crate::services::device_fingerprint;
 use crate::services::http_debug::LoggedSend;
 use crate::services::http_utils::{self, router_http_client};
+use crate::services::token_usage::{
+    StreamUsageSniffer, TokenUsage, UsageAccounting, parse_token_usage,
+};
 
 #[derive(Clone)]
 pub struct AnthropicRouterConfig {
@@ -28,11 +31,14 @@ pub struct AnthropicRouter {
     /// local processes can't spend the key through this router. On the router
     /// (not config) so existing config literals stay untouched.
     expected_token: Option<String>,
+    /// When set, 2xx token usage is recorded against the launching key.
+    usage: Option<UsageAccounting>,
 }
 
 struct AnthropicRouterState {
     config: Arc<AnthropicRouterConfig>,
     expected_token: Option<String>,
+    usage: Option<UsageAccounting>,
     client: reqwest::Client,
     /// Set to true when the provider rejects `anthropic-beta` headers.
     /// Once learned, the header is stripped from all future requests.
@@ -64,12 +70,40 @@ impl AnthropicRouter {
         Self {
             config,
             expected_token: None,
+            usage: None,
         }
     }
 
     /// Requires loopback clients to present this token (Bearer/x-api-key).
     pub fn with_auth_token(mut self, token: String) -> Self {
         self.expected_token = Some(token);
+        self
+    }
+
+    /// Record 2xx token usage against `key_id` in stats, attributed to `tool`.
+    pub fn with_usage_accounting(
+        mut self,
+        store: crate::services::session_store::SessionStore,
+        key_id: String,
+        tool: String,
+    ) -> Self {
+        self.usage = Some(UsageAccounting {
+            store,
+            key_id,
+            tool,
+            run_tally: None,
+        });
+        self
+    }
+
+    /// Fold accounted usage into a per-run tally; no-op without accounting.
+    pub fn with_run_tally(
+        mut self,
+        tally: std::sync::Arc<crate::services::usage_stats_store::RunTokenTally>,
+    ) -> Self {
+        if let Some(usage) = self.usage.as_mut() {
+            usage.run_tally = Some(tally);
+        }
         self
     }
 
@@ -80,6 +114,7 @@ impl AnthropicRouter {
         let state = AnthropicRouterState {
             config: Arc::new(self.config.clone()),
             expected_token: self.expected_token.clone(),
+            usage: self.usage.clone(),
             client: router_http_client(),
             beta_header_rejected: Arc::new(AtomicBool::new(false)),
         };
@@ -133,7 +168,16 @@ async fn handle_router_request(
     .await
     {
         Ok(resp) => {
-            let _ = write_router_response(&mut socket, resp).await;
+            let usage = write_router_response(&mut socket, resp, state.usage.is_some())
+                .await
+                .unwrap_or(None);
+            if let (Some(acct), Some(u)) = (&state.usage, usage) {
+                let model = http_utils::extract_request_body(&request)
+                    .ok()
+                    .and_then(|b| serde_json::from_str::<Value>(b).ok())
+                    .and_then(|v| v.get("model").and_then(|m| m.as_str()).map(str::to_string));
+                acct.record(model.as_deref(), &u).await;
+            }
         }
         Err(e) => {
             let err =
@@ -195,27 +239,43 @@ async fn classify_upstream_response(response: reqwest::Response) -> Result<Route
     }
 }
 
+/// Writes the response to the socket; with `sniff_usage`, returns 2xx token
+/// usage parsed from a buffered body or sniffed off the forwarded stream.
 async fn write_router_response(
     socket: &mut tokio::net::TcpStream,
     response: RouterResponse,
-) -> Result<()> {
+    sniff_usage: bool,
+) -> Result<Option<TokenUsage>> {
     match response {
         RouterResponse::Buffered {
             status,
             content_type,
             body,
         } => {
+            let usage = (sniff_usage && (200..300).contains(&status))
+                .then(|| parse_token_usage(&body))
+                .flatten();
             http_utils::write_buffered_response(socket, status, &content_type, &body).await?;
+            Ok(usage)
         }
         RouterResponse::Streaming {
             status,
             content_type,
             upstream,
         } => {
-            http_utils::write_streaming_response(socket, status, &content_type, upstream).await?;
+            let mut sniffer = StreamUsageSniffer::new(sniff_usage && (200..300).contains(&status));
+            http_utils::write_streaming_response_with_prefix(
+                socket,
+                status,
+                &content_type,
+                &[],
+                upstream,
+                |chunk| sniffer.observe(chunk),
+            )
+            .await?;
+            Ok(sniffer.finish())
         }
     }
-    Ok(())
 }
 
 async fn forward_request(

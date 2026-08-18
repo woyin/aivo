@@ -20,6 +20,7 @@ use crate::services::copilot_auth::{
 };
 use crate::services::http_debug::LoggedSend;
 use crate::services::http_utils;
+use crate::services::token_usage::{UsageAccounting, parse_http_response_usage};
 use crate::services::wire_format::{
     RequestOptions, ResponseOptions, translate_request, translate_response,
 };
@@ -34,11 +35,14 @@ pub struct CopilotRouter {
     /// Per-launch loopback token; `Some` rejects requests without it so other
     /// local processes can't spend the Copilot quota through this router.
     expected_token: Option<String>,
+    /// When set, 2xx token usage is recorded against the launching key.
+    usage: Option<UsageAccounting>,
 }
 
 struct CopilotRouterState {
     token_manager: Arc<CopilotTokenManager>,
     expected_token: Option<String>,
+    usage: Option<UsageAccounting>,
     client: reqwest::Client,
 }
 
@@ -47,6 +51,7 @@ impl CopilotRouter {
         Self {
             config,
             expected_token: None,
+            usage: None,
         }
     }
 
@@ -56,11 +61,39 @@ impl CopilotRouter {
         self
     }
 
+    /// Record 2xx token usage against `key_id` in stats, attributed to `tool`.
+    pub fn with_usage_accounting(
+        mut self,
+        store: crate::services::session_store::SessionStore,
+        key_id: String,
+        tool: String,
+    ) -> Self {
+        self.usage = Some(UsageAccounting {
+            store,
+            key_id,
+            tool,
+            run_tally: None,
+        });
+        self
+    }
+
+    /// Fold accounted usage into a per-run tally; no-op without accounting.
+    pub fn with_run_tally(
+        mut self,
+        tally: Arc<crate::services::usage_stats_store::RunTokenTally>,
+    ) -> Self {
+        if let Some(usage) = self.usage.as_mut() {
+            usage.run_tally = Some(tally);
+        }
+        self
+    }
+
     pub async fn start_background(&self) -> Result<(u16, tokio::task::JoinHandle<Result<()>>)> {
         let (listener, port) = http_utils::bind_local_listener().await?;
         let state = CopilotRouterState {
             token_manager: Arc::new(CopilotTokenManager::new(self.config.github_token.clone())),
             expected_token: self.expected_token.clone(),
+            usage: self.usage.clone(),
             client: http_utils::router_http_client(),
         };
         let handle = tokio::spawn(async move {
@@ -80,10 +113,20 @@ async fn handle_copilot_request(request: String, state: Arc<CopilotRouterState>)
         );
     }
     if http_utils::is_post_path(&request, &["/v1/messages", "/messages"]) {
-        match handle_messages(&request, &state).await {
+        let response = match handle_messages(&request, &state).await {
             Ok(r) => r,
             Err(e) => http_utils::http_error_response(500, &e.to_string()),
+        };
+        if let Some(acct) = &state.usage
+            && let Some(u) = parse_http_response_usage(&response)
+        {
+            let model = http_utils::extract_request_body(&request)
+                .ok()
+                .and_then(|b| serde_json::from_str::<Value>(b).ok())
+                .and_then(|v| v.get("model").and_then(|m| m.as_str()).map(str::to_string));
+            acct.record(model.as_deref(), &u).await;
         }
+        response
     } else {
         http_utils::http_error_response(404, "Not found")
     }

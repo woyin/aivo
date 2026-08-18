@@ -49,6 +49,47 @@ impl ModelTotals {
     }
 }
 
+/// Estimated USD; `None` without vendor pricing. `model[opts]` prices as its base id.
+fn model_cost_usd(name: &str, m: &ModelTotals) -> Option<f64> {
+    let base = name.split('[').next().unwrap_or(name).trim();
+    let pricing = crate::services::model_metadata::model_pricing(base)?;
+    pricing.cost_usd(&crate::services::session_store::SessionTokens {
+        // `input` is fresh-only; cost_usd expects the inclusive convention.
+        prompt_tokens: m
+            .input
+            .saturating_add(m.cache_read)
+            .saturating_add(m.cache_write),
+        completion_tokens: m.output,
+        cache_read_tokens: m.cache_read,
+        cache_write_tokens: m.cache_write,
+    })
+}
+
+/// Sum over priced models only; `None` when nothing priced.
+fn total_cost_usd(models: &HashMap<String, ModelTotals>) -> Option<f64> {
+    let mut total = 0.0;
+    let mut any = false;
+    for (name, m) in models {
+        if let Some(c) = model_cost_usd(name, m) {
+            total += c;
+            any = true;
+        }
+    }
+    any.then_some(total)
+}
+
+fn fmt_usd(v: f64) -> String {
+    if v < 0.005 {
+        "<$0.01".to_string()
+    } else if v < 10.0 {
+        format!("${v:.2}")
+    } else if v < 1000.0 {
+        format!("${v:.0}")
+    } else {
+        format!("${}", format_number(v as u64))
+    }
+}
+
 pub struct StatsCommand {
     store: SessionStore,
 }
@@ -383,6 +424,9 @@ impl StatsCommand {
         }
         if show_cache {
             parts.push(format!("{} cached", colorize_unit(&fmt(total_cache))));
+        }
+        if let Some(cost) = total_cost_usd(&model_tokens) {
+            parts.push(format!("≈{}", colorize_unit(&fmt_usd(cost))));
         }
         parts.push(format!("{} sessions", colorize_unit(&fmt(total_sessions))));
         parts.push(format!("{} models", colorize_unit(&fmt(total_models))));
@@ -841,6 +885,7 @@ fn build_overview_json(
                 "cache_read_tokens": m.cache_read,
                 "cache_write_tokens": m.cache_write,
                 "total_tokens": m.total(),
+                "estimated_cost_usd": model_cost_usd(&name, &m),
             })
         })
         .collect();
@@ -855,6 +900,7 @@ fn build_overview_json(
             "cache_write_tokens": total_cache_write,
             "sessions": total_sessions,
             "models": total_models,
+            "estimated_cost_usd": total_cost_usd(model_tokens),
         },
         "by_tool": by_tool,
         "by_model": by_model,
@@ -1271,6 +1317,9 @@ fn print_tool_view(view: &ToolView, count_label: &str, fmt: fn(u64) -> String, a
     if total_cache > 0 {
         parts.push(format!("{} cached", colorize_unit(&fmt(total_cache))));
     }
+    if let Some(cost) = total_cost_usd(&view.models) {
+        parts.push(format!("≈{}", colorize_unit(&fmt_usd(cost))));
+    }
     parts.push(format!("{} {count_label}", colorize_unit(&fmt(view.count))));
     parts.push(format!("{} models", colorize_unit(&fmt(model_count))));
 
@@ -1487,7 +1536,8 @@ fn render_model_table(
     let max_display = MAX_MODEL_ROWS;
     let truncated = !args.all && total_model_count > max_display;
 
-    let display_rows: Vec<(String, ModelTotals)> = if truncated {
+    // Costs are computed before the `others` fold — an aggregate can't be priced by name.
+    let display_rows: Vec<(String, ModelTotals, Option<f64>)> = if truncated {
         let others_count = total_model_count - max_display;
         let others =
             model_rows[max_display..]
@@ -1498,20 +1548,35 @@ fn render_model_table(
                     cache_read: acc.cache_read.saturating_add(m.cache_read),
                     cache_write: acc.cache_write.saturating_add(m.cache_write),
                 });
-        let mut rows: Vec<(String, ModelTotals)> = model_rows[..max_display].to_vec();
-        rows.push((format!("others ({} models)", others_count), others));
+        let others_cost = model_rows[max_display..]
+            .iter()
+            .filter_map(|(n, m)| model_cost_usd(n, m))
+            .fold(None, |acc: Option<f64>, c| Some(acc.unwrap_or(0.0) + c));
+        let mut rows: Vec<(String, ModelTotals, Option<f64>)> = model_rows[..max_display]
+            .iter()
+            .map(|(n, m)| (n.clone(), *m, model_cost_usd(n, m)))
+            .collect();
+        rows.push((
+            format!("others ({} models)", others_count),
+            others,
+            others_cost,
+        ));
         rows
     } else {
         model_rows
+            .iter()
+            .map(|(n, m)| (n.clone(), *m, model_cost_usd(n, m)))
+            .collect()
     };
 
-    let any_cached = display_rows.iter().any(|(_, m)| m.cached() > 0);
+    let any_cached = display_rows.iter().any(|(_, m, _)| m.cached() > 0);
+    let any_cost = display_rows.iter().any(|(_, _, c)| c.is_some());
     let show_bar = !searching && display_rows.len() > 1;
 
     if args.detailed {
-        render_detailed_model_table(&display_rows, fmt, show_bar);
+        render_detailed_model_table(&display_rows, fmt, show_bar, any_cost);
     } else {
-        render_default_model_table(&display_rows, fmt, show_bar, any_cached);
+        render_default_model_table(&display_rows, fmt, show_bar, any_cached, any_cost);
     }
 
     println!();
@@ -1525,147 +1590,169 @@ fn render_model_table(
     hints.push("-n numbers".to_string());
     hints.push("-r refresh".to_string());
     hints.push("-s filter".to_string());
+    if any_cost {
+        // Subscription (OAuth) usage isn't billed per token — hence "est.".
+        hints.push("cost = est. at API list prices".to_string());
+    }
     println!("{}", style::dim(hints.join(" · ")));
 }
 
 fn render_default_model_table(
-    display_rows: &[(String, ModelTotals)],
+    display_rows: &[(String, ModelTotals, Option<f64>)],
     fmt: fn(u64) -> String,
     show_bar: bool,
     any_cached: bool,
+    any_cost: bool,
 ) {
     let name_w = display_rows
         .iter()
-        .map(|(n, _)| n.len())
+        .map(|(n, _, _)| n.len())
         .max()
         .unwrap_or(0)
         .max("By model".len());
     let tok_w = display_rows
         .iter()
-        .map(|(_, m)| fmt(m.tokens()).len())
+        .map(|(_, m, _)| fmt(m.tokens()).len())
         .max()
         .unwrap_or(0)
         .max("tokens".len());
     let cache_w = display_rows
         .iter()
-        .map(|(_, m)| fmt(m.cached()).len())
+        .map(|(_, m, _)| fmt(m.cached()).len())
         .max()
         .unwrap_or(0)
         .max("cached".len());
+    let cost_w = display_rows
+        .iter()
+        .filter_map(|(_, _, c)| c.map(|v| fmt_usd(v).len()))
+        .max()
+        .unwrap_or(0)
+        .max("cost".len());
     let max_tok = display_rows
         .iter()
-        .map(|(_, m)| m.tokens())
+        .map(|(_, m, _)| m.tokens())
         .max()
         .unwrap_or(0);
+    // Unpriced → blank, not $0.
+    let cost_cell = |c: &Option<f64>| match c {
+        Some(v) => colorize_unit(&format!("{:>cost_w$}", fmt_usd(*v))),
+        None => format!("{:>cost_w$}", ""),
+    };
 
-    if any_cached {
-        println!(
-            "{} {} {}",
-            style::bold(format!("{:<name_w$}", "By model")),
-            style::dim(format!("{:>cache_w$}", "cached")),
-            style::dim(format!("{:>tok_w$}", "tokens")),
-        );
-    } else {
-        println!(
-            "{} {}",
-            style::bold(format!("{:<name_w$}", "By model")),
-            style::dim(format!("{:>tok_w$}", "tokens")),
-        );
+    // Cost stays away from the bar — the bar visualizes tokens, not cost.
+    let mut head = vec![style::bold(format!("{:<name_w$}", "By model"))];
+    if any_cost {
+        head.push(style::dim(format!("{:>cost_w$}", "cost")));
     }
+    if any_cached {
+        head.push(style::dim(format!("{:>cache_w$}", "cached")));
+    }
+    head.push(style::dim(format!("{:>tok_w$}", "tokens")));
+    println!("{}", head.join(" "));
 
-    for (name, m) in display_rows {
-        let pn = format!("{:<width$}", name, width = name_w);
-        let pt = colorize_unit(&format!("{:>width$}", fmt(m.tokens()), width = tok_w));
-        if any_cached {
-            let pc = colorize_unit(&format!("{:>width$}", fmt(m.cached()), width = cache_w));
-            if show_bar {
-                println!(
-                    "{} {} {} {}",
-                    style::cyan(&pn),
-                    pc,
-                    pt,
-                    bar(m.tokens(), max_tok),
-                );
-            } else {
-                println!("{} {} {}", style::cyan(&pn), pc, pt);
-            }
-        } else if show_bar {
-            println!("{} {} {}", style::cyan(&pn), pt, bar(m.tokens(), max_tok),);
-        } else {
-            println!("{} {}", style::cyan(&pn), pt);
+    for (name, m, cost) in display_rows {
+        let mut cells = vec![style::cyan(format!("{:<width$}", name, width = name_w))];
+        if any_cost {
+            cells.push(cost_cell(cost));
         }
+        if any_cached {
+            cells.push(colorize_unit(&format!(
+                "{:>width$}",
+                fmt(m.cached()),
+                width = cache_w
+            )));
+        }
+        cells.push(colorize_unit(&format!(
+            "{:>width$}",
+            fmt(m.tokens()),
+            width = tok_w
+        )));
+        if show_bar {
+            cells.push(bar(m.tokens(), max_tok));
+        }
+        println!("{}", cells.join(" "));
     }
 }
 
 fn render_detailed_model_table(
-    display_rows: &[(String, ModelTotals)],
+    display_rows: &[(String, ModelTotals, Option<f64>)],
     fmt: fn(u64) -> String,
     show_bar: bool,
+    any_cost: bool,
 ) {
     let name_w = display_rows
         .iter()
-        .map(|(n, _)| n.len())
+        .map(|(n, _, _)| n.len())
         .max()
         .unwrap_or(0)
         .max("By model".len());
     let in_w = display_rows
         .iter()
-        .map(|(_, m)| fmt(m.input).len())
+        .map(|(_, m, _)| fmt(m.input).len())
         .max()
         .unwrap_or(0)
         .max("input".len());
     let out_w = display_rows
         .iter()
-        .map(|(_, m)| fmt(m.output).len())
+        .map(|(_, m, _)| fmt(m.output).len())
         .max()
         .unwrap_or(0)
         .max("output".len());
     let cache_w = display_rows
         .iter()
-        .map(|(_, m)| fmt(m.cached()).len())
+        .map(|(_, m, _)| fmt(m.cached()).len())
         .max()
         .unwrap_or(0)
         .max("cached".len());
     let total_w = display_rows
         .iter()
-        .map(|(_, m)| fmt(m.total()).len())
+        .map(|(_, m, _)| fmt(m.total()).len())
         .max()
         .unwrap_or(0)
         .max("total".len());
+    let cost_w = display_rows
+        .iter()
+        .filter_map(|(_, _, c)| c.map(|v| fmt_usd(v).len()))
+        .max()
+        .unwrap_or(0)
+        .max("cost".len());
     let max_total = display_rows
         .iter()
-        .map(|(_, m)| m.total())
+        .map(|(_, m, _)| m.total())
         .max()
         .unwrap_or(0);
 
-    println!(
-        "{} {} {} {} {}",
-        style::bold(format!("{:<name_w$}", "By model")),
+    let mut head = vec![style::bold(format!("{:<name_w$}", "By model"))];
+    if any_cost {
+        head.push(style::dim(format!("{:>cost_w$}", "cost")));
+    }
+    head.extend([
         style::dim(format!("{:>in_w$}", "input")),
         style::dim(format!("{:>out_w$}", "output")),
         style::dim(format!("{:>cache_w$}", "cached")),
         style::dim(format!("{:>total_w$}", "total")),
-    );
+    ]);
+    println!("{}", head.join(" "));
 
-    for (name, m) in display_rows {
+    for (name, m, cost) in display_rows {
         let pn = format!("{:<width$}", name, width = name_w);
-        let pi = colorize_unit(&format!("{:>width$}", fmt(m.input), width = in_w));
-        let po = colorize_unit(&format!("{:>width$}", fmt(m.output), width = out_w));
-        let pc = colorize_unit(&format!("{:>width$}", fmt(m.cached()), width = cache_w));
-        let ptot = colorize_unit(&format!("{:>width$}", fmt(m.total()), width = total_w));
-        if show_bar {
-            println!(
-                "{} {} {} {} {} {}",
-                style::cyan(&pn),
-                pi,
-                po,
-                pc,
-                ptot,
-                bar(m.total(), max_total),
-            );
-        } else {
-            println!("{} {} {} {} {}", style::cyan(&pn), pi, po, pc, ptot);
+        let mut cells = vec![style::cyan(&pn)];
+        if any_cost {
+            cells.push(match cost {
+                Some(v) => colorize_unit(&format!("{:>cost_w$}", fmt_usd(*v))),
+                None => format!("{:>cost_w$}", ""),
+            });
         }
+        cells.extend([
+            colorize_unit(&format!("{:>width$}", fmt(m.input), width = in_w)),
+            colorize_unit(&format!("{:>width$}", fmt(m.output), width = out_w)),
+            colorize_unit(&format!("{:>width$}", fmt(m.cached()), width = cache_w)),
+            colorize_unit(&format!("{:>width$}", fmt(m.total()), width = total_w)),
+        ]);
+        if show_bar {
+            cells.push(bar(m.total(), max_total));
+        }
+        println!("{}", cells.join(" "));
     }
 }
 
@@ -1923,6 +2010,46 @@ pub(crate) fn colorize_unit(s: &str) -> String {
 mod tests {
     use super::*;
     use crate::services::session_store::UsageCounter;
+
+    #[test]
+    fn fmt_usd_tiers() {
+        assert_eq!(fmt_usd(0.001), "<$0.01");
+        assert_eq!(fmt_usd(0.42), "$0.42");
+        assert_eq!(fmt_usd(57.4), "$57");
+        assert_eq!(fmt_usd(19594.6), format!("${}", format_number(19594)));
+    }
+
+    #[test]
+    fn model_cost_strips_bracket_suffix_and_skips_unpriced() {
+        let m = ModelTotals {
+            input: 1_000_000,
+            output: 1_000_000,
+            cache_read: 0,
+            cache_write: 0,
+        };
+        // Snapshot prices opus-4.8 at $5/$25 per MTok.
+        let base = model_cost_usd("claude-opus-4-8", &m).expect("priced");
+        assert!((base - 30.0).abs() < 1e-6, "got {base}");
+        let suffixed = model_cost_usd("claude-opus-4-8[thinking=true,effort=high]", &m);
+        assert_eq!(suffixed, Some(base));
+        assert_eq!(model_cost_usd("definitely-not-a-model", &m), None);
+    }
+
+    #[test]
+    fn total_cost_sums_priced_models_only() {
+        let m = ModelTotals {
+            input: 1_000_000,
+            output: 0,
+            cache_read: 0,
+            cache_write: 0,
+        };
+        let mut models = HashMap::new();
+        models.insert("definitely-not-a-model".to_string(), m);
+        assert_eq!(total_cost_usd(&models), None);
+        models.insert("claude-opus-4-8".to_string(), m);
+        // 1M input × $5; the unpriced model contributes nothing.
+        assert_eq!(total_cost_usd(&models), Some(5.0));
+    }
 
     #[test]
     fn format_number_small() {

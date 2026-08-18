@@ -44,9 +44,8 @@ pub(crate) struct LaunchRuntimeState {
     /// override file; must outlive the spawned gemini process.
     #[allow(dead_code)] // kept alive solely for its Drop impl
     pub(crate) gemini_system_settings: Option<tempfile::TempDir>,
-    /// Per-run tally from the grok ServeRouter, stamped onto the finished
-    /// row — grok has no on-disk accounting for `aivo stats` to scrape.
-    pub(crate) run_tally: Option<Arc<crate::services::usage_stats_store::RunTokenTally>>,
+    /// Per-run tally from accounting-enabled routers, stamped onto the finished row.
+    pub(crate) run_tally: Arc<crate::services::usage_stats_store::RunTokenTally>,
 }
 
 pub(crate) async fn prepare_runtime_env(
@@ -56,9 +55,11 @@ pub(crate) async fn prepare_runtime_env(
 ) -> Result<LaunchRuntimeState> {
     let mut route_cache: Option<Arc<RouteCache>> = None;
     let mut learned_requires_reasoning: Option<Arc<AtomicBool>> = None;
+    // Shared across all routers; the finished row stamps whatever accumulated.
+    let run_tally = Arc::new(crate::services::usage_stats_store::RunTokenTally::default());
 
     if tool == AIToolType::Claude && env.contains_key("AIVO_USE_ROUTER") {
-        let port = start_anthropic_router(&env).await?;
+        let port = start_anthropic_router(&env, session_store, run_tally.clone()).await?;
         set_local_base_url(&mut env, "ANTHROPIC_BASE_URL", port);
     }
 
@@ -75,7 +76,8 @@ pub(crate) async fn prepare_runtime_env(
         {
             set_local_base_url(&mut env, "ANTHROPIC_BASE_URL", port);
         } else {
-            let (port, cache, learned) = start_anthropic_to_openai_router(&env).await?;
+            let (port, cache, learned) =
+                start_anthropic_to_openai_router(&env, session_store, run_tally.clone()).await?;
             route_cache = Some(cache);
             learned_requires_reasoning = Some(learned);
             set_local_base_url(&mut env, "ANTHROPIC_BASE_URL", port);
@@ -83,7 +85,7 @@ pub(crate) async fn prepare_runtime_env(
     }
 
     if tool == AIToolType::Claude && env.contains_key("AIVO_USE_COPILOT_ROUTER") {
-        let port = start_copilot_router(&env).await?;
+        let port = start_copilot_router(&env, session_store, run_tally.clone()).await?;
         set_local_base_url(&mut env, "ANTHROPIC_BASE_URL", port);
     }
 
@@ -123,7 +125,9 @@ pub(crate) async fn prepare_runtime_env(
         if let Some(port) = start_provider_oauth_router(&env, router_key, session_store).await? {
             set_local_base_url(&mut env, "OPENAI_BASE_URL", port);
         } else {
-            let (port, cache, learned) = start_responses_to_chat_router("codex", &env).await?;
+            let (port, cache, learned) =
+                start_responses_to_chat_router("codex", &env, session_store, run_tally.clone())
+                    .await?;
             route_cache = Some(cache);
             learned_requires_reasoning = Some(learned);
             set_local_base_url(&mut env, "OPENAI_BASE_URL", port);
@@ -131,7 +135,9 @@ pub(crate) async fn prepare_runtime_env(
     }
 
     if tool.is_codex_family() && env.contains_key("AIVO_USE_RESPONSES_TO_CHAT_COPILOT_ROUTER") {
-        let port = start_responses_to_chat_copilot_router(&env).await?;
+        let port =
+            start_responses_to_chat_copilot_router("codex", &env, session_store, run_tally.clone())
+                .await?;
         set_local_base_url(&mut env, "OPENAI_BASE_URL", port);
     }
 
@@ -145,7 +151,8 @@ pub(crate) async fn prepare_runtime_env(
         if let Some(port) = start_provider_oauth_router(&env, router_key, session_store).await? {
             set_local_base_url(&mut env, "GOOGLE_GEMINI_BASE_URL", port);
         } else {
-            let (port, cache, learned) = start_gemini_router(&env).await?;
+            let (port, cache, learned) =
+                start_gemini_router(&env, session_store, run_tally.clone()).await?;
             route_cache = Some(cache);
             learned_requires_reasoning = Some(learned);
             set_local_base_url(&mut env, "GOOGLE_GEMINI_BASE_URL", port);
@@ -154,13 +161,19 @@ pub(crate) async fn prepare_runtime_env(
     }
 
     if tool == AIToolType::Gemini && env.contains_key("AIVO_USE_GEMINI_COPILOT_ROUTER") {
-        let port = start_gemini_copilot_router(&env).await?;
+        let port = start_gemini_copilot_router(&env, session_store, run_tally.clone()).await?;
         set_local_base_url(&mut env, "GOOGLE_GEMINI_BASE_URL", port);
         clear_node_proxy_env(&mut env);
     }
 
     if tool == AIToolType::Opencode && env.contains_key("AIVO_USE_OPENCODE_COPILOT_ROUTER") {
-        let port = start_responses_to_chat_copilot_router(&env).await?;
+        let port = start_responses_to_chat_copilot_router(
+            "opencode",
+            &env,
+            session_store,
+            run_tally.clone(),
+        )
+        .await?;
         patch_opencode_config_content(&mut env, port);
     }
 
@@ -172,14 +185,15 @@ pub(crate) async fn prepare_runtime_env(
         if let Some(port) = start_provider_oauth_router(&env, router_key, session_store).await? {
             patch_opencode_config_content(&mut env, port);
         } else {
-            let (port, cache, learned) = start_responses_to_chat_router("opencode", &env).await?;
+            let (port, cache, learned) =
+                start_responses_to_chat_router("opencode", &env, session_store, run_tally.clone())
+                    .await?;
             route_cache = Some(cache);
             learned_requires_reasoning = Some(learned);
             patch_opencode_config_content(&mut env, port);
         }
     }
 
-    let mut run_tally: Option<Arc<crate::services::usage_stats_store::RunTokenTally>> = None;
     if tool == AIToolType::Grok {
         // Unconditional: cursor-key launches (routed above) need the home too.
         prepare_grok_home(&mut env).await;
@@ -192,9 +206,7 @@ pub(crate) async fn prepare_runtime_env(
                 .find(|k| k.id == key_id)
                 .ok_or_else(|| anyhow::anyhow!("grok launch: key '{key_id}' not found"))?;
             SessionStore::decrypt_key_secret(&mut key)?;
-            let tally = Arc::new(crate::services::usage_stats_store::RunTokenTally::default());
-            let port = start_grok_serve_router(key, &env, session_store, tally.clone()).await?;
-            run_tally = Some(tally);
+            let port = start_grok_serve_router(key, &env, session_store, run_tally.clone()).await?;
             set_local_base_url(&mut env, "GROK_MODELS_BASE_URL", port);
             // grok appends bare `/models` + `/chat/completions`; the serve
             // router mounts them under `/v1`.
@@ -210,12 +222,15 @@ pub(crate) async fn prepare_runtime_env(
     }
 
     if tool == AIToolType::Pi && env.contains_key("AIVO_USE_PI_COPILOT_ROUTER") {
-        let port = start_responses_to_chat_copilot_router(&env).await?;
+        let port =
+            start_responses_to_chat_copilot_router("pi", &env, session_store, run_tally.clone())
+                .await?;
         write_pi_agent_dir(&mut env, Some(port)).await?;
     }
 
     if tool == AIToolType::Pi && env.contains_key("AIVO_USE_PI_STARTER_ROUTER") {
-        let (port, cache, learned) = start_responses_to_chat_router("pi", &env).await?;
+        let (port, cache, learned) =
+            start_responses_to_chat_router("pi", &env, session_store, run_tally.clone()).await?;
         route_cache = Some(cache);
         learned_requires_reasoning = Some(learned);
         write_pi_agent_dir(&mut env, Some(port)).await?;
@@ -229,7 +244,9 @@ pub(crate) async fn prepare_runtime_env(
         if let Some(port) = start_provider_oauth_router(&env, router_key, session_store).await? {
             write_pi_agent_dir(&mut env, Some(port)).await?;
         } else {
-            let (port, cache, learned) = start_responses_to_chat_router("pi", &env).await?;
+            let (port, cache, learned) =
+                start_responses_to_chat_router("pi", &env, session_store, run_tally.clone())
+                    .await?;
             route_cache = Some(cache);
             learned_requires_reasoning = Some(learned);
             write_pi_agent_dir(&mut env, Some(port)).await?;
@@ -1192,7 +1209,11 @@ async fn start_multi_upstream_serve_router(
     .await
 }
 
-async fn start_anthropic_router(env: &HashMap<String, String>) -> Result<u16> {
+async fn start_anthropic_router(
+    env: &HashMap<String, String>,
+    session_store: &SessionStore,
+    run_tally: Arc<crate::services::usage_stats_store::RunTokenTally>,
+) -> Result<u16> {
     use crate::services::{AnthropicRouter, AnthropicRouterConfig};
 
     let api_key = env
@@ -1218,6 +1239,11 @@ async fn start_anthropic_router(env: &HashMap<String, String>) -> Result<u16> {
     if let Some(token) = loopback_auth_token(env) {
         router = router.with_auth_token(token);
     }
+    if let Some(key_id) = env.get("AIVO_ROUTER_KEY_ID") {
+        router = router
+            .with_usage_accounting(session_store.clone(), key_id.clone(), "claude".to_string())
+            .with_run_tally(run_tally);
+    }
     let (port, handle) = router.start_background().await?;
     tokio::spawn(async move {
         if let Ok(Err(e)) = handle.await {
@@ -1237,6 +1263,8 @@ fn parse_seed_routes(env: &HashMap<String, String>, var: &str) -> BTreeMap<Strin
 
 async fn start_anthropic_to_openai_router(
     env: &HashMap<String, String>,
+    session_store: &SessionStore,
+    run_tally: Arc<crate::services::usage_stats_store::RunTokenTally>,
 ) -> Result<(u16, Arc<RouteCache>, Arc<AtomicBool>)> {
     use crate::services::{AnthropicToOpenAIRouter, AnthropicToOpenAIRouterConfig};
 
@@ -1282,6 +1310,11 @@ async fn start_anthropic_to_openai_router(
     if let Some(token) = loopback_auth_token(env) {
         router = router.with_auth_token(token);
     }
+    if let Some(key_id) = env.get("AIVO_ANTHROPIC_TO_OPENAI_ROUTER_KEY_ID") {
+        router = router
+            .with_usage_accounting(session_store.clone(), key_id.clone(), "claude".to_string())
+            .with_run_tally(run_tally);
+    }
     let (port, route_cache, learned_requires_reasoning, handle) = router.start_background().await?;
     tokio::spawn(async move {
         if let Ok(Err(e)) = handle.await {
@@ -1294,6 +1327,8 @@ async fn start_anthropic_to_openai_router(
 async fn start_responses_to_chat_router(
     tool_name: &'static str,
     env: &HashMap<String, String>,
+    session_store: &SessionStore,
+    run_tally: Arc<crate::services::usage_stats_store::RunTokenTally>,
 ) -> Result<(u16, Arc<RouteCache>, Arc<AtomicBool>)> {
     use crate::services::provider_protocol::detect_provider_protocol;
     use crate::services::{ResponsesToChatRouter, ResponsesToChatRouterConfig};
@@ -1365,6 +1400,12 @@ async fn start_responses_to_chat_router(
         env,
         "AIVO_RESPONSES_TO_CHAT_ROUTER_ROUTES_JSON",
     ));
+    let router = match env.get("AIVO_RESPONSES_TO_CHAT_ROUTER_KEY_ID") {
+        Some(key_id) => router
+            .with_usage_accounting(session_store.clone(), key_id.clone(), tool_name.to_string())
+            .with_run_tally(run_tally),
+        None => router,
+    };
     let router = match loopback_auth_token(env) {
         Some(token) => router.with_auth_token(token),
         None => router,
@@ -1380,6 +1421,8 @@ async fn start_responses_to_chat_router(
 
 async fn start_gemini_router(
     env: &HashMap<String, String>,
+    session_store: &SessionStore,
+    run_tally: Arc<crate::services::usage_stats_store::RunTokenTally>,
 ) -> Result<(u16, Arc<RouteCache>, Arc<AtomicBool>)> {
     use crate::services::provider_protocol::detect_provider_protocol;
     use crate::services::{GeminiRouter, GeminiRouterConfig};
@@ -1419,6 +1462,12 @@ async fn start_gemini_router(
             .unwrap_or(false),
     })
     .with_seed_routes(parse_seed_routes(env, "AIVO_GEMINI_ROUTER_ROUTES_JSON"));
+    let router = match env.get("AIVO_GEMINI_ROUTER_KEY_ID") {
+        Some(key_id) => router
+            .with_usage_accounting(session_store.clone(), key_id.clone(), "gemini".to_string())
+            .with_run_tally(run_tally),
+        None => router,
+    };
     let router = match loopback_auth_token(env) {
         Some(token) => router.with_auth_token(token),
         None => router,
@@ -1432,7 +1481,11 @@ async fn start_gemini_router(
     Ok((port, route_cache, learned_requires_reasoning))
 }
 
-async fn start_gemini_copilot_router(env: &HashMap<String, String>) -> Result<u16> {
+async fn start_gemini_copilot_router(
+    env: &HashMap<String, String>,
+    session_store: &SessionStore,
+    run_tally: Arc<crate::services::usage_stats_store::RunTokenTally>,
+) -> Result<u16> {
     use crate::services::copilot_auth::CopilotTokenManager;
     use crate::services::{GeminiRouter, GeminiRouterConfig};
 
@@ -1461,6 +1514,12 @@ async fn start_gemini_copilot_router(env: &HashMap<String, String>) -> Result<u1
         max_tokens_cap: None,
         is_starter: false,
     });
+    let router = match env.get("AIVO_COPILOT_KEY_ID") {
+        Some(key_id) => router
+            .with_usage_accounting(session_store.clone(), key_id.clone(), "gemini".to_string())
+            .with_run_tally(run_tally),
+        None => router,
+    };
     let router = match loopback_auth_token(env) {
         Some(token) => router.with_auth_token(token),
         None => router,
@@ -1474,7 +1533,11 @@ async fn start_gemini_copilot_router(env: &HashMap<String, String>) -> Result<u1
     Ok(port)
 }
 
-async fn start_copilot_router(env: &HashMap<String, String>) -> Result<u16> {
+async fn start_copilot_router(
+    env: &HashMap<String, String>,
+    session_store: &SessionStore,
+    run_tally: Arc<crate::services::usage_stats_store::RunTokenTally>,
+) -> Result<u16> {
     use crate::services::{CopilotRouter, CopilotRouterConfig};
 
     let github_token = env
@@ -1485,6 +1548,11 @@ async fn start_copilot_router(env: &HashMap<String, String>) -> Result<u16> {
     let mut router = CopilotRouter::new(CopilotRouterConfig { github_token });
     if let Some(token) = loopback_auth_token(env) {
         router = router.with_auth_token(token);
+    }
+    if let Some(key_id) = env.get("AIVO_COPILOT_KEY_ID") {
+        router = router
+            .with_usage_accounting(session_store.clone(), key_id.clone(), "claude".to_string())
+            .with_run_tally(run_tally);
     }
     let (port, handle) = router.start_background().await?;
     tokio::spawn(async move {
@@ -1588,7 +1656,12 @@ async fn start_cursor_router(env: &mut HashMap<String, String>, tool: AIToolType
     Ok(port)
 }
 
-async fn start_responses_to_chat_copilot_router(env: &HashMap<String, String>) -> Result<u16> {
+async fn start_responses_to_chat_copilot_router(
+    tool_name: &'static str,
+    env: &HashMap<String, String>,
+    session_store: &SessionStore,
+    run_tally: Arc<crate::services::usage_stats_store::RunTokenTally>,
+) -> Result<u16> {
     use crate::services::copilot_auth::CopilotTokenManager;
     use crate::services::{ResponsesToChatRouter, ResponsesToChatRouterConfig};
 
@@ -1611,6 +1684,12 @@ async fn start_responses_to_chat_copilot_router(env: &HashMap<String, String>) -
         is_starter: false,
         aivo_prefix_models: Vec::new(),
     });
+    let router = match env.get("AIVO_COPILOT_KEY_ID") {
+        Some(key_id) => router
+            .with_usage_accounting(session_store.clone(), key_id.clone(), tool_name.to_string())
+            .with_run_tally(run_tally),
+        None => router,
+    };
     let router = match loopback_auth_token(env) {
         Some(token) => router.with_auth_token(token),
         None => router,
@@ -2405,5 +2484,248 @@ mod tests {
 
         let reloaded = store.get_key_by_id(&key_id).await.unwrap().unwrap();
         assert_eq!(reloaded.requires_reasoning_content, Some(true));
+    }
+
+    /// Fake chat upstream: answers any POST with a completion carrying usage.
+    fn spawn_chat_upstream_with_usage() -> u16 {
+        use std::io::{Read, Write};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                let mut request = Vec::new();
+                let mut buf = [0u8; 4096];
+                // Read headers, then drain the content-length body so the
+                // client never sees a reset mid-write.
+                while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match stream.read(&mut buf) {
+                        Ok(0) => break,
+                        Ok(n) => request.extend_from_slice(&buf[..n]),
+                        Err(_) => break,
+                    }
+                }
+                let text = String::from_utf8_lossy(&request);
+                let content_length = text
+                    .lines()
+                    .find_map(|l| {
+                        l.to_ascii_lowercase()
+                            .strip_prefix("content-length:")
+                            .map(str::trim)
+                            .map(str::to_string)
+                    })
+                    .and_then(|v| v.parse::<usize>().ok())
+                    .unwrap_or(0);
+                let header_end = request
+                    .windows(4)
+                    .position(|w| w == b"\r\n\r\n")
+                    .map(|p| p + 4)
+                    .unwrap_or(request.len());
+                let mut body_read = request.len() - header_end;
+                while body_read < content_length {
+                    match stream.read(&mut buf) {
+                        Ok(0) => break,
+                        Ok(n) => body_read += n,
+                        Err(_) => break,
+                    }
+                }
+                let body = serde_json::json!({
+                    "id": "chatcmpl-1",
+                    "object": "chat.completion",
+                    "model": "gpt-test",
+                    "choices": [{
+                        "index": 0,
+                        "message": { "role": "assistant", "content": "hello" },
+                        "finish_reason": "stop"
+                    }],
+                    "usage": { "prompt_tokens": 7, "completion_tokens": 5, "total_tokens": 12 }
+                })
+                .to_string();
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = stream.write_all(head.as_bytes());
+                let _ = stream.write_all(body.as_bytes());
+                let _ = stream.flush();
+            }
+        });
+        port
+    }
+
+    #[tokio::test]
+    async fn routed_codex_launch_accounts_usage_into_run_tally() {
+        use crate::services::ai_launcher::AIToolType;
+        use crate::services::session_store::SessionStore;
+
+        let upstream = spawn_chat_upstream_with_usage();
+        let temp = tempfile::tempdir().unwrap();
+        let store = SessionStore::with_path(temp.path().join("config.json"));
+
+        let env: HashMap<String, String> = [
+            ("AIVO_USE_RESPONSES_TO_CHAT_ROUTER", "1".to_string()),
+            ("AIVO_RESPONSES_TO_CHAT_ROUTER_API_KEY", "sk-x".to_string()),
+            (
+                "AIVO_RESPONSES_TO_CHAT_ROUTER_BASE_URL",
+                format!("http://127.0.0.1:{upstream}/v1"),
+            ),
+            (
+                "AIVO_RESPONSES_TO_CHAT_ROUTER_UPSTREAM_PROTOCOL",
+                "openai".to_string(),
+            ),
+            (
+                "AIVO_RESPONSES_TO_CHAT_ROUTER_RESPONSES_API",
+                "0".to_string(),
+            ),
+            ("AIVO_RESPONSES_TO_CHAT_ROUTER_KEY_ID", "key-1".to_string()),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v))
+        .collect();
+
+        let runtime = super::prepare_runtime_env(AIToolType::Codex, env, &store)
+            .await
+            .unwrap();
+        let base = runtime.env.get("OPENAI_BASE_URL").unwrap().clone();
+
+        let resp = reqwest::Client::new()
+            .post(format!("{base}/v1/chat/completions"))
+            .json(&serde_json::json!({
+                "model": "gpt-test",
+                "messages": [{ "role": "user", "content": "hi" }]
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert!(
+            resp.status().is_success(),
+            "router returned {}",
+            resp.status()
+        );
+
+        // Accounting runs alongside the response write; poll briefly.
+        let mut snapshot = runtime.run_tally.snapshot();
+        for _ in 0..40 {
+            if snapshot.0 > 0 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            snapshot = runtime.run_tally.snapshot();
+        }
+        assert_eq!((snapshot.0, snapshot.1), (7, 5));
+    }
+
+    #[tokio::test]
+    async fn routed_gemini_launch_accounts_usage_into_run_tally() {
+        use crate::services::ai_launcher::AIToolType;
+        use crate::services::session_store::SessionStore;
+
+        let upstream = spawn_chat_upstream_with_usage();
+        let temp = tempfile::tempdir().unwrap();
+        let store = SessionStore::with_path(temp.path().join("config.json"));
+
+        let env: HashMap<String, String> = [
+            ("AIVO_USE_GEMINI_ROUTER", "1".to_string()),
+            ("AIVO_GEMINI_ROUTER_API_KEY", "sk-x".to_string()),
+            (
+                "AIVO_GEMINI_ROUTER_BASE_URL",
+                format!("http://127.0.0.1:{upstream}/v1"),
+            ),
+            ("AIVO_GEMINI_ROUTER_UPSTREAM_PROTOCOL", "openai".to_string()),
+            ("AIVO_GEMINI_ROUTER_KEY_ID", "key-1".to_string()),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v))
+        .collect();
+
+        let runtime = super::prepare_runtime_env(AIToolType::Gemini, env, &store)
+            .await
+            .unwrap();
+        let base = runtime.env.get("GOOGLE_GEMINI_BASE_URL").unwrap().clone();
+
+        let resp = reqwest::Client::new()
+            .post(format!("{base}/v1beta/models/gemini-test:generateContent"))
+            .json(&serde_json::json!({
+                "contents": [{ "role": "user", "parts": [{ "text": "hi" }] }]
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert!(
+            resp.status().is_success(),
+            "router returned {}",
+            resp.status()
+        );
+
+        let mut snapshot = runtime.run_tally.snapshot();
+        for _ in 0..40 {
+            if snapshot.0 > 0 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            snapshot = runtime.run_tally.snapshot();
+        }
+        assert_eq!((snapshot.0, snapshot.1), (7, 5));
+    }
+
+    #[tokio::test]
+    async fn routed_claude_launch_accounts_usage_into_run_tally() {
+        use crate::services::ai_launcher::AIToolType;
+        use crate::services::session_store::SessionStore;
+
+        let upstream = spawn_chat_upstream_with_usage();
+        let temp = tempfile::tempdir().unwrap();
+        let store = SessionStore::with_path(temp.path().join("config.json"));
+
+        let env: HashMap<String, String> = [
+            ("AIVO_USE_ANTHROPIC_TO_OPENAI_ROUTER", "1".to_string()),
+            (
+                "AIVO_ANTHROPIC_TO_OPENAI_ROUTER_API_KEY",
+                "sk-x".to_string(),
+            ),
+            (
+                "AIVO_ANTHROPIC_TO_OPENAI_ROUTER_BASE_URL",
+                format!("http://127.0.0.1:{upstream}/v1"),
+            ),
+            (
+                "AIVO_ANTHROPIC_TO_OPENAI_ROUTER_KEY_ID",
+                "key-1".to_string(),
+            ),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v))
+        .collect();
+
+        let runtime = super::prepare_runtime_env(AIToolType::Claude, env, &store)
+            .await
+            .unwrap();
+        let base = runtime.env.get("ANTHROPIC_BASE_URL").unwrap().clone();
+
+        let resp = reqwest::Client::new()
+            .post(format!("{base}/v1/messages"))
+            .json(&serde_json::json!({
+                "model": "gpt-test",
+                "max_tokens": 64,
+                "messages": [{ "role": "user", "content": "hi" }]
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert!(
+            resp.status().is_success(),
+            "router returned {}",
+            resp.status()
+        );
+
+        let mut snapshot = runtime.run_tally.snapshot();
+        for _ in 0..40 {
+            if snapshot.0 > 0 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            snapshot = runtime.run_tally.snapshot();
+        }
+        assert_eq!((snapshot.0, snapshot.1), (7, 5));
     }
 }
