@@ -633,12 +633,6 @@ pub(super) fn parse_slash_command(input: &str) -> Result<SlashCommand> {
         "attach" => Ok(SlashCommand::Attach(
             argument.ok_or_else(|| anyhow::anyhow!("Usage: /attach <path>"))?,
         )),
-        "detach" => Ok(SlashCommand::Detach(
-            argument
-                .ok_or_else(|| anyhow::anyhow!("Usage: /detach <n>"))?
-                .parse::<usize>()
-                .map_err(|_| anyhow::anyhow!("Usage: /detach <n>"))?,
-        )),
         "copy" => Ok(SlashCommand::Copy(match argument {
             None => None,
             Some(value) => Some(

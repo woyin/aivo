@@ -3214,7 +3214,7 @@ impl CodeTuiApp {
             format!("{} ", self.composer_prompt_glyph()),
             self.composer_prompt_style(),
         );
-        let mut lines = composer_attachment_lines(&self.draft_attachments);
+        let mut lines = Vec::new();
         if self.draft.is_empty() {
             let placeholder = if self.loading_resume.is_some() {
                 Span::styled("Resume loading…", Style::default().fg(FAINT()))
@@ -3243,19 +3243,41 @@ impl CodeTuiApp {
         // hanging indent so text aligns under the first character.
         let rows = composer_visual_rows(&self.draft, self.composer_text_width());
         let last = rows.len().saturating_sub(1);
+        // Attachment tags render accented so they read as removable objects.
+        let mut tag_spans: Vec<(usize, usize)> =
+            self.attachment_tag_spans().into_iter().flatten().collect();
+        tag_spans.sort_unstable();
         for (index, &(start, end)) in rows.iter().enumerate().skip(self.composer_scroll) {
             let prefix = if index == 0 {
                 prompt.clone()
             } else {
                 Span::raw("  ")
             };
-            let mut spans = vec![
-                prefix,
-                Span::styled(
-                    self.draft[start..end].to_string(),
+            let mut spans = vec![prefix];
+            let mut pos = start;
+            for &(ts, te) in &tag_spans {
+                let (ts, te) = (ts.max(pos), te.min(end));
+                if ts >= te {
+                    continue;
+                }
+                if pos < ts {
+                    spans.push(Span::styled(
+                        self.draft[pos..ts].to_string(),
+                        Style::default().fg(draft_color),
+                    ));
+                }
+                spans.push(Span::styled(
+                    self.draft[ts..te].to_string(),
+                    Style::default().fg(ACCENT()),
+                ));
+                pos = te;
+            }
+            if pos < end {
+                spans.push(Span::styled(
+                    self.draft[pos..end].to_string(),
                     Style::default().fg(draft_color),
-                ),
-            ];
+                ));
+            }
             if index == last
                 && let Some(hint) = ghost
             {
@@ -3290,12 +3312,10 @@ impl CodeTuiApp {
     }
 
     /// Scroll the draft within the composer so the cursor's visual row stays
-    /// inside the visible window. Attachment lines sit above the draft and aren't
-    /// scrolled; only the draft rows scroll. Recomputed each render.
+    /// inside the visible window. Recomputed each render.
     pub(super) fn update_composer_scroll(&mut self, area: Rect) {
         let rows = composer_visual_rows(&self.draft, self.composer_text_width());
-        let attach = self.draft_attachments.len();
-        let visible = usize::from(area.height).saturating_sub(attach).max(1);
+        let visible = usize::from(area.height).max(1);
         let (cursor_row, _) = composer_cursor_rowcol(&self.draft, self.cursor, &rows);
         if cursor_row < self.composer_scroll {
             self.composer_scroll = cursor_row;
@@ -3306,8 +3326,8 @@ impl CodeTuiApp {
     }
 
     /// Absolute terminal `(x, y)` for the input cursor, in the composer's
-    /// hanging-indent wrap model, accounting for attachment rows and scroll.
-    /// `None` when the cursor row is scrolled out of view.
+    /// hanging-indent wrap model, accounting for scroll. `None` when the cursor
+    /// row is scrolled out of view.
     pub(super) fn composer_cursor_screen(&self, area: Rect) -> Option<(u16, u16)> {
         let (x_rel, row) = cursor_position(
             &self.draft,
@@ -3319,8 +3339,7 @@ impl CodeTuiApp {
         if row < self.composer_scroll {
             return None;
         }
-        let attach = self.draft_attachments.len() as u16;
-        let y = area.y + attach + (row - self.composer_scroll) as u16;
+        let y = area.y + (row - self.composer_scroll) as u16;
         let x = area.x + x_rel;
         let max_x = area.x + area.width.saturating_sub(1);
         let max_y = area.y + area.height.saturating_sub(1);
@@ -3636,10 +3655,9 @@ impl CodeTuiApp {
                 .max(1);
             composer_visual_rows(&self.draft, text_width).len()
         };
-        let lines = (draft_rows + self.draft_attachments.len()) as u16;
         // +3 reserves the leading blank spacing row and the box's two border
         // rows; the rest is draft text (capped, then it scrolls within the box).
-        (lines + 3).clamp(4, 10)
+        (draft_rows as u16 + 3).clamp(4, 10)
     }
 
     /// Wrap width available to the composer's draft text (the rendered composer

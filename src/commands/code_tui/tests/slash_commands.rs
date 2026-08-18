@@ -15,9 +15,9 @@ fn test_parse_slash_command_with_argument() {
         parse_slash_command("resume").unwrap(),
         SlashCommand::Resume(None)
     );
-    assert_eq!(
-        parse_slash_command("detach 2").unwrap(),
-        SlashCommand::Detach(2)
+    assert!(
+        parse_slash_command("detach 2").is_err(),
+        "/detach was removed — deleting the inline tag detaches instead"
     );
     assert_eq!(
         parse_slash_command("mcp add fs npx -y srv").unwrap(),

@@ -2098,8 +2098,10 @@ impl CodeTuiApp {
         let text = text.replace("\r\n", "\n");
         let text = text.trim_end_matches('\n');
         self.leave_history_navigation();
+        let before = self.attachment_tag_spans();
         self.draft = text.to_string();
         self.cursor = self.draft.len();
+        self.reconcile_attachment_tags(&before);
         self.sync_command_menu_state();
         Ok(())
     }
@@ -2743,14 +2745,9 @@ impl CodeTuiApp {
         if self.draft.is_empty() {
             return Some(0);
         }
-        let attach = self.draft_attachments.len() as u16;
         let rel_y = mouse.row.saturating_sub(area.y);
-        if rel_y < attach {
-            // Clicked an attachment row above the draft → caret to the start.
-            return Some(0);
-        }
         let rows = composer_visual_rows(&self.draft, self.composer_text_width());
-        let row = (usize::from(rel_y - attach) + self.composer_scroll).min(rows.len() - 1);
+        let row = (usize::from(rel_y) + self.composer_scroll).min(rows.len() - 1);
         let target_col = usize::from(mouse.column.saturating_sub(area.x));
         Some(composer_offset_for_col(&self.draft, &rows, row, target_col))
     }

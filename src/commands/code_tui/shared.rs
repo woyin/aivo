@@ -530,12 +530,6 @@ pub(super) const SLASH_COMMANDS: &[SlashCommandSpec] = &[
         takes_argument: true,
     },
     SlashCommandSpec {
-        name: "detach",
-        help_label: "/detach <n>",
-        description: "remove one queued attachment",
-        takes_argument: true,
-    },
-    SlashCommandSpec {
         name: "copy",
         help_label: "/copy [n]",
         description: "copy the latest reply (or Nth) to the clipboard",
@@ -672,7 +666,6 @@ pub(super) fn command_usage_hint(name: &str) -> Option<&'static str> {
         "key" => Some("[id|name]"),
         "resume" => Some("[query]"),
         "copy" => Some("[n]"),
-        "detach" => Some("<n>"),
         // `attach` is deliberately omitted: typing `/attach ` opens path
         // completion, which is more useful than a static `<path>` ghost — and a
         // ghost would suppress that menu (see `visible_command_menu`).
@@ -2431,7 +2424,6 @@ pub(super) enum SlashCommand {
     Model(Option<String>),
     Key(Option<String>),
     Attach(String),
-    Detach(usize),
     /// Copy the Nth-latest assistant reply (default 1 = most recent) to the clipboard.
     Copy(Option<usize>),
     /// Agent skills: bare opens the overlay; `add …` / `rm <name>` manage them.

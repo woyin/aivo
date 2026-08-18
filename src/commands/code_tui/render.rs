@@ -541,6 +541,12 @@ pub(super) fn attachment_kind_label(attachment: &MessageAttachment) -> &'static 
     }
 }
 
+/// A queued attachment's inline draft tag, e.g. `[image #2]` (1-based queue
+/// position). Deleting it from the draft detaches the attachment.
+pub(super) fn attachment_tag(attachment: &MessageAttachment, position: usize) -> String {
+    format!("[{} #{position}]", attachment_kind_label(attachment))
+}
+
 pub(super) fn render_user_attachment_lines(
     lines: &mut Vec<StyledLine>,
     attachments: &[MessageAttachment],
@@ -556,27 +562,6 @@ pub(super) fn render_user_attachment_lines(
             Style::default().fg(MUTED()),
         );
     }
-}
-
-pub(super) fn composer_attachment_lines(attachments: &[MessageAttachment]) -> Vec<Line<'static>> {
-    attachments
-        .iter()
-        .enumerate()
-        .map(|(index, attachment)| {
-            Line::from(vec![
-                Span::styled("· ", Style::default().fg(ACCENT())),
-                Span::styled(
-                    format!(
-                        "{}. [{}] {}",
-                        index + 1,
-                        attachment_kind_label(attachment),
-                        attachment.name
-                    ),
-                    Style::default().fg(MUTED()),
-                ),
-            ])
-        })
-        .collect()
 }
 
 /// `/resume` preview transcript, in the live transcript's marker style: user

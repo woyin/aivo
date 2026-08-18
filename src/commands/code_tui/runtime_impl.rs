@@ -208,6 +208,7 @@ impl CodeTuiApp {
                     command,
                     SlashCommand::Skill { .. } | SlashCommand::CreateSkill(_)
                 );
+                let was_attach = matches!(command, SlashCommand::Attach(_));
                 let typed = self.draft.trim().to_string();
                 match self.execute_slash_command(command).await {
                     Ok(should_exit) => {
@@ -216,6 +217,9 @@ impl CodeTuiApp {
                         }
                         self.draft.clear();
                         self.cursor = 0;
+                        if was_attach {
+                            self.append_missing_attachment_tags();
+                        }
                         self.command_menu.reset();
                         self.draft_history_index = None;
                         self.draft_history_stash = None;
@@ -1784,28 +1788,6 @@ impl CodeTuiApp {
         Ok(())
     }
 
-    pub(super) fn detach_attachment(&mut self, index: usize) -> Result<()> {
-        if index == 0 {
-            anyhow::bail!("Usage: /detach <n> where n starts at 1");
-        }
-        let remove_at = index - 1;
-        if remove_at >= self.draft_attachments.len() {
-            anyhow::bail!(
-                "No queued attachment #{index}. There {} {} queued.",
-                if self.draft_attachments.len() == 1 {
-                    "is"
-                } else {
-                    "are"
-                },
-                self.draft_attachments.len()
-            );
-        }
-        let attachment = self.draft_attachments.remove(remove_at);
-        let kind = attachment_kind_label(&attachment);
-        self.notice = Some((MUTED(), format!("Removed {kind}: {}", attachment.name)));
-        Ok(())
-    }
-
     pub(super) async fn execute_slash_command(&mut self, command: SlashCommand) -> Result<bool> {
         match command {
             SlashCommand::New => {
@@ -1841,10 +1823,6 @@ impl CodeTuiApp {
             }
             SlashCommand::Attach(path) => {
                 self.queue_attachment(path)?;
-                Ok(false)
-            }
-            SlashCommand::Detach(index) => {
-                self.detach_attachment(index)?;
                 Ok(false)
             }
             SlashCommand::Copy(n) => {

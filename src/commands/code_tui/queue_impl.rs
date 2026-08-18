@@ -171,7 +171,6 @@ pub(super) fn command_recall_text(command: &SlashCommand) -> String {
         SlashCommand::Model(arg) => with_arg("model", arg),
         SlashCommand::Key(arg) => with_arg("key", arg),
         SlashCommand::Attach(path) => format!("/attach {path}"),
-        SlashCommand::Detach(n) => format!("/detach {n}"),
         SlashCommand::Copy(None) => "/copy".to_string(),
         SlashCommand::Copy(Some(n)) => format!("/copy {n}"),
         SlashCommand::Skills(arg) => with_arg("skills", arg),

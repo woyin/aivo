@@ -40,14 +40,6 @@ fn test_cursor_position_wraps_after_prefix_width() {
 }
 
 #[test]
-fn test_composer_cursor_position_offsets_attachment_rows() {
-    let (x, y) = cursor_position("hello", 5, 20, 2);
-    assert_eq!((x, y.saturating_add(1)), (7, 1));
-    let (x, y) = cursor_position("", 0, 20, 2);
-    assert_eq!((x, y.saturating_add(2)), (2, 2));
-}
-
-#[test]
 fn test_composer_visual_rows_wraps_with_hanging_indent() {
     // One word, no break opportunity → hard-wraps mid-word: "ij" spills to row 1.
     let rows = composer_visual_rows("abcdefghij", 8);
@@ -705,37 +697,6 @@ async fn test_draft_history_capped_at_max() {
     );
 }
 
-#[test]
-fn test_detach_attachment_removes_selected_item() {
-    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-    let mut app = make_test_app(tx, rx);
-    app.draft_attachments = vec![
-        MessageAttachment {
-            name: "one.txt".to_string(),
-            mime_type: "text/plain".to_string(),
-            storage: AttachmentStorage::FileRef {
-                path: "./one.txt".to_string(),
-            },
-        },
-        MessageAttachment {
-            name: "two.png".to_string(),
-            mime_type: "image/png".to_string(),
-            storage: AttachmentStorage::FileRef {
-                path: "./two.png".to_string(),
-            },
-        },
-    ];
-
-    app.detach_attachment(2).unwrap();
-
-    assert_eq!(app.draft_attachments.len(), 1);
-    assert_eq!(app.draft_attachments[0].name, "one.txt");
-    assert_eq!(
-        app.notice.as_ref().map(|(_, text)| text.as_str()),
-        Some("Removed image: two.png")
-    );
-}
-
 #[tokio::test]
 async fn test_submit_draft_keeps_failed_attach_command_and_shows_notice() {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
@@ -754,23 +715,139 @@ async fn test_submit_draft_keeps_failed_attach_command_and_shows_notice() {
 }
 
 #[test]
-fn test_composer_attachment_lines_show_indices() {
-    let lines = composer_attachment_lines(&[MessageAttachment {
-        name: "hi.css".to_string(),
-        mime_type: "text/css".to_string(),
-        storage: AttachmentStorage::FileRef {
-            path: "./hi.css".to_string(),
-        },
-    }]);
-    let plain = plain_text_from_spans(&lines[0].spans);
-    assert_eq!(plain, "· 1. [file] hi.css");
-}
-
-#[test]
 fn test_empty_composer_placeholder_reserves_cursor_cell() {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let app = make_test_app(tx, rx);
     let line = app.render_composer_text().lines[0].clone();
     let plain = plain_text_from_spans(&line.spans);
     assert_eq!(plain, "❯ Ask, plan, or build · / for commands");
+}
+
+fn image_attachment(name: &str) -> MessageAttachment {
+    MessageAttachment {
+        name: name.to_string(),
+        mime_type: "image/png".to_string(),
+        storage: AttachmentStorage::FileRef {
+            path: format!("./{name}"),
+        },
+    }
+}
+
+#[test]
+fn test_insert_attachment_tag_pads_with_spaces() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.draft = "look at this".to_string();
+    app.cursor = app.draft.len();
+    app.draft_attachments.push(image_attachment("shot.png"));
+    app.insert_attachment_tag("[image #1]");
+    assert_eq!(app.draft, "look at this [image #1] ");
+    assert_eq!(app.cursor, app.draft.len());
+}
+
+#[test]
+fn test_backspace_into_tag_removes_whole_tag_and_detaches() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.draft_attachments.push(image_attachment("shot.png"));
+    app.draft = "before [image #1] after".to_string();
+    // Cursor right after the closing bracket.
+    app.cursor = "before [image #1]".len();
+    app.delete_char_before_cursor();
+    assert_eq!(app.draft, "before  after");
+    assert_eq!(app.cursor, "before ".len());
+    assert!(app.draft_attachments.is_empty());
+    assert_eq!(
+        app.notice.as_ref().map(|(_, text)| text.as_str()),
+        Some("Removed image: shot.png")
+    );
+}
+
+#[test]
+fn test_deleting_first_tag_renumbers_survivors() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.draft_attachments.push(image_attachment("one.png"));
+    app.draft_attachments.push(image_attachment("two.png"));
+    app.draft = "[image #1] [image #2] hi".to_string();
+    app.cursor = "[image #1]".len();
+    app.delete_char_before_cursor();
+    assert_eq!(app.draft, " [image #1] hi");
+    assert_eq!(app.draft_attachments.len(), 1);
+    assert_eq!(app.draft_attachments[0].name, "two.png");
+}
+
+#[test]
+fn test_typing_inside_tag_snaps_to_tag_end() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.draft_attachments.push(image_attachment("shot.png"));
+    app.draft = "[image #1] hi".to_string();
+    app.cursor = 4; // inside the tag
+    app.insert_char_at_cursor('x');
+    assert_eq!(app.draft, "[image #1]x hi");
+    assert_eq!(app.draft_attachments.len(), 1);
+}
+
+#[test]
+fn test_word_delete_swallows_tag() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.draft_attachments.push(image_attachment("shot.png"));
+    app.draft = "see [image #1] now".to_string();
+    // Cursor mid-tag (e.g. after word-nav); Ctrl+W must not leave a half-tag.
+    app.cursor = "see [image".len();
+    app.delete_word_backward();
+    assert!(!app.draft.contains('['), "no tag remnant: {:?}", app.draft);
+    assert!(app.draft_attachments.is_empty());
+}
+
+#[test]
+fn test_kill_line_swallows_tag_and_detaches() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.draft_attachments.push(image_attachment("shot.png"));
+    app.draft = "keep [image #1] tail".to_string();
+    app.cursor = "keep ".len();
+    app.kill_to_end_of_line();
+    assert_eq!(app.draft, "keep ");
+    assert!(app.draft_attachments.is_empty());
+}
+
+#[test]
+fn test_tagless_attachment_survives_draft_edits() {
+    // A recalled-history draft has no tags; editing it must not drop staged files.
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.draft_attachments.push(image_attachment("shot.png"));
+    app.draft = "an old prompt".to_string();
+    app.cursor = app.draft.len();
+    app.delete_char_before_cursor();
+    app.delete_word_backward();
+    assert_eq!(app.draft_attachments.len(), 1);
+}
+
+#[test]
+fn test_cursor_left_hops_over_tag() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.draft_attachments.push(image_attachment("shot.png"));
+    app.draft = "a [image #1] b".to_string();
+    app.cursor = "a [image #1]".len();
+    app.cursor_left();
+    assert_eq!(app.cursor, "a ".len());
+}
+
+#[test]
+fn test_append_missing_attachment_tags_seeds_draft() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.draft_attachments.push(image_attachment("one.png"));
+    app.draft_attachments.push(image_attachment("two.png"));
+    app.append_missing_attachment_tags();
+    assert_eq!(app.draft, "[image #1] [image #2] ");
+    assert_eq!(app.cursor, app.draft.len());
+    // Idempotent.
+    app.append_missing_attachment_tags();
+    assert_eq!(app.draft, "[image #1] [image #2] ");
 }

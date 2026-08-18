@@ -189,6 +189,7 @@ impl CodeTuiApp {
         app.format = initial_format;
         app.history = params.initial_history;
         app.draft_attachments = params.initial_draft_attachments;
+        app.append_missing_attachment_tags();
         app.mcp_configured_count = mcp_configured_count;
         app.welcome_tip_index = welcome_tip_index;
         app.draft_history = draft_history;

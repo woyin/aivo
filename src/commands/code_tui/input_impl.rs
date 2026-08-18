@@ -1,6 +1,123 @@
 use super::*;
 
 impl CodeTuiApp {
+    /// Byte span of each attachment's tag in the draft; `None` when absent
+    /// (staged mid-turn, recalled history).
+    pub(super) fn attachment_tag_spans(&self) -> Vec<Option<(usize, usize)>> {
+        self.draft_attachments
+            .iter()
+            .enumerate()
+            .map(|(i, a)| {
+                let tag = attachment_tag(a, i + 1);
+                self.draft.find(&tag).map(|s| (s, s + tag.len()))
+            })
+            .collect()
+    }
+
+    fn tag_span_covering(&self, pos: usize) -> Option<(usize, usize)> {
+        self.attachment_tag_spans()
+            .into_iter()
+            .flatten()
+            .find(|&(s, e)| s <= pos && pos < e)
+    }
+
+    fn tag_span_strictly_inside(&self, pos: usize) -> Option<(usize, usize)> {
+        self.attachment_tag_spans()
+            .into_iter()
+            .flatten()
+            .find(|&(s, e)| s < pos && pos < e)
+    }
+
+    /// Drop attachments whose tag the edit removed and renumber survivors.
+    /// `before` = spans captured pre-edit: only attachments that had a tag then
+    /// can be dropped, so tagless staged attachments always survive.
+    pub(super) fn reconcile_attachment_tags(&mut self, before: &[Option<(usize, usize)>]) {
+        if self.draft_attachments.is_empty() {
+            return;
+        }
+        let mut keep: Vec<(usize, MessageAttachment)> = Vec::new();
+        let mut dropped: Vec<MessageAttachment> = Vec::new();
+        for (i, att) in std::mem::take(&mut self.draft_attachments)
+            .into_iter()
+            .enumerate()
+        {
+            let had_tag = before.get(i).copied().flatten().is_some();
+            if had_tag && !self.draft.contains(&attachment_tag(&att, i + 1)) {
+                dropped.push(att);
+            } else {
+                keep.push((i, att));
+            }
+        }
+        if !dropped.is_empty() {
+            // Ascending rewrite can't collide: new numbers never exceed old.
+            for (new_idx, (old_idx, att)) in keep.iter().enumerate() {
+                if new_idx != *old_idx {
+                    self.replace_in_draft(
+                        &attachment_tag(att, *old_idx + 1),
+                        &attachment_tag(att, new_idx + 1),
+                    );
+                }
+            }
+            self.notice = Some((MUTED(), removed_attachment_notice(&dropped)));
+        }
+        self.draft_attachments = keep.into_iter().map(|(_, att)| att).collect();
+    }
+
+    fn replace_in_draft(&mut self, old: &str, new: &str) {
+        let Some(start) = self.draft.find(old) else {
+            return;
+        };
+        self.draft.replace_range(start..start + old.len(), new);
+        if self.cursor >= start + old.len() {
+            self.cursor = self.cursor + new.len() - old.len();
+        } else if self.cursor > start {
+            self.cursor = self.cursor.min(start + new.len());
+        }
+    }
+
+    pub(super) fn insert_attachment_tag(&mut self, tag: &str) {
+        if let Some((_, end)) = self.tag_span_strictly_inside(self.cursor) {
+            self.cursor = end;
+        }
+        let mut text = String::new();
+        if self.draft[..self.cursor]
+            .chars()
+            .next_back()
+            .is_some_and(|c| !c.is_whitespace())
+        {
+            text.push(' ');
+        }
+        text.push_str(tag);
+        if self.draft[self.cursor..]
+            .chars()
+            .next()
+            .is_none_or(|c| !c.is_whitespace())
+        {
+            text.push(' ');
+        }
+        self.draft.insert_str(self.cursor, &text);
+        self.cursor += text.len();
+    }
+
+    /// Seed tags for attachments the draft doesn't show (`/attach`, CLI `-a`).
+    pub(super) fn append_missing_attachment_tags(&mut self) {
+        for i in 0..self.draft_attachments.len() {
+            let tag = attachment_tag(&self.draft_attachments[i], i + 1);
+            if self.draft.contains(&tag) {
+                continue;
+            }
+            let cursor_at_end = self.cursor == self.draft.len();
+            if !self.draft.is_empty() && !self.draft.ends_with(char::is_whitespace) {
+                self.draft.push(' ');
+            }
+            self.draft.push_str(&tag);
+            self.draft.push(' ');
+            if cursor_at_end {
+                self.cursor = self.draft.len();
+            }
+        }
+    }
+
     pub(super) fn cursor_left(&mut self) {
         if self.cursor == 0 {
             return;
@@ -8,6 +125,9 @@ impl CodeTuiApp {
         let mut pos = self.cursor - 1;
         while pos > 0 && !self.draft.is_char_boundary(pos) {
             pos -= 1;
+        }
+        if let Some((start, _)) = self.tag_span_strictly_inside(pos) {
+            pos = start;
         }
         self.cursor = pos;
     }
@@ -19,6 +139,9 @@ impl CodeTuiApp {
         let mut pos = self.cursor + 1;
         while pos < self.draft.len() && !self.draft.is_char_boundary(pos) {
             pos += 1;
+        }
+        if let Some((_, end)) = self.tag_span_strictly_inside(pos) {
+            pos = end;
         }
         self.cursor = pos;
     }
@@ -132,6 +255,10 @@ impl CodeTuiApp {
     }
 
     pub(super) fn insert_char_at_cursor(&mut self, ch: char) {
+        // Typing inside a tag would split it — snap out.
+        if let Some((_, end)) = self.tag_span_strictly_inside(self.cursor) {
+            self.cursor = end;
+        }
         self.draft.insert(self.cursor, ch);
         self.cursor += ch.len_utf8();
     }
@@ -153,6 +280,14 @@ impl CodeTuiApp {
         while start > 0 && !self.draft.is_char_boundary(start) {
             start -= 1;
         }
+        // Deleting into a tag swallows the whole tag.
+        if let Some((s, e)) = self.tag_span_covering(start) {
+            let before = self.attachment_tag_spans();
+            self.draft.drain(s..e);
+            self.cursor = s;
+            self.reconcile_attachment_tags(&before);
+            return;
+        }
         self.draft.remove(start);
         self.cursor = start;
     }
@@ -161,26 +296,57 @@ impl CodeTuiApp {
         if self.cursor >= self.draft.len() {
             return;
         }
+        if let Some((s, e)) = self.tag_span_covering(self.cursor) {
+            let before = self.attachment_tag_spans();
+            self.draft.drain(s..e);
+            self.cursor = s;
+            self.reconcile_attachment_tags(&before);
+            return;
+        }
         self.draft.remove(self.cursor);
     }
 
+    /// Widen `start..end` over any tag it bites into — no half-tag remnants.
+    fn expand_range_over_tags(
+        &self,
+        spans: &[Option<(usize, usize)>],
+        mut start: usize,
+        mut end: usize,
+    ) -> (usize, usize) {
+        for &(s, e) in spans.iter().flatten() {
+            if s < end && e > start {
+                start = start.min(s);
+                end = end.max(e);
+            }
+        }
+        (start, end)
+    }
+
     pub(super) fn delete_word_backward(&mut self) {
+        let before = self.attachment_tag_spans();
         let old_cursor = self.cursor;
         self.cursor_word_left();
-        self.draft.drain(self.cursor..old_cursor);
+        let (start, end) = self.expand_range_over_tags(&before, self.cursor, old_cursor);
+        self.draft.drain(start..end);
+        self.cursor = start;
+        self.reconcile_attachment_tags(&before);
     }
 
     pub(super) fn kill_to_end_of_line(&mut self) {
+        let before = self.attachment_tag_spans();
         let after = &self.draft[self.cursor..];
         let end = after
             .find('\n')
             .map(|pos| self.cursor + pos)
             .unwrap_or(self.draft.len());
         if end == self.cursor && end < self.draft.len() {
-            self.draft.remove(self.cursor);
-        } else {
-            self.draft.drain(self.cursor..end);
+            self.delete_char_at_cursor();
+            return;
         }
+        let (start, end) = self.expand_range_over_tags(&before, self.cursor, end);
+        self.draft.drain(start..end);
+        self.cursor = start;
+        self.reconcile_attachment_tags(&before);
     }
 
     pub(super) fn active_command_query(&self) -> Option<&str> {
@@ -528,13 +694,33 @@ impl CodeTuiApp {
             ClipboardPayload::Attachment(attachment) => {
                 let kind = attachment_kind_label(&attachment);
                 let name = attachment.name.clone();
+                self.leave_history_navigation();
+                let tag = attachment_tag(&attachment, self.draft_attachments.len() + 1);
                 self.draft_attachments.push(attachment);
-                self.notice = Some((MUTED(), format!("Pasted {kind}: {name}")));
+                self.insert_attachment_tag(&tag);
+                self.notice = Some((
+                    MUTED(),
+                    format!("Pasted {kind}: {name} — delete {tag} to detach"),
+                ));
             }
             ClipboardPayload::Empty => {
                 self.notice = Some((MUTED(), "Clipboard is empty".to_string()));
             }
         }
         Ok(())
+    }
+}
+
+pub(super) fn removed_attachment_notice(dropped: &[MessageAttachment]) -> String {
+    match dropped {
+        [one] => format!("Removed {}: {}", attachment_kind_label(one), one.name),
+        many => format!(
+            "Removed {} attachments: {}",
+            many.len(),
+            many.iter()
+                .map(|a| a.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
     }
 }

@@ -444,7 +444,6 @@ fn test_composer_command_hint() {
         ("/key", "[id|name]"),
         ("/resume", "[query]"),
         ("/copy", "[n]"),
-        ("/detach", "<n>"),
     ] {
         set(&mut app, draft);
         assert_eq!(
