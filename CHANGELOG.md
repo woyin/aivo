@@ -1,5 +1,27 @@
 # Changelog
 
+## v0.45.0
+
+The code agent gets an explicit end-of-turn contract: `finish_turn` convergence, multi-check verification plans, and typed stops that make `-e` exit non-zero when a budget or guard cuts a run short. Running sessions can now talk to each other over file mailboxes, `-e` accepts `--attach`, and the composer grows inline `[image #n]` attachment tags plus an inline `/effort` picker.
+
+- feat(code): open-session communication — `list_sessions` / `send_session` over file mailboxes (c7486924)
+- feat(agent): `finish_turn` convergence protocol, subagent budgets, loop resets (5f651290)
+- feat(agent): multi-check verification plans, typed verify state, batch call-order barrier (323fd94e)
+- feat(agent): `update_plan` is the only status source — no plan auto-complete on convergence (ec022571)
+- feat(code): typed turn stops — budget/guard stops now exit 1 in `-e` (12afd643)
+- feat(code): accept `--attach` in `-e` headless runs (01c36f58)
+- feat(code): validate `--json-schema` answers locally, surface `-e` save failures (fb02f459)
+- feat(code): inline `[image #n]` attachment tags in the composer, replacing `/detach` (235214bc)
+- feat(code): pick `/effort` from the composer dropdown (46884c0b)
+- improve(code): rework the TUI palettes (1160bfa2)
+- improve(code): spell out the TUI / `-e` / `-p` modes in help and errors (1bbea081)
+- fix(agent): size the compaction reserve to the window and the actual tool schemas (4f3f7b29)
+- fix(code): render the `finish_turn` summary when a turn streams no text (be0f4628, 1160bfa2)
+- fix(code): make the image→plain-chat tool drop visible (e90353b5)
+- fix(code): survive stream drops and empty completions in the turn loop (cd557d63)
+- fix(resume): reach claude sessions filed under mismatched storage dirs (ac98c51d)
+- chore(dist): remove the npm install channel (716a3d2b)
+
 ## v0.44.0
 
 Grok goes native, deprecating the `aivo-grok` plugin, and codex gets `--review-model` / `--subagent-model` slot flags.
