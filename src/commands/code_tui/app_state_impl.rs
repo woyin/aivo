@@ -88,6 +88,7 @@ impl CodeTuiApp {
             shift_index_map_after_removal(&mut self.local_outputs, idx);
             shift_index_set_after_removal(&mut self.expanded_thinking, idx);
             shift_index_set_after_removal(&mut self.expanded_output, idx);
+            shift_index_set_after_removal(&mut self.expanded_step_folds, idx);
             shift_index_opt_after_removal(&mut self.plan_card_idx, idx);
         }
     }
@@ -175,6 +176,7 @@ impl CodeTuiApp {
         self.history.clear();
         self.expanded_thinking.clear();
         self.expanded_output.clear();
+        self.expanded_step_folds.clear();
         self.local_outputs.clear();
         self.reasoning_durations.clear();
         self.turn_durations.clear();

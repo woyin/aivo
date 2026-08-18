@@ -139,8 +139,25 @@ impl UsageStatsStore {
     }
 
     pub(crate) async fn load(&self) -> Result<UsageStats> {
-        let _lock = self.stats_ctx.acquire_lock()?;
-        self.load_with_migration().await
+        match self.stats_ctx.acquire_lock() {
+            Ok(_lock) => self.load_with_migration().await,
+            // A write-confined environment (e.g. the agent's shell sandbox)
+            // can't open the lock file for write; a pure read must still work,
+            // so fall back to a lockless read that performs no migration writes.
+            Err(err) if crate::errors::is_permission_denied(&err) => self.load_readonly().await,
+            Err(err) => Err(err),
+        }
+    }
+
+    /// Lock-free read from wherever the stats currently live; no on-disk migration.
+    async fn load_readonly(&self) -> Result<UsageStats> {
+        let mut stats = if tokio::fs::try_exists(&self.stats_ctx.stats_path).await? {
+            self.stats_ctx.load().await?
+        } else {
+            self.config_ctx.load().await?.stats
+        };
+        stats.migrate_legacy_per_model();
+        Ok(stats)
     }
 
     pub(crate) async fn record_selection(
@@ -262,6 +279,32 @@ mod tests {
             .unwrap();
         assert!(crate::services::paths::stats_json(dir.path()).exists());
         let stats = store.load().await.unwrap();
+        assert_eq!(*stats.tool_counts.get("claude").unwrap(), 1);
+    }
+
+    /// A write-sandboxed process can't create the lock file (EACCES); a pure
+    /// read must fall back to a lockless load instead of failing.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn load_falls_back_lockless_when_lock_unwritable() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = TempDir::new().unwrap();
+        let store = test_store(&dir);
+        store
+            .record_selection("key1", "claude", Some("opus"))
+            .await
+            .unwrap();
+        let state_dir = crate::services::paths::stats_json(dir.path())
+            .parent()
+            .unwrap()
+            .to_path_buf();
+        // Remove the lock so acquire must create it, then make the dir
+        // read-only so that creation is denied — the sandbox failure mode.
+        std::fs::remove_file(crate::services::paths::stats_lock(dir.path())).unwrap();
+        std::fs::set_permissions(&state_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let stats = store.load().await.unwrap();
+        std::fs::set_permissions(&state_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
         assert_eq!(*stats.tool_counts.get("claude").unwrap(), 1);
     }
 

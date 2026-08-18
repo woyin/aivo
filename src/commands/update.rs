@@ -10,7 +10,7 @@ use reqwest::Client;
 use sha2::{Digest, Sha256};
 use tokio::io::AsyncWriteExt;
 
-use crate::errors::ExitCode;
+use crate::errors::{ExitCode, is_permission_denied};
 #[cfg(not(windows))]
 use crate::services::path_search::{collect_path_dirs, find_in_dirs};
 use crate::style;
@@ -700,7 +700,7 @@ pub async fn execute_rollback() -> ExitCode {
     let exec_path = match get_install_path() {
         Ok(p) => p,
         Err(e) => {
-            eprintln!("{} {}", style::red("Error:"), e);
+            eprintln!("{} {:#}", style::red("Error:"), e);
             return ExitCode::UserError;
         }
     };
@@ -807,15 +807,6 @@ fn check_install_dir_writable(exec_path: &Path) -> Result<()> {
             Err(anyhow::Error::new(e).context(format!("No write access to {}", dir.display())))
         }
     }
-}
-
-/// True when any cause in the chain is an EACCES-style I/O error.
-fn is_permission_denied(error: &anyhow::Error) -> bool {
-    error.chain().any(|cause| {
-        cause
-            .downcast_ref::<std::io::Error>()
-            .is_some_and(|io| io.kind() == std::io::ErrorKind::PermissionDenied)
-    })
 }
 
 #[cfg(not(windows))]

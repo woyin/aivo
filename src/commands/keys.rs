@@ -1188,10 +1188,7 @@ impl KeysCommand {
                 println!("{}", style::dim("Cancelled."));
                 ExitCode::Success
             }
-            Err(e) => {
-                eprintln!("{} {}", style::red("Error:"), e);
-                crate::errors::exit_code_for_error(&e)
-            }
+            Err(e) => crate::errors::report(&e),
         }
     }
 
@@ -2180,7 +2177,7 @@ impl KeysCommand {
                     Ok(ExitCode::Success)
                 }
                 Err(e) => {
-                    eprintln!("{} {e}", style::red("Error:"));
+                    eprintln!("{} {e:#}", style::red("Error:"));
                     Ok(ExitCode::UserError)
                 }
             }
@@ -2231,7 +2228,7 @@ impl KeysCommand {
             cursor_acp::build_cursor_apikey_secret(&shadow.account_id, trimmed)
         } else {
             if let Err(e) = cursor_acp::run_cursor_login_for_shadow(&shadow).await {
-                eprintln!("{} {e}", style::red("Error:"));
+                eprintln!("{} {e:#}", style::red("Error:"));
                 return Ok(ExitCode::UserError);
             }
             if !cursor_acp::cursor_status_authenticated_for_shadow(&shadow)
@@ -2946,7 +2943,7 @@ impl KeysCommand {
 
         // OAuth login into the shadow.
         if let Err(e) = cursor_acp::run_cursor_login_for_shadow(shadow).await {
-            eprintln!("{} {}", style::red("Error:"), e);
+            eprintln!("{} {:#}", style::red("Error:"), e);
             return Err(ExitCode::UserError);
         }
         if !cursor_acp::cursor_status_authenticated_for_shadow(shadow)

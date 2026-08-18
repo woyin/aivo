@@ -1232,7 +1232,12 @@ pub(super) fn render_tool_call(
     } else {
         Style::default().fg(MUTED())
     };
-    let mut spans = vec![Span::styled("→ ".to_string(), Style::default().fg(MUTED()))];
+    // Failed steps must scan at the row start, not via `exited N` mid-line.
+    let arrow_color = if failed { ERROR() } else { MUTED() };
+    let mut spans = vec![Span::styled(
+        "→ ".to_string(),
+        Style::default().fg(arrow_color),
+    )];
     if name == "subagent" {
         // A delegated task reads as the task itself — "subagent" is jargon and the
         // arrow already marks it as a step. Show the task in place of the verb.
@@ -1387,7 +1392,7 @@ pub(super) fn render_tool_call_group(
 /// Friendly verb for a tool call: an `mcp__server__tool` name renders as
 /// `server/tool` (the raw double-underscore form is ugly); everything else is
 /// shown as-is.
-fn tool_display_name(name: &str) -> String {
+pub(super) fn tool_display_name(name: &str) -> String {
     if let Some(rest) = name.strip_prefix("mcp__")
         && let Some((server, tool)) = rest.split_once("__")
     {
@@ -1685,6 +1690,82 @@ pub(super) fn is_output_expander(row: &str) -> bool {
     row.starts_with(OUTPUT_COLLAPSED_PREFIX) || row.starts_with(OUTPUT_EXPANDED_PREFIX)
 }
 
+/// Step-fold marker text, NBSP-glued like [`fold_marker`]. Disjoint from
+/// [`is_output_expander`] (collapsed has no `+` after the glue, expanded no
+/// digit) so the two click-ordinal spaces can't bleed into each other.
+const STEP_FOLD_COLLAPSED_GLYPH: &str = "▸\u{a0}";
+const STEP_FOLD_LABEL: &str = " earlier steps";
+const STEP_FOLD_EXPANDED_PREFIX: &str = "▾\u{a0}earlier steps";
+
+/// Whether a rendered row is a step-fold toggle.
+pub(super) fn is_step_fold_marker(row: &str) -> bool {
+    let row = row.trim_start();
+    (row.starts_with(STEP_FOLD_COLLAPSED_GLYPH) && row.contains(STEP_FOLD_LABEL))
+        || row.starts_with(STEP_FOLD_EXPANDED_PREFIX)
+}
+
+/// One collapsed row standing in for a long run of settled tool steps:
+/// `▸ N earlier steps (run_bash ×12, grep ×8, +2 more · 1 failed)`.
+/// `counts` come sorted by frequency; only the top three are named.
+pub(super) fn render_step_fold(
+    lines: &mut Vec<StyledLine>,
+    steps: usize,
+    counts: &[(String, usize)],
+    failed: usize,
+) {
+    let mut breakdown: Vec<String> = counts
+        .iter()
+        .take(3)
+        .map(|(name, n)| {
+            if *n > 1 {
+                format!("{name} ×{n}")
+            } else {
+                name.clone()
+            }
+        })
+        .collect();
+    let rest = counts.len().saturating_sub(3);
+    if rest > 0 {
+        breakdown.push(format!("+{rest} more"));
+    }
+    let mut spans = vec![Span::styled(
+        format!("{STEP_FOLD_COLLAPSED_GLYPH}{steps}{STEP_FOLD_LABEL}"),
+        Style::default().fg(MUTED()),
+    )];
+    if !breakdown.is_empty() {
+        spans.push(Span::styled(
+            format!(" ({})", breakdown.join(", ")),
+            Style::default().fg(FAINT()),
+        ));
+    }
+    if failed > 0 {
+        spans.push(Span::styled(
+            format!(" · {failed} failed"),
+            Style::default().fg(ERROR()),
+        ));
+    }
+    lines.push(line_with_plain(spans));
+}
+
+/// Header row an expanded step fold keeps: `▾ earlier steps (N)`.
+pub(super) fn step_fold_header(steps: usize) -> String {
+    format!("{STEP_FOLD_EXPANDED_PREFIX} ({steps})")
+}
+
+/// Whether a tool result reads as failed (nonzero bash exit / `error:` text).
+pub(super) fn result_failed(result: &str, tool: Option<&str>) -> bool {
+    result_outcome(result, tool).failed
+}
+
+/// The tool name a `tool_call` entry carries — without [`decode_tool_call`]'s
+/// clone of the full `args` payload, which fold scans don't need.
+pub(super) fn decode_tool_name(content: &str) -> String {
+    serde_json::from_str::<serde_json::Value>(content)
+        .ok()
+        .and_then(|v| v.get("name").and_then(|x| x.as_str()).map(str::to_string))
+        .unwrap_or_default()
+}
+
 /// The true output line count a `local_command` entry carries (its persisted
 /// `total_lines`, or the counted preview as a fallback). Only runs whose total
 /// exceeds `MAX_OUTPUT_LINES` render an expander, so this keys the click handler's
@@ -1909,6 +1990,21 @@ fn result_outcome(result: &str, tool: Option<&str>) -> ResultOutcome {
     }
 }
 
+/// Merge a result's spans onto its call row (space-separated); a failed result
+/// also recolors the leading `→ ` to the error hue — the in-process path
+/// renders the call before the result exists, so the glyph learns its status here.
+pub(super) fn merge_result_onto(line: &mut StyledLine, spans: Vec<Span<'static>>, failed: bool) {
+    if failed
+        && let Some(first) = line.line.spans.first_mut()
+        && first.content.as_ref() == "→ "
+    {
+        first.style = Style::default().fg(ERROR());
+    }
+    let mut suffix = vec![Span::raw(" ")];
+    suffix.extend(spans);
+    append_result_spans(line, suffix);
+}
+
 /// Append spans to a logical line, keeping its `plain` mirror (hitbox,
 /// selection copy) in sync.
 pub(super) fn append_result_spans(line: &mut StyledLine, spans: Vec<Span<'static>>) {
@@ -2034,11 +2130,19 @@ pub(super) fn render_tool_result_body(
             )]));
         }
     } else if tool == Some("run_bash") && failed {
-        for line in result.lines().skip(count.saturating_sub(STREAM_TAIL_LINES)) {
-            let is_exit_line = line.trim().starts_with("[exit ");
+        // The `[exit N]` sentinel (and blank spacer lines) duplicate the call
+        // row's `exited N` — the folded tail shows only real command output.
+        let body: Vec<&str> = result
+            .lines()
+            .filter(|l| !l.trim().is_empty() && !l.trim().starts_with("[exit "))
+            .collect();
+        for line in body
+            .iter()
+            .skip(body.len().saturating_sub(STREAM_TAIL_LINES))
+        {
             lines.push(line_with_plain(vec![Span::styled(
                 tool_tail_row_text(&strip_ansi_and_controls(line), TOOL_TAIL_MAX_COLS),
-                Style::default().fg(if is_exit_line { ERROR() } else { FAINT() }),
+                Style::default().fg(FAINT()),
             )]));
         }
     }
@@ -3096,7 +3200,10 @@ fn tool_arg_summary(name: &str, args: &serde_json::Value, cwd: &str) -> String {
             display_path(pick("path"), cwd)
         }
         "glob" | "grep" => truncate_chars(pick("pattern"), 60),
-        "run_bash" => truncate_chars(&condense_command(pick("command"), cwd), 60),
+        // Middle-elided: long commands often share a boilerplate preamble
+        // (set -eu / mktemp / trap …), so tail-truncation renders sibling calls
+        // identical — the distinguishing part is the tail.
+        "run_bash" => elide_middle(&condense_command(pick("command"), cwd), 60),
         "web_fetch" => display_url(pick("url"), 60),
         "web_search" => truncate_chars(pick("query"), 60),
         "skill" => truncate_chars(pick("name"), 60),
@@ -3336,11 +3443,19 @@ pub(super) fn render_output_line(raw: &str) -> String {
 fn tool_result_summary(s: &str, cwd: &str) -> String {
     let cwd = cwd.trim_end_matches(['/', '\\']);
     let clean = strip_ansi_and_controls(s.trim());
-    let stripped = if cwd.is_empty() {
+    let mut stripped = if cwd.is_empty() {
         clean
     } else {
         clean.replace(&format!("{cwd}/"), "")
     };
+    // An error result carries a recovery steer for the MODEL after the reason
+    // ("… is down. Answer from what you already know …") — the human preview
+    // wants only the reason, so cut at the first sentence break.
+    if stripped.starts_with("error:")
+        && let Some(pos) = stripped.find(". ")
+    {
+        stripped.truncate(pos + 1);
+    }
     truncate_chars(&stripped, 60)
 }
 
@@ -3387,6 +3502,21 @@ fn truncate_chars(s: &str, max: usize) -> String {
     }
     let t: String = s.chars().take(max.saturating_sub(1)).collect();
     format!("{t}…")
+}
+
+/// Truncate keeping head AND tail (`head…tail`) — for labels whose
+/// distinguishing part may sit at either end.
+fn elide_middle(s: &str, max: usize) -> String {
+    let chars: Vec<char> = s.chars().collect();
+    if chars.len() <= max || max < 3 {
+        return truncate_chars(s, max);
+    }
+    let head = max * 3 / 5;
+    let tail = max - head - 1;
+    let mut out: String = chars[..head].iter().collect();
+    out.push('…');
+    out.extend(&chars[chars.len() - tail..]);
+    out
 }
 
 /// Render markdown to styled transcript lines. `width` is the text-area width

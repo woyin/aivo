@@ -3012,6 +3012,9 @@ pub(super) struct CodeTuiApp {
     /// the status tail ticking between round-boundary measurements.
     pub(super) turn_stream_chars: u64,
     pub(super) turn_stream_chars_measured: u64,
+    /// Tool calls this turn (status-line tail) — the growing count is the
+    /// visible proof a long turn is advancing, not wedged.
+    pub(super) turn_steps: u64,
     /// A connection retry is in progress → status reads "Working", not
     /// "Thinking". Set on the retry notice, cleared on progress.
     pub(super) retrying: bool,
@@ -3336,6 +3339,10 @@ pub(super) struct CodeTuiApp {
     /// output shown in place of the folded preview). In-memory only; cleared with
     /// `expanded_thinking`. A toggle bumps `transcript_revision` so the flip repaints.
     pub(super) expanded_output: std::collections::HashSet<usize>,
+    /// Start indices of long settled tool-step runs the user expanded back out
+    /// of their one-row `▸ N earlier steps` fold. In-memory only; maintained
+    /// like `expanded_output` (shifted on removal, cleared on history replace).
+    pub(super) expanded_step_folds: std::collections::HashSet<usize>,
     /// History indices of assistant turns the user COLLAPSED (folded to the `▸`
     /// summary). Thoughts show in full by default, so this set holds the exceptions.
     /// In-memory only; cleared when history is replaced (new chat, resume, rewind).
@@ -3617,6 +3624,7 @@ impl CodeTuiApp {
             turn_output_tokens: 0,
             turn_stream_chars: 0,
             turn_stream_chars_measured: 0,
+            turn_steps: 0,
             retrying: false,
             last_usage: None,
             live_usage: None,
@@ -3730,6 +3738,7 @@ impl CodeTuiApp {
             jobs_running: 0,
             local_outputs: std::collections::HashMap::new(),
             expanded_output: std::collections::HashSet::new(),
+            expanded_step_folds: std::collections::HashSet::new(),
             expanded_thinking: std::collections::HashSet::new(),
             agent_turn_indices: std::collections::HashSet::new(),
             reasoning_durations: std::collections::HashMap::new(),

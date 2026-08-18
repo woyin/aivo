@@ -1,5 +1,12 @@
 use super::*;
 
+/// Trailing tool entries of a run left visible outside its step fold (~4 steps
+/// with separate results) — the recent context worth keeping at a glance.
+const FOLD_KEEP_TAIL: usize = 8;
+/// Minimum entries a step fold must cover — folding a handful of rows behind a
+/// marker costs more indirection than it saves.
+const FOLD_MIN: usize = 12;
+
 /// Width the transcript body is built to fit (tables, pre-wrapped turn blocks):
 /// full column minus left gutter and right margin. Must equal the paint-time text
 /// area's width, or pre-wrapped rows get re-broken flush at the gutter.
@@ -187,6 +194,105 @@ impl CodeTuiApp {
         RenderedTranscript::new(lines, bars)
     }
 
+    /// Committed history length for rendering: hides the trailing `tool_call`
+    /// run while any of it is in flight — the status line (and batch rows)
+    /// names the work instead. Cursor resolves entries out of order, so the
+    /// cards wait for the whole run.
+    pub(super) fn committed_render_len(&self) -> usize {
+        let mut render_len = self.history.len();
+        if self.sending {
+            let mut start = render_len;
+            while start > 0 && self.history[start - 1].role == "tool_call" {
+                start -= 1;
+            }
+            let live = self.history[start..render_len].iter().any(|m| {
+                let (result, failed) = decode_tool_outcome(&m.content);
+                result.is_none() && !failed
+            });
+            if live {
+                render_len = start;
+            }
+        }
+        render_len
+    }
+
+    /// `(start, len)` history spans that fold to one `▸ N earlier steps` row:
+    /// within each maximal run of consecutive tool entries, everything except
+    /// the trailing [`FOLD_KEEP_TAIL`] entries — kept only when the foldable
+    /// prefix is itself long enough ([`FOLD_MIN`]) to be worth the indirection.
+    /// Pure over (history, render_len) so render and click mapping agree.
+    pub(super) fn step_folds(&self, render_len: usize) -> Vec<(usize, usize)> {
+        // A plan payload renders as a card, never inside a fold.
+        let foldable = |m: &ChatMessage| match m.role.as_str() {
+            "tool_result" => true,
+            "tool_call" => decode_tool_name(&m.content) != "exit_plan_mode",
+            _ => false,
+        };
+        let mut folds = Vec::new();
+        let mut i = 0;
+        while i < render_len {
+            if !foldable(&self.history[i]) {
+                i += 1;
+                continue;
+            }
+            let start = i;
+            while i < render_len && foldable(&self.history[i]) {
+                i += 1;
+            }
+            let run_len = i - start;
+            if run_len <= FOLD_KEEP_TAIL {
+                continue;
+            }
+            let mut fold_len = run_len - FOLD_KEEP_TAIL;
+            // Never split a call from its trailing result(s): grow the fold
+            // until the first visible entry is a call (or the run ends).
+            while start + fold_len < i && self.history[start + fold_len].role == "tool_result" {
+                fold_len += 1;
+            }
+            if fold_len >= FOLD_MIN {
+                folds.push((start, fold_len));
+            }
+        }
+        folds
+    }
+
+    /// `(steps, tool counts sorted by frequency, failures)` for a fold's span.
+    /// One JSON parse per entry: the name and a cursor-style `failed` come off
+    /// the same value; in-process failures come off the following `tool_result`.
+    fn fold_summary(&self, start: usize, len: usize) -> (usize, Vec<(String, usize)>, usize) {
+        let mut steps = 0;
+        let mut failed = 0;
+        let mut counts: Vec<(String, usize)> = Vec::new();
+        let mut last_tool: Option<String> = None;
+        for m in &self.history[start..start + len] {
+            match m.role.as_str() {
+                "tool_call" => {
+                    let v = serde_json::from_str::<serde_json::Value>(&m.content)
+                        .unwrap_or(serde_json::Value::Null);
+                    let name =
+                        canonical_tool_name(v.get("name").and_then(|x| x.as_str()).unwrap_or(""))
+                            .to_string();
+                    steps += 1;
+                    let disp = tool_display_name(&name);
+                    match counts.iter_mut().find(|(n, _)| *n == disp) {
+                        Some((_, c)) => *c += 1,
+                        None => counts.push((disp, 1)),
+                    }
+                    if v.get("failed").and_then(|x| x.as_bool()).unwrap_or(false) {
+                        failed += 1;
+                    }
+                    last_tool = Some(name);
+                }
+                "tool_result" if result_failed(&m.content, last_tool.as_deref()) => {
+                    failed += 1;
+                }
+                _ => {}
+            }
+        }
+        counts.sort_by_key(|&(_, n)| std::cmp::Reverse(n));
+        (steps, counts, failed)
+    }
+
     /// The memoizable transcript prefix: intro + committed history, with no
     /// dependence on the live stream or notice. This is the expensive part
     /// (markdown parsing, tool decoding) and what
@@ -238,26 +344,13 @@ impl CodeTuiApp {
         // coalesced call line drops its target list to avoid repeating it.
         let separate_results = self.history.iter().any(|m| m.role == "tool_result");
 
-        // Hide the trailing `tool_call` run while any of it is in flight — the
-        // status line (and batch rows) names the work instead. Cursor resolves
-        // entries out of order, so the cards wait for the whole run.
-        let mut render_len = self.history.len();
-        if self.sending {
-            let mut start = render_len;
-            while start > 0 && self.history[start - 1].role == "tool_call" {
-                start -= 1;
-            }
-            let live = self.history[start..render_len].iter().any(|m| {
-                let (result, failed) = decode_tool_outcome(&m.content);
-                result.is_none() && !failed
-            });
-            if live {
-                render_len = start;
-            }
-        }
+        let render_len = self.committed_render_len();
 
         let (inline_result, consumed_results, split_calls) =
             self.parallel_batch_pairing(render_len);
+
+        // The click handler recomputes this list for its ordinal map.
+        let folds = self.step_folds(render_len);
 
         // The previous lone tool call's `→` row — the row an adjacent result
         // merges onto instead of spending a `⎿` line.
@@ -294,10 +387,31 @@ impl CodeTuiApp {
                 }
                 previous_model = Some(model);
             }
+            // A fold either collapses here to one summary row, or — expanded —
+            // keeps a `▾` header above its normally-rendered rows.
+            let fold_here = folds.iter().find(|&&(s, _)| s == idx).map(|&(_, l)| l);
+            let collapsed_fold = fold_here.filter(|_| !self.expanded_step_folds.contains(&idx));
+            if let Some(fold_len) = fold_here
+                && collapsed_fold.is_none()
+            {
+                let (steps, _, _) = self.fold_summary(idx, fold_len);
+                let header = line_with_plain(vec![Span::styled(
+                    step_fold_header(steps),
+                    Style::default().fg(MUTED()),
+                )]);
+                lines.push(indent_styled_line(header, usize::from(SUB_BLOCK_INDENT)));
+                bars.push(Some(role_bar_color(message.role.as_str())));
+            }
             let mut block = Vec::new();
             let mut advance = 1;
             let mut anchor_call = false;
             match message.role.as_str() {
+                _ if collapsed_fold.is_some() => {
+                    let fold_len = collapsed_fold.unwrap();
+                    let (steps, counts, failed) = self.fold_summary(idx, fold_len);
+                    render_step_fold(&mut block, steps, &counts, failed);
+                    advance = fold_len;
+                }
                 "user" => {
                     // A skill invocation stores the full expanded SKILL.md as the
                     // user message (the model needs it), but the transcript should
@@ -356,6 +470,12 @@ impl CodeTuiApp {
                     };
                     // Don't coalesce into the hidden in-flight tail.
                     let run = run.min(render_len - idx);
+                    // Nor across a fold start — every fold must render its own
+                    // marker row, or the click ordinal → fold mapping shifts.
+                    let run = match folds.iter().map(|&(s, _)| s).find(|&s| s > idx) {
+                        Some(s) => run.min(s - idx),
+                        None => run,
+                    };
                     if run >= 2 {
                         let targets: Vec<String> = self.history[idx..idx + run]
                             .iter()
@@ -397,7 +517,7 @@ impl CodeTuiApp {
                         if let Some(&res_idx) = inline_result.get(&idx) {
                             let content = &self.history[res_idx].content;
                             let expanded = self.expanded_output.contains(&res_idx);
-                            let (spans, _) = tool_result_spans(
+                            let (spans, res_failed) = tool_result_spans(
                                 content,
                                 cwd,
                                 Some(name.as_str()),
@@ -405,9 +525,7 @@ impl CodeTuiApp {
                                 expanded,
                                 true,
                             );
-                            let mut suffix = vec![Span::raw(" ")];
-                            suffix.extend(spans);
-                            append_result_spans(&mut block[call_row], suffix);
+                            merge_result_onto(&mut block[call_row], spans, res_failed);
                             render_tool_result_body(
                                 &mut block,
                                 content,
@@ -436,7 +554,7 @@ impl CodeTuiApp {
                     match merge_anchor.take().filter(|_| !detached) {
                         // Ride the call row directly above: `→ verb(args) ▸ +N lines`.
                         Some(anchor) if !message.content.trim().is_empty() => {
-                            let (spans, _) = tool_result_spans(
+                            let (spans, res_failed) = tool_result_spans(
                                 &message.content,
                                 cwd,
                                 tool.as_deref(),
@@ -444,9 +562,7 @@ impl CodeTuiApp {
                                 expanded,
                                 true,
                             );
-                            let mut suffix = vec![Span::raw(" ")];
-                            suffix.extend(spans);
-                            append_result_spans(&mut lines[anchor], suffix);
+                            merge_result_onto(&mut lines[anchor], spans, res_failed);
                             render_tool_result_body(
                                 &mut block,
                                 &message.content,
@@ -752,9 +868,13 @@ impl CodeTuiApp {
             Some((label, _)) => label.clone(),
             None => self.desired_status(),
         };
-        // Tokens (measured, else ~chars/4; 0 omitted) · queued count.
+        // Steps · tokens (measured, else ~chars/4; 0 omitted) · queued count.
         let tail = if self.sending {
             let mut parts: Vec<String> = Vec::new();
+            // >1 only — a single step would just restate the action label.
+            if self.turn_steps > 1 {
+                parts.push(format!("{} steps", self.turn_steps));
+            }
             // Measured rounds + chars/4 of the stream since, so the count keeps
             // ticking through a long thought.
             let unmeasured = crate::agent::tokens::chars_to_tokens(
@@ -783,6 +903,12 @@ impl CodeTuiApp {
                     (since.elapsed(), budget.map(std::time::Duration::from_secs))
                 })
                 .unwrap_or_default()
+        } else if activity == "waiting"
+            && let Some(last) = self.last_stream_activity
+        {
+            // The stall label times the stall — "waiting (6m)" next to the
+            // whole-turn clock would read as a six-minute hang.
+            (last.elapsed(), None)
         } else {
             (
                 started_at

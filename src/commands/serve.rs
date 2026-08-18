@@ -34,10 +34,7 @@ impl ServeCommand {
     pub async fn execute(&self, params: ServeParams) -> ExitCode {
         match self.execute_internal(params).await {
             Ok(code) => code,
-            Err(e) => {
-                eprintln!("{} {}", style::red("Error:"), e);
-                crate::errors::exit_code_for_error(&e)
-            }
+            Err(e) => crate::errors::report(&e),
         }
     }
 

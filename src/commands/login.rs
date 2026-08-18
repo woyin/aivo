@@ -29,10 +29,7 @@ impl LoginCommand {
     pub async fn execute(&self, args: LoginArgs) -> ExitCode {
         match self.execute_internal(args).await {
             Ok(code) => code,
-            Err(e) => {
-                eprintln!("{} {}", style::red("Error:"), e);
-                crate::errors::exit_code_for_error(&e)
-            }
+            Err(e) => crate::errors::report(&e),
         }
     }
 
@@ -387,10 +384,7 @@ impl LogoutCommand {
     pub async fn execute(&self, args: LogoutArgs) -> ExitCode {
         match self.execute_internal(args).await {
             Ok(code) => code,
-            Err(e) => {
-                eprintln!("{} {}", style::red("Error:"), e);
-                crate::errors::exit_code_for_error(&e)
-            }
+            Err(e) => crate::errors::report(&e),
         }
     }
 

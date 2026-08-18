@@ -110,15 +110,14 @@ impl StatsCommand {
         let stats = match self.store.load_stats().await {
             Ok(s) => s,
             Err(e) => {
-                eprintln!("{} {}", style::red("Error:"), e);
-                return crate::errors::exit_code_for_error(&e);
+                return crate::errors::report(&e);
             }
         };
 
         let cutoff = match resolve_since(args.since.as_deref()) {
             Ok(c) => c,
             Err(e) => {
-                eprintln!("{} {e}", style::red("Error:"));
+                eprintln!("{} {e:#}", style::red("Error:"));
                 return ExitCode::UserError;
             }
         };
@@ -543,7 +542,7 @@ impl StatsCommand {
         let cutoff = match resolve_since(args.since.as_deref()) {
             Ok(c) => c,
             Err(e) => {
-                eprintln!("{} {e}", style::red("Error:"));
+                eprintln!("{} {e:#}", style::red("Error:"));
                 return ExitCode::UserError;
             }
         };
@@ -826,7 +825,7 @@ fn print_json(payload: &Value) -> ExitCode {
             ExitCode::Success
         }
         Err(e) => {
-            eprintln!("{} {}", style::red("Error:"), e);
+            eprintln!("{} {:#}", style::red("Error:"), e);
             ExitCode::UserError
         }
     }

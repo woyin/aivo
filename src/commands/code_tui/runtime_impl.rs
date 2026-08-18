@@ -412,6 +412,7 @@ impl CodeTuiApp {
         self.turn_output_tokens = 0;
         self.turn_stream_chars = 0;
         self.turn_stream_chars_measured = 0;
+        self.turn_steps = 0;
         self.subagent_token_base = 0;
         self.retrying = false;
         // Fresh stall clock — a stale stamp would flag a "stall" at turn start.
@@ -1361,6 +1362,7 @@ impl CodeTuiApp {
         self.turn_output_tokens = 0;
         self.turn_stream_chars = 0;
         self.turn_stream_chars_measured = 0;
+        self.turn_steps = 0;
         self.subagent_token_base = 0;
         self.compact_before = Some(before);
         self.response_task = Some(tokio::spawn(async move {
@@ -2220,6 +2222,7 @@ impl CodeTuiApp {
         // they can't point at the wrong block.
         self.expanded_thinking.clear();
         self.expanded_output.clear();
+        self.expanded_step_folds.clear();
         self.local_outputs.clear();
         self.reasoning_durations.clear();
         self.turn_durations.clear();
@@ -3655,6 +3658,7 @@ and keep each turn's work small"
         self.acp_checkpoint_store = None;
         self.expanded_thinking.clear();
         self.expanded_output.clear();
+        self.expanded_step_folds.clear();
         self.local_outputs.clear();
         self.reasoning_durations.clear();
         self.turn_durations.clear();

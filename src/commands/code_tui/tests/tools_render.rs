@@ -426,14 +426,20 @@ fn test_folded_run_bash_result_keeps_streaming_tail_height() {
     let plain = app.build_transcript().plain_lines.join("\n");
     assert!(plain.contains("exited 7"), "{plain}");
     assert!(plain.contains("row 39"), "last lines kept: {plain}");
-    assert!(plain.contains("row 37"), "tail window kept: {plain}");
+    // The `[exit 7]` sentinel is dropped from the tail (the call row already
+    // says `exited 7`), so the window holds 4 real output lines.
+    assert!(plain.contains("row 36"), "tail window kept: {plain}");
     assert!(
-        !plain.contains("row 36"),
+        !plain.contains("\n      row 35"),
         "earlier lines fold away: {plain}"
     );
     assert!(
         !plain.contains("row 20"),
         "earlier lines fold away: {plain}"
+    );
+    assert!(
+        !plain.contains("[exit 7]"),
+        "exit sentinel stays out of the tail: {plain}"
     );
 
     // One huge single line (a JSON blob) is clamped like the live tail rows —
@@ -885,6 +891,65 @@ fn test_failed_bash_result_shows_exit_code_in_error_hue() {
 }
 
 #[test]
+fn long_tool_run_folds_to_summary_row() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    for i in 1..=12 {
+        app.apply_agent_tool_call(
+            None,
+            "run_bash".to_string(),
+            serde_json::json!({ "command": format!("cmd-{i}") }),
+            vec![],
+            None,
+        );
+        let result = if i == 2 {
+            "boom\n[exit 1]".to_string()
+        } else {
+            format!("out-{i}")
+        };
+        app.apply_agent_tool_result(result);
+    }
+
+    // 24 entries → the leading 16 (8 steps) fold; the last 4 steps stay.
+    let plain = app.build_transcript().plain_lines.join("\n");
+    assert!(plain.contains("▸\u{a0}8 earlier steps"), "{plain}");
+    assert!(plain.contains("run_bash ×8"), "{plain}");
+    assert!(plain.contains("1 failed"), "{plain}");
+    assert!(!plain.contains("cmd-3"), "folded call hidden: {plain}");
+    assert!(plain.contains("cmd-9"), "recent calls stay: {plain}");
+    assert!(plain.contains("cmd-12"), "{plain}");
+
+    // Expanding restores the rows and swaps the marker to the ▾ header.
+    let folds = app.step_folds(app.history.len());
+    assert_eq!(folds.len(), 1, "{folds:?}");
+    app.expanded_step_folds.insert(folds[0].0);
+    let plain = app.build_transcript().plain_lines.join("\n");
+    assert!(plain.contains("▾\u{a0}earlier steps (8)"), "{plain}");
+    assert!(plain.contains("cmd-3"), "expanded rows visible: {plain}");
+}
+
+#[test]
+fn short_tool_run_stays_unfolded() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    for i in 1..=6 {
+        app.apply_agent_tool_call(
+            None,
+            "run_bash".to_string(),
+            serde_json::json!({ "command": format!("cmd-{i}") }),
+            vec![],
+            None,
+        );
+        app.apply_agent_tool_result(format!("out-{i}"));
+    }
+    // 12 entries: prefix past the keep-tail is 4 < FOLD_MIN — every row shows.
+    let plain = app.build_transcript().plain_lines.join("\n");
+    assert!(!plain.contains("earlier steps"), "{plain}");
+    assert!(plain.contains("cmd-1"), "{plain}");
+    assert!(plain.contains("cmd-6"), "{plain}");
+}
+
+#[test]
 fn test_tool_result_expands_inline_via_keyboard_toggle() {
     // Folded run_bash keeps only the streamed tail; Ctrl+O (toggle_latest_output)
     // reveals the full output in place and folds back.
@@ -910,8 +975,10 @@ fn test_tool_result_expands_inline_via_keyboard_toggle() {
         "{plain}"
     );
     assert!(plain.contains("exited 1"), "{plain}");
-    // The streamed tail stays put, but earlier lines fold away.
-    assert!(plain.contains("[exit 1]"), "tail line kept: {plain}");
+    // The streamed tail stays put, but earlier lines fold away — and the
+    // `[exit 1]` sentinel stays out (the call row already says `exited 1`).
+    assert!(plain.contains("test d ... ok"), "tail line kept: {plain}");
+    assert!(!plain.contains("[exit 1]"), "sentinel dropped: {plain}");
     assert!(
         !plain.contains("test 1 ... ok"),
         "folded result hides its early lines: {plain}"

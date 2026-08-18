@@ -24,7 +24,7 @@ pub(crate) fn key_or_exit(result: anyhow::Result<KeyResolution>) -> Option<ApiKe
         Ok(KeyResolution::Cancelled) => process::exit(ExitCode::Success.code()),
         Ok(KeyResolution::MissingAuth) => process::exit(ExitCode::AuthError.code()),
         Err(e) => {
-            eprintln!("{} {}", style::red("Error:"), e);
+            eprintln!("{} {:#}", style::red("Error:"), e);
             process::exit(ExitCode::UserError.code());
         }
     }
@@ -198,7 +198,7 @@ async fn resolve_active_key_or_prompt(
     let all_keys = match session_store.get_keys().await {
         Ok(keys) => keys,
         Err(e) => {
-            eprintln!("{} {}", style::red("Error:"), e);
+            eprintln!("{} {:#}", style::red("Error:"), e);
             return None;
         }
     };
@@ -243,7 +243,7 @@ async fn resolve_active_key_or_prompt(
             None
         }
         Err(e) => {
-            eprintln!("{} {}", style::red("Error:"), e);
+            eprintln!("{} {:#}", style::red("Error:"), e);
             None
         }
     }

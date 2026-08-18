@@ -163,7 +163,7 @@ impl AccountCommand {
                         ExitCode::Success
                     }
                     Err(e) => {
-                        eprintln!("{} {e}", style::red("Error:"));
+                        eprintln!("{} {e:#}", style::red("Error:"));
                         ExitCode::UserError
                     }
                 }
@@ -553,7 +553,7 @@ fn info_json(sync: AccountSync, usage: AccountUsage) -> ExitCode {
             ExitCode::Success
         }
         Err(e) => {
-            eprintln!("{} {e}", style::red("Error:"));
+            eprintln!("{} {e:#}", style::red("Error:"));
             ExitCode::UserError
         }
     }

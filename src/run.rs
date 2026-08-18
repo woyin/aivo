@@ -729,8 +729,7 @@ pub async fn run() -> ! {
                     match services::oauth_relogin::relogin_key(&session_store, &key).await {
                         Ok(updated) => Some(updated),
                         Err(e) => {
-                            eprintln!("{} {e}", style::red("Error:"));
-                            process::exit(crate::errors::exit_code_for_error(&e).code());
+                            process::exit(crate::errors::report(&e).code());
                         }
                     }
                 } else {
@@ -912,8 +911,7 @@ pub async fn run() -> ! {
                 let hf_ref = match services::huggingface::parse_hf_ref(raw) {
                     Ok(r) => r,
                     Err(e) => {
-                        eprintln!("{} {}", style::red("Error:"), e);
-                        process::exit(crate::errors::exit_code_for_error(&e).code());
+                        process::exit(crate::errors::report(&e).code());
                     }
                 };
                 match services::huggingface::ensure_ready(&hf_ref).await {
@@ -928,7 +926,7 @@ pub async fn run() -> ! {
                         ))
                     }
                     Err(e) => {
-                        eprintln!("{} {}", style::red("Error:"), e);
+                        eprintln!("{} {:#}", style::red("Error:"), e);
                         // ensure_ready may have stored the child in
                         // SERVER_CHILD before its health-check failed;
                         // `process::exit` skips destructors so we have
@@ -956,8 +954,7 @@ pub async fn run() -> ! {
                     Ok(KeyResolution::Cancelled) => process::exit(ExitCode::Success.code()),
                     Ok(KeyResolution::MissingAuth) => None,
                     Err(e) => {
-                        eprintln!("{} {}", style::red("Error:"), e);
-                        process::exit(crate::errors::exit_code_for_error(&e).code());
+                        process::exit(crate::errors::report(&e).code());
                     }
                 }
             };

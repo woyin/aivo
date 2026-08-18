@@ -97,10 +97,7 @@ impl StartCommand {
                 eprintln!("{}", style::dim("Cancelled."));
                 ExitCode::Success
             }
-            Err(e) => {
-                eprintln!("{} {}", style::red("Error:"), e);
-                crate::errors::exit_code_for_error(&e)
-            }
+            Err(e) => crate::errors::report(&e),
         }
     }
 

@@ -35,10 +35,7 @@ impl InfoCommand {
     pub async fn execute(&self, check: bool, json: bool) -> ExitCode {
         match self.execute_internal(check, json).await {
             Ok(code) => code,
-            Err(e) => {
-                eprintln!("{} {}", style::red("Error:"), e);
-                crate::errors::exit_code_for_error(&e)
-            }
+            Err(e) => crate::errors::report(&e),
         }
     }
 

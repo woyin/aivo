@@ -118,6 +118,25 @@ impl CLIError {
 /// failure (connect/timeout) anywhere in the chain maps to network; anything
 /// else is a user error (1). Keeps the documented exit-code contract honest
 /// without every call site re-classifying.
+/// Report an error at a command boundary: full cause chain to stderr
+/// (`Error: <context>: <root cause>`), then the mapped exit code. The chain
+/// matters — e.g. a sandboxed run's "Operation not permitted" root cause is
+/// what identifies a confinement block downstream.
+pub fn report(err: &anyhow::Error) -> ExitCode {
+    eprintln!("{} {err:#}", crate::style::red("Error:"));
+    exit_code_for_error(err)
+}
+
+/// True when any cause in the chain is an EACCES/EPERM-style I/O error — the
+/// signature of a permission or write-sandbox block.
+pub fn is_permission_denied(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|io| io.kind() == std::io::ErrorKind::PermissionDenied)
+    })
+}
+
 pub fn exit_code_for_error(err: &anyhow::Error) -> ExitCode {
     if let Some(cli) = err.chain().find_map(|c| c.downcast_ref::<CLIError>()) {
         return cli.exit_code();

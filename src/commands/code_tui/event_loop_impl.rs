@@ -541,6 +541,7 @@ impl CodeTuiApp {
         self.clear_sandbox_escalation_notice();
         self.flush_pending_assistant();
         self.clear_tool_output();
+        self.turn_steps += 1;
         // Stamp the status-line action label for the in-flight step.
         let cwd = if self.real_cwd.is_empty() {
             self.cwd.clone()
@@ -2407,7 +2408,8 @@ impl CodeTuiApp {
                     // Anything else starts a drag-select.
                     1 if matches!(surface, SelectionSurface::Transcript)
                         && (self.toggle_thinking_at_row(point.row)
-                            || self.toggle_output_at_row(point.row)) => {}
+                            || self.toggle_output_at_row(point.row)
+                            || self.toggle_step_fold_at_row(point.row)) => {}
                     _ => self.begin_drag(surface, point),
                 }
             }
@@ -2876,18 +2878,8 @@ impl CodeTuiApp {
     /// [`Self::expandable_output_indices`]. A click on a live run's marker (ordinal
     /// past the committed blocks) is ignored.
     pub(super) fn toggle_output_at_row(&mut self, row: usize) -> bool {
-        let ordinal = {
-            let Some(hitbox) = self.transcript_hitbox.as_ref() else {
-                return false;
-            };
-            if !hitbox.row(row).is_some_and(is_output_expander) {
-                return false;
-            }
-            hitbox
-                .rows()
-                .take(row + 1)
-                .filter(|r| is_output_expander(r))
-                .count()
+        let Some(ordinal) = self.marker_ordinal(row, is_output_expander) else {
+            return false;
         };
         let Some(&idx) = self.expandable_output_indices().get(ordinal - 1) else {
             return false;
@@ -2895,30 +2887,36 @@ impl CodeTuiApp {
         if !self.expanded_output.insert(idx) {
             self.expanded_output.remove(&idx);
         }
-        // The memoized body keys on `transcript_revision`; bump so the flip repaints.
-        self.transcript_revision = self.transcript_revision.wrapping_add(1);
+        self.bump_transcript_revision();
+        true
+    }
+
+    /// If transcript `row` is a step-fold marker (`▸ N earlier steps` /
+    /// `▾ earlier steps`), toggle that fold and return `true`. Ordinal maps
+    /// into [`Self::step_folds`] — each fold renders exactly one marker row
+    /// in either state.
+    pub(super) fn toggle_step_fold_at_row(&mut self, row: usize) -> bool {
+        let Some(ordinal) = self.marker_ordinal(row, is_step_fold_marker) else {
+            return false;
+        };
+        let folds = self.step_folds(self.committed_render_len());
+        let Some(&(start, _)) = folds.get(ordinal - 1) else {
+            return false;
+        };
+        if !self.expanded_step_folds.insert(start) {
+            self.expanded_step_folds.remove(&start);
+        }
+        self.bump_transcript_revision();
         true
     }
 
     /// If transcript `row` is a `▸`/`▾ thought` header, toggle that block's inline
-    /// expansion and return `true`. Counts header rows from the top to get the
-    /// block's ordinal, then maps it to a committed message via
-    /// [`Self::reasoning_message_indices`] — they stay in lockstep because each
-    /// committed block renders exactly one header row. A click on the live
-    /// streaming summary (ordinal past the committed blocks) is ignored.
+    /// expansion and return `true`. Ordinal maps into
+    /// [`Self::reasoning_message_indices`]; a click on the live streaming summary
+    /// (ordinal past the committed blocks) is ignored.
     pub(super) fn toggle_thinking_at_row(&mut self, row: usize) -> bool {
-        let ordinal = {
-            let Some(hitbox) = self.transcript_hitbox.as_ref() else {
-                return false;
-            };
-            if !hitbox.row(row).is_some_and(is_thinking_header) {
-                return false;
-            }
-            hitbox
-                .rows()
-                .take(row + 1)
-                .filter(|r| is_thinking_header(r))
-                .count()
+        let Some(ordinal) = self.marker_ordinal(row, is_thinking_header) else {
+            return false;
         };
         let Some(&idx) = self.reasoning_message_indices().get(ordinal - 1) else {
             return false;
@@ -2926,9 +2924,24 @@ impl CodeTuiApp {
         if !self.expanded_thinking.insert(idx) {
             self.expanded_thinking.remove(&idx);
         }
-        // The memoized body keys on `transcript_revision`; bump so the flip repaints.
-        self.transcript_revision = self.transcript_revision.wrapping_add(1);
+        self.bump_transcript_revision();
         true
+    }
+
+    /// 1-based ordinal of the marker row at `row` among all rows matching
+    /// `pred`, or `None` when it isn't one. Each producer renders exactly one
+    /// marker row per entity, so the ordinal indexes its entity list directly.
+    fn marker_ordinal(&self, row: usize, pred: fn(&str) -> bool) -> Option<usize> {
+        let hitbox = self.transcript_hitbox.as_ref()?;
+        if !hitbox.row(row).is_some_and(pred) {
+            return None;
+        }
+        Some(hitbox.rows().take(row + 1).filter(|r| pred(r)).count())
+    }
+
+    /// The memoized body keys on `transcript_revision`; bump so a flip repaints.
+    fn bump_transcript_revision(&mut self) {
+        self.transcript_revision = self.transcript_revision.wrapping_add(1);
     }
 
     /// Maps a mouse position to a `screen_surface` point (absolute coordinates).

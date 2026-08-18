@@ -2970,6 +2970,7 @@ is preserved."
         self.acp_checkpoint_store = None;
         self.expanded_thinking.clear();
         self.expanded_output.clear();
+        self.expanded_step_folds.clear();
         self.local_outputs.clear();
         self.reasoning_durations.clear();
         self.turn_durations.clear();
