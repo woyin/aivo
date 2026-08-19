@@ -146,12 +146,17 @@ fn tmux_client_info() -> Option<TmuxClientInfo> {
 pub fn detect() -> GraphicsCaps {
     let in_tmux = std::env::var("TMUX").is_ok_and(|v| !v.is_empty());
     let tmux_info = if in_tmux { tmux_client_info() } else { None };
-    detect_from(&|key| std::env::var(key).ok(), tmux_info.as_ref())
+    detect_from(
+        &|key| std::env::var(key).ok(),
+        tmux_info.as_ref(),
+        cfg!(windows),
+    )
 }
 
 fn detect_from(
     var: &dyn Fn(&str) -> Option<String>,
     tmux_info: Option<&TmuxClientInfo>,
+    windows: bool,
 ) -> GraphicsCaps {
     let tmux = var("TMUX").is_some_and(|v| !v.is_empty())
         || var("TERM").is_some_and(|t| t.starts_with("tmux"));
@@ -217,7 +222,9 @@ fn detect_from(
         },
         None => {}
     }
-    if cfg!(windows) {
+    // No auto-detection on Windows (conhost/WT can't render these protocols),
+    // but explicit AIVO_PREVIEW overrides above still apply.
+    if windows {
         return GraphicsCaps::default();
     }
     match auto() {
@@ -583,7 +590,7 @@ mod tests {
             .iter()
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect();
-        detect_from(&move |key| map.get(key).cloned(), tmux_info)
+        detect_from(&move |key| map.get(key).cloned(), tmux_info, false)
     }
 
     #[test]

@@ -229,6 +229,18 @@ fn text_image_paths(text: &str) -> Vec<String> {
     image_tokens(text, MAX_RESULT_PATH_PREVIEWS, has_image_extension)
 }
 
+/// A tool whose deliverable IS an image URL answers in a line or two;
+/// incidental image links ride in big payloads (API JSON, scraped HTML) that
+/// shouldn't become a gallery.
+const MAX_RESULT_URL_SCAN_BYTES: usize = 2048;
+
+fn result_image_urls(result: &str) -> Vec<String> {
+    if result.len() > MAX_RESULT_URL_SCAN_BYTES {
+        return Vec::new();
+    }
+    text_image_urls(result)
+}
+
 /// Image paths a tool result points at: aivo's `[image saved:]` trailer, plus
 /// bare image-path lines — a glob/ls answering "show me x.png" ends there
 /// without any read/write call to hook. Display-only, best-effort.
@@ -430,8 +442,8 @@ impl CodeTuiApp {
             let want_path = |pin_wants: &mut Vec<(u64, PathBuf)>, path: &str| {
                 pin_wants.push((pin_id(idx, content, path), resolve_in(&base, path)));
             };
-            let want_urls = |url_wants: &mut Vec<(u64, String)>| {
-                for url in text_image_urls(content) {
+            let want_urls = |url_wants: &mut Vec<(u64, String)>, urls: Vec<String>| {
+                for url in urls {
                     url_wants.push((pin_id(idx, content, &url), url));
                 }
             };
@@ -458,13 +470,13 @@ impl CodeTuiApp {
                     for path in text_image_paths(content) {
                         want_path(&mut pin_wants, &path);
                     }
-                    want_urls(&mut url_wants);
+                    want_urls(&mut url_wants, text_image_urls(content));
                 }
                 "assistant" => {
                     for path in text_image_paths(content) {
                         want_path(&mut pin_wants, &path);
                     }
-                    want_urls(&mut url_wants);
+                    want_urls(&mut url_wants, text_image_urls(content));
                 }
                 "tool_call" => {
                     if let Some((path, mutates)) = file_tool_image_target(content) {
@@ -483,7 +495,7 @@ impl CodeTuiApp {
                     for path in result_image_paths(content) {
                         want_path(&mut pin_wants, &path);
                     }
-                    want_urls(&mut url_wants);
+                    want_urls(&mut url_wants, result_image_urls(content));
                 }
                 _ => {}
             }
@@ -613,21 +625,21 @@ impl CodeTuiApp {
         }
     }
 
-    /// Previews for the given path mentions plus any image URLs in `content`,
-    /// keyed by the pins `queue_missing_previews` resolved.
+    /// Previews for the given path/URL mentions, keyed by the pins
+    /// `queue_missing_previews` resolved.
     fn push_mention_preview_lines(
         &self,
         lines: &mut Vec<StyledLine>,
         seen: &mut HashSet<u64>,
         idx: usize,
         content: &str,
-        paths: Vec<String>,
+        mentions: Vec<String>,
         width: u16,
     ) {
         if !self.inline_images.caps.enabled() {
             return;
         }
-        for mention in paths.into_iter().chain(text_image_urls(content)) {
+        for mention in mentions {
             if let Some(key) = self.lookup_pinned(idx, content, &mention) {
                 self.push_preview_once(lines, seen, key, width);
             }
@@ -645,14 +657,9 @@ impl CodeTuiApp {
         content: &str,
         width: u16,
     ) {
-        self.push_mention_preview_lines(
-            lines,
-            seen,
-            idx,
-            content,
-            text_image_paths(content),
-            width,
-        );
+        let mut mentions = text_image_paths(content);
+        mentions.extend(text_image_urls(content));
+        self.push_mention_preview_lines(lines, seen, idx, content, mentions, width);
     }
 
     pub(super) fn push_tool_image_preview_lines(
@@ -694,14 +701,9 @@ impl CodeTuiApp {
         result: &str,
         width: u16,
     ) {
-        self.push_mention_preview_lines(
-            lines,
-            seen,
-            idx,
-            result,
-            result_image_paths(result),
-            width,
-        );
+        let mut mentions = result_image_paths(result);
+        mentions.extend(result_image_urls(result));
+        self.push_mention_preview_lines(lines, seen, idx, result, mentions, width);
     }
 
     /// Ensures `key`'s data is transmitted, appending to `seq`; returns false
@@ -890,8 +892,8 @@ impl CodeTuiApp {
             };
             let check_all =
                 |paths: Vec<String>| -> Option<String> { paths.iter().find_map(|p| check(p)) };
-            let check_urls = || -> Option<String> {
-                text_image_urls(content).into_iter().find(|url| {
+            let check_urls = |urls: Vec<String>| -> Option<String> {
+                urls.into_iter().find(|url| {
                     self.inline_images.pinned.get(&pin_id(idx, content, url)) == Some(&key)
                 })
             };
@@ -914,11 +916,14 @@ impl CodeTuiApp {
                             _ => {}
                         }
                     }
-                    check_all(text_image_paths(content)).or_else(check_urls)
+                    check_all(text_image_paths(content))
+                        .or_else(|| check_urls(text_image_urls(content)))
                 }
-                "assistant" => check_all(text_image_paths(content)).or_else(check_urls),
+                "assistant" => check_all(text_image_paths(content))
+                    .or_else(|| check_urls(text_image_urls(content))),
                 "tool_call" => file_tool_image_target(content).and_then(|(p, _)| check(&p)),
-                "tool_result" => check_all(result_image_paths(content)).or_else(check_urls),
+                "tool_result" => check_all(result_image_paths(content))
+                    .or_else(|| check_urls(result_image_urls(content))),
                 _ => None,
             };
             if found.is_some() {
@@ -1130,6 +1135,22 @@ mod tests {
             2,
             "capped at 2 per message"
         );
+    }
+
+    #[test]
+    fn result_image_urls_gated_on_result_size() {
+        // A tool answering with an image URL previews it.
+        let short = "generated: https://img.example.dev/out.png";
+        assert_eq!(
+            result_image_urls(short),
+            vec!["https://img.example.dev/out.png"]
+        );
+        // Incidental links in a big payload (wttr.in JSON's weatherIconUrl,
+        // scraped HTML) preview nothing.
+        let icon = r#"{"weatherIconUrl": [{"value": "https://cdn.example.com/wsymbol_0003_white_cloud.png"}]}"#;
+        let big = icon.repeat(1 + MAX_RESULT_URL_SCAN_BYTES / icon.len());
+        assert!(big.len() > MAX_RESULT_URL_SCAN_BYTES);
+        assert!(result_image_urls(&big).is_empty());
     }
 
     #[test]
