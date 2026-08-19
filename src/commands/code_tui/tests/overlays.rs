@@ -388,6 +388,11 @@ fn brand_palettes_keep_lime_focus_and_theme_aware_destructive_rows() {
     assert_eq!(Palette::DARK.accent, Color::Rgb(222, 252, 9));
     assert_eq!(Palette::DARK.select_accent, Palette::DARK.accent);
     assert_eq!(Palette::LIGHT.faint, Color::Rgb(122, 114, 102));
+    assert_eq!(
+        Palette::LIGHT.canvas,
+        Some(Palette::DARK.text),
+        "light canvas is the brand paper dark uses as ink — cream, not white"
+    );
     assert_ne!(Palette::DARK.select_bg, Palette::DARK.delete_bg);
     assert_ne!(Palette::LIGHT.select_bg, Palette::LIGHT.delete_bg);
     assert_ne!(Palette::DARK.error, Palette::DARK.info);

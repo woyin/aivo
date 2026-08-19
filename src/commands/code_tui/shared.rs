@@ -123,8 +123,9 @@ impl Palette {
         jump_bg: Color::Rgb(231, 227, 219),
     };
 
-    /// Light brand paper: dark warm ink and an olive form of the lime that keeps
-    /// contrast without losing the brand hue.
+    /// Light brand linen: the same warm paper dark uses as ink, now as the
+    /// canvas — cream, not white, so it doesn't glare. Olive lime keeps the
+    /// brand hue with enough contrast on that paper.
     pub const LIGHT: Self = Self {
         text: Color::Rgb(27, 24, 19),
         muted: Color::Rgb(102, 95, 85),
@@ -140,27 +141,27 @@ impl Palette {
         warning: Color::Rgb(122, 90, 30), // --code-string
         info: Color::Rgb(50, 105, 160),
         live: Color::Rgb(200, 60, 55),
-        diff_add_bg: Color::Rgb(220, 240, 225),
-        diff_del_bg: Color::Rgb(250, 230, 228),
+        diff_add_bg: Color::Rgb(214, 228, 216),
+        diff_del_bg: Color::Rgb(230, 216, 212),
         diff_add_fg: Color::Rgb(40, 100, 70),
         diff_del_fg: Color::Rgb(160, 60, 50),
         diff_add_sign: Color::Rgb(30, 130, 80),
         diff_del_sign: Color::Rgb(180, 50, 45),
-        diff_add_hl_bg: Color::Rgb(190, 230, 200),
-        diff_del_hl_bg: Color::Rgb(240, 200, 195),
+        diff_add_hl_bg: Color::Rgb(186, 214, 192),
+        diff_del_hl_bg: Color::Rgb(224, 190, 184),
         select_bg: Color::Rgb(184, 181, 174),
         select_text: Color::Rgb(27, 24, 19),
         select_accent: Color::Rgb(89, 102, 0),
         // Same rule as dark: wash = the bar; flash darkens (paper inverts emphasis).
         select_wash: Color::Rgb(184, 181, 174),
         select_flash: Color::Rgb(162, 158, 150),
-        delete_bg: Color::Rgb(250, 226, 218),
+        delete_bg: Color::Rgb(226, 206, 198),
         delete_text: Color::Rgb(116, 38, 24),
         delete_accent: Color::Rgb(166, 58, 35),
-        canvas: Some(Color::Rgb(251, 250, 247)), // --bg-canvas #FBFAF7
+        canvas: Some(Color::Rgb(237, 233, 226)), // brand paper, same as DARK.text
         code: Color::Rgb(38, 105, 98),
-        toast_bg: Color::Rgb(243, 240, 232),
-        jump_fg: Color::Rgb(251, 250, 247),
+        toast_bg: Color::Rgb(226, 220, 208),
+        jump_fg: Color::Rgb(237, 233, 226),
         jump_bg: Color::Rgb(22, 20, 26),
     };
 
