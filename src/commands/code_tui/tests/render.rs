@@ -707,6 +707,7 @@ fn test_wrap_transcript_carries_bar_color_per_row() {
     let lines = vec![StyledLine {
         line: Line::from("alpha beta gamma delta"),
         plain: "alpha beta gamma delta".to_string(),
+        ..Default::default()
     }];
     let wrapped = wrap_transcript(&lines, &[Some(TOOL())], 8);
     assert!(wrapped.rows.len() >= 3);
@@ -730,6 +731,7 @@ fn test_wrap_transcript_fills_background_to_full_width() {
             ),
         ]),
         plain: "   + let very long added line".to_string(),
+        ..Default::default()
     }];
     let wrapped = wrap_transcript(&diff, &[None], 12);
     assert!(wrapped.rows.len() >= 2, "long diff line should wrap");
@@ -753,6 +755,7 @@ fn test_wrap_transcript_fills_background_to_full_width() {
     let plain = vec![StyledLine {
         line: Line::from(Span::styled("hi".to_string(), Style::default().fg(TEXT()))),
         plain: "hi".to_string(),
+        ..Default::default()
     }];
     let wrapped = wrap_transcript(&plain, &[None], 12);
     assert_eq!(wrapped.rows[0], "hi");
@@ -958,4 +961,340 @@ fn test_render_main_uses_full_height_for_long_transcript() {
         expected_width
     );
     assert_eq!(app.transcript_width, expected_width);
+}
+
+#[test]
+fn test_inline_image_preview_rows_reserved_and_anchored() {
+    use crate::services::terminal_graphics::{
+        EncodedPreview, GraphicsCaps, PLACEHOLDER_CHAR, PixelFormat, Protocol,
+    };
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.inline_images.caps = GraphicsCaps {
+        protocol: Protocol::KittyVirtual,
+        tmux: false,
+        ..GraphicsCaps::default()
+    };
+    app.history.push(ChatMessage {
+        model: None,
+        role: "user".to_string(),
+        content: "look at this".to_string(),
+        reasoning_content: None,
+        attachments: vec![MessageAttachment {
+            name: "shot.png".to_string(),
+            mime_type: "image/png".to_string(),
+            storage: AttachmentStorage::Inline {
+                data: "iVBORtestpayload".to_string(),
+            },
+        }],
+    });
+    let key = match &app.history[0].attachments[0].storage {
+        AttachmentStorage::Inline { data } => hash_inline(data),
+        _ => panic!("test attachment is inline"),
+    };
+    app.inline_images.previews.insert(
+        key,
+        PreviewSlot::Ready(std::sync::Arc::new(EncodedPreview {
+            format: PixelFormat::Png,
+            px_w: 800,
+            px_h: 400,
+            payload_b64: "AAAA".to_string(),
+            thumb: None,
+            content_hash: 0xA1,
+        })),
+    );
+
+    let body = app.build_transcript_history_body(80);
+    let anchors: Vec<_> = body.lines.iter().filter_map(|l| l.image).collect();
+    assert_eq!(anchors.len(), 1, "one attachment → one anchor");
+    let anchor = anchors[0];
+    assert_eq!(anchor.key, key);
+    assert!(anchor.cols >= 4 && anchor.rows >= 1);
+    // Reserved rows are ZWSP (not trim-blank), so compaction kept all of them.
+    let reserved = body
+        .lines
+        .iter()
+        .filter(|l| l.plain.contains('\u{200B}'))
+        .count();
+    assert_eq!(reserved, usize::from(anchor.rows));
+
+    // Virtual mode paints real placeholder cells; every block line renders as
+    // exactly one visual row despite the (wrapper-hostile) diacritics.
+    let placeholder_lines = body
+        .lines
+        .iter()
+        .filter(|l| {
+            l.line
+                .spans
+                .iter()
+                .any(|s| s.content.contains(PLACEHOLDER_CHAR))
+        })
+        .count();
+    assert_eq!(placeholder_lines, usize::from(anchor.rows));
+
+    // The wrap carries the anchor at its wrapped-row index, rows mapping 1:1.
+    let wrapped = wrap_transcript(&body.lines, &body.bar_colors, 78);
+    assert_eq!(wrapped.image_rows.len(), 1);
+    let (row, wrapped_anchor) = wrapped.image_rows[0];
+    assert_eq!(wrapped_anchor, anchor);
+    for offset in 0..usize::from(anchor.rows) {
+        assert!(
+            wrapped.rows[row + offset].contains('\u{200B}'),
+            "row {} should be reserved",
+            row + offset
+        );
+        let spans = &wrapped.text.lines[row + offset].spans;
+        let cells = spans
+            .iter()
+            .map(|s| s.content.chars().filter(|&c| c == PLACEHOLDER_CHAR).count())
+            .sum::<usize>();
+        assert_eq!(
+            cells,
+            usize::from(anchor.cols),
+            "placeholder row must survive the wrap un-sheared"
+        );
+    }
+
+    // Capability off → no reserved rows, no anchors (plain [image] line only).
+    app.inline_images.caps = GraphicsCaps::default();
+    app.bump_transcript_revision();
+    let body = app.build_transcript_history_body(80);
+    assert!(body.lines.iter().all(|l| l.image.is_none()));
+    assert!(body.lines.iter().all(|l| !l.plain.contains('\u{200B}')));
+}
+
+#[test]
+fn test_inline_image_flush_diffs_placements() {
+    use crate::services::terminal_graphics::{EncodedPreview, GraphicsCaps, PixelFormat, Protocol};
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.inline_images.caps = GraphicsCaps {
+        protocol: Protocol::KittyClassic,
+        tmux: false,
+        ..GraphicsCaps::default()
+    };
+    let key = 42u64;
+    app.inline_images.previews.insert(
+        key,
+        PreviewSlot::Ready(std::sync::Arc::new(EncodedPreview {
+            format: PixelFormat::Png,
+            px_w: 100,
+            px_h: 100,
+            payload_b64: "QUJD".to_string(),
+            thumb: None,
+            content_hash: 0xB2,
+        })),
+    );
+    let want = PlacedImage {
+        key,
+        x: 3,
+        y: 5,
+        cols: 10,
+        rows: 4,
+    };
+
+    // First flush transmits then places.
+    app.inline_images.desired = vec![want];
+    let mut out = Vec::new();
+    app.flush_inline_images(&mut out);
+    let emitted = String::from_utf8(out).unwrap();
+    assert!(emitted.contains("a=t,q=2,f=100"), "transmit: {emitted:?}");
+    assert!(emitted.contains("a=p,q=2"), "place: {emitted:?}");
+
+    // Unchanged frame → zero bytes.
+    app.inline_images.desired = vec![want];
+    let mut out = Vec::new();
+    app.flush_inline_images(&mut out);
+    assert!(out.is_empty(), "steady frame must emit nothing");
+
+    // A scroll (new y) deletes the old placement and re-places WITHOUT
+    // re-transmitting the payload.
+    app.inline_images.desired = vec![PlacedImage { y: 6, ..want }];
+    let mut out = Vec::new();
+    app.flush_inline_images(&mut out);
+    let emitted = String::from_utf8(out).unwrap();
+    assert!(emitted.contains("a=d,d=i"), "delete old: {emitted:?}");
+    assert!(emitted.contains("a=p,q=2"), "re-place: {emitted:?}");
+    assert!(!emitted.contains("a=t,"), "no re-transmit: {emitted:?}");
+
+    // Scrolled fully out of view → placement deleted, data retained.
+    app.inline_images.desired = Vec::new();
+    let mut out = Vec::new();
+    app.flush_inline_images(&mut out);
+    let emitted = String::from_utf8(out).unwrap();
+    assert!(emitted.contains("a=d,d=i"));
+    assert!(app.inline_images.transmitted.contains_key(&key));
+
+    // Exit cleanup frees the transmitted data.
+    let mut out = Vec::new();
+    app.cleanup_inline_images(&mut out);
+    let emitted = String::from_utf8(out).unwrap();
+    assert!(emitted.contains("a=d,d=I"));
+    assert!(app.inline_images.transmitted.is_empty());
+}
+
+#[test]
+fn test_inline_image_flush_virtual_mode_is_scroll_free() {
+    use crate::services::terminal_graphics::{EncodedPreview, GraphicsCaps, PixelFormat, Protocol};
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.inline_images.caps = GraphicsCaps {
+        protocol: Protocol::KittyVirtual,
+        tmux: true,
+        ..GraphicsCaps::default()
+    };
+    let key = 7u64;
+    app.inline_images.previews.insert(
+        key,
+        PreviewSlot::Ready(std::sync::Arc::new(EncodedPreview {
+            format: PixelFormat::Png,
+            px_w: 100,
+            px_h: 100,
+            payload_b64: "QUJD".to_string(),
+            thumb: None,
+            content_hash: 0xB2,
+        })),
+    );
+    let want = PlacedImage {
+        key,
+        x: 0,
+        y: 0,
+        cols: 20,
+        rows: 8,
+    };
+
+    // First sight: transmit + virtual placement, tmux-passthrough-wrapped.
+    app.inline_images.desired = vec![want];
+    let mut out = Vec::new();
+    app.flush_inline_images(&mut out);
+    let emitted = String::from_utf8(out).unwrap();
+    assert!(emitted.contains("a=t,q=2"), "transmit: {emitted:?}");
+    assert!(emitted.contains("U=1"), "virtual placement: {emitted:?}");
+    assert!(emitted.contains("\x1bPtmux;"), "passthrough: {emitted:?}");
+    assert!(
+        !emitted.contains("\x1b["),
+        "virtual mode must never move the cursor: {emitted:?}"
+    );
+
+    // Scrolling changes nothing — placeholder cells carry the position.
+    app.inline_images.desired = vec![want];
+    let mut out = Vec::new();
+    app.flush_inline_images(&mut out);
+    assert!(out.is_empty());
+
+    // A width change re-creates the placement without re-transmitting.
+    app.inline_images.desired = vec![PlacedImage {
+        cols: 12,
+        rows: 5,
+        ..want
+    }];
+    let mut out = Vec::new();
+    app.flush_inline_images(&mut out);
+    let emitted = String::from_utf8(out).unwrap();
+    assert!(emitted.contains("U=1"), "re-place: {emitted:?}");
+    assert!(!emitted.contains("a=t,"), "no re-transmit: {emitted:?}");
+}
+
+#[tokio::test]
+async fn test_inline_image_previews_pin_to_mention_time_state() {
+    use crate::services::terminal_graphics::{GraphicsCaps, Protocol};
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.inline_images.caps = GraphicsCaps {
+        protocol: Protocol::HalfBlocks,
+        tmux: true,
+        ..GraphicsCaps::default()
+    };
+    let dir = crate::test_sandbox::tmp("pin-preview");
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("shape.svg");
+    std::fs::write(&file, "<svg>v1</svg>").unwrap();
+    app.real_cwd = dir.to_string_lossy().to_string();
+
+    let user_msg = |content: &str| ChatMessage {
+        model: None,
+        role: "user".to_string(),
+        content: content.to_string(),
+        reasoning_content: None,
+        attachments: Vec::new(),
+    };
+    app.history.push(user_msg("show shape.svg"));
+    app.queue_missing_previews();
+    assert_eq!(app.inline_images.pinned.len(), 1, "first mention pinned");
+    let first_key = *app.inline_images.pinned.values().next().unwrap();
+
+    // The file changes (recolor); a NEW mention resolves the new state, but
+    // the OLD mention's pin must not move — its block keeps the old image.
+    std::fs::write(&file, "<svg>v2 recolor</svg>").unwrap();
+    app.history.push(user_msg("show shape.svg again"));
+    app.queue_missing_previews();
+    assert_eq!(app.inline_images.pinned.len(), 2, "second mention pinned");
+    let keys: Vec<u64> = app.inline_images.pinned.values().copied().collect();
+    assert!(keys.contains(&first_key), "old pin must survive the edit");
+    assert!(
+        keys.iter().any(|&k| k != first_key),
+        "new mention must resolve the NEW file state"
+    );
+
+    // Re-running the queue is idempotent: pins never re-resolve.
+    app.queue_missing_previews();
+    assert_eq!(app.inline_images.pinned.len(), 2);
+    assert!(app.inline_images.pinned.values().any(|&k| k == first_key));
+}
+
+#[test]
+fn test_inline_image_dedup_is_by_content_not_source_key() {
+    use crate::services::terminal_graphics::{EncodedPreview, GraphicsCaps, PixelFormat, Protocol};
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.inline_images.caps = GraphicsCaps {
+        protocol: Protocol::KittyVirtual,
+        ..GraphicsCaps::default()
+    };
+    // Two attachments with different bytes → two source keys.
+    let make_att = |data: &str| MessageAttachment {
+        name: "shot.png".to_string(),
+        mime_type: "image/png".to_string(),
+        storage: AttachmentStorage::Inline {
+            data: data.to_string(),
+        },
+    };
+    app.history.push(ChatMessage {
+        model: None,
+        role: "user".to_string(),
+        content: "two copies of one picture".to_string(),
+        reasoning_content: None,
+        attachments: vec![make_att("iVBORaaaa"), make_att("iVBORbbbb")],
+    });
+    let ready = |hash: u64| {
+        PreviewSlot::Ready(std::sync::Arc::new(EncodedPreview {
+            format: PixelFormat::Png,
+            px_w: 400,
+            px_h: 400,
+            payload_b64: "AAAA".to_string(),
+            thumb: None,
+            content_hash: hash,
+        }))
+    };
+    let keys: Vec<u64> = app.history[0]
+        .attachments
+        .iter()
+        .map(|a| match &a.storage {
+            AttachmentStorage::Inline { data } => hash_inline(data),
+            _ => unreachable!(),
+        })
+        .collect();
+    assert_ne!(keys[0], keys[1], "different bytes → different source keys");
+
+    // Same pixels (e.g. URL + its downloaded file) → ONE block.
+    app.inline_images.previews.insert(keys[0], ready(0x77));
+    app.inline_images.previews.insert(keys[1], ready(0x77));
+    let body = app.build_transcript_history_body(80);
+    assert_eq!(body.lines.iter().filter(|l| l.image.is_some()).count(), 1);
+
+    // Genuinely different pixels → two blocks.
+    app.inline_images.previews.insert(keys[1], ready(0x88));
+    app.bump_transcript_revision();
+    let body = app.build_transcript_history_body(80);
+    assert_eq!(body.lines.iter().filter(|l| l.image.is_some()).count(), 2);
 }

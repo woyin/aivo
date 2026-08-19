@@ -2583,6 +2583,11 @@ pub(super) enum RuntimeEvent {
         session_id: String,
         entry: PreviewEntry,
     },
+    /// An inline-image preview prep finished; `None` = source undecodable.
+    ImagePreviewReady {
+        key: u64,
+        preview: Option<Box<crate::services::terminal_graphics::EncodedPreview>>,
+    },
     /// A cursor-agent ACP session finished opening on a background task. The
     /// event loop stores it on the app so subsequent turns reuse it without
     /// paying the Node.js startup cost again.
@@ -3112,6 +3117,8 @@ pub(super) struct CodeTuiApp {
     pub(super) resume_restore_state: Option<ResumeRestoreState>,
     /// `/resume` picker preview state; only `event_loop_impl.rs` drives it.
     pub(super) session_preview: SessionPreviewState,
+    /// Inline transcript image previews (Kitty graphics); see `inline_images.rs`.
+    pub(super) inline_images: InlineImageState,
     pub(super) reduce_motion: bool,
     pub(super) frame_tick: usize,
     pub(super) picker_hitbox: Option<PickerHitbox>,
@@ -3668,6 +3675,7 @@ impl CodeTuiApp {
             loading_resume: None,
             resume_restore_state: None,
             session_preview: SessionPreviewState::default(),
+            inline_images: InlineImageState::default(),
             render_cache: RenderCache::default(),
             reduce_motion: false,
             frame_tick: 0,

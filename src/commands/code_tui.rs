@@ -61,6 +61,8 @@ mod account_impl;
 mod app_state_impl;
 #[path = "code_tui/event_loop_impl.rs"]
 mod event_loop_impl;
+#[path = "code_tui/inline_images.rs"]
+mod inline_images;
 #[path = "code_tui/input_impl.rs"]
 mod input_impl;
 #[path = "code_tui/key_handler_impl.rs"]
@@ -74,6 +76,7 @@ mod runtime_impl;
 #[path = "code_tui/session_impl.rs"]
 mod session_impl;
 
+use self::inline_images::*;
 use self::menu::*;
 use self::render::*;
 pub(crate) use self::runtime_impl::skill_invocation_label;

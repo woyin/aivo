@@ -37,6 +37,15 @@ impl CodeTuiApp {
             RuntimeEvent::ResumeLoaded { request_id, result } => {
                 self.apply_resume_load_result(request_id, result).await?;
             }
+            RuntimeEvent::ImagePreviewReady { key, preview } => {
+                let slot = match preview {
+                    Some(p) => PreviewSlot::Ready(std::sync::Arc::new(*p)),
+                    None => PreviewSlot::Failed,
+                };
+                self.inline_images.previews.insert(key, slot);
+                // The reserved rows (and their anchors) appear on the next build.
+                self.bump_transcript_revision();
+            }
             RuntimeEvent::SessionPreviewLoaded { session_id, entry } => {
                 // Always cache — an entry for a no-longer-selected row is still correct.
                 if self.session_preview.cache.len() >= PREVIEW_CACHE_CAP {
@@ -1784,6 +1793,8 @@ impl CodeTuiApp {
 
     pub(super) async fn run(&mut self) -> Result<()> {
         let mut terminal = setup_terminal(chat_mouse_enabled())?;
+        // Tests and headless paths keep the default (disabled) caps from `bare()`.
+        self.inline_images.caps = crate::services::terminal_graphics::detect();
         // Open the cursor session now (no-op for other keys) so its connect
         // overlaps the user typing their first message.
         self.prewarm_cursor_session();
@@ -1888,9 +1899,13 @@ impl CodeTuiApp {
                     }
                     terminal.swap_buffers();
                     last_stream_repaint = std::time::Instant::now();
+                    // Full cell rewrite wipes tmux's sixel layer; the
+                    // post-draw flush must re-emit every visible image.
+                    self.note_cells_repainted();
                 }
                 // `.err()` drops the `CompletedFrame` borrow so End can write.
                 let draw_err = terminal.draw(|frame| self.render(frame)).err();
+                let image_reflush = self.flush_inline_images(terminal.backend_mut());
                 let _ = execute!(
                     terminal.backend_mut(),
                     crossterm::terminal::EndSynchronizedUpdate
@@ -1898,7 +1913,7 @@ impl CodeTuiApp {
                 if let Some(err) = draw_err {
                     break Err(err.into());
                 }
-                needs_redraw = false;
+                needs_redraw = image_reflush;
             }
 
             // Drain every buffered input event in one pass before the next
@@ -1915,6 +1930,7 @@ impl CodeTuiApp {
 
             if std::mem::take(&mut self.pending_external_edit) {
                 self.edit_draft_in_external_editor(&mut terminal).await;
+                self.reset_inline_image_terminal_state();
                 needs_redraw = true;
             }
 
@@ -1971,6 +1987,7 @@ impl CodeTuiApp {
         }
         // Background jobs must not outlive the TUI.
         let _ = self.jobs.kill_all().await;
+        self.cleanup_inline_images(terminal.backend_mut());
         restore_terminal(terminal)?;
         run_result
     }
@@ -2327,7 +2344,12 @@ impl CodeTuiApp {
             }
             Event::Key(_) => Ok(None),
             Event::Mouse(mouse) => Ok(Some(self.handle_mouse(mouse).await?)),
-            Event::Resize(_, _) => Ok(None),
+            Event::Resize(_, _) => {
+                // The resize redraw rewrites every cell, wiping tmux's sixel
+                // layer — forget placements so the next flush re-emits.
+                self.note_cells_repainted();
+                Ok(None)
+            }
             Event::Paste(text) => {
                 if !self.overlay_paste(&text)
                     && !self.overlay.blocks_input()
@@ -2404,12 +2426,14 @@ impl CodeTuiApp {
                         self.copy_selection_to_clipboard();
                     }
                     // A single click on a `▸`/`▾` fold marker (thinking header or
-                    // `!cmd` output expander) toggles that block's inline expansion.
+                    // `!cmd` output expander) toggles that block's inline
+                    // expansion; on an image preview it opens the original.
                     // Anything else starts a drag-select.
                     1 if matches!(surface, SelectionSurface::Transcript)
                         && (self.toggle_thinking_at_row(point.row)
                             || self.toggle_output_at_row(point.row)
-                            || self.toggle_step_fold_at_row(point.row)) => {}
+                            || self.toggle_step_fold_at_row(point.row)
+                            || self.open_image_at(point.row, point.column)) => {}
                     _ => self.begin_drag(surface, point),
                 }
             }
@@ -2940,7 +2964,7 @@ impl CodeTuiApp {
     }
 
     /// The memoized body keys on `transcript_revision`; bump so a flip repaints.
-    fn bump_transcript_revision(&mut self) {
+    pub(super) fn bump_transcript_revision(&mut self) {
         self.transcript_revision = self.transcript_revision.wrapping_add(1);
     }
 

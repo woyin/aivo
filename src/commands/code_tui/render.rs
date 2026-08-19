@@ -1,10 +1,25 @@
 use super::*;
 use std::borrow::Cow;
 
-#[derive(Clone)]
+/// A logical line's inline-image block: `rows` reserved rows (this line is the
+/// first) that `render_main` maps to a screen rect for Kitty-graphics placement.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct ImageAnchor {
+    pub(super) key: u64,
+    pub(super) cols: u16,
+    pub(super) rows: u16,
+}
+
+#[derive(Clone, Default)]
 pub(super) struct StyledLine {
     pub(super) line: Line<'static>,
     pub(super) plain: String,
+    /// Set on the first reserved row of an image preview block.
+    pub(super) image: Option<ImageAnchor>,
+    /// Bypass the word-wrapper (always exactly one visual row). Image preview
+    /// rows need this: the wrapper counts every char ≥1 column, which would
+    /// shear a placeholder row's zero-width diacritics across rows.
+    pub(super) no_wrap: bool,
 }
 
 pub(super) struct RenderedTranscript {
@@ -171,6 +186,7 @@ fn styled_line_from_chars(chars: &[(char, Style)]) -> StyledLine {
     StyledLine {
         line: Line::from(spans),
         plain,
+        ..Default::default()
     }
 }
 
@@ -184,6 +200,8 @@ pub(super) struct WrappedTranscript {
     /// wrap keeps carrying them per row.
     #[cfg_attr(not(test), allow(dead_code))]
     pub(super) bars: Vec<Option<Color>>,
+    /// Image anchors by wrapped-row index, in display order.
+    pub(super) image_rows: Vec<(usize, ImageAnchor)>,
 }
 
 /// Word-wrap all logical lines to `width`, carrying each line's bar color onto
@@ -197,8 +215,18 @@ pub(super) fn wrap_transcript(
     let mut text_lines: Vec<Line<'static>> = Vec::new();
     let mut rows: Vec<String> = Vec::new();
     let mut row_bars: Vec<Option<Color>> = Vec::new();
+    let mut image_rows: Vec<(usize, ImageAnchor)> = Vec::new();
     for (idx, sl) in lines.iter().enumerate() {
         let bar = bars.get(idx).copied().flatten();
+        if let Some(anchor) = sl.image {
+            image_rows.push((text_lines.len(), anchor));
+        }
+        if sl.no_wrap {
+            text_lines.push(sl.line.clone());
+            rows.push(sl.plain.clone());
+            row_bars.push(bar);
+            continue;
+        }
         for vrow in wrap_styled_line(&sl.line.spans, width) {
             let vrow = fill_trailing_background(vrow, width);
             text_lines.push(vrow.line);
@@ -215,6 +243,7 @@ pub(super) fn wrap_transcript(
         text: Text::from(text_lines),
         rows: std::sync::Arc::new(rows),
         bars: row_bars,
+        image_rows,
     }
 }
 
@@ -898,6 +927,8 @@ fn mark_block_from(
             out.push(StyledLine {
                 line: Line::from(spans),
                 plain: format!("{lead_plain}{}", row.plain),
+                image: row.image,
+                no_wrap: row.no_wrap,
             });
         }
     }
@@ -1551,24 +1582,36 @@ fn strip_leading_cd<'a>(cmd: &'a str, cwd: &str) -> &'a str {
 }
 
 /// Final path segment (handles both `/` and `\` separators).
-fn basename(path: &str) -> String {
+pub(super) fn basename(path: &str) -> String {
     path.rsplit(['/', '\\'])
         .find(|s| !s.is_empty())
         .unwrap_or(path)
         .to_string()
 }
 
-/// Basenames from the aivo-authored `[image saved: …]` trailer — only text after
-/// the last `</untrusted>` counts (in-frame text could fake the marker).
+/// Basenames from the aivo-authored `[image saved: …]` trailer.
 pub(super) fn saved_image_names(result: &str) -> Vec<String> {
+    saved_image_paths(result)
+        .iter()
+        .map(|p| basename(p))
+        .collect()
+}
+
+/// Full paths from the `[image saved: …]` trailer — only text after the last
+/// `</untrusted>` counts (in-frame text could fake the marker).
+pub(super) fn saved_image_paths(result: &str) -> Vec<String> {
     let Some((_, tail)) = result.rsplit_once("</untrusted>") else {
         return Vec::new();
     };
     tail.lines()
         .filter_map(|l| {
             let inner = l.trim().strip_prefix("[image saved: ")?.strip_suffix(']')?;
-            let path = inner.rsplit_once(" (").map_or(inner, |(p, _)| p);
-            Some(basename(path))
+            Some(
+                inner
+                    .rsplit_once(" (")
+                    .map_or(inner, |(p, _)| p)
+                    .to_string(),
+            )
         })
         .collect()
 }
@@ -2608,6 +2651,8 @@ pub(super) fn indent_styled_line(sl: StyledLine, n: usize) -> StyledLine {
     StyledLine {
         line: Line::from(spans),
         plain: format!("{pad}{}", sl.plain),
+        image: sl.image,
+        no_wrap: sl.no_wrap,
     }
 }
 
@@ -3994,6 +4039,7 @@ impl MarkdownRenderer {
         let line = StyledLine {
             line: Line::from(std::mem::take(&mut self.current_spans)),
             plain: std::mem::take(&mut self.current_plain),
+            ..Default::default()
         };
         self.lines.push(line);
     }
@@ -4066,6 +4112,7 @@ pub(super) fn line_plain(text: String, style: Style) -> StyledLine {
     StyledLine {
         plain: text.clone(),
         line: Line::from(Span::styled(text, style)),
+        ..Default::default()
     }
 }
 
@@ -4077,6 +4124,7 @@ pub(super) fn line_with_plain(spans: Vec<Span<'static>>) -> StyledLine {
     StyledLine {
         line: Line::from(spans),
         plain,
+        ..Default::default()
     }
 }
 

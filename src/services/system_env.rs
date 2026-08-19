@@ -90,7 +90,12 @@ pub fn username() -> Option<String> {
 /// Parse an on/off env flag; `None` means unset/empty (caller's default applies).
 /// The one truthiness rule — hand-rolled per-site checks used to drift.
 pub fn env_flag(var: &str) -> Option<bool> {
-    let v = std::env::var(var).ok()?;
+    flag_value(&std::env::var(var).ok()?)
+}
+
+/// [`env_flag`]'s truthiness rule on an already-fetched value, for callers
+/// that read env indirectly (e.g. through an injectable lookup).
+pub fn flag_value(v: &str) -> Option<bool> {
     let v = v.trim();
     if v.is_empty() {
         return None;

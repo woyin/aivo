@@ -352,6 +352,11 @@ impl CodeTuiApp {
         // The click handler recomputes this list for its ordinal map.
         let folds = self.step_folds(render_len);
 
+        // One preview block per image PER TURN, whichever mention renders
+        // first (see `push_preview_once`); reset at each user message so
+        // "show it again" in a later turn renders again.
+        let mut previewed: std::collections::HashSet<u64> = std::collections::HashSet::new();
+
         // The previous lone tool call's `→` row — the row an adjacent result
         // merges onto instead of spending a `⎿` line.
         let mut merge_anchor: Option<usize> = None;
@@ -413,12 +418,28 @@ impl CodeTuiApp {
                     advance = fold_len;
                 }
                 "user" => {
+                    previewed.clear();
                     // A skill invocation stores the full expanded SKILL.md as the
                     // user message (the model needs it), but the transcript should
                     // show the compact `/name args` the user actually typed.
                     let label = super::skill_invocation_label(&message.content);
                     let shown = label.as_deref().unwrap_or(&message.content);
                     render_user_message(&mut block, shown, &message.attachments, text_width);
+                    self.push_attachment_preview_lines(
+                        &mut block,
+                        &mut previewed,
+                        idx,
+                        &message.content,
+                        &message.attachments,
+                        text_width,
+                    );
+                    self.push_text_image_preview_lines(
+                        &mut block,
+                        &mut previewed,
+                        idx,
+                        &message.content,
+                        text_width,
+                    );
                 }
                 "assistant" => {
                     let reasoning = self
@@ -446,6 +467,20 @@ impl CodeTuiApp {
                             text_width,
                             role_bar_color("assistant"),
                             true,
+                        );
+                        let mut extra = Vec::new();
+                        self.push_text_image_preview_lines(
+                            &mut extra,
+                            &mut previewed,
+                            idx,
+                            &message.content,
+                            text_width,
+                        );
+                        push_block(
+                            &mut lines,
+                            &mut bars,
+                            extra,
+                            Some(role_bar_color("assistant")),
                         );
                     }
                 }
@@ -532,9 +567,23 @@ impl CodeTuiApp {
                                 Some(name.as_str()),
                                 expanded,
                             );
+                            self.push_saved_image_preview_lines(
+                                &mut block,
+                                &mut previewed,
+                                res_idx,
+                                content,
+                                text_width,
+                            );
                         } else {
                             anchor_call = true;
                         }
+                        self.push_tool_image_preview_lines(
+                            &mut block,
+                            &mut previewed,
+                            idx,
+                            &message.content,
+                            text_width,
+                        );
                     }
                 }
                 // Drawn under its call; empty block still carries a `✻ Done in` marker.
@@ -580,6 +629,13 @@ impl CodeTuiApp {
                             expanded,
                         ),
                     }
+                    self.push_saved_image_preview_lines(
+                        &mut block,
+                        &mut previewed,
+                        idx,
+                        &message.content,
+                        text_width,
+                    );
                 }
                 "local_command" => {
                     // Expanded renders the in-memory output (persisted preview after a
@@ -1159,6 +1215,9 @@ impl CodeTuiApp {
         if fresh {
             return;
         }
+        // New images referenced by this rebuild start their (async) preview
+        // prep here; completion bumps `transcript_revision`, re-entering once.
+        self.queue_missing_previews();
         let body = self.build_transcript_history_body(table_layout_width(area_width));
         let plain_width = table_layout_width(area_width).max(1);
         let plain_prepass = wrap_plain_lines(&body.plain_lines, plain_width).len();
@@ -1639,6 +1698,20 @@ impl CodeTuiApp {
             self.render_login_card(frame, composer_area, outer);
         }
 
+        // Images float above cells, so anything drawn over the transcript
+        // (overlays, decision cards, the command menu) must suppress them for
+        // the frame — the post-draw flush then deletes the stale placements.
+        let covering_surface = !matches!(self.overlay, Overlay::None)
+            || self.visible_command_menu().is_some()
+            || self.cards.mcp_consent.is_some()
+            || self.cards.plan_continue.is_some()
+            || self.cards.any_agent_card()
+            || self.account.pending_logout.is_some()
+            || self.account.login.is_some();
+        if covering_surface {
+            self.inline_images.desired.clear();
+        }
+
         // Snapshot the finished screen so a drag can copy from anywhere on it,
         // then wash the full-screen selection over whatever now sits there.
         self.capture_screen_surface(frame);
@@ -1663,6 +1736,14 @@ impl CodeTuiApp {
             let mut row = String::with_capacity(usize::from(area.width));
             for x in area.x..area.x.saturating_add(area.width) {
                 if let Some(cell) = buffer.cell((x, y)) {
+                    // Image placeholder cells copy as blanks, not U+10EEEE noise.
+                    if cell
+                        .symbol()
+                        .starts_with(crate::services::terminal_graphics::PLACEHOLDER_CHAR)
+                    {
+                        row.push(' ');
+                        continue;
+                    }
                     // Wide-char spacers carry an empty symbol, so the row's display
                     // width stays equal to its column count.
                     row.push_str(cell.symbol());
@@ -2648,6 +2729,8 @@ impl CodeTuiApp {
             segments,
         });
 
+        self.collect_desired_inline_images(transcript_text_area);
+
         clear_to_canvas(frame, chunks[0]);
 
         if is_empty {
@@ -3295,6 +3378,7 @@ impl CodeTuiApp {
         if mcp > 0 {
             parts.push(format!("{mcp} MCP"));
         }
+        parts.extend(self.inline_images.caps.protocol.label().map(str::to_string));
         (!parts.is_empty()).then(|| parts.join(" · "))
     }
 

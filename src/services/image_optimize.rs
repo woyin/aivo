@@ -17,8 +17,8 @@ pub struct OptimizedImage {
     pub mime_type: String,
 }
 
-#[derive(Clone, Copy)]
-enum SniffedFormat {
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SniffedFormat {
     Png,
     Jpeg,
 }
@@ -56,7 +56,21 @@ pub fn optimize_base64(data: &str) -> Option<(String, String)> {
     Some((image.mime_type, BASE64.encode(image.bytes)))
 }
 
-fn sniff_format(bytes: &[u8]) -> Option<SniffedFormat> {
+/// Decoded RGB capped to `max_edge` on the long side, for terminal previews.
+pub(crate) fn preview_rgb(bytes: &[u8], max_edge: u32) -> Option<(Vec<u8>, u32, u32)> {
+    let format = sniff_format(bytes)?;
+    let (width, height) = probe_dimensions(bytes, format)?;
+    if u64::from(width) * u64::from(height) > MAX_DECODE_PIXELS {
+        return None;
+    }
+    let rgb = decode_rgb(bytes, format, width, height)?;
+    match clamped_dimensions_to(width, height, max_edge) {
+        Some((nw, nh)) => Some((box_downscale_rgb(&rgb, width, height, nw, nh), nw, nh)),
+        None => Some((rgb, width, height)),
+    }
+}
+
+pub(crate) fn sniff_format(bytes: &[u8]) -> Option<SniffedFormat> {
     match bytes {
         [0x89, b'P', b'N', b'G', ..] => Some(SniffedFormat::Png),
         [0xFF, 0xD8, 0xFF, ..] => Some(SniffedFormat::Jpeg),
@@ -65,7 +79,7 @@ fn sniff_format(bytes: &[u8]) -> Option<SniffedFormat> {
 }
 
 /// Reads dimensions before allocating a decoded pixel buffer.
-fn probe_dimensions(bytes: &[u8], format: SniffedFormat) -> Option<(u32, u32)> {
+pub(crate) fn probe_dimensions(bytes: &[u8], format: SniffedFormat) -> Option<(u32, u32)> {
     let (w, h) = match format {
         SniffedFormat::Png => {
             let mut decoder = zune_png::PngDecoder::new(bytes);
@@ -136,14 +150,27 @@ fn decode_jpeg_rgb(bytes: &[u8]) -> Option<Vec<u8>> {
     zune_jpeg::JpegDecoder::new(bytes).decode().ok()
 }
 
+/// Box-average RGB to exactly `nw`×`nh` (nearest-neighbor when upscaling),
+/// for cell-painted previews whose grid is fixed by the terminal layout.
+pub(crate) fn resample_rgb_exact(rgb: &[u8], w: u32, h: u32, nw: u32, nh: u32) -> Vec<u8> {
+    if w == 0 || h == 0 || nw == 0 || nh == 0 || rgb.len() != (w * h * 3) as usize {
+        return vec![0; (nw * nh * 3) as usize];
+    }
+    box_downscale_rgb(rgb, w, h, nw, nh)
+}
+
 fn clamped_dimensions(width: u32, height: u32) -> Option<(u32, u32)> {
+    clamped_dimensions_to(width, height, MAX_EDGE_PX)
+}
+
+fn clamped_dimensions_to(width: u32, height: u32, max_edge: u32) -> Option<(u32, u32)> {
     let long_edge = width.max(height);
-    if long_edge <= MAX_EDGE_PX {
+    if long_edge <= max_edge {
         return None;
     }
     let scale = |edge: u32| -> u32 {
-        let scaled = u64::from(edge) * u64::from(MAX_EDGE_PX) / u64::from(long_edge);
-        u32::try_from(scaled).unwrap_or(MAX_EDGE_PX).max(1)
+        let scaled = u64::from(edge) * u64::from(max_edge) / u64::from(long_edge);
+        u32::try_from(scaled).unwrap_or(max_edge).max(1)
     };
     Some((scale(width), scale(height)))
 }
