@@ -2084,7 +2084,7 @@ impl CodeTuiApp {
         if chat_mouse_enabled() {
             let _ = execute!(terminal.backend_mut(), EnableMouseCapture);
         }
-        let _ = terminal.clear();
+        let _ = terminal.clear(); // contract-ok: re-entering alt screen after $EDITOR needs a clean slate
 
         if let Err(err) = result {
             self.notice = Some((ERROR(), format!("External edit failed: {err:#}")));

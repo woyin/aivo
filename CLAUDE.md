@@ -58,6 +58,20 @@ src/main.rs → src/commands/* → SessionStore → EnvironmentInjector → AILa
 
 **Exit codes**: 0 = success, 1 = user error, 2 = network, 3 = auth.
 
+## Anti-goals
+
+Settled constraints — don't re-add or work around. The greppable ones are enforced by `tests/contracts.rs`; when adding here, extend its lists too.
+
+- No hardcoded provider/model data — derive from `/v1/models` or the models.dev sync.
+- Never `terminal.clear()` in the code TUI — corruption self-heals via full repaint.
+- No progress bars or emoji in TUI output.
+- `/review`, `/vision`, and `/detach` commands are removed — review mode and the vision fallback stay.
+- No OSC 11 theme auto-detection — it leaks over slow SSH; default dark.
+- Never modify a launched coding agent's own config files (claude, codex, amp, gemini, …) — aivo injects env vars and override dirs instead.
+- Help stays hand-rolled (`print_help*`), never clap-generated.
+- No second execution path for the same feature — one agent engine serves the code TUI and oneshot.
+- Releases ship via R2 + Homebrew; no GitHub Releases (`gh release list` is empty by design).
+
 ## Instructions
 
 * Restate the question in fully concrete terms, making every implicit detail explicit. Then answer.

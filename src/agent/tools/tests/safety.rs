@@ -266,7 +266,7 @@ fn readonly_command_allowlist() {
     // Inspection commands and combinations of them read as read-only.
     assert!(bash_is_readonly("git diff --cached --stat"));
     assert!(bash_is_readonly(
-        "cd /Users/yc/project/work/aivo && git diff --cached --stat"
+        "cd /Users/dev/project/work/aivo && git diff --cached --stat"
     ));
     assert!(bash_is_readonly("git log --oneline -20"));
     assert!(bash_is_readonly("git -C sub --no-pager status"));

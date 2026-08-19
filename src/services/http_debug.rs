@@ -977,12 +977,12 @@ mod tests {
 
     #[test]
     fn redact_body_scrubs_bearer_token_in_codex_approved_prefixes() {
-        // Real shape pulled from a codex /responses payload: the bearer
-        // sits inside an `approved_command_prefixes` curl literal, so the
-        // scrubber has to find it without parsing JSON.
-        let body = "{\"prefixes\":[\"curl\",\"-H\",\"Authorization: Bearer sk-8OHXJR2LGKlPkGNWa0dp1QVPdTJZO5IP\"]}";
+        // Shape as seen in a codex /responses payload (token synthesized): the
+        // bearer sits inside an `approved_command_prefixes` curl literal, so
+        // the scrubber has to find it without parsing JSON.
+        let body = "{\"prefixes\":[\"curl\",\"-H\",\"Authorization: Bearer sk-FAKEfake0FAKEfake0FAKEfake0FAKEf\"]}";
         let out = redact_body(body);
-        assert!(!out.contains("sk-8OHXJR2"), "token leaked: {out}");
+        assert!(!out.contains("sk-FAKEfake0"), "token leaked: {out}");
         assert!(out.contains("Bearer [REDACTED]"), "shape lost: {out}");
     }
 
