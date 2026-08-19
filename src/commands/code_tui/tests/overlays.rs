@@ -495,6 +495,126 @@ async fn config_overlay_renders_live_values_and_focused_options() {
     for label in ["normal", "auto-approve", "review"] {
         assert!(text.contains(label), "option {label:?} missing:\n{text}");
     }
+    assert!(
+        text.contains("Risky actions"),
+        "active-value copy missing:\n{text}"
+    );
+}
+
+#[tokio::test]
+async fn config_overlay_split_shows_inspector_beside_list() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.open_config_overlay();
+    // 84% of 100 = 84 cols, inner 80 >= SPLIT_MIN_INNER_WIDTH (76).
+    let (text, _) = render_full_screen(&mut app, 100, 30);
+    assert!(text.contains("│"), "split rule missing:\n{text}");
+    assert!(
+        text.contains("Dark palette") || text.contains("Applies immediately"),
+        "Theme inspector missing on the right:\n{text}"
+    );
+    assert!(text.contains("Image generation"), "list missing:\n{text}");
+    for header in ["Appearance", "Behavior", "Media"] {
+        assert!(text.contains(header), "group {header:?} missing:\n{text}");
+    }
+}
+
+#[tokio::test]
+async fn config_overlay_click_selects_list_row() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.open_config_overlay();
+    let _ = render_full_screen(&mut app, 100, 30);
+    let hitbox = app
+        .picker_hitbox
+        .clone()
+        .expect("config list hitbox recorded");
+    // Visual rows (split, with group gaps): Appearance, Theme, Thinking, blank,
+    // Behavior, Mode, Web search, Agent tools, blank, Media, Vision fallback,
+    // Image generation.
+    let image_row = hitbox.list_area.y + 11;
+    app.handle_mouse(left_click(hitbox.list_area.x, image_row))
+        .await
+        .unwrap();
+    match &app.overlay {
+        Overlay::Config(state) => {
+            assert_eq!(state.items[state.selected].setting, ConfigSetting::ImageGen)
+        }
+        _ => panic!("expected config overlay"),
+    }
+}
+
+#[tokio::test]
+async fn config_overlay_click_header_does_not_change_selection() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.open_config_overlay();
+    let _ = render_full_screen(&mut app, 100, 30);
+    let hitbox = app
+        .picker_hitbox
+        .clone()
+        .expect("config list hitbox recorded");
+    app.handle_mouse(left_click(hitbox.list_area.x, hitbox.list_area.y))
+        .await
+        .unwrap();
+    match &app.overlay {
+        Overlay::Config(state) => {
+            assert_eq!(state.items[state.selected].setting, ConfigSetting::Theme)
+        }
+        _ => panic!("expected config overlay"),
+    }
+}
+
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
+async fn config_overlay_click_segment_sets_theme() {
+    let _theme = theme_lock();
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    assert_eq!(app.theme, UiTheme::Dark);
+    app.open_config_overlay();
+    let _ = render_full_screen(&mut app, 100, 30);
+    let hitbox = app
+        .picker_hitbox
+        .clone()
+        .expect("config segment hits recorded");
+    let light = hitbox
+        .segment_hits
+        .iter()
+        .find(|(_, option)| *option == 1)
+        .map(|(area, _)| *area)
+        .expect("light pill hitbox");
+    app.handle_mouse(left_click(light.x + 1, light.y))
+        .await
+        .unwrap();
+    assert_eq!(app.theme, UiTheme::Light);
+    // Theme is process-global; put Dark back so later tests see the default.
+    app.cycle_config_setting(0, CycleDir::Enter).await;
+    assert_eq!(app.theme, UiTheme::Dark);
+}
+
+#[tokio::test]
+async fn config_overlay_reopens_on_last_setting() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.open_config_overlay();
+    if let Overlay::Config(state) = &mut app.overlay {
+        state.selected = state
+            .items
+            .iter()
+            .position(|i| i.setting == ConfigSetting::ImageGen)
+            .unwrap();
+    }
+    app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+        .await
+        .unwrap();
+    app.open_config_overlay();
+    match &app.overlay {
+        Overlay::Config(state) => {
+            assert_eq!(state.items[state.selected].setting, ConfigSetting::ImageGen)
+        }
+        _ => panic!("expected config overlay"),
+    }
 }
 
 #[tokio::test]

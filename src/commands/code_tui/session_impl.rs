@@ -400,7 +400,10 @@ is preserved."
     /// fetch has to authenticate with the real one.
     fn open_describer_model_picker(&mut self, mut key: ApiKey) {
         if let Err(e) = SessionStore::decrypt_key_secret(&mut key) {
-            self.notice = Some((ERROR(), format!("couldn't unlock key: {e}")));
+            self.set_config_error(
+                ConfigSetting::VisionFallback,
+                format!("couldn't unlock key: {e}"),
+            );
             return;
         }
         self.open_model_picker(None, ModelSelectionTarget::VisionDescriber(key), false);
@@ -412,7 +415,10 @@ is preserved."
         let keys = match self.session_store.get_keys().await {
             Ok(keys) => keys,
             Err(e) => {
-                self.notice = Some((ERROR(), format!("couldn't read keys: {e}")));
+                self.set_config_error(
+                    ConfigSetting::VisionFallback,
+                    format!("couldn't read keys: {e}"),
+                );
                 return;
             }
         };
@@ -421,11 +427,10 @@ is preserved."
             .filter(crate::commands::code_agent_oneshot::key_is_agent_capable)
             .collect();
         if eligible.is_empty() {
-            self.notice = Some((
-                ERROR(),
-                "No key can serve as a describer (needs an API key, not launch-bound OAuth/ACP)"
-                    .to_string(),
-            ));
+            self.set_config_error(
+                ConfigSetting::VisionFallback,
+                "No key can serve as a describer (needs an API key, not launch-bound OAuth/ACP)",
+            );
             return;
         }
         if eligible.len() == 1 {
@@ -454,7 +459,7 @@ is preserved."
         let keys = match self.session_store.get_keys().await {
             Ok(keys) => keys,
             Err(e) => {
-                self.notice = Some((ERROR(), format!("couldn't read keys: {e}")));
+                self.set_config_error(ConfigSetting::ImageGen, format!("couldn't read keys: {e}"));
                 return;
             }
         };
@@ -463,11 +468,10 @@ is preserved."
             .filter(crate::commands::code_agent_oneshot::key_is_agent_capable)
             .collect();
         if eligible.is_empty() {
-            self.notice = Some((
-                ERROR(),
-                "No key can serve as a generator (needs an API key, not launch-bound OAuth/ACP)"
-                    .to_string(),
-            ));
+            self.set_config_error(
+                ConfigSetting::ImageGen,
+                "No key can serve as a generator (needs an API key, not launch-bound OAuth/ACP)",
+            );
             return;
         }
         if eligible.len() == 1 {
@@ -495,7 +499,7 @@ is preserved."
     /// authenticate with the real one.
     fn open_image_generator_model_picker(&mut self, mut key: ApiKey) {
         if let Err(e) = SessionStore::decrypt_key_secret(&mut key) {
-            self.notice = Some((ERROR(), format!("couldn't unlock key: {e}")));
+            self.set_config_error(ConfigSetting::ImageGen, format!("couldn't unlock key: {e}"));
             return;
         }
         self.open_model_picker(None, ModelSelectionTarget::ImageGenerator(key), false);
@@ -716,69 +720,177 @@ is preserved."
 
     /// `/config`: a fixed list of chat-preference segmented switches, seeded live.
     pub(super) fn open_config_overlay(&mut self) {
-        let thinking_desc = if self.model_supports_thinking {
-            "let the model reason before answering (shown folded)"
-        } else {
-            "let the model reason (this model has no thinking)"
-        };
         let items = vec![
             ConfigRow {
                 setting: ConfigSetting::Theme,
                 label: "Theme",
-                description: "color palette for the whole TUI".to_string(),
             },
             ConfigRow {
                 setting: ConfigSetting::Thinking,
                 label: "Thinking",
-                description: thinking_desc.to_string(),
             },
             ConfigRow {
                 setting: ConfigSetting::Approval,
                 label: "Mode",
-                description: "auto-approve runs unattended · review each edit".to_string(),
             },
             ConfigRow {
                 setting: ConfigSetting::UseWebSearch,
                 label: "Web search",
-                description: "let the agent search the web via aivo (daily quota)".to_string(),
             },
             ConfigRow {
                 setting: ConfigSetting::AgentTools,
                 label: "Agent tools",
-                description: "off = plain chat: no tools, no system prompt".to_string(),
             },
             ConfigRow {
                 setting: ConfigSetting::VisionFallback,
                 label: "Vision fallback",
-                description: self.vision_fallback_desc(),
             },
             ConfigRow {
                 setting: ConfigSetting::ImageGen,
                 label: "Image generation",
-                description: self.image_gen_desc(),
             },
         ];
-        self.overlay = Overlay::Config(ConfigOverlay { items, selected: 0 });
+        let selected = self
+            .last_config_setting
+            .and_then(|setting| items.iter().position(|item| item.setting == setting))
+            .unwrap_or(0);
+        self.overlay = Overlay::Config(ConfigOverlay {
+            items,
+            selected,
+            error: None,
+            detail_scroll: 0,
+        });
     }
 
-    /// Read fresh at render so a mid-overlay flip to `custom` names the picked
-    /// model. Model first — a narrow overlay clips the tail.
-    pub(super) fn vision_fallback_desc(&self) -> String {
-        match (&self.vision_fallback, &self.vision_fallback_custom) {
-            (crate::services::session_store::VisionFallbackMode::Custom, Some((_, model))) => {
-                format!("{model} describes images · enter re-picks")
-            }
-            _ => "describe images for text-only models · custom picks a key + model".to_string(),
+    /// Open `/config` with `setting` focused — picker drill-in entry and Esc/error exit.
+    pub(super) fn open_config_overlay_at(&mut self, setting: ConfigSetting) {
+        self.open_config_overlay();
+        if let Overlay::Config(state) = &mut self.overlay
+            && let Some(row) = state.items.iter().position(|i| i.setting == setting)
+        {
+            state.selected = row;
+            self.last_config_setting = Some(setting);
         }
     }
 
-    /// Read fresh at render so a mid-overlay flip to `custom` names the picked model.
-    pub(super) fn image_gen_desc(&self) -> String {
-        match (&self.image_gen, &self.image_gen_custom) {
-            (crate::services::session_store::ImageGenMode::Custom, Some((_, model))) => {
-                format!("{model} generates images · enter re-picks")
+    /// A drill-in failure belongs on the setting, not the transcript notice
+    /// (the modal sits far below the transcript, so the two never read together).
+    pub(super) fn set_config_error(&mut self, setting: ConfigSetting, message: impl Into<String>) {
+        self.notice = None;
+        self.open_config_overlay_at(setting);
+        if let Overlay::Config(state) = &mut self.overlay {
+            state.error = Some((setting, message.into()));
+        }
+    }
+
+    /// What the focused setting's *live* value means — one paragraph, not a
+    /// glossary of every alternative (those sit in the segmented control).
+    pub(super) fn config_active_help(&self, setting: ConfigSetting) -> String {
+        let segs = self.config_segments(setting);
+        let opt = segs.options.get(segs.active).copied().unwrap_or("");
+        match (setting, opt) {
+            (ConfigSetting::Theme, "light") => {
+                "Light palette for the whole TUI. Applies immediately.".to_string()
             }
-            _ => "give the agent a generate_image tool · custom picks a key + model".to_string(),
+            (ConfigSetting::Theme, _) => {
+                "Dark palette for the whole TUI. Applies immediately.".to_string()
+            }
+            (ConfigSetting::Thinking, "on") if self.model_supports_thinking => {
+                "The model reasons before answering. Thinking is shown folded.".to_string()
+            }
+            (ConfigSetting::Thinking, "on") => {
+                "This model has no thinking; the toggle is remembered for models that do."
+                    .to_string()
+            }
+            (ConfigSetting::Thinking, _) => {
+                "Answers directly, without a thinking block.".to_string()
+            }
+            (ConfigSetting::Approval, "auto-approve") => {
+                "Tools run unattended. Plan mode is still /plan (or Shift+Tab).".to_string()
+            }
+            (ConfigSetting::Approval, "review") => {
+                "Approve each edit before it's applied.".to_string()
+            }
+            (ConfigSetting::Approval, _) => {
+                "Risky actions ask first. Plan mode is /plan (or Shift+Tab), not a standing setting."
+                    .to_string()
+            }
+            (ConfigSetting::UseWebSearch, "on") => {
+                "The agent can search the web through aivo (daily quota).".to_string()
+            }
+            (ConfigSetting::UseWebSearch, _) => {
+                "The agent won't search via aivo.".to_string()
+            }
+            (ConfigSetting::AgentTools, "on") => {
+                "The agent can edit files, run commands, and use tools.".to_string()
+            }
+            (ConfigSetting::AgentTools, _) => {
+                "Plain chat: no tools, no system prompt.".to_string()
+            }
+            (ConfigSetting::VisionFallback, "custom") => {
+                "The picked model describes images the chat model can't read.".to_string()
+            }
+            (ConfigSetting::VisionFallback, "off") => {
+                "Text-only models refuse images.".to_string()
+            }
+            (ConfigSetting::VisionFallback, _) => {
+                "When the chat model can't read images, aivo describes them (daily quota)."
+                    .to_string()
+            }
+            (ConfigSetting::ImageGen, "custom") => {
+                "The agent can generate images with this model.".to_string()
+            }
+            (ConfigSetting::ImageGen, _) => {
+                "The agent can't generate images. Switch to custom to pick a key with an image-output model."
+                    .to_string()
+            }
+        }
+    }
+
+    /// The live custom model for vision/image, if that mode is on.
+    pub(super) fn config_current_model(&self, setting: ConfigSetting) -> Option<&str> {
+        self.config_current_pick(setting).map(|(_, model)| model)
+    }
+
+    pub(super) fn config_current_pick(&self, setting: ConfigSetting) -> Option<(&str, &str)> {
+        match setting {
+            ConfigSetting::VisionFallback => {
+                match (&self.vision_fallback, &self.vision_fallback_custom) {
+                    (
+                        crate::services::session_store::VisionFallbackMode::Custom,
+                        Some((key, model)),
+                    ) => Some((key.as_str(), model.as_str())),
+                    _ => None,
+                }
+            }
+            ConfigSetting::ImageGen => match (&self.image_gen, &self.image_gen_custom) {
+                (crate::services::session_store::ImageGenMode::Custom, Some((key, model))) => {
+                    Some((key.as_str(), model.as_str()))
+                }
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// List-row value: the live model when a custom pick is on, else the segment label.
+    pub(super) fn config_list_value(&self, setting: ConfigSetting) -> &str {
+        if let Some(model) = self.config_current_model(setting) {
+            return model;
+        }
+        let segs = self.config_segments(setting);
+        segs.options.get(segs.active).copied().unwrap_or("")
+    }
+
+    pub(super) fn config_has_drill_in(&self, setting: ConfigSetting) -> bool {
+        match setting {
+            ConfigSetting::VisionFallback => {
+                self.vision_fallback == crate::services::session_store::VisionFallbackMode::Custom
+            }
+            ConfigSetting::ImageGen => {
+                self.image_gen == crate::services::session_store::ImageGenMode::Custom
+            }
+            _ => false,
         }
     }
 
@@ -895,6 +1007,26 @@ is preserved."
             .await;
     }
 
+    /// Mouse: pick a specific segment. Clicking the live `custom` pill re-opens
+    /// the key/model picker — same as Enter on that row.
+    pub(super) async fn pick_config_segment(&mut self, option: usize) {
+        let Overlay::Config(state) = &self.overlay else {
+            return;
+        };
+        let row = state.selected;
+        let Some(setting) = self.config_row_setting(row) else {
+            return;
+        };
+        let segs = self.config_segments(setting);
+        if segs.active == option {
+            if self.config_has_drill_in(setting) {
+                self.cycle_config_setting(row, CycleDir::Enter).await;
+            }
+            return;
+        }
+        self.set_config_segment(setting, option).await;
+    }
+
     /// Apply `setting`'s `target` segment live (+persist); no-op if already active.
     async fn set_config_segment(&mut self, setting: ConfigSetting, target: usize) {
         let segs = self.config_segments(setting);
@@ -1009,6 +1141,7 @@ is preserved."
             return;
         }
         self.vision_fallback = mode;
+        self.clear_config_error_if(ConfigSetting::VisionFallback);
         let toast = match mode {
             VisionFallbackMode::Gateway => {
                 "Vision fallback: aivo describes images (daily quota)".to_string()
@@ -1031,8 +1164,7 @@ is preserved."
     pub(super) async fn apply_vision_describer(&mut self, key: ApiKey, model: String) {
         use crate::services::session_store::VisionFallbackMode;
         if let Err(message) = super::validate_describer_model(&model, &self.model) {
-            self.open_config_overlay_at_vision();
-            self.notice = Some((ERROR(), message));
+            self.set_config_error(ConfigSetting::VisionFallback, message);
             return;
         }
         self.vision_fallback_custom = Some((key.id.clone(), model.clone()));
@@ -1041,25 +1173,11 @@ is preserved."
             .session_store
             .set_chat_vision_fallback(VisionFallbackMode::Custom, Some((&key.id, &model)))
             .await;
-        self.open_config_overlay_at_vision();
+        self.open_config_overlay_at(ConfigSetting::VisionFallback);
         self.show_toast(format!(
             "Vision fallback: {model} via {}",
             key.display_name()
         ));
-    }
-
-    /// The describer flow's entry and exit point, so Esc/completion lands back
-    /// where the user started.
-    pub(super) fn open_config_overlay_at_vision(&mut self) {
-        self.open_config_overlay();
-        if let Overlay::Config(state) = &mut self.overlay
-            && let Some(row) = state
-                .items
-                .iter()
-                .position(|i| i.setting == ConfigSetting::VisionFallback)
-        {
-            state.selected = row;
-        }
     }
 
     /// `custom` is only ever set with a generator pair in hand (picker flow /
@@ -1073,6 +1191,7 @@ is preserved."
             return;
         }
         self.image_gen = mode;
+        self.clear_config_error_if(ConfigSetting::ImageGen);
         let toast = match mode {
             ImageGenMode::Custom => match &self.image_gen_custom {
                 Some((_, model)) => format!("Image generation: {model} (generate_image tool)"),
@@ -1087,8 +1206,7 @@ is preserved."
     pub(super) async fn apply_image_generator(&mut self, key: ApiKey, model: String) {
         use crate::services::session_store::ImageGenMode;
         if let Err(message) = super::validate_generator_model(&model, &self.model) {
-            self.open_config_overlay_at_image_gen();
-            self.notice = Some((ERROR(), message));
+            self.set_config_error(ConfigSetting::ImageGen, message);
             return;
         }
         self.image_gen_custom = Some((key.id.clone(), model.clone()));
@@ -1097,24 +1215,19 @@ is preserved."
             .session_store
             .set_chat_image_gen(ImageGenMode::Custom, Some((&key.id, &model)))
             .await;
-        self.open_config_overlay_at_image_gen();
+        self.open_config_overlay_at(ConfigSetting::ImageGen);
         self.show_toast(format!(
             "Image generation: {model} via {}",
             key.display_name()
         ));
     }
 
-    /// The generator flow's entry and exit point, so Esc/completion lands back
-    /// where the user started.
-    pub(super) fn open_config_overlay_at_image_gen(&mut self) {
-        self.open_config_overlay();
+    /// Drop a row's overlay error once that setting actually changes.
+    fn clear_config_error_if(&mut self, setting: ConfigSetting) {
         if let Overlay::Config(state) = &mut self.overlay
-            && let Some(row) = state
-                .items
-                .iter()
-                .position(|i| i.setting == ConfigSetting::ImageGen)
+            && state.error.as_ref().is_some_and(|(s, _)| *s == setting)
         {
-            state.selected = row;
+            state.error = None;
         }
     }
 

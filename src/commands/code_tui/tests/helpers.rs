@@ -33,6 +33,18 @@ pub(super) fn notice_text(app: &CodeTuiApp) -> &str {
     app.notice.as_ref().map(|(_, n)| n.as_str()).unwrap_or("")
 }
 
+/// Overlay-scoped `/config` error ("" when none or the overlay isn't Config).
+pub(super) fn config_error_text(app: &CodeTuiApp) -> &str {
+    match &app.overlay {
+        Overlay::Config(state) => state
+            .error
+            .as_ref()
+            .map(|(_, message)| message.as_str())
+            .unwrap_or(""),
+        _ => "",
+    }
+}
+
 /// Theme is process-global: tests that flip it and tests that compare palette
 /// colors across draws must not overlap.
 pub(super) fn theme_lock() -> std::sync::MutexGuard<'static, ()> {

@@ -1654,20 +1654,21 @@ impl CodeTuiApp {
                 self.render_mcp_paste_overlay(frame, area, &paste);
             }
             Overlay::Config(config) => {
-                // Content-sized box; width capped, not a percentage, so a wide
-                // terminal doesn't fling the right-aligned values off to the edge.
-                let n = config.items.len() as u16;
-                let width = body
-                    .width
-                    .saturating_mul(7)
-                    .saturating_div(10)
-                    .clamp(48, 56);
-                // +9: borders, input, gap, blank, option strip, 2 description
-                // lines, footer.
-                let height = n + 9;
-                let area = centered_rect_fixed(width, height, body);
+                let (area, split) = split_overlay_area(body, 84, 80, 72, 82);
                 self.set_overlay_regions(area);
-                self.render_config_overlay(frame, area, &config);
+                let out = self.render_config_overlay(frame, area, &config, split);
+                self.overlay_detail_area = out.detail_area;
+                self.picker_hitbox = out.list_area.map(|list_area| PickerHitbox {
+                    overlay_area: area,
+                    list_area,
+                    row_to_filtered_index: out.list_row_index,
+                    segment_hits: out.segment_hits,
+                });
+                if let Overlay::Config(s) = &mut self.overlay
+                    && let Some(c) = out.detail_scroll
+                {
+                    s.detail_scroll = c;
+                }
             }
             Overlay::None => {}
         }

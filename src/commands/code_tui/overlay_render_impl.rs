@@ -109,6 +109,7 @@ impl CodeTuiApp {
                 overlay_area: area,
                 list_area: chunks[2],
                 row_to_filtered_index: Vec::new(),
+                ..Default::default()
             });
             frame.render_widget(
                 Paragraph::new("Loading available models…").style(Style::default().fg(MUTED())),
@@ -144,6 +145,7 @@ impl CodeTuiApp {
             overlay_area: area,
             list_area: chunks[2],
             row_to_filtered_index: row_to_filtered_index.into_iter().map(Some).collect(),
+            ..Default::default()
         });
 
         frame.render_widget(
@@ -231,6 +233,7 @@ impl CodeTuiApp {
             overlay_area: area,
             list_area: chunks[2],
             row_to_filtered_index,
+            ..Default::default()
         });
 
         frame.render_widget(
@@ -294,6 +297,7 @@ impl CodeTuiApp {
             detail_scroll: Some(clamped),
             detail_area: Some(right),
             scroll_for: Some(preview.session_id),
+            ..Default::default()
         }
     }
 
@@ -955,6 +959,7 @@ impl CodeTuiApp {
             detail_scroll,
             detail_area: Some(right),
             scroll_for: None,
+            ..Default::default()
         }
     }
 
@@ -1191,78 +1196,236 @@ impl CodeTuiApp {
             detail_scroll,
             detail_area: Some(right),
             scroll_for: None,
+            ..Default::default()
         }
     }
 
-    /// `/config`: one line per setting, name left and live value flush right.
-    /// Only the focused row spells out its alternatives (the strip under the
-    /// list) — the rest stay a scannable column of values. Shares the
-    /// `/skills` / `/mcp` chrome via [`render_toggle_list`].
+    /// `/config`: settings list + inspector. Wide terminals split (list left,
+    /// the focused setting's control / copy / error on the right); narrow stacks
+    /// the inspector under the list. Chrome matches `/skills` / `/mcp`.
     pub(super) fn render_config_overlay(
         &self,
         frame: &mut Frame<'_>,
         area: Rect,
         state: &ConfigOverlay,
-    ) {
-        let input_line = Line::from(Span::styled(
-            "Settings — remembered across sessions",
-            Style::default().fg(MUTED()),
-        ));
-
-        let inner_width = usize::from(area.width).saturating_sub(4).max(1);
-        let rows: Vec<Line> = state
-            .items
-            .iter()
-            .enumerate()
-            .map(|(pos, item)| {
-                let segs = self.config_segments(item.setting);
-                config_value_line(
-                    item.label,
-                    segs.options.get(segs.active).copied().unwrap_or(""),
-                    pos == state.selected,
-                    inner_width,
-                )
-            })
-            .collect();
-
-        let mut detail: Vec<Line> = Vec::new();
-        let mut footer = vec![("↑↓", "move"), ("←→", "change")];
-        if let Some(item) = state.items.get(state.selected) {
-            let segs = self.config_segments(item.setting);
-            detail.push(config_options_line(segs.options, segs.active));
-            let description = if item.setting == ConfigSetting::VisionFallback {
-                self.vision_fallback_desc()
-            } else {
-                item.description.clone()
-            };
-            let mut wrapped = wrap_words(&description, inner_width);
-            wrapped.resize(CONFIG_DESC_ROWS, String::new());
-            detail.extend(
-                wrapped
-                    .into_iter()
-                    .map(|line| Line::from(Span::styled(line, Style::default().fg(MUTED())))),
-            );
-            if item.setting == ConfigSetting::VisionFallback
-                && self.vision_fallback
-                    == crate::services::session_store::VisionFallbackMode::Custom
-            {
-                footer.push(("Enter", "pick model"));
-            }
-        }
-
-        render_toggle_list(
+        split: bool,
+    ) -> OverlayRenderOut {
+        let inner = overlay_shell(
             frame,
             area,
-            ToggleListView {
-                title: "Config",
-                badge: Some(("esc".to_string(), MUTED())),
-                input_line,
-                rows,
-                selected_pos: state.selected,
-                detail,
-                footer,
-            },
+            "Config",
+            Some(("remembered · esc".to_string(), MUTED())),
         );
+        if inner.height == 0 {
+            return OverlayRenderOut::default();
+        }
+
+        let mut footer = vec![("↑↓", "move"), ("←→", "change")];
+        if let Some(item) = state.items.get(state.selected)
+            && self.config_has_drill_in(item.setting)
+        {
+            footer.push(("Enter", "pick model"));
+        }
+
+        let footer_rect = Rect {
+            y: inner.y + inner.height - 1,
+            height: 1,
+            ..inner
+        };
+        let gap = u16::from(inner.height >= 8);
+        let body = Rect {
+            y: inner.y + gap,
+            height: inner.height.saturating_sub(gap + 1),
+            ..inner
+        };
+
+        let list_width = if split {
+            usize::from(body.width * 40 / 100).saturating_sub(1).max(1)
+        } else {
+            usize::from(body.width).saturating_sub(1).max(1)
+        };
+        let (rows, row_index, selected_pos) = self.config_list_lines(state, list_width, split);
+
+        let (list_pane, detail_pane) = if split && body.height > 0 {
+            let (left, rule, right) = split_columns(body);
+            render_vertical_rule(frame, rule);
+            (left, Some(right))
+        } else if body.height > 1 {
+            // Keep the inspector readable on short terminals — the list can
+            // scroll; a 2-line inspector with its own scroll chrome cannot.
+            let min_inspector = 7u16.min(body.height.saturating_sub(3)).max(1);
+            let list_h = (rows.len() as u16).min(body.height.saturating_sub(min_inspector));
+            (
+                Rect {
+                    height: list_h,
+                    ..body
+                },
+                Some(Rect {
+                    y: body.y + list_h,
+                    height: body.height.saturating_sub(list_h),
+                    ..body
+                })
+                .filter(|r| r.height > 0),
+            )
+        } else {
+            (body, None)
+        };
+
+        if list_pane.height > 0 {
+            let view_h = usize::from(list_pane.height);
+            let offset = selected_pos.saturating_sub(view_h.saturating_sub(1));
+            frame.render_widget(
+                Paragraph::new(Text::from(rows)).scroll((offset as u16, 0)),
+                list_pane,
+            );
+        }
+
+        let Some(detail_area) = detail_pane else {
+            render_footer_hints(frame, footer_rect, &footer);
+            return OverlayRenderOut {
+                list_area: Some(list_pane),
+                list_row_index: row_index,
+                ..Default::default()
+            };
+        };
+        let inspector = if split {
+            detail_area
+        } else {
+            render_horizontal_rule(
+                frame,
+                Rect {
+                    height: 1,
+                    ..detail_area
+                },
+            );
+            Rect {
+                y: detail_area.y + 1,
+                height: detail_area.height.saturating_sub(1),
+                ..detail_area
+            }
+        };
+        let width = usize::from(inspector.width).max(1);
+        let lines = self.config_setting_detail_lines(state, width);
+        let line_count = lines.len();
+        if line_count > usize::from(inspector.height) {
+            footer.push(("PgDn", "scroll"));
+        }
+        render_footer_hints(frame, footer_rect, &footer);
+        let clamped = render_detail_lines(frame, inspector, lines, state.detail_scroll);
+        let segment_hits = state
+            .items
+            .get(state.selected)
+            .map(|item| {
+                let segs = self.config_segments(item.setting);
+                config_segment_hitboxes(inspector, clamped, line_count, 1, segs.options)
+            })
+            .unwrap_or_default();
+        OverlayRenderOut {
+            detail_scroll: Some(clamped),
+            detail_area: Some(inspector),
+            list_area: Some(list_pane),
+            list_row_index: row_index,
+            segment_hits,
+            scroll_for: None,
+        }
+    }
+
+    /// Grouped settings list: appearance, behavior, then media. Headers are
+    /// labels only (not selectable); settings indent under them. Wide splits
+    /// get a blank between groups — the list is tall enough.
+    fn config_list_lines(
+        &self,
+        state: &ConfigOverlay,
+        width: usize,
+        group_gaps: bool,
+    ) -> (Vec<Line<'static>>, Vec<Option<usize>>, usize) {
+        let mut rows: Vec<Line<'static>> = Vec::new();
+        let mut row_index: Vec<Option<usize>> = Vec::new();
+        let mut selected_pos = 0usize;
+        for (pos, item) in state.items.iter().enumerate() {
+            if let Some(header) = config_group_header(item.setting) {
+                if group_gaps && pos > 0 {
+                    rows.push(Line::from(""));
+                    row_index.push(None);
+                }
+                rows.push(Line::from(Span::styled(
+                    header.to_string(),
+                    Style::default().fg(FAINT()),
+                )));
+                row_index.push(None);
+            }
+            let erred = state
+                .error
+                .as_ref()
+                .is_some_and(|(s, _)| *s == item.setting);
+            if pos == state.selected {
+                selected_pos = rows.len();
+            }
+            rows.push(config_value_line(
+                &format!("  {}", item.label),
+                self.config_list_value(item.setting),
+                pos == state.selected,
+                width,
+                erred,
+            ));
+            row_index.push(Some(pos));
+        }
+        (rows, row_index, selected_pos)
+    }
+
+    /// Inspector: setting title, the segmented control, then error, current
+    /// pick, and a paragraph for the live value.
+    fn config_setting_detail_lines(
+        &self,
+        state: &ConfigOverlay,
+        width: usize,
+    ) -> Vec<Line<'static>> {
+        let mut lines: Vec<Line<'static>> = Vec::new();
+        let Some(item) = state.items.get(state.selected) else {
+            return lines;
+        };
+        let segs = self.config_segments(item.setting);
+        lines.push(Line::from(Span::styled(
+            item.label.to_string(),
+            Style::default().fg(TEXT()).add_modifier(Modifier::BOLD),
+        )));
+        lines.push(config_segment_line(segs.options, segs.active));
+        if let Some((_, message)) = state.error.as_ref().filter(|(s, _)| *s == item.setting) {
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                "Couldn't pick",
+                Style::default().fg(ERROR()).add_modifier(Modifier::BOLD),
+            )));
+            lines.extend(
+                wrap_words(message, width)
+                    .into_iter()
+                    .map(|chunk| Line::from(Span::styled(chunk, Style::default().fg(ERROR())))),
+            );
+        }
+        if let Some((key, model)) = self.config_current_pick(item.setting) {
+            lines.push(Line::from(""));
+            let verb = if item.setting == ConfigSetting::ImageGen {
+                "generates images"
+            } else {
+                "describes images"
+            };
+            lines.push(Line::from(Span::styled(
+                format!("{model} {verb}"),
+                Style::default().fg(TEXT()).add_modifier(Modifier::BOLD),
+            )));
+            lines.push(Line::from(Span::styled(
+                format!("via {key}"),
+                Style::default().fg(FAINT()),
+            )));
+        }
+        lines.push(Line::from(""));
+        for chunk in wrap_words(&self.config_active_help(item.setting), width) {
+            lines.push(Line::from(Span::styled(
+                chunk,
+                Style::default().fg(MUTED()),
+            )));
+        }
+        lines
     }
 
     /// The Ctrl+T drill-in: one MCP server's tools as a toggle list. Toggling
@@ -1909,6 +2072,7 @@ impl CodeTuiApp {
             detail_scroll,
             detail_area: Some(right),
             scroll_for: None,
+            ..Default::default()
         }
     }
 
@@ -2202,8 +2366,7 @@ struct ToggleListView<'a> {
     /// Line index within `rows` to keep on screen, so the list scrolls to follow
     /// the selection (each item spans two lines plus a separator).
     selected_pos: usize,
-    /// Detail block for the selected item, shown just above the footer — one
-    /// line for the toggle lists, three for `/config`'s strip + description.
+    /// Detail block for the selected item, shown just above the footer.
     detail: Vec<Line<'a>>,
     /// `(key, label)` hints rendered along the footer.
     footer: Vec<(&'a str, &'a str)>,
@@ -2242,7 +2405,7 @@ fn overlay_shell(
     })
 }
 
-/// Shell + body for a whole-modal toggle overlay (`/config`); `/skills` and
+/// Shell + body for a whole-modal toggle overlay; `/skills` and
 /// `/mcp` draw their own shell and call [`render_toggle_list_body`] directly.
 fn render_toggle_list(frame: &mut Frame<'_>, area: Rect, mut view: ToggleListView) {
     let inner = overlay_shell(frame, area, view.title, view.badge.take());
@@ -2318,6 +2481,16 @@ fn detail_line(detail: Option<(String, Color)>, width: usize) -> Vec<Line<'stati
         .collect()
 }
 
+/// Section label above the first setting of a `/config` group.
+fn config_group_header(setting: ConfigSetting) -> Option<&'static str> {
+    match setting {
+        ConfigSetting::Theme => Some("Appearance"),
+        ConfigSetting::Approval => Some("Behavior"),
+        ConfigSetting::VisionFallback => Some("Media"),
+        _ => None,
+    }
+}
+
 /// The `│` divider between a split overlay's panes, centered in its gutter rect.
 fn render_vertical_rule(frame: &mut Frame<'_>, area: Rect) {
     if area.width == 0 {
@@ -2333,6 +2506,18 @@ fn render_vertical_rule(frame: &mut Frame<'_>, area: Rect) {
             width: 1,
             ..area
         },
+    );
+}
+
+/// A faint `─` rule across `area` — stacked `/config` separates list from inspector.
+fn render_horizontal_rule(frame: &mut Frame<'_>, area: Rect) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    let rule = "─".repeat(usize::from(area.width));
+    frame.render_widget(
+        Paragraph::new(Span::styled(rule, Style::default().fg(FAINT()))),
+        Rect { height: 1, ..area },
     );
 }
 
@@ -2400,38 +2585,112 @@ fn toggle_list_rows(
     }
 }
 
-/// Description lines under the `/config` list — fits the longest one, and is
-/// constant so moving the selection can't resize the box.
-const CONFIG_DESC_ROWS: usize = 2;
-
-/// The focused `/config` row's options, active in bold accent — the only place
-/// the alternatives are visible.
-fn config_options_line(options: &[&str], active: usize) -> Line<'static> {
+/// Segmented control for the focused `/config` row. The live value is a filled
+/// pill so it reads as a switch, not a label.
+fn config_segment_line(options: &[&str], active: usize) -> Line<'static> {
     let mut spans: Vec<Span<'static>> = Vec::new();
     for (i, opt) in options.iter().enumerate() {
         if i > 0 {
             spans.push(Span::raw("  "));
         }
-        spans.push(Span::styled(
-            (*opt).to_string(),
-            if i == active {
-                Style::default().fg(ACCENT()).add_modifier(Modifier::BOLD)
-            } else {
-                Style::default().fg(MUTED())
-            },
-        ));
+        if i == active {
+            spans.push(Span::styled("[", Style::default().fg(FAINT())));
+            spans.push(Span::styled(
+                format!(" {opt} "),
+                Style::default()
+                    .fg(SELECT_ACCENT())
+                    .bg(SELECT_BG())
+                    .add_modifier(Modifier::BOLD),
+            ));
+            spans.push(Span::styled("]", Style::default().fg(FAINT())));
+        } else {
+            spans.push(Span::styled(
+                format!("  {opt}  "),
+                Style::default().fg(MUTED()),
+            ));
+        }
     }
     Line::from(spans)
 }
 
+/// Clickable rects for each pill on the inspector's segment row. Empty when
+/// that row has scrolled out of the inspector body.
+fn config_segment_hitboxes(
+    inspector: Rect,
+    scroll: u16,
+    line_count: usize,
+    segment_line: u16,
+    options: &[&str],
+) -> Vec<(Rect, usize)> {
+    if inspector.width == 0 || inspector.height == 0 {
+        return Vec::new();
+    }
+    let overflow = line_count > usize::from(inspector.height);
+    let body_h = if overflow {
+        inspector.height.saturating_sub(1)
+    } else {
+        inspector.height
+    };
+    let Some(y_off) = segment_line.checked_sub(scroll) else {
+        return Vec::new();
+    };
+    if y_off >= body_h {
+        return Vec::new();
+    }
+    let y = inspector.y + y_off;
+    let mut x = inspector.x;
+    let mut hits = Vec::with_capacity(options.len());
+    for (i, opt) in options.iter().enumerate() {
+        if i > 0 {
+            x = x.saturating_add(2);
+        }
+        let width = (4 + display_width(opt)) as u16;
+        let remaining = inspector
+            .x
+            .saturating_add(inspector.width)
+            .saturating_sub(x);
+        if remaining == 0 {
+            break;
+        }
+        let width = width.min(remaining).max(1);
+        hits.push((
+            Rect {
+                x,
+                y,
+                width,
+                height: 1,
+            },
+            i,
+        ));
+        x = x.saturating_add(width);
+    }
+    hits
+}
+
 /// One `/config` line: bold name left, live value flush right, the filled gap
 /// carrying the selection bar on the focused row. `off` stays muted so a
-/// disabled setting can't read as lit up.
-fn config_value_line(name: &str, value: &str, selected: bool, width: usize) -> Line<'static> {
-    let live = if value == "off" { MUTED() } else { ACCENT() };
+/// disabled setting can't read as lit up. A row with an overlay error paints
+/// the value in `ERROR` so the failure stays attached to the setting even
+/// after the selection moves.
+fn config_value_line(
+    name: &str,
+    value: &str,
+    selected: bool,
+    width: usize,
+    erred: bool,
+) -> Line<'static> {
+    let live = if erred {
+        ERROR()
+    } else if value == "off" {
+        MUTED()
+    } else {
+        ACCENT()
+    };
     let (name_style, value_style, bar) = if selected {
         let bar = Style::default().bg(SELECT_BG());
-        let value_fg = if value == "off" {
+        let value_fg = if erred {
+            ERROR()
+        } else if value == "off" {
             SELECT_ACCENT()
         } else {
             live
@@ -2448,8 +2707,11 @@ fn config_value_line(name: &str, value: &str, selected: bool, width: usize) -> L
             Style::default(),
         )
     };
-    // +1: a trailing column so the value never touches the bar's edge.
-    let value_w = display_width(value) + 1;
+    // Keep the setting name; ellipsize a long live value (a model id) instead.
+    let name_w = display_width(name);
+    let value_room = width.saturating_sub(name_w + 2).max(4);
+    let value_disp = truncate_for_display_width(value, value_room);
+    let value_w = display_width(&value_disp) + 1;
     let name_room = width.saturating_sub(value_w + 1).max(1);
     let name_disp = truncate_for_display_width(name, name_room);
     let pad = width.saturating_sub(display_width(&name_disp) + value_w);
@@ -2457,7 +2719,7 @@ fn config_value_line(name: &str, value: &str, selected: bool, width: usize) -> L
     if pad > 0 {
         spans.push(Span::styled(" ".repeat(pad), bar));
     }
-    spans.push(Span::styled(value.to_string(), value_style));
+    spans.push(Span::styled(value_disp, value_style));
     spans.push(Span::styled(" ", bar));
     Line::from(spans)
 }

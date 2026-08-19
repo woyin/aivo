@@ -1496,21 +1496,26 @@ pub(super) struct ConfigSegments {
     pub(super) active: usize,
 }
 
-/// One `/config` row: a labelled preference with a one-line description.
+/// One `/config` row: a labelled preference. Inspector copy is live-read at
+/// render (`config_active_help`) so a mid-overlay pick can't go stale.
 #[derive(Clone, Debug)]
 pub(super) struct ConfigRow {
     pub(super) setting: ConfigSetting,
     pub(super) label: &'static str,
-    /// Owned — the Vision row folds live state into its description.
-    pub(super) description: String,
 }
 
 /// The `/config` overlay: a fixed list of segmented switches. ↑/↓ move rows, ←/→
 /// (or Enter/Space) change the selected value; `selected` indexes `items`.
+/// Split layout shows a setting inspector in the right pane.
 #[derive(Clone, Debug, Default)]
 pub(super) struct ConfigOverlay {
     pub(super) items: Vec<ConfigRow>,
     pub(super) selected: usize,
+    /// Picker/apply failure for a row — shown in that row's inspector, not as a
+    /// transcript notice (the modal would hide it / sit too far from the setting).
+    pub(super) error: Option<(ConfigSetting, String)>,
+    /// Right-pane (or stacked detail) scroll; reset when the selection moves.
+    pub(super) detail_scroll: u16,
 }
 
 impl ConfigOverlay {
@@ -1520,11 +1525,13 @@ impl ConfigOverlay {
             return;
         }
         self.selected = self.selected.checked_sub(1).unwrap_or(self.items.len() - 1);
+        self.detail_scroll = 0;
     }
 
     pub(super) fn select_next(&mut self) {
         if !self.items.is_empty() {
             self.selected = (self.selected + 1) % self.items.len();
+            self.detail_scroll = 0;
         }
     }
 }
@@ -1796,6 +1803,29 @@ pub(super) enum PickerKind {
     PlanResume,
 }
 
+impl PickerKind {
+    /// Drill-in from `/config` — Esc or an empty catalog lands on this row.
+    pub(super) fn config_home(&self) -> Option<ConfigSetting> {
+        match self {
+            Self::Key {
+                target: KeySelectionTarget::VisionDescriber,
+            }
+            | Self::Model {
+                target: ModelSelectionTarget::VisionDescriber(_),
+                ..
+            } => Some(ConfigSetting::VisionFallback),
+            Self::Key {
+                target: KeySelectionTarget::ImageGenerator,
+            }
+            | Self::Model {
+                target: ModelSelectionTarget::ImageGenerator(_),
+                ..
+            } => Some(ConfigSetting::ImageGen),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Clone)]
 pub(super) struct PickerState {
     pub(super) title: &'static str,
@@ -1819,6 +1849,11 @@ pub(super) struct OverlayRenderOut {
     pub(super) detail_area: Option<Rect>,
     /// Session id a `/resume` preview-scroll clamp belongs to.
     pub(super) scroll_for: Option<String>,
+    /// Config (and similar) list pane: visual row → item index for click-to-select.
+    pub(super) list_area: Option<Rect>,
+    pub(super) list_row_index: Vec<Option<usize>>,
+    /// Inspector segmented-control pills: clickable rect → option index.
+    pub(super) segment_hits: Vec<(Rect, usize)>,
 }
 
 #[derive(Clone, Default)]
@@ -1826,6 +1861,7 @@ pub(super) struct PickerHitbox {
     pub(super) overlay_area: Rect,
     pub(super) list_area: Rect,
     pub(super) row_to_filtered_index: Vec<Option<usize>>,
+    pub(super) segment_hits: Vec<(Rect, usize)>,
 }
 
 #[derive(Clone)]
@@ -2993,6 +3029,9 @@ pub(super) struct CodeTuiApp {
     pub(super) draft_history_stash: Option<String>,
     pub(super) session_id: String,
     pub(super) overlay: Overlay,
+    /// Last `/config` row the user stood on — restored the next time the modal
+    /// opens in this session (not persisted).
+    pub(super) last_config_setting: Option<ConfigSetting>,
     pub(super) notice: Option<(Color, String)>,
     pub(super) pending_response: String,
     /// Stream text received but not yet revealed by the typewriter. Deltas land
@@ -3633,6 +3672,7 @@ impl CodeTuiApp {
             draft_history_stash: None,
             session_id: String::new(),
             overlay: Overlay::None,
+            last_config_setting: None,
             notice: None,
             pending_response: String::new(),
             incoming_buffer: String::new(),

@@ -248,10 +248,11 @@ async fn apply_vision_describer_persists_or_refuses() {
     app.apply_vision_describer(key.clone(), "deepseek-chat".to_string())
         .await;
     assert_ne!(app.vision_fallback, VisionFallbackMode::Custom);
+    assert_eq!(notice_text(&app), "", "refusal stays in the modal");
     assert!(
-        notice_text(&app).contains("isn't a vision model"),
+        config_error_text(&app).contains("isn't a vision model"),
         "{}",
-        notice_text(&app)
+        config_error_text(&app)
     );
 
     app.model = "same-model".to_string();
@@ -259,9 +260,9 @@ async fn apply_vision_describer_persists_or_refuses() {
         .await;
     assert_ne!(app.vision_fallback, VisionFallbackMode::Custom);
     assert!(
-        notice_text(&app).contains("can't be the active model"),
+        config_error_text(&app).contains("can't be the active model"),
         "{}",
-        notice_text(&app)
+        config_error_text(&app)
     );
 
     app.apply_vision_describer(key.clone(), "gemini-2.5-flash".to_string())
@@ -539,19 +540,13 @@ async fn config_row_description_shows_current_describer() {
     app.vision_fallback = VisionFallbackMode::Custom;
     app.vision_fallback_custom = Some(("k1".to_string(), "glm-4.6v".to_string()));
     app.open_config_overlay();
-    let Overlay::Config(state) = &app.overlay else {
-        panic!("expected config overlay");
-    };
-    let row = state
-        .items
-        .iter()
-        .find(|i| i.setting == ConfigSetting::VisionFallback)
-        .unwrap();
-    assert!(row.description.contains("glm-4.6v"), "{}", row.description);
+    assert_eq!(
+        app.config_current_model(ConfigSetting::VisionFallback),
+        Some("glm-4.6v")
+    );
 }
 
-/// The vision row is the only one with a drill-in, and the only description
-/// long enough to wrap.
+/// The vision row is a drill-in; its description is long enough to wrap.
 #[tokio::test]
 async fn config_vision_row_wraps_description_and_advertises_enter() {
     use ratatui::Terminal;
@@ -579,10 +574,7 @@ async fn config_vision_row_wraps_description_and_advertises_enter() {
         .collect::<Vec<_>>()
         .join("\n");
 
-    assert!(
-        text.contains("a key + model"),
-        "description clipped:\n{text}"
-    );
+    assert!(text.contains("daily quota"), "aivo help missing:\n{text}");
     // gateway is live, so Enter cycles rather than re-picking — no drill-in hint.
     assert!(!text.contains("pick model"), "stale Enter hint:\n{text}");
 
@@ -905,4 +897,136 @@ async fn image_generator_resolution_requires_custom_mode_and_pair() {
     // A pair whose model equals the chat model would hijack the main route.
     app.image_gen_custom = Some(("k1".to_string(), app.model.clone()));
     assert!(app.resolve_image_generator().await.is_none());
+}
+
+#[tokio::test]
+async fn generator_picker_empty_catalog_stays_on_config_with_inline_error() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.open_model_picker(
+        None,
+        ModelSelectionTarget::ImageGenerator(app.key.clone()),
+        false,
+    );
+    let index = app.populate_model_picker(vec![ModelChoice {
+        label: "deepseek-chat".to_string(),
+        id: "deepseek-chat".to_string(),
+    }]);
+    assert!(index.is_none(), "strict filter is empty");
+    assert_eq!(notice_text(&app), "", "error stays in the modal");
+    match &app.overlay {
+        Overlay::Config(state) => {
+            assert_eq!(state.items[state.selected].setting, ConfigSetting::ImageGen);
+            assert!(
+                config_error_text(&app).contains("no image-output"),
+                "{}",
+                config_error_text(&app)
+            );
+        }
+        other => panic!("expected config overlay, got {}", overlay_name(other)),
+    }
+
+    let (text, _) = render_full_screen(&mut app, 80, 28);
+    assert!(
+        text.contains("Couldn't pick"),
+        "error heading missing:\n{text}"
+    );
+    assert!(
+        text.contains("no image-output"),
+        "error must render inside the modal:\n{text}"
+    );
+    assert!(
+        text.contains("Image generation"),
+        "setting label missing:\n{text}"
+    );
+}
+
+#[tokio::test]
+async fn generator_key_without_eligible_keys_errors_in_config() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.open_config_overlay_at(ConfigSetting::ImageGen);
+    app.open_image_gen_key_picker().await;
+    assert!(
+        matches!(app.overlay, Overlay::Config(_)),
+        "no picker when no keys"
+    );
+    assert_eq!(notice_text(&app), "");
+    assert!(
+        config_error_text(&app).contains("No key can serve as a generator"),
+        "{}",
+        config_error_text(&app)
+    );
+}
+
+#[tokio::test]
+async fn esc_from_image_generator_picker_returns_to_config() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.open_model_picker(
+        None,
+        ModelSelectionTarget::ImageGenerator(app.key.clone()),
+        false,
+    );
+    app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+        .await
+        .unwrap();
+    match &app.overlay {
+        Overlay::Config(state) => {
+            assert_eq!(state.items[state.selected].setting, ConfigSetting::ImageGen)
+        }
+        other => panic!("expected config overlay, got {}", overlay_name(other)),
+    }
+}
+
+#[tokio::test]
+async fn apply_image_generator_refusal_stays_in_config() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    let key = app.key.clone();
+    app.apply_image_generator(key, "deepseek-chat".to_string())
+        .await;
+    assert_eq!(notice_text(&app), "");
+    assert!(
+        config_error_text(&app).contains("isn't known to generate"),
+        "{}",
+        config_error_text(&app)
+    );
+    match &app.overlay {
+        Overlay::Config(state) => {
+            assert_eq!(state.items[state.selected].setting, ConfigSetting::ImageGen)
+        }
+        other => panic!("expected config overlay, got {}", overlay_name(other)),
+    }
+}
+
+#[tokio::test]
+async fn config_image_gen_row_live_description_and_enter_hint() {
+    use crate::services::session_store::ImageGenMode;
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.open_config_overlay_at(ConfigSetting::ImageGen);
+
+    let (text, _) = render_full_screen(&mut app, 80, 28);
+    assert!(text.contains("image-output"), "intro clipped:\n{text}");
+    assert!(
+        !text.contains("pick model"),
+        "off should not advertise Enter:\n{text}"
+    );
+
+    app.image_gen = ImageGenMode::Custom;
+    app.image_gen_custom = Some(("k1".to_string(), "gemini-2.5-flash-image".to_string()));
+    let (text, _) = render_full_screen(&mut app, 80, 28);
+    assert!(
+        text.contains("pick model"),
+        "custom needs the Enter hint:\n{text}"
+    );
+    assert!(
+        text.contains("gemini-2.5-flash-image generates images"),
+        "picked model missing after mid-overlay flip:\n{text}"
+    );
+    assert!(
+        text.contains("via k1"),
+        "key that owns the model missing:\n{text}"
+    );
 }

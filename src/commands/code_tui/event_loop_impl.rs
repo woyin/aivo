@@ -1571,6 +1571,12 @@ impl CodeTuiApp {
                     self.complete_key_switch(key, prior).await?;
                     return Ok(());
                 }
+                if let Overlay::Picker(picker) = &self.overlay
+                    && let Some(setting) = picker.kind.config_home()
+                {
+                    self.set_config_error(setting, err);
+                    return Ok(());
+                }
                 self.overlay = Overlay::None;
                 self.notice = Some((ERROR(), err));
             }
@@ -1604,13 +1610,11 @@ impl CodeTuiApp {
         if generator_key.is_some() && models.is_empty() {
             // Empty after a strict filter: this key can't generate. Stay on the
             // config row rather than an empty picker the user has to re-navigate.
-            self.open_config_overlay_at_image_gen();
-            self.notice = Some((
-                ERROR(),
-                "this key lists no image-output models — use a key that has one \
-(e.g. gemini-2.5-flash-image via a Gemini or OpenRouter key)"
-                    .to_string(),
-            ));
+            self.set_config_error(
+                ConfigSetting::ImageGen,
+                "This key has no image-output models. Try a Gemini or OpenRouter key \
+(e.g. gemini-2.5-flash-image).",
+            );
             return None;
         }
         let Overlay::Picker(picker) = &mut self.overlay else {
@@ -3040,6 +3044,26 @@ impl CodeTuiApp {
                     .handle_overlay_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
                     .await;
             }
+            if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
+                && matches!(self.overlay, Overlay::Config(_))
+            {
+                if self
+                    .apply_config_segment_click_at(mouse.column, mouse.row)
+                    .await
+                {
+                    return Ok(Some(false));
+                }
+                if self.select_config_row_at(mouse.column, mouse.row) {
+                    return Ok(Some(false));
+                }
+                if self.picker_hitbox.as_ref().is_some_and(|hitbox| {
+                    rect_contains(hitbox.list_area, (mouse.column, mouse.row))
+                }) {
+                    // Headers aren't settings; still swallow so a click there
+                    // doesn't start a transcript selection through the modal.
+                    return Ok(Some(false));
+                }
+            }
             return Ok(None);
         }
         match (&self.overlay, mouse.kind) {
@@ -3175,8 +3199,13 @@ impl CodeTuiApp {
             (Overlay::McpPaste(_), _) => Ok(Some(false)),
             (Overlay::Config(_), MouseEventKind::ScrollUp | MouseEventKind::ScrollDown) => {
                 let up = matches!(mouse.kind, MouseEventKind::ScrollUp);
+                let over_detail = self
+                    .overlay_detail_area
+                    .is_some_and(|area| rect_contains(area, (mouse.column, mouse.row)));
                 if let Overlay::Config(state) = &mut self.overlay {
-                    if up {
+                    if over_detail {
+                        state.detail_scroll = wheel_scroll(state.detail_scroll, up);
+                    } else if up {
                         state.select_prev();
                     } else {
                         state.select_next();
@@ -3221,6 +3250,57 @@ impl CodeTuiApp {
             (Overlay::Picker(_), _) => Ok(Some(false)),
             (Overlay::None, _) => Ok(None),
         }
+    }
+
+    /// Click a `/config` list row to focus it. True when the click landed on a
+    /// setting (headers and the inspector are ignored).
+    fn select_config_row_at(&mut self, col: u16, row: u16) -> bool {
+        let Some(hitbox) = self.picker_hitbox.clone() else {
+            return false;
+        };
+        if !rect_contains(hitbox.list_area, (col, row)) {
+            return false;
+        }
+        let Overlay::Config(state) = &self.overlay else {
+            return false;
+        };
+        let view_h = usize::from(hitbox.list_area.height.max(1));
+        let selected_visual = hitbox
+            .row_to_filtered_index
+            .iter()
+            .position(|&i| i == Some(state.selected))
+            .unwrap_or(0);
+        let offset = selected_visual.saturating_sub(view_h.saturating_sub(1));
+        let visual = offset + usize::from(row.saturating_sub(hitbox.list_area.y));
+        let Some(index) = hitbox.row_to_filtered_index.get(visual).copied().flatten() else {
+            return false;
+        };
+        if let Overlay::Config(state) = &mut self.overlay {
+            if state.selected != index {
+                state.selected = index;
+                state.detail_scroll = 0;
+            }
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Click a pill on the inspector's segmented control. Active `custom`
+    /// re-opens the model picker; any other pill applies immediately.
+    async fn apply_config_segment_click_at(&mut self, col: u16, row: u16) -> bool {
+        let Some(hitbox) = self.picker_hitbox.clone() else {
+            return false;
+        };
+        let Some(&(_, option)) = hitbox
+            .segment_hits
+            .iter()
+            .find(|(area, _)| rect_contains(*area, (col, row)))
+        else {
+            return false;
+        };
+        self.pick_config_segment(option).await;
+        true
     }
 
     async fn handle_picker_click(&mut self, mouse: MouseEvent) -> Result<Option<bool>> {

@@ -927,15 +927,22 @@ impl CodeTuiApp {
             }
             Overlay::Config(state) => {
                 // ↑/↓ (Ctrl+P/N) move rows, ←/→ change the value, Enter/Space/Tab
-                // advance it (wrapping), Esc closes.
+                // advance it (wrapping), Esc closes. PgUp/PgDn scroll the inspector.
                 let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
                 let has_rows = !state.items.is_empty();
                 match key.code {
-                    KeyCode::Esc => self.overlay = Overlay::None,
+                    KeyCode::Esc => {
+                        self.last_config_setting =
+                            state.items.get(state.selected).map(|item| item.setting);
+                        self.overlay = Overlay::None;
+                    }
                     KeyCode::Up => state.select_prev(),
                     KeyCode::Char('p') if ctrl => state.select_prev(),
                     KeyCode::Down => state.select_next(),
                     KeyCode::Char('n') if ctrl => state.select_next(),
+                    KeyCode::PageUp | KeyCode::PageDown | KeyCode::Home | KeyCode::End if split => {
+                        apply_detail_scroll(&mut state.detail_scroll, key, ctrl);
+                    }
                     KeyCode::Left if has_rows => {
                         return OverlayKeyAction::StepConfigSetting(state.selected, -1);
                     }
@@ -1320,8 +1327,8 @@ impl CodeTuiApp {
             Overlay::Picker(picker) => {
                 if picker.loading {
                     if matches!(key.code, KeyCode::Esc) {
-                        if picker_returns_to_config(&picker.kind) {
-                            self.open_config_overlay_at_vision();
+                        if let Some(setting) = picker.kind.config_home() {
+                            self.open_config_overlay_at(setting);
                         } else {
                             self.overlay = Overlay::None;
                         }
@@ -1331,8 +1338,8 @@ impl CodeTuiApp {
 
                 match key.code {
                     KeyCode::Esc => {
-                        if picker_returns_to_config(&picker.kind) {
-                            self.open_config_overlay_at_vision();
+                        if let Some(setting) = picker.kind.config_home() {
+                            self.open_config_overlay_at(setting);
                         } else {
                             self.overlay = Overlay::None;
                         }
@@ -1800,18 +1807,4 @@ fn apply_detail_scroll(scroll: &mut u16, key: KeyEvent, ctrl: bool) {
         KeyCode::End => u16::MAX,
         _ => *scroll,
     };
-}
-
-/// Vision-describer pickers are a drill-in from `/config` — closing them
-/// returns there instead of dropping to the composer.
-fn picker_returns_to_config(kind: &PickerKind) -> bool {
-    matches!(
-        kind,
-        PickerKind::Key {
-            target: KeySelectionTarget::VisionDescriber,
-        } | PickerKind::Model {
-            target: ModelSelectionTarget::VisionDescriber(_),
-            ..
-        }
-    )
 }
