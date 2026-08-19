@@ -4,6 +4,7 @@
 //!
 //! Row per normalized id: `[context|null, output|null, "flags", "efforts"]`.
 //! flags: `t`=tool_call, `r`=reasoning, `a`=attachment, `i`=image input,
+//! `g`=image output,
 //! `f`=rejects temperature, `d`=deprecated.
 //!
 //! Keep the winner/normalization rules in lockstep with the Python generator —
@@ -241,6 +242,13 @@ fn flags_for(e: &ApiModel) -> String {
     if e.modalities.input.iter().any(|m| m == "image") {
         f.push('i');
     }
+    if e.modalities
+        .output
+        .as_ref()
+        .is_some_and(|o| o.iter().any(|m| m == "image"))
+    {
+        f.push('g');
+    }
     f
 }
 
@@ -255,6 +263,7 @@ fn effort_values(e: &ApiModel) -> Option<Vec<String>> {
 }
 
 /// OR of `t/r/a/i` flag chars across observations, emitted in canonical order.
+/// `g` is NOT OR'd — see `pick_winner`: it takes a vendor verdict like `r/f/d`.
 fn or_flags(rows: &[Obs]) -> String {
     let set: HashSet<char> = rows.iter().flat_map(|r| r.flags.chars()).collect();
     "trai".chars().filter(|c| set.contains(c)).collect()
@@ -367,6 +376,12 @@ fn pick_winner(rows: &[Obs]) -> Row {
     let out = modal_min(&out_vals);
 
     let mut flags = or_flags(rows);
+    // `g` drives the generate_image picker/tool, so a lone noisy aggregator
+    // (neon branded the whole gpt-5 family image-emitting) must not set it —
+    // vendor-verdict-else-majority, like `r/f/d`.
+    if vendor_verdict(rows, |r| Some(r.flags.contains('g'))) == Some(true) {
+        flags.push('g');
+    }
     if vendor_verdict(rows, |r| r.temp) == Some(false) {
         flags.push('f');
     }
@@ -492,6 +507,24 @@ mod tests {
         }"#;
         let (json, _) = transform(api).unwrap();
         assert_eq!(rows_of(&json)["m"][2], "");
+    }
+
+    #[test]
+    fn image_output_uses_vendor_verdict() {
+        // A lone aggregator brands the model image-emitting (neon did this to
+        // the whole gpt-5 family); the vendor says text-only. Vendor wins → no
+        // `g`. The inverse — vendor confirms image output — sets it.
+        let api = r#"{
+          "openai": {"models": {"m": {"limit": {"context": 400000},
+                                 "modalities": {"output": ["text"]}}}},
+          "neon": {"models": {"m": {"limit": {"context": 400000},
+                                 "modalities": {"output": ["text", "image"]}}}},
+          "google": {"models": {"pic": {"limit": {"context": 32768},
+                                 "modalities": {"output": ["text", "image"]}}}}
+        }"#;
+        let (json, _) = transform(api).unwrap();
+        assert_eq!(rows_of(&json)["m"][2], "", "lone aggregator can't set g");
+        assert_eq!(rows_of(&json)["pic"][2], "g", "vendor-confirmed g sticks");
     }
 
     #[test]

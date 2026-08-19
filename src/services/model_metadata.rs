@@ -20,6 +20,8 @@ pub struct ModelLimits {
     pub reasoning: bool,
     pub attachment: bool,
     pub image_input: bool,
+    /// Model emits images in its output (`g` snapshot flag).
+    pub image_output: bool,
     /// False when the model rejects the `temperature` param (o-series,
     /// forced-reasoning claude variants).
     pub temperature: bool,
@@ -69,6 +71,19 @@ impl Pricing {
 /// Prices for `model` from the embedded snapshot (same folded lookup as limits).
 pub fn model_pricing(model: &str) -> Option<Pricing> {
     snapshot_limits(model)?.pricing
+}
+
+/// Snapshot `g` flag. Unknown models → false: the image-gen picker offers only
+/// models known to generate.
+pub fn model_generates_images(model: &str) -> bool {
+    snapshot_limits(model).is_some_and(|l| l.image_output)
+}
+
+/// Snapshot `t` flag. Unknown models → false; callers pair this with a
+/// snapshot-known predicate (e.g. `model_generates_images`) so the false
+/// default never penalizes off-catalog models.
+pub fn model_calls_tools(model: &str) -> bool {
+    snapshot_limits(model).is_some_and(|l| l.tool_call)
 }
 
 /// Cascade result: per-field merge of live cache over snapshot. `caps` are
@@ -142,6 +157,10 @@ fn overlay_override(
     for (k, mut limits) in fold_rows(over) {
         if let Some(prev) = map.get(&k) {
             merge_pricing(&mut limits, prev.pricing);
+            // The `g` flag postdates deployed override caches (2026-08): a row
+            // written by an older binary would otherwise mask a capability the
+            // embedded snapshot knows — until the user happens to resync.
+            limits.image_output |= prev.image_output;
         }
         map.insert(k, limits);
     }
@@ -217,6 +236,7 @@ fn parse_row(row: &[serde_json::Value]) -> Option<ModelLimits> {
         reasoning: flags.contains('r'),
         attachment: flags.contains('a'),
         image_input: flags.contains('i'),
+        image_output: flags.contains('g'),
         temperature: !flags.contains('f'),
         deprecated: flags.contains('d'),
         reasoning_efforts: efforts
@@ -339,6 +359,7 @@ fn hf_local_caps(image_input: bool) -> ModelLimits {
         reasoning: false,
         attachment: false,
         image_input,
+        image_output: false,
         temperature: true,
         deprecated: false,
         reasoning_efforts: Vec::new(),
@@ -613,6 +634,22 @@ mod tests {
     }
 
     #[test]
+    fn image_output_flag_parses_and_queries() {
+        let limits = parse_row(&row(Some(32768), Some(32768), "aig".into())).unwrap();
+        assert!(limits.image_input);
+        assert!(limits.image_output);
+        assert!(
+            !parse_row(&row(None, None, "tai".into()))
+                .unwrap()
+                .image_output
+        );
+        // The synced snapshot knows at least one image-output model.
+        assert!(model_generates_images("gemini-2.5-flash-image"));
+        assert!(!model_generates_images("deepseek-chat"));
+        assert!(!model_generates_images("totally-unknown-model-xyz"));
+    }
+
+    #[test]
     fn temperature_and_deprecated_flags_parse() {
         // o-series and forced-reasoning claude variants reject temperature.
         assert!(rejects_temperature("o3"));
@@ -809,6 +846,28 @@ mod tests {
         assert!(folded["model-a"].reasoning);
         assert_eq!(folded["model-b"].context, Some(200)); // untouched embedded id
         assert_eq!(folded["model-c"].context, Some(300)); // new id from override
+    }
+
+    #[test]
+    fn stale_override_without_g_flag_keeps_embedded_image_output() {
+        use std::collections::BTreeMap;
+        // Regression: an override cache written by a pre-`g` binary (flags
+        // "rai") shadowed the embedded snapshot's "raig" and hid every image
+        // model from the generator picker until a manual resync.
+        let mut base: BTreeMap<String, LimitRow> = BTreeMap::new();
+        base.insert(
+            "gemini-2.5-flash-image".into(),
+            row(Some(32_768), Some(32_768), "aig".into()),
+        );
+        let mut over: BTreeMap<String, LimitRow> = BTreeMap::new();
+        over.insert(
+            "gemini-2.5-flash-image".into(),
+            row(Some(32_768), Some(32_768), "rai".into()),
+        );
+        let folded = overlay_override(base, over);
+        let m = &folded["gemini-2-5-flash-image"];
+        assert!(m.image_output, "embedded capability survives a stale cache");
+        assert!(m.reasoning, "fresh override fields still win");
     }
 
     #[test]

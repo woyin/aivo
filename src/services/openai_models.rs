@@ -495,6 +495,11 @@ pub(crate) struct OpenAIChatResponseMessage {
     pub reasoning_content: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_calls: Option<Vec<OpenAIChatToolCall>>,
+    /// Image outputs, opaque passthrough. This type is the hop a buffered reply
+    /// takes to SSE, and image models commonly ignore `stream` — dropping the
+    /// field loses the whole reply.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub images: Option<Vec<Value>>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
@@ -855,6 +860,7 @@ pub(crate) fn convert_responses_to_chat_response(resp: &ResponsesResponse) -> Op
                 content,
                 reasoning_content: None,
                 tool_calls,
+                images: None,
             },
             finish_reason: finish_reason.to_string(),
         }],

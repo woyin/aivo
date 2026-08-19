@@ -836,6 +836,11 @@ pub struct ChatToggles {
     /// The custom describer `(key_id, model)`, stored independently of the mode
     /// so it survives mode flips. `None` when never set or malformed.
     pub vision_fallback_custom: Option<(String, String)>,
+    /// The `generate_image` tool's backing source (`/config`); default off.
+    pub image_gen: ImageGenMode,
+    /// The custom generator `(key_id, model)`, stored independently of the mode
+    /// so it survives mode flips.
+    pub image_gen_custom: Option<(String, String)>,
 }
 
 /// Persisted chat TUI color theme (`"theme"` in code-prefs.json).
@@ -890,6 +895,34 @@ impl VisionFallbackMode {
             "custom" => Self::Custom,
             "off" => Self::Off,
             _ => Self::Gateway,
+        }
+    }
+}
+
+/// Persisted image-generation mode (`"imageGen"` in code-prefs.json). The
+/// generator pair lives under the sibling `"imageGenCustom"` key so flipping
+/// the mode away and back doesn't lose it. Unknown values parse to `Off` so a
+/// future `"gateway"` value stays forward-compatible.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ImageGenMode {
+    Custom,
+    #[default]
+    Off,
+}
+
+impl ImageGenMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Custom => "custom",
+            Self::Off => "off",
+        }
+    }
+
+    /// Missing/unknown → the default (off): generation needs a picked model.
+    pub fn parse(s: &str) -> Self {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "custom" => Self::Custom,
+            _ => Self::Off,
         }
     }
 }
@@ -2174,6 +2207,26 @@ impl SessionStore {
         self.write_code_prefs(&prefs).await
     }
 
+    /// One read-modify-write, preserving sibling prefs (atomic write).
+    pub async fn set_chat_image_gen(
+        &self,
+        mode: ImageGenMode,
+        custom: Option<(&str, &str)>,
+    ) -> Result<()> {
+        let mut prefs = self.read_code_prefs().await;
+        prefs.insert(
+            "imageGen".into(),
+            serde_json::Value::String(mode.as_str().to_string()),
+        );
+        if let Some((key_id, model)) = custom {
+            prefs.insert(
+                "imageGenCustom".into(),
+                serde_json::json!({ "keyId": key_id, "model": model }),
+            );
+        }
+        self.write_code_prefs(&prefs).await
+    }
+
     /// Every `aivo code` toggle in a single read of code-prefs.json, so startup
     /// doesn't open+parse the same file twice.
     pub async fn get_chat_toggles(&self) -> ChatToggles {
@@ -2209,6 +2262,19 @@ impl SessionStore {
                 .unwrap_or_default(),
             vision_fallback_custom: prefs
                 .get("visionFallbackCustom")
+                .and_then(|v| {
+                    let key_id = v.get("keyId")?.as_str()?.to_string();
+                    let model = v.get("model")?.as_str()?.to_string();
+                    Some((key_id, model))
+                })
+                .filter(|(key_id, model)| !key_id.is_empty() && !model.is_empty()),
+            image_gen: prefs
+                .get("imageGen")
+                .and_then(|v| v.as_str())
+                .map(ImageGenMode::parse)
+                .unwrap_or_default(),
+            image_gen_custom: prefs
+                .get("imageGenCustom")
                 .and_then(|v| {
                     let key_id = v.get("keyId")?.as_str()?.to_string();
                     let model = v.get("model")?.as_str()?.to_string();
@@ -2842,6 +2908,44 @@ mod tests {
             VisionFallbackMode::parse("bogus"),
             VisionFallbackMode::Gateway
         );
+    }
+
+    /// Flipping the mode away and back must not lose the stored generator.
+    #[tokio::test]
+    async fn image_gen_prefs_round_trip() {
+        let temp_dir = TempDir::new().unwrap();
+        let store = SessionStore::with_path(temp_dir.path().join("config.json"));
+
+        let toggles = store.get_chat_toggles().await;
+        assert_eq!(toggles.image_gen, ImageGenMode::Off);
+        assert!(toggles.image_gen_custom.is_none());
+
+        store
+            .set_chat_image_gen(
+                ImageGenMode::Custom,
+                Some(("key123", "gemini-2.5-flash-image")),
+            )
+            .await
+            .unwrap();
+        let toggles = store.get_chat_toggles().await;
+        assert_eq!(toggles.image_gen, ImageGenMode::Custom);
+        assert_eq!(
+            toggles.image_gen_custom,
+            Some(("key123".to_string(), "gemini-2.5-flash-image".to_string()))
+        );
+
+        // The pair survives the mode flip.
+        store
+            .set_chat_image_gen(ImageGenMode::Off, None)
+            .await
+            .unwrap();
+        let toggles = store.get_chat_toggles().await;
+        assert_eq!(toggles.image_gen, ImageGenMode::Off);
+        assert!(toggles.image_gen_custom.is_some());
+
+        // Unknown (e.g. a future "gateway") → off, never a crash.
+        assert_eq!(ImageGenMode::parse("gateway"), ImageGenMode::Off);
+        assert_eq!(ImageGenMode::parse("bogus"), ImageGenMode::Off);
     }
 
     /// The per-repo project-MCP allow-list round-trips and shares code-prefs.json

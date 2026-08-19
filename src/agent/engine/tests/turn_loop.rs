@@ -579,6 +579,51 @@ async fn empty_completion_retry_recovers() {
     assert_eq!(engine.messages.last().unwrap()["content"], "done");
 }
 
+/// An image with no text is an answer, not an empty completion — and its saved
+/// path must reach history, the only surface the inline preview can find.
+#[tokio::test]
+async fn image_only_reply_is_saved_not_treated_as_empty() {
+    let dir = tmp();
+    let png = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
+    let body = format!(
+        "data: {}\n\ndata: [DONE]\n\n",
+        json!({"choices":[{"delta":{"images":[
+            {"type":"image_url","image_url":{"url":format!("data:image/png;base64,{png}")}}
+        ]}}]})
+    );
+    let port = spawn_sse_sequence(vec![body]);
+    let client = reqwest::Client::builder().no_proxy().build().unwrap();
+    let base = format!("http://127.0.0.1:{port}");
+    let mut engine = AgentEngine::new(&dir.display().to_string(), "m", "", &[], &[], 0, 0);
+    let mut ui = CapturingUi::default();
+    run_session(
+        &mut engine,
+        &turn_ctx(&client, &base, &dir),
+        Some("draw a dot".into()),
+        &mut ui,
+    )
+    .await;
+
+    assert!(
+        ui.errors.is_empty(),
+        "an image is an answer: {:?}",
+        ui.errors
+    );
+    assert!(
+        !ui.notices.iter().any(|n| n.contains("empty response")),
+        "image-only reply must not retry as empty: {:?}",
+        ui.notices
+    );
+    let last = engine.messages.last().unwrap();
+    assert_eq!(role(last), "assistant");
+    let recorded = content_str(last);
+    assert!(
+        recorded.contains("[image saved:") && recorded.contains(".png"),
+        "saved path must reach history: {recorded}"
+    );
+    assert!(ui.text.contains("[image saved:"), "streamed: {}", ui.text);
+}
+
 /// A kept text-only partial gets one continue nudge; the follow-up completes the answer.
 #[tokio::test]
 async fn truncated_reply_is_continued_with_a_nudge() {

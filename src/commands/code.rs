@@ -60,7 +60,7 @@ pub(crate) use super::code_response_parser::TokenUsage;
 pub(crate) use code_tui_format::format_time_ago_short;
 
 #[path = "code_tui.rs"]
-mod code_tui;
+pub(crate) mod code_tui;
 // `code_tui_format` is declared at the parent (`commands/mod.rs`) so other
 // commands (notably `aivo logs` / `--resume`) can reuse its time/text
 // formatters. Re-exported here so the chat module references it without
@@ -425,6 +425,7 @@ impl CodeCommand {
         max_cost: Option<f64>,
         auto_approve: bool,
         vision_model: Option<String>,
+        image_model: Option<String>,
     ) -> ExitCode {
         match self
             .execute_internal(
@@ -446,6 +447,7 @@ impl CodeCommand {
                 max_cost,
                 auto_approve,
                 vision_model,
+                image_model,
             )
             .await
         {
@@ -475,6 +477,7 @@ impl CodeCommand {
         max_cost: Option<f64>,
         auto_approve: bool,
         vision_model: Option<String>,
+        image_model: Option<String>,
     ) -> Result<ExitCode> {
         if (max_steps.is_some() || max_output_tokens.is_some()) && !agent_mode {
             anyhow::bail!("--max-steps and --max-output-tokens may only be used with -e/--exec");
@@ -764,6 +767,7 @@ impl CodeCommand {
                     auto_approve,
                     resume,
                     model_flag.is_some(),
+                    image_model,
                 )
                 .await;
             }
@@ -1010,6 +1014,7 @@ impl CodeCommand {
             share,
             auto_approve,
             vision_model,
+            image_model,
         })
         .await?;
 
@@ -1118,6 +1123,10 @@ impl CodeCommand {
         print_opt(
             "--vision-model [[key::]m]",
             "Vision model that describes images for text-only models (bare/key:: = picker)",
+        );
+        print_opt(
+            "--image-model [key::]m",
+            "Image model backing the agent's generate_image tool (session-only)",
         );
         print_opt("--json", "Raw provider JSON (with -p)");
         print_opt(
@@ -3002,6 +3011,7 @@ mod tests {
                 None,
                 None,
                 false,
+                None,
                 None,
             )
             .await;

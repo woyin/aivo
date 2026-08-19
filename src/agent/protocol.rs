@@ -34,6 +34,9 @@ pub struct AssistantMessage {
     /// Upstream model echoed by the response chunks; never on the wire.
     #[serde(skip)]
     pub model: Option<String>,
+    /// Image data URLs collected off `delta.images`. Never on the wire.
+    #[serde(skip)]
+    pub images: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

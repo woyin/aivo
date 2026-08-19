@@ -566,6 +566,34 @@ impl GeminiToOpenAIStreamConverter {
                     ));
                 }
 
+                // Image-output parts (gemini-*-image models) ride the
+                // OpenRouter `delta.images` convention so OpenAI-side clients
+                // can collect them; dropping them here would silently eat the
+                // model's actual answer.
+                if let Some(inline) = part.get("inlineData").or_else(|| part.get("inline_data"))
+                    && let Some(data) = inline.get("data").and_then(|v| v.as_str())
+                {
+                    let mime = inline
+                        .get("mimeType")
+                        .or_else(|| inline.get("mime_type"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("image/png");
+                    self.emit_role_if_needed(output);
+                    output.push_str(&openai_sse_chunk(
+                        &self.id,
+                        self.created,
+                        &self.model,
+                        json!({
+                            "images": [{
+                                "type": "image_url",
+                                "image_url": {"url": format!("data:{mime};base64,{data}")}
+                            }]
+                        }),
+                        Value::Null,
+                        None,
+                    ));
+                }
+
                 if let Some(function_call) = part.get("functionCall") {
                     let index = self.next_tool_index;
                     self.next_tool_index += 1;
@@ -934,6 +962,24 @@ mod tests {
         assert!(output.contains("\"finish_reason\":\"tool_calls\""));
         assert!(output.contains("\"cache_read_input_tokens\":90"));
         assert!(output.contains("data: [DONE]"));
+    }
+
+    #[test]
+    fn test_gemini_stream_converter_emits_image_output_as_delta_images() {
+        let mut converter = GeminiToOpenAIStreamConverter::new("gemini-2.5-flash-image");
+        let input = concat!(
+            "data: {\"responseId\":\"resp_1\",\"candidates\":[{\"content\":{\"parts\":[",
+            "{\"text\":\"here you go\"},",
+            "{\"inlineData\":{\"mimeType\":\"image/png\",\"data\":\"aGk=\"}}",
+            "],\"role\":\"model\"},\"finishReason\":\"STOP\"}]}\n\n",
+        );
+        let mut output = converter.push_bytes(input.as_bytes()).unwrap();
+        output.push_str(&converter.finish().unwrap());
+
+        assert!(output.contains("\"content\":\"here you go\""));
+        assert!(output.contains("\"images\":[{"));
+        assert!(output.contains("data:image/png;base64,aGk="));
+        assert!(output.contains("\"finish_reason\":\"stop\""));
     }
 
     #[test]

@@ -27,6 +27,11 @@ pub fn text_chat_incompat_reason(model_id: &str) -> Option<&'static str> {
         return Some("speech-to-text");
     }
     if lower.starts_with("dall-e") || lower.contains("-image") {
+        // Catalog evidence beats the name pattern: a `g`-flagged model chats
+        // (gemini-2.5-flash-image); only image models with no such evidence stay out.
+        if crate::services::model_metadata::model_generates_images(model_id) {
+            return None;
+        }
         return Some("image generation");
     }
     None
@@ -63,6 +68,9 @@ mod tests {
             text_chat_incompat_reason("grok-imagine-image"),
             Some("image generation")
         );
+        // Catalog-confirmed image-output chat models are exempt from the `-image` name rule.
+        assert!(text_chat_incompat_reason("gemini-2.5-flash-image").is_none());
+        assert!(text_chat_incompat_reason("google/gemini-2.5-flash-image").is_none());
         assert_eq!(text_chat_incompat_reason("tts-1"), Some("text-to-speech"));
         assert_eq!(
             text_chat_incompat_reason("whisper-1"),

@@ -11,6 +11,13 @@ pub fn is_mutating(name: &str) -> bool {
     )
 }
 
+/// Tools plan mode strips from the advertised set: the file-mutating ones
+/// (`run_bash` stays, gated per call), `subagent` (its sub-engine isn't
+/// read-only), and `generate_image` (writes a file, bills an API call).
+pub fn hidden_in_plan_mode(name: &str) -> bool {
+    (is_mutating(name) && name != "run_bash") || matches!(name, "subagent" | "generate_image")
+}
+
 /// Built-in tools that only read (filesystem or network) and share no mutable
 /// state, so several can run concurrently within one tool-call batch. A
 /// deliberate allowlist: writes and `run_bash` mutate the workspace; plan /

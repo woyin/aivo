@@ -2421,7 +2421,7 @@ async fn extract_result(
             let dir = default_images_dir();
             pending
                 .into_iter()
-                .map(|(mime, ext, data)| save_image_block(mime, ext, &data, &dir))
+                .map(|(mime, ext, data)| save_image_block(mime, ext, &data, &dir, "mcp"))
                 .collect::<Vec<_>>()
         })
         .await
@@ -2442,11 +2442,36 @@ async fn extract_result(
     (cap_chars(&joined, MAX_MCP_RESULT_CHARS), images)
 }
 
-fn default_images_dir() -> PathBuf {
+pub(crate) fn default_images_dir() -> PathBuf {
     crate::services::paths::images_dir(&crate::services::paths::config_dir())
 }
 
-fn image_ext(mime: &str) -> Option<&'static str> {
+/// Save `data:`-URL image outputs, returning `[image saved: …]` notes plus the
+/// blocks. Callers must `spawn_blocking`: a multi-MB decode+hash+write would
+/// freeze the current-thread runtime driving the TUI and the loopback serve.
+pub(crate) fn save_data_url_images(
+    urls: &[String],
+    prefix: &str,
+) -> Result<(String, Vec<crate::agent::engine::ToolImage>), String> {
+    let dir = default_images_dir();
+    let mut notes = String::new();
+    let mut images = Vec::new();
+    for url in urls {
+        let Some((mime, data)) = crate::services::vision_describe::parse_data_url(url) else {
+            return Err("image output wasn't a base64 data URL".to_string());
+        };
+        let mime = if mime.is_empty() { "image/png" } else { mime };
+        let Some(ext) = image_ext(mime) else {
+            return Err(format!("unsupported image type `{mime}`"));
+        };
+        let img = save_image_block(mime.to_string(), ext, data, &dir, prefix)?;
+        notes.push_str(&format!("\n[image saved: {} ({mime})]", img.path.display()));
+        images.push(img);
+    }
+    Ok((notes, images))
+}
+
+pub(crate) fn image_ext(mime: &str) -> Option<&'static str> {
     match mime {
         "image/png" => Some("png"),
         "image/jpeg" => Some("jpg"),
@@ -2481,11 +2506,12 @@ fn normalize_base64(data: &str) -> String {
 
 /// Content-addressed by `vision_describe::image_hash` (the vision-shim cache
 /// key). Atomic write: a torn file at a content address dedups onto forever.
-fn save_image_block(
+pub(crate) fn save_image_block(
     mime: String,
     ext: &str,
     data: &str,
     dir: &Path,
+    prefix: &str,
 ) -> Result<crate::agent::engine::ToolImage, String> {
     let cleaned = normalize_base64(data);
     if cleaned.len() > MAX_MCP_IMAGE_B64_CHARS {
@@ -2498,7 +2524,7 @@ fn save_image_block(
         .decode(cleaned.as_bytes())
         .map_err(|e| format!("invalid base64: {e}"))?;
     let hash = crate::services::vision_describe::image_hash(&cleaned);
-    let path = dir.join(format!("mcp-{}.{ext}", &hash[..12]));
+    let path = dir.join(format!("{prefix}-{}.{ext}", &hash[..12]));
     if !path.exists() {
         crate::services::atomic_write::atomic_write_secure_blocking(&path, &bytes)
             .map_err(|e| format!("write {}: {e}", path.display()))?;
@@ -3013,7 +3039,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         // 1x1 PNG, with whitespace wrapping that servers sometimes emit.
         let b64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGNg\nYGAAAAAEAAH2FzhVAAAAAElFTkSuQmCC";
-        let img = save_image_block("image/png".into(), "png", b64, &dir).unwrap();
+        let img = save_image_block("image/png".into(), "png", b64, &dir, "mcp").unwrap();
         assert!(img.path.exists());
         assert!(
             img.path
@@ -3036,7 +3062,7 @@ mod tests {
             format!("mcp-{expected}.png")
         );
         // Same bytes again → same path, no error (content-addressed dedup).
-        let img2 = save_image_block("image/png".into(), "png", b64, &dir).unwrap();
+        let img2 = save_image_block("image/png".into(), "png", b64, &dir, "mcp").unwrap();
         assert_eq!(img.path, img2.path);
         assert_eq!(image_ext("image/tiff"), None);
         let _ = std::fs::remove_dir_all(&dir);

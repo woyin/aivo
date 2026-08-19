@@ -543,6 +543,8 @@ pub struct AgentEngine {
     thinking_enabled: bool,
     /// `/config` toggle for aivo's hosted web_search (the local tool); native search untouched.
     use_web_search_enabled: bool,
+    /// `/config` Image generation model; `Some` advertises `generate_image`.
+    image_model: Option<String>,
     /// `/config` master switch; off → plain chat (no tools, no system prompt).
     agent_tools_enabled: bool,
     /// Whether this model can reason at all (snapshot). Cached at construction so the

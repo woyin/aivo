@@ -101,6 +101,7 @@ pub async fn complete(
     let mut tools: Vec<StreamedToolCall> = Vec::new();
     let mut usage: Option<Value> = None;
     let mut model: Option<String> = None;
+    let mut images: Vec<String> = Vec::new();
     // Accumulate raw BYTES, not lossily-decoded chunks: a multi-byte char (CJK,
     // emoji) can straddle a chunk boundary, and decoding each chunk separately
     // would turn each half into a replacement char. A `\n`-terminated line never
@@ -151,6 +152,11 @@ pub async fn complete(
             {
                 model = Some(m.to_string());
             }
+            // A `stream: true` request answered with one final non-delta chunk
+            // still carries its images under `message`.
+            if let Some(imgs) = v.pointer("/choices/0/message/images") {
+                collect_image_urls(imgs, &mut images);
+            }
             let Some(delta) = v.pointer("/choices/0/delta") else {
                 continue;
             };
@@ -174,6 +180,9 @@ pub async fn complete(
             }
             if let Some(tcs) = delta.get("tool_calls").and_then(|x| x.as_array()) {
                 accumulate_tool_call_deltas(tcs, &mut tools);
+            }
+            if let Some(imgs) = delta.get("images") {
+                collect_image_urls(imgs, &mut images);
             }
         }
         if done {
@@ -205,7 +214,28 @@ pub async fn complete(
         usage,
         truncated,
         model,
+        images,
     })
+}
+
+/// OpenRouter-convention image outputs: entries are either `{image_url:{url}}`
+/// objects or bare data-URL strings. Deduped — a converted buffered response can
+/// carry the same image on both `delta.images` and `message.images`.
+fn collect_image_urls(node: &Value, out: &mut Vec<String>) {
+    let Some(imgs) = node.as_array() else {
+        return;
+    };
+    for img in imgs {
+        let url = img
+            .pointer("/image_url/url")
+            .and_then(|u| u.as_str())
+            .or_else(|| img.as_str());
+        if let Some(url) = url.filter(|u| !u.is_empty())
+            && !out.iter().any(|seen| seen == url)
+        {
+            out.push(url.to_string());
+        }
+    }
 }
 
 /// Parse tool-call args; repair a truncated/malformed JSON string before falling
@@ -394,6 +424,53 @@ data: [DONE]\n\n";
         assert_eq!(msg.tool_calls[0].name, "read_file");
         assert_eq!(msg.tool_calls[0].id, "call_1");
         assert_eq!(msg.tool_calls[0].arguments["path"], "a.txt");
+    }
+
+    #[tokio::test]
+    async fn collects_delta_images_in_both_conventions() {
+        let body = "data: {\"choices\":[{\"delta\":{\"content\":\"done\",\"images\":[{\"type\":\"image_url\",\"image_url\":{\"url\":\"data:image/png;base64,aGk=\"}}]}}]}\n\n\
+data: {\"choices\":[{\"delta\":{\"images\":[\"data:image/jpeg;base64,eW8=\"]}}]}\n\n\
+data: [DONE]\n\n";
+        let port = spawn_sse(body);
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let msg = complete(
+            &client,
+            &format!("http://127.0.0.1:{port}"),
+            None,
+            &req(),
+            &mut |_| {},
+        )
+        .await
+        .unwrap();
+        assert_eq!(msg.content.as_deref(), Some("done"));
+        assert_eq!(
+            msg.images,
+            vec![
+                "data:image/png;base64,aGk=".to_string(),
+                "data:image/jpeg;base64,eW8=".to_string()
+            ]
+        );
+    }
+
+    /// A chunk carrying `message` instead of `delta` — and the same image on
+    /// both, which must dedup to one.
+    #[tokio::test]
+    async fn collects_message_images_from_a_non_delta_chunk() {
+        let body = "data: {\"choices\":[{\"message\":{\"role\":\"assistant\",\"images\":[{\"image_url\":{\"url\":\"data:image/png;base64,aGk=\"}}]}}]}\n\n\
+data: {\"choices\":[{\"delta\":{\"images\":[\"data:image/png;base64,aGk=\"]}}]}\n\n\
+data: [DONE]\n\n";
+        let port = spawn_sse(body);
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let msg = complete(
+            &client,
+            &format!("http://127.0.0.1:{port}"),
+            None,
+            &req(),
+            &mut |_| {},
+        )
+        .await
+        .unwrap();
+        assert_eq!(msg.images, vec!["data:image/png;base64,aGk=".to_string()]);
     }
 
     #[tokio::test]

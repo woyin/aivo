@@ -143,7 +143,7 @@ impl AgentEngine {
             let mut retries = 0usize;
             let mut forced_compactions = 0usize;
             let mut terminal_error = false;
-            let message = loop {
+            let mut message = loop {
                 let mut streamed_any = false;
                 let mut streamed_text = 0usize;
                 let result = serve_client::complete(
@@ -211,6 +211,7 @@ impl AgentEngine {
                             usage: None,
                             truncated: false,
                             model: None,
+                            images: Vec::new(),
                         };
                     }
                 }
@@ -289,6 +290,26 @@ impl AgentEngine {
                 break;
             }
 
+            // An image-output model can reply with an image and no text. Fold the
+            // saved path into the reply: the emptiness check below counts text only,
+            // and `assistant_to_openai` skips `images`, so it would otherwise retry
+            // into "no answer produced" and never reach history or the preview.
+            if !message.images.is_empty() {
+                let urls = std::mem::take(&mut message.images);
+                match tokio::task::spawn_blocking(move || {
+                    crate::agent::mcp::save_data_url_images(&urls, "gen")
+                })
+                .await
+                {
+                    Ok(Ok((notes, _))) => {
+                        ui.assistant_text(&notes);
+                        let text = message.content.take().unwrap_or_default();
+                        message.content = Some(format!("{text}{notes}"));
+                    }
+                    Ok(Err(e)) => ui.notify_error(&format!("image output not saved: {e}")),
+                    Err(e) => ui.notify_error(&format!("image save task failed: {e}")),
+                }
+            }
             // Empty completion converges the turn; don't record it — an empty assistant 400s the Anthropic bridge (non-retryable → bricks the next turn).
             let no_output = message.tool_calls.is_empty()
                 && message.content.as_deref().is_none_or(str::is_empty);
@@ -328,6 +349,7 @@ impl AgentEngine {
                     usage: message.usage.clone(),
                     truncated: false,
                     model: None,
+                    images: Vec::new(),
                 };
                 self.messages.push(assistant_to_openai(&recorded_msg));
                 self.push_text_turn("user", LEAKED_TOOL_CALL_NUDGE.to_string());

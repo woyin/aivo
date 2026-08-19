@@ -463,6 +463,53 @@ fn describer_picker_filters_to_vision_models_cheapest_first() {
     assert_eq!(unknown_only.len(), 2, "all-unknown catalogs pass through");
 }
 
+#[test]
+fn generator_picker_filters_strictly_to_image_output_models() {
+    use super::super::event_loop_impl::filter_generator_choices;
+    let choice = |id: &str| ModelChoice {
+        label: id.to_string(),
+        id: id.to_string(),
+    };
+    let filtered = filter_generator_choices(vec![
+        choice("gemini-3-pro-image"),     // generates, pricier
+        choice("gemini-2.5-flash"),       // vision-in only, no image output
+        choice("deepseek-chat"),          // text-only
+        choice("gemini-2.5-flash-image"), // generates, cheapest
+        choice("my-local-mystery"),       // unknown → excluded (strict)
+    ]);
+    let ids: Vec<&str> = filtered.iter().map(|m| m.id.as_str()).collect();
+    assert_eq!(
+        ids,
+        ["gemini-2.5-flash-image", "gemini-3-pro-image"],
+        "image-output models only, price-ascending"
+    );
+
+    assert!(filter_generator_choices(vec![choice("mystery"), choice("deepseek-chat")]).is_empty());
+}
+
+#[test]
+fn main_picker_excludes_no_tool_image_generators() {
+    use super::super::event_loop_impl::filter_main_chat_choices;
+    let choice = |id: &str| ModelChoice {
+        label: id.to_string(),
+        id: id.to_string(),
+    };
+    let ids: Vec<String> = filter_main_chat_choices(vec![
+        choice("gemini-2.5-flash-image"), // "aig": generates, no tools → excluded
+        choice("gemini-3-pro-image"),     // "traig": generates AND tool-calls → kept
+        choice("deepseek-chat"),          // ordinary chat model → kept
+        choice("my-local-mystery"),       // unknown → kept (never penalized)
+    ])
+    .into_iter()
+    .map(|m| m.id)
+    .collect();
+    assert_eq!(
+        ids,
+        ["gemini-3-pro-image", "deepseek-chat", "my-local-mystery"],
+        "a generator that can't drive the agent loop never reaches the main picker"
+    );
+}
+
 /// The working fallback is invisible: no describer announcement at attach time.
 #[tokio::test]
 async fn attaching_an_image_stays_silent_about_the_describer() {
@@ -829,4 +876,33 @@ fn resume_load_keeps_small_history_images_verbatim() {
     };
     assert_eq!(data, &tiny_b64, "small image untouched");
     assert_eq!(session.messages[0].attachments[0].mime_type, "image/png");
+}
+
+#[test]
+fn generator_model_validation_is_strict() {
+    validate_generator_model("gemini-2.5-flash-image", "deepseek-chat").unwrap();
+    // Active-model collision would hijack the main upstream route.
+    let err =
+        validate_generator_model("gemini-2.5-flash-image", "gemini-2.5-flash-image").unwrap_err();
+    assert!(err.contains("active model"), "got: {err}");
+    let err = validate_generator_model("deepseek-chat", "gpt-5.4").unwrap_err();
+    assert!(err.contains("isn't known to generate"), "got: {err}");
+    let err = validate_generator_model("totally-unknown-xyz", "gpt-5.4").unwrap_err();
+    assert!(err.contains("isn't known to generate"), "got: {err}");
+}
+
+#[tokio::test]
+async fn image_generator_resolution_requires_custom_mode_and_pair() {
+    use crate::services::session_store::ImageGenMode;
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+
+    assert!(app.resolve_image_generator().await.is_none());
+
+    app.image_gen = ImageGenMode::Custom;
+    assert!(app.resolve_image_generator().await.is_none());
+
+    // A pair whose model equals the chat model would hijack the main route.
+    app.image_gen_custom = Some(("k1".to_string(), app.model.clone()));
+    assert!(app.resolve_image_generator().await.is_none());
 }

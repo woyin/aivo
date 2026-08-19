@@ -181,6 +181,25 @@ pub fn native_web_search_enabled(model: &str) -> bool {
     ) && native_search_supported(model)
 }
 
+/// Advertised only when the engine carries a configured image model
+/// (`/config` → Image generation) — see `set_image_model`.
+pub fn generate_image_tool_spec() -> ToolSpec {
+    spec(
+        "generate_image",
+        "Generate an image from a text prompt with the user's configured image model. \
+Returns the saved file path — use run_bash to copy or move it where the user wants it. \
+Not for reading, editing, or converting existing images (use run_bash for those). \
+If a dedicated image-generation tool from an MCP server is available, prefer that one.",
+        json!({
+            "type": "object",
+            "properties": {
+                "prompt": {"type": "string", "description": "What to generate, described concretely (subject, style, composition)"}
+            },
+            "required": ["prompt"]
+        }),
+    )
+}
+
 pub(super) fn apply_patch_spec() -> ToolSpec {
     spec(
         "apply_patch",

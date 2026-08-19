@@ -711,6 +711,33 @@ impl CodeTuiApp {
         Err(self.vision_refusal_message(&status))
     }
 
+    /// Custom generator, resolved at dispatch. `None` (off, unconfigured, or
+    /// the pair's model equals the chat model — that would hijack main turns)
+    /// leaves `generate_image` unregistered; no refusal flow.
+    pub(super) async fn resolve_image_generator(&self) -> Option<(String, ApiKey)> {
+        use crate::services::session_store::ImageGenMode;
+        if !self.agent_capable() || self.image_gen != ImageGenMode::Custom {
+            return None;
+        }
+        let (key_id, model) = self.image_gen_custom.as_ref()?;
+        if *model == self.model {
+            return None;
+        }
+        // Re-check the catalog at dispatch: a pair stored while the snapshot
+        // was wrong (or before a capability was revoked) must not arm the tool.
+        if !crate::services::model_metadata::model_generates_images(model) {
+            return None;
+        }
+        let mut key = self
+            .session_store
+            .get_key_by_id(key_id)
+            .await
+            .ok()
+            .flatten()?;
+        crate::services::session_store::SessionStore::decrypt_key_secret(&mut key).ok()?;
+        Some((model.clone(), key))
+    }
+
     fn image_refusal_base(&self) -> String {
         format!(
             "{} can't read images — switch to a vision model (e.g. /model) and resend.",
@@ -1060,13 +1087,22 @@ impl CodeTuiApp {
         let engine = self.agent_engine.as_ref().unwrap().engine.clone();
 
         // Rides this turn's loopback: same auth, same usage accounting.
-        let describer_upstream = match &vision_shim {
-            Some(DescriberSource::OwnKey { model, key }) => {
-                Some((model.clone(), key.as_ref().clone()))
+        let mut model_upstreams: Vec<(String, ApiKey)> = Vec::new();
+        if let Some(DescriberSource::OwnKey { model, key }) = &vision_shim {
+            model_upstreams.push((model.clone(), key.as_ref().clone()));
+        }
+        let image_generator = self.resolve_image_generator().await;
+        let image_model = image_generator.as_ref().map(|(m, _)| m.clone());
+        if let Some((model, key)) = image_generator {
+            // The router keys upstreams by model name; if the describer already
+            // claimed this model, keep its route (generation still works, same
+            // model) instead of silently re-authing describe calls onto the
+            // generator's key.
+            if !model_upstreams.iter().any(|(m, _)| m == &model) {
+                model_upstreams.push((model, key));
             }
-            _ => None,
-        };
-        let (base, auth) = match self.start_agent_serve(describer_upstream).await {
+        }
+        let (base, auth) = match self.start_agent_serve(model_upstreams).await {
             Ok(t) => t,
             Err(e) => {
                 self.notice = Some((ERROR(), format!("agent serve failed to start: {e}")));
@@ -1167,6 +1203,7 @@ impl CodeTuiApp {
             engine.set_thinking_enabled(thinking_enabled);
             engine.set_web_search_enabled(web_search_enabled);
             engine.set_agent_tools_enabled(agent_tools_enabled);
+            engine.set_image_model(image_model);
             engine.set_reasoning_efforts(reasoning_efforts);
             if let Some(effort) = reasoning_effort {
                 engine.set_reasoning_effort(effort);
@@ -1245,7 +1282,7 @@ impl CodeTuiApp {
     async fn build_agent_serve_router(
         key: &ApiKey,
         session_store: &crate::services::session_store::SessionStore,
-        model_upstream: Option<(String, ApiKey)>,
+        model_upstreams: Vec<(String, ApiKey)>,
     ) -> (crate::services::serve_router::ServeRouter, String) {
         use crate::services::serve_router::{
             ServeRouter, ServeRouterConfig, random_auth_token, resolve_grok_fallback,
@@ -1268,8 +1305,8 @@ impl CodeTuiApp {
             .with_oauth_persist(session_store.clone())
             .with_usage_accounting(session_store.clone(), "code".to_string())
             .quiet(true);
-        if let Some((model, upstream_key)) = model_upstream {
-            router = router.with_model_upstreams(vec![(model, upstream_key)]);
+        if !model_upstreams.is_empty() {
+            router = router.with_model_upstreams(model_upstreams);
         }
         (router, auth)
     }
@@ -1277,10 +1314,10 @@ impl CodeTuiApp {
     /// Start this turn's loopback serve; sets `self.agent_serve`, returns `(base, auth)`.
     async fn start_agent_serve(
         &mut self,
-        model_upstream: Option<(String, ApiKey)>,
+        model_upstreams: Vec<(String, ApiKey)>,
     ) -> Result<(String, String)> {
         let (router, auth) =
-            Self::build_agent_serve_router(&self.key, &self.session_store, model_upstream).await;
+            Self::build_agent_serve_router(&self.key, &self.session_store, model_upstreams).await;
         let router = router.with_route_cache(self.agent_route_cache());
         let (handle, shutdown, port) = router.start_background_with_addr("127.0.0.1", 0).await?;
         self.agent_serve = Some((handle, shutdown));
@@ -1342,7 +1379,7 @@ impl CodeTuiApp {
     ) {
         use crate::agent::engine::TurnCtx;
 
-        let (base, auth) = match self.start_agent_serve(None).await {
+        let (base, auth) = match self.start_agent_serve(Vec::new()).await {
             Ok(t) => t,
             Err(e) => {
                 self.notice = Some((ERROR(), format!("compact serve failed to start: {e}")));
@@ -2522,7 +2559,7 @@ impl CodeTuiApp {
             self.notice = Some((MUTED(), "no session history to consolidate yet".to_string()));
             return;
         };
-        let (base, auth) = match self.start_agent_serve(None).await {
+        let (base, auth) = match self.start_agent_serve(Vec::new()).await {
             Ok(t) => t,
             Err(e) => {
                 self.notice = Some((ERROR(), format!("memory dream serve failed: {e}")));
@@ -2576,7 +2613,7 @@ impl CodeTuiApp {
         let Some(input) = crate::agent::memory::build_dream_input(cwd) else {
             return;
         };
-        let (router, auth) = Self::build_agent_serve_router(&key, &session_store, None).await;
+        let (router, auth) = Self::build_agent_serve_router(&key, &session_store, Vec::new()).await;
         let Ok((handle, shutdown, port)) = router.start_background_with_addr("127.0.0.1", 0).await
         else {
             return;

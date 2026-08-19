@@ -11,6 +11,7 @@ impl CodeTuiApp {
         let query = query.unwrap_or_default();
         let title = match &target {
             ModelSelectionTarget::VisionDescriber(_) => "Describer model (reads images)",
+            ModelSelectionTarget::ImageGenerator(_) => "Generator model (makes images)",
             _ => "Select model",
         };
         self.overlay = Overlay::Picker(Box::new(PickerState::loading(
@@ -448,6 +449,58 @@ is preserved."
         self.overlay = Overlay::Picker(Box::new(picker));
     }
 
+    /// One eligible key skips the key stage; the stored generator pre-selects.
+    pub(super) async fn open_image_gen_key_picker(&mut self) {
+        let keys = match self.session_store.get_keys().await {
+            Ok(keys) => keys,
+            Err(e) => {
+                self.notice = Some((ERROR(), format!("couldn't read keys: {e}")));
+                return;
+            }
+        };
+        let mut eligible: Vec<ApiKey> = keys
+            .into_iter()
+            .filter(crate::commands::code_agent_oneshot::key_is_agent_capable)
+            .collect();
+        if eligible.is_empty() {
+            self.notice = Some((
+                ERROR(),
+                "No key can serve as a generator (needs an API key, not launch-bound OAuth/ACP)"
+                    .to_string(),
+            ));
+            return;
+        }
+        if eligible.len() == 1 {
+            self.open_image_generator_model_picker(eligible.remove(0));
+            return;
+        }
+        let stored_key = self
+            .image_gen_custom
+            .as_ref()
+            .and_then(|(id, _)| eligible.iter().position(|k| &k.id == id))
+            .unwrap_or(0);
+        let mut picker = PickerState::ready(
+            "Generator key",
+            String::new(),
+            key_picker_items(eligible),
+            PickerKind::Key {
+                target: KeySelectionTarget::ImageGenerator,
+            },
+        );
+        picker.selected = stored_key;
+        self.overlay = Overlay::Picker(Box::new(picker));
+    }
+
+    /// Picker items carry encrypted secrets, but the live model fetch has to
+    /// authenticate with the real one.
+    fn open_image_generator_model_picker(&mut self, mut key: ApiKey) {
+        if let Err(e) = SessionStore::decrypt_key_secret(&mut key) {
+            self.notice = Some((ERROR(), format!("couldn't unlock key: {e}")));
+            return;
+        }
+        self.open_model_picker(None, ModelSelectionTarget::ImageGenerator(key), false);
+    }
+
     pub(super) async fn open_resume_picker(&mut self, query: Option<String>) -> Result<()> {
         // Scoped to the launch dir; an empty real_cwd can't scope → all.
         let scope_cwd = (!self.real_cwd.is_empty()).then(|| self.real_cwd.clone());
@@ -699,6 +752,11 @@ is preserved."
                 label: "Vision fallback",
                 description: self.vision_fallback_desc(),
             },
+            ConfigRow {
+                setting: ConfigSetting::ImageGen,
+                label: "Image generation",
+                description: self.image_gen_desc(),
+            },
         ];
         self.overlay = Overlay::Config(ConfigOverlay { items, selected: 0 });
     }
@@ -711,6 +769,16 @@ is preserved."
                 format!("{model} describes images · enter re-picks")
             }
             _ => "describe images for text-only models · custom picks a key + model".to_string(),
+        }
+    }
+
+    /// Read fresh at render so a mid-overlay flip to `custom` names the picked model.
+    pub(super) fn image_gen_desc(&self) -> String {
+        match (&self.image_gen, &self.image_gen_custom) {
+            (crate::services::session_store::ImageGenMode::Custom, Some((_, model))) => {
+                format!("{model} generates images · enter re-picks")
+            }
+            _ => "give the agent a generate_image tool · custom picks a key + model".to_string(),
         }
     }
 
@@ -751,6 +819,17 @@ is preserved."
                         VisionFallbackMode::Gateway => 0,
                         VisionFallbackMode::Custom => 1,
                         VisionFallbackMode::Off => 2,
+                    },
+                }
+            }
+            ConfigSetting::ImageGen => {
+                use crate::services::session_store::ImageGenMode;
+                const OPTIONS: &[&str] = &["custom", "off"];
+                ConfigSegments {
+                    options: OPTIONS,
+                    active: match self.image_gen {
+                        ImageGenMode::Custom => 0,
+                        ImageGenMode::Off => 1,
                     },
                 }
             }
@@ -799,6 +878,13 @@ is preserved."
             self.open_vision_key_picker().await;
             return;
         }
+        if dir == CycleDir::Enter
+            && setting == ConfigSetting::ImageGen
+            && self.image_gen == crate::services::session_store::ImageGenMode::Custom
+        {
+            self.open_image_gen_key_picker().await;
+            return;
+        }
         let segs = self.config_segments(setting);
         let len = segs.options.len();
         if len == 0 {
@@ -842,6 +928,16 @@ is preserved."
                         self.open_vision_key_picker().await
                     }
                     mode => self.set_vision_fallback_mode(mode).await,
+                }
+            }
+            ConfigSetting::ImageGen => {
+                use crate::services::session_store::ImageGenMode;
+                let mode = ImageGenMode::parse(segs.options.get(target).copied().unwrap_or(""));
+                match mode {
+                    ImageGenMode::Custom if self.image_gen_custom.is_none() => {
+                        self.open_image_gen_key_picker().await
+                    }
+                    mode => self.set_image_gen_mode(mode).await,
                 }
             }
         }
@@ -961,6 +1057,62 @@ is preserved."
                 .items
                 .iter()
                 .position(|i| i.setting == ConfigSetting::VisionFallback)
+        {
+            state.selected = row;
+        }
+    }
+
+    /// `custom` is only ever set with a generator pair in hand (picker flow /
+    /// `--image-model`), so no pairless guard is needed here.
+    pub(super) async fn set_image_gen_mode(
+        &mut self,
+        mode: crate::services::session_store::ImageGenMode,
+    ) {
+        use crate::services::session_store::ImageGenMode;
+        if self.image_gen == mode {
+            return;
+        }
+        self.image_gen = mode;
+        let toast = match mode {
+            ImageGenMode::Custom => match &self.image_gen_custom {
+                Some((_, model)) => format!("Image generation: {model} (generate_image tool)"),
+                None => "Image generation: custom generator".to_string(),
+            },
+            ImageGenMode::Off => "Image generation off".to_string(),
+        };
+        self.show_toast(toast);
+        let _ = self.session_store.set_chat_image_gen(mode, None).await;
+    }
+
+    pub(super) async fn apply_image_generator(&mut self, key: ApiKey, model: String) {
+        use crate::services::session_store::ImageGenMode;
+        if let Err(message) = super::validate_generator_model(&model, &self.model) {
+            self.open_config_overlay_at_image_gen();
+            self.notice = Some((ERROR(), message));
+            return;
+        }
+        self.image_gen_custom = Some((key.id.clone(), model.clone()));
+        self.image_gen = ImageGenMode::Custom;
+        let _ = self
+            .session_store
+            .set_chat_image_gen(ImageGenMode::Custom, Some((&key.id, &model)))
+            .await;
+        self.open_config_overlay_at_image_gen();
+        self.show_toast(format!(
+            "Image generation: {model} via {}",
+            key.display_name()
+        ));
+    }
+
+    /// The generator flow's entry and exit point, so Esc/completion lands back
+    /// where the user started.
+    pub(super) fn open_config_overlay_at_image_gen(&mut self) {
+        self.open_config_overlay();
+        if let Overlay::Config(state) = &mut self.overlay
+            && let Some(row) = state
+                .items
+                .iter()
+                .position(|i| i.setting == ConfigSetting::ImageGen)
         {
             state.selected = row;
         }
@@ -2635,6 +2787,9 @@ is preserved."
                 ModelSelectionTarget::VisionDescriber(key) => {
                     self.apply_vision_describer(key, model).await;
                 }
+                ModelSelectionTarget::ImageGenerator(key) => {
+                    self.apply_image_generator(key, model).await;
+                }
             },
             (
                 PickerKind::Key {
@@ -2651,6 +2806,14 @@ is preserved."
                 PickerValue::Key(key),
             ) => {
                 self.open_describer_model_picker(key);
+            }
+            (
+                PickerKind::Key {
+                    target: KeySelectionTarget::ImageGenerator,
+                },
+                PickerValue::Key(key),
+            ) => {
+                self.open_image_generator_model_picker(key);
             }
             (PickerKind::Session, PickerValue::Session(session)) => {
                 self.begin_resume_load(session);
@@ -2756,6 +2919,10 @@ is preserved."
             }
             | PickerKind::Model {
                 target: ModelSelectionTarget::VisionDescriber(key),
+                ..
+            }
+            | PickerKind::Model {
+                target: ModelSelectionTarget::ImageGenerator(key),
                 ..
             } => Some(key.clone()),
             _ => None,

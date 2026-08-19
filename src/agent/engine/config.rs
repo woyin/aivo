@@ -73,6 +73,7 @@ impl AgentEngine {
             reasoning_efforts: Vec::new(),
             thinking_enabled: true,
             use_web_search_enabled: true,
+            image_model: None,
             agent_tools_enabled: true,
             reasoning_capable: default_reasoning_effort(model).is_some(),
             read_only: false,
@@ -274,7 +275,7 @@ plan-approval card — suggest it when a task deserves real design discussion.",
                 .into_iter()
                 .partition(|t| {
                     let name = t["function"]["name"].as_str().unwrap_or("");
-                    (tools::is_mutating(name) && name != "run_bash") || name == "subagent"
+                    tools::hidden_in_plan_mode(name)
                 });
             self.plan_mode_stash = stashed;
             self.tools_openai = kept;
@@ -369,6 +370,34 @@ plan-approval card — suggest it when a task deserves real design discussion.",
 
     pub fn set_agent_tools_enabled(&mut self, on: bool) {
         self.agent_tools_enabled = on;
+    }
+
+    /// `/config` Image generation: `Some(model)` advertises `generate_image`, `None` removes it.
+    pub fn set_image_model(&mut self, model: Option<String>) {
+        let is_gen = |t: &Value| t["function"]["name"].as_str() == Some("generate_image");
+        let has = self.tools_openai.iter().any(is_gen) || self.plan_mode_stash.iter().any(is_gen);
+        if model.is_some() && !has {
+            self.advertise_tool(tool_to_openai(tools::generate_image_tool_spec()));
+        } else if model.is_none() && has {
+            self.tools_openai.retain(|t| !is_gen(t));
+            self.plan_mode_stash.retain(|t| !is_gen(t));
+        }
+        self.image_model = model;
+    }
+
+    /// Add a tool spec — into the plan-mode stash when it's one plan mode hides,
+    /// since the TUI re-runs these setters every turn, after `set_plan_mode`. A
+    /// live push there would both leak the tool into plan mode and duplicate it
+    /// when the stash is restored on exit.
+    pub(super) fn advertise_tool(&mut self, spec: Value) {
+        let hidden = spec["function"]["name"]
+            .as_str()
+            .is_some_and(tools::hidden_in_plan_mode);
+        if self.read_only && hidden {
+            self.plan_mode_stash.push(spec);
+        } else {
+            self.tools_openai.push(spec);
+        }
     }
 
     /// Set the catalog-advertised effort levels for this turn. See `reasoning_efforts`.

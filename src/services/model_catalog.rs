@@ -1238,7 +1238,9 @@ mod tests {
         assert!(!is_text_chat_model("tts-1-hd"));
         assert!(!is_text_chat_model("whisper-1"));
         assert!(!is_text_chat_model("gpt-image-1"));
-        assert!(!is_text_chat_model("google/gemini-3.1-flash-image-preview"));
+        // Catalog-confirmed image-output chat models pass the `-image` name rule.
+        assert!(is_text_chat_model("google/gemini-3.1-flash-image-preview"));
+        assert!(is_text_chat_model("gemini-2.5-flash-image"));
     }
 
     #[test]

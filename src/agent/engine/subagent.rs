@@ -12,8 +12,9 @@ impl AgentEngine {
         }
         self.tools_openai
             .retain(|t| t["function"]["name"].as_str() != Some("subagent"));
-        self.tools_openai
-            .push(tool_to_openai(subagent_tool_spec(subagents)));
+        self.plan_mode_stash
+            .retain(|t| t["function"]["name"].as_str() != Some("subagent"));
+        self.advertise_tool(tool_to_openai(subagent_tool_spec(subagents)));
         let section = subagents::subagents_prompt_section(subagents);
         if !section.is_empty()
             && let Some(sys) = self.messages.first_mut()

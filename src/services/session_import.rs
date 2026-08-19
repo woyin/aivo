@@ -525,6 +525,7 @@ impl TranscriptBuilder {
             usage: None,
             truncated: false,
             model: None,
+            images: Vec::new(),
         };
         self.engine.push(assistant_to_openai(&am));
         let AssistantMessage {

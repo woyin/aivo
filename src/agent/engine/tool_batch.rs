@@ -100,11 +100,12 @@ impl AgentEngine {
                 continue;
             }
             ui.tool_start(n, &call.arguments);
-            // Backstop for a hallucinated mutating tool (also hidden from the schema).
-            if self.read_only && tools::is_mutating(n) && n != "run_bash" {
+            // Backstop for a hallucinated state-changing tool (also hidden from the
+            // schema); `subagent` has its own refusal below.
+            if self.read_only && tools::hidden_in_plan_mode(n) && n != "subagent" {
                 outcomes[i] = Some(Err(
-                    "Plan mode is read-only — do not modify files. Investigate, or call \
-`exit_plan_mode` with your plan."
+                    "Plan mode is read-only — do not modify files or write artifacts. \
+Investigate, or call `exit_plan_mode` with your plan."
                         .to_string(),
                 ));
                 continue;
@@ -498,6 +499,15 @@ planning is off) — continue with the task."
                     }
                     out.text
                 })
+            } else if n == "generate_image" {
+                self.generate_image_call(ctx, &call.arguments)
+                    .await
+                    .map(|out| {
+                        if !out.images.is_empty() {
+                            batch_images.push((call.name.clone(), out.images));
+                        }
+                        out.text
+                    })
             } else if n == "run_bash" && jobs::wants_background(&call.arguments) {
                 // Detached job — no escalation flow (a spawn returns before a sandbox block shows).
                 match (
@@ -692,6 +702,79 @@ command in the foreground (drop `background`)."
             "[aivo] `{tool}` has now failed repeatedly with: {error}\n\
 Before calling `{tool}` again, make its arguments match this schema exactly:\n{schema}"
         ))
+    }
+
+    /// Prompt-only chat turn against the configured image model on the loopback
+    /// serve. Saved like MCP image results so TUI preview reuses that path.
+    async fn generate_image_call(
+        &self,
+        ctx: &TurnCtx<'_>,
+        args: &Value,
+    ) -> Result<crate::agent::engine::ToolOutput, String> {
+        const GENERATE_TIMEOUT_SECS: u64 = 180;
+        let Some(model) = self.image_model.as_deref() else {
+            return Err(
+                "image generation isn't configured — pick a model in /config → Image generation"
+                    .to_string(),
+            );
+        };
+        let prompt = args
+            .get("prompt")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .ok_or("missing required string argument `prompt`")?;
+        // OpenRouter only emits image outputs when the request opts in via
+        // `modalities`; OpenAI recognizes the param and the Gemini bridge maps
+        // it to `responseModalities`.
+        let mut extra = serde_json::Map::new();
+        extra.insert(
+            "modalities".to_string(),
+            serde_json::json!(["image", "text"]),
+        );
+        let request = crate::agent::protocol::ChatRequest {
+            model: model.to_string(),
+            messages: vec![serde_json::json!({"role": "user", "content": prompt})],
+            tools: vec![],
+            extra,
+        };
+        let mut sink = |_: crate::agent::serve_client::StreamDelta| {};
+        let call = crate::agent::serve_client::complete(
+            ctx.client,
+            ctx.serve_base,
+            ctx.auth,
+            &request,
+            &mut sink,
+        );
+        let msg =
+            match tokio::time::timeout(std::time::Duration::from_secs(GENERATE_TIMEOUT_SECS), call)
+                .await
+            {
+                Err(_) => return Err(format!("image generation via {model} timed out")),
+                Ok(Err(e)) => return Err(format!("image generation via {model} failed: {e}")),
+                Ok(Ok(m)) => m,
+            };
+        if msg.images.is_empty() {
+            // Text-only reply (refusal/clarification) — surface it so the agent can react.
+            let text = msg.content.unwrap_or_default();
+            return Err(if text.trim().is_empty() {
+                format!("{model} returned no image")
+            } else {
+                format!("{model} returned no image: {text}")
+            });
+        }
+        let mut text = msg.content.unwrap_or_default();
+        let urls = msg.images;
+        let (saved_notes, images) = tokio::task::spawn_blocking(move || {
+            crate::agent::mcp::save_data_url_images(&urls, "gen")
+        })
+        .await
+        .map_err(|e| format!("image save task failed: {e}"))??;
+        text.push_str(&saved_notes);
+        Ok(crate::agent::engine::ToolOutput {
+            text: text.trim_start().to_string(),
+            images,
+        })
     }
 
     /// Run a `run_bash` call confined to the workspace. If the OS sandbox blocks a

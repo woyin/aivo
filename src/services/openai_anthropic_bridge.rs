@@ -460,6 +460,7 @@ pub fn convert_anthropic_to_openai_chat_response(resp: &Value, fallback_model: &
                 content: (!text_parts.is_empty()).then(|| text_parts.join("\n")),
                 reasoning_content: (!thinking_parts.is_empty()).then(|| thinking_parts.join("\n")),
                 tool_calls: (!tool_calls.is_empty()).then_some(tool_calls),
+                images: None,
             },
             finish_reason: finish_reason.to_string(),
         }],
@@ -556,6 +557,7 @@ pub fn convert_openai_chat_response_to_sse(resp: &Value) -> Result<String, serde
             content: None,
             reasoning_content: None,
             tool_calls: None,
+            images: None,
         });
     let finish_reason = choice
         .map(|choice| Value::String(choice.finish_reason))
@@ -610,6 +612,26 @@ pub fn convert_openai_chat_response_to_sse(resp: &Value) -> Result<String, serde
                 "choices": [{
                     "index": 0,
                     "delta": {"content": text},
+                    "finish_reason": Value::Null
+                }]
+            })
+        ));
+    }
+
+    // Image outputs ride `delta.images` — the shape the collector reads. An image
+    // model that ignores `stream` lands here, so dropping them would turn a
+    // successful generation into "returned no image".
+    if let Some(images) = message.images.filter(|i| !i.is_empty()) {
+        events.push_str(&format!(
+            "data: {}\n\n",
+            json!({
+                "id": id,
+                "object": "chat.completion.chunk",
+                "created": created,
+                "model": model,
+                "choices": [{
+                    "index": 0,
+                    "delta": {"images": images},
                     "finish_reason": Value::Null
                 }]
             })
@@ -955,6 +977,37 @@ mod tests {
         assert!(sse.contains("\"choices\":[]"));
         assert!(sse.contains("\"prompt_tokens\":15000"));
         assert!(sse.contains("\"completion_tokens\":42"));
+    }
+
+    /// Image models routinely answer a `stream: true` request with buffered JSON,
+    /// and this is the only hop to SSE.
+    #[test]
+    fn test_convert_openai_chat_response_to_sse_preserves_images() {
+        let body = json!({
+            "id": "chatcmpl_img",
+            "model": "gemini-2.5-flash-image",
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": "here you go",
+                    "images": [{"type": "image_url", "image_url": {"url": "data:image/png;base64,aGk="}}]
+                },
+                "finish_reason": "stop"
+            }]
+        });
+
+        let sse = convert_openai_chat_response_to_sse(&body).unwrap();
+        let deltas: Vec<Value> = sse
+            .lines()
+            .filter_map(|l| l.strip_prefix("data: "))
+            .filter_map(|d| serde_json::from_str::<Value>(d).ok())
+            .filter_map(|v| v.pointer("/choices/0/delta").cloned())
+            .collect();
+        let images = deltas
+            .iter()
+            .find_map(|d| d.get("images").cloned())
+            .expect("images survive the JSON→SSE conversion");
+        assert_eq!(images[0]["image_url"]["url"], "data:image/png;base64,aGk=");
     }
 
     #[test]

@@ -731,6 +731,8 @@ pub(crate) struct CodeTuiParams {
     pub auto_approve: bool,
     /// `--vision-model [key::]model`: session-only describer, not persisted.
     pub vision_model: Option<String>,
+    /// `--image-model [key::]model`: session-only generator, not persisted.
+    pub image_model: Option<String>,
 }
 
 #[derive(Clone)]
@@ -1474,6 +1476,8 @@ pub(super) enum ConfigSetting {
     AgentTools,
     /// Describe images for text-only models (`aivo` / `custom` / `off`).
     VisionFallback,
+    /// The agent's `generate_image` tool (`custom` / `off`).
+    ImageGen,
 }
 
 /// `Enter` also drills in: the vision row re-opens the describer picker instead
@@ -1766,13 +1770,15 @@ pub(super) enum ModelSelectionTarget {
         prior_model: Option<String>,
     },
     VisionDescriber(ApiKey),
+    ImageGenerator(ApiKey),
 }
 
-/// What picking a key is for; `VisionDescriber` chains into a model picker.
+/// What picking a key is for; the vision/image variants chain into a model picker.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum KeySelectionTarget {
     Switch,
     VisionDescriber,
+    ImageGenerator,
 }
 
 #[derive(Clone)]
@@ -3299,6 +3305,10 @@ pub(super) struct CodeTuiApp {
     /// Snapshot vision support, cached on each model resolve. `Some(false)` =
     /// text-only (image sends refused pre-flight); `None` = unknown (let through).
     pub(super) model_image_input: Option<bool>,
+    /// Image-generation mode (`/config`, `--image-model`); persisted in code-prefs.
+    pub(super) image_gen: crate::services::session_store::ImageGenMode,
+    /// The picked generator `(key_id, model)`; `Custom` without a pair = unconfigured.
+    pub(super) image_gen_custom: Option<(String, String)>,
     /// Vision fallback mode (`/config`, `--vision-model`); persisted in code-prefs.
     pub(super) vision_fallback: crate::services::session_store::VisionFallbackMode,
     /// Custom describer `(key_id, model)` for `VisionFallbackMode::Custom`.
@@ -3739,6 +3749,8 @@ impl CodeTuiApp {
             model_image_input: None,
             vision_fallback: crate::services::session_store::VisionFallbackMode::default(),
             vision_fallback_custom: None,
+            image_gen: crate::services::session_store::ImageGenMode::default(),
+            image_gen_custom: None,
             vision_descriptions: std::collections::HashMap::new(),
             cursor_effort_label: None,
             reasoning_effort: None,

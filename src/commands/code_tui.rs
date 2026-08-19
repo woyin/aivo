@@ -122,6 +122,8 @@ impl CodeTuiApp {
             theme: chat_theme,
             vision_fallback,
             vision_fallback_custom,
+            image_gen,
+            image_gen_custom,
         } = params.session_store.get_chat_toggles().await;
         // Session-only describer override; forces custom mode.
         let vision_override = match params.vision_model.as_deref().map(parse_vision_flag) {
@@ -136,6 +138,19 @@ impl CodeTuiApp {
                 .await,
             ),
             _ => None,
+        };
+        // Session-only generator override; forces custom mode.
+        let image_override = match params.image_model.as_deref() {
+            Some(spec) => Some(
+                resolve_image_model_override(
+                    &params.session_store,
+                    &params.key,
+                    &params.model,
+                    spec,
+                )
+                .await,
+            ),
+            None => None,
         };
         let theme = resolve_startup_theme(chat_theme);
         set_ui_theme(theme);
@@ -218,12 +233,22 @@ impl CodeTuiApp {
         app.agent_tools_enabled = agent_tools_enabled;
         app.vision_fallback = vision_fallback;
         app.vision_fallback_custom = vision_fallback_custom;
+        app.image_gen = image_gen;
+        app.image_gen_custom = image_gen_custom;
         match vision_override {
             Some(Ok(pair)) => {
                 app.vision_fallback_custom = Some(pair);
                 app.vision_fallback = crate::services::session_store::VisionFallbackMode::Custom;
             }
             // Overwrites the startup notice on purpose.
+            Some(Err(message)) => app.notice = Some((ERROR(), message)),
+            None => {}
+        }
+        match image_override {
+            Some(Ok((key, model))) => {
+                app.image_gen_custom = Some((key.id, model));
+                app.image_gen = crate::services::session_store::ImageGenMode::Custom;
+            }
             Some(Err(message)) => app.notice = Some((ERROR(), message)),
             None => {}
         }
@@ -286,6 +311,25 @@ pub(super) fn validate_describer_model(
     Ok(())
 }
 
+/// Strict (unknown → reject), unlike the describer: a non-generator fails only
+/// at tool time with a confusing text-only answer. Chat-incompatible generators
+/// (gpt-image-1) aren't in the snapshot, so they're rejected too.
+pub(super) fn validate_generator_model(
+    model: &str,
+    active_model: &str,
+) -> std::result::Result<(), String> {
+    if model == active_model {
+        return Err("the generator can't be the active model — pick a different one".to_string());
+    }
+    if !crate::services::model_metadata::model_generates_images(model) {
+        return Err(format!(
+            "{model} isn't known to generate images — pick an image-output chat model \
+(e.g. gemini-2.5-flash-image)"
+        ));
+    }
+    Ok(())
+}
+
 /// An empty model half means "open a picker", handled after startup.
 enum VisionFlag {
     Describer { key: Option<String>, model: String },
@@ -322,6 +366,31 @@ async fn resolve_vision_model_override(
     };
     validate_describer_model(&model, active_model).map_err(|e| format!("--vision-model: {e}"))?;
     Ok((key.id, model))
+}
+
+/// `--image-model [key::]model`: no `key::` half → the active session key.
+/// A concrete model is required — the picker lives in /config, and startup
+/// shouldn't block for a tool the turn may never call.
+pub(crate) async fn resolve_image_model_override(
+    store: &SessionStore,
+    active_key: &ApiKey,
+    active_model: &str,
+    spec: &str,
+) -> std::result::Result<(ApiKey, String), String> {
+    let (key_ref, model) = crate::cli_args::split_tier_spec(spec);
+    let model = model.trim().to_string();
+    if model.is_empty() {
+        return Err(
+            "--image-model needs a model (e.g. gemini::gemini-2.5-flash-image) — the picker flow lives in /config → Image generation"
+                .to_string(),
+        );
+    }
+    let key = match key_ref {
+        None => require_describer_key(active_key.clone())?,
+        Some(query) => resolve_describer_key(store, &query).await?,
+    };
+    validate_generator_model(&model, active_model).map_err(|e| format!("--image-model: {e}"))?;
+    Ok((key, model))
 }
 
 pub(super) async fn run_chat_tui(params: CodeTuiParams) -> Result<()> {

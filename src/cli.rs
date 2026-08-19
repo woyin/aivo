@@ -974,6 +974,11 @@ pub struct CodeArgs {
     )]
     pub vision_model: Option<String>,
 
+    /// Image-generation model for the agent's generate_image tool
+    /// (`[key::]model`, model required). Session-only (persistent choice: /config).
+    #[arg(long, value_name = "[KEY::]MODEL")]
+    pub image_model: Option<String>,
+
     /// Bypass cache and fetch fresh model list for the model picker
     #[arg(short = 'r', long)]
     pub refresh: bool,

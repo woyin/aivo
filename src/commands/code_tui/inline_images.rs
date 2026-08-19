@@ -46,6 +46,8 @@ pub(super) enum PreviewSlot {
 pub(super) enum PreviewSource {
     InlineB64(String),
     File(PathBuf),
+    /// Extracted inline `<svg>` markup.
+    Raw(Vec<u8>),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -229,6 +231,49 @@ fn text_image_paths(text: &str) -> Vec<String> {
     image_tokens(text, MAX_RESULT_PATH_PREVIEWS, has_image_extension)
 }
 
+const MAX_INLINE_SVG_BLOCKS: usize = 2;
+
+const MAX_INLINE_SVG_BYTES: usize = 512 * 1024;
+
+/// Inline `<svg>…</svg>` in message text (fenced or bare). Models often paste
+/// markup with no file path; content-addressed like pasted attachments.
+fn inline_svg_blocks(text: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut rest = text;
+    while out.len() < MAX_INLINE_SVG_BLOCKS {
+        let Some(start) = rest.find("<svg") else {
+            break;
+        };
+        let after = &rest[start..];
+        // `<svg>` / `<svg ` / `<svg\n` — not `<svgfoo>`. A false hit only
+        // skips the tag, so a real block right after it still extracts.
+        if !after[4..]
+            .chars()
+            .next()
+            .is_some_and(|c| c == '>' || c.is_whitespace())
+        {
+            rest = &after[4..];
+            continue;
+        }
+        let Some(end) = after.find("</svg>") else {
+            break;
+        };
+        let close = end + "</svg>".len();
+        if close <= MAX_INLINE_SVG_BYTES {
+            let block = &after[..close];
+            // Untrusted markup rasterizes through qlmanage (WebKit) — skip
+            // external refs (SSRF/beacon risk).
+            if !out.iter().any(|b| b == block)
+                && !crate::services::svg_raster::svg_has_external_refs(block)
+            {
+                out.push(block.to_string());
+            }
+        }
+        rest = &after[close..];
+    }
+    out
+}
+
 /// A tool whose deliverable IS an image URL answers in a line or two;
 /// incidental image links ride in big payloads (API JSON, scraped HTML) that
 /// shouldn't become a gallery.
@@ -282,6 +327,7 @@ fn prepare_preview_source(source: PreviewSource) -> Option<EncodedPreview> {
             }
             std::fs::read(&path).ok()?
         }
+        PreviewSource::Raw(bytes) => bytes,
     };
     prepare_bytes(bytes)
 }
@@ -435,6 +481,8 @@ impl CodeTuiApp {
         // (mention pin, resolved path) — resolved to preview keys below.
         let mut pin_wants: Vec<(u64, PathBuf)> = Vec::new();
         let mut inline_wants: Vec<(u64, String)> = Vec::new();
+        // (content key, svg markup) — pasted in a message, no file to stat.
+        let mut inline_svg_wants: Vec<(u64, String)> = Vec::new();
         // (mention pin, url) — keyed on the URL string, fetched async.
         let mut url_wants: Vec<(u64, String)> = Vec::new();
         for (idx, message) in self.history.iter().enumerate() {
@@ -477,6 +525,12 @@ impl CodeTuiApp {
                         want_path(&mut pin_wants, &path);
                     }
                     want_urls(&mut url_wants, text_image_urls(content));
+                    for block in inline_svg_blocks(content) {
+                        let key = hash_inline(&block);
+                        if !self.inline_images.previews.contains_key(&key) {
+                            inline_svg_wants.push((key, block));
+                        }
+                    }
                 }
                 "tool_call" => {
                     if let Some((path, mutates)) = file_tool_image_target(content) {
@@ -533,6 +587,13 @@ impl CodeTuiApp {
         }
         for (key, data) in inline_wants {
             spawn(&mut self.inline_images, key, PreviewSource::InlineB64(data));
+        }
+        for (key, block) in inline_svg_wants {
+            spawn(
+                &mut self.inline_images,
+                key,
+                PreviewSource::Raw(block.into_bytes()),
+            );
         }
     }
 
@@ -660,6 +721,23 @@ impl CodeTuiApp {
         let mut mentions = text_image_paths(content);
         mentions.extend(text_image_urls(content));
         self.push_mention_preview_lines(lines, seen, idx, content, mentions, width);
+        if !self.inline_images.caps.enabled() {
+            return;
+        }
+        // Failed rasterization surfaces like the tool path — the block only
+        // exists because the model produced an image.
+        for block in inline_svg_blocks(content) {
+            let key = hash_inline(&block);
+            match self.inline_images.previews.get(&key) {
+                Some(PreviewSlot::Ready(_)) => self.push_preview_once(lines, seen, key, width),
+                Some(PreviewSlot::Failed) => push_styled_line(
+                    lines,
+                    "  ⚠ image preview failed (svg needs rsvg-convert or qlmanage)",
+                    Style::default().fg(FAINT()),
+                ),
+                _ => {}
+            }
+        }
     }
 
     pub(super) fn push_tool_image_preview_lines(
@@ -1115,6 +1193,32 @@ mod tests {
         assert_eq!(text_image_paths("a.png a.png").len(), 1);
         assert_eq!(text_image_paths("w.png x.png y.png z.png").len(), 3);
         assert!(text_image_paths("no images mentioned here").is_empty());
+    }
+
+    #[test]
+    fn inline_svg_blocks_extracts_fenced_and_bare_markup() {
+        let bare = "here you go\n<svg width=\"10\"><circle r=\"4\"/></svg>\ndone";
+        assert_eq!(
+            inline_svg_blocks(bare),
+            vec!["<svg width=\"10\"><circle r=\"4\"/></svg>"]
+        );
+        let fenced = "```svg\n<svg>\n<rect/>\n</svg>\n```";
+        assert_eq!(inline_svg_blocks(fenced), vec!["<svg>\n<rect/>\n</svg>"]);
+        // `<svgfoo>` is not an svg tag; unterminated markup waits (streaming).
+        assert!(inline_svg_blocks("<svgfoo></svgfoo> <svgbar></svg>").is_empty());
+        // A false `<svg…` hit must not swallow the real block after it.
+        assert_eq!(
+            inline_svg_blocks("<svgfoo> then <svg><rect/></svg>"),
+            vec!["<svg><rect/></svg>"]
+        );
+        assert!(inline_svg_blocks("<svg width=\"10\"><circle").is_empty());
+        let twice = "<svg><rect/></svg> and again <svg><rect/></svg>";
+        assert_eq!(inline_svg_blocks(twice).len(), 1);
+        let many = "<svg>1</svg><svg>2</svg><svg>3</svg>";
+        assert_eq!(inline_svg_blocks(many).len(), MAX_INLINE_SVG_BLOCKS);
+        assert!(inline_svg_blocks("plain prose, no markup").is_empty());
+        // External refs never reach the rasterizer (qlmanage could fetch them).
+        assert!(inline_svg_blocks("<svg><image href=\"http://evil/t.png\"/></svg>").is_empty());
     }
 
     #[test]

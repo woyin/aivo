@@ -514,6 +514,13 @@ pub fn convert_openai_chat_to_gemini_request(body: &Value, config: &OpenAIToGemi
             crate::services::bridge_defaults::stop_sequences_array(v),
         );
     }
+    // OpenRouter-convention `modalities: ["image","text"]` → Gemini
+    // `responseModalities`: image-output models need the explicit opt-in.
+    if let Some(mods) = body.get("modalities").and_then(|v| v.as_array())
+        && mods.iter().any(|m| m.as_str() == Some("image"))
+    {
+        generation.insert("responseModalities".to_string(), json!(["TEXT", "IMAGE"]));
+    }
     // OpenAI `reasoning_effort` → Gemini `thinkingConfig`; the surface differs
     // by version (see `gemini_uses_thinking_level`).
     if !generation.contains_key("thinkingConfig")
@@ -555,6 +562,9 @@ pub fn convert_gemini_to_openai_chat_response(resp: &Value, fallback_model: &str
     let mut text_parts: Vec<String> = Vec::new();
     let mut thought_parts: Vec<String> = Vec::new();
     let mut tool_calls: Vec<Value> = Vec::new();
+    // Image-output parts (gemini-*-image models) → OpenRouter-convention
+    // `message.images`; dropping them would eat the model's actual answer.
+    let mut images: Vec<Value> = Vec::new();
     // The first part-position-based signature stands in for any non-functionCall
     // part (text, inlineData) that needs to be replayed in image-edit / thinking
     // flows. Per spec, signatures attach to the first emitted part of each
@@ -582,6 +592,19 @@ pub fn convert_gemini_to_openai_chat_response(resp: &Value, fallback_model: &str
             && !sig.is_empty()
         {
             leading_part_signature = Some(sig.to_string());
+        }
+        if let Some(inline) = part.get("inlineData").or_else(|| part.get("inline_data"))
+            && let Some(data) = inline.get("data").and_then(|v| v.as_str())
+        {
+            let mime = inline
+                .get("mimeType")
+                .or_else(|| inline.get("mime_type"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("image/png");
+            images.push(json!({
+                "type": "image_url",
+                "image_url": {"url": format!("data:{mime};base64,{data}")}
+            }));
         }
         if let Some(function_call) = part.get("functionCall") {
             let args = function_call
@@ -641,6 +664,9 @@ pub fn convert_gemini_to_openai_chat_response(resp: &Value, fallback_model: &str
     }
     if !tool_calls.is_empty() {
         message["tool_calls"] = Value::Array(tool_calls);
+    }
+    if !images.is_empty() {
+        message["images"] = Value::Array(images);
     }
 
     let prompt_tokens = resp
@@ -1522,6 +1548,49 @@ mod tests {
             },
         );
         assert!(converted["contents"].is_array());
+    }
+
+    #[test]
+    fn test_convert_openai_request_modalities_becomes_response_modalities() {
+        let config = OpenAIToGeminiConfig {
+            default_model: "gemini-2.5-flash-image",
+        };
+        let body = json!({
+            "model": "gemini-2.5-flash-image",
+            "messages": [{"role": "user", "content": "a cat"}],
+            "modalities": ["image", "text"]
+        });
+        let converted = convert_openai_chat_to_gemini_request(&body, &config);
+        assert_eq!(
+            converted["generationConfig"]["responseModalities"],
+            json!(["TEXT", "IMAGE"])
+        );
+        let body = json!({
+            "model": "gemini-2.5-flash",
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        let converted = convert_openai_chat_to_gemini_request(&body, &config);
+        assert!(converted["generationConfig"]["responseModalities"].is_null());
+    }
+
+    #[test]
+    fn test_convert_gemini_response_image_output_becomes_message_images() {
+        let resp = json!({
+            "candidates": [{
+                "content": {"parts": [
+                    {"text": "here you go"},
+                    {"inlineData": {"mimeType": "image/png", "data": "aGk="}}
+                ]},
+                "finishReason": "STOP"
+            }]
+        });
+        let out = convert_gemini_to_openai_chat_response(&resp, "gemini-2.5-flash-image");
+        let message = &out["choices"][0]["message"];
+        assert_eq!(message["content"], "here you go");
+        assert_eq!(
+            message["images"][0]["image_url"]["url"],
+            "data:image/png;base64,aGk="
+        );
     }
 
     #[test]

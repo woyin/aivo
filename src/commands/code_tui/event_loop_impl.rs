@@ -1579,23 +1579,42 @@ impl CodeTuiApp {
     }
 
     pub(super) fn populate_model_picker(&mut self, models: Vec<ModelChoice>) -> Option<usize> {
-        let Overlay::Picker(picker) = &mut self.overlay else {
-            return None;
-        };
-        if !matches!(picker.kind, PickerKind::Model { .. }) {
-            return None;
-        }
-        let describer_key = match &picker.kind {
-            PickerKind::Model {
-                target: ModelSelectionTarget::VisionDescriber(key),
-                ..
-            } => Some(key.id.clone()),
-            _ => None,
+        let (describer_key, generator_key) = match &self.overlay {
+            Overlay::Picker(picker) => match &picker.kind {
+                PickerKind::Model {
+                    target: ModelSelectionTarget::VisionDescriber(key),
+                    ..
+                } => (Some(key.id.clone()), None),
+                PickerKind::Model {
+                    target: ModelSelectionTarget::ImageGenerator(key),
+                    ..
+                } => (None, Some(key.id.clone())),
+                PickerKind::Model { .. } => (None, None),
+                _ => return None,
+            },
+            _ => return None,
         };
         let models = if describer_key.is_some() {
             filter_vision_choices(models)
+        } else if generator_key.is_some() {
+            filter_generator_choices(models)
         } else {
-            models
+            filter_main_chat_choices(models)
+        };
+        if generator_key.is_some() && models.is_empty() {
+            // Empty after a strict filter: this key can't generate. Stay on the
+            // config row rather than an empty picker the user has to re-navigate.
+            self.open_config_overlay_at_image_gen();
+            self.notice = Some((
+                ERROR(),
+                "this key lists no image-output models — use a key that has one \
+(e.g. gemini-2.5-flash-image via a Gemini or OpenRouter key)"
+                    .to_string(),
+            ));
+            return None;
+        }
+        let Overlay::Picker(picker) = &mut self.overlay else {
+            return None;
         };
         // Focus the remembered choice per target.
         let stored = match &picker.kind {
@@ -1611,12 +1630,19 @@ impl CodeTuiApp {
                     },
                 ..
             } => models.iter().position(|m| &m.id == prior),
-            _ => match (&describer_key, &self.vision_fallback_custom) {
-                (Some(key_id), Some((id, model))) if key_id == id => {
-                    models.iter().position(|m| &m.id == model)
+            _ => {
+                let pair = if describer_key.is_some() {
+                    &self.vision_fallback_custom
+                } else {
+                    &self.image_gen_custom
+                };
+                match (describer_key.as_ref().or(generator_key.as_ref()), pair) {
+                    (Some(key_id), Some((id, model))) if key_id == id => {
+                        models.iter().position(|m| &m.id == model)
+                    }
+                    _ => None,
                 }
-                _ => None,
-            },
+            }
         };
 
         picker.items = models
@@ -3428,7 +3454,34 @@ pub(super) fn filter_vision_choices(models: Vec<ModelChoice>) -> Vec<ModelChoice
     if vision.is_empty() {
         return rest;
     }
-    // Unknown price sorts last; stable, so equal-price models keep catalog order.
+    sort_cheapest_first(vision)
+}
+
+/// Image models pass `is_text_chat_model` so the generator picker can offer
+/// them, but a no-tool generator (gemini-2.5-flash-image) can't drive the
+/// agent loop. Keep those out of the main picker only.
+pub(super) fn filter_main_chat_choices(models: Vec<ModelChoice>) -> Vec<ModelChoice> {
+    models
+        .into_iter()
+        .filter(|m| {
+            !crate::services::model_metadata::model_generates_images(&m.id)
+                || crate::services::model_metadata::model_calls_tools(&m.id)
+        })
+        .collect()
+}
+
+/// Snapshot `g` flag only — no permissive fallback; the caller handles empty.
+pub(super) fn filter_generator_choices(models: Vec<ModelChoice>) -> Vec<ModelChoice> {
+    sort_cheapest_first(
+        models
+            .into_iter()
+            .filter(|m| crate::services::model_metadata::model_generates_images(&m.id))
+            .collect(),
+    )
+}
+
+/// Unknown price sorts last; stable, so equal-price models keep catalog order.
+fn sort_cheapest_first(models: Vec<ModelChoice>) -> Vec<ModelChoice> {
     let price = |id: &str| -> f64 {
         crate::services::model_metadata::model_pricing(id)
             .and_then(|p| match (p.input, p.output) {
@@ -3438,7 +3491,7 @@ pub(super) fn filter_vision_choices(models: Vec<ModelChoice>) -> Vec<ModelChoice
             .unwrap_or(f64::MAX)
     };
     let mut keyed: Vec<(f64, ModelChoice)> =
-        vision.into_iter().map(|m| (price(&m.id), m)).collect();
+        models.into_iter().map(|m| (price(&m.id), m)).collect();
     keyed.sort_by(|a, b| a.0.total_cmp(&b.0));
     keyed.into_iter().map(|(_, m)| m).collect()
 }
