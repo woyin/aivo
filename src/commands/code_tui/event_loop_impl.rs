@@ -1892,7 +1892,8 @@ impl CodeTuiApp {
                     crossterm::terminal::BeginSynchronizedUpdate,
                     crossterm::cursor::Hide
                 );
-                if std::mem::take(&mut self.pending_full_repaint) {
+                let full_repaint = std::mem::take(&mut self.pending_full_repaint);
+                if full_repaint {
                     terminal.swap_buffers();
                     for cell in &mut terminal.current_buffer_mut().content {
                         cell.skip = true;
@@ -1903,9 +1904,15 @@ impl CodeTuiApp {
                     // post-draw flush must re-emit every visible image.
                     self.note_cells_repainted();
                 }
+                let draw_start = std::time::Instant::now();
                 // `.err()` drops the `CompletedFrame` borrow so End can write.
                 let draw_err = terminal.draw(|frame| self.render(frame)).err();
                 let image_reflush = self.flush_inline_images(terminal.backend_mut());
+                crate::trace_ev!(
+                    "render",
+                    "event=draw us={} full={full_repaint} img_reflush={image_reflush} streaming={streaming}",
+                    draw_start.elapsed().as_micros()
+                );
                 let _ = execute!(
                     terminal.backend_mut(),
                     crossterm::terminal::EndSynchronizedUpdate
@@ -2344,7 +2351,8 @@ impl CodeTuiApp {
             }
             Event::Key(_) => Ok(None),
             Event::Mouse(mouse) => Ok(Some(self.handle_mouse(mouse).await?)),
-            Event::Resize(_, _) => {
+            Event::Resize(cols, rows) => {
+                crate::trace_ev!("render", "event=resize cols={cols} rows={rows}");
                 self.pending_full_repaint = true;
                 Ok(None)
             }
