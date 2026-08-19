@@ -73,7 +73,7 @@ impl AgentEngine {
             reasoning_efforts: Vec::new(),
             thinking_enabled: true,
             use_web_search_enabled: true,
-            image_model: None,
+            image_source: None,
             agent_tools_enabled: true,
             reasoning_capable: default_reasoning_effort(model).is_some(),
             read_only: false,
@@ -233,6 +233,16 @@ impl AgentEngine {
                 ctx.effort_levels.join(", ")
             )
         };
+        // Without this the model thinks the terminal is text-only: it reads an
+        // image to narrate it, then runs `open` on an unasked-for desktop viewer.
+        let images_clause = if ctx.inline_images {
+            " This terminal DOES render images: name an image file's path in your \
+reply and it appears inline in the transcript. So for \"show me x.png\" just say the \
+path — don't read the file to describe it, and never run `open`/`xdg-open` to launch \
+an external viewer unless the user explicitly asks you to open it."
+        } else {
+            ""
+        };
         let block = format!(
             "This is an interactive `aivo code` session (not a plain shell). Live setup — model: \
 `{model}`, provider: `{provider}`{effort_clause}. When the user asks what model, provider, or \
@@ -249,7 +259,7 @@ questions. A decision that is genuinely the user's — a requirement the request
 trade-off between reasonable designs — deserves an `ask_user` BEFORE you build on one answer; a \
 choice with an obvious conventional default doesn't (take the default and say so). For bigger \
 work the user can also run `/plan`, which puts the session in read-only planning mode with a \
-plan-approval card — suggest it when a task deserves real design discussion.",
+plan-approval card — suggest it when a task deserves real design discussion.{images_clause}",
             model = ctx.model_label,
             provider = ctx.provider_label,
         );
@@ -372,23 +382,26 @@ plan-approval card — suggest it when a task deserves real design discussion.",
         self.agent_tools_enabled = on;
     }
 
-    /// `/config` Image generation: `Some(model)` advertises `generate_image`, `None` removes it.
-    pub fn set_image_model(&mut self, model: Option<String>) {
+    /// `/config` Image generation: `Some(source)` advertises `generate_image`,
+    /// `None` removes it.
+    pub fn set_image_source(
+        &mut self,
+        source: Option<crate::services::image_generate::GeneratorSource>,
+    ) {
         let is_gen = |t: &Value| t["function"]["name"].as_str() == Some("generate_image");
         let has = self.tools_openai.iter().any(is_gen) || self.plan_mode_stash.iter().any(is_gen);
-        if model.is_some() && !has {
+        if source.is_some() && !has {
             self.advertise_tool(tool_to_openai(tools::generate_image_tool_spec()));
-        } else if model.is_none() && has {
+        } else if source.is_none() && has {
             self.tools_openai.retain(|t| !is_gen(t));
             self.plan_mode_stash.retain(|t| !is_gen(t));
         }
-        self.image_model = model;
+        self.image_source = source;
     }
 
-    /// Add a tool spec — into the plan-mode stash when it's one plan mode hides,
-    /// since the TUI re-runs these setters every turn, after `set_plan_mode`. A
-    /// live push there would both leak the tool into plan mode and duplicate it
-    /// when the stash is restored on exit.
+    /// Add a tool spec — into the plan-mode stash when plan mode hides it. The TUI
+    /// re-runs these setters every turn AFTER `set_plan_mode`, so a live push
+    /// would leak the tool into plan mode and duplicate it on exit.
     pub(super) fn advertise_tool(&mut self, spec: Value) {
         let hidden = spec["function"]["name"]
             .as_str()

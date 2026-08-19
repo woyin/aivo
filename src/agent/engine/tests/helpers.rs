@@ -275,3 +275,17 @@ pub(super) fn system_content(engine: &AgentEngine) -> String {
         .unwrap_or_default()
         .to_string()
 }
+
+/// Own-key generator for tool-wiring tests; never called.
+pub(super) fn test_generator() -> crate::services::image_generate::GeneratorSource {
+    crate::services::image_generate::GeneratorSource::OwnKey {
+        model: "gemini-2.5-flash-image".to_string(),
+        key: Box::new(crate::services::session_store::ApiKey::new_with_protocol(
+            "k1".into(),
+            "k".into(),
+            "https://example.invalid/v1".into(),
+            None,
+            "sk-test".into(),
+        )),
+    }
+}

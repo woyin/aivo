@@ -360,6 +360,9 @@ impl CodeTuiApp {
         // The previous lone tool call's `→` row — the row an adjacent result
         // merges onto instead of spending a `⎿` line.
         let mut merge_anchor: Option<usize> = None;
+        // A path the USER named previews under the ANSWER: anchored to the request
+        // it lands above the reasoning still looking for it.
+        let mut deferred_mention: Option<usize> = None;
         let mut idx = 0;
         while idx < render_len {
             let message = &self.history[idx];
@@ -371,6 +374,18 @@ impl CodeTuiApp {
             if message.role == "plan" {
                 idx += 1;
                 continue;
+            }
+            // Turn ended with no assistant message (error, interrupt).
+            if message.role == "user"
+                && let Some(d_idx) = deferred_mention.take()
+            {
+                self.push_deferred_mention(
+                    &mut lines,
+                    &mut bars,
+                    &mut previewed,
+                    d_idx,
+                    text_width,
+                );
             }
             if should_add_message_spacing(previous_role, message.role.as_str()) {
                 push_message_spacing(&mut lines);
@@ -433,13 +448,7 @@ impl CodeTuiApp {
                         &message.attachments,
                         text_width,
                     );
-                    self.push_text_image_preview_lines(
-                        &mut block,
-                        &mut previewed,
-                        idx,
-                        &message.content,
-                        text_width,
-                    );
+                    deferred_mention = Some(idx);
                 }
                 "assistant" => {
                     let reasoning = self
@@ -469,6 +478,15 @@ impl CodeTuiApp {
                             true,
                         );
                         let mut extra = Vec::new();
+                        if let Some(d_idx) = deferred_mention.take() {
+                            self.push_text_image_preview_lines(
+                                &mut extra,
+                                &mut previewed,
+                                d_idx,
+                                &self.history[d_idx].content,
+                                text_width,
+                            );
+                        }
                         self.push_text_image_preview_lines(
                             &mut extra,
                             &mut previewed,
@@ -694,6 +712,12 @@ impl CodeTuiApp {
             }
             previous_role = Some(message.role.as_str());
             idx += advance;
+        }
+        // Reply not in yet (mid-turn, or an in-flight tool run hidden by
+        // `committed_render_len`): render at the tail, else naming a path shows
+        // nothing for the whole turn.
+        if let Some(d_idx) = deferred_mention.take() {
+            self.push_deferred_mention(&mut lines, &mut bars, &mut previewed, d_idx, text_width);
         }
 
         compact_lines_and_bars(&mut lines, &mut bars);
@@ -1699,9 +1723,10 @@ impl CodeTuiApp {
             self.render_login_card(frame, composer_area, outer);
         }
 
-        // Images float above cells, so anything drawn over the transcript
-        // (overlays, decision cards, the command menu) must suppress them for
-        // the frame — the post-draw flush then deletes the stale placements.
+        // Cursor-addressed images float above cells, so surfaces drawn over the
+        // transcript must suppress them for the frame — the post-draw flush then
+        // deletes the stale placements. Virtual placements are exempt: covering
+        // cells clips them naturally.
         let covering_surface = !matches!(self.overlay, Overlay::None)
             || self.visible_command_menu().is_some()
             || self.cards.mcp_consent.is_some()
@@ -1709,7 +1734,7 @@ impl CodeTuiApp {
             || self.cards.any_agent_card()
             || self.account.pending_logout.is_some()
             || self.account.login.is_some();
-        if covering_surface {
+        if covering_surface && !self.inline_images.caps.virtual_placement() {
             self.inline_images.desired.clear();
         }
 

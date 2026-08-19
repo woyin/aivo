@@ -38,7 +38,7 @@ fn plan_mode_hides_mutating_tools_but_keeps_bash() {
 #[test]
 fn plan_mode_hides_generate_image() {
     let mut engine = AgentEngine::new("/tmp", "m", "", &[], &[], 0, 0);
-    engine.set_image_model(Some("gemini-2.5-flash-image".into()));
+    engine.set_image_source(Some(test_generator()));
     assert!(tool_names(&engine).iter().any(|n| n == "generate_image"));
     engine.set_plan_mode(true);
     assert!(
@@ -49,14 +49,13 @@ fn plan_mode_hides_generate_image() {
     assert!(tool_names(&engine).iter().any(|n| n == "generate_image"));
 }
 
-/// The TUI's real order: `set_plan_mode` first, then `set_image_model` every
-/// turn. A live re-add would leak the tool into plan mode and leave a duplicate
-/// spec (which some providers 400 on) once the stash is restored.
+/// The TUI's real order: `set_plan_mode` first, then `set_image_source` every
+/// turn. A live re-add leaks into plan mode and duplicates the spec on exit.
 #[test]
 fn image_model_set_during_plan_mode_stays_stashed() {
     let mut engine = AgentEngine::new("/tmp", "m", "", &[], &[], 0, 0);
     engine.set_plan_mode(true);
-    engine.set_image_model(Some("gemini-2.5-flash-image".into()));
+    engine.set_image_source(Some(test_generator()));
     assert!(
         !tool_names(&engine).iter().any(|n| n == "generate_image"),
         "configured mid-plan, the tool must stay hidden"
@@ -72,7 +71,7 @@ fn image_model_set_during_plan_mode_stays_stashed() {
     );
     // Clearing while stashed must reach the stash too.
     engine.set_plan_mode(true);
-    engine.set_image_model(None);
+    engine.set_image_source(None);
     engine.set_plan_mode(false);
     assert!(!tool_names(&engine).iter().any(|n| n == "generate_image"));
 }

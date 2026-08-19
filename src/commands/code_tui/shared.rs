@@ -1687,6 +1687,7 @@ impl Overlay {
     }
 }
 
+pub(super) use crate::services::image_generate::GeneratorSource;
 pub(super) use crate::services::vision_describe::DescriberSource;
 
 /// Whether the vision fallback can cover this turn, and if not why — the one

@@ -22,6 +22,7 @@ fn chat_session_context_injects_facts_and_tools() {
         provider_label: "openrouter".to_string(),
         effort: Some("high".to_string()),
         effort_levels: vec!["low".into(), "medium".into(), "high".into()],
+        inline_images: true,
     });
     let p = system_content(&e);
     assert!(p.contains("interactive `aivo code` session"));
@@ -29,6 +30,8 @@ fn chat_session_context_injects_facts_and_tools() {
     assert!(p.contains("/model") && p.contains("switch_model") && p.contains("/key"));
     assert!(p.contains("BEFORE you build on one answer"));
     assert!(p.contains("/plan"));
+    // Previews on: don't narrate or `open` an image.
+    assert!(p.contains("DOES render images") && p.contains("never run `open`"));
     let names = tool_names(&e);
     assert!(names.contains(&"switch_model".to_string()));
     assert!(names.contains(&"set_effort".to_string()));
@@ -40,6 +43,7 @@ fn chat_session_context_injects_facts_and_tools() {
         provider_label: "y".into(),
         effort: None,
         effort_levels: vec![],
+        inline_images: false,
     });
     assert_eq!(
         tool_names(&e)
@@ -58,8 +62,11 @@ fn chat_session_context_reports_no_effort_levels() {
         provider_label: "prov".into(),
         effort: None,
         effort_levels: vec![],
+        inline_images: false,
     });
     assert!(system_content(&e).contains("no reasoning-effort levels"));
+    // Previews off: promising inline rendering would be a lie.
+    assert!(!system_content(&e).contains("DOES render images"));
 }
 
 #[tokio::test]

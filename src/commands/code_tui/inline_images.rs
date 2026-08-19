@@ -144,7 +144,7 @@ pub(super) fn file_tool_image_target(content: &str) -> Option<(String, bool)> {
 
 /// Identity of one image mention: which history entry, roughly what it said,
 /// and which path — the pin under which the resolved preview key is frozen.
-fn pin_id(idx: usize, content: &str, path: &str) -> u64 {
+pub(super) fn pin_id(idx: usize, content: &str, path: &str) -> u64 {
     keyed_hash("pin", |h| {
         idx.hash(h);
         content.len().hash(h);
@@ -196,14 +196,76 @@ fn hash_url(url: &str) -> u64 {
 /// Distinct punctuation-trimmed whitespace tokens accepted by `keep`, capped.
 fn image_tokens(text: &str, cap: usize, keep: impl Fn(&str) -> bool) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
-    for token in text.split_whitespace() {
-        let token = token.trim_matches(|c: char| "\"'`()[]{}<>,;:!?*".contains(c));
+    let push = |token: &str, out: &mut Vec<String>| {
         if token.is_empty() || !keep(token) || out.iter().any(|t| t == token) {
-            continue;
+            return;
         }
         out.push(token.to_string());
+    };
+    // `![alt](path.png)`: the `](` sits mid-token, so whitespace splitting alone
+    // never recovers the path — the way models usually present an image.
+    for target in markdown_link_targets(text) {
+        push(target, &mut out);
+        if out.len() == cap {
+            return out;
+        }
+    }
+    for token in text.split(is_token_boundary) {
+        let token = token.trim_matches(|c: char| "\"'`()[]{}<>,;:!?*".contains(c));
+        // Markdown leftovers pass the extension gate and burn a slot on a path
+        // that cannot exist; the pass above already had them.
+        if token.contains("](") {
+            continue;
+        }
+        push(token, &mut out);
         if out.len() == cap {
             break;
+        }
+    }
+    out
+}
+
+/// Whitespace plus CJK punctuation, which sets flush against the word
+/// (`路径：a.svg`, `a.svg。`) and so never splits on whitespace alone.
+fn is_token_boundary(c: char) -> bool {
+    c.is_whitespace()
+        || matches!(
+            c,
+            '。' | '，'
+                | '、'
+                | '：'
+                | '；'
+                | '！'
+                | '？'
+                | '（'
+                | '）'
+                | '【'
+                | '】'
+                | '「'
+                | '」'
+                | '『'
+                | '』'
+                | '《'
+                | '》'
+                | '〈'
+                | '〉'
+                | '…'
+        )
+}
+
+/// The `path` in `](path)`, minus an optional `"title"` and `<>` wrapping.
+fn markdown_link_targets(text: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    for (i, _) in text.match_indices("](") {
+        let rest = &text[i + "](".len()..];
+        let Some(end) = rest.find(')') else {
+            continue;
+        };
+        let target = rest[..end].trim();
+        let target = target.split_whitespace().next().unwrap_or(""); // drop a "Title"
+        let target = target.trim_start_matches('<').trim_end_matches('>');
+        if !target.is_empty() {
+            out.push(target);
         }
     }
     out
@@ -286,6 +348,18 @@ fn result_image_urls(result: &str) -> Vec<String> {
     text_image_urls(result)
 }
 
+/// Strips a leading bullet and ONE trailing parenthetical —
+/// `- /out/cat.png (412.3 KB, image/png)`, the shape MCP image tools answer in.
+/// Narrow on purpose: prose that merely names a file still previews nothing.
+fn undecorate_path_line(line: &str) -> &str {
+    let line = line.trim_start_matches(['-', '*', '•', '+']).trim_start();
+    let line = match line.rfind(" (") {
+        Some(i) if line.ends_with(')') => &line[..i],
+        _ => line,
+    };
+    line.trim()
+}
+
 /// Image paths a tool result points at: aivo's `[image saved:]` trailer, plus
 /// bare image-path lines — a glob/ls answering "show me x.png" ends there
 /// without any read/write call to hook. Display-only, best-effort.
@@ -294,6 +368,7 @@ fn result_image_paths(result: &str) -> Vec<String> {
     let bare: Vec<&str> = result
         .lines()
         .map(str::trim)
+        .map(undecorate_path_line)
         .filter(|l| !l.is_empty() && has_image_extension(l))
         .collect();
     if bare.len() <= MAX_RESULT_PATH_PREVIEWS {
@@ -705,6 +780,24 @@ impl CodeTuiApp {
                 self.push_preview_once(lines, seen, key, width);
             }
         }
+    }
+
+    /// A user message's deferred path mention as its own block; the pin identity
+    /// stays with the user message, only the position moves.
+    pub(super) fn push_deferred_mention(
+        &self,
+        lines: &mut Vec<StyledLine>,
+        bars: &mut Vec<Option<Color>>,
+        seen: &mut HashSet<u64>,
+        idx: usize,
+        width: u16,
+    ) {
+        let Some(content) = self.history.get(idx).map(|m| m.content.clone()) else {
+            return;
+        };
+        let mut extra = Vec::new();
+        self.push_text_image_preview_lines(&mut extra, seen, idx, &content, width);
+        super::push_block(lines, bars, extra, Some(super::role_bar_color("user")));
     }
 
     /// Previews for image paths mentioned in a user or assistant message —
@@ -1182,6 +1275,59 @@ mod tests {
         assert!(file_tool_image_target(&grep).is_none());
     }
 
+    /// Whitespace tokenization alone yields `rain](assets/cat.png)` — an
+    /// impossible filename the stat gate drops, silently.
+    #[test]
+    fn text_image_paths_reads_markdown_image_syntax() {
+        assert_eq!(
+            text_image_paths("Here it is:\n![Cat in the rain](assets/cat-in-the-rain.png)"),
+            vec!["assets/cat-in-the-rain.png"]
+        );
+        assert_eq!(
+            text_image_paths("![cat](assets/cat.png)"),
+            vec!["assets/cat.png"]
+        );
+        // Title / angle-bracket forms.
+        assert_eq!(
+            text_image_paths("![a](shots/a.png \"My title\")"),
+            vec!["shots/a.png"]
+        );
+        assert_eq!(text_image_paths("[link](<b.jpeg>)"), vec!["b.jpeg"]);
+        // Markdown + the same bare path dedup.
+        assert_eq!(
+            text_image_paths("![a](x.png) and also x.png"),
+            vec!["x.png"]
+        );
+        // The extension gate still rules.
+        assert!(text_image_paths("[docs](https://example.com/page)").is_empty());
+    }
+
+    #[test]
+    fn text_image_urls_read_markdown_targets() {
+        assert_eq!(
+            text_image_urls("![remote](https://cdn.example/a.png)"),
+            vec!["https://cdn.example/a.png"]
+        );
+    }
+
+    /// Chinese sets punctuation flush against the path.
+    #[test]
+    fn text_image_paths_survives_cjk_punctuation() {
+        assert_eq!(
+            text_image_paths("SVG 已生成，路径：triangles-circles.svg"),
+            vec!["triangles-circles.svg"]
+        );
+        assert_eq!(
+            text_image_paths("就是这张。源文件在 triangles-circles.svg。"),
+            vec!["triangles-circles.svg"]
+        );
+        assert_eq!(text_image_paths("生成了 cat.png，请查看"), vec!["cat.png"]);
+        assert_eq!(
+            text_image_paths("图片（shots/a.png）已保存"),
+            vec!["shots/a.png"]
+        );
+    }
+
     #[test]
     fn text_image_paths_extracts_mentions() {
         assert_eq!(text_image_paths("show octagon.svg"), vec!["octagon.svg"]);
@@ -1255,6 +1401,27 @@ mod tests {
         let big = icon.repeat(1 + MAX_RESULT_URL_SCAN_BYTES / icon.len());
         assert!(big.len() > MAX_RESULT_URL_SCAN_BYTES);
         assert!(result_image_urls(&big).is_empty());
+    }
+
+    /// The shape MCP image tools answer in: bullet, path, size/mime annotation.
+    #[test]
+    fn result_image_paths_reads_decorated_list_lines() {
+        let mcp = "Generated 1 image with gemini-3.1-flash-lite-image:\n\
+- /out/img/cat-in-the-rain.png (412.3 KB, image/png)\n\
+\nModel notes: a wet tabby";
+        assert_eq!(
+            result_image_paths(mcp),
+            vec!["/out/img/cat-in-the-rain.png".to_string()]
+        );
+        // Several images in one answer, up to the cap.
+        let two = "Generated 2 images with m:\n- a/one.png (1 KB, image/png)\n* b/two.jpg (2 KB, image/jpeg)";
+        assert_eq!(
+            result_image_paths(two),
+            vec!["a/one.png".to_string(), "b/two.jpg".to_string()]
+        );
+        // Prose naming a file stays quiet: the line must BE a path once undecorated.
+        assert!(result_image_paths("I updated logo.png in the header").is_empty());
+        assert!(result_image_paths("- see logo.png for details").is_empty());
     }
 
     #[test]

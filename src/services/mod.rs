@@ -55,6 +55,7 @@ pub mod http_debug;
 pub mod http_utils;
 pub mod huggingface;
 pub mod id_compact;
+pub mod image_generate;
 pub mod image_optimize;
 pub mod json_store;
 pub mod key_compat;

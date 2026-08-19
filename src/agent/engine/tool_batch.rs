@@ -704,17 +704,15 @@ Before calling `{tool}` again, make its arguments match this schema exactly:\n{s
         ))
     }
 
-    /// Prompt-only chat turn against the configured image model on the loopback
-    /// serve. Saved like MCP image results so TUI preview reuses that path.
+    /// Saved like MCP image results, so the TUI preview path is reused.
     async fn generate_image_call(
         &self,
         ctx: &TurnCtx<'_>,
         args: &Value,
     ) -> Result<crate::agent::engine::ToolOutput, String> {
-        const GENERATE_TIMEOUT_SECS: u64 = 180;
-        let Some(model) = self.image_model.as_deref() else {
+        let Some(source) = self.image_source.as_ref() else {
             return Err(
-                "image generation isn't configured — pick a model in /config → Image generation"
+                "image generation isn't configured — turn it on in /config → Image generation"
                     .to_string(),
             );
         };
@@ -724,55 +722,21 @@ Before calling `{tool}` again, make its arguments match this schema exactly:\n{s
             .map(str::trim)
             .filter(|s| !s.is_empty())
             .ok_or("missing required string argument `prompt`")?;
-        // OpenRouter only emits image outputs when the request opts in via
-        // `modalities`; OpenAI recognizes the param and the Gemini bridge maps
-        // it to `responseModalities`.
-        let mut extra = serde_json::Map::new();
-        extra.insert(
-            "modalities".to_string(),
-            serde_json::json!(["image", "text"]),
-        );
-        let request = crate::agent::protocol::ChatRequest {
-            model: model.to_string(),
-            messages: vec![serde_json::json!({"role": "user", "content": prompt})],
-            tools: vec![],
-            extra,
-        };
-        let mut sink = |_: crate::agent::serve_client::StreamDelta| {};
-        let call = crate::agent::serve_client::complete(
+        let urls = crate::services::image_generate::generate(
+            source,
             ctx.client,
             ctx.serve_base,
-            ctx.auth,
-            &request,
-            &mut sink,
-        );
-        let msg =
-            match tokio::time::timeout(std::time::Duration::from_secs(GENERATE_TIMEOUT_SECS), call)
-                .await
-            {
-                Err(_) => return Err(format!("image generation via {model} timed out")),
-                Ok(Err(e)) => return Err(format!("image generation via {model} failed: {e}")),
-                Ok(Ok(m)) => m,
-            };
-        if msg.images.is_empty() {
-            // Text-only reply (refusal/clarification) — surface it so the agent can react.
-            let text = msg.content.unwrap_or_default();
-            return Err(if text.trim().is_empty() {
-                format!("{model} returned no image")
-            } else {
-                format!("{model} returned no image: {text}")
-            });
-        }
-        let mut text = msg.content.unwrap_or_default();
-        let urls = msg.images;
+            ctx.auth.unwrap_or_default(),
+            prompt,
+        )
+        .await?;
         let (saved_notes, images) = tokio::task::spawn_blocking(move || {
             crate::agent::mcp::save_data_url_images(&urls, "gen")
         })
         .await
         .map_err(|e| format!("image save task failed: {e}"))??;
-        text.push_str(&saved_notes);
         Ok(crate::agent::engine::ToolOutput {
-            text: text.trim_start().to_string(),
+            text: saved_notes.trim_start().to_string(),
             images,
         })
     }

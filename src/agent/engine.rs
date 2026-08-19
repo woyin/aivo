@@ -544,7 +544,8 @@ pub struct AgentEngine {
     /// `/config` toggle for aivo's hosted web_search (the local tool); native search untouched.
     use_web_search_enabled: bool,
     /// `/config` Image generation model; `Some` advertises `generate_image`.
-    image_model: Option<String>,
+    /// `None` → `generate_image` isn't advertised.
+    image_source: Option<crate::services::image_generate::GeneratorSource>,
     /// `/config` master switch; off → plain chat (no tools, no system prompt).
     agent_tools_enabled: bool,
     /// Whether this model can reason at all (snapshot). Cached at construction so the
@@ -670,6 +671,8 @@ pub struct ChatSessionContext {
     pub provider_label: String,
     pub effort: Option<String>,
     pub effort_levels: Vec<String>,
+    /// Off (no graphics protocol) the model must NOT be told it can show pictures.
+    pub inline_images: bool,
 }
 
 /// Default reasoning-effort level: `AIVO_AGENT_REASONING_EFFORT` or `"medium"`.

@@ -1063,6 +1063,111 @@ fn test_inline_image_preview_rows_reserved_and_anchored() {
     assert!(body.lines.iter().all(|l| !l.plain.contains('\u{200B}')));
 }
 
+/// A path the USER names previews under the ANSWER, not the request.
+#[test]
+fn test_user_named_image_previews_under_the_reply() {
+    use crate::services::terminal_graphics::{EncodedPreview, GraphicsCaps, PixelFormat, Protocol};
+    let ready = |key: u64| {
+        PreviewSlot::Ready(std::sync::Arc::new(EncodedPreview {
+            format: PixelFormat::Png,
+            px_w: 400,
+            px_h: 200,
+            payload_b64: "AAAA".to_string(),
+            thumb: None,
+            content_hash: key,
+        }))
+    };
+    let msg = |role: &str, content: &str| ChatMessage {
+        model: None,
+        role: role.to_string(),
+        content: content.to_string(),
+        reasoning_content: None,
+        attachments: vec![],
+    };
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.inline_images.caps = GraphicsCaps {
+        protocol: Protocol::KittyVirtual,
+        tmux: false,
+        ..GraphicsCaps::default()
+    };
+    const KEY: u64 = 0xBEEF;
+    app.history.push(msg("user", "show shot.png"));
+    app.history.push(msg("assistant", "Here it is, rendered."));
+    app.inline_images
+        .pinned
+        .insert(super::super::pin_id(0, "show shot.png", "shot.png"), KEY);
+    app.inline_images.previews.insert(KEY, ready(KEY));
+
+    let body = app.build_transcript_history_body(80);
+    let row_of = |needle: &str| {
+        body.lines
+            .iter()
+            .position(|l| l.plain.contains(needle))
+            .unwrap_or_else(|| panic!("missing line: {needle}"))
+    };
+    let anchor_row = body
+        .lines
+        .iter()
+        .position(|l| l.image.is_some())
+        .expect("the mention previews somewhere");
+    assert!(
+        anchor_row > row_of("Here it is, rendered."),
+        "the picture belongs under the reply, not above the work that found it"
+    );
+    assert_eq!(
+        body.lines.iter().filter(|l| l.image.is_some()).count(),
+        1,
+        "one mention, one image"
+    );
+
+    // No assistant message: flushed at the next user message, not dropped.
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.inline_images.caps = GraphicsCaps {
+        protocol: Protocol::KittyVirtual,
+        tmux: false,
+        ..GraphicsCaps::default()
+    };
+    app.history.push(msg("user", "show shot.png"));
+    app.history.push(msg("user", "still there?"));
+    app.inline_images
+        .pinned
+        .insert(super::super::pin_id(0, "show shot.png", "shot.png"), KEY);
+    app.inline_images.previews.insert(KEY, ready(KEY));
+    let body = app.build_transcript_history_body(80);
+    let anchor_row = body
+        .lines
+        .iter()
+        .position(|l| l.image.is_some())
+        .expect("an unanswered turn still previews");
+    let second_user = body
+        .lines
+        .iter()
+        .position(|l| l.plain.contains("still there?"))
+        .expect("second user line");
+    assert!(anchor_row < second_user, "flushed before the next turn");
+
+    // Mid-turn: no tail flush would show NOTHING for the whole turn.
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.inline_images.caps = GraphicsCaps {
+        protocol: Protocol::KittyVirtual,
+        tmux: false,
+        ..GraphicsCaps::default()
+    };
+    app.history.push(msg("user", "show shot.png"));
+    app.inline_images
+        .pinned
+        .insert(super::super::pin_id(0, "show shot.png", "shot.png"), KEY);
+    app.inline_images.previews.insert(KEY, ready(KEY));
+    let body = app.build_transcript_history_body(80);
+    assert!(
+        body.lines.iter().any(|l| l.image.is_some()),
+        "a turn with no reply yet still shows the picture"
+    );
+}
+
 #[test]
 fn test_inline_image_flush_diffs_placements() {
     use crate::services::terminal_graphics::{EncodedPreview, GraphicsCaps, PixelFormat, Protocol};
@@ -1131,6 +1236,80 @@ fn test_inline_image_flush_diffs_placements() {
     let emitted = String::from_utf8(out).unwrap();
     assert!(emitted.contains("a=d,d=I"));
     assert!(app.inline_images.transmitted.is_empty());
+}
+
+/// A decision card drops floating (cursor-addressed) placements for the
+/// frame but keeps virtual ones — those clip naturally via their cells.
+#[test]
+fn test_ask_card_keeps_virtual_placements_drops_floating_ones() {
+    use crate::services::terminal_graphics::{EncodedPreview, GraphicsCaps, PixelFormat, Protocol};
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    let build = |protocol: Protocol| {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = make_test_app(tx, rx);
+        app.inline_images.caps = GraphicsCaps {
+            protocol,
+            tmux: false,
+            ..GraphicsCaps::default()
+        };
+        const KEY: u64 = 0xCAFE;
+        app.history.push(ChatMessage {
+            model: None,
+            role: "user".to_string(),
+            content: "show shot.png".to_string(),
+            reasoning_content: None,
+            attachments: vec![],
+        });
+        app.inline_images
+            .pinned
+            .insert(super::super::pin_id(0, "show shot.png", "shot.png"), KEY);
+        app.inline_images.previews.insert(
+            KEY,
+            PreviewSlot::Ready(std::sync::Arc::new(EncodedPreview {
+                format: PixelFormat::Png,
+                px_w: 400,
+                px_h: 200,
+                payload_b64: "AAAA".to_string(),
+                thumb: None,
+                content_hash: KEY,
+            })),
+        );
+        let (reply, _answer_rx) =
+            tokio::sync::oneshot::channel::<std::result::Result<String, String>>();
+        app.cards.set_ask(PendingAskUser {
+            question: "Which shape?".to_string(),
+            options: vec![crate::agent::ask::AskOption {
+                label: "Diamonds".to_string(),
+                description: None,
+            }],
+            allow_free_text: true,
+            multi_select: false,
+            checked: Vec::new(),
+            selected: 0,
+            record_history: false,
+            reply,
+        });
+        app
+    };
+
+    let mut terminal = Terminal::new(TestBackend::new(80, 30)).unwrap();
+
+    let mut app = build(Protocol::KittyVirtual);
+    terminal.draw(|frame| app.render(frame)).unwrap();
+    assert!(
+        !app.inline_images.desired.is_empty(),
+        "virtual placements must survive a decision card"
+    );
+
+    let mut terminal = Terminal::new(TestBackend::new(80, 30)).unwrap();
+    let mut app = build(Protocol::KittyClassic);
+    terminal.draw(|frame| app.render(frame)).unwrap();
+    assert!(
+        app.inline_images.desired.is_empty(),
+        "floating placements must drop while a card covers the transcript"
+    );
 }
 
 #[test]

@@ -182,7 +182,7 @@ pub fn native_web_search_enabled(model: &str) -> bool {
 }
 
 /// Advertised only when the engine carries a configured image model
-/// (`/config` → Image generation) — see `set_image_model`.
+/// (`/config` → Image generation) — see `set_image_source`.
 pub fn generate_image_tool_spec() -> ToolSpec {
     spec(
         "generate_image",

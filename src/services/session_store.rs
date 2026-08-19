@@ -901,10 +901,12 @@ impl VisionFallbackMode {
 
 /// Persisted image-generation mode (`"imageGen"` in code-prefs.json). The
 /// generator pair lives under the sibling `"imageGenCustom"` key so flipping
-/// the mode away and back doesn't lose it. Unknown values parse to `Off` so a
-/// future `"gateway"` value stays forward-compatible.
+/// the mode away and back doesn't lose it. `Gateway` persists as `"gateway"`
+/// but displays as `aivo` in `/config`. Default `Off` (unlike vision fallback):
+/// a generation costs orders of magnitude more than a describe.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ImageGenMode {
+    Gateway,
     Custom,
     #[default]
     Off,
@@ -913,14 +915,16 @@ pub enum ImageGenMode {
 impl ImageGenMode {
     pub fn as_str(self) -> &'static str {
         match self {
+            Self::Gateway => "gateway",
             Self::Custom => "custom",
             Self::Off => "off",
         }
     }
 
-    /// Missing/unknown → the default (off): generation needs a picked model.
+    /// Missing/unknown → the default (off): generation is opt-in either way.
     pub fn parse(s: &str) -> Self {
         match s.trim().to_ascii_lowercase().as_str() {
+            "gateway" => Self::Gateway,
             "custom" => Self::Custom,
             _ => Self::Off,
         }
@@ -2943,9 +2947,20 @@ mod tests {
         assert_eq!(toggles.image_gen, ImageGenMode::Off);
         assert!(toggles.image_gen_custom.is_some());
 
-        // Unknown (e.g. a future "gateway") → off, never a crash.
-        assert_eq!(ImageGenMode::parse("gateway"), ImageGenMode::Off);
+        // The hosted mode round-trips and keeps the custom pair for a flip back.
+        store
+            .set_chat_image_gen(ImageGenMode::Gateway, None)
+            .await
+            .unwrap();
+        let toggles = store.get_chat_toggles().await;
+        assert_eq!(toggles.image_gen, ImageGenMode::Gateway);
+        assert!(toggles.image_gen_custom.is_some());
+
+        assert_eq!(ImageGenMode::parse("gateway"), ImageGenMode::Gateway);
+        // Unknown → off (not gateway): generation is opt-in, so a typo must
+        // never silently start spending the hosted quota.
         assert_eq!(ImageGenMode::parse("bogus"), ImageGenMode::Off);
+        assert_eq!(ImageGenMode::parse(""), ImageGenMode::Off);
     }
 
     /// The per-repo project-MCP allow-list round-trips and shares code-prefs.json

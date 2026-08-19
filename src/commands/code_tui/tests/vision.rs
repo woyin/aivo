@@ -899,6 +899,37 @@ async fn image_generator_resolution_requires_custom_mode_and_pair() {
     assert!(app.resolve_image_generator().await.is_none());
 }
 
+/// The row shows `aivo`; the persisted value is "gateway". Routing the label
+/// through `ImageGenMode::parse` would silently select Off.
+#[tokio::test]
+async fn config_image_gen_aivo_segment_selects_the_gateway_mode() {
+    use crate::services::session_store::ImageGenMode;
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.open_config_overlay_at(ConfigSetting::ImageGen);
+    assert_eq!(app.image_gen, ImageGenMode::Off);
+    let row = match &app.overlay {
+        Overlay::Config(state) => state.selected,
+        other => panic!("expected config overlay, got {}", overlay_name(other)),
+    };
+
+    // Off is the last segment; one step forward wraps to `aivo`.
+    app.cycle_config_setting(row, CycleDir::Next).await;
+    assert_eq!(app.image_gen, ImageGenMode::Gateway);
+    assert!(
+        app.resolve_image_generator().await.is_some(),
+        "tool is armed"
+    );
+    assert!(
+        !app.config_has_drill_in(ConfigSetting::ImageGen),
+        "the hosted mode has no key/model to pick"
+    );
+
+    // Unconfigured `custom` opens the picker and leaves the mode alone.
+    app.cycle_config_setting(row, CycleDir::Next).await;
+    assert_eq!(app.image_gen, ImageGenMode::Gateway);
+}
+
 #[tokio::test]
 async fn generator_picker_empty_catalog_stays_on_config_with_inline_error() {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();

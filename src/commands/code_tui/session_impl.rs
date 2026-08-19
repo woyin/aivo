@@ -840,8 +840,11 @@ is preserved."
             (ConfigSetting::ImageGen, "custom") => {
                 "The agent can generate images with this model.".to_string()
             }
+            (ConfigSetting::ImageGen, "aivo") => {
+                "The agent generates images through aivo (daily quota).".to_string()
+            }
             (ConfigSetting::ImageGen, _) => {
-                "The agent can't generate images. Switch to custom to pick a key with an image-output model."
+                "The agent can't generate images. Switch to aivo, or to custom to pick a key with an image-output model."
                     .to_string()
             }
         }
@@ -936,12 +939,13 @@ is preserved."
             }
             ConfigSetting::ImageGen => {
                 use crate::services::session_store::ImageGenMode;
-                const OPTIONS: &[&str] = &["custom", "off"];
+                const OPTIONS: &[&str] = &["aivo", "custom", "off"];
                 ConfigSegments {
                     options: OPTIONS,
                     active: match self.image_gen {
-                        ImageGenMode::Custom => 0,
-                        ImageGenMode::Off => 1,
+                        ImageGenMode::Gateway => 0,
+                        ImageGenMode::Custom => 1,
+                        ImageGenMode::Off => 2,
                     },
                 }
             }
@@ -1064,7 +1068,13 @@ is preserved."
             }
             ConfigSetting::ImageGen => {
                 use crate::services::session_store::ImageGenMode;
-                let mode = ImageGenMode::parse(segs.options.get(target).copied().unwrap_or(""));
+                // `parse` reads the PERSISTED vocabulary ("gateway"); the row
+                // shows `aivo`, which would parse to the Off default.
+                let mode = match segs.options.get(target).copied().unwrap_or("") {
+                    "aivo" => ImageGenMode::Gateway,
+                    "custom" => ImageGenMode::Custom,
+                    _ => ImageGenMode::Off,
+                };
                 match mode {
                     ImageGenMode::Custom if self.image_gen_custom.is_none() => {
                         self.open_image_gen_key_picker().await
@@ -1193,6 +1203,9 @@ is preserved."
         self.image_gen = mode;
         self.clear_config_error_if(ConfigSetting::ImageGen);
         let toast = match mode {
+            ImageGenMode::Gateway => {
+                "Image generation: aivo generates images (daily quota)".to_string()
+            }
             ImageGenMode::Custom => match &self.image_gen_custom {
                 Some((_, model)) => format!("Image generation: {model} (generate_image tool)"),
                 None => "Image generation: custom generator".to_string(),

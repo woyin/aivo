@@ -711,13 +711,19 @@ impl CodeTuiApp {
         Err(self.vision_refusal_message(&status))
     }
 
-    /// Custom generator, resolved at dispatch. `None` (off, unconfigured, or
+    /// Generator source, resolved at dispatch. `None` (off, unconfigured, or
     /// the pair's model equals the chat model — that would hijack main turns)
     /// leaves `generate_image` unregistered; no refusal flow.
-    pub(super) async fn resolve_image_generator(&self) -> Option<(String, ApiKey)> {
+    pub(super) async fn resolve_image_generator(&self) -> Option<GeneratorSource> {
         use crate::services::session_store::ImageGenMode;
-        if !self.agent_capable() || self.image_gen != ImageGenMode::Custom {
+        if !self.agent_capable() {
             return None;
+        }
+        match self.image_gen {
+            // The gateway holds the model and key; failures surface as tool errors.
+            ImageGenMode::Gateway => return Some(GeneratorSource::Gateway),
+            ImageGenMode::Custom => {}
+            ImageGenMode::Off => return None,
         }
         let (key_id, model) = self.image_gen_custom.as_ref()?;
         if *model == self.model {
@@ -735,7 +741,10 @@ impl CodeTuiApp {
             .ok()
             .flatten()?;
         crate::services::session_store::SessionStore::decrypt_key_secret(&mut key).ok()?;
-        Some((model.clone(), key))
+        Some(GeneratorSource::OwnKey {
+            model: model.clone(),
+            key: Box::new(key),
+        })
     }
 
     fn image_refusal_base(&self) -> String {
@@ -992,6 +1001,7 @@ impl CodeTuiApp {
                 provider_label: self.key.display_name().to_string(),
                 effort: self.effective_reasoning_effort(),
                 effort_levels: self.model_reasoning_efforts.clone(),
+                inline_images: self.inline_images.caps.enabled(),
             });
             // Share the live thinking toggle so the engine requests reasoning (on
             // reasoning-capable models) only while thinking is on.
@@ -1091,15 +1101,15 @@ impl CodeTuiApp {
         if let Some(DescriberSource::OwnKey { model, key }) = &vision_shim {
             model_upstreams.push((model.clone(), key.as_ref().clone()));
         }
-        let image_generator = self.resolve_image_generator().await;
-        let image_model = image_generator.as_ref().map(|(m, _)| m.clone());
-        if let Some((model, key)) = image_generator {
+        let image_source = self.resolve_image_generator().await;
+        // Only an own-key generator needs an upstream; the gateway is direct.
+        if let Some(GeneratorSource::OwnKey { model, key }) = &image_source {
             // The router keys upstreams by model name; if the describer already
             // claimed this model, keep its route (generation still works, same
             // model) instead of silently re-authing describe calls onto the
             // generator's key.
-            if !model_upstreams.iter().any(|(m, _)| m == &model) {
-                model_upstreams.push((model, key));
+            if !model_upstreams.iter().any(|(m, _)| m == model) {
+                model_upstreams.push((model.clone(), key.as_ref().clone()));
             }
         }
         let (base, auth) = match self.start_agent_serve(model_upstreams).await {
@@ -1203,7 +1213,7 @@ impl CodeTuiApp {
             engine.set_thinking_enabled(thinking_enabled);
             engine.set_web_search_enabled(web_search_enabled);
             engine.set_agent_tools_enabled(agent_tools_enabled);
-            engine.set_image_model(image_model);
+            engine.set_image_source(image_source);
             engine.set_reasoning_efforts(reasoning_efforts);
             if let Some(effort) = reasoning_effort {
                 engine.set_reasoning_effort(effort);

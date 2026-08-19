@@ -24,6 +24,7 @@ use crate::agent::finish::{FinishReport, FinishStatus};
 use crate::agent::protocol::Decision;
 use crate::agent::system_prompt::discover_project_guides;
 use crate::errors::ExitCode;
+use crate::services::image_generate::GeneratorSource;
 use crate::services::models_cache::ModelsCache;
 use crate::services::session_store::{ApiKey, MessageAttachment, SessionStore, SessionTokens};
 
@@ -39,11 +40,14 @@ pub(crate) fn key_is_agent_capable(key: &ApiKey) -> bool {
 async fn resolve_image_generator(
     session_store: &crate::services::session_store::SessionStore,
     model: &str,
-) -> Option<(String, ApiKey)> {
+) -> Option<GeneratorSource> {
     use crate::services::session_store::ImageGenMode;
     let toggles = session_store.get_chat_toggles().await;
-    if toggles.image_gen != ImageGenMode::Custom {
-        return None;
+    match toggles.image_gen {
+        // The gateway holds the model and key.
+        ImageGenMode::Gateway => return Some(GeneratorSource::Gateway),
+        ImageGenMode::Custom => {}
+        ImageGenMode::Off => return None,
     }
     let (key_id, gen_model) = toggles.image_gen_custom?;
     if gen_model == model {
@@ -54,7 +58,10 @@ async fn resolve_image_generator(
     }
     let mut key = session_store.get_key_by_id(&key_id).await.ok().flatten()?;
     SessionStore::decrypt_key_secret(&mut key).ok()?;
-    Some((gen_model, key))
+    Some(GeneratorSource::OwnKey {
+        model: gen_model,
+        key: Box::new(key),
+    })
 }
 
 /// Unattended `-e` backstops (env-overridable, 0 disables) — the TUI relies on esc instead.
@@ -390,11 +397,14 @@ async fn run_agent_captured(
                 .await
                 .map_err(|e| anyhow::anyhow!(e))?;
             SessionStore::decrypt_key_secret(&mut gen_key)?;
-            Some((gen_model, gen_key))
+            Some(GeneratorSource::OwnKey {
+                model: gen_model,
+                key: Box::new(gen_key),
+            })
         }
         None => resolve_image_generator(session_store, model).await,
     };
-    engine.set_image_model(image_generator.as_ref().map(|(m, _)| m.clone()));
+    engine.set_image_source(image_generator.clone());
 
     // Eval/CI hook: AIVO_AGENT_FAKE_SSE=<script> swaps the provider for a scripted
     // loopback model, so the real loop + real tool execution run deterministically.
@@ -426,8 +436,13 @@ async fn run_agent_captured(
             .with_oauth_persist(session_store.clone())
             .with_usage_accounting(session_store.clone(), "code".to_string())
             .quiet(true);
-        if let Some((gen_model, gen_key)) = image_generator {
-            router = router.with_model_upstreams(vec![(gen_model, gen_key)]);
+        // Only an own-key generator needs an upstream; the gateway is direct.
+        if let Some(GeneratorSource::OwnKey {
+            model,
+            key: gen_key,
+        }) = image_generator
+        {
+            router = router.with_model_upstreams(vec![(model, *gen_key)]);
         }
         let (handle, shutdown, port) = router.start_background_with_addr("127.0.0.1", 0).await?;
         (

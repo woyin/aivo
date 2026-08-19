@@ -392,8 +392,14 @@ fn print_usage(s: &UsageSummary) {
     }
     if s.describes_total > 0 {
         parts.push(format!(
-            "{} images",
+            "{} described",
             colorize_unit(&format_human(s.describes_total))
+        ));
+    }
+    if s.images_total > 0 {
+        parts.push(format!(
+            "{} generated",
+            colorize_unit(&format_human(s.images_total))
         ));
     }
     if let Some(ts) = &s.window_resets_at {
@@ -441,15 +447,31 @@ fn print_usage(s: &UsageSummary) {
             s.limits.rpm,
         ),
     ];
+    // After Searches, and only when usable (or already spent) — same rule as the
+    // dashboard. Named apart: two rows called "Images" would be unreadable.
+    let mut at = 4;
     if s.describe_available || s.describes > 0 {
         rows.insert(
-            4,
+            at,
             meter_row(
-                "Images",
+                "Image desc",
                 format_human(s.describes),
                 cap_or_infinity(s.limits.dpd),
                 s.describes,
                 s.limits.dpd,
+            ),
+        );
+        at += 1;
+    }
+    if s.image_available || s.images > 0 {
+        rows.insert(
+            at,
+            meter_row(
+                "Image gen",
+                format_human(s.images),
+                cap_or_infinity(s.limits.ipd),
+                s.images,
+                s.limits.ipd,
             ),
         );
     }
