@@ -109,8 +109,10 @@ impl Palette {
         select_bg: Color::Rgb(94, 102, 126),
         select_text: Color::Rgb(243, 239, 231),
         select_accent: Color::Rgb(222, 252, 9),
-        select_wash: Color::Rgb(48, 52, 64),
-        select_flash: Color::Rgb(86, 92, 110),
+        // Mouse wash matches the menu selection bar exactly — one selection
+        // color everywhere; the flash is the same hue a step brighter.
+        select_wash: Color::Rgb(94, 102, 126),
+        select_flash: Color::Rgb(122, 132, 160),
         delete_bg: Color::Rgb(82, 42, 36),
         delete_text: Color::Rgb(255, 235, 226),
         delete_accent: Color::Rgb(255, 174, 146),
@@ -149,8 +151,9 @@ impl Palette {
         select_bg: Color::Rgb(184, 181, 174),
         select_text: Color::Rgb(27, 24, 19),
         select_accent: Color::Rgb(89, 102, 0),
-        select_wash: Color::Rgb(220, 218, 212),
-        select_flash: Color::Rgb(200, 198, 190),
+        // Same rule as dark: wash = the bar; flash darkens (paper inverts emphasis).
+        select_wash: Color::Rgb(184, 181, 174),
+        select_flash: Color::Rgb(162, 158, 150),
         delete_bg: Color::Rgb(250, 226, 218),
         delete_text: Color::Rgb(116, 38, 24),
         delete_accent: Color::Rgb(166, 58, 35),
