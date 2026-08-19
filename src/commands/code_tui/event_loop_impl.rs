@@ -2345,9 +2345,7 @@ impl CodeTuiApp {
             Event::Key(_) => Ok(None),
             Event::Mouse(mouse) => Ok(Some(self.handle_mouse(mouse).await?)),
             Event::Resize(_, _) => {
-                // The resize redraw rewrites every cell, wiping tmux's sixel
-                // layer — forget placements so the next flush re-emits.
-                self.note_cells_repainted();
+                self.pending_full_repaint = true;
                 Ok(None)
             }
             Event::Paste(text) => {
