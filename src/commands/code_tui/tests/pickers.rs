@@ -93,6 +93,50 @@ fn test_picker_visible_items_track_selection_for_single_line_rows() {
 }
 
 #[test]
+fn test_picker_ranks_substring_hits_above_subsequence_noise() {
+    // "glm-" is a scattered subsequence of "google/gemini-…"; real glm models
+    // must outrank that noise.
+    let picker = PickerState {
+        title: "Select model",
+        query: "glm-".to_string(),
+        items: [
+            "google/gemini-2.5-flash",
+            "google/gemini-2.5-pro",
+            "zai/glm-4.6",
+            "zai/glm-4.5-air",
+        ]
+        .into_iter()
+        .map(|id| PickerEntry {
+            label: id.to_string(),
+            search_text: id.to_string(),
+            value: PickerValue::Model(id.to_string()),
+        })
+        .collect(),
+        loading: false,
+        selected: 0,
+        kind: PickerKind::Session,
+        pending_delete: None,
+        preview_scroll: 0,
+        preview_scroll_for: None,
+    };
+
+    let filtered = picker.filtered_items();
+    let labels: Vec<&str> = filtered
+        .iter()
+        .map(|(_, item)| item.label.as_str())
+        .collect();
+    assert_eq!(
+        labels,
+        [
+            "zai/glm-4.6",
+            "zai/glm-4.5-air",
+            "google/gemini-2.5-pro",
+            "google/gemini-2.5-flash",
+        ]
+    );
+}
+
+#[test]
 fn test_picker_navigation_wraps() {
     let mut picker = PickerState {
         title: "Select model",

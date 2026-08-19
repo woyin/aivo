@@ -2065,11 +2065,19 @@ impl PickerState {
     }
 
     pub(super) fn filtered_items(&self) -> Vec<(usize, &PickerEntry)> {
-        self.items
+        let mut filtered: Vec<(usize, &PickerEntry)> = self
+            .items
             .iter()
             .enumerate()
             .filter(|(_, item)| matches_fuzzy(&self.query, &item.search_text))
-            .collect()
+            .collect();
+        // Rank prefix > substring > subsequence; stable, ties keep list order.
+        if !self.query.is_empty() {
+            filtered.sort_by_cached_key(|(_, item)| {
+                crate::tui::score_match(&self.query, &item.search_text)
+            });
+        }
+        filtered
     }
 
     pub(super) fn exact_match_index(&self) -> Option<usize> {
