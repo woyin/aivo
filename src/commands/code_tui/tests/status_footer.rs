@@ -144,10 +144,9 @@ fn test_footer_shows_plain_chat_badge_when_agent_tools_off() {
     app.agent_tools_enabled = false;
     assert!(footer_text(&mut app).contains("plain chat"));
 
-    // Tools on but an uncovered history image pins dispatch plain.
+    // Back on: the badge clears — images never pin the route anymore.
     app.agent_tools_enabled = true;
-    pin_to_plain_chat(&mut app);
-    assert!(footer_text(&mut app).contains("plain chat"));
+    assert!(!footer_text(&mut app).contains("plain chat"));
 }
 
 #[test]

@@ -295,15 +295,17 @@ fn require_describer_key(key: ApiKey) -> std::result::Result<ApiKey, String> {
 }
 
 /// The per-model upstream routes by name, so a describer equal to the active
-/// model would hijack the main chat.
+/// model would hijack the main chat. `image_input` is the resolved flag
+/// (live catalog over snapshot); only a definitive `false` rejects.
 pub(super) fn validate_describer_model(
     model: &str,
     active_model: &str,
+    image_input: Option<bool>,
 ) -> std::result::Result<(), String> {
     if model == active_model {
         return Err("the describer can't be the active model — pick a different one".to_string());
     }
-    if crate::services::model_metadata::snapshot_limits(model).is_some_and(|l| !l.image_input) {
+    if image_input == Some(false) {
         return Err(format!(
             "{model} isn't a vision model — pick one that reads images"
         ));
@@ -364,7 +366,15 @@ async fn resolve_vision_model_override(
         None => require_describer_key(active_key.clone())?,
         Some(query) => resolve_describer_key(store, &query).await?,
     };
-    validate_describer_model(&model, active_model).map_err(|e| format!("--vision-model: {e}"))?;
+    let image_input = crate::services::model_metadata::resolve_limits(
+        &crate::services::ModelsCache::new(),
+        Some(&key.base_url),
+        &model,
+    )
+    .await
+    .image_input;
+    validate_describer_model(&model, active_model, image_input)
+        .map_err(|e| format!("--vision-model: {e}"))?;
     Ok((key.id, model))
 }
 

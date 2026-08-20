@@ -353,26 +353,23 @@ impl CodeTuiApp {
         record: Option<String>,
         display: Option<String>,
     ) -> Result<()> {
-        // A known text-only model would 400 on image bytes. The fallback describes
-        // them instead; anything it can't take falls closed to the refusal, keeping
-        // draft + attachment so the user can switch and resend.
+        // Images never change the route: describer → described text; known
+        // text-only without one → placeholder notes, except a fresh image
+        // draft, which refuses (raw would silently eat it); unknown → raw,
+        // provider decides (a rejection latches via `apply_agent_error`).
         let mut vision_shim: Option<DescriberSource> = None;
-        if self.model_image_input == Some(false) {
+        let mut placeholder_images = false;
+        if self.model_image_input != Some(true) {
             let has_image_draft = self.draft_attachments.iter().any(|a| a.is_image());
-            let has_other_draft = self.draft_attachments.iter().any(|a| !a.is_image());
-            if has_image_draft && has_other_draft {
-                // The shim only covers the agent route, which needs all images.
-                self.notice = Some((ERROR(), self.image_refusal_base()));
-                return Ok(());
-            }
+            let known_text_only = self.model_image_input == Some(false);
             if has_image_draft || self.history_has_image() || self.engine_history_has_images() {
                 match self.resolve_describer().await {
                     Ok(src) => vision_shim = Some(src),
-                    Err(refusal) if has_image_draft => {
+                    Err(refusal) if has_image_draft && known_text_only => {
                         self.notice = Some((ERROR(), refusal));
                         return Ok(());
                     }
-                    Err(_) => {}
+                    Err(_) => placeholder_images = known_text_only,
                 }
             }
         }
@@ -442,45 +439,21 @@ impl CodeTuiApp {
         self.turn_model = (!self.raw_model.is_empty()).then(|| self.raw_model.clone());
         self.follow_output = true;
 
-        // TUI-history images only: plain chat never carries engine-internal images,
-        // so they must not force the plain route (would strand the session tool-less).
-        let conversation_has_image = self.history_has_image();
-        let all_images = !attachments.is_empty() && attachments.iter().all(|a| a.is_image());
-        let shim_active = vision_shim.is_some();
-        // Route images to the agent on a model we KNOW reads them, or with the
-        // vision shim covering (images become described text); unknown models
-        // keep the plain-chat route (which has 400-recovery).
-        let agent_vision_ok = all_images && (self.model_image_input == Some(true) || shim_active);
-        // Images that accrued on plain chat must keep re-sending there — unless
-        // the shim substitutes them, which keeps the agent path (tools stay on).
-        let stay_plain_for_vision =
-            conversation_has_image && self.model_image_input != Some(true) && !shim_active;
-        let route_agent = self.agent_capable()
-            && ((attachments.is_empty() && !stay_plain_for_vision) || agent_vision_ok);
+        // The route follows the key, never the payload — plain chat serves
+        // only keys that can't run the agent.
+        #[cfg(test)]
+        let route_agent = self.agent_capable() && !self.test_force_plain_route;
+        #[cfg(not(test))]
+        let route_agent = self.agent_capable();
         if self.key.is_cursor_acp() {
             self.push_acp_checkpoint();
             self.spawn_cursor_turn(input, attachments);
         } else if route_agent {
-            self.spawn_agent_turn(input, attachments, vision_shim).await;
+            self.spawn_agent_turn(input, attachments, vision_shim, placeholder_images)
+                .await;
         } else {
-            // Warn once, on the turn that drops tools; the footer badge covers
-            // the pinned follow-ups.
-            if self.agent_capable() && !attachments.is_empty() {
-                self.notice = Some((
-                    MUTED(),
-                    if all_images {
-                        format!(
-                            "Image sent as plain chat — {} isn't known to read images, so agent tools are off from here (/new restores them)",
-                            self.model
-                        )
-                    } else {
-                        "Attachment sent as plain chat — agent tools are off for this message"
-                            .to_string()
-                    },
-                ));
-            }
-            // Plain chat's finish path never auto-continues — a goal falling back
-            // here would strand the loop, so disarm it and say why.
+            // Plain chat's finish path never auto-continues — a goal reaching
+            // here (key switched mid-loop) would stall armed, so disarm it.
             if self.goal_mode.take().is_some() {
                 self.notice = Some((
                     ERROR(),
@@ -653,17 +626,6 @@ impl CodeTuiApp {
     /// True when the current key can drive the in-process agent (see `key_is_agent_capable`).
     pub(super) fn agent_capable(&self) -> bool {
         crate::commands::code_agent_oneshot::key_is_agent_capable(&self.key)
-    }
-
-    /// Render-time mirror of dispatch's `stay_plain_for_vision`.
-    pub(super) fn vision_pins_plain(&self) -> bool {
-        self.model_image_input != Some(true)
-            && self.history_has_image()
-            && !(self.model_image_input == Some(false)
-                && matches!(
-                    self.describer_status(),
-                    DescriberStatus::Gateway | DescriberStatus::OwnKey { .. }
-                ))
     }
 
     pub(super) fn describer_status(&self) -> DescriberStatus {
@@ -876,6 +838,7 @@ impl CodeTuiApp {
         input: String,
         attachments: Vec<MessageAttachment>,
         vision_shim: Option<DescriberSource>,
+        placeholder_images: bool,
     ) {
         use crate::agent::engine::{AgentEngine, TurnCtx};
 
@@ -1220,7 +1183,7 @@ impl CodeTuiApp {
             }
             // Before the first request: a failure returns here, where the engine
             // hasn't consumed the turn, so the composer restores cleanly.
-            engine.set_image_substitution(vision_shim.is_some());
+            engine.set_image_substitution(vision_shim.is_some() || placeholder_images);
             engine.set_model_reads_images(model_reads_images);
             if let Some(src) = &vision_shim {
                 engine.merge_image_descriptions(&vision_descriptions);
@@ -1254,6 +1217,14 @@ impl CodeTuiApp {
                 if let Some(message) = failure {
                     let _ = ui.tx.send(RuntimeEvent::DescribeFailed { message });
                     return;
+                }
+            } else if placeholder_images {
+                // Engine-local, never persisted as real descriptions.
+                for (hash, _) in engine.undescribed_images(multimodal.as_ref()) {
+                    engine.insert_image_description(
+                        hash,
+                        "[image attached — not available to this model]".to_string(),
+                    );
                 }
             }
             // run_turn ends by calling ui.footer → AgentFinished commits the turn.

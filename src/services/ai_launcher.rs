@@ -2460,6 +2460,7 @@ mod tests {
                 context: Some(128_000),
                 output: Some(8_000),
                 caps: None,
+                image_input: None,
                 reasoning_efforts: Vec::new(),
             },
         );

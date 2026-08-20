@@ -325,6 +325,7 @@ fn choice(id: &str) -> ModelChoice {
     ModelChoice {
         id: id.to_string(),
         label: id.to_string(),
+        image_input: None,
     }
 }
 
@@ -562,6 +563,7 @@ fn model_choice(id: &str) -> ModelChoice {
     ModelChoice {
         id: id.to_string(),
         label: id.to_string(),
+        image_input: None,
     }
 }
 

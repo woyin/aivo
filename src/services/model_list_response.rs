@@ -164,6 +164,7 @@ mod tests {
                     context: Some(1_000_000),
                     output: Some(64_000),
                     caps: None,
+                    image_input: None,
                     reasoning_efforts: Vec::new(),
                 },
             },

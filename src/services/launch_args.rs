@@ -999,9 +999,7 @@ fn model_entry(model: &str, index: usize, limits: Option<&ResolvedLimits>) -> se
     // Real context from the limits cascade when known; 128k stays the
     // unknown-model fallback.
     let context_window = limits.and_then(|l| l.context).unwrap_or(128_000);
-    let image_input = limits
-        .and_then(|l| l.caps)
-        .is_some_and(|caps| caps.image_input);
+    let image_input = limits.and_then(|l| l.image_input).unwrap_or(false);
     let input_modalities = if image_input {
         json!(["text", "image"])
     } else {

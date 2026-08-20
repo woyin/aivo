@@ -518,22 +518,8 @@ async fn test_goal_step_limit_steers_continuation() {
 async fn test_goal_guard_stop_cleared_on_new_goal() {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let mut app = make_test_app(tx, rx);
-    // Force the plain-chat route (image in history, vision unknown) to keep the
-    // dispatch lightweight; the guard-stop clear happens before dispatch either way.
-    app.model_image_input = None;
-    app.history.push(ChatMessage {
-        model: None,
-        role: "user".to_string(),
-        content: "look".to_string(),
-        reasoning_content: None,
-        attachments: vec![MessageAttachment {
-            name: "shot.png".to_string(),
-            mime_type: "image/png".to_string(),
-            storage: AttachmentStorage::Inline {
-                data: "iVBOR".to_string(),
-            },
-        }],
-    });
+    // The guard-stop clear happens at arm time, before dispatch either way.
+    pin_dispatch_refusal(&mut app);
     app.goal_guard_stop = Some(crate::agent::engine::TurnStop::ToolFailureLoop);
 
     app.run_goal_command(Some("do the thing".to_string())).await;
@@ -544,38 +530,27 @@ async fn test_goal_guard_stop_cleared_on_new_goal() {
     );
 }
 
-/// `/goal` where dispatch falls back to plain chat (image in history, vision
-/// unconfirmed) must not arm a loop `finish_response` will never drive.
+/// `/goal` on a key that can't drive the agent is refused at the gate — the
+/// loop must never arm on the plain-chat route.
 #[tokio::test]
-async fn test_goal_start_disarms_on_plain_chat_route() {
+async fn test_goal_start_refused_on_non_agent_key() {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let mut app = make_test_app(tx, rx);
-    app.model_image_input = None; // vision support unknown → plain-chat fallback
-    app.history.push(ChatMessage {
-        model: None,
-        role: "user".to_string(),
-        content: "look".to_string(),
-        reasoning_content: None,
-        attachments: vec![MessageAttachment {
-            name: "shot.png".to_string(),
-            mime_type: "image/png".to_string(),
-            storage: AttachmentStorage::Inline {
-                data: "iVBOR".to_string(),
-            },
-        }],
-    });
+    app.key.base_url = "claude-oauth".to_string();
 
     app.run_goal_command(Some("fix it".to_string())).await;
 
+    assert!(app.goal_mode.is_none(), "the gate must not arm a loop");
+    assert!(!app.sending, "nothing went out");
     assert!(
-        app.goal_mode.is_none(),
-        "plain-chat route must not arm a loop"
+        app.notice
+            .as_ref()
+            .unwrap()
+            .1
+            .contains("needs the native agent"),
+        "got: {}",
+        app.notice.as_ref().unwrap().1
     );
-    assert!(
-        app.sending,
-        "the objective still went out as a plain message"
-    );
-    assert!(app.notice.as_ref().unwrap().1.contains("plain chat"));
 }
 
 /// `/goal` whose first dispatch is refused outright (staged image on a known
@@ -620,27 +595,12 @@ async fn test_plan_entry_stops_goal_mode() {
         max: 20,
         msg_floor: 0,
     });
-    // Image in history + unknown vision pins the kick-off to plain chat — an
-    // agent engine build would touch real config/git.
-    app.history.push(ChatMessage {
-        model: None,
-        role: "user".to_string(),
-        content: "look".to_string(),
-        reasoning_content: None,
-        attachments: vec![MessageAttachment {
-            name: "shot.png".to_string(),
-            mime_type: "image/png".to_string(),
-            storage: AttachmentStorage::Inline {
-                data: "iVBOR".to_string(),
-            },
-        }],
-    });
-    app.model_image_input = None;
+    // Plan entry stops the goal before the (declined) kick-off dispatch.
+    pin_dispatch_refusal(&mut app);
     app.run_plan_command(None).await;
 
     assert!(app.plan_mode, "plan mode is on");
     assert!(app.goal_mode.is_none(), "plan entry ends the goal loop");
-    assert!(app.sending, "the kick-off turn went out");
     assert!(app.notice.as_ref().unwrap().1.contains("Goal mode stopped"));
 }
 

@@ -1709,17 +1709,6 @@ pub(super) enum DescriberStatus {
     NotAgentCapable,
 }
 
-impl DescriberStatus {
-    /// Attach-time describer label, or `None` when the fallback can't cover.
-    pub(super) fn label(&self) -> Option<&str> {
-        match self {
-            Self::Gateway => Some("aivo"),
-            Self::OwnKey { model, .. } => Some(model),
-            _ => None,
-        }
-    }
-}
-
 #[derive(Clone)]
 pub(super) enum PickerValue {
     Model(String),
@@ -1744,6 +1733,8 @@ pub(super) enum PickerValue {
 pub(super) struct ModelChoice {
     pub(super) id: String,
     pub(super) label: String,
+    /// Live catalog `image_input` when advertised; `None` = unknown.
+    pub(super) image_input: Option<bool>,
 }
 
 #[derive(Clone)]
@@ -3346,6 +3337,10 @@ pub(super) struct CodeTuiApp {
     /// Snapshot vision support, cached on each model resolve. `Some(false)` =
     /// text-only (image sends refused pre-flight); `None` = unknown (let through).
     pub(super) model_image_input: Option<bool>,
+    /// Test-only: force the plain-chat route — production never downgrades,
+    /// but tests need a successful dispatch without an agent-engine build.
+    #[cfg(test)]
+    pub(super) test_force_plain_route: bool,
     /// Image-generation mode (`/config`, `--image-model`); persisted in code-prefs.
     pub(super) image_gen: crate::services::session_store::ImageGenMode,
     /// The picked generator `(key_id, model)`; `Custom` without a pair = unconfigured.
@@ -3789,6 +3784,8 @@ impl CodeTuiApp {
             theme: UiTheme::Dark,
             model_supports_thinking: false,
             model_image_input: None,
+            #[cfg(test)]
+            test_force_plain_route: false,
             vision_fallback: crate::services::session_store::VisionFallbackMode::default(),
             vision_fallback_custom: None,
             image_gen: crate::services::session_store::ImageGenMode::default(),

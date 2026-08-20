@@ -73,12 +73,14 @@ async fn custom_describer_matching_active_model_is_rejected() {
     assert!(app.resolve_describer().await.is_err());
 }
 
+/// Mixed drafts ride the agent route with a describer; without one, a known
+/// text-only model still refuses the image part up front.
 #[tokio::test]
-async fn mixed_attachments_keep_plain_refusal() {
+async fn mixed_attachments_without_describer_keep_refusal() {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let mut app = make_test_app(tx, rx);
     app.model_image_input = Some(false);
-    app.vision_fallback = VisionFallbackMode::Gateway;
+    app.vision_fallback = VisionFallbackMode::Off;
     app.draft_attachments.push(image_attachment());
     app.draft_attachments.push(MessageAttachment {
         name: "doc.pdf".to_string(),
@@ -98,33 +100,45 @@ async fn mixed_attachments_keep_plain_refusal() {
     assert_eq!(app.draft_attachments.len(), 2, "both attachments retained");
 }
 
+/// A provider rejecting raw image parts mid-run latches the model text-only
+/// and leads the error with the actionable reframe.
 #[tokio::test]
-async fn unknown_vision_image_turn_warns_about_tool_loss() {
+async fn agent_image_rejection_latches_text_only() {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let mut app = make_test_app(tx, rx);
     app.model_image_input = None;
-    app.draft_attachments.push(image_attachment());
 
-    app.dispatch_user_message("look".to_string(), None)
-        .await
-        .unwrap();
+    app.apply_agent_error("400: image input is not supported by this model".to_string());
 
-    assert!(app.sending, "plain-chat turn went out");
+    assert_eq!(app.model_image_input, Some(false), "rejection latches");
     let msg = notice_text(&app);
-    assert!(msg.contains("agent tools are off"), "got: {msg}");
+    assert!(msg.contains("can't read images"), "got: {msg}");
+    assert!(msg.contains("/model"), "reframe points at /model: {msg}");
+}
+
+/// A non-image agent error must not latch or reframe.
+#[tokio::test]
+async fn unrelated_agent_error_leaves_vision_state_alone() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.model_image_input = None;
+
+    app.apply_agent_error("500: upstream exploded".to_string());
+
+    assert_eq!(app.model_image_input, None, "no latch without a rejection");
+    assert_eq!(notice_text(&app), "500: upstream exploded");
 }
 
 #[tokio::test]
-async fn known_vision_and_unknown_models_bypass_the_shim() {
+async fn non_agent_key_dispatches_plain_silently() {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let mut app = make_test_app(tx, rx);
-    pin_to_plain_chat(&mut app);
+    app.key.base_url = "claude-oauth".to_string();
     app.dispatch_user_message("follow-up".to_string(), None)
         .await
         .unwrap();
     assert!(app.sending, "plain-chat turn went out");
-    // Attach-time already warned; the lingering-image re-route is silent.
-    assert_eq!(notice_text(&app), "", "text follow-up must not re-nag");
+    assert_eq!(notice_text(&app), "", "no nag on the only route available");
 }
 
 #[tokio::test]
@@ -156,43 +170,6 @@ async fn image_described_event_populates_session_cache() {
         Some("[Image] a red button"),
         "persisted immediately, not just at turn end"
     );
-}
-
-/// The learn-on-400 retry must cover a resumed session whose image lives only
-/// in HISTORY (the first send after resume 400s with no image in the draft).
-#[tokio::test]
-async fn retry_coverage_includes_history_only_images() {
-    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-    let mut app = make_test_app(tx, rx);
-    // Gateway coverage reads the process-global exhausted latch.
-    let _guard = crate::services::vision_describe::TEST_DESCRIBE_LOCK
-        .lock()
-        .await;
-    app.vision_fallback = VisionFallbackMode::Gateway;
-    assert!(
-        !app.vision_retry_covered(),
-        "no image anywhere → nothing to retry"
-    );
-
-    app.history.push(ChatMessage {
-        model: None,
-        role: "user".to_string(),
-        content: "what is this".to_string(),
-        reasoning_content: None,
-        attachments: vec![image_attachment()],
-    });
-    assert!(
-        app.vision_retry_covered(),
-        "history image + gateway describer → retryable"
-    );
-
-    app.vision_fallback = VisionFallbackMode::Off;
-    assert!(!app.vision_retry_covered(), "no describer → not retryable");
-
-    app.history.clear();
-    app.vision_fallback = VisionFallbackMode::Gateway;
-    app.draft_attachments.push(image_attachment());
-    assert!(app.vision_retry_covered(), "draft image still qualifies");
 }
 
 #[tokio::test]
@@ -445,6 +422,7 @@ fn describer_picker_filters_to_vision_models_cheapest_first() {
     let choice = |id: &str| ModelChoice {
         label: id.to_string(),
         id: id.to_string(),
+        image_input: None,
     };
     let filtered = filter_vision_choices(vec![
         choice("gpt-4o"),                 // vision, pricey
@@ -465,11 +443,45 @@ fn describer_picker_filters_to_vision_models_cheapest_first() {
 }
 
 #[test]
+fn describer_picker_honors_live_catalog_image_input() {
+    use super::super::event_loop_impl::filter_vision_choices;
+    let choice = |id: &str, image_input: Option<bool>| ModelChoice {
+        label: id.to_string(),
+        id: id.to_string(),
+        image_input,
+    };
+    // Live flag beats the snapshot in both directions.
+    let filtered = filter_vision_choices(vec![
+        choice("gpt-4o", Some(false)),       // snapshot vision, live says no
+        choice("aivo/mystery", Some(true)),  // no snapshot row, live says yes
+        choice("aivo/starter", Some(false)), // no snapshot row, live says no
+        choice("gemini-2.5-flash", None),    // snapshot vision
+    ]);
+    let ids: Vec<&str> = filtered.iter().map(|m| m.id.as_str()).collect();
+    assert!(ids.contains(&"aivo/mystery"), "got: {ids:?}");
+    assert!(ids.contains(&"gemini-2.5-flash"), "got: {ids:?}");
+    assert!(
+        !ids.contains(&"gpt-4o"),
+        "live false beats snapshot: {ids:?}"
+    );
+    assert!(!ids.contains(&"aivo/starter"), "got: {ids:?}");
+
+    // No confirmed vision entries: fall through, minus definitive live-false.
+    let fallthrough = filter_vision_choices(vec![
+        choice("aivo/starter", Some(false)),
+        choice("mystery", None),
+    ]);
+    let ids: Vec<&str> = fallthrough.iter().map(|m| m.id.as_str()).collect();
+    assert_eq!(ids, ["mystery"], "live text-only never falls through");
+}
+
+#[test]
 fn generator_picker_filters_strictly_to_image_output_models() {
     use super::super::event_loop_impl::filter_generator_choices;
     let choice = |id: &str| ModelChoice {
         label: id.to_string(),
         id: id.to_string(),
+        image_input: None,
     };
     let filtered = filter_generator_choices(vec![
         choice("gemini-3-pro-image"),     // generates, pricier
@@ -494,6 +506,7 @@ fn main_picker_excludes_no_tool_image_generators() {
     let choice = |id: &str| ModelChoice {
         label: id.to_string(),
         id: id.to_string(),
+        image_input: None,
     };
     let ids: Vec<String> = filter_main_chat_choices(vec![
         choice("gemini-2.5-flash-image"), // "aig": generates, no tools → excluded
@@ -942,6 +955,7 @@ async fn generator_picker_empty_catalog_stays_on_config_with_inline_error() {
     let index = app.populate_model_picker(vec![ModelChoice {
         label: "deepseek-chat".to_string(),
         id: "deepseek-chat".to_string(),
+        image_input: None,
     }]);
     assert!(index.is_none(), "strict filter is empty");
     assert_eq!(notice_text(&app), "", "error stays in the modal");

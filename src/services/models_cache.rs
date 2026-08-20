@@ -32,6 +32,9 @@ pub struct ModelMetadata {
     /// Reasoning-effort levels advertised by `/v1/models` (e.g. for `aivo/starter`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub reasoning_efforts: Vec<String>,
+    /// Whether chat may include image parts. `None` when the catalog omitted it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_input: Option<bool>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]

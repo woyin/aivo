@@ -256,7 +256,7 @@ async fn run_agent_captured(
         crate::services::model_metadata::resolve_limits(cache, Some(&key.base_url), model).await;
     // Fail fast only on a *known* non-vision model; unknown caps let the provider decide.
     if opts.attachments.iter().any(MessageAttachment::is_image)
-        && resolved.caps.is_some_and(|c| !c.image_input)
+        && resolved.image_input == Some(false)
     {
         anyhow::bail!(
             "model '{model}' can't read images — pick a vision-capable model or drop the image attachments"
@@ -293,7 +293,7 @@ async fn run_agent_captured(
         "AIVO_AGENT_MAX_OUTPUT_TOKENS",
         DEFAULT_MAX_OUTPUT_TOKENS,
     ));
-    engine.set_model_reads_images(resolved.caps.is_some_and(|c| c.image_input));
+    engine.set_model_reads_images(resolved.image_input == Some(true));
     // A cost estimate needs both input and output prices; fail closed otherwise.
     if let Some(usd) = limits.max_cost.filter(|c| *c > 0.0) {
         let pricing = crate::services::model_metadata::model_pricing(model)

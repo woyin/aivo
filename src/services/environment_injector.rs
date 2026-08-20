@@ -3301,6 +3301,7 @@ mod tests {
                 context: Some(128_000),
                 output: Some(8_000),
                 caps: None,
+                image_input: None,
                 reasoning_efforts: Vec::new(),
             },
         );
@@ -3311,6 +3312,7 @@ mod tests {
                 context: Some(1_000_000),
                 output: Some(384_000),
                 caps: None,
+                image_input: None,
                 reasoning_efforts: Vec::new(),
             },
         );
@@ -3320,8 +3322,7 @@ mod tests {
             crate::services::model_metadata::ResolvedLimits {
                 context: Some(64_000),
                 output: None,
-                caps: None,
-                reasoning_efforts: Vec::new(),
+                ..Default::default()
             },
         );
         let discovered = vec![
@@ -3915,6 +3916,7 @@ mod tests {
                 context: Some(1_000_000),
                 output: Some(384_000),
                 caps: None,
+                image_input: None,
                 reasoning_efforts: Vec::new(),
             },
         );
@@ -3961,6 +3963,7 @@ mod tests {
                 context: Some(1_050_000),
                 output: Some(128_000),
                 caps: None,
+                image_input: None,
                 reasoning_efforts: ["none", "low", "medium", "high", "xhigh", "max"]
                     .map(String::from)
                     .to_vec(),
@@ -3972,6 +3975,7 @@ mod tests {
                 context: Some(128_000),
                 output: Some(8_000),
                 caps: None,
+                image_input: None,
                 reasoning_efforts: Vec::new(),
             },
         );
@@ -3982,6 +3986,7 @@ mod tests {
                 context: Some(200_000),
                 output: Some(64_000),
                 caps: crate::services::model_metadata::snapshot_limits("o3"),
+                image_input: None,
                 reasoning_efforts: Vec::new(),
             },
         );
@@ -3991,6 +3996,7 @@ mod tests {
                 context: Some(128_000),
                 output: Some(64_000),
                 caps: None,
+                image_input: None,
                 reasoning_efforts: ["high", "xhigh"].map(String::from).to_vec(),
             },
         );

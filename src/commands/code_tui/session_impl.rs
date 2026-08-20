@@ -71,8 +71,8 @@ impl CodeTuiApp {
         // Reasoning-capable per the snapshot, or implied by advertised levels.
         self.model_supports_thinking =
             limits.caps.is_some_and(|c| c.reasoning) || !self.model_reasoning_efforts.is_empty();
-        // Snapshot vision support (None when absent); gates the pre-flight refusal.
-        self.model_image_input = limits.caps.map(|c| c.image_input);
+        // Snapshot vision support (None when absent); live catalog wins.
+        self.model_image_input = limits.image_input;
         // This model's remembered effort, dropped if no longer a valid level.
         self.reasoning_effort = match self
             .session_store
@@ -1173,7 +1173,15 @@ is preserved."
 
     pub(super) async fn apply_vision_describer(&mut self, key: ApiKey, model: String) {
         use crate::services::session_store::VisionFallbackMode;
-        if let Err(message) = super::validate_describer_model(&model, &self.model) {
+        // Live-over-snapshot: `image_input: false` rejects without a snapshot row.
+        let image_input = crate::services::model_metadata::resolve_limits(
+            &self.cache,
+            Some(&key.base_url),
+            &model,
+        )
+        .await
+        .image_input;
+        if let Err(message) = super::validate_describer_model(&model, &self.model, image_input) {
             self.set_config_error(ConfigSetting::VisionFallback, message);
             return;
         }
@@ -3774,6 +3782,7 @@ async fn load_model_choices(
                 .into_iter()
                 .map(|m| ModelChoice {
                     label: crate::commands::models::picker_label(&m),
+                    image_input: m.image_input,
                     id: m.id,
                 })
                 .collect()
@@ -3784,6 +3793,7 @@ async fn load_model_choices(
             .map(|id| ModelChoice {
                 label: id.clone(),
                 id,
+                image_input: None,
             })
             .collect(),
     }

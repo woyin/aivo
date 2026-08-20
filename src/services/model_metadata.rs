@@ -87,7 +87,8 @@ pub fn model_calls_tools(model: &str) -> bool {
 }
 
 /// Cascade result: per-field merge of live cache over snapshot. `caps` are
-/// snapshot-only (the cache doesn't store capability flags).
+/// snapshot-only except `image_input`, which the live catalog can advertise
+/// for aliases the snapshot lacks (e.g. `aivo/starter`).
 #[derive(Debug, Clone, Default)]
 pub struct ResolvedLimits {
     pub context: Option<u64>,
@@ -96,6 +97,8 @@ pub struct ResolvedLimits {
     /// Reasoning-effort levels (live catalog, else snapshot). Owned, not on
     /// `caps`, since the live source isn't `'static`.
     pub reasoning_efforts: Vec<String>,
+    /// Live catalog `image_input`, else the snapshot flag; `None` = unknown.
+    pub image_input: Option<bool>,
 }
 
 /// `[context, output, flags, efforts]` + optional `[in, out, cache_read, cache_write]`
@@ -397,6 +400,7 @@ fn hf_local_limits_for(
         output: None,
         caps: Some(caps),
         reasoning_efforts: Vec::new(),
+        image_input: Some(info.image_input),
     })
 }
 
@@ -442,6 +446,10 @@ pub async fn resolve_limits(
             .or_else(|| snap.and_then(|s| s.output)),
         reasoning_efforts,
         caps: snap,
+        image_input: live
+            .as_ref()
+            .and_then(|m| m.image_input)
+            .or_else(|| snap.map(|s| s.image_input)),
     }
 }
 
@@ -969,6 +977,32 @@ mod tests {
         let resolved =
             resolve_limits(&cache, Some("https://api.getaivo.dev"), "aivo/starter").await;
         assert_eq!(resolved.reasoning_efforts, vec!["low", "medium", "high"]);
+        assert_eq!(resolved.image_input, None, "catalog omitted image_input");
+    }
+
+    #[tokio::test]
+    async fn image_input_comes_from_live_catalog_for_unknown_model() {
+        let dir = TempDir::new().unwrap();
+        let cache = ModelsCache::with_path(dir.path().join("models-cache.json"));
+        let mut metadata = std::collections::HashMap::new();
+        metadata.insert(
+            "aivo/starter".to_string(),
+            ModelMetadata {
+                image_input: Some(false),
+                ..Default::default()
+            },
+        );
+        cache
+            .set_with_metadata(
+                &full_catalog_key("https://api.getaivo.dev"),
+                vec!["aivo/starter".to_string()],
+                metadata,
+            )
+            .await;
+        let resolved =
+            resolve_limits(&cache, Some("https://api.getaivo.dev"), "aivo/starter").await;
+        assert_eq!(resolved.image_input, Some(false));
+        assert!(resolved.caps.is_none(), "snapshot has no aivo/starter row");
     }
 
     #[tokio::test]
@@ -993,6 +1027,7 @@ mod tests {
         let by_url = hf_local_limits_for(&info, Some("http://127.0.0.1:18080/v1"), "anything")
             .expect("url match");
         assert_eq!(by_url.context, Some(40_960));
+        assert_eq!(by_url.image_input, Some(true));
         assert!(by_url.caps.unwrap().image_input);
         assert!(by_url.caps.unwrap().tool_call);
         // Display model name.
@@ -1016,6 +1051,7 @@ mod tests {
         };
         let limits = hf_local_limits_for(&info, Some("http://127.0.0.1:18081/v1"), "m").unwrap();
         assert!(!limits.caps.unwrap().image_input);
+        assert_eq!(limits.image_input, Some(false));
         assert_eq!(limits.output, None);
     }
 
@@ -1027,5 +1063,6 @@ mod tests {
         assert_eq!(resolved.context, None);
         assert_eq!(resolved.output, None);
         assert!(resolved.caps.is_none());
+        assert_eq!(resolved.image_input, None);
     }
 }

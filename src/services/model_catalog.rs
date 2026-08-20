@@ -48,6 +48,9 @@ pub(crate) struct ModelInfo {
     /// catalog-only models (e.g. `aivo/starter`) the snapshot lacks.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub reasoning_efforts: Vec<String>,
+    /// Live catalog `image_input` when advertised. `None` = unknown.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub image_input: Option<bool>,
 }
 
 impl ModelInfo {
@@ -63,6 +66,7 @@ impl ModelInfo {
             multiplier: None,
             deprecated: false,
             reasoning_efforts: Vec::new(),
+            image_input: None,
         }
     }
 }
@@ -91,6 +95,7 @@ impl OpenAIModel {
         let (input_price, output_price) = self.find_pricing(price_scale);
         let multiplier = self.find_multiplier();
         let reasoning_efforts = self.find_reasoning_efforts();
+        let image_input = self.find_image_input();
         ModelInfo {
             id: self.id,
             context,
@@ -102,6 +107,7 @@ impl OpenAIModel {
             multiplier,
             deprecated: false,
             reasoning_efforts,
+            image_input,
         }
     }
 
@@ -119,6 +125,11 @@ impl OpenAIModel {
                     .collect()
             })
             .unwrap_or_default()
+    }
+
+    /// Exact `image_input` boolean when the catalog advertises it.
+    fn find_image_input(&self) -> Option<bool> {
+        self.extra.get("image_input")?.as_bool()
     }
 
     /// Search for a Copilot-style billing multiplier (`billing.multiplier`).
@@ -517,13 +528,15 @@ pub(crate) fn build_metadata_map(models: &[ModelInfo]) -> HashMap<String, ModelM
                 output_price: m.output_price.clone(),
                 multiplier: m.multiplier,
                 reasoning_efforts: m.reasoning_efforts.clone(),
+                image_input: m.image_input,
             };
             let any = meta.context_window.is_some()
                 || meta.max_output.is_some()
                 || meta.input_price.is_some()
                 || meta.output_price.is_some()
                 || meta.multiplier.is_some()
-                || !meta.reasoning_efforts.is_empty();
+                || !meta.reasoning_efforts.is_empty()
+                || meta.image_input.is_some();
             any.then(|| (m.id.clone(), meta))
         })
         .collect()
@@ -558,6 +571,7 @@ pub(crate) fn kimi_model_infos(
         .map(|m| ModelInfo {
             context: m.context_length.map(format_token_count),
             context_tokens: m.context_length,
+            image_input: None,
             ..ModelInfo::id_only(m.id)
         })
         .collect()
@@ -584,6 +598,7 @@ pub(crate) fn models_from_cache(
                 multiplier: m.multiplier,
                 deprecated: false,
                 reasoning_efforts: m.reasoning_efforts,
+                image_input: m.image_input,
             }
         })
         .collect()
@@ -899,6 +914,7 @@ pub(crate) async fn fetch_models_detailed_filtered(
                         multiplier: None,
                         deprecated: false,
                         reasoning_efforts: Vec::new(),
+                        image_input: None,
                         id,
                     }
                 })
@@ -1577,8 +1593,7 @@ mod tests {
                 max_output_tokens: Some(32_000),
                 input_price: Some("$3".to_string()),
                 output_price: Some("$15".to_string()),
-                multiplier: None,
-                reasoning_efforts: Vec::new(),
+                ..Default::default()
             },
         );
         metadata.insert(
@@ -1627,6 +1642,7 @@ mod tests {
                 multiplier: None,
                 deprecated: false,
                 reasoning_efforts: Vec::new(),
+                image_input: None,
             },
             ModelInfo::id_only("bare".to_string()),
         ];
@@ -1636,6 +1652,37 @@ mod tests {
         let rich = map.get("rich").unwrap();
         assert_eq!(rich.context_window, Some(128_000));
         assert_eq!(rich.max_output.as_deref(), Some("8K"));
+    }
+
+    #[test]
+    fn harvests_image_input_boolean_from_catalog() {
+        let resp: OpenAIModelsResponse = serde_json::from_value(serde_json::json!({
+            "data": [
+                {"id": "aivo/starter", "image_input": false},
+                {"id": "vision", "image_input": true},
+                {"id": "mystery"}
+            ]
+        }))
+        .unwrap();
+        let infos: Vec<ModelInfo> = resp
+            .data
+            .into_iter()
+            .map(|m| m.into_model_info(1.0))
+            .collect();
+        assert_eq!(infos[0].image_input, Some(false));
+        assert_eq!(infos[1].image_input, Some(true));
+        assert_eq!(infos[2].image_input, None);
+
+        let map = build_metadata_map(&infos);
+        assert_eq!(
+            map.get("aivo/starter").and_then(|m| m.image_input),
+            Some(false)
+        );
+        assert_eq!(map.get("vision").and_then(|m| m.image_input), Some(true));
+        assert!(
+            !map.contains_key("mystery"),
+            "id-only rows still skip the metadata map"
+        );
     }
 
     #[test]

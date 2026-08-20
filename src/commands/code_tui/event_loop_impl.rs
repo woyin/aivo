@@ -866,6 +866,11 @@ impl CodeTuiApp {
     /// after scrolling or resume. Display-only; `agent_seed_turns` skips it.
     pub(super) fn apply_agent_error(&mut self, text: String) {
         self.flush_pending_assistant();
+        // Latch, so the next send substitutes instead of failing the same way.
+        if is_image_input_rejection(&text) && self.model_image_input != Some(false) {
+            self.model_image_input = Some(false);
+        }
+        let text = reframe_image_input_error(text, &self.model);
         self.notice = Some((ERROR(), text.clone()));
         self.history.push(ChatMessage {
             model: None,
@@ -1506,42 +1511,18 @@ impl CodeTuiApp {
         self.incoming_buffer.clear();
         self.pending_finish = None;
         self.pending_reasoning.clear();
-        let restored = restore_cancelled_submission(
+        restore_cancelled_submission(
             &mut self.history,
             &mut self.draft,
             &mut self.draft_attachments,
             &mut self.pending_submit,
         );
-        // e.g. `aivo/starter`, text-only upstream but snapshot-unknown. Loop-safe:
-        // with `Some(false)` the retry can't take this path again.
+        // Latch, so the next send refuses up front. No shim retry — this path
+        // only serves non-agent keys, which can't drive a describer.
         if is_image_input_rejection(&err) && self.model_image_input != Some(false) {
             self.model_image_input = Some(false);
-            if restored && self.retry_via_vision_fallback().await {
-                return;
-            }
         }
         self.notice = Some((ERROR(), reframe_image_input_error(err, &self.model)));
-    }
-
-    /// Retryable through the shim: an image in scope (draft OR history — a
-    /// resumed session can 400 with no draft image) and a describer configured.
-    pub(super) fn vision_retry_covered(&self) -> bool {
-        let has_image =
-            self.draft_attachments.iter().any(|a| a.is_image()) || self.history_has_image();
-        has_image && self.describer_status().label().is_some()
-    }
-
-    /// `false` leaves the composer untouched for the caller's error notice.
-    async fn retry_via_vision_fallback(&mut self) -> bool {
-        if !self.vision_retry_covered() {
-            return false;
-        }
-        let retry = self.draft.clone();
-        if self.dispatch_user_message(retry, None).await.is_err() || !self.sending {
-            return false;
-        }
-        // Silent by design: the fallback working is not news, only its failures.
-        true
     }
 
     async fn apply_loaded_models(
@@ -3525,14 +3506,18 @@ pub(super) fn parse_sgr_scroll(frag: &str) -> Option<MouseEvent> {
     })
 }
 
-/// Snapshot-confirmed vision models, cheapest first. The snapshot is sparse, so
-/// a catalog with NO confirmed entries falls through unfiltered rather than
-/// showing an empty picker.
+/// Confirmed vision models (live catalog flag over snapshot), cheapest first.
+/// Both sources are sparse: no confirmed entries → fall through rather than
+/// an empty picker, minus live-confirmed text-only models.
 pub(super) fn filter_vision_choices(models: Vec<ModelChoice>) -> Vec<ModelChoice> {
-    let (vision, rest): (Vec<ModelChoice>, Vec<ModelChoice>) =
-        models.into_iter().partition(|m| model_reads_images(&m.id));
+    let (vision, rest): (Vec<ModelChoice>, Vec<ModelChoice>) = models
+        .into_iter()
+        .partition(|m| m.image_input.unwrap_or_else(|| model_reads_images(&m.id)));
     if vision.is_empty() {
-        return rest;
+        return rest
+            .into_iter()
+            .filter(|m| m.image_input != Some(false))
+            .collect();
     }
     sort_cheapest_first(vision)
 }

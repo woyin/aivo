@@ -52,23 +52,22 @@ pub(super) fn theme_lock() -> std::sync::MutexGuard<'static, ()> {
     LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-/// Pin dispatch to the plain-chat path (image in history + unknown vision), so
-/// tests don't touch the agent-engine build (real config/git).
-pub(super) fn pin_to_plain_chat(app: &mut CodeTuiApp) {
-    app.history.push(ChatMessage {
-        model: None,
-        role: "user".to_string(),
-        content: "look".to_string(),
-        reasoning_content: None,
-        attachments: vec![MessageAttachment {
-            name: "shot.png".to_string(),
-            mime_type: "image/png".to_string(),
-            storage: AttachmentStorage::Inline {
-                data: "iVBOR".to_string(),
-            },
-        }],
+/// Make dispatch decline before any spawn, keeping tests off the agent engine.
+pub(super) fn pin_dispatch_refusal(app: &mut CodeTuiApp) {
+    app.draft_attachments.push(MessageAttachment {
+        name: "shot.png".to_string(),
+        mime_type: "image/png".to_string(),
+        storage: AttachmentStorage::Inline {
+            data: "iVBOR".to_string(),
+        },
     });
-    app.model_image_input = None;
+    app.model_image_input = Some(false);
+    app.vision_fallback = crate::services::session_store::VisionFallbackMode::Off;
+}
+
+/// Force the plain-chat route: a successful dispatch without the agent engine.
+pub(super) fn pin_to_plain_chat(app: &mut CodeTuiApp) {
+    app.test_force_plain_route = true;
 }
 
 pub(super) fn seed_two_exchanges(app: &mut CodeTuiApp) {
