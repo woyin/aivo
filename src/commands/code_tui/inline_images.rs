@@ -358,8 +358,8 @@ fn inline_svg_blocks(text: &str) -> Vec<String> {
         let close = end + "</svg>".len();
         if close <= MAX_INLINE_SVG_BYTES {
             let block = &after[..close];
-            // Untrusted markup rasterizes through qlmanage (WebKit) — skip
-            // external refs (SSRF/beacon risk).
+            // External refs would beacon via the browser rasterizer rungs;
+            // rasterize_svg re-checks, this just skips doomed work early.
             if !out.iter().any(|b| b == block)
                 && !crate::services::svg_raster::svg_has_external_refs(block)
             {
