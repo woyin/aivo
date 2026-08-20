@@ -1605,7 +1605,8 @@ async fn start_cursor_router(env: &mut HashMap<String, String>, tool: AIToolType
     // signed out, rather than let the first request surface a dead upstream.
     if cursor_acp::cursor_oauth_shadow_signed_out(&key).await {
         anyhow::bail!(
-            "Cursor is not logged in for this key. Run `aivo keys reauth <id>` (or pick `aivo keys reauth` interactively) to sign in again."
+            "{} (or pick `aivo keys reauth` interactively)",
+            cursor_acp::cursor_login_reauth_hint(&key.id)
         );
     }
     let workspace_cwd = std::env::current_dir()

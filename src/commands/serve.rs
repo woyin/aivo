@@ -349,9 +349,9 @@ async fn serve_cursor(params: CursorServeParams) -> Result<ExitCode> {
     // Fail before binding rather than on the first request.
     if cursor_acp::cursor_oauth_shadow_signed_out(&key).await {
         eprintln!(
-            "{} Cursor is not logged in for this key. Run `aivo keys reauth {}` to sign in again.",
+            "{} {}",
             style::red("Error:"),
-            key.name
+            cursor_acp::cursor_login_reauth_hint(key.display_name())
         );
         return Ok(ExitCode::AuthError);
     }

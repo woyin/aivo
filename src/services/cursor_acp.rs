@@ -696,31 +696,30 @@ pub async fn list_cursor_models(key: &ApiKey) -> Result<Vec<String>> {
         );
     }
 
-    // OAuth-login shadow keys: `cursor-agent status` is authoritative.
-    // (API-key shadows can't use status — cursor-agent only inspects
-    // auth.json there, ignoring CURSOR_API_KEY, so a valid API-key key
-    // would report "unauthenticated".)
+    // API-key shadows can't use status: it only inspects auth.json, so a
+    // valid CURSOR_API_KEY key would report unauthenticated.
     if let Some(parsed) = parse_cursor_shadow_secret(key.key.as_str())
         && parsed.api_key.is_none()
         && !cursor_status_authenticated_for_key(key)
             .await
             .unwrap_or(false)
     {
-        anyhow::bail!(
-            "Cursor is not logged in for this key. Run `aivo keys reauth {0}` to sign in again.",
-            key.id
-        );
+        anyhow::bail!("{}", cursor_login_reauth_hint(&key.id));
     }
 
     let primary = run_cursor_agent(["models"], key).await;
     let output = match primary {
         Ok(output) => output,
+        Err(primary_err) if looks_like_cursor_auth_failure(&format!("{primary_err:#}")) => {
+            return Err(map_cursor_auth_error(primary_err, &key.id));
+        }
         Err(primary_err) => run_cursor_agent(["--list-models"], key)
             .await
-            .with_context(|| {
-                format!(
+            .map_err(|fallback_err| {
+                let combined = fallback_err.context(format!(
                     "`cursor-agent models` failed ({primary_err}); fallback `cursor-agent --list-models` also failed"
-                )
+                ));
+                map_cursor_auth_error(combined, &key.id)
             })?,
     };
 
@@ -731,10 +730,7 @@ pub async fn list_cursor_models(key: &ApiKey) -> Result<Vec<String>> {
                 "Run `aivo keys reauth {0}` and paste a valid Cursor API key.",
                 key.id
             ),
-            Some(_) => format!(
-                "Run `aivo keys reauth {0}` to sign in again — the saved cursor account has been signed out.",
-                key.id
-            ),
+            Some(_) => cursor_login_reauth_hint(&key.id),
             _ => "Re-run `aivo keys add cursor` to set up a fresh isolated cursor account."
                 .to_string(),
         };
@@ -757,11 +753,46 @@ fn looks_like_no_models_message(output: &str) -> bool {
     if lower.is_empty() {
         return false;
     }
-    lower.starts_with("no models")
-        || lower.contains("not logged in")
-        || lower.contains("not authenticated")
-        || lower.contains("please log in")
-        || lower.contains("please sign in")
+    lower.starts_with("no models") || looks_like_cursor_auth_failure(&stripped)
+}
+
+pub fn cursor_login_reauth_hint(key_id_or_name: &str) -> String {
+    format!(
+        "Cursor login expired or signed out. Run `aivo keys reauth {key_id_or_name}` to sign in again."
+    )
+}
+
+pub fn looks_like_cursor_auth_failure(msg: &str) -> bool {
+    let lower = crate::services::ansi::strip_ansi(msg).to_ascii_lowercase();
+    const MARKERS: &[&str] = &[
+        "not logged in",
+        "not authenticated",
+        "authentication required",
+        "authentication is invalid",
+        "please log in",
+        "please sign in",
+        "token expired",
+        "invalid token",
+        "unauthenticated",
+        "authentication failed",
+        "signed out",
+        "re-authenticate",
+        "login expired",
+        "auth required",
+    ];
+    if MARKERS.iter().any(|m| lower.contains(m)) {
+        return true;
+    }
+    // Skip Node's TLS `rejectUnauthorized`.
+    lower.contains("unauthorized") && !lower.contains("rejectunauthorized")
+}
+
+pub fn map_cursor_auth_error(err: anyhow::Error, key_id_or_name: &str) -> anyhow::Error {
+    let msg = format!("{err:#}");
+    if !looks_like_cursor_auth_failure(&msg) || msg.contains("login expired or signed out") {
+        return err;
+    }
+    err.context(cursor_login_reauth_hint(key_id_or_name))
 }
 
 async fn cursor_status_authenticated(mut cmd: Command) -> Result<bool> {
@@ -785,11 +816,8 @@ pub async fn cursor_status_authenticated_for_key(key: &ApiKey) -> Result<bool> {
     cursor_status_authenticated(cursor_agent_command_for_key(key)?).await
 }
 
-/// True when `key` is an OAuth-login shadow (no API key) whose `cursor-agent`
-/// session is signed out — the signal to bail before spawning a router that
-/// would hand over a dead endpoint. API-key shadows always report
-/// unauthenticated (`status` only inspects auth.json), so they're excluded and
-/// left for the first upstream request to validate.
+/// OAuth-login shadow whose `cursor-agent status` is signed out. API-key
+/// shadows always look unauthenticated (`status` ignores CURSOR_API_KEY).
 pub async fn cursor_oauth_shadow_signed_out(key: &ApiKey) -> bool {
     let is_oauth_shadow =
         parse_cursor_shadow_secret(key.key.as_str()).is_some_and(|parsed| parsed.api_key.is_none());
@@ -1109,8 +1137,14 @@ fn status_value_authenticated(value: &Value) -> Option<bool> {
                     {
                         return Some(true);
                     }
-                    if ["unauthenticated", "logged_out", "logged-out", "logged out"]
-                        .contains(&lower.as_str())
+                    if [
+                        "unauthenticated",
+                        "logged_out",
+                        "logged-out",
+                        "logged out",
+                        "partially-authenticated",
+                    ]
+                    .contains(&lower.as_str())
                     {
                         return Some(false);
                     }
@@ -1534,11 +1568,9 @@ impl CursorAcpSession {
                 json!({"cwd": workspace_cwd, "mcpServers": mcp_servers}),
             )
             .await
-            .with_context(|| {
-                format!(
-                    "cursor-agent ACP session/new failed — check the cursor key with `aivo keys reauth {0}`",
-                    key.id
-                )
+            .map_err(|e| {
+                let e = e.context("cursor-agent ACP session/new failed");
+                map_cursor_auth_error(e, &key.id)
             })?;
 
         let session_id = new_session
@@ -1697,10 +1729,14 @@ where
         None,
         CursorInteractionHooks::default(),
     )
-    .await?;
+    .await
+    .map_err(|e| map_cursor_auth_error(e, &key.id))?;
     ensure_image_attachments_supported(session.prompt_capabilities(), attachments)?;
     let blocks = build_prompt_blocks(prompt_text, attachments)?;
-    let mut stream = session.prompt_with_blocks(blocks).await?;
+    let mut stream = session
+        .prompt_with_blocks(blocks)
+        .await
+        .map_err(|e| map_cursor_auth_error(e, &key.id))?;
 
     let mut out = CursorTurnResult {
         model: session.model_id().map(str::to_string),
@@ -1715,7 +1751,8 @@ where
             PromptEvent::Done(result) => {
                 let value = result
                     .map_err(|e| anyhow!(e))
-                    .context("cursor-agent ACP session/prompt failed")?;
+                    .context("cursor-agent ACP session/prompt failed")
+                    .map_err(|e| map_cursor_auth_error(e, &key.id))?;
                 out.stop_reason = value
                     .get("stopReason")
                     .and_then(Value::as_str)
@@ -2805,7 +2842,49 @@ mod tests {
             "No models available for this account."
         ));
         assert!(looks_like_no_models_message("Not logged in. Run login."));
+        assert!(looks_like_no_models_message(
+            "Your stored authentication is invalid. Please log in again."
+        ));
         assert!(!looks_like_no_models_message("composer-2.5\ngpt-5"));
+    }
+
+    #[test]
+    fn auth_failure_detector_matches_cursor_agent_expiry() {
+        assert!(looks_like_cursor_auth_failure(
+            "Your stored authentication is invalid. Please log in again."
+        ));
+        assert!(looks_like_cursor_auth_failure(
+            "Authentication required. Please run 'cursor-agent login' first"
+        ));
+        assert!(looks_like_cursor_auth_failure(
+            "Failed to load models: run `cursor-agent login` to re-authenticate."
+        ));
+        assert!(looks_like_cursor_auth_failure(
+            "Auth token expired, refreshing..."
+        ));
+        assert!(looks_like_cursor_auth_failure(&cursor_login_reauth_hint(
+            "abc"
+        )));
+        assert!(!looks_like_cursor_auth_failure(
+            "cursor-agent ACP session/new failed"
+        ));
+        assert!(!looks_like_cursor_auth_failure(
+            "TLS rejectUnauthorized handshake"
+        ));
+    }
+
+    #[test]
+    fn map_cursor_auth_error_wraps_only_auth_failures() {
+        let wrapped = map_cursor_auth_error(
+            anyhow!("Your stored authentication is invalid. Please log in again."),
+            "abc",
+        );
+        let msg = format!("{wrapped:#}");
+        assert!(msg.contains("login expired or signed out"));
+        assert!(msg.contains("aivo keys reauth abc"));
+
+        let other = map_cursor_auth_error(anyhow!("connection reset by peer"), "abc");
+        assert!(!format!("{other:#}").contains("reauth"));
     }
 
     #[test]
@@ -2836,6 +2915,18 @@ mod tests {
         );
         assert_eq!(
             parse_cursor_status_authenticated(r#"{"user":{"email":"a@example.com"}}"#),
+            Some(true)
+        );
+        assert_eq!(
+            parse_cursor_status_authenticated(
+                r#"{"status":"partially-authenticated","isAuthenticated":false}"#
+            ),
+            Some(false)
+        );
+        assert_eq!(
+            parse_cursor_status_authenticated(
+                r#"{"status":"authenticated","isAuthenticated":true,"message":"Logged in (unable to fetch user details)"}"#
+            ),
             Some(true)
         );
     }

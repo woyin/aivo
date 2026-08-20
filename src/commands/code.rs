@@ -568,6 +568,18 @@ impl CodeCommand {
             };
         }
 
+        if !hf_active
+            && key.is_cursor_acp()
+            && cursor_acp::cursor_oauth_shadow_signed_out(&key).await
+        {
+            eprintln!(
+                "{} {}",
+                style::red("Error:"),
+                cursor_acp::cursor_login_reauth_hint(&key.id)
+            );
+            return Ok(ExitCode::AuthError);
+        }
+
         let client = crate::services::http_utils::router_http_client();
         // `aivo code` always runs in an isolated sandbox dir so backends
         // that accept a `cwd` (cursor ACP today) can't auto-pull

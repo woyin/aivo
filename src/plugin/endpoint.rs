@@ -1193,10 +1193,7 @@ async fn start_cursor_endpoint(key: &ApiKey) -> anyhow::Result<EndpointHandle> {
 
     // Check OAuth-login auth before handing a dead endpoint to the plugin.
     if cursor_acp::cursor_oauth_shadow_signed_out(key).await {
-        anyhow::bail!(
-            "Cursor is not logged in for this key. Run `aivo keys reauth {0}` to sign in again.",
-            key.id
-        );
+        anyhow::bail!("{}", cursor_acp::cursor_login_reauth_hint(&key.id));
     }
 
     let token = random_auth_token();

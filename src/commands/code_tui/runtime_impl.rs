@@ -1679,6 +1679,7 @@ impl CodeTuiApp {
             )
         });
         let key = self.key.clone();
+        let key_id = key.id.clone();
         let requested_model = (!self.raw_model.is_empty()).then(|| self.raw_model.clone());
         // A fresh open (prewarm/`/new`) comes up in `agent`; re-apply plan below.
         let want_plan_mode = self.cursor_plan_mode;
@@ -1764,7 +1765,9 @@ impl CodeTuiApp {
                             })
                             .ok();
                             tx.send(RuntimeEvent::Finished {
-                                result: Err(e.to_string()),
+                                result: Err(
+                                    cursor_acp::map_cursor_auth_error(e, &key_id).to_string()
+                                ),
                                 format,
                             })
                             .ok();
@@ -1792,7 +1795,7 @@ impl CodeTuiApp {
 
             let result = drive_cursor_turn(client, session_id, model_id, input, attachments, &tx)
                 .await
-                .map_err(|err| err.to_string());
+                .map_err(|err| cursor_acp::map_cursor_auth_error(err, &key_id).to_string());
             // Close the checkpoint before Finished (same channel = ordered);
             // an interrupted turn aborts this task → finalized lazily at rewind.
             let changed = match (&acp_store, &acp_tree) {
@@ -4669,14 +4672,13 @@ async fn open_cursor_session_with_retry(
     }
 }
 
-/// Whether a cursor open error is permanent — retrying it is pointless because
-/// the cause won't clear on its own. Everything else (spawn, `initialize`,
-/// `session/new`) can be a transient network/handshake failure worth another
-/// attempt. Matches the full error chain so wrapping context doesn't hide the
-/// root marker.
+/// Missing binary, legacy key, or expired login — retrying can't help.
+/// Matches the full error chain so `.context(...)` wrapping doesn't hide it.
 fn is_permanent_cursor_open_error(err: &anyhow::Error) -> bool {
     let msg = format!("{err:#}");
-    msg.contains("was not found on PATH") || msg.contains("predates per-account isolation")
+    msg.contains("was not found on PATH")
+        || msg.contains("predates per-account isolation")
+        || crate::services::cursor_acp::looks_like_cursor_auth_failure(&msg)
 }
 
 /// Compose cursor's structured plan (title/overview/body + todo & phase
@@ -5164,7 +5166,7 @@ mod cursor_open_retry_tests {
         // These are the ones worth retrying — a flaky link at connect.
         for msg in [
             "cursor-agent ACP initialize failed",
-            "cursor-agent ACP session/new failed — check the cursor key with `aivo keys reauth abc`",
+            "cursor-agent ACP session/new failed",
             "ACP child stdout closed",
             "connection reset by peer",
         ] {
@@ -5172,6 +5174,22 @@ mod cursor_open_retry_tests {
             assert!(
                 !is_permanent_cursor_open_error(&err),
                 "should retry transient: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn expired_or_signed_out_login_is_permanent() {
+        for msg in [
+            "Your stored authentication is invalid. Please log in again.",
+            "Authentication required. Please run 'cursor-agent login' first",
+            "Cursor login expired or signed out. Run `aivo keys reauth abc` to sign in again.",
+        ] {
+            let err =
+                anyhow::anyhow!(msg.to_string()).context("cursor-agent ACP session/new failed");
+            assert!(
+                is_permanent_cursor_open_error(&err),
+                "should not retry auth: {msg}"
             );
         }
     }
