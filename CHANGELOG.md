@@ -1,5 +1,22 @@
 # Changelog
 
+## v0.46.0
+
+Images land in the code TUI — inline previews, a `generate_image` tool, and SVG rasterization. Usage accounting gets honest, and repeatedly denied tool calls hit a denial ladder instead of looping.
+
+- feat(code): inline image previews, with an SVG raster cascade and a `/config` toggle (cf155c3e, 5d64ab37, 34dc1b66)
+- feat(code): `generate_image` tool — own key or the hosted aivo generator (ff4e054c, 8e230615)
+- feat(code): denial ladder for re-issued denied calls (14e603f5)
+- feat(stats): account native-launch router usage, add cost estimates (f6b55e96)
+- improve(code): `/config` becomes a settings inspector with inline errors (aa849edc)
+- improve(code): folded tool runs, scannable failures, honest error chains (4cf23c50)
+- improve(code): images never downgrade to plain chat, route follows the key (f3241d75)
+- fix(agent): refuse file-tool writes outside the workspace (9423618c)
+- fix(stats): stop native dedup swallowing aivo-own usage (ce684a70)
+- fix(cursor): fail fast on expired login instead of retrying as a network blip (ddcc9336)
+- fix(cursor): keep the `--list-models` fallback a version probe, not a retry (98e4171d)
+- fix(code): keep inline images across terminal resizes (49da777b, 455fe59c)
+
 ## v0.45.0
 
 The code agent gets an explicit end-of-turn contract: `finish_turn` convergence, multi-check verification plans, and typed stops that make `-e` exit non-zero when a budget or guard cuts a run short. Running sessions can now talk to each other over file mailboxes, `-e` accepts `--attach`, and the composer grows inline `[image #n]` attachment tags plus an inline `/effort` picker.
