@@ -400,18 +400,33 @@ fn undecorate_path_line(line: &str) -> &str {
 /// without any read/write call to hook. Display-only, best-effort.
 fn result_image_paths(result: &str) -> Vec<String> {
     let mut paths = saved_image_paths(result);
-    let bare: Vec<&str> = result
+    let lines: Vec<&str> = result
         .lines()
         .map(str::trim)
-        .map(undecorate_path_line)
+        .filter(|l| !l.is_empty())
+        .collect();
+    let bare: Vec<&str> = lines
+        .iter()
+        .map(|l| undecorate_path_line(l))
         .filter(|l| !l.is_empty() && has_image_extension(l))
         .collect();
-    if bare.len() <= MAX_RESULT_PATH_PREVIEWS {
+    if bare.len() <= MAX_RESULT_PATH_PREVIEWS && images_are_the_answer(bare.len(), lines.len()) {
         paths.extend(bare.iter().map(|s| s.to_string()));
     }
     paths.dedup();
     dedup_same_stem(paths)
 }
+
+fn images_are_the_answer(image_lines: usize, total_lines: usize) -> bool {
+    image_lines > 0
+        && total_lines <= MAX_RESULT_PREVIEW_LINES
+        && image_lines * MIN_IMAGE_LINE_SHARE_DENOM >= total_lines
+}
+
+/// Lines a result can hold and still be "about" the image it names.
+const MAX_RESULT_PREVIEW_LINES: usize = 8;
+
+const MIN_IMAGE_LINE_SHARE_DENOM: usize = 4;
 
 /// Blocking tail of preview prep: rasterize-if-svg, decode, downscale, encode.
 fn prepare_bytes(bytes: Vec<u8>) -> Option<EncodedPreview> {
@@ -442,11 +457,6 @@ fn prepare_preview_source(source: PreviewSource) -> Option<EncodedPreview> {
     prepare_bytes(bytes)
 }
 
-/// Cell box for a preview: full-ish width, aspect preserved via the cell
-/// ratio, capped in both directions (the terminal scales into exactly this
-/// box, so the box must match the aspect or the image distorts). Half-blocks
-/// get a larger box and a 1-px-per-col source floor: there the grid is the
-/// pixel resolution.
 pub(super) fn preview_grid(
     px_w: u32,
     px_h: u32,
@@ -1532,6 +1542,27 @@ mod tests {
         assert!(result_image_paths("12 matches in 3 files").is_empty());
         let saved = "ok</untrusted>\n[image saved: /tmp/x.png (image/png)]";
         assert_eq!(result_image_paths(saved), vec!["/tmp/x.png".to_string()]);
+    }
+
+    #[test]
+    fn result_image_paths_ignores_images_incidental_to_a_listing() {
+        let listing = "src\ntests\nCargo.toml\nCargo.lock\nREADME.md\nMakefile\n\
+logo.png\nbuild.rs\ndocs\nassets\n.gitignore\nchart.svg\n";
+        assert!(result_image_paths(listing).is_empty());
+        // The same two images, alone, are still the answer.
+        assert_eq!(
+            result_image_paths("logo.png\nchart.svg\n"),
+            vec!["logo.png".to_string(), "chart.svg".to_string()]
+        );
+        // A short listing where one image is a minority stays quiet too.
+        assert!(result_image_paths("src\ntests\nCargo.toml\nMakefile\nlogo.png\n").is_empty());
+        // The saved-image trailer is a deliberate signal — never ratio-gated.
+        let long_then_saved =
+            "a\nb\nc\nd\ne\nf\ng\nh\ni</untrusted>\n[image saved: /tmp/x.png (image/png)]";
+        assert_eq!(
+            result_image_paths(long_then_saved),
+            vec!["/tmp/x.png".to_string()]
+        );
     }
 
     #[test]
