@@ -187,6 +187,34 @@ fn has_image_extension(path: &str) -> bool {
     })
 }
 
+fn image_stem(path: &str) -> String {
+    let lower = path.to_ascii_lowercase();
+    for ext in [".svg", ".png", ".jpg", ".jpeg"] {
+        if let Some(stem) = lower.strip_suffix(ext) {
+            return stem.to_string();
+        }
+    }
+    lower
+}
+
+/// `foo.svg` + `foo.png` in one message is one picture (source + render) —
+/// content-hash dedup can't see that (different pixels). First mention wins.
+fn dedup_same_stem(paths: Vec<String>) -> Vec<String> {
+    let mut seen: Vec<String> = Vec::new();
+    paths
+        .into_iter()
+        .filter(|path| {
+            let stem = image_stem(path);
+            if seen.contains(&stem) {
+                false
+            } else {
+                seen.push(stem);
+                true
+            }
+        })
+        .collect()
+}
+
 /// Key for a URL preview — content-unknown until fetched, so the URL string
 /// itself is the identity (first fetch wins, like a pin).
 fn hash_url(url: &str) -> u64 {
@@ -290,7 +318,11 @@ const MAX_RESULT_PATH_PREVIEWS: usize = 3;
 /// itself is the only hook. Stat-gating (at queue/push time) keeps ordinary
 /// prose mentioning filenames quiet.
 fn text_image_paths(text: &str) -> Vec<String> {
-    image_tokens(text, MAX_RESULT_PATH_PREVIEWS, has_image_extension)
+    dedup_same_stem(image_tokens(
+        text,
+        MAX_RESULT_PATH_PREVIEWS,
+        has_image_extension,
+    ))
 }
 
 const MAX_INLINE_SVG_BLOCKS: usize = 2;
@@ -375,7 +407,7 @@ fn result_image_paths(result: &str) -> Vec<String> {
         paths.extend(bare.iter().map(|s| s.to_string()));
     }
     paths.dedup();
-    paths
+    dedup_same_stem(paths)
 }
 
 /// Blocking tail of preview prep: rasterize-if-svg, decode, downscale, encode.
@@ -724,6 +756,10 @@ impl CodeTuiApp {
         };
         if !seen.insert(preview.content_hash) {
             return;
+        }
+        // Back-to-back blocks read as one glued picture.
+        if lines.last().is_some_and(|l| l.plain == RESERVED_ROW) {
+            push_styled_line(lines, "", Style::default());
         }
         push_preview_rows(
             lines,
@@ -1325,6 +1361,27 @@ mod tests {
         assert_eq!(
             text_image_paths("图片（shots/a.png）已保存"),
             vec!["shots/a.png"]
+        );
+    }
+
+    #[test]
+    fn same_stem_mentions_preview_once() {
+        assert_eq!(
+            text_image_paths("grid.svg is a 12×12 grid; preview: grid.png"),
+            vec!["grid.svg"]
+        );
+        assert_eq!(
+            text_image_paths("rendered out/pic.PNG from out/pic.svg"),
+            vec!["out/pic.PNG"]
+        );
+        // Same basename in different dirs = different pictures.
+        assert_eq!(
+            text_image_paths("light/logo.png vs dark/logo.png"),
+            vec!["light/logo.png", "dark/logo.png"]
+        );
+        assert_eq!(
+            result_image_paths("a/one.svg\na/one.png\n"),
+            vec!["a/one.svg".to_string()]
         );
     }
 
