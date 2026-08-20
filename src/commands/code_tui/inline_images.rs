@@ -28,6 +28,8 @@ const CELL_WIDTH_OVER_HEIGHT: f64 = 0.5;
 const MIN_SOURCE_PX_PER_COL: u32 = 10;
 /// Images kept transmitted in the terminal before LRU eviction.
 const MAX_TRANSMITTED: usize = 24;
+/// Debounce for resize re-transmit — a live drag is a resize-event burst.
+const RESIZE_SETTLE: std::time::Duration = std::time::Duration::from_millis(250);
 const MAX_SOURCE_BYTES: u64 = 20 * 1024 * 1024;
 
 /// The reserved transcript row under an image: a zero-width space — invisible
@@ -81,6 +83,7 @@ pub(super) struct InlineImageState {
     /// What this frame's render wants on screen; virtual mode uses it purely
     /// as the transmit trigger, classic mode diffs it against `placed`.
     pub(super) desired: Vec<PlacedImage>,
+    pub(super) resize_settle: Option<std::time::Instant>,
 }
 
 /// Placement ids derive from the screen row: the same image visible twice
@@ -1238,6 +1241,29 @@ impl CodeTuiApp {
         if self.inline_images.caps.protocol == Protocol::Sixel {
             self.inline_images.placed.clear();
         }
+    }
+
+    /// Terminals may drop transmitted image data on a window resize; the
+    /// repainted placeholder cells then composite nothing.
+    pub(super) fn note_image_resize(&mut self) {
+        if self.inline_images.caps.emits_escapes() {
+            self.inline_images.resize_settle = Some(std::time::Instant::now());
+        }
+    }
+
+    /// Resize settled: forget terminal-side state so the flush re-sends.
+    pub(super) fn tick_image_resize_settle(&mut self) -> bool {
+        let settled = self
+            .inline_images
+            .resize_settle
+            .is_some_and(|at| at.elapsed() >= RESIZE_SETTLE);
+        if !settled {
+            return false;
+        }
+        self.inline_images.resize_settle = None;
+        self.reset_inline_image_terminal_state();
+        self.pending_full_repaint = true;
+        true
     }
 
     /// Forget the terminal-side state after something else owned the terminal

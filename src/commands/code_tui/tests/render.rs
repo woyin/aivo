@@ -1313,6 +1313,45 @@ fn test_ask_card_keeps_virtual_placements_drops_floating_ones() {
 }
 
 #[test]
+fn test_resize_settle_resends_inline_images() {
+    use crate::services::terminal_graphics::{GraphicsCaps, Protocol};
+
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.inline_images.caps = GraphicsCaps {
+        protocol: Protocol::KittyVirtual,
+        tmux: false,
+        ..GraphicsCaps::default()
+    };
+    app.inline_images.transmitted.insert(0xCAFE, (46, 12));
+    app.inline_images.transmit_order.push_back(0xCAFE);
+
+    app.note_image_resize();
+    assert!(
+        !app.tick_image_resize_settle(),
+        "must not reset while the resize burst is still live"
+    );
+    assert!(!app.inline_images.transmitted.is_empty());
+
+    app.inline_images.resize_settle =
+        std::time::Instant::now().checked_sub(std::time::Duration::from_secs(1));
+    assert!(app.tick_image_resize_settle());
+    assert!(
+        app.inline_images.transmitted.is_empty(),
+        "settle must forget terminal-side data so the flush re-transmits"
+    );
+    assert!(app.pending_full_repaint);
+    assert!(
+        !app.tick_image_resize_settle(),
+        "one reset per resize burst"
+    );
+
+    app.inline_images.caps = GraphicsCaps::default();
+    app.note_image_resize();
+    assert!(app.inline_images.resize_settle.is_none());
+}
+
+#[test]
 fn test_inline_image_flush_virtual_mode_is_scroll_free() {
     use crate::services::terminal_graphics::{EncodedPreview, GraphicsCaps, PixelFormat, Protocol};
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();

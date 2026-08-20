@@ -1888,6 +1888,10 @@ impl CodeTuiApp {
                 needs_redraw = true;
             }
 
+            if self.tick_image_resize_settle() {
+                needs_redraw = true;
+            }
+
             // Self-heal: full repaint mid-stream and once more when it settles.
             let streaming = self.sending || !self.incoming_buffer.is_empty();
             if streaming && last_stream_repaint.elapsed() >= STREAM_FULL_REPAINT_INTERVAL {
@@ -2370,6 +2374,7 @@ impl CodeTuiApp {
             Event::Resize(cols, rows) => {
                 crate::trace_ev!("render", "event=resize cols={cols} rows={rows}");
                 self.pending_full_repaint = true;
+                self.note_image_resize();
                 Ok(None)
             }
             Event::Paste(text) => {
