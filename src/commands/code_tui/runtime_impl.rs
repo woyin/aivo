@@ -4821,6 +4821,19 @@ async fn drive_cursor_turn(
                 result,
                 failed,
             },
+            CursorChunk::Usage {
+                context_window,
+                used,
+            } => {
+                if context_window > 0 {
+                    tx.send(RuntimeEvent::AgentContextWindow(context_window))
+                        .ok();
+                }
+                RuntimeEvent::AgentContext {
+                    tokens: used,
+                    measured: true,
+                }
+            }
         };
         tx.send(event).ok();
         Ok(())
@@ -4837,9 +4850,10 @@ async fn drive_cursor_turn(
                 )?;
             }
             PromptEvent::Done(result) => {
-                result
+                let value = result
                     .map_err(|e| anyhow::anyhow!(e))
                     .context("cursor-agent ACP session/prompt failed")?;
+                turn_result.usage = cursor_acp::parse_result_usage(&value);
                 break;
             }
         }
@@ -4853,7 +4867,9 @@ async fn drive_cursor_turn(
 
     Ok(ChatTurnResult {
         content: turn_result.content,
-        usage: None,
+        usage: turn_result
+            .usage
+            .map(cursor_acp::CursorUsage::to_token_usage),
         model: model_id,
         raw_body: None,
     })

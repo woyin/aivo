@@ -106,6 +106,12 @@ impl CodeTuiApp {
             RuntimeEvent::AgentContext { tokens, measured } => {
                 self.apply_agent_context(tokens, measured);
             }
+            RuntimeEvent::AgentContextWindow(size) => {
+                // `--max-context` still wins, as in `refresh_context_window`.
+                if size > 0 && self.context_window_override.is_none() {
+                    self.context_window = size;
+                }
+            }
             RuntimeEvent::AgentTurnTokens(output) => {
                 self.turn_output_tokens = output;
                 self.turn_stream_chars_measured = self.turn_stream_chars;

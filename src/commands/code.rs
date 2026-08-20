@@ -837,6 +837,7 @@ impl CodeCommand {
                             }
                             return Ok(());
                         }
+                        CursorChunk::Usage { .. } => return Ok(()),
                     };
                     on_chunk(mapped)
                 };
@@ -850,7 +851,7 @@ impl CodeCommand {
                         &mut forward,
                     ) => res.map(|cur| ChatTurnResult {
                         content: cur.content,
-                        usage: None,
+                        usage: cur.usage.map(cursor_acp::CursorUsage::to_token_usage),
                         model: cur.model,
                         raw_body: None,
                     }),

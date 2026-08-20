@@ -2774,6 +2774,9 @@ pub(super) enum RuntimeEvent {
         tokens: u64,
         measured: bool,
     },
+    /// Cursor's `usage_update` reported the real context window — beats the
+    /// id-parsed guess.
+    AgentContextWindow(u64),
     /// The turn's cumulative generated (output) tokens so far — drives the live
     /// per-turn counter in the status line.
     AgentTurnTokens(u64),

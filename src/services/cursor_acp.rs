@@ -18,6 +18,7 @@ use crate::services::acp_client::{
 };
 use crate::services::cursor_home_shadow::CursorShadow;
 use crate::services::session_store::{ApiKey, AttachmentStorage, MessageAttachment};
+use crate::services::token_usage::TokenUsage;
 
 pub const CURSOR_ACP_SENTINEL: &str = "cursor";
 /// `key.key` prefix that marks a shadow-isolated cursor account. The slug
@@ -1253,6 +1254,63 @@ pub struct CursorTurnResult {
     pub reasoning_content: Option<String>,
     pub stop_reason: Option<String>,
     pub model: Option<String>,
+    /// `None` → callers fall back to their chars/4 estimate.
+    pub usage: Option<CursorUsage>,
+}
+
+/// Token usage from an ACP `session/prompt` result. Schema-defined but not
+/// yet emitted as of cursor-agent 2026.07.09 — guarded on presence.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CursorUsage {
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cached_read_tokens: u64,
+    pub cached_write_tokens: u64,
+    pub thought_tokens: u64,
+    pub total_tokens: u64,
+}
+
+impl CursorUsage {
+    /// Map to aivo's convention: cache ⊂ prompt, reasoning billed as output.
+    /// Cursor's names mirror Anthropic's exclusive split, so cache folds into
+    /// prompt — unless `totalTokens` proves the emit is already inclusive.
+    pub fn to_token_usage(self) -> TokenUsage {
+        let cache = self.cached_read_tokens + self.cached_write_tokens;
+        let already_inclusive = self.total_tokens > 0
+            && self.total_tokens == self.input_tokens + self.output_tokens + self.thought_tokens;
+        let prompt_tokens = if already_inclusive {
+            self.input_tokens
+        } else {
+            self.input_tokens + cache
+        };
+        TokenUsage {
+            prompt_tokens,
+            completion_tokens: self.output_tokens + self.thought_tokens,
+            cache_read_input_tokens: self.cached_read_tokens,
+            cache_creation_input_tokens: self.cached_write_tokens,
+        }
+    }
+}
+
+/// `None` when absent or all-zero — a zero-filled frame must not clobber the
+/// estimate fallback. Both cache-key spellings accepted; no live frame exists
+/// yet to pin down which one ships.
+pub fn parse_result_usage(result: &Value) -> Option<CursorUsage> {
+    let u = result.get("usage")?;
+    let int = |keys: &[&str]| -> u64 {
+        keys.iter()
+            .find_map(|k| u.get(*k).and_then(Value::as_u64))
+            .unwrap_or(0)
+    };
+    let usage = CursorUsage {
+        input_tokens: int(&["inputTokens"]),
+        output_tokens: int(&["outputTokens"]),
+        cached_read_tokens: int(&["cachedReadTokens", "cacheReadTokens"]),
+        cached_write_tokens: int(&["cachedWriteTokens", "cacheWriteTokens"]),
+        thought_tokens: int(&["thoughtTokens"]),
+        total_tokens: int(&["totalTokens"]),
+    };
+    (usage != CursorUsage::default()).then_some(usage)
 }
 
 /// Streaming chunk delivered to callers of [`run_cursor_acp_turn`]. Text deltas
@@ -1281,6 +1339,12 @@ pub enum CursorChunk<'a> {
         args: Option<serde_json::Value>,
         result: Option<String>,
         failed: bool,
+    },
+    /// `usage_update` telemetry. Its `cost` field is ignored until a live
+    /// frame pins down the unit (dollars vs cents).
+    Usage {
+        context_window: u64,
+        used: u64,
     },
 }
 
@@ -1656,6 +1720,7 @@ where
                     .get("stopReason")
                     .and_then(Value::as_str)
                     .map(str::to_string);
+                out.usage = parse_result_usage(&value);
                 break;
             }
         }
@@ -1726,6 +1791,17 @@ where
                         failed,
                     })?;
                 }
+            }
+        }
+        Some("usage_update") => {
+            let int = |k: &str| update.get(k).and_then(Value::as_u64);
+            if let (Some(size), Some(used)) = (int("size"), int("used"))
+                && used > 0
+            {
+                on_chunk(CursorChunk::Usage {
+                    context_window: size,
+                    used,
+                })?;
             }
         }
         _ => {}
@@ -2979,6 +3055,10 @@ mod tests {
                 CursorChunk::Reasoning(t) => chunks.push(("reasoning".into(), t.to_string())),
                 CursorChunk::ToolCall { name, .. } => chunks.push(("tool_call".into(), name)),
                 CursorChunk::ToolUpdate { id, .. } => chunks.push(("tool_update".into(), id)),
+                CursorChunk::Usage {
+                    context_window,
+                    used,
+                } => chunks.push(("usage".into(), format!("{context_window}|{used}"))),
             }
             Ok(())
         };
@@ -3012,6 +3092,102 @@ mod tests {
     }
 
     #[test]
+    fn parse_result_usage_maps_fields_and_rejects_empty() {
+        let value = serde_json::json!({
+            "stopReason": "end_turn",
+            "usage": {
+                "inputTokens": 1000,
+                "outputTokens": 200,
+                "cachedReadTokens": 8000,
+                "cachedWriteTokens": 500,
+                "thoughtTokens": 300,
+                "totalTokens": 10000,
+            },
+        });
+        let usage = parse_result_usage(&value).unwrap();
+        assert_eq!(usage.input_tokens, 1000);
+        assert_eq!(usage.cached_read_tokens, 8000);
+        assert_eq!(usage.thought_tokens, 300);
+        let alt = serde_json::json!({"usage": {"inputTokens": 1, "cacheReadTokens": 7}});
+        assert_eq!(parse_result_usage(&alt).unwrap().cached_read_tokens, 7);
+        assert!(parse_result_usage(&serde_json::json!({"stopReason": "end_turn"})).is_none());
+        assert!(parse_result_usage(&serde_json::json!({"usage": {}})).is_none());
+        assert!(
+            parse_result_usage(
+                &serde_json::json!({"usage": {"inputTokens": 0, "outputTokens": 0}})
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn cursor_usage_folds_exclusive_split_into_prompt() {
+        let usage = CursorUsage {
+            input_tokens: 1000,
+            output_tokens: 200,
+            cached_read_tokens: 8000,
+            cached_write_tokens: 500,
+            thought_tokens: 300,
+            total_tokens: 10000,
+        };
+        let t = usage.to_token_usage();
+        assert_eq!(t.prompt_tokens, 9500);
+        assert_eq!(t.completion_tokens, 500);
+        assert_eq!(t.cache_read_input_tokens, 8000);
+        assert_eq!(t.cache_creation_input_tokens, 500);
+    }
+
+    #[test]
+    fn cursor_usage_keeps_inclusive_prompt() {
+        let usage = CursorUsage {
+            input_tokens: 9500,
+            output_tokens: 200,
+            cached_read_tokens: 8000,
+            cached_write_tokens: 500,
+            thought_tokens: 300,
+            total_tokens: 10000,
+        };
+        assert_eq!(usage.to_token_usage().prompt_tokens, 9500);
+        let no_total = CursorUsage {
+            total_tokens: 0,
+            input_tokens: 1000,
+            ..usage
+        };
+        assert_eq!(no_total.to_token_usage().prompt_tokens, 9500);
+    }
+
+    #[test]
+    fn consume_session_update_surfaces_usage_update() {
+        let mut out = CursorTurnResult::default();
+        let mut reasoning = String::new();
+        let mut seen: Vec<(u64, u64)> = Vec::new();
+        let mut on_chunk = |chunk: CursorChunk<'_>| -> Result<()> {
+            if let CursorChunk::Usage {
+                context_window,
+                used,
+            } = chunk
+            {
+                seen.push((context_window, used));
+            }
+            Ok(())
+        };
+        let msg = serde_json::json!({
+            "sessionId": "s1",
+            "update": {"sessionUpdate": "usage_update", "size": 272000, "used": 41000, "cost": 3},
+        });
+        consume_session_update(&msg, &mut out, &mut reasoning, &mut on_chunk).unwrap();
+        let zero = serde_json::json!({
+            "update": {"sessionUpdate": "usage_update", "size": 272000, "used": 0},
+        });
+        consume_session_update(&zero, &mut out, &mut reasoning, &mut on_chunk).unwrap();
+        let malformed = serde_json::json!({
+            "update": {"sessionUpdate": "usage_update", "used": 41000},
+        });
+        consume_session_update(&malformed, &mut out, &mut reasoning, &mut on_chunk).unwrap();
+        assert_eq!(seen, vec![(272000, 41000)]);
+    }
+
+    #[test]
     fn consume_session_update_surfaces_tool_calls() {
         let mut out = CursorTurnResult::default();
         let mut reasoning = String::new();
@@ -3037,6 +3213,10 @@ mod tests {
                         result.unwrap_or_default(),
                     ),
                 )),
+                CursorChunk::Usage {
+                    context_window,
+                    used,
+                } => chunks.push(("usage".into(), format!("{context_window}|{used}"))),
             }
             Ok(())
         };
