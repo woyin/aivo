@@ -237,7 +237,8 @@ async fn test_log_agent_turn_records_under_real_cwd() {
         attachments: vec![],
     });
 
-    app.log_agent_turn(1234).await;
+    // No provider split (e.g. cursor ACP): transcript total falls back to output.
+    app.log_agent_turn(1234, SessionTokens::default()).await;
 
     // The turn shows in `aivo logs` filtered to the real project dir.
     let rows = store
@@ -253,6 +254,35 @@ async fn test_log_agent_turn_records_under_real_cwd() {
     assert_eq!(rows[0].kind, "code_turn");
     assert_eq!(rows[0].session_id.as_deref(), Some("agent-sess"));
     assert_eq!(rows[0].output_tokens, Some(1234));
+
+    // With the engine's split, the row carries real input/output/cache columns.
+    app.log_agent_turn(
+        999_999,
+        SessionTokens {
+            prompt_tokens: 962_753,
+            completion_tokens: 35_883,
+            cache_read_tokens: 939_264,
+            cache_write_tokens: 128,
+        },
+    )
+    .await;
+    let rows = store
+        .logs()
+        .list(LogQuery {
+            limit: 100,
+            cwd: Some("/home/me/proj".to_string()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 2);
+    let split_row = rows
+        .iter()
+        .find(|r| r.output_tokens == Some(35_883))
+        .expect("split row logged");
+    assert_eq!(split_row.input_tokens, Some(962_753));
+    assert_eq!(split_row.cache_read_input_tokens, Some(939_264));
+    assert_eq!(split_row.cache_creation_input_tokens, Some(128));
 }
 
 #[tokio::test]

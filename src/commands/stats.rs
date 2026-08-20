@@ -336,16 +336,18 @@ impl StatsCommand {
         let show_cache = total_cache > 0;
         let total_sessions: u64 = tool_tokens.values().map(|t| t.sessions).sum();
 
-        let mut aivo_model_usage = aivo_model_usage_for_window(&stats, &key_ids, cutoff);
+        let (aivo_gated, mut aivo_own) = aivo_model_usage_for_window(&stats, &key_ids, cutoff);
+        // Windowed chat/code usage is aivo-own: never behind the native dedup.
         for (model, tokens) in &chat_window.per_model {
             let key = global_stats::normalize_model_for_display(model);
-            let entry = aivo_model_usage.entry(key).or_default();
-            entry.input = entry.input.saturating_add(tokens.prompt_tokens);
-            entry.output = entry.output.saturating_add(tokens.completion_tokens);
-            entry.cache_read = entry.cache_read.saturating_add(tokens.cache_read_tokens);
-            entry.cache_write = entry.cache_write.saturating_add(tokens.cache_write_tokens);
+            aivo_own.entry(key).or_default().add(
+                tokens.prompt_tokens,
+                tokens.completion_tokens,
+                tokens.cache_read_tokens,
+                tokens.cache_write_tokens,
+            );
         }
-        let mut model_tokens = combine_model_tokens(&global, &aivo_model_usage);
+        let mut model_tokens = combine_model_tokens(&global, &aivo_gated, &aivo_own);
         // Fold in the windowed per-model tokens from probe-less plugin runs (their
         // endpoint usage isn't in `global`/`aivo_model_usage`), so the breakdown
         // matches the per-tool totals computed above.
@@ -1196,9 +1198,9 @@ fn aivo_model_usage_for_window(
     stats: &UsageStats,
     key_ids: &HashSet<&str>,
     cutoff: Option<chrono::DateTime<chrono::Utc>>,
-) -> HashMap<String, ModelTotals> {
+) -> (HashMap<String, ModelTotals>, HashMap<String, ModelTotals>) {
     if cutoff.is_some() {
-        return HashMap::new();
+        return (HashMap::new(), HashMap::new());
     }
     aggregate_model_usage(stats, key_ids)
 }
@@ -1801,31 +1803,50 @@ fn render_since_footer(since: Option<&str>, omitted_sources: &[&str]) {
 /// being dropped whenever any native data exists.
 fn combine_model_tokens(
     global: &HashMap<String, global_stats::GlobalToolStats>,
-    aivo_model_usage: &HashMap<String, ModelTotals>,
+    aivo_gated: &HashMap<String, ModelTotals>,
+    aivo_own: &HashMap<String, ModelTotals>,
 ) -> HashMap<String, ModelTotals> {
     let mut model_tokens: HashMap<String, ModelTotals> = HashMap::new();
     for gs in global.values() {
         for (model, mt) in &gs.models {
             let key = normalize_model_for_display(model);
             let entry = model_tokens.entry(key).or_default();
-            entry.input = entry.input.saturating_add(mt.input_tokens);
-            entry.output = entry.output.saturating_add(mt.output_tokens);
-            entry.cache_read = entry.cache_read.saturating_add(mt.cache_read_tokens);
-            entry.cache_write = entry.cache_write.saturating_add(mt.cache_write_tokens);
+            entry.add(
+                mt.input_tokens,
+                mt.output_tokens,
+                mt.cache_read_tokens,
+                mt.cache_write_tokens,
+            );
         }
     }
 
-    for (model, totals) in aivo_model_usage {
+    // Snapshot: the dedup must test native models, not earlier aivo entries.
+    let native_models: HashSet<String> = model_tokens.keys().cloned().collect();
+    for (model, totals) in aivo_gated {
         let key = normalize_model_for_display(model);
-        if model_tokens.contains_key(&key) {
-            // Native already covers this model; skip to avoid double counting.
+        if native_models.contains(&key) {
+            // Native files already record these requests; skip to avoid double counting.
             continue;
         }
         let entry = model_tokens.entry(key).or_default();
-        entry.input = entry.input.saturating_add(totals.input);
-        entry.output = entry.output.saturating_add(totals.output);
-        entry.cache_read = entry.cache_read.saturating_add(totals.cache_read);
-        entry.cache_write = entry.cache_write.saturating_add(totals.cache_write);
+        entry.add(
+            totals.input,
+            totals.output,
+            totals.cache_read,
+            totals.cache_write,
+        );
+    }
+
+    // The own share exists nowhere in native files — counted unconditionally.
+    for (model, totals) in aivo_own {
+        let key = normalize_model_for_display(model);
+        let entry = model_tokens.entry(key).or_default();
+        entry.add(
+            totals.input,
+            totals.output,
+            totals.cache_read,
+            totals.cache_write,
+        );
     }
 
     model_tokens
@@ -1876,6 +1897,12 @@ fn aggregate_tool_counts(
 /// `migrate_legacy_per_model` first, so this function never has to know about
 /// the old per-model maps.
 ///
+/// Returns `(gated, own)`, keyed by normalized model name. `own` — recorded
+/// under aivo-own tools (code TUI, chat, plugins), absent from native CLI data
+/// files, counted unconditionally. `gated` — launched native CLIs (their own
+/// files record the same requests) plus keys without a per-tool split; stays
+/// behind the native-wins dedup.
+///
 /// Falls back to the global `model_usage` map (a flat `total_tokens` per model
 /// with no input/output split) when no key has per-model data — i.e. an
 /// install that predates per-key tracking entirely. The fallback assigns the
@@ -1885,25 +1912,67 @@ fn aggregate_tool_counts(
 fn aggregate_model_usage(
     stats: &UsageStats,
     existing_keys: &HashSet<&str>,
-) -> HashMap<String, ModelTotals> {
-    let mut result: HashMap<String, ModelTotals> = HashMap::new();
+) -> (HashMap<String, ModelTotals>, HashMap<String, ModelTotals>) {
+    let mut gated: HashMap<String, ModelTotals> = HashMap::new();
+    let mut own: HashMap<String, ModelTotals> = HashMap::new();
     let mut any_per_key = false;
     for (key_id, entry) in &stats.key_usage {
-        if existing_keys.contains(key_id.as_str()) {
-            if !entry.per_model_usage.is_empty() {
-                any_per_key = true;
+        if !existing_keys.contains(key_id.as_str()) {
+            continue;
+        }
+        if !entry.per_model_usage.is_empty() {
+            any_per_key = true;
+        }
+        // Normalize before subtracting so variant spellings of one model cancel.
+        let mut key_own: HashMap<String, ModelTotals> = HashMap::new();
+        for (tool, models) in &entry.per_tool_model_usage {
+            if global_stats::is_native_tool(tool) {
+                continue;
             }
-            for (model, mc) in &entry.per_model_usage {
-                let m = result.entry(model.clone()).or_default();
-                m.input = m.input.saturating_add(mc.prompt_tokens);
-                m.output = m.output.saturating_add(mc.completion_tokens);
-                m.cache_read = m.cache_read.saturating_add(mc.cache_read_input_tokens);
-                m.cache_write = m.cache_write.saturating_add(mc.cache_creation_input_tokens);
+            for (model, mc) in models {
+                key_own
+                    .entry(normalize_model_for_display(model))
+                    .or_default()
+                    .add(
+                        mc.prompt_tokens,
+                        mc.completion_tokens,
+                        mc.cache_read_input_tokens,
+                        mc.cache_creation_input_tokens,
+                    );
             }
+        }
+        let mut key_total: HashMap<String, ModelTotals> = HashMap::new();
+        for (model, mc) in &entry.per_model_usage {
+            key_total
+                .entry(normalize_model_for_display(model))
+                .or_default()
+                .add(
+                    mc.prompt_tokens,
+                    mc.completion_tokens,
+                    mc.cache_read_input_tokens,
+                    mc.cache_creation_input_tokens,
+                );
+        }
+        for (model, totals) in key_total {
+            let own_share = key_own.get(&model).copied().unwrap_or_default();
+            gated.entry(model).or_default().add(
+                totals.input.saturating_sub(own_share.input),
+                totals.output.saturating_sub(own_share.output),
+                totals.cache_read.saturating_sub(own_share.cache_read),
+                totals.cache_write.saturating_sub(own_share.cache_write),
+            );
+        }
+        for (model, totals) in key_own {
+            own.entry(model).or_default().add(
+                totals.input,
+                totals.output,
+                totals.cache_read,
+                totals.cache_write,
+            );
         }
     }
     if !any_per_key {
-        return stats
+        let fallback = stats
             .model_usage
             .iter()
             .map(|(name, c)| {
@@ -1918,8 +1987,9 @@ fn aggregate_model_usage(
                 )
             })
             .collect();
+        return (fallback, HashMap::new());
     }
-    result
+    (gated, own)
 }
 
 fn is_valid_tool(tool: &str, plugins: &HashSet<String>) -> bool {
@@ -2424,14 +2494,65 @@ mod tests {
         stats.key_usage.insert("key1".to_string(), counter);
 
         let keys: HashSet<&str> = ["key1"].into_iter().collect();
-        let result = aggregate_model_usage(&stats, &keys);
-        let m = result.get("gpt-4o").unwrap();
+        let (gated, own) = aggregate_model_usage(&stats, &keys);
+        assert!(own.is_empty(), "no per-tool split → everything gated");
+        let m = gated.get("gpt-4o").unwrap();
         assert_eq!(m.input, 700);
         assert_eq!(m.output, 300);
         assert_eq!(m.tokens(), 1000);
         assert_eq!(m.cached(), 1000);
         assert_eq!(m.cache_read, 800);
         assert_eq!(m.cache_write, 200);
+    }
+
+    #[test]
+    fn aggregate_model_usage_splits_own_tools_from_native_launched() {
+        use crate::services::session_store::ModelCounter;
+
+        let mut stats = UsageStats::default();
+        let mut counter = UsageCounter::default();
+        counter.per_model_usage.insert(
+            "aivo/starter".to_string(),
+            ModelCounter {
+                prompt_tokens: 1_000,
+                completion_tokens: 100,
+                cache_read_input_tokens: 800,
+                cache_creation_input_tokens: 0,
+            },
+        );
+        // 600/60 under the code TUI (own), 300/30 under launched claude, 100/10 untracked.
+        counter.per_tool_model_usage.insert(
+            "code".to_string(),
+            HashMap::from([(
+                "aivo/starter".to_string(),
+                ModelCounter {
+                    prompt_tokens: 600,
+                    completion_tokens: 60,
+                    cache_read_input_tokens: 500,
+                    cache_creation_input_tokens: 0,
+                },
+            )]),
+        );
+        counter.per_tool_model_usage.insert(
+            "claude".to_string(),
+            HashMap::from([(
+                "aivo/starter".to_string(),
+                ModelCounter {
+                    prompt_tokens: 300,
+                    completion_tokens: 30,
+                    cache_read_input_tokens: 200,
+                    cache_creation_input_tokens: 0,
+                },
+            )]),
+        );
+        stats.key_usage.insert("key1".to_string(), counter);
+
+        let keys: HashSet<&str> = ["key1"].into_iter().collect();
+        let (gated, own) = aggregate_model_usage(&stats, &keys);
+        let o = own.get("starter").unwrap();
+        assert_eq!((o.input, o.output, o.cache_read), (600, 60, 500));
+        let g = gated.get("starter").unwrap();
+        assert_eq!((g.input, g.output, g.cache_read), (400, 40, 300));
     }
 
     #[test]
@@ -2478,9 +2599,10 @@ mod tests {
         stats.model_usage.insert("gpt-4o".to_string(), global);
 
         let keys: HashSet<&str> = ["legacy_key"].into_iter().collect();
-        let result = aggregate_model_usage(&stats, &keys);
+        let (gated, own) = aggregate_model_usage(&stats, &keys);
+        assert!(own.is_empty());
         // Legacy global has no per-model cache or prompt/completion split — it lands in output.
-        let m = result.get("gpt-4o").unwrap();
+        let m = gated.get("gpt-4o").unwrap();
         assert_eq!(m.tokens(), 500_000);
         assert_eq!(m.cached(), 0);
     }
@@ -2499,7 +2621,7 @@ mod tests {
             },
         );
 
-        let result = combine_model_tokens(&global, &aivo);
+        let result = combine_model_tokens(&global, &aivo, &HashMap::new());
         let m = result.get("gpt-4o").unwrap();
         assert_eq!(m.input, 800);
         assert_eq!(m.output, 434);
@@ -2536,7 +2658,7 @@ mod tests {
             },
         );
 
-        let result = combine_model_tokens(&global, &aivo);
+        let result = combine_model_tokens(&global, &aivo, &HashMap::new());
         let m = result.get("gpt-5.4").unwrap();
         assert_eq!(m.input, 100);
         assert_eq!(m.output, 25);
@@ -2575,7 +2697,7 @@ mod tests {
             },
         );
 
-        let result = combine_model_tokens(&global, &aivo);
+        let result = combine_model_tokens(&global, &aivo, &HashMap::new());
         assert!(result.contains_key("claude-opus"));
         assert!(result.contains_key("kimi-k2.6"));
         assert_eq!(result.get("kimi-k2.6").unwrap().input, 132);
@@ -2623,6 +2745,53 @@ mod tests {
         assert_eq!(folded.get("claude-opus-4.8").unwrap().input, 30);
     }
 
+    /// A small native row must not suppress the aivo-own share (the
+    /// aivo-starter swallow); only the gated share is deduped.
+    #[test]
+    fn combine_model_tokens_counts_own_share_despite_native_overlap() {
+        let mut global = HashMap::new();
+        global.insert(
+            "claude".to_string(),
+            global_stats::GlobalToolStats {
+                models: HashMap::from([(
+                    "starter".to_string(),
+                    global_stats::ModelTokens {
+                        input_tokens: 3_000,
+                        output_tokens: 300,
+                        cache_read_tokens: 0,
+                        cache_write_tokens: 0,
+                    },
+                )]),
+                ..Default::default()
+            },
+        );
+        let gated = HashMap::from([(
+            "starter".to_string(),
+            ModelTotals {
+                input: 400,
+                output: 40,
+                cache_read: 0,
+                cache_write: 0,
+            },
+        )]);
+        let own = HashMap::from([(
+            "starter".to_string(),
+            ModelTotals {
+                input: 100_000,
+                output: 10_000,
+                cache_read: 90_000,
+                cache_write: 0,
+            },
+        )]);
+
+        let result = combine_model_tokens(&global, &gated, &own);
+        let m = result.get("starter").unwrap();
+        // native + own; the gated 400/40 is skipped
+        assert_eq!(m.input, 103_000);
+        assert_eq!(m.output, 10_300);
+        assert_eq!(m.cache_read, 90_000);
+    }
+
     /// Folding before the dedup would let a small native variant swallow the
     /// separately-recorded aivo total for the base name.
     #[test]
@@ -2653,7 +2822,7 @@ mod tests {
             },
         )]);
 
-        let folded = fold_model_variants(combine_model_tokens(&global, &aivo));
+        let folded = fold_model_variants(combine_model_tokens(&global, &aivo, &HashMap::new()));
         let grok = folded.get("grok-4.5").unwrap();
         assert_eq!(grok.input, 1_050);
         assert_eq!(grok.output, 105);
@@ -3072,8 +3241,8 @@ mod tests {
         stats.key_usage.insert("k1".to_string(), counter);
         let keys: HashSet<&str> = ["k1"].into_iter().collect();
 
-        let result = aivo_model_usage_for_window(&stats, &keys, None);
-        let m = result.get("minimax-m2.7").expect("lifetime model present");
+        let (gated, _own) = aivo_model_usage_for_window(&stats, &keys, None);
+        let m = gated.get("minimax-m2.7").expect("lifetime model present");
         assert_eq!(m.output, 6_717_791);
     }
 
@@ -3100,9 +3269,9 @@ mod tests {
         let keys: HashSet<&str> = ["k1"].into_iter().collect();
 
         let cutoff = Some(chrono::Utc::now() - chrono::Duration::hours(1));
-        let result = aivo_model_usage_for_window(&stats, &keys, cutoff);
+        let (gated, own) = aivo_model_usage_for_window(&stats, &keys, cutoff);
         assert!(
-            result.is_empty(),
+            gated.is_empty() && own.is_empty(),
             "lifetime models must not leak under cutoff"
         );
     }

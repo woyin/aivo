@@ -1040,6 +1040,7 @@ impl CodeTuiApp {
         // Fold this turn's real provider-measured split into the session's running
         // total BEFORE a possible MCP rebuild drops the engine, so the chat index
         // entry (and thus `aivo stats --since`) carries actual chat tokens.
+        let mut turn_split = crate::services::session_store::SessionTokens::default();
         if let Some(session) = self.agent_engine.as_ref() {
             let (turn, reported_cost, billed) = {
                 let mut engine = session.engine.lock().await;
@@ -1070,6 +1071,7 @@ impl CodeTuiApp {
                 self.turn_notes.insert(idx, note);
             }
             self.session_tokens = self.session_tokens.merge(turn);
+            turn_split = turn;
         }
         // Capture a drafted plan before the persist (and before a queued message
         // flips `sending`) so it rides this turn-end save.
@@ -1077,7 +1079,7 @@ impl CodeTuiApp {
         self.persist_history().await?;
         // A compact adds no user/assistant message; logging would duplicate the prior row.
         if compact_before.is_none() {
-            self.log_agent_turn(tokens).await;
+            self.log_agent_turn(tokens, turn_split).await;
         }
         // Pick up skills created/edited during the turn (e.g. via `/create-skill`):
         // refresh the `/` menu and, if the set changed, rebuild the engine next turn
@@ -1105,10 +1107,14 @@ impl CodeTuiApp {
     /// Record the agent turn in `aivo logs`. The per-turn loopback serve only
     /// logs low-level, cwd-less `serve_request` rows; this adds the same
     /// `chat_turn` entry the HTTP path writes (prompt title, conversation body)
-    /// under the real cwd so the turn shows in the project's logs. The accurate
-    /// per-tool token split lives in `aivo stats` (the serve's usage accounting);
-    /// here we only have the turn total.
-    pub(super) async fn log_agent_turn(&self, tokens: u64) {
+    /// under the real cwd so the turn shows in the project's logs. When the
+    /// provider reported no `split` (e.g. cursor ACP), the transcript total
+    /// lands in `completion_tokens` as a last resort.
+    pub(super) async fn log_agent_turn(
+        &self,
+        tokens: u64,
+        split: crate::services::session_store::SessionTokens,
+    ) {
         let Some(user_message) = self
             .history
             .iter()
@@ -1125,9 +1131,18 @@ impl CodeTuiApp {
             .find(|m| m.role == "assistant")
             .map(|m| m.content.clone())
             .unwrap_or_default();
-        let usage = TokenUsage {
-            completion_tokens: tokens,
-            ..Default::default()
+        let usage = if split == crate::services::session_store::SessionTokens::default() {
+            TokenUsage {
+                completion_tokens: tokens,
+                ..Default::default()
+            }
+        } else {
+            TokenUsage {
+                prompt_tokens: split.prompt_tokens,
+                completion_tokens: split.completion_tokens,
+                cache_read_input_tokens: split.cache_read_tokens,
+                cache_creation_input_tokens: split.cache_write_tokens,
+            }
         };
         let _ = log_chat_turn(
             &self.session_store,
