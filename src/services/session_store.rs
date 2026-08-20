@@ -827,6 +827,8 @@ pub struct ChatToggles {
     /// aivo's hosted web_search (`/config`). Defaults off (opt-in).
     pub web_search_enabled: bool,
     pub agent_tools_enabled: bool,
+    /// Inline transcript image previews (`/config`). Defaults on.
+    pub inline_images_enabled: bool,
     /// Chat TUI color theme (`/config`). `None` = the user has never picked one,
     /// so startup auto-detects from the terminal background (falling back to dark);
     /// `Some` = an explicit choice that's always honored.
@@ -2154,6 +2156,12 @@ impl SessionStore {
         self.write_code_prefs(&prefs).await
     }
 
+    pub async fn set_chat_inline_images_enabled(&self, on: bool) -> Result<()> {
+        let mut prefs = self.read_code_prefs().await;
+        prefs.insert("inlineImages".into(), serde_json::Value::Bool(on));
+        self.write_code_prefs(&prefs).await
+    }
+
     /// The persisted `/effort` reasoning level for `model` (remembered across
     /// `aivo code` sessions). Effort levels are model-specific, so they're stored
     /// per-model under `reasoningEffort: {<model>: <level>}` in code-prefs.json.
@@ -2254,6 +2262,7 @@ impl SessionStore {
             thinking_enabled,
             web_search_enabled: bool_or("useWebSearch", false),
             agent_tools_enabled: bool_or("agentTools", true),
+            inline_images_enabled: bool_or("inlineImages", true),
             // Absent or unparseable → None, so startup auto-detects.
             theme: prefs
                 .get("theme")

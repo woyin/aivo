@@ -1805,7 +1805,11 @@ impl CodeTuiApp {
     pub(super) async fn run(&mut self) -> Result<()> {
         let mut terminal = setup_terminal(chat_mouse_enabled())?;
         // Tests and headless paths keep the default (disabled) caps from `bare()`.
-        self.inline_images.caps = crate::services::terminal_graphics::detect();
+        // Detection always runs so a mid-session `/config` re-enable can restore it.
+        self.detected_graphics_caps = crate::services::terminal_graphics::detect();
+        if self.inline_images_enabled {
+            self.inline_images.caps = self.detected_graphics_caps;
+        }
         // Open the cursor session now (no-op for other keys) so its connect
         // overlaps the user typing their first message.
         self.prewarm_cursor_session();
@@ -1915,6 +1919,7 @@ impl CodeTuiApp {
                     // post-draw flush must re-emit every visible image.
                     self.note_cells_repainted();
                 }
+                self.finish_inline_image_disable(terminal.backend_mut());
                 let draw_start = std::time::Instant::now();
                 // `.err()` drops the `CompletedFrame` borrow so End can write.
                 let draw_err = terminal.draw(|frame| self.render(frame)).err();

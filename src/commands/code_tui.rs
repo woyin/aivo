@@ -119,6 +119,7 @@ impl CodeTuiApp {
             thinking_enabled,
             web_search_enabled,
             agent_tools_enabled,
+            inline_images_enabled,
             theme: chat_theme,
             vision_fallback,
             vision_fallback_custom,
@@ -231,6 +232,7 @@ impl CodeTuiApp {
         app.thinking_enabled = thinking_enabled;
         app.web_search_enabled = web_search_enabled;
         app.agent_tools_enabled = agent_tools_enabled;
+        app.inline_images_enabled = inline_images_enabled;
         app.vision_fallback = vision_fallback;
         app.vision_fallback_custom = vision_fallback_custom;
         app.image_gen = image_gen;

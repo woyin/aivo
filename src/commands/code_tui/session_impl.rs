@@ -726,6 +726,10 @@ is preserved."
                 label: "Theme",
             },
             ConfigRow {
+                setting: ConfigSetting::InlineImages,
+                label: "Inline images",
+            },
+            ConfigRow {
                 setting: ConfigSetting::Thinking,
                 label: "Thinking",
             },
@@ -794,6 +798,16 @@ is preserved."
             }
             (ConfigSetting::Theme, _) => {
                 "Dark palette for the whole TUI. Applies immediately.".to_string()
+            }
+            (ConfigSetting::InlineImages, "on") if !self.detected_graphics_caps.enabled() => {
+                "On, but image previews aren't available in this terminal — nothing will render."
+                    .to_string()
+            }
+            (ConfigSetting::InlineImages, "on") => {
+                "Images in the transcript render inline.".to_string()
+            }
+            (ConfigSetting::InlineImages, _) => {
+                "No inline previews; images appear as text mentions only.".to_string()
             }
             (ConfigSetting::Thinking, "on") if self.model_supports_thinking => {
                 "The model reasons before answering. Thinking is shown folded.".to_string()
@@ -913,6 +927,7 @@ is preserved."
                     UiTheme::Light => 1,
                 },
             },
+            ConfigSetting::InlineImages => switch(self.inline_images_enabled),
             ConfigSetting::Thinking => switch(self.thinking_enabled),
             ConfigSetting::Approval => {
                 // Plan mode is transient (via /plan / Shift+Tab), not a standing mode.
@@ -1046,6 +1061,7 @@ is preserved."
                 };
                 self.set_theme(next).await;
             }
+            ConfigSetting::InlineImages => self.set_inline_images_enabled(target == 0).await,
             ConfigSetting::Thinking => self.set_thinking_enabled(target == 0).await,
             ConfigSetting::Approval => {
                 let mode = segs.options.get(target).copied().unwrap_or("normal");
@@ -1264,6 +1280,26 @@ is preserved."
             "aivo web search off — the agent won't search via aivo"
         });
         let _ = self.session_store.set_chat_web_search_enabled(on).await;
+    }
+
+    pub(super) async fn set_inline_images_enabled(&mut self, on: bool) {
+        if self.inline_images_enabled == on {
+            return;
+        }
+        self.inline_images_enabled = on;
+        if on {
+            self.pending_inline_image_cleanup = false;
+            self.inline_images.caps = self.detected_graphics_caps;
+        } else {
+            // Kitty deletes need the terminal writer — the event loop finishes
+            // the disable; the full repaint wipes sixel/half-block rows.
+            self.pending_inline_image_cleanup = true;
+            self.inline_images.desired.clear();
+            self.inline_images.placed.clear();
+        }
+        self.transcript_revision = self.transcript_revision.wrapping_add(1);
+        self.pending_full_repaint = true;
+        let _ = self.session_store.set_chat_inline_images_enabled(on).await;
     }
 
     pub(super) async fn set_agent_tools_enabled(&mut self, on: bool) {

@@ -321,6 +321,55 @@ async fn test_config_overlay_toggles_thinking() {
 }
 
 #[tokio::test]
+async fn test_config_overlay_toggles_inline_images() {
+    use crate::services::terminal_graphics::{GraphicsCaps, Protocol};
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    let detected = GraphicsCaps {
+        protocol: Protocol::KittyVirtual,
+        ..GraphicsCaps::default()
+    };
+    // No detected protocol (Windows, unsupported terminal): on warns it's inert.
+    assert!(
+        app.config_active_help(ConfigSetting::InlineImages)
+            .contains("aren't available"),
+        "undetected caps must warn that the toggle is inert"
+    );
+    app.detected_graphics_caps = detected;
+    app.inline_images.caps = detected;
+    assert!(app.inline_images_enabled, "defaults on");
+    assert!(
+        app.config_active_help(ConfigSetting::InlineImages)
+            .contains("render inline"),
+        "detected caps get the normal copy"
+    );
+
+    app.open_config_overlay();
+    let Overlay::Config(state) = &app.overlay else {
+        panic!("expected config overlay");
+    };
+    let idx = state
+        .items
+        .iter()
+        .position(|i| i.setting == ConfigSetting::InlineImages)
+        .expect("Inline images row present");
+    assert_eq!(app.config_segments(ConfigSetting::InlineImages).active, 0);
+
+    // Off: the event loop finishes the disable with the terminal writer.
+    app.cycle_config_setting(idx, CycleDir::Enter).await;
+    assert!(!app.inline_images_enabled);
+    assert!(app.pending_inline_image_cleanup);
+    app.finish_inline_image_disable(&mut Vec::new());
+    assert!(!app.inline_images.caps.enabled());
+    assert_eq!(app.config_segments(ConfigSetting::InlineImages).active, 1);
+
+    // Back on: the startup detection result is restored, not re-probed.
+    app.cycle_config_setting(idx, CycleDir::Enter).await;
+    assert!(app.inline_images_enabled);
+    assert_eq!(app.inline_images.caps, detected);
+}
+
+#[tokio::test]
 // Serializing the global theme is the point — the guard must span the awaits.
 #[allow(clippy::await_holding_lock)]
 async fn test_config_overlay_cycles_theme() {
@@ -460,7 +509,7 @@ async fn config_overlay_renders_live_values_and_focused_options() {
     app.open_config_overlay();
 
     let render = |app: &mut CodeTuiApp| {
-        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        let mut terminal = Terminal::new(TestBackend::new(80, 26)).unwrap();
         terminal.draw(|frame| app.render(frame)).unwrap();
         let buffer = terminal.backend().buffer();
         (0..buffer.area.height)
@@ -534,10 +583,10 @@ async fn config_overlay_click_selects_list_row() {
         .picker_hitbox
         .clone()
         .expect("config list hitbox recorded");
-    // Visual rows (split, with group gaps): Appearance, Theme, Thinking, blank,
-    // Behavior, Mode, Web search, Agent tools, blank, Media, Vision fallback,
-    // Image generation.
-    let image_row = hitbox.list_area.y + 11;
+    // Visual rows (split, with group gaps): Appearance, Theme, Inline images,
+    // Thinking, blank, Behavior, Mode, Web search, Agent tools, blank, Media,
+    // Vision fallback, Image generation.
+    let image_row = hitbox.list_area.y + 12;
     app.handle_mouse(left_click(hitbox.list_area.x, image_row))
         .await
         .unwrap();

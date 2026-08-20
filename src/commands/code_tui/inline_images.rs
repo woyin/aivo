@@ -1248,6 +1248,16 @@ impl CodeTuiApp {
         self.inline_images.transmit_order.clear();
     }
 
+    /// Deferred half of the `/config` preview disable: delete the kitty-held
+    /// images while the caps still permit the escapes, then drop the caps.
+    pub(super) fn finish_inline_image_disable(&mut self, out: &mut impl std::io::Write) {
+        if !std::mem::take(&mut self.pending_inline_image_cleanup) {
+            return;
+        }
+        self.cleanup_inline_images(out);
+        self.inline_images.caps = GraphicsCaps::default();
+    }
+
     /// Frees every transmitted image before leaving the alternate screen.
     pub(super) fn cleanup_inline_images(&mut self, out: &mut impl std::io::Write) {
         if !self.inline_images.caps.kitty() || self.inline_images.transmitted.is_empty() {

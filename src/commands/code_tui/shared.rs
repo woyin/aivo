@@ -1469,6 +1469,7 @@ impl McpPasteOverlay {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum ConfigSetting {
     Theme,
+    InlineImages,
     Thinking,
     /// Standing permission mode (`normal` / `auto-approve` / `review`), folding the
     /// two former checkboxes into one radio.
@@ -3168,6 +3169,12 @@ pub(super) struct CodeTuiApp {
     pub(super) session_preview: SessionPreviewState,
     /// Inline transcript image previews (Kitty graphics); see `inline_images.rs`.
     pub(super) inline_images: InlineImageState,
+    /// `/config` inline-preview toggle; off keeps `inline_images.caps` disabled.
+    pub(super) inline_images_enabled: bool,
+    /// The kitty deletes on disable need the terminal writer — event loop only.
+    pub(super) pending_inline_image_cleanup: bool,
+    /// Startup detection result, kept so a mid-session re-enable can restore caps.
+    pub(super) detected_graphics_caps: crate::services::terminal_graphics::GraphicsCaps,
     pub(super) reduce_motion: bool,
     pub(super) frame_tick: usize,
     pub(super) picker_hitbox: Option<PickerHitbox>,
@@ -3734,6 +3741,9 @@ impl CodeTuiApp {
             resume_restore_state: None,
             session_preview: SessionPreviewState::default(),
             inline_images: InlineImageState::default(),
+            inline_images_enabled: true,
+            pending_inline_image_cleanup: false,
+            detected_graphics_caps: crate::services::terminal_graphics::GraphicsCaps::default(),
             render_cache: RenderCache::default(),
             reduce_motion: false,
             frame_tick: 0,
