@@ -127,9 +127,9 @@ Investigate, or call `exit_plan_mode` with your plan."
                 outcomes[i] = Some(Err(format!("blocked by PreToolUse hook: {reason}")));
                 continue;
             }
-            // Confirm only genuinely risky actions: destructive command, out-of-cwd
-            // write, blind overwrite of an unread file, or an untrusted external tool.
-            let needs_confirm = tools::is_dangerous(n, &call.arguments, ctx.cwd)
+            // Confirm only genuinely risky actions: destructive command, blind
+            // overwrite of an unread file, or an untrusted external tool.
+            let needs_confirm = tools::is_dangerous(n, &call.arguments)
                 || self.write_clobbers_unread(n, &call.arguments, ctx.cwd)
                 || secrets_guard::read_targets_secret(n, &call.arguments, ctx.cwd)
                 || self

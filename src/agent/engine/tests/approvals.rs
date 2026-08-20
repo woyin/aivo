@@ -588,3 +588,34 @@ async fn safe_tool_runs_without_prompt() {
     assert_eq!(ui.tools, vec!["write_file"]);
     assert!(dir.join("out.txt").exists(), "safe write was blocked");
 }
+
+#[tokio::test]
+async fn write_file_outside_workspace_refused_under_auto_approve() {
+    let dir = tmp();
+    let rel = format!(
+        "../{}-escape.txt",
+        dir.file_name().unwrap().to_string_lossy()
+    );
+    let sse = tool_call_sse("write_file", json!({"path": rel, "content": "PWN"}));
+    let port = spawn_sse_sequence(vec![sse, FINAL_TEXT_SSE.to_string()]);
+    let client = reqwest::Client::builder().no_proxy().build().unwrap();
+    let base = format!("http://127.0.0.1:{port}");
+    let mut engine = AgentEngine::new(&dir.display().to_string(), "m", "", &[], &[], 0, 0);
+    let mut ui = CapturingUi::default();
+    run_session(
+        &mut engine,
+        &turn_ctx(&client, &base, &dir),
+        Some("write outside".into()),
+        &mut ui,
+    )
+    .await;
+
+    assert_eq!(ui.asks, 0);
+    assert_eq!(ui.tool_errors, vec!["write_file"]);
+    assert!(!dir.join(&rel).exists());
+    let results = tool_result_texts(&engine);
+    assert!(
+        results.iter().any(|r| r.contains("outside the workspace")),
+        "model should see the refuse: {results:?}"
+    );
+}

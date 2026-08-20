@@ -2,7 +2,7 @@
 //! format GPT-5/Codex models emit. Parsed into per-file changes, then applied with
 //! 3-level fuzzy context matching (exact → trailing-ws → all-ws).
 
-use crate::agent::tools::{atomic_write, resolve};
+use crate::agent::tools::{atomic_write, confine_write_path, resolve};
 use std::path::{Path, PathBuf};
 
 const BEGIN: &str = "*** Begin Patch";
@@ -275,6 +275,15 @@ pub fn diff_blocks(patch: &str) -> Vec<DiffBlock> {
 /// before writing so a validation error leaves the workspace untouched.
 pub fn apply(patch: &str, cwd: &Path) -> Result<String, String> {
     let changes = parse(patch)?;
+    for ch in &changes {
+        confine_write_path(&ch.path, cwd)?;
+        if let ChangeKind::Update {
+            move_to: Some(m), ..
+        } = &ch.kind
+        {
+            confine_write_path(m, cwd)?;
+        }
+    }
     enum Step {
         Write(PathBuf, String),
         Remove(PathBuf),
@@ -456,6 +465,52 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(dir.path().join("d.txt")).unwrap(),
             "a\ny\nb\n"
+        );
+    }
+
+    #[test]
+    fn add_file_outside_workspace_is_refused_without_writing() {
+        let dir = cwd();
+        let rel = format!(
+            "../{}-escape.txt",
+            dir.path().file_name().unwrap().to_string_lossy()
+        );
+        let patch = format!("*** Begin Patch\n*** Add File: {rel}\n+PWN\n*** End Patch");
+        let err = apply(&patch, dir.path()).unwrap_err();
+        assert!(
+            err.contains("outside the workspace"),
+            "expected refuse, got: {err}"
+        );
+        assert!(
+            !dir.path()
+                .parent()
+                .unwrap()
+                .join(rel.trim_start_matches("../"))
+                .exists(),
+            "a refused patch must not create the file"
+        );
+    }
+
+    #[test]
+    fn move_to_outside_workspace_is_refused() {
+        let dir = cwd();
+        std::fs::write(dir.path().join("src.txt"), "one\ntwo\n").unwrap();
+        let dest = format!(
+            "../{}-stolen.txt",
+            dir.path().file_name().unwrap().to_string_lossy()
+        );
+        let patch = format!(
+            "*** Begin Patch\n*** Update File: src.txt\n*** Move to: {dest}\n one\n-two\n+TWO\n*** End Patch"
+        );
+        let err = apply(&patch, dir.path()).unwrap_err();
+        assert!(err.contains("outside the workspace"), "got: {err}");
+        assert!(dir.path().join("src.txt").exists(), "source must stay");
+        assert!(
+            !dir.path()
+                .parent()
+                .unwrap()
+                .join(dest.trim_start_matches("../"))
+                .exists()
         );
     }
 }

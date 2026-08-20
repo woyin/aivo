@@ -177,3 +177,39 @@ fn write_is_atomic_and_leaves_no_temp_file() {
         .any(|e| e.file_name().to_string_lossy().starts_with(".aivo-tmp-"));
     assert!(!leftover, "a staging temp file was left behind");
 }
+
+#[test]
+fn write_file_refuses_path_outside_workspace_and_creates_nothing() {
+    let dir = tmp();
+    let rel = format!(
+        "../{}-escape.txt",
+        dir.file_name().unwrap().to_string_lossy()
+    );
+    let err = write_file(&json!({"path": &rel, "content": "PWN"}), &dir).unwrap_err();
+    assert!(
+        err.contains("outside the workspace"),
+        "expected refuse, got: {err}"
+    );
+    assert!(
+        !dir.parent()
+            .unwrap()
+            .join(rel.trim_start_matches("../"))
+            .exists(),
+        "a refused write must not create the file"
+    );
+}
+
+#[test]
+fn edit_file_refuses_path_outside_workspace() {
+    let dir = tmp();
+    let rel = format!(
+        "../{}-escape.txt",
+        dir.file_name().unwrap().to_string_lossy()
+    );
+    let err = edit_file(
+        &json!({"path": &rel, "old_string": "a", "new_string": "b"}),
+        &dir,
+    )
+    .unwrap_err();
+    assert!(err.contains("outside the workspace"), "got: {err}");
+}

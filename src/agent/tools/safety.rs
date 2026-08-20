@@ -56,33 +56,28 @@ pub fn is_read_only(name: &str) -> bool {
     )
 }
 
-/// Whether a tool call warrants a confirmation prompt. Only genuinely risky
-/// actions are gated — a destructive shell command, or a write/edit that leaves
-/// the working directory. Ordinary in-project edits and benign commands
-/// (`cargo test`, `ls`, `git status`, …) run without interruption.
-pub fn is_dangerous(name: &str, args: &Value, cwd: &Path) -> bool {
+/// Confirmation gate for destructive `run_bash`.
+pub fn is_dangerous(name: &str, args: &Value) -> bool {
     match name {
         "run_bash" => args
             .get("command")
             .and_then(|c| c.as_str())
             .map(bash_looks_destructive)
             .unwrap_or(false),
-        "write_file" | "edit_file" | "multi_edit" => args
-            .get("path")
-            .and_then(|p| p.as_str())
-            .map(|p| path_escapes_cwd(p, cwd))
-            .unwrap_or(false),
-        // A patch may touch many files; gate it if *any* target leaves the cwd.
-        "apply_patch" => args
-            .get("input")
-            .and_then(|p| p.as_str())
-            .map(|p| {
-                crate::agent::apply_patch::target_paths(p)
-                    .iter()
-                    .any(|t| path_escapes_cwd(t, cwd))
-            })
-            .unwrap_or(false),
         _ => false,
+    }
+}
+
+/// In-process writes skip the OS sandbox; refuse anything outside cwd + `--add-dir`.
+pub(crate) fn confine_write_path(path: &str, cwd: &Path) -> Result<(), String> {
+    if path_escapes_cwd(path, cwd) {
+        Err(format!(
+            "refused: `{path}` is outside the workspace. File writes are confined to the \
+working directory (and any --add-dir roots), including under auto-approve. Re-run with \
+`--add-dir <dir>` if this path should be writable, or use a path inside the workspace."
+        ))
+    } else {
+        Ok(())
     }
 }
 
@@ -241,8 +236,7 @@ pub(super) fn git_subcommand_is_readonly(tokens: &[&str]) -> bool {
 }
 
 /// True when a path resolves outside the working directory (absolute elsewhere,
-/// `..` traversal, or **through a symlink** that points out of the project) —
-/// editing outside the project is worth confirming.
+/// `..` traversal, or **through a symlink** that points out of the project).
 ///
 /// A purely lexical check follows a symlink blindly: `repo/link/file` where
 /// `repo/link -> /outside` normalizes to `repo/link/file`, which *looks*
