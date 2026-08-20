@@ -713,6 +713,13 @@ pub async fn list_cursor_models(key: &ApiKey) -> Result<Vec<String>> {
         Err(primary_err) if looks_like_cursor_auth_failure(&format!("{primary_err:#}")) => {
             return Err(map_cursor_auth_error(primary_err, &key.id));
         }
+        // Only a cursor-agent that RAN and rejected `models` earns the legacy
+        // flag. A spawn that never got off the ground says nothing about which
+        // CLI version is installed, and falling back on it would answer a
+        // transient blip with a quietly worse model list.
+        Err(primary_err) if !ran_and_rejected(&primary_err) => {
+            return Err(primary_err.context("`cursor-agent models` could not be run"));
+        }
         Err(primary_err) => run_cursor_agent(["--list-models"], key)
             .await
             .map_err(|fallback_err| {
@@ -852,6 +859,24 @@ pub async fn run_cursor_login_for_shadow(shadow: &CursorShadow) -> Result<()> {
     Ok(())
 }
 
+/// Marker on the one failure mode that reflects the installed cursor-agent
+/// rather than the machine: the binary started and exited non-zero. Callers
+/// that keep a legacy fallback gate on this — see `list_cursor_models`.
+#[derive(Debug)]
+struct CursorAgentRejected(String);
+
+impl std::fmt::Display for CursorAgentRejected {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for CursorAgentRejected {}
+
+fn ran_and_rejected(err: &anyhow::Error) -> bool {
+    err.downcast_ref::<CursorAgentRejected>().is_some()
+}
+
 async fn run_cursor_agent<const N: usize>(args: [&str; N], key: &ApiKey) -> Result<String> {
     let mut cmd = cursor_agent_command_for_key(key)?;
     cmd.args(args).stdin(Stdio::null());
@@ -860,10 +885,12 @@ async fn run_cursor_agent<const N: usize>(args: [&str; N], key: &ApiKey) -> Resu
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         let detail = stderr.trim();
-        if detail.is_empty() {
-            anyhow::bail!("cursor-agent exited with {}", output.status);
-        }
-        anyhow::bail!("cursor-agent exited with {}: {}", output.status, detail);
+        let message = if detail.is_empty() {
+            format!("cursor-agent exited with {}", output.status)
+        } else {
+            format!("cursor-agent exited with {}: {}", output.status, detail)
+        };
+        return Err(anyhow::Error::new(CursorAgentRejected(message)));
     }
 
     let mut text = String::from_utf8_lossy(&output.stdout).to_string();
@@ -2145,6 +2172,24 @@ fn pick_prefer_no_thinking(list: &[Value], requested: &str) -> Option<String> {
 mod tests {
     use super::*;
     use zeroize::Zeroizing;
+
+    /// The `--list-models` fallback is a version probe, not a retry: only a
+    /// cursor-agent that ran and exited non-zero may trigger it.
+    #[test]
+    fn only_a_nonzero_exit_counts_as_rejection() {
+        let rejected = anyhow::Error::new(CursorAgentRejected(
+            "cursor-agent exited with exit status: 1: unknown command `models`".to_string(),
+        ));
+        assert!(ran_and_rejected(&rejected));
+        // Message text is unchanged by the marker — it IS the message.
+        assert!(format!("{rejected:#}").contains("unknown command `models`"));
+        // Survives the context the caller wraps it in.
+        assert!(ran_and_rejected(&rejected.context("listing cursor models")));
+        // A spawn that never started is not evidence about the CLI version.
+        let spawn_failed =
+            anyhow::anyhow!("No such file or directory").context("failed to run cursor-agent");
+        assert!(!ran_and_rejected(&spawn_failed));
+    }
 
     #[test]
     fn mode_available_matches_session_new_modes_shape() {

@@ -224,6 +224,66 @@ fn cursor_key_and_models_use_cursor_agent() {
     assert_eq!(payload["models"][1]["id"], "gpt-5");
 }
 
+/// A cursor-agent old enough to have no `models` subcommand still lists via
+/// the `--list-models` flag — the fallback exists for exactly this.
+#[cfg(unix)]
+#[test]
+fn legacy_cursor_agent_falls_back_to_list_models_flag() {
+    let home = TempDir::new().unwrap();
+    let fake_bin = TempDir::new().unwrap();
+    let path = fake_bin.path().join("cursor-agent");
+    std::fs::write(
+        &path,
+        r#"#!/bin/sh
+if [ "$1" = "--list-models" ]; then
+  printf '%s\n' 'legacy-model'
+  exit 0
+fi
+if [ "$1" = "status" ]; then
+  printf '%s\n' '{"authenticated":true}'
+  exit 0
+fi
+echo "unknown command: $1" >&2
+exit 1
+"#,
+    )
+    .expect("write legacy cursor-agent");
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(&path).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&path, perms).unwrap();
+    }
+
+    let mut add = aivo(&home);
+    prepend_path(&mut add, fake_bin.path());
+    let output = add
+        .args(["keys", "add", "cursor", "--key", "sk-cursor-legacy"])
+        .output()
+        .expect("aivo keys add cursor");
+    assert!(
+        output.status.success(),
+        "aivo keys add cursor failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    let mut models = aivo(&home);
+    prepend_path(&mut models, fake_bin.path());
+    let output = models
+        .args(["models", "-k", "cursor", "--json", "--refresh"])
+        .output()
+        .expect("aivo models cursor");
+    assert!(
+        output.status.success(),
+        "aivo models cursor failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let payload: Value = serde_json::from_slice(&output.stdout).expect("models json");
+    assert_eq!(payload["models"][0]["id"], "legacy-model");
+}
+
 #[cfg(unix)]
 fn fake_plugin(dir: &TempDir, name: &str, body: &str) -> PathBuf {
     use std::os::unix::fs::PermissionsExt;
