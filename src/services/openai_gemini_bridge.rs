@@ -723,12 +723,16 @@ pub fn convert_gemini_to_openai_chat_response(resp: &Value, fallback_model: &str
     })
 }
 
+// Gemini requires `functionResponse.response` to be a Struct (JSON object);
+// bare scalars/arrays (e.g. a tool that printed "100") get a 400 INVALID_ARGUMENT.
 fn parse_tool_content(content: Option<&Value>) -> Value {
     match content {
-        Some(Value::String(value)) => {
-            serde_json::from_str(value).unwrap_or_else(|_| json!({ "content": value }))
-        }
-        Some(other) => other.clone(),
+        Some(Value::String(value)) => serde_json::from_str::<Value>(value)
+            .ok()
+            .filter(Value::is_object)
+            .unwrap_or_else(|| json!({ "content": value })),
+        Some(other) if other.is_object() => other.clone(),
+        Some(other) => json!({ "content": other }),
         None => json!({}),
     }
 }
@@ -1655,6 +1659,28 @@ mod tests {
         assert_eq!(
             parse_tool_content(Some(&content)),
             json!({"content": "not valid json"})
+        );
+    }
+
+    #[test]
+    fn test_parse_tool_content_scalar_json_wrapped() {
+        // "100" parses as JSON, but Gemini requires an object — must wrap.
+        for raw in ["100", "true", "null", "3.14", "\"quoted\"", "[1, 2]"] {
+            let content = json!(raw);
+            assert_eq!(
+                parse_tool_content(Some(&content)),
+                json!({ "content": raw }),
+                "scalar-JSON tool output {raw:?} must be wrapped in an object"
+            );
+        }
+    }
+
+    #[test]
+    fn test_parse_tool_content_non_string_non_object_wrapped() {
+        let content = json!([{"type": "text", "text": "hi"}]);
+        assert_eq!(
+            parse_tool_content(Some(&content)),
+            json!({ "content": [{"type": "text", "text": "hi"}] })
         );
     }
 
