@@ -2792,6 +2792,10 @@ approach — pick a different one, and record the dead end with take_note"
                         "a tool call kept failing the same way. Do NOT retry the same call — \
 fix the input or pick another route, and record the dead end with take_note"
                     }
+                    TurnStop::DeniedLoop => {
+                        "it kept attempting actions that were denied. Do NOT retry them — \
+pursue a materially different route, or state what's blocked and stop"
+                    }
                     TurnStop::StepLimit => {
                         "it ran out of steps mid-work. Break the remaining work into smaller \
 pieces and keep going"

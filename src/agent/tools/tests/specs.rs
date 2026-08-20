@@ -71,6 +71,57 @@ fn apply_patch_routing_by_model() {
     }
 }
 
+/// For every model variant, any tool name a description mentions must itself be
+/// advertised to that model — "use X instead" must never point at an absent tool.
+#[test]
+fn descriptions_only_reference_tools_advertised_to_the_same_model() {
+    let all_names: Vec<String> = tool_specs()
+        .into_iter()
+        .map(|s| s.name)
+        .chain(std::iter::once("apply_patch".to_string()))
+        .collect();
+    // Word-boundary mention, so `ripgrep` doesn't count as naming `grep`.
+    let mentions = |desc: &str, name: &str| {
+        let is_word = |c: Option<char>| c.is_some_and(|c| c.is_ascii_alphanumeric() || c == '_');
+        desc.match_indices(name).any(|(i, _)| {
+            !is_word(desc[..i].chars().next_back())
+                && !is_word(desc[i + name.len()..].chars().next())
+        })
+    };
+    for m in [
+        "gpt-5",
+        "openai/gpt-5-codex",
+        "gpt-4.1-mini",
+        "claude-sonnet-4-6",
+        "gemini-2.5-pro",
+        "deepseek-v4",
+    ] {
+        let specs = tool_specs_for(m);
+        let advertised: Vec<&str> = specs.iter().map(|s| s.name.as_str()).collect();
+        for s in &specs {
+            for name in &all_names {
+                if mentions(&s.description, name) && !advertised.contains(&name.as_str()) {
+                    panic!(
+                        "{m}: `{}` description references `{name}`, which this model \
+doesn't have — reroute the cross-reference in tool_specs_for",
+                        s.name
+                    );
+                }
+            }
+        }
+    }
+    // Rerouting, not deletion: swap models point at apply_patch, others keep the pointer.
+    let desc_for = |m: &str| {
+        tool_specs_for(m)
+            .into_iter()
+            .find(|s| s.name == "write_file")
+            .unwrap()
+            .description
+    };
+    assert!(desc_for("gpt-5").contains("apply_patch"));
+    assert!(desc_for("claude-sonnet-4-6").contains("edit_file/multi_edit"));
+}
+
 /// `execute` must route `apply_patch` (the advertised tool for GPT-5/Codex) to
 /// the V4A applier, not to `edit_file` — the normalize table once collapsed the
 /// two, which errored on the missing `path` arg and broke editing for those

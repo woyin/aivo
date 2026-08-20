@@ -87,6 +87,21 @@ alternative exists, state exactly what's blocking you and finish (finish_turn st
 pub(crate) const STOP_NO_PROGRESS: &str =
     "stopping: the model repeated the same action with no progress";
 pub(crate) const STOP_TOOL_FAILURE: &str = "stopping: a tool call kept failing the same way";
+pub(crate) const STOP_DENIED_LOOP: &str =
+    "stopping: the model kept attempting actions the user denied";
+/// Denied-call result; the `denied by user` prefix is load-bearing
+/// ([`guards::is_policy_denial`] and the denial ladder match on it).
+pub(crate) const DENIED_BY_USER_RESULT: &str = "denied by user — the action did not run. Do not \
+retry it unchanged, and do not attempt the same effect by another route (e.g. through the shell). \
+If the task can proceed on a materially different approach, continue there; otherwise wrap up and \
+tell the user what was blocked and what they could do.";
+/// Denial ladder: varied retries of denied actions evade the batch-signature guards,
+/// so a fail-closed headless run would otherwise grind to the step limit.
+const DENIAL_DIRECTIVE_AT: usize = 2;
+const DENIAL_STOP_AT: usize = 4;
+const DENIAL_RECOVERY_DIRECTIVE: &str = "[permission guard] Several actions were denied. Stop \
+pursuing the blocked approach — do not call tools for it again. Reply now: state what was \
+blocked, what you completed, and what the user could do to unblock it.";
 const COMPLETION_NUDGE: &str = "That may not be finished. If the task is genuinely complete, \
 briefly confirm what you did and verified, then stop. Otherwise keep going — don't stop until \
 it's done or you're truly blocked (then say exactly what's blocking you).";
@@ -129,6 +144,7 @@ pub(crate) enum VerifyRun {
 pub enum TurnStop {
     NoProgress,
     ToolFailureLoop,
+    DeniedLoop,
     StepLimit,
     OutputBudget,
     CostBudget,
@@ -140,6 +156,7 @@ impl TurnStop {
         match self {
             TurnStop::NoProgress => "noProgress",
             TurnStop::ToolFailureLoop => "toolFailureLoop",
+            TurnStop::DeniedLoop => "deniedLoop",
             TurnStop::StepLimit => "stepLimit",
             TurnStop::OutputBudget => "outputBudget",
             TurnStop::CostBudget => "costBudget",
@@ -150,6 +167,7 @@ impl TurnStop {
         match self {
             TurnStop::NoProgress => "the model repeated the same action with no progress",
             TurnStop::ToolFailureLoop => "a tool call kept failing the same way",
+            TurnStop::DeniedLoop => "the model kept attempting actions the user denied",
             TurnStop::StepLimit => "reached the step limit",
             TurnStop::OutputBudget => "reached the per-turn output-token budget",
             TurnStop::CostBudget => "reached the cost budget",
@@ -479,6 +497,9 @@ pub struct AgentEngine {
     /// session-only unless a grant is safe to persist (see [`crate::agent::grant_store`]).
     /// A durable "always allow `rm …`" is a footgun, so dangerous acts stay exact+session.
     grants: crate::agent::grant_store::GrantStore,
+    /// Tool+args the user denied this turn — identical re-issues auto-deny. Cleared
+    /// per turn, on steering, and on plan exit (a deny may have been reversed).
+    denied_sigs: std::collections::HashSet<String>,
     /// Discovered SKILL.md skills, loaded on demand via the `skill` tool.
     skills: Vec<Skill>,
     /// Named specialist sub-agents (top-level engine only). The `subagent` tool's

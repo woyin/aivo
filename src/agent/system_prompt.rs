@@ -406,6 +406,25 @@ mod tests {
     }
 
     #[test]
+    fn base_prompt_never_names_conditionally_absent_tools() {
+        // These can be absent from the advertised set (model routing, config, mode);
+        // teaching them in the base prompt could desync prompt and tool set.
+        let p = system_prompt("/tmp/proj", "2026-01-01", &[], &[]);
+        for tool in [
+            "`edit_file`",
+            "`multi_edit`",
+            "`apply_patch`",
+            "`generate_image`",
+            "`exit_plan_mode`",
+            "`switch_model`",
+            "`set_effort`",
+            "`ask_user`",
+        ] {
+            assert!(!p.contains(tool), "base prompt names {tool}");
+        }
+    }
+
+    #[test]
     fn system_prompt_includes_restraint_guardrails() {
         // The action-biased prompt carries its counterweights (verify-before-done, don't-claim-unverified, confirm-before-irreversible).
         let p = system_prompt("/tmp/proj", "", &[], &[]);

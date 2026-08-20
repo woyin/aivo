@@ -50,6 +50,7 @@ impl AgentEngine {
             max_steps,
             max_output_tokens: 0,
             grants: crate::agent::grant_store::GrantStore::default(),
+            denied_sigs: Default::default(),
             skills: skills.to_vec(),
             subagents: Vec::new(),
             agents_dir: None,
@@ -296,6 +297,8 @@ plan-approval card — suggest it when a task deserves real design discussion.{i
                 .retain(|t| t["function"]["name"].as_str() != Some("exit_plan_mode"));
             self.tools_openai
                 .extend(std::mem::take(&mut self.plan_mode_stash));
+            // A plan-mode deny often means "not yet" — exiting reverses it.
+            self.denied_sigs.clear();
         }
         let directive = format!("\n\n{}", plan_mode::PLAN_MODE_DIRECTIVE);
         if let Some(content) = self.messages.first_mut().and_then(|m| m.get_mut("content"))

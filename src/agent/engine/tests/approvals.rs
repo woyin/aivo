@@ -323,6 +323,184 @@ async fn always_allow_broadens_a_subcommand_family_but_not_siblings() {
     assert_eq!(ui.tools, vec!["run_bash", "run_bash", "run_bash"]);
 }
 
+/// An identical re-issue of a denied call is auto-denied — no second approval card.
+#[tokio::test]
+async fn denied_call_reissued_identically_is_auto_denied_without_reprompt() {
+    let dir = tmp();
+    let cmd = json!({ "command": "rm -rf zzz_same" });
+    let port = spawn_sse_sequence(vec![
+        tool_call_sse("run_bash", cmd.clone()),
+        tool_call_sse("run_bash", cmd),
+        FINAL_TEXT_SSE.to_string(),
+    ]);
+    let client = reqwest::Client::builder().no_proxy().build().unwrap();
+    let base = format!("http://127.0.0.1:{port}");
+    let mut engine = AgentEngine::new(&dir.display().to_string(), "m", "", &[], &[], 0, 0);
+    let mut ui = CapturingUi {
+        deny: true,
+        ..Default::default()
+    };
+    let ctx = TurnCtx {
+        yes: false,
+        ..turn_ctx(&client, &base, &dir)
+    };
+    run_session(&mut engine, &ctx, Some("clean up".into()), &mut ui).await;
+
+    assert_eq!(ui.asks, 1, "the identical re-issue must not re-prompt");
+    assert_eq!(ui.tools, vec!["run_bash", "run_bash"]);
+    let texts = tool_result_texts(&engine);
+    assert!(
+        texts.iter().any(|t| t.contains("auto-denied")),
+        "second result should carry the auto-denied marker: {texts:?}"
+    );
+}
+
+/// Steering clears the denial memory — the user may have reversed the decision.
+#[tokio::test]
+async fn steering_interjection_clears_turn_denials() {
+    let dir = tmp();
+    let cmd = json!({ "command": "rm -rf zzz_same" });
+    let port = spawn_sse_sequence(vec![
+        tool_call_sse("run_bash", cmd.clone()),
+        tool_call_sse("run_bash", cmd),
+        FINAL_TEXT_SSE.to_string(),
+    ]);
+    let client = reqwest::Client::builder().no_proxy().build().unwrap();
+    let base = format!("http://127.0.0.1:{port}");
+    let mut engine = AgentEngine::new(&dir.display().to_string(), "m", "", &[], &[], 0, 0);
+    let mut ui = CapturingUi {
+        deny: true,
+        // Drained after the first batch, between the two attempts.
+        steering: vec!["actually, that one is fine".into()],
+        ..Default::default()
+    };
+    let ctx = TurnCtx {
+        yes: false,
+        ..turn_ctx(&client, &base, &dir)
+    };
+    run_session(&mut engine, &ctx, Some("clean up".into()), &mut ui).await;
+
+    assert_eq!(ui.asks, 2, "steering must clear the auto-deny memory");
+}
+
+/// The second denial-carrying batch triggers the wrap-up directive, exactly once.
+#[tokio::test]
+async fn second_denied_batch_gets_wrapup_directive_once() {
+    let dir = tmp();
+    let port = spawn_sse_sequence(vec![
+        tool_call_sse("run_bash", json!({ "command": "rm -rf zzz_a" })),
+        tool_call_sse("run_bash", json!({ "command": "rm -rf zzz_b" })),
+        FINAL_TEXT_SSE.to_string(),
+    ]);
+    let client = reqwest::Client::builder().no_proxy().build().unwrap();
+    let base = format!("http://127.0.0.1:{port}");
+    let mut engine = AgentEngine::new(&dir.display().to_string(), "m", "", &[], &[], 0, 0);
+    let mut ui = CapturingUi {
+        deny: true,
+        ..Default::default()
+    };
+    let ctx = TurnCtx {
+        yes: false,
+        ..turn_ctx(&client, &base, &dir)
+    };
+    run_session(&mut engine, &ctx, Some("clean up".into()), &mut ui).await;
+
+    let folded = tool_result_texts(&engine)
+        .iter()
+        .filter(|t| t.contains("[permission guard]"))
+        .count();
+    assert_eq!(folded, 1, "directive should fold exactly once");
+    assert!(ui.stops.is_empty(), "two denials must not stop the turn");
+}
+
+/// Four consecutive denied batches stop the turn — varied retries evade the other guards.
+#[tokio::test]
+async fn four_consecutive_denied_batches_stop_the_turn() {
+    let dir = tmp();
+    let port = spawn_sse_sequence(vec![
+        tool_call_sse("run_bash", json!({ "command": "rm -rf zzz_a" })),
+        tool_call_sse("run_bash", json!({ "command": "rm -rf zzz_b" })),
+        tool_call_sse("run_bash", json!({ "command": "rm -rf zzz_c" })),
+        tool_call_sse("run_bash", json!({ "command": "rm -rf zzz_d" })),
+        FINAL_TEXT_SSE.to_string(), // never reached
+    ]);
+    let client = reqwest::Client::builder().no_proxy().build().unwrap();
+    let base = format!("http://127.0.0.1:{port}");
+    let mut engine = AgentEngine::new(&dir.display().to_string(), "m", "", &[], &[], 0, 0);
+    let mut ui = CapturingUi {
+        deny: true,
+        ..Default::default()
+    };
+    let ctx = TurnCtx {
+        yes: false,
+        ..turn_ctx(&client, &base, &dir)
+    };
+    run_session(&mut engine, &ctx, Some("clean up".into()), &mut ui).await;
+
+    assert_eq!(ui.stops, vec![TurnStop::DeniedLoop]);
+    assert_eq!(ui.asks, 4, "each varied attempt prompts once");
+}
+
+/// A denial-free batch resets the streak: interleaved useful work never stops the turn.
+#[tokio::test]
+async fn denial_streak_resets_on_a_clean_batch() {
+    let dir = tmp();
+    let port = spawn_sse_sequence(vec![
+        tool_call_sse("run_bash", json!({ "command": "rm -rf zzz_a" })),
+        tool_call_sse("run_bash", json!({ "command": "rm -rf zzz_b" })),
+        WRITE_TOOL_SSE.to_string(), // safe write: runs unprompted, resets the streak
+        tool_call_sse("run_bash", json!({ "command": "rm -rf zzz_c" })),
+        tool_call_sse("run_bash", json!({ "command": "rm -rf zzz_d" })),
+        FINAL_TEXT_SSE.to_string(),
+    ]);
+    let client = reqwest::Client::builder().no_proxy().build().unwrap();
+    let base = format!("http://127.0.0.1:{port}");
+    let mut engine = AgentEngine::new(&dir.display().to_string(), "m", "", &[], &[], 0, 0);
+    let mut ui = CapturingUi {
+        deny: true,
+        ..Default::default()
+    };
+    let ctx = TurnCtx {
+        yes: false,
+        ..turn_ctx(&client, &base, &dir)
+    };
+    run_session(&mut engine, &ctx, Some("clean up".into()), &mut ui).await;
+
+    assert!(
+        ui.stops.is_empty(),
+        "4 denials split by a clean batch must not stop: {:?}",
+        ui.stops
+    );
+    assert!(dir.join("out.txt").exists(), "the safe write should run");
+}
+
+/// Plan exit clears the denial memory — a plan-mode "not yet" must not outlive approval.
+#[test]
+fn plan_mode_exit_clears_turn_denials() {
+    let dir = tmp();
+    let mut engine = AgentEngine::new(&dir.display().to_string(), "m", "", &[], &[], 0, 0);
+    engine.set_plan_mode(true);
+    engine
+        .denied_sigs
+        .insert("run_bash\u{0}{\"command\":\"cargo build\"}".into());
+    engine.set_plan_mode(false);
+    assert!(
+        engine.denied_sigs.is_empty(),
+        "plan exit must clear turn denials"
+    );
+}
+
+/// The enriched denial text still classifies as a policy denial (prefix is load-bearing).
+#[test]
+fn denial_result_text_stays_a_policy_denial() {
+    assert!(crate::agent::guards::is_policy_denial(
+        DENIED_BY_USER_RESULT
+    ));
+    assert!(crate::agent::guards::is_policy_denial(&format!(
+        "{DENIED_BY_USER_RESULT} (auto-denied: the user already declined this exact action this turn.)"
+    )));
+}
+
 #[test]
 fn write_clobbers_unread_only_flags_blind_overwrites() {
     let dir = tmp();

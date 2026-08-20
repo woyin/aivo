@@ -100,6 +100,15 @@ impl AgentEngine {
                 continue;
             }
             ui.tool_start(n, &call.arguments);
+            // Already declined this turn — auto-deny instead of re-prompting.
+            let deny_sig = deny_sig(n, &call.arguments);
+            if self.denied_sigs.contains(&deny_sig) {
+                outcomes[i] = Some(Err(format!(
+                    "{DENIED_BY_USER_RESULT} (auto-denied: the user already declined this \
+exact action this turn.)"
+                )));
+                continue;
+            }
             // Backstop for a hallucinated state-changing tool (also hidden from the
             // schema); `subagent` has its own refusal below.
             if self.read_only && tools::hidden_in_plan_mode(n) && n != "subagent" {
@@ -188,7 +197,8 @@ Investigate, or call `exit_plan_mode` with your plan."
                 }
             };
             if !allowed {
-                outcomes[i] = Some(Err("denied by user".to_string()));
+                self.denied_sigs.insert(deny_sig);
+                outcomes[i] = Some(Err(DENIED_BY_USER_RESULT.to_string()));
                 continue;
             }
             // A side-effect-free built-in runs concurrently — unless an external tool
@@ -911,4 +921,9 @@ Fix the cause, or finish with status \"blocked\".",
     }
 
     // --- /rewind: tree checkpoints ---
+}
+
+/// Turn-scoped denial signature — ignores the call id so an identical re-issue matches.
+fn deny_sig(name: &str, args: &Value) -> String {
+    format!("{name}\u{0}{args}")
 }

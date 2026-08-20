@@ -37,6 +37,8 @@ pub(super) struct CapturingUi {
     pub(super) steering: Vec<String>,
     /// Every `verify_evidence` record, in arrival order (not merged).
     pub(super) verify_records: Vec<crate::agent::verify::EvidenceRecord>,
+    /// Every typed guard stop, in order.
+    pub(super) stops: Vec<TurnStop>,
 }
 
 impl AgentUi for CapturingUi {
@@ -70,6 +72,9 @@ impl AgentUi for CapturingUi {
     }
     fn notify_error(&mut self, t: &str) {
         self.errors.push(t.to_string());
+    }
+    fn turn_stopped(&mut self, stop: TurnStop) {
+        self.stops.push(stop);
     }
     fn footer(&mut self, _: Option<&str>, _: usize, tokens: u64, _: u64, _: u64) {
         self.footer_tokens = tokens;

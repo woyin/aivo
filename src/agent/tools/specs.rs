@@ -8,7 +8,9 @@ pub fn tool_specs() -> Vec<ToolSpec> {
     vec![
         spec(
             "read_file",
-            "Read a file's contents with line numbers. Use offset/limit to page large files.",
+            "Read a file's contents with line numbers. Paths are relative to the working \
+directory unless absolute. Use offset/limit to page a large file instead of pulling it whole. \
+Not for directories — use list_dir.",
             json!({
                 "type": "object",
                 "properties": {
@@ -21,7 +23,8 @@ pub fn tool_specs() -> Vec<ToolSpec> {
         ),
         spec(
             "list_dir",
-            "List the entries of a directory (directories shown with a trailing /).",
+            "List the entries of a directory (directories shown with a trailing /). Not for \
+recursive file discovery (use glob) or content search (use grep).",
             json!({
                 "type": "object",
                 "properties": {
@@ -31,7 +34,9 @@ pub fn tool_specs() -> Vec<ToolSpec> {
         ),
         spec(
             "glob",
-            "Find files by glob pattern. Supports *, ?, and **/ for recursive matching (e.g. **/*.rs).",
+            "Find files by NAME with a glob pattern. Supports *, ?, and **/ for recursive \
+matching (e.g. **/*.rs). Searches the working directory by default; pass `path` (absolute or ~) \
+to look elsewhere. Not for searching file CONTENTS — use grep.",
             json!({
                 "type": "object",
                 "properties": {
@@ -43,7 +48,11 @@ pub fn tool_specs() -> Vec<ToolSpec> {
         ),
         spec(
             "grep",
-            "Search file contents for a pattern (regex via ripgrep when available). Returns path:line:text. Set `context` to also show N lines around each match (like grep -C) — see a match's surrounding code in one call instead of a follow-up read_file.",
+            "Search file CONTENTS for a pattern (regex via ripgrep when available). Returns \
+path:line:text. Searches the working directory by default; pass `path` (absolute or ~) to look \
+elsewhere. Set `context` to also show N lines around each match (like grep -C) — see a match's \
+surrounding code in one call instead of a follow-up read_file. Not for finding files by name — \
+use glob.",
             json!({
                 "type": "object",
                 "properties": {
@@ -56,7 +65,10 @@ pub fn tool_specs() -> Vec<ToolSpec> {
         ),
         spec(
             "write_file",
-            "Write (create or overwrite) a file with the given content. Creates parent directories.",
+            "Write (create or overwrite) a file with the given content. Creates parent \
+directories. Overwriting makes the file exactly `content`, losing everything else — fine for a \
+deliberate full rewrite; for targeted changes to an existing file, read it and use \
+edit_file/multi_edit instead.",
             json!({
                 "type": "object",
                 "properties": {
@@ -68,7 +80,10 @@ pub fn tool_specs() -> Vec<ToolSpec> {
         ),
         spec(
             "edit_file",
-            "Replace an exact string in a file with a new string. By default old_string must match exactly once (errors if missing or ambiguous); set replace_all to replace every occurrence.",
+            "Replace an exact string in a file with a new string. Copy `old_string` from the \
+file's actual current content (read it first) — it must match exactly once by default (errors if \
+missing or ambiguous); set replace_all to replace every occurrence. Not for creating files or \
+full rewrites — use write_file.",
             json!({
                 "type": "object",
                 "properties": {
@@ -82,7 +97,10 @@ pub fn tool_specs() -> Vec<ToolSpec> {
         ),
         spec(
             "multi_edit",
-            "Apply several edits to one file in a single call. Edits run in order, each against the result of the previous one; if any edit fails to match, none are applied (the file is left untouched). Prefer this over repeated edit_file calls on the same file.",
+            "Apply several edits to one file in a single call. Edits run in order, each against \
+the result of the previous one; if any edit fails to match, none are applied (the file is left \
+untouched). Prefer this over repeated edit_file calls on the same file. Not for edits spanning \
+several files — one call per file (a lone edit is fine as edit_file).",
             json!({
                 "type": "object",
                 "properties": {
@@ -106,7 +124,10 @@ pub fn tool_specs() -> Vec<ToolSpec> {
         ),
         spec(
             "web_fetch",
-            "Fetch a public http(s) URL and return its content as readable text (HTML is reduced to text). Read-only GET; for APIs, custom headers, or POST, use run_bash with curl. Private/loopback/link-local addresses (localhost, RFC1918, cloud metadata) are refused.",
+            "Fetch a public http(s) URL and return its content as readable text (HTML is reduced \
+to text). Read-only GET; for APIs, custom headers, or POST, use run_bash with curl. Not for \
+local or workspace files — use read_file. Private/loopback/link-local addresses (localhost, \
+RFC1918, cloud metadata) are refused.",
             json!({
                 "type": "object",
                 "properties": {
@@ -118,7 +139,10 @@ pub fn tool_specs() -> Vec<ToolSpec> {
         ),
         spec(
             "web_search",
-            "Search the web and return ranked results (title, URL, snippet). Use it to find current or external information, then call web_fetch on a result URL to read that page.",
+            "Search the web and return ranked results (title, URL, snippet). Use it to find \
+current or external information, then call web_fetch on a result URL to read that page. Not for \
+questions the local repo or system can answer — search the workspace with your file tools \
+instead.",
             json!({
                 "type": "object",
                 "properties": {
@@ -130,7 +154,7 @@ pub fn tool_specs() -> Vec<ToolSpec> {
         ),
         spec(
             "run_bash",
-            "Run a shell command in the working directory. Each call is a fresh shell (cd does not persist). Runs non-interactively with no TTY: interactive programs (editors, `ssh`/`sudo` prompts, TUIs) are refused, and long-running ones are killed at the timeout — use non-interactive flags. To start a server, watcher, or anything long-running, pass `background: true`: the command is detached and this returns immediately with a job id and log file; poll or stop it with `check_job`.",
+            "Run a shell command in the working directory. Each call is a fresh shell (cd does not persist). For plain file reads and searches prefer read_file/grep/glob — they run in parallel and page cleanly. Runs non-interactively with no TTY: interactive programs (editors, `ssh`/`sudo` prompts, TUIs) are refused, and long-running ones are killed at the timeout — use non-interactive flags. To start a server, watcher, or anything long-running, pass `background: true`: the command is detached and this returns immediately with a job id and log file; poll or stop it with `check_job`.",
             json!({
                 "type": "object",
                 "properties": {
@@ -150,6 +174,10 @@ pub fn tool_specs_for(model: &str) -> Vec<ToolSpec> {
     let mut specs = tool_specs();
     if uses_apply_patch(model) {
         specs.retain(|s| s.name != "edit_file" && s.name != "multi_edit");
+        // Reroute cross-references: descriptions must not name tools this model lacks.
+        for s in &mut specs {
+            s.description = s.description.replace("edit_file/multi_edit", "apply_patch");
+        }
         specs.push(apply_patch_spec());
     }
     specs

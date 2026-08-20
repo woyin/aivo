@@ -102,6 +102,10 @@ impl AgentEngine {
         // Same-signature tool-failure streaks: hint the schema, then hard-stop a loop.
         let mut failure_guard = guards::FailureGuard::default();
         let mut stop_hook_continues = 0usize;
+        // Denial ladder (see the DENIAL_* constants).
+        let mut denial_batches = 0usize;
+        let mut denial_directive_sent = false;
+        self.denied_sigs.clear();
         let mut converged = false;
 
         for _ in 0..self.max_steps {
@@ -504,6 +508,27 @@ impl AgentEngine {
                 break;
             }
 
+            // Denial ladder (user denials only — plan-mode refusals have their own flow).
+            if failures
+                .iter()
+                .any(|(_, e)| e.starts_with("denied by user"))
+            {
+                denial_batches += 1;
+                if denial_batches >= DENIAL_STOP_AT {
+                    ui.notify(STOP_DENIED_LOOP);
+                    ui.turn_stopped(TurnStop::DeniedLoop);
+                    converged = true;
+                    break;
+                }
+                if denial_batches >= DENIAL_DIRECTIVE_AT && !denial_directive_sent {
+                    denial_directive_sent = true;
+                    ui.notify("repeated permission denials — asking the model to wrap up");
+                    self.fold_into_last_tool_result(DENIAL_RECOVERY_DIRECTIVE.to_string());
+                }
+            } else {
+                denial_batches = 0;
+            }
+
             if repeats + 1 >= REPEAT_LIMIT
                 || page_repeats + 1 >= REPEAT_LIMIT
                 || alt_repeats + 1 >= ALT_REPEAT_LIMIT
@@ -576,6 +601,8 @@ impl AgentEngine {
         if steering.is_empty() {
             return;
         }
+        // An interjection may reverse a denial — let the next attempt re-prompt.
+        self.denied_sigs.clear();
         let block = format!(
             "<user_interjection>\n{}\n</user_interjection>\nThe user sent this while you were \
 working. Factor it in before continuing — it may change what to do next.",
