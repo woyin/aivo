@@ -1,78 +1,43 @@
 # CLAUDE.md
 
-## Project Overview
-
-`aivo` is a Rust CLI providing unified access to multiple AI coding assistants (Claude, Codex, Gemini, OpenCode, Pi) with local API key management and secure storage. Supports OpenAI-compatible providers, GitHub Copilot, OpenRouter, Ollama, native APIs, and OAuth accounts.
-
-> [!IMPORTANT]
-> **Rebuild before testing**: after code changes, run `cargo build && cargo install --path . --debug` before testing the binary — never test a stale build. Use `--release` only for final pre-release verification.
+`aivo` is a Rust CLI providing unified access to multiple AI coding assistants (Claude, Codex, Gemini, OpenCode, Pi) with local API key management. Supports OpenAI-compatible providers, GitHub Copilot, OpenRouter, Ollama, native APIs, and OAuth accounts.
 
 ## Build & Test
 
 ```bash
-cargo build                             # Debug build (~1s incremental)
-cargo test --features __internal_test_fast_crypto  # All tests (~3000; reduced PBKDF2 iterations)
-cargo test -- test_name                 # Single test
-cargo clippy                            # Lint (fix all warnings before committing)
-cargo fmt                               # Format (run before committing)
+cargo build                                        # Debug build
+cargo test --features __internal_test_fast_crypto  # All tests (reduced PBKDF2 iterations)
+cargo clippy && cargo fmt                          # Required clean before committing
 ```
 
-A `Makefile` wraps these: `make test|build|clippy|install|release`.
+- After code changes, `cargo build && cargo install --path . --debug` before testing the binary — never test a stale build.
+- Tests are hermetic: a pre-main sandbox (`tests/support/mod.rs`) points `$HOME` at `~/.aivo-test-home/<pid>`, so tests can never touch the real config.
 
-Tests are hermetic: a pre-main sandbox (`tests/support/mod.rs`, included by every test binary and the lib) points `$HOME` at `~/.aivo-test-home/<pid>`, so tests can never touch the real config. `tests/sandbox_linux.rs` deliberately opts out. Per-case isolation still uses `with_path` + tempdirs; the sandbox is the safety net.
+## Git & Release
 
-## Git Conventions
-
-- Always squash merge to main: `git merge --squash <branch> && git commit`
-- Never commit automatically — only when asked.
-
-## Release Process
-
-> [!IMPORTANT]
-> **Tag only after CI is green on main.** `ci.yml` runs the test matrix on every `main` push. Tagging before tests pass burns the version number — a failed release can't be re-cut on the same tag, and any `chore: release vX.Y.Z` commit becomes a zombie. Push main, wait for the green check, then tag.
-
-1. Bump version in `Cargo.toml` — never tag without bumping.
-2. `cargo fmt`, `cargo clippy -- -D warnings`, `cargo test`.
-3. `cargo build --release && cargo install --path .` to verify.
-4. Stage exactly the release files (`Cargo.toml`, `Cargo.lock`; never `git add -A`), commit `chore: release vX.Y.Z`, push main.
-5. Wait for CI to pass on **all three runners** (Linux, macOS, Windows) — `#[cfg(windows)]` code is invisible to Linux/macOS clippy. `gh run watch $(gh run list --workflow=ci.yml --branch=main --limit=1 --json databaseId --jq '.[0].databaseId') --exit-status`
-6. `git tag vX.Y.Z && git push origin vX.Y.Z` (triggers `release.yml`).
-
-## CLI / UX Conventions
-
-Match existing CLI help text formatting exactly (alignment, spacing, bracket style). Help output is hand-rolled (`print_help*` fns), not clap-generated. When implementing interactive UI, verify: keyboard handling (arrows, Ctrl+P/N, ESC, Ctrl+C), selection pre-selection, column alignment, and edge cases (empty input, single item, long strings).
+- Squash merge to main; never commit unless asked.
+- Release: bump version in `Cargo.toml`, fmt/clippy/test, stage only `Cargo.toml` + `Cargo.lock` (never `git add -A`), commit `chore: release vX.Y.Z`, push main, wait for CI green on **all three runners** (`#[cfg(windows)]` code is invisible to Linux/macOS clippy), then tag. **Never tag before CI is green** — a failed release can't be re-cut on the same tag.
 
 ## Architecture
 
-```
-src/main.rs → src/commands/* → SessionStore → EnvironmentInjector → AILauncher
-```
+`src/main.rs` → `src/commands/*` (one module per subcommand: `run`, `start`, `code`, `keys`, `serve`, …) → `src/services/*` (key/session/stats stores, process launching, provider routers, wire-format bridges Anthropic ⇄ OpenAI ⇄ Gemini, OAuth flows).
 
-- **`src/`**: entry point, CLI parsing, error handling, TUI components, styling
-- **`src/commands/`**: one module per subcommand — `run`, `start` (interactive picker), `code` (coding-agent TUI + one-shot), `keys`, `serve`, `mcp`, `agents`, `plugins`, `logs`, `stats`, …
-- **`src/services/`**: key/session/stats stores, process launching, provider routers and wire-format bridges (Anthropic ⇄ OpenAI ⇄ Gemini, Copilot, Ollama), OAuth flows, model-name transforms, HTTP utilities
+Keys are AES-256-GCM encrypted in `config.json` under `$AIVO_CONFIG_DIR` (default `~/.config/aivo`). Sentinel `base_url` values `"copilot"`/`"ollama"` mark special provider types. Exit codes: 0 success, 1 user error, 2 network, 3 auth.
 
-**Data model**: `ApiKey` (`id`, `name`, `base_url`, `key`, `created_at`) AES-256-GCM encrypted in `config.json` under the config dir — `$AIVO_CONFIG_DIR`, default `~/.config/aivo`, with `state/ secrets/ cache/ logs/ run/` subdirs. Sentinel `base_url` values `"copilot"` and `"ollama"` identify special provider types.
+## Conventions
 
-**Cross-platform**: platform-specific code gated behind `cfg(unix)` / `cfg(windows)`.
-
-**Exit codes**: 0 = success, 1 = user error, 2 = network, 3 = auth.
+- Match existing CLI help text formatting exactly; verify interactive-UI edge cases (keyboard handling, empty input, single item, long strings).
+- Comments: concise, why-only. Don't comment obvious code.
+- Restate the question in fully concrete terms, making every implicit detail explicit. Then answer.
 
 ## Anti-goals
 
-Settled constraints — don't re-add or work around. The greppable ones are enforced by `tests/contracts.rs`; when adding here, extend its lists too.
+Settled constraints — don't re-add or work around. Greppable ones are enforced by `tests/contracts.rs`; extend its lists when adding here.
 
 - No hardcoded provider/model data — derive from `/v1/models` or the models.dev sync.
-- Never `terminal.clear()` in the code TUI — corruption self-heals via full repaint.
-- No progress bars or emoji in TUI output.
-- `/review`, `/vision`, and `/detach` commands are removed — review mode and the vision fallback stay.
-- No OSC 11 theme auto-detection — it leaks over slow SSH; default dark.
-- Never modify a launched coding agent's own config files (claude, codex, amp, gemini, …) — aivo injects env vars and override dirs instead.
+- Never `terminal.clear()` in the code TUI; no progress bars or emoji in TUI output.
+- `/review`, `/vision`, and `/detach` commands are removed; no OSC 11 theme auto-detection (default dark).
+- Never modify a launched coding agent's own config files — aivo injects env vars and override dirs instead.
 - Help stays hand-rolled (`print_help*`), never clap-generated.
-- No second execution path for the same feature — one agent engine serves the code TUI and oneshot.
+- One agent engine serves the code TUI and oneshot — no second execution path for the same feature.
 - Releases ship via R2 + Homebrew; no GitHub Releases (`gh release list` is empty by design).
-
-## Instructions
-
-* Restate the question in fully concrete terms, making every implicit detail explicit. Then answer.
-* Comments: clean, concise, why-only. Don't comment obvious code.
