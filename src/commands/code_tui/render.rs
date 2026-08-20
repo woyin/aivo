@@ -1490,11 +1490,20 @@ pub(super) fn tool_action_label(name: &str, args: &serde_json::Value, cwd: &str)
         return "updating tasks".to_string();
     }
     if name == "send_session" {
-        let target = args.get("target").and_then(|v| v.as_str()).unwrap_or("");
-        return if target.is_empty() {
-            "messaging another session".to_string()
-        } else {
-            format!("messaging session {target}")
+        let target = truncate_label(
+            args.get("target").and_then(|v| v.as_str()).unwrap_or(""),
+            ACTION_TARGET_MAX_COLS,
+        );
+        // A blocking send can sit on this label for minutes; it must not read
+        // like the instant fire-and-forget send.
+        let waiting = args
+            .get("wait")
+            .is_some_and(|v| v.as_bool().unwrap_or_else(|| v.as_str() == Some("true")));
+        return match (waiting, target.is_empty()) {
+            (true, true) => "waiting for another session to reply".to_string(),
+            (true, false) => format!("waiting for session {target} to reply"),
+            (false, true) => "messaging another session".to_string(),
+            (false, false) => format!("messaging session {target}"),
         };
     }
     if name == "skill" {
@@ -4258,6 +4267,29 @@ mod render_tests {
         );
         // Never strip down to nothing — a bare preamble stays as-is.
         assert_eq!(condense_subagent_task("You are"), "You are");
+    }
+
+    #[test]
+    fn tool_action_label_distinguishes_a_blocking_send_session() {
+        use super::tool_action_label;
+        let label = |args| tool_action_label("send_session", &args, "");
+        assert_eq!(
+            label(serde_json::json!({"target": "7f56583a", "text": "hi"})),
+            "messaging session 7f56583a"
+        );
+        assert_eq!(
+            label(serde_json::json!({"target": "7f56583a", "text": "hi", "wait": true})),
+            "waiting for session 7f56583a to reply"
+        );
+        // `wait` also arrives stringly-typed.
+        assert_eq!(
+            label(serde_json::json!({"target": "7f56583a", "text": "hi", "wait": "true"})),
+            "waiting for session 7f56583a to reply"
+        );
+        assert_eq!(
+            label(serde_json::json!({"text": "hi", "wait": true})),
+            "waiting for another session to reply"
+        );
     }
 
     #[test]

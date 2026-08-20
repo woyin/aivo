@@ -65,6 +65,77 @@ async fn send_session_fire_and_forget_delivers() {
     assert_eq!(got.from, "aaaa-sess-1");
 }
 
+/// Regression: `reply_to: ""` framed a first contact as a reply, telling the
+/// receiver no answer was needed — so the sender's wait always timed out.
+#[tokio::test]
+async fn send_session_ignores_an_empty_reply_to() {
+    let dir = tempfile::tempdir().unwrap();
+    let (a, b) = mail_pair(dir.path());
+    let e = engine_with_mail(a);
+    e.send_session(&json!({"target": "bbbb", "text": "round 1?", "reply_to": "  "}))
+        .await
+        .unwrap();
+    let got = b.claim_next().unwrap();
+    assert_eq!(got.reply_to, None);
+    assert!(
+        !got.transcript_display().contains("reply from"),
+        "a first message isn't a reply: {}",
+        got.transcript_display()
+    );
+    assert!(!got.agent_frame().contains("no further reply"));
+}
+
+#[tokio::test]
+async fn send_session_wait_marks_the_message_as_awaited() {
+    let dir = tempfile::tempdir().unwrap();
+    let (a, b) = mail_pair(dir.path());
+    let e = engine_with_mail(a);
+    // Stringly-typed `wait` on purpose — models send that too.
+    let waiter = tokio::spawn(async move {
+        e.send_session(&json!({
+            "target": "bbbb", "text": "answer me", "wait": "true", "timeout_ms": 10_000
+        }))
+        .await
+    });
+    let got = loop {
+        if let Some(msg) = b.claim_next() {
+            break msg;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    };
+    assert!(got.awaiting_reply, "the sender is blocked on this message");
+    assert!(got.agent_frame().contains("BLOCKED waiting"));
+    b.send("aaaa-sess-1", "ok", Some(&got.id), None).unwrap();
+    assert!(waiter.await.unwrap().unwrap().contains("ok"));
+}
+
+/// A blocks on B while B is already blocked on a question to A — A's wait
+/// must return B's question instead of sitting out the timeout.
+#[tokio::test]
+async fn send_session_wait_breaks_a_mutual_wait_by_handing_over_the_question() {
+    let dir = tempfile::tempdir().unwrap();
+    let (a, b) = mail_pair(dir.path());
+    b.send_awaiting_reply("aaaa-sess-1", "which port?", None, None)
+        .unwrap();
+    let e = engine_with_mail(a);
+    let out = e
+        .send_session(&json!({
+            "target": "bbbb", "text": "review this please",
+            "wait": true, "timeout_ms": 60_000
+        }))
+        .await
+        .unwrap();
+    assert!(out.contains("blocked waiting for YOUR answer"), "{out}");
+    assert!(out.contains("which port?"), "{out}");
+    assert!(
+        out.contains("target=\"bbbb-ses\""),
+        "the handed-over frame must carry reply addressing: {out}"
+    );
+    // A's own message is untouched — B answers it in a later turn.
+    let pending = b.claim_next().unwrap();
+    assert_eq!(pending.text, "review this please");
+}
+
 #[tokio::test]
 async fn send_session_wait_gets_the_reply() {
     let dir = tempfile::tempdir().unwrap();
@@ -91,6 +162,10 @@ async fn send_session_wait_gets_the_reply() {
     replier.await.unwrap();
     assert!(out.contains("Reply from session bbbb-ses"), "{out}");
     assert!(out.contains("the answer is 42"), "{out}");
+    assert!(
+        out.contains("message id: "),
+        "the next round's reply_to needs the reply's own id: {out}"
+    );
 }
 
 #[tokio::test]

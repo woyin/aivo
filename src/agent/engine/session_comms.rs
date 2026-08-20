@@ -19,17 +19,20 @@ pub(super) fn send_session_tool_spec() -> ToolSpec {
         name: "send_session".to_string(),
         description: "Send a message to another open aivo code session (the user's own, on this \
 machine — find targets with list_sessions). The receiving session sees it as an incoming message \
-and its agent can reply. Default is fire-and-forget: your turn continues and any reply arrives \
-later as a new incoming message. Set wait=true to block for the reply (up to timeout_ms) when you \
-need the answer to proceed. When answering an incoming message, set reply_to to that message's id \
-so the sender's wait is satisfied."
+and its agent can reply. Default is fire-and-forget: your turn continues (and can end), and any \
+reply arrives later as a new incoming message that starts its own turn. Use this default for \
+conversations and multi-round exchanges — each round is its own turn, nobody blocks. Set \
+wait=true ONLY when you cannot proceed with the current turn without the answer; it blocks up to \
+timeout_ms, and a busy target may not even see the message until its own turn ends. When \
+answering an incoming message, set reply_to to that message's id so the sender's wait is \
+satisfied."
             .to_string(),
         parameters: json!({
             "type": "object",
             "properties": {
                 "target": {"type": "string", "description": "Target session id (or unique prefix) from list_sessions, or the `from` id of a message you're answering"},
                 "text": {"type": "string", "description": "The message"},
-                "reply_to": {"type": "string", "description": "Id of the incoming message this answers (from its frame), if any"},
+                "reply_to": {"type": "string", "description": "Id of the incoming message this answers (from its frame). Omit entirely when starting a new exchange"},
                 "wait": {"type": "boolean", "description": "Block until the target replies (default false)"},
                 "timeout_ms": {"type": "integer", "description": "Max wait in ms (default 120000, max 600000); only with wait"}
             },
@@ -85,16 +88,28 @@ impl AgentEngine {
             .map(str::trim)
             .filter(|s| !s.is_empty())
             .ok_or("send_session: missing `text`.")?;
-        let reply_to = args.get("reply_to").and_then(|v| v.as_str());
-        let wait = args.get("wait").and_then(|v| v.as_bool()).unwrap_or(false);
+        // Models send `reply_to: ""` and `wait: "true"`; an empty reply_to
+        // must not frame a first contact as a reply.
+        let reply_to = args
+            .get("reply_to")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        let wait = args
+            .get("wait")
+            .map(|v| v.as_bool().unwrap_or_else(|| v.as_str() == Some("true")))
+            .unwrap_or(false);
 
         let peer = mail
             .resolve_peer(target)
             .map_err(|e| format!("send_session: {e}"))?;
         let own_cwd = crate::services::system_env::current_dir_string();
-        let msg_id = mail
-            .send(&peer.session_id, text, reply_to, own_cwd)
-            .map_err(|e| format!("send_session: delivery failed: {e}"))?;
+        let msg_id = if wait {
+            mail.send_awaiting_reply(&peer.session_id, text, reply_to, own_cwd)
+        } else {
+            mail.send(&peer.session_id, text, reply_to, own_cwd)
+        }
+        .map_err(|e| format!("send_session: delivery failed: {e}"))?;
         let to = short_sid(&peer.session_id);
         if !wait {
             return Ok(format!(
@@ -111,10 +126,23 @@ as a new incoming message."
         let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
         loop {
             if let Some(reply) = mail.take_reply(&msg_id) {
+                // The id lets a follow-up round set reply_to correctly.
                 return Ok(format!(
-                    "Reply from session {}:\n{}",
+                    "Reply from session {} (message id: {}):\n{}",
                     short_sid(&reply.from),
+                    reply.id,
                     reply.text
+                ));
+            }
+            // Mutual wait — the target is blocked on a question to us, so
+            // neither side would ever claim the other's mail. Hand its
+            // question over instead of sitting out both timeouts.
+            if let Some(cross) = mail.take_awaiting_from(&peer.session_id) {
+                return Ok(format!(
+                    "No reply yet — session {to} is itself blocked waiting for YOUR answer, \
+so it can't respond until you do. Its message:\n\n{frame}\n\n(Your own message stays \
+delivered; once the peer unblocks, its reply arrives as a new incoming message.)",
+                    frame = cross.agent_frame()
                 ));
             }
             if std::time::Instant::now() >= deadline {
