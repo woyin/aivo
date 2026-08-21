@@ -1,5 +1,15 @@
 # Changelog
 
+## v0.46.2
+
+Two long-standing spawn failures traced to their real causes: a cursor shell-hook write that raced a background process of aivo's own making, and a Windows `codex-app` probe that never looked where the Store package actually puts its runtime. The binary sheds another slice of dependency weight.
+
+- fix(cursor): stop the shadow shell-hook write racing itself across processes (d4454529)
+- fix(codex-app): widen the Windows codex runtime probe past MSIX redirection (2245020e)
+- fix(hf): search GGUF mirrors under the base repo name, not the quant suffix (b2514e8d)
+- improve(size): drop the ICU4X idna stack and ed25519 precomputed tables (92f94e84)
+- improve(size): trim clap to parse-only features and drop the rand crate (3b705f60)
+
 ## v0.46.1
 
 Session-to-session mail actually gets replies now: the harness enforces the reply obligation instead of trusting the model to honor it. File tools gain the same sandbox escalation bash already had, with protected paths floored below any waiver.
