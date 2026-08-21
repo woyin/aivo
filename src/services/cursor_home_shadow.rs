@@ -104,7 +104,8 @@ impl CursorShadow {
                 .args(["create-keychain", "-p", "", keychain_str])
                 .output()
                 .context("invoking `/usr/bin/security create-keychain` for cursor shadow")?;
-            if !output.status.success() {
+            // A concurrent ensure() may have won the race; only absence is fatal.
+            if !output.status.success() && !keychain.exists() {
                 let stderr = String::from_utf8_lossy(&output.stderr);
                 anyhow::bail!(
                     "failed to pre-create cursor shadow keychain ({}): {}",
@@ -298,11 +299,16 @@ fn sh_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
 
-/// Write-then-rename so a shell never sources a half-written hook.
+/// Write-then-rename so a shell never sources a half-written hook. Per-writer
+/// temp name: `keys add cursor` detaches a `models --refresh` that installs the
+/// same hooks concurrently, and a shared name left the loser renaming a path
+/// the winner had already taken.
 #[cfg(any(target_os = "macos", target_os = "linux", target_os = "freebsd"))]
 fn write_atomic(path: &Path, content: &str) -> Result<()> {
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let mut tmp_name = path.file_name().unwrap_or_default().to_os_string();
-    tmp_name.push(".tmp");
+    tmp_name.push(format!(".{}.{seq}.tmp", std::process::id()));
     let tmp = path.with_file_name(tmp_name);
     std::fs::write(&tmp, content)
         .with_context(|| format!("writing shadow shell hook {}", tmp.display()))?;

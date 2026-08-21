@@ -45,7 +45,7 @@ impl ModelsCommand {
         {
             Ok(code) => code,
             Err(e) => {
-                eprintln!("{}", style::yellow(e.to_string()));
+                eprintln!("{}", style::yellow(format!("{e:#}")));
                 crate::errors::exit_code_for_error(&e)
             }
         }
