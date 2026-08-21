@@ -1,5 +1,5 @@
 use anyhow::Result;
-use rand::Rng;
+
 use std::collections::{BTreeMap, HashSet};
 use zeroize::Zeroizing;
 
@@ -123,15 +123,8 @@ fn migrate_keys_in_place(keys: &mut [ApiKey]) -> bool {
 }
 
 pub(crate) fn generate_key_id(existing_ids: &HashSet<String>) -> Result<String> {
-    let mut rng = rand::thread_rng();
-
     for _ in 0..1000 {
-        let id: String = (0..KEY_ID_LENGTH)
-            .map(|_| {
-                let idx = rng.gen_range(0..KEY_ID_ALPHABET.len());
-                KEY_ID_ALPHABET[idx] as char
-            })
-            .collect();
+        let id = super::rng::string_from(KEY_ID_ALPHABET, KEY_ID_LENGTH);
 
         if !existing_ids.contains(&id) {
             return Ok(id);

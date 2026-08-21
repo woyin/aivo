@@ -60,12 +60,10 @@ static HEALTH_RESPONSE: LazyLock<Vec<u8>> = LazyLock::new(|| {
 
 /// A random 32-char alphanumeric bearer token for a serve/endpoint instance.
 pub(crate) fn random_auth_token() -> String {
-    use rand::Rng;
-    rand::thread_rng()
-        .sample_iter(&rand::distributions::Alphanumeric)
-        .take(32)
-        .map(char::from)
-        .collect()
+    super::rng::string_from(
+        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789",
+        32,
+    )
 }
 
 pub struct ServeRouterConfig {

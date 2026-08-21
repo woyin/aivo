@@ -8,7 +8,6 @@
 //! through this MCP HTTP path — never through the ACP session-update stream.
 
 use anyhow::{Context, Result, anyhow};
-use rand::Rng;
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -847,17 +846,7 @@ fn parse_session_path(path: &str) -> Option<String> {
 }
 
 fn generate_bridge_id() -> String {
-    let mut rng = rand::thread_rng();
-    (0..16)
-        .map(|_| {
-            let n: u8 = rng.gen_range(0..36);
-            if n < 10 {
-                (b'0' + n) as char
-            } else {
-                (b'a' + (n - 10)) as char
-            }
-        })
-        .collect()
+    crate::services::rng::string_from(b"0123456789abcdefghijklmnopqrstuvwxyz", 16)
 }
 
 /// Allocate a fresh tool_use_id with the per-protocol prefix the upstream
@@ -866,17 +855,10 @@ fn generate_bridge_id() -> String {
 /// probability is astronomically small over the lifetime of a router
 /// process even for the global parked-call lookup.
 fn new_tool_use_id(style: ToolUseIdStyle) -> String {
-    let mut rng = rand::thread_rng();
-    let suffix: String = (0..24)
-        .map(|_| {
-            let n: u8 = rng.gen_range(0..62);
-            match n {
-                0..=9 => (b'0' + n) as char,
-                10..=35 => (b'a' + (n - 10)) as char,
-                _ => (b'A' + (n - 36)) as char,
-            }
-        })
-        .collect();
+    let suffix = crate::services::rng::string_from(
+        b"0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ",
+        24,
+    );
     format!("{}{suffix}", style.prefix())
 }
 

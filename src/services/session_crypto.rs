@@ -6,7 +6,6 @@ use aes_gcm::{
 use anyhow::Result;
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use pbkdf2::pbkdf2_hmac;
-use rand::RngCore;
 use sha2::{Digest, Sha256};
 use std::sync::OnceLock;
 use zeroize::{Zeroize, ZeroizeOnDrop};
@@ -184,7 +183,7 @@ pub fn encrypt(plaintext: &str) -> Result<String> {
     let cipher = Aes256Gcm16::new(GenericArray::from_slice(key.as_slice()));
 
     let mut iv = [0u8; IV_LENGTH];
-    rand::thread_rng().fill_bytes(&mut iv);
+    super::rng::fill(&mut iv);
 
     let nonce = GenericArray::from_slice(&iv);
     let ciphertext = cipher
@@ -285,7 +284,6 @@ mod tests {
     use crate::services::os_keyring;
     use aes_gcm::aead::{Aead, KeyInit, generic_array::GenericArray};
     use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
-    use rand::RngCore;
 
     #[test]
     fn test_encryption_format() {
@@ -432,7 +430,7 @@ mod tests {
         let cipher = Aes256Gcm16::new(GenericArray::from_slice(key.as_slice()));
 
         let mut iv = [0u8; IV_LENGTH];
-        rand::thread_rng().fill_bytes(&mut iv);
+        crate::services::rng::fill(&mut iv);
         let nonce = GenericArray::from_slice(&iv);
         let ciphertext = cipher.encrypt(nonce, plaintext.as_bytes()).unwrap();
 
@@ -452,7 +450,7 @@ mod tests {
         let cipher = Aes256Gcm16::new(GenericArray::from_slice(key.as_slice()));
 
         let mut iv = [0u8; IV_LENGTH];
-        rand::thread_rng().fill_bytes(&mut iv);
+        crate::services::rng::fill(&mut iv);
         let nonce = GenericArray::from_slice(&iv);
         let ciphertext = cipher.encrypt(nonce, plaintext.as_bytes()).unwrap();
 
@@ -472,7 +470,7 @@ mod tests {
         let cipher = Aes256Gcm16::new(GenericArray::from_slice(key.as_slice()));
 
         let mut iv = [0u8; IV_LENGTH];
-        rand::thread_rng().fill_bytes(&mut iv);
+        crate::services::rng::fill(&mut iv);
         let nonce = GenericArray::from_slice(&iv);
         let ciphertext = cipher.encrypt(nonce, plaintext.as_bytes()).unwrap();
 

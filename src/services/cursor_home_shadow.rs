@@ -4,7 +4,6 @@
 //! the real user environment for everything it spawns through a shell.
 
 use anyhow::{Context, Result};
-use rand::RngCore;
 use std::ffi::OsString;
 #[cfg(any(target_os = "macos", target_os = "linux", target_os = "freebsd"))]
 use std::path::Path;
@@ -351,19 +350,7 @@ fn ensure_valid_account_id(id: &str) -> Result<()> {
 /// 12-char base36 id. ~62 bits of entropy — collision-free for the
 /// realistic ceiling of cursor accounts a user will manage on one machine.
 fn generate_account_id() -> String {
-    let mut bytes = [0u8; ACCOUNT_ID_LEN];
-    rand::thread_rng().fill_bytes(&mut bytes);
-    bytes
-        .iter()
-        .map(|b| {
-            let n = b % 36;
-            if n < 10 {
-                (b'0' + n) as char
-            } else {
-                (b'a' + (n - 10)) as char
-            }
-        })
-        .collect()
+    super::rng::string_from(b"0123456789abcdefghijklmnopqrstuvwxyz", ACCOUNT_ID_LEN)
 }
 
 fn accounts_dir() -> Result<PathBuf> {

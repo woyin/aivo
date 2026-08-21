@@ -93,6 +93,7 @@ pub mod provider_protocol;
 pub mod request_log;
 pub mod responses_chat_conversion;
 pub mod responses_to_chat_router;
+pub mod rng;
 pub mod route_cache;
 pub mod router_selection;
 pub mod serve_responses;

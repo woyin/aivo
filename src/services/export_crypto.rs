@@ -24,7 +24,6 @@ use aes_gcm::{
 use anyhow::{Result, anyhow};
 use argon2::{Algorithm, Argon2, Params, Version};
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
-use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
@@ -109,10 +108,10 @@ pub fn encrypt_export(plaintext: &[u8], password: &str) -> Result<ExportEnvelope
     }
 
     let mut salt = [0u8; SALT_LENGTH];
-    rand::thread_rng().fill_bytes(&mut salt);
+    super::rng::fill(&mut salt);
 
     let mut iv = [0u8; IV_LENGTH];
-    rand::thread_rng().fill_bytes(&mut iv);
+    super::rng::fill(&mut iv);
 
     // Build envelope first so the encrypt-time AAD comes from the same
     // string forms `aad()` recomputes on decrypt — no drift risk.

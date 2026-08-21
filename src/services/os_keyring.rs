@@ -93,9 +93,8 @@ pub fn ensure_master_secret() -> Option<MasterSecret> {
             Some(Lookup::Absent) => {}
             _ => return None,
         }
-        use rand::RngCore;
         let mut fresh = [0u8; SECRET_LEN];
-        rand::thread_rng().fill_bytes(&mut fresh);
+        super::rng::fill(&mut fresh);
         let attempted = backend_store(&fresh);
         fresh.zeroize();
         if !attempted {

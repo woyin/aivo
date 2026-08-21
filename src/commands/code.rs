@@ -1652,8 +1652,8 @@ fn to_stored_messages(history: &[ChatMessage]) -> Vec<StoredChatMessage> {
 }
 
 pub(crate) fn new_code_session_id() -> String {
-    use rand::Rng;
-    let bytes: [u8; 16] = rand::thread_rng().r#gen();
+    let mut bytes = [0u8; 16];
+    crate::services::rng::fill(&mut bytes);
     format!(
         "{:08x}-{:04x}-{:04x}-{:04x}-{:012x}",
         u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]),

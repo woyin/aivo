@@ -377,12 +377,7 @@ pub fn now_millis() -> u64 {
 }
 
 fn rand_tag(len: usize) -> String {
-    use rand::Rng;
-    const ALPHABET: &[u8] = b"23456789abcdefghjkmnpqrstvwxyz";
-    let mut rng = rand::thread_rng();
-    (0..len)
-        .map(|_| ALPHABET[rng.gen_range(0..ALPHABET.len())] as char)
-        .collect()
+    super::rng::string_from(b"23456789abcdefghjkmnpqrstvwxyz", len)
 }
 
 #[cfg(test)]

@@ -18,7 +18,6 @@ use anyhow::{Context, Result, anyhow};
 use base64::Engine;
 use base64::engine::general_purpose::{STANDARD_NO_PAD, URL_SAFE_NO_PAD};
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
-use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
@@ -116,7 +115,7 @@ impl PkcePair {
         // requires 43-128 chars of [A-Z a-z 0-9 -._~]; URL_SAFE_NO_PAD uses
         // the "-._~" alphabet subset, which satisfies the spec.
         let mut buf = [0u8; 32];
-        rand::thread_rng().fill_bytes(&mut buf);
+        super::rng::fill(&mut buf);
         let verifier = URL_SAFE_NO_PAD.encode(buf);
         let digest = Sha256::digest(verifier.as_bytes());
         let challenge = URL_SAFE_NO_PAD.encode(digest);
@@ -130,7 +129,7 @@ impl PkcePair {
 /// 32-hex-char state (16 random bytes). Matches codex-multi-auth.
 pub fn generate_state() -> String {
     let mut buf = [0u8; 16];
-    rand::thread_rng().fill_bytes(&mut buf);
+    super::rng::fill(&mut buf);
     buf.iter().fold(String::with_capacity(32), |mut acc, b| {
         use std::fmt::Write;
         let _ = write!(acc, "{:02x}", b);
@@ -484,7 +483,7 @@ fn manual_paste_prompt() -> Result<String> {
 /// Random UUIDv4-shaped id for the `session_id` request header.
 pub fn generate_session_id() -> String {
     let mut buf = [0u8; 16];
-    rand::thread_rng().fill_bytes(&mut buf);
+    super::rng::fill(&mut buf);
     buf[6] = (buf[6] & 0x0f) | 0x40; // version 4
     buf[8] = (buf[8] & 0x3f) | 0x80; // RFC 4122 variant
     format!(

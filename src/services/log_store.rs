@@ -456,15 +456,7 @@ fn option_integer(value: Option<i64>) -> SqlValue {
 }
 
 pub fn new_log_id() -> String {
-    use rand::Rng;
-    const ALPHABET: &[u8] = b"23456789abcdefghjkmnpqrstvwxyz";
-    let mut rng = rand::thread_rng();
-    (0..12)
-        .map(|_| {
-            let index = rng.gen_range(0..ALPHABET.len());
-            ALPHABET[index] as char
-        })
-        .collect()
+    super::rng::string_from(b"23456789abcdefghjkmnpqrstvwxyz", 12)
 }
 
 fn open_connection(path: &Path) -> Result<Connection> {

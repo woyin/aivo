@@ -5,7 +5,6 @@
 //! `${device_id}:${timestamp}` so a leaked `device_id` alone can't impersonate.
 
 use ed25519_dalek::{Signer, SigningKey};
-use rand::RngCore;
 use sha2::{Digest, Sha256};
 use std::path::PathBuf;
 use std::sync::OnceLock;
@@ -113,7 +112,7 @@ fn load_or_create_signing_key() -> Option<SigningKey> {
 
 fn generate_signing_key() -> SigningKey {
     let mut seed = [0u8; 32];
-    rand::thread_rng().fill_bytes(&mut seed);
+    super::rng::fill(&mut seed);
     SigningKey::from_bytes(&seed)
 }
 
