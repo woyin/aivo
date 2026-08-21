@@ -5,7 +5,9 @@ a tool_call that creates canary_done.txt=CANARY_OK, then on the follow-up turn
 (tool result present) returns a final text. Proves the full
 tool_call->tool_result cycle survives aivo's protocol converters.
 
-FAKE_MODE=text|tool (default text). Logs received paths + a debug dump."""
+FAKE_MODE=text|tool|task (default text). `task` first answers with a Task
+tool_call so the CLI spawns a subagent, then behaves like `tool`.
+Logs received paths + per-request models + a debug dump."""
 import json
 import os
 import sys
@@ -83,6 +85,30 @@ def pick_tool_and_args(tools):
     return None, None
 
 
+TASK_EMITTED = False
+
+
+def pick_task_tool(tools):
+    """Synthesize a dispatch whose subagent creates the sentinel file."""
+    for t in tools or []:
+        fn = t.get("function", t)
+        name = (fn.get("name") or "").lower()
+        if name not in ("task", "dispatch_agent"):
+            continue
+        props = ((fn.get("parameters") or {}).get("properties")) or {}
+        args = {}
+        for p in props:
+            pl = p.lower()
+            if "prompt" in pl:
+                args[p] = "Create a file named canary_done.txt with content CANARY_OK"
+            elif "description" in pl:
+                args[p] = "canary subagent"
+            elif "subagent" in pl or "agent" in pl:
+                args[p] = "general-purpose"
+        return fn.get("name"), args
+    return None, None
+
+
 def has_tool_result(messages):
     """True once the conversation carries a tool result (the follow-up turn)."""
     for m in messages or []:
@@ -112,6 +138,17 @@ class Handler(BaseHTTPRequestHandler):
             self._json(200, {"object": "list", "data": [{"id": "canary-model", "object": "model", "owned_by": "fake"}]})
         else:
             self._json(404, {"error": {"message": "not found"}})
+
+    def _tool_call(self, model, nm, args, stream):
+        tc = {"index": 0, "id": "call_canary", "type": "function",
+              "function": {"name": nm, "arguments": json.dumps(args)}}
+        if stream:
+            self._stream(model, [{"role": "assistant", "tool_calls": [tc]}], "tool_calls")
+        else:
+            self._json(200, {"id": "chatcmpl-canary", "object": "chat.completion", "created": 1,
+                             "model": model, "choices": [{"index": 0, "finish_reason": "tool_calls",
+                             "message": {"role": "assistant", "content": None, "tool_calls": [tc]}}],
+                             "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}})
 
     def _stream(self, model, delta_seq, finish):
         self.send_response(200)
@@ -146,27 +183,29 @@ class Handler(BaseHTTPRequestHandler):
         messages = req.get("messages", [])
         tools = req.get("tools", [])
         stream = bool(req.get("stream"))
+        logp("MODEL " + model)
 
         if tools and not has_tool_result(messages):
             dump("FULLTOOLS: " + json.dumps([
                 {(t.get("function") or t).get("name"):
                  list(((t.get("function") or t).get("parameters") or {}).get("properties", {}).keys())}
                 for t in tools]))
-        emit_tool = MODE == "tool" and tools and not has_tool_result(messages)
+
+        global TASK_EMITTED
+        if MODE == "task" and tools and not TASK_EMITTED and not has_tool_result(messages):
+            nm, args = pick_task_tool(tools)
+            dump(f"task picked={nm} args={args}")
+            if nm:
+                TASK_EMITTED = True
+                self._tool_call(model, nm, args, stream)
+                return
+
+        emit_tool = MODE in ("tool", "task") and tools and not has_tool_result(messages)
         if emit_tool:
             nm, args = pick_tool_and_args(tools)
             dump(f"picked={nm} args={args}")
             if nm:
-                argstr = json.dumps(args)
-                tc = {"index": 0, "id": "call_canary", "type": "function",
-                      "function": {"name": nm, "arguments": argstr}}
-                if stream:
-                    self._stream(model, [{"role": "assistant", "tool_calls": [tc]}], "tool_calls")
-                else:
-                    self._json(200, {"id": "chatcmpl-canary", "object": "chat.completion", "created": 1,
-                                     "model": model, "choices": [{"index": 0, "finish_reason": "tool_calls",
-                                     "message": {"role": "assistant", "content": None, "tool_calls": [tc]}}],
-                                     "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}})
+                self._tool_call(model, nm, args, stream)
                 return
             dump("tool mode but no write/shell tool found; falling back to text")
 

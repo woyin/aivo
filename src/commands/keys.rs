@@ -638,6 +638,10 @@ fn validate_base_url(url: &str) -> Result<(), &'static str> {
     if host.is_empty() {
         return Err("URL must include a host");
     }
+    // API paths are glued on by string concat, so a query would end up mid-URL.
+    if url.contains('?') || url.contains('#') {
+        return Err("URL must not contain a query string or fragment (secrets go in the API key)");
+    }
     Ok(())
 }
 const CLOUDFLARE_PROVIDER_ID: &str = "cloudflare-workers-ai";
@@ -2063,15 +2067,21 @@ impl KeysCommand {
                 || value == "ollama"
                 || value == "aivo-starter"
                 || value == "aivo starter"
-                || value.starts_with("http://")
-                || value.starts_with("https://")
             {
                 break value;
             }
-            eprintln!(
-                "{} URL must start with http:// or https:// (or enter 'copilot' / 'ollama' for special providers)",
-                style::red("Error:")
-            );
+            match validate_base_url(&value) {
+                Ok(()) => break value,
+                Err(msg) if value.starts_with("http://") || value.starts_with("https://") => {
+                    eprintln!("{} {msg}", style::red("Error:"));
+                }
+                Err(_) => {
+                    eprintln!(
+                        "{} URL must start with http:// or https:// (or enter 'copilot' / 'ollama' for special providers)",
+                        style::red("Error:")
+                    );
+                }
+            }
         };
 
         // API Key
@@ -3283,11 +3293,13 @@ impl KeysCommand {
                     }
                     continue;
                 }
-                if value.starts_with("http://") || value.starts_with("https://") {
-                    break value;
-                }
-                if let Some(code) = reject("URL must start with http:// or https://".to_string()) {
-                    return Ok(code);
+                match validate_base_url(&value) {
+                    Ok(()) => break value,
+                    Err(msg) => {
+                        if let Some(code) = reject(msg.to_string()) {
+                            return Ok(code);
+                        }
+                    }
                 }
             }
         };
@@ -4607,6 +4619,8 @@ mod tests {
         assert!(validate_base_url("https://").is_err());
         assert!(validate_base_url("https:// example.com").is_err());
         assert!(validate_base_url("https://example.com/path with space").is_err());
+        assert!(validate_base_url("https://example.com/v1?key=sk-secret").is_err());
+        assert!(validate_base_url("https://example.com/v1#frag").is_err());
     }
 
     #[test]

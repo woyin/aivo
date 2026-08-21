@@ -244,6 +244,26 @@ jobs:
             fail=1
           fi
 
+          # Layer C (claude only) — subagent model slot: the fake's first
+          # reply is a Task tool call, so claude dispatches a real subagent,
+          # whose requests must reach the fake carrying --subagent-model's
+          # value (a different route slot than the main model).
+          if [ "$TOOL" = "claude" ]; then
+            run_layer task "--subagent-model canary-sub $TOOL_RUN" "Use the Task tool to create canary_done.txt"
+            if [ -f "$LAYER_WORK/canary_done.txt" ] && grep -q CANARY_OK "$LAYER_WORK/canary_done.txt" \
+                && grep -q "MODEL canary-sub" "$LAYER_SEEN"; then
+              echo "✅ \`$TOOL\` $TRANSFORM subagent slot (CLI $CLI_VER)" >> "$GITHUB_STEP_SUMMARY"
+            elif [ -f "$LAYER_WORK/canary_done.txt" ]; then
+              echo "❌ \`$TOOL\` $TRANSFORM subagent slot (CLI $CLI_VER) — subagent ran but never carried the slot model" >> "$GITHUB_STEP_SUMMARY"
+              echo "--- fake (task) debug dump ---"; cat "$LAYER_DUMP" 2>/dev/null || true
+              fail=1
+            else
+              echo "❌ \`$TOOL\` $TRANSFORM subagent slot (CLI $CLI_VER) — Task dispatch did not complete" >> "$GITHUB_STEP_SUMMARY"
+              echo "--- fake (task) debug dump ---"; cat "$LAYER_DUMP" 2>/dev/null || true
+              fail=1
+            fi
+          fi
+
           if [ "$fail" -ne 0 ]; then
             echo "::error title=transform failure::$TOOL $TRANSFORM failed (CLI $CLI_VER)"
             exit 1
