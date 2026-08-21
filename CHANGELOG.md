@@ -1,5 +1,16 @@
 # Changelog
 
+## v0.46.1
+
+Session-to-session mail actually gets replies now: the harness enforces the reply obligation instead of trusting the model to honor it. File tools gain the same sandbox escalation bash already had, with protected paths floored below any waiver.
+
+- fix(code): enforce session-mail replies instead of trusting the model (664c37fe)
+- fix(code): make `send_session`'s blocking wait actually get replies (4378bcb0)
+- fix(code): give file tools the bash sandbox escalation and floor protected paths (05fae9ab)
+- fix(keys): reject query/fragment in `base_url` (f79c6c2e)
+- fix(gemini): wrap scalar tool outputs so `functionResponse.response` stays a Struct (ffd2c068)
+- improve(code): Esc on the effort menu clears the `/effort` scaffolding draft (24f85ad4)
+
 ## v0.46.0
 
 Images land in the code TUI — inline previews, a `generate_image` tool, and SVG rasterization. Usage accounting gets honest, and repeatedly denied tool calls hit a denial ladder instead of looping.
