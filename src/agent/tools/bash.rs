@@ -16,29 +16,50 @@ pub struct BashOutcome {
 /// Live `run_bash` output chunks for the UI; never changes the final result.
 pub type BashProgress = tokio::sync::mpsc::UnboundedSender<String>;
 
+/// Sandbox tier for a `run_bash` spawn: default → approved escalation (writes
+/// open except protected roots) → bare shell (user-confirmed floor).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum BashConfinement {
+    Workspace,
+    DenyProtected,
+    None,
+}
+
 /// Run a shell command with file writes confined to the workspace sandbox.
 pub(super) async fn run_bash(args: &Value, cwd: &Path) -> Result<String, String> {
     run_bash_confined(args, cwd, None).await.result
 }
 
 /// Like [`run_bash`], but also reports whether the sandbox blocked a write so
-/// the engine can offer to escalate (see [`run_bash_unconfined`]).
+/// the engine can offer to escalate (see [`run_bash_escalated`]).
 pub async fn run_bash_confined(
     args: &Value,
     cwd: &Path,
     progress: Option<BashProgress>,
 ) -> BashOutcome {
-    run_bash_inner(args, cwd, true, progress).await
+    run_bash_inner(args, cwd, BashConfinement::Workspace, progress).await
 }
 
-/// Run a shell command WITHOUT the workspace sandbox. Reserved for the
-/// user-approved escalation of a command the sandbox blocked.
+/// The approved escalation: writes open except the protected roots. A
+/// `sandbox_blocked` here means the protected floor — the engine must confirm
+/// before going fully unconfined.
+pub async fn run_bash_escalated(
+    args: &Value,
+    cwd: &Path,
+    progress: Option<BashProgress>,
+) -> BashOutcome {
+    run_bash_inner(args, cwd, BashConfinement::DenyProtected, progress).await
+}
+
+/// Run a shell command WITHOUT any sandbox (user-confirmed floor only).
 pub async fn run_bash_unconfined(
     args: &Value,
     cwd: &Path,
     progress: Option<BashProgress>,
 ) -> Result<String, String> {
-    run_bash_inner(args, cwd, false, progress).await.result
+    run_bash_inner(args, cwd, BashConfinement::None, progress)
+        .await
+        .result
 }
 
 pub(super) fn is_shell_operator(tok: &str) -> bool {
@@ -306,7 +327,7 @@ pub(super) async fn drain_pipe<R: tokio::io::AsyncRead + Unpin>(
 pub(super) async fn run_bash_inner(
     args: &Value,
     cwd: &Path,
-    confined: bool,
+    confinement: BashConfinement,
     progress: Option<BashProgress>,
 ) -> BashOutcome {
     let early = |result| BashOutcome {
@@ -324,13 +345,18 @@ pub(super) async fn run_bash_inner(
     let timeout = arg_u64(args, "timeout")
         .unwrap_or(BASH_DEFAULT_TIMEOUT)
         .min(BASH_MAX_TIMEOUT);
-    // Confine file writes to the workspace (where supported); reads and network
-    // stay open. The unconfined path runs the bare shell — reserved for the
-    // user-approved escalation of a blocked command. See agent::sandbox.
-    let spawn = if confined {
-        crate::agent::sandbox::wrap_shell(command, cwd)
-    } else {
-        crate::agent::sandbox::bare_shell(command)
+    // Reads and network stay open at every tier; see agent::sandbox.
+    let spawn = match confinement {
+        BashConfinement::Workspace => crate::agent::sandbox::wrap_shell(command, cwd),
+        BashConfinement::DenyProtected => crate::agent::sandbox::wrap_shell_escalated(command),
+        BashConfinement::None => crate::agent::sandbox::bare_shell(command),
+    };
+    // Gates the blocked-write detection: only a tier that actually sandboxes
+    // can plausibly turn EPERM into "blocked".
+    let sandbox_enforced = match confinement {
+        BashConfinement::Workspace => crate::agent::sandbox::active(),
+        BashConfinement::DenyProtected => crate::agent::sandbox::escalated_sandbox_active(),
+        BashConfinement::None => false,
     };
     // Std builder first so the anti-hang hardening is shared with background jobs
     // (one drift-proof site); the tokio conversion preserves args/env/stdio.
@@ -404,17 +430,23 @@ pub(super) async fn run_bash_inner(
         // it so the engine can offer to re-run the command outside the sandbox on
         // approval, and tell the model this was a confinement block — not a real
         // failure — so it doesn't give up and ask the user to run it by hand.
-        if confined
-            && crate::agent::sandbox::active()
+        if sandbox_enforced
             && (out.contains("Operation not permitted") || out.contains("Permission denied"))
         {
             sandbox_blocked = true;
-            out.push_str(
-                "\n[note: blocked by the workspace write-sandbox, not a real command \
+            out.push_str(match confinement {
+                BashConfinement::Workspace => {
+                    "\n[note: blocked by the workspace write-sandbox, not a real command \
 failure — it wrote outside the agent's workspace. The user can approve re-running it \
 outside the sandbox; don't fall back to telling the user to run it by hand. To drop \
-confinement for the whole session, relaunch aivo with AIVO_AGENT_NO_SANDBOX=1.]",
-            );
+confinement for the whole session, relaunch aivo with AIVO_AGENT_NO_SANDBOX=1.]"
+                }
+                _ => {
+                    "\n[note: blocked writing to a protected path (aivo's config dir or \
+~/.ssh) — the sandbox escalation deliberately excludes these. Only the user's explicit \
+per-command confirmation can open them.]"
+                }
+            });
         }
     }
     if out.is_empty() {

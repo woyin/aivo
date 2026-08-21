@@ -3914,6 +3914,7 @@ fn permission_heading(tool: &str) -> String {
     match tool {
         "run_bash" => "Run a command?".to_string(),
         "run_bash_unsandboxed" => "Run outside the workspace sandbox?".to_string(),
+        "write_outside_workspace" => "Write outside the workspace?".to_string(),
         "cursor" => "Allow Cursor to run this?".to_string(),
         "write_file" => "Write a file?".to_string(),
         "edit_file" | "multi_edit" => "Edit a file?".to_string(),

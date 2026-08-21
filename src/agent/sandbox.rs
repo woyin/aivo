@@ -45,6 +45,16 @@ pub fn extra_write_roots() -> &'static [PathBuf] {
     EXTRA_WRITE_ROOTS.get().map(Vec::as_slice).unwrap_or(&[])
 }
 
+/// Roots no escalation may open silently: aivo's config dir (key store) and
+/// `~/.ssh`. Deliberately tiny — broadening it re-breaks routine dotfile edits.
+pub fn protected_write_roots() -> Vec<PathBuf> {
+    let mut roots = vec![crate::services::paths::config_dir()];
+    if let Some(home) = crate::services::system_env::home_dir() {
+        roots.push(home.join(".ssh"));
+    }
+    roots
+}
+
 /// Confinement level for the agent's shell (`run_bash` writes/network).
 /// Under `ReadOnly`, `tools::execute` also refuses the in-process edit tools.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
@@ -296,6 +306,39 @@ fn landlock_relaunch(
     ShellInvocation { program: exe, args }
 }
 
+/// Whether [`wrap_shell_escalated`] still enforces the protected floor. Only
+/// seatbelt can express "write anywhere except these roots" (Landlock is
+/// allowlist-only), so elsewhere the floor is the engine's heuristic.
+pub fn escalated_sandbox_active() -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        !disabled() && Path::new(SANDBOX_EXEC).exists() && !protected_write_roots().is_empty()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        false
+    }
+}
+
+/// Spawn target for an approved escalation: writes open everywhere EXCEPT the
+/// protected roots. Bare shell where that profile can't be enforced.
+pub fn wrap_shell_escalated(command: &str) -> ShellInvocation {
+    #[cfg(target_os = "macos")]
+    if escalated_sandbox_active() {
+        return ShellInvocation {
+            program: SANDBOX_EXEC.to_string(),
+            args: vec![
+                "-p".to_string(),
+                macos_escalated_profile(),
+                "sh".to_string(),
+                "-c".to_string(),
+                command.to_string(),
+            ],
+        };
+    }
+    bare_shell(command)
+}
+
 /// The plain shell invocation with no sandbox wrapper. Used by `wrap_shell` when
 /// no sandbox applies, and by `run_bash`'s escalation path when the user
 /// approves re-running a sandbox-blocked command outside the workspace.
@@ -455,6 +498,35 @@ fn macos_profile(cwd: &Path, profile: SandboxProfile) -> String {
     }
     profile_str.push_str(")\n");
     profile_str
+}
+
+/// Everything writable EXCEPT the protected roots (last matching rule wins, so
+/// the deny sits after the allow). Raw + canonical spellings, like `macos_profile`.
+#[cfg(target_os = "macos")]
+fn macos_escalated_profile() -> String {
+    let mut denied: Vec<String> = Vec::new();
+    for root in protected_write_roots() {
+        denied.push(root.to_string_lossy().into_owned());
+        if let Ok(canon) = root.canonicalize() {
+            denied.push(canon.to_string_lossy().into_owned());
+        }
+    }
+    // A filterless `(deny file-write*)` would deny everything.
+    let subpaths: Vec<String> = denied
+        .iter()
+        .map(|p| p.trim_end_matches('/'))
+        .filter(|p| !p.is_empty())
+        .map(|p| format!("    (subpath \"{}\")\n", sbpl_escape(p)))
+        .collect();
+    let mut profile = String::from("(version 1)\n(allow default)\n");
+    if !subpaths.is_empty() {
+        profile.push_str("(deny file-write*\n");
+        for line in subpaths {
+            profile.push_str(&line);
+        }
+        profile.push_str(")\n");
+    }
+    profile
 }
 
 /// Escape a path for an SBPL double-quoted string literal.
@@ -689,6 +761,21 @@ mod macos_tests {
         // Network denied; package prefixes NOT writable.
         assert!(profile.contains("(deny network*)"));
         assert!(!profile.contains("/opt/homebrew"));
+    }
+
+    #[test]
+    fn escalated_profile_denies_only_protected_roots() {
+        let profile = macos_escalated_profile();
+        assert!(profile.contains("(allow default)"));
+        assert!(!profile.contains("(allow file-write*"));
+        assert!(profile.contains("(deny file-write*"));
+        let config = crate::services::paths::config_dir();
+        assert!(profile.contains(&format!("(subpath \"{}\")", config.display())));
+        if let Some(home) = crate::services::system_env::home_dir() {
+            assert!(profile.contains(&format!("(subpath \"{}\")", home.join(".ssh").display())));
+        }
+        assert!(!profile.contains("(deny file-read"));
+        assert!(!profile.contains("(deny network"));
     }
 
     #[test]

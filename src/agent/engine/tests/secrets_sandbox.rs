@@ -130,6 +130,44 @@ async fn sandbox_block_prompts_to_run_unsandboxed_and_respects_deny() {
     );
 }
 
+/// A blocked command naming a protected root is confirmed per call even under
+/// auto-approve. macOS-only (needs the seatbelt to produce the block).
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn bash_write_to_protected_root_prompts_even_under_auto_approve() {
+    if !crate::agent::sandbox::active() {
+        return;
+    }
+    let dir = tmp();
+    let config = crate::services::paths::config_dir();
+    // The write must fail on the sandbox (EPERM), not on a missing parent (ENOENT).
+    std::fs::create_dir_all(&config).unwrap();
+    let target = config.join(format!("aivo_floor_{}.txt", std::process::id()));
+    let _ = std::fs::remove_file(&target);
+    let cmd = format!("echo pwn > '{}'", target.display());
+    let bash = tool_call_sse("run_bash", json!({ "command": cmd }));
+    let port = spawn_sse_sequence(vec![bash, FINAL_TEXT_SSE.to_string()]);
+    let client = reqwest::Client::builder().no_proxy().build().unwrap();
+    let base = format!("http://127.0.0.1:{port}");
+    let mut engine = AgentEngine::new(&dir.display().to_string(), "m", "", &[], &[], 0, 0);
+    let mut ui = CapturingUi {
+        deny: true,
+        ..Default::default()
+    };
+    run_session(
+        &mut engine,
+        &turn_ctx(&client, &base, &dir),
+        Some("write config".into()),
+        &mut ui,
+    )
+    .await;
+
+    let existed = target.exists();
+    let _ = std::fs::remove_file(&target);
+    assert_eq!(ui.ask_tools, vec!["run_bash_unsandboxed"]);
+    assert!(!existed, "denied protected write still landed");
+}
+
 /// Approving the escalation re-runs outside the sandbox, so the blocked out-of-workspace write now succeeds.
 #[cfg(target_os = "macos")]
 #[tokio::test]

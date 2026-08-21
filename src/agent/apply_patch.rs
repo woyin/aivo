@@ -274,14 +274,22 @@ pub fn diff_blocks(patch: &str) -> Vec<DiffBlock> {
 /// Parse and apply a V4A patch under `cwd`, computing every change in memory
 /// before writing so a validation error leaves the workspace untouched.
 pub fn apply(patch: &str, cwd: &Path) -> Result<String, String> {
+    apply_confined(patch, cwd, true)
+}
+
+/// Like [`apply`]; `confine: false` waives the workspace check (approved
+/// escalation only).
+pub fn apply_confined(patch: &str, cwd: &Path, confine: bool) -> Result<String, String> {
     let changes = parse(patch)?;
-    for ch in &changes {
-        confine_write_path(&ch.path, cwd)?;
-        if let ChangeKind::Update {
-            move_to: Some(m), ..
-        } = &ch.kind
-        {
-            confine_write_path(m, cwd)?;
+    if confine {
+        for ch in &changes {
+            confine_write_path(&ch.path, cwd)?;
+            if let ChangeKind::Update {
+                move_to: Some(m), ..
+            } = &ch.kind
+            {
+                confine_write_path(m, cwd)?;
+            }
         }
     }
     enum Step {

@@ -66,7 +66,7 @@ use glob.",
         spec(
             "write_file",
             "Write (create or overwrite) a file with the given content. Creates parent \
-directories. Path must stay inside the workspace (cwd or --add-dir); outside paths are refused. \
+directories. A path outside the workspace (cwd or --add-dir) pauses for the user's approval. \
 Overwriting makes the file exactly `content`, losing everything else — fine for a \
 deliberate full rewrite; for targeted changes to an existing file, read it and use \
 edit_file/multi_edit instead.",
@@ -83,8 +83,8 @@ edit_file/multi_edit instead.",
             "edit_file",
             "Replace an exact string in a file with a new string. Copy `old_string` from the \
 file's actual current content (read it first) — it must match exactly once by default (errors if \
-missing or ambiguous); set replace_all to replace every occurrence. Path must stay inside the \
-workspace (cwd or --add-dir). Not for creating files or \
+missing or ambiguous); set replace_all to replace every occurrence. A path outside the \
+workspace (cwd or --add-dir) pauses for the user's approval. Not for creating files or \
 full rewrites — use write_file.",
             json!({
                 "type": "object",

@@ -536,6 +536,10 @@ command in the foreground (drop `background`)."
                 // Run confined; a sandbox write-block offers an in-session escape hatch instead of a dead-end error.
                 self.run_bash_with_escalation(ctx, ui, &call.arguments)
                     .await
+            } else if matches!(n, "write_file" | "edit_file" | "multi_edit" | "apply_patch") {
+                // Same escape hatch as bash for an out-of-workspace target.
+                self.run_write_with_escalation(ctx, ui, n, &call.arguments)
+                    .await
             } else if n == "check_job" {
                 match &self.jobs {
                     Some(t) => {
@@ -753,8 +757,12 @@ Before calling `{tool}` again, make its arguments match this schema exactly:\n{s
 
     /// Run a `run_bash` call confined to the workspace. If the OS sandbox blocks a
     /// write, offer to re-run outside the sandbox (same approval flow) instead of a
-    /// dead-end error. Auto-approve / a prior "always" skip the prompt; off a TTY it
+    /// dead-end error. Auto-approve / a prior "always" skip that prompt; off a TTY it
     /// fails closed, so the blocked result (with its hint) flows back.
+    ///
+    /// The approved re-run still denies the protected roots where enforceable;
+    /// a command that hits (or names) one is confirmed per call even under
+    /// auto-approve, like the catastrophic floor.
     pub(super) async fn run_bash_with_escalation(
         &mut self,
         ctx: &TurnCtx<'_>,
@@ -772,6 +780,25 @@ Before calling `{tool}` again, make its arguments match this schema exactly:\n{s
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .trim();
+        // Heuristic floor; the escalated run's sandbox is the enforced backstop.
+        if tools::command_mentions_protected_path(command) {
+            let preview = format!(
+                "{command}\n\nThe workspace sandbox blocked this, and it names a protected \
+path (aivo's config dir or ~/.ssh). Re-run the full command with no write confinement?"
+            );
+            if matches!(
+                ui.ask_permission("run_bash_unsandboxed", Some(&preview), true)
+                    .await,
+                Decision::Deny
+            ) {
+                return outcome.result;
+            }
+            ui.notify(SANDBOX_ESCALATION_NOTICE);
+            return Self::pump_bash_progress(ui, |tx| {
+                tools::run_bash_unconfined(args, ctx.cwd, Some(tx))
+            })
+            .await;
+        }
         // Scoped to the exact command so "always" doesn't blanket-escalate every bash call.
         let ekey = format!("run_bash_unsandboxed\u{0}{command}");
         let approved = ctx.auto_approve_enabled() || self.grants.covers_key(&ekey) || {
@@ -797,7 +824,92 @@ Re-run the full command without write confinement?",
             return outcome.result;
         }
         ui.notify(SANDBOX_ESCALATION_NOTICE);
+        let escalated =
+            Self::pump_bash_progress(ui, |tx| tools::run_bash_escalated(args, ctx.cwd, Some(tx)))
+                .await;
+        if !escalated.sandbox_blocked {
+            return escalated.result;
+        }
+        // Blocked again = a protected root — confirm per call, even under auto-approve.
+        let preview = format!(
+            "{command}\n\nStill blocked after escalation: it writes to a protected path \
+(aivo's config dir or ~/.ssh). Re-run with no write confinement at all?"
+        );
+        if matches!(
+            ui.ask_permission("run_bash_unsandboxed", Some(&preview), true)
+                .await,
+            Decision::Deny
+        ) {
+            return escalated.result;
+        }
+        ui.notify(SANDBOX_ESCALATION_NOTICE);
         Self::pump_bash_progress(ui, |tx| tools::run_bash_unconfined(args, ctx.cwd, Some(tx))).await
+    }
+
+    /// Run a file-write tool with the same escalation as a sandbox-blocked
+    /// `run_bash`: an out-of-workspace target prompts (auto-approve / "always"
+    /// skip it), then runs with confinement waived. A protected-root target is
+    /// confirmed per call even under auto-approve.
+    pub(super) async fn run_write_with_escalation(
+        &mut self,
+        ctx: &TurnCtx<'_>,
+        ui: &mut dyn AgentUi,
+        name: &str,
+        args: &Value,
+    ) -> Result<String, String> {
+        let outside = tools::escaping_write_paths(name, args, ctx.cwd);
+        // Escalation must never bypass the read-only profile's refusal.
+        if outside.is_empty()
+            || crate::agent::sandbox::current_profile()
+                == crate::agent::sandbox::SandboxProfile::ReadOnly
+        {
+            return tools::execute(name, args, ctx.cwd).await;
+        }
+        let joined = outside.join(", ");
+        let protected = outside
+            .iter()
+            .any(|p| tools::write_path_is_protected(p, ctx.cwd));
+        let approved = if protected {
+            let preview = format!(
+                "{name}: {joined}\n\nThis writes to a protected path (aivo's config dir or \
+~/.ssh), outside the workspace {}. Allow this write?",
+                ctx.cwd.display()
+            );
+            !matches!(
+                ui.ask_permission("write_outside_workspace", Some(&preview), true)
+                    .await,
+                Decision::Deny
+            )
+        } else {
+            // Scoped to the exact targets so "always" doesn't blanket-open the filesystem.
+            let ekey = format!("write_outside_workspace\u{0}{joined}");
+            ctx.auto_approve_enabled() || self.grants.covers_key(&ekey) || {
+                let preview = format!(
+                    "{name}: {joined}\n\nThis writes outside the workspace {}. Allow the write?",
+                    ctx.cwd.display()
+                );
+                match ui
+                    .ask_permission("write_outside_workspace", Some(&preview), false)
+                    .await
+                {
+                    Decision::Allow => true,
+                    Decision::AlwaysAllow => {
+                        self.grants.remember_key(ekey);
+                        true
+                    }
+                    Decision::Deny => false,
+                }
+            }
+        };
+        if !approved {
+            return Err(format!(
+                "refused: `{joined}` is outside the workspace and the user declined the \
+write. Use a path inside {} instead, or ask the user to relaunch with `--add-dir`.",
+                ctx.cwd.display()
+            ));
+        }
+        ui.notify(WRITE_ESCALATION_NOTICE);
+        tools::execute_write_unconfined(name, args, ctx.cwd).await
     }
 
     /// Run a `run_bash` future, forwarding its live output chunks to the UI.

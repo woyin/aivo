@@ -182,6 +182,9 @@ const MAX_FORCED_COMPACTIONS: usize = 3;
 /// on the next agent output so it isn't pinned all turn.
 pub const SANDBOX_ESCALATION_NOTICE: &str = "re-running outside the workspace sandbox (approved)";
 
+/// File-tool counterpart of [`SANDBOX_ESCALATION_NOTICE`].
+pub const WRITE_ESCALATION_NOTICE: &str = "writing outside the workspace (approved)";
+
 /// One-line diagnostic to stderr, gated by `AIVO_DEBUG=1`.
 fn agent_debug(msg: &str) {
     if matches!(std::env::var("AIVO_DEBUG").as_deref(), Ok("1")) {

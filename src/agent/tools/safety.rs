@@ -69,16 +69,72 @@ pub fn is_dangerous(name: &str, args: &Value) -> bool {
 }
 
 /// In-process writes skip the OS sandbox; refuse anything outside cwd + `--add-dir`.
+/// Fallback only — the engine intercepts first via [`escaping_write_paths`].
 pub(crate) fn confine_write_path(path: &str, cwd: &Path) -> Result<(), String> {
     if path_escapes_cwd(path, cwd) {
         Err(format!(
             "refused: `{path}` is outside the workspace. File writes are confined to the \
-working directory (and any --add-dir roots), including under auto-approve. Re-run with \
-`--add-dir <dir>` if this path should be writable, or use a path inside the workspace."
+working directory (and any --add-dir roots). Use a path inside the workspace, or ask \
+the user to approve the write or relaunch with `--add-dir <dir>`."
         ))
     } else {
         Ok(())
     }
+}
+
+/// The out-of-workspace targets of a write-tool call — empty when fully
+/// confined (or args don't parse; execution surfaces that error).
+pub fn escaping_write_paths(name: &str, args: &Value, cwd: &Path) -> Vec<String> {
+    let candidates: Vec<String> = match name {
+        "write_file" | "edit_file" | "multi_edit" => args
+            .get("path")
+            .and_then(|v| v.as_str())
+            .map(|p| vec![p.to_string()])
+            .unwrap_or_default(),
+        "apply_patch" => args
+            .get("input")
+            .and_then(|v| v.as_str())
+            .map(crate::agent::apply_patch::target_paths)
+            .unwrap_or_default(),
+        _ => Vec::new(),
+    };
+    candidates
+        .into_iter()
+        .filter(|p| path_escapes_cwd(p, cwd))
+        .collect()
+}
+
+/// Whether a write target resolves under a protected root — confirmed even
+/// under auto-approve.
+pub fn write_path_is_protected(path: &str, cwd: &Path) -> bool {
+    let target = canonicalize_existing_ancestor(&resolve(cwd, path));
+    crate::agent::sandbox::protected_write_roots()
+        .iter()
+        .any(|root| target.starts_with(canonicalize_existing_ancestor(root)))
+}
+
+/// Best-effort check that a command names a protected root (absolute, `~/`, or
+/// `$HOME` spelling). Advisory — the enforced floor is the escalated seatbelt
+/// profile (macOS); this is the only floor where that can't be built.
+pub fn command_mentions_protected_path(cmd: &str) -> bool {
+    let home = crate::services::system_env::home_dir();
+    for root in crate::agent::sandbox::protected_write_roots() {
+        if cmd.contains(root.to_string_lossy().as_ref()) {
+            return true;
+        }
+        if let Some(home) = &home
+            && let Ok(rel) = root.strip_prefix(home)
+        {
+            let rel = rel.to_string_lossy().replace('\\', "/");
+            if ["~/", "$HOME/", "${HOME}/"]
+                .iter()
+                .any(|prefix| cmd.contains(&format!("{prefix}{rel}")))
+            {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// A hard floor under [`is_dangerous`]: an unrecoverable `run_bash` command (see

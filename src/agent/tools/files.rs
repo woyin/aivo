@@ -159,9 +159,19 @@ pub(super) async fn run_capture(program: &str, args: &[&str], cwd: &Path) -> Opt
 // --- mutating tools ---
 
 pub(super) fn write_file(args: &Value, cwd: &Path) -> Result<String, String> {
+    write_file_confined(args, cwd, true)
+}
+
+pub(super) fn write_file_confined(
+    args: &Value,
+    cwd: &Path,
+    confine: bool,
+) -> Result<String, String> {
     let path = arg_str(args, "path")?;
     let content = arg_str(args, "content")?;
-    confine_write_path(path, cwd)?;
+    if confine {
+        confine_write_path(path, cwd)?;
+    }
     let full = resolve(cwd, path);
     if let Some(parent) = full.parent() {
         std::fs::create_dir_all(parent).map_err(|e| format!("create dir for {path}: {e}"))?;
@@ -391,8 +401,18 @@ pub(crate) fn atomic_write(full: &Path, content: &str) -> std::io::Result<()> {
 }
 
 pub(super) fn edit_file(args: &Value, cwd: &Path) -> Result<String, String> {
+    edit_file_confined(args, cwd, true)
+}
+
+pub(super) fn edit_file_confined(
+    args: &Value,
+    cwd: &Path,
+    confine: bool,
+) -> Result<String, String> {
     let path = arg_str(args, "path")?;
-    confine_write_path(path, cwd)?;
+    if confine {
+        confine_write_path(path, cwd)?;
+    }
     let old = arg_str(args, "old_string")?;
     let new = arg_str(args, "new_string")?;
     let replace_all = args
@@ -415,8 +435,18 @@ pub(super) fn edit_file(args: &Value, cwd: &Path) -> Result<String, String> {
 /// the previous, and the file is written only if all match — so a later failure
 /// never leaves a half-edited file (Claude's MultiEdit semantics).
 pub(super) fn multi_edit(args: &Value, cwd: &Path) -> Result<String, String> {
+    multi_edit_confined(args, cwd, true)
+}
+
+pub(super) fn multi_edit_confined(
+    args: &Value,
+    cwd: &Path,
+    confine: bool,
+) -> Result<String, String> {
     let path = arg_str(args, "path")?;
-    confine_write_path(path, cwd)?;
+    if confine {
+        confine_write_path(path, cwd)?;
+    }
     let edits = args
         .get("edits")
         .and_then(|v| v.as_array())

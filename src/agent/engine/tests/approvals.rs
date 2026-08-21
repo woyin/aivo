@@ -589,8 +589,10 @@ async fn safe_tool_runs_without_prompt() {
     assert!(dir.join("out.txt").exists(), "safe write was blocked");
 }
 
+/// Auto-approve waives the out-of-workspace write prompt (same contract as the
+/// bash escalation); the write is announced via the notice.
 #[tokio::test]
-async fn write_file_outside_workspace_refused_under_auto_approve() {
+async fn write_file_outside_workspace_auto_approved_with_notice() {
     let dir = tmp();
     let rel = format!(
         "../{}-escape.txt",
@@ -611,11 +613,79 @@ async fn write_file_outside_workspace_refused_under_auto_approve() {
     .await;
 
     assert_eq!(ui.asks, 0);
+    assert_eq!(ui.tools, vec!["write_file"]);
+    assert!(dir.join(&rel).exists(), "auto-approved write did not land");
+    assert!(
+        ui.notices
+            .iter()
+            .any(|n| n.contains("writing outside the workspace")),
+        "missing escalation notice: {:?}",
+        ui.notices
+    );
+}
+
+/// With auto-approve off, an out-of-workspace write prompts; declining refuses.
+#[tokio::test]
+async fn write_file_outside_workspace_prompts_and_deny_refuses() {
+    let dir = tmp();
+    let rel = format!(
+        "../{}-deny-escape.txt",
+        dir.file_name().unwrap().to_string_lossy()
+    );
+    let sse = tool_call_sse("write_file", json!({"path": rel, "content": "PWN"}));
+    let port = spawn_sse_sequence(vec![sse, FINAL_TEXT_SSE.to_string()]);
+    let client = reqwest::Client::builder().no_proxy().build().unwrap();
+    let base = format!("http://127.0.0.1:{port}");
+    let mut engine = AgentEngine::new(&dir.display().to_string(), "m", "", &[], &[], 0, 0);
+    let mut ui = CapturingUi {
+        deny: true,
+        ..Default::default()
+    };
+    let ctx = TurnCtx {
+        yes: false,
+        auto_approve_all: false,
+        ..turn_ctx(&client, &base, &dir)
+    };
+    run_session(&mut engine, &ctx, Some("write outside".into()), &mut ui).await;
+
+    assert_eq!(ui.ask_tools, vec!["write_outside_workspace"]);
     assert_eq!(ui.tool_errors, vec!["write_file"]);
     assert!(!dir.join(&rel).exists());
     let results = tool_result_texts(&engine);
     assert!(
-        results.iter().any(|r| r.contains("outside the workspace")),
-        "model should see the refuse: {results:?}"
+        results
+            .iter()
+            .any(|r| r.contains("outside the workspace") && r.contains("declined")),
+        "model should see the decline: {results:?}"
     );
+}
+
+/// A write under aivo's own config dir prompts even under auto-approve.
+#[tokio::test]
+async fn write_file_to_protected_root_prompts_even_under_auto_approve() {
+    let dir = tmp();
+    let target = crate::services::paths::config_dir().join("pwned.json");
+    let sse = tool_call_sse(
+        "write_file",
+        json!({"path": target.display().to_string(), "content": "PWN"}),
+    );
+    let port = spawn_sse_sequence(vec![sse, FINAL_TEXT_SSE.to_string()]);
+    let client = reqwest::Client::builder().no_proxy().build().unwrap();
+    let base = format!("http://127.0.0.1:{port}");
+    let mut engine = AgentEngine::new(&dir.display().to_string(), "m", "", &[], &[], 0, 0);
+    let mut ui = CapturingUi {
+        deny: true,
+        ..Default::default()
+    };
+    run_session(
+        &mut engine,
+        &turn_ctx(&client, &base, &dir),
+        Some("write config".into()),
+        &mut ui,
+    )
+    .await;
+
+    assert_eq!(ui.ask_tools, vec!["write_outside_workspace"]);
+    assert_eq!(ui.tool_errors, vec!["write_file"]);
+    assert!(!target.exists(), "denied protected write still landed");
 }

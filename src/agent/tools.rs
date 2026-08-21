@@ -143,16 +143,7 @@ pub async fn execute(name: &str, args: &Value, cwd: &Path) -> Result<String, Str
         None => name,
     };
     // The OS sandbox confines only the shell; refuse in-process edits here too.
-    if matches!(
-        name,
-        "write_file" | "edit_file" | "multi_edit" | "apply_patch"
-    ) && crate::agent::sandbox::current_profile()
-        == crate::agent::sandbox::SandboxProfile::ReadOnly
-    {
-        return Err(format!(
-            "{name}: refused — the read-only sandbox profile is active, so no files may be written."
-        ));
-    }
+    refuse_writes_in_read_only(name)?;
     match name {
         "read_file" => read_file(args, cwd),
         "list_dir" => list_dir(args, cwd),
@@ -169,6 +160,40 @@ pub async fn execute(name: &str, args: &Value, cwd: &Path) -> Result<String, Str
             "unknown tool `{other}` (available: read_file, list_dir, glob, grep, write_file, edit_file, multi_edit, web_fetch, web_search, run_bash)"
         )),
     }
+}
+
+/// Execute a write tool with confinement waived (approved escalation only).
+/// The read-only profile still refuses.
+pub async fn execute_write_unconfined(
+    name: &str,
+    args: &Value,
+    cwd: &Path,
+) -> Result<String, String> {
+    let name = subagents::normalize_tool_name(name).unwrap_or(name);
+    refuse_writes_in_read_only(name)?;
+    match name {
+        "write_file" => write_file_confined(args, cwd, false),
+        "edit_file" => edit_file_confined(args, cwd, false),
+        "multi_edit" => multi_edit_confined(args, cwd, false),
+        "apply_patch" => {
+            crate::agent::apply_patch::apply_confined(arg_str(args, "input")?, cwd, false)
+        }
+        other => Err(format!("`{other}` is not a write tool")),
+    }
+}
+
+fn refuse_writes_in_read_only(name: &str) -> Result<(), String> {
+    if matches!(
+        name,
+        "write_file" | "edit_file" | "multi_edit" | "apply_patch"
+    ) && crate::agent::sandbox::current_profile()
+        == crate::agent::sandbox::SandboxProfile::ReadOnly
+    {
+        return Err(format!(
+            "{name}: refused — the read-only sandbox profile is active, so no files may be written."
+        ));
+    }
+    Ok(())
 }
 
 // --- argument helpers ---

@@ -75,6 +75,63 @@ fn confine_write_path_catches_symlink_escape() {
 }
 
 #[test]
+fn escaping_write_paths_flags_only_outside_targets() {
+    let dir = tmp();
+    assert!(
+        escaping_write_paths(
+            "write_file",
+            &json!({"path": "in.txt", "content": "x"}),
+            &dir
+        )
+        .is_empty()
+    );
+    assert_eq!(
+        escaping_write_paths("edit_file", &json!({"path": "../out.txt"}), &dir),
+        vec!["../out.txt".to_string()]
+    );
+    assert!(escaping_write_paths("write_file", &json!({}), &dir).is_empty());
+    let patch =
+        "*** Begin Patch\n*** Add File: ok.txt\n+hi\n*** Add File: ../esc.txt\n+hi\n*** End Patch";
+    assert_eq!(
+        escaping_write_paths("apply_patch", &json!({"input": patch}), &dir),
+        vec!["../esc.txt".to_string()]
+    );
+    assert!(escaping_write_paths("read_file", &json!({"path": "../x"}), &dir).is_empty());
+}
+
+#[test]
+fn protected_write_paths_cover_config_and_ssh_only() {
+    let dir = tmp();
+    let config = crate::services::paths::config_dir();
+    assert!(write_path_is_protected(
+        &config.join("config.json").display().to_string(),
+        &dir
+    ));
+    assert!(write_path_is_protected("~/.ssh/authorized_keys", &dir));
+    assert!(!write_path_is_protected("~/notes.txt", &dir));
+    assert!(!write_path_is_protected("in-repo.txt", &dir));
+}
+
+#[test]
+fn command_mentions_protected_path_matches_common_spellings() {
+    let config = crate::services::paths::config_dir();
+    assert!(command_mentions_protected_path(&format!(
+        "cat x > {}/config.json",
+        config.display()
+    )));
+    assert!(command_mentions_protected_path(
+        "echo key >> ~/.ssh/authorized_keys"
+    ));
+    assert!(command_mentions_protected_path(
+        "cp id_rsa $HOME/.ssh/id_rsa"
+    ));
+    assert!(!command_mentions_protected_path(
+        "sed -i '' 's/a/b/' ~/.config/tmux/tmux.conf.local"
+    ));
+    assert!(!command_mentions_protected_path("cargo build"));
+}
+
+#[test]
 fn classification_and_destructive() {
     assert!(is_mutating("run_bash"));
     assert!(!is_mutating("read_file"));
