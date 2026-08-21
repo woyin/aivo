@@ -58,11 +58,9 @@ pub fn bundled_codex_in(app: &Path) -> Option<PathBuf> {
 }
 
 /// Windows: the MSIX package dir is ACL-locked, so the GUI materializes its
-/// bundled codex into `<CODEX_HOME>\bin` on first run (CODEX_HOME = env
-/// override, else `~\.codex`; the GUI force-sets the same on its app-server).
-/// Older builds used `%LOCALAPPDATA%\OpenAI\Codex\bin`. Package resources
-/// are a last-ditch probe (listing usually denied). `AIVO_CODEX_APP_PATH`
-/// may be the codex.exe itself or a package root.
+/// bundled codex into a writable `bin` dir (see [`codex_bin_dirs`]); package
+/// resources are a last-ditch probe (listing usually denied).
+/// `AIVO_CODEX_APP_PATH` may be the codex.exe itself or a package root.
 #[cfg(windows)]
 pub fn locate_bundled_codex() -> Option<PathBuf> {
     if let Some(p) = std::env::var_os("AIVO_CODEX_APP_PATH") {
@@ -75,17 +73,9 @@ pub fn locate_bundled_codex() -> Option<PathBuf> {
             return Some(nested);
         }
     }
-    let codex_home = std::env::var_os("CODEX_HOME")
-        .map(PathBuf::from)
-        .or_else(|| crate::services::system_env::home_dir().map(|h| h.join(".codex")));
-    if let Some(home) = codex_home
-        && let Some(hit) = newest_codex_exe(&home.join("bin"))
-    {
-        return Some(hit);
-    }
-    if let Some(lad) = std::env::var_os("LOCALAPPDATA")
-        && let Some(hit) =
-            newest_codex_exe(&PathBuf::from(lad).join("OpenAI").join("Codex").join("bin"))
+    if let Some(hit) = codex_bin_dirs()
+        .iter()
+        .find_map(|dir| newest_codex_exe(dir))
     {
         return Some(hit);
     }
@@ -110,6 +100,55 @@ pub fn locate_bundled_codex() -> Option<PathBuf> {
         }
     }
     None
+}
+
+/// Writable `bin` dirs the GUI materializes codex into, in probe order. MSIX
+/// redirects a packaged app's `%LOCALAPPDATA%`/`%APPDATA%` writes into
+/// `...\Packages\<family>\LocalCache\{Local,Roaming}`. Also listed in the
+/// "not materialized" error.
+#[cfg(windows)]
+pub fn codex_bin_dirs() -> Vec<PathBuf> {
+    fn app_dirs(local: &Path, roaming: &Path) -> Vec<PathBuf> {
+        let mut dirs = vec![local.join(".codex").join("bin")];
+        // Display name became "ChatGPT"; the package identity below did not.
+        for brand in ["Codex", "ChatGPT"] {
+            dirs.push(local.join("OpenAI").join(brand).join("bin"));
+            dirs.push(roaming.join("OpenAI").join(brand).join("bin"));
+        }
+        dirs
+    }
+
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    if let Some(home) = std::env::var_os("CODEX_HOME")
+        .map(PathBuf::from)
+        .or_else(|| crate::services::system_env::home_dir().map(|h| h.join(".codex")))
+    {
+        dirs.push(home.join("bin"));
+    }
+    let Some(local_appdata) = std::env::var_os("LOCALAPPDATA").map(PathBuf::from) else {
+        return dirs;
+    };
+    let roaming = std::env::var_os("APPDATA").map(PathBuf::from);
+    dirs.extend(app_dirs(
+        &local_appdata,
+        roaming.as_deref().unwrap_or(&local_appdata),
+    ));
+    let Ok(packages) = std::fs::read_dir(local_appdata.join("Packages")) else {
+        return dirs;
+    };
+    for entry in packages.flatten() {
+        if !entry
+            .file_name()
+            .to_string_lossy()
+            .starts_with("OpenAI.Codex")
+        {
+            continue;
+        }
+        let cache = entry.path().join("LocalCache");
+        dirs.extend(app_dirs(&cache.join("Local"), &cache.join("Roaming")));
+        dirs.push(entry.path().join("LocalState").join(".codex").join("bin"));
+    }
+    dirs
 }
 
 /// `bin\codex.exe`, else the newest-mtime `bin\<version>\codex.exe` — the GUI

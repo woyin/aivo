@@ -351,7 +351,7 @@ impl AILauncher {
                         "Codex desktop app not found. `aivo codex-app` requires the Store package (OpenAI.Codex).",
                         ErrorCategory::User,
                         None::<String>,
-                        Some("Install it from the Microsoft Store: https://apps.microsoft.com/detail/9plm9xgg6vks"),
+                        Some("Install it from the Microsoft Store, where it is now listed as \"ChatGPT\": https://apps.microsoft.com/detail/9plm9xgg6vks"),
                     )
                     .into());
                 };
@@ -366,11 +366,15 @@ impl AILauncher {
                 };
                 let Some(codex_bin) = crate::services::codex_app_wrapper::locate_bundled_codex()
                 else {
+                    let probed = crate::services::codex_app_wrapper::codex_bin_dirs()
+                        .iter()
+                        .map(|dir| format!("\n  - {}", dir.display()))
+                        .collect::<String>();
                     return Err(CLIError::new(
                         "Codex desktop app is installed but its codex runtime isn't materialized yet.",
                         ErrorCategory::User,
-                        None::<String>,
-                        Some("Launch the desktop app once (it installs its codex runtime), quit it, then re-run `aivo codex-app`."),
+                        Some(format!("No codex.exe under any known runtime dir:{probed}")),
+                        Some("Launch the desktop app once (it installs its codex runtime), quit it, then re-run `aivo codex-app`. If a codex.exe already exists somewhere else, point aivo at it with AIVO_CODEX_APP_PATH=<path to codex.exe>."),
                     )
                     .into());
                 };
@@ -1890,8 +1894,9 @@ fn pid_alive(pid: i32) -> bool {
     }
 }
 
-/// Codex Store package identity via `Get-AppxPackage` — stable across Codex-
-/// and ChatGPT-branded builds.
+/// Codex Store package identity via `Get-AppxPackage`. Match identity, never
+/// the display name: the listing renamed to "ChatGPT" but still ships as
+/// `OpenAI.Codex_2p2nqsd0c76g0`.
 #[cfg(windows)]
 #[derive(Debug, Clone, serde::Deserialize)]
 struct WindowsCodexPackage {
