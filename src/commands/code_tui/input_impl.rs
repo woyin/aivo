@@ -657,6 +657,11 @@ impl CodeTuiApp {
         {
             return false;
         }
+        // The `/effort ` draft is picker scaffolding, not typed prose — clear it.
+        if self.active_effort_query().is_some() {
+            self.draft.clear();
+            self.cursor = 0;
+        }
         self.command_menu.dismissed = true;
         self.command_menu.placement = None;
         true

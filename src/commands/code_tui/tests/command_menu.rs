@@ -195,7 +195,7 @@ async fn test_selecting_effort_command_transitions_to_level_menu() {
 }
 
 #[tokio::test]
-async fn test_bare_effort_submit_reopens_level_menu_after_dismiss() {
+async fn test_effort_menu_esc_cancels_and_clears_scaffolding_draft() {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let mut app = make_test_app(tx, rx);
     app.model_reasoning_efforts = vec!["low".into(), "medium".into(), "high".into()];
@@ -206,20 +206,40 @@ async fn test_bare_effort_submit_reopens_level_menu_after_dismiss() {
     app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
         .await
         .unwrap();
-    assert!(app.visible_command_menu().is_none());
 
-    app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+    assert!(app.visible_command_menu().is_none());
+    assert_eq!(app.draft, "");
+    assert_eq!(app.cursor, 0);
+}
+
+#[tokio::test]
+async fn test_esc_keeps_partially_typed_command_draft() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.draft = "/mo".to_string();
+    app.cursor = app.draft.len();
+    app.sync_command_menu_state();
+
+    app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
         .await
         .unwrap();
+
+    assert!(app.visible_command_menu().is_none());
+    assert_eq!(app.draft, "/mo");
+}
+
+#[tokio::test]
+async fn test_bare_effort_command_reopens_level_menu() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.model_reasoning_efforts = vec!["low".into(), "medium".into(), "high".into()];
+
+    app.run_effort_command(None).await;
 
     assert_eq!(app.draft, "/effort ");
     let menu = app.visible_command_menu().expect("effort level menu");
     assert_eq!(menu.kind, MenuKind::Effort);
     assert_eq!(menu.entries.len(), 3);
-    assert!(
-        app.draft_history.last().is_none(),
-        "reopening the menu is not a submitted command"
-    );
 }
 
 #[tokio::test]
