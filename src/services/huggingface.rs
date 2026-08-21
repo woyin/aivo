@@ -1877,7 +1877,14 @@ async fn resolve_gguf_file_uncached(model: &HfModelRef) -> Result<ResolvedGgufFi
                 .next()
                 .unwrap_or(&current.repo)
                 .to_string();
-            let suggestions = search_gguf_mirrors(&basename).await;
+            let mut search_name = basename.clone();
+            let mut suggestions = search_gguf_mirrors(&search_name).await;
+            if suggestions.is_empty()
+                && let Some(stripped) = strip_repo_quant_suffix(&basename)
+            {
+                search_name = stripped.to_string();
+                suggestions = search_gguf_mirrors(&search_name).await;
+            }
             if let Some(chosen) = prompt_pick_mirror(&current.repo, &suggestions) {
                 current.repo = chosen;
                 current.file = None;
@@ -1891,7 +1898,7 @@ async fn resolve_gguf_file_uncached(model: &HfModelRef) -> Result<ResolvedGgufFi
             anyhow::bail!(
                 "Repo `{}` has no GGUF files — it's likely the original safetensors release.\n  {}",
                 current.repo,
-                format_no_gguf_hint(&basename, &suggestions)
+                format_no_gguf_hint(&search_name, &suggestions)
             );
         }
         // Skip `*-of-*.gguf` split parts — loading one in isolation would
@@ -2025,12 +2032,12 @@ fn prompt_pick_mirror(original_repo: &str, suggestions: &[String]) -> Option<Str
 fn format_no_gguf_hint(basename: &str, suggestions: &[String]) -> String {
     if suggestions.is_empty() {
         format!(
-            "Search huggingface.co for `{basename}-GGUF` (community converters: bartowski, lmstudio-community, TheBloke)."
+            "Search huggingface.co for `{basename}-GGUF` (community converters: bartowski, unsloth, lmstudio-community)."
         )
     } else {
         let lines: Vec<String> = suggestions
             .iter()
-            .map(|s| format!("    aivo claude --model hf:{s}"))
+            .map(|s| format!("    aivo hf:{s}"))
             .collect();
         format!("Try one of:\n{}", lines.join("\n"))
     }
@@ -2126,6 +2133,50 @@ async fn search_gguf_mirrors(basename: &str) -> Vec<String> {
         .map(|h| h.id)
         .collect();
     rank_gguf_mirrors(ids)
+}
+
+const REPO_QUANT_SUFFIXES: &[&str] = &[
+    "int2",
+    "int3",
+    "int4",
+    "int8",
+    "fp4",
+    "fp8",
+    "fp16",
+    "bf16",
+    "nvfp4",
+    "mxfp4",
+    "awq",
+    "gptq",
+    "w4a16",
+    "w8a8",
+    "2bit",
+    "3bit",
+    "4bit",
+    "6bit",
+    "8bit",
+    "bnb",
+    "mlx",
+    "quantized",
+];
+
+/// `Ling-3.0-tiny-int4` → `Ling-3.0-tiny`: GGUF mirrors convert the base repo,
+/// so the upstream quant marker finds nothing.
+fn strip_repo_quant_suffix(basename: &str) -> Option<&str> {
+    let mut name = basename;
+    while let Some((head, tail)) = name.rsplit_once('-') {
+        if !REPO_QUANT_SUFFIXES
+            .iter()
+            .any(|s| tail.eq_ignore_ascii_case(s))
+        {
+            break;
+        }
+        name = head;
+    }
+    let bare_marker = REPO_QUANT_SUFFIXES
+        .iter()
+        .any(|s| name.eq_ignore_ascii_case(s));
+    (name.len() < basename.len() && !name.is_empty() && !bare_marker).then_some(name)
 }
 
 /// Stable-promotes well-known converters ahead of noisier community uploads
@@ -3971,6 +4022,27 @@ mod tests {
         ));
         // "unsloth" must be the owner, not a substring of the repo name.
         assert!(!is_trusted_gguf_converter("someone/unsloth-clone-GGUF"));
+    }
+
+    #[test]
+    fn strip_repo_quant_suffix_drops_upstream_quant_markers() {
+        assert_eq!(
+            strip_repo_quant_suffix("Ling-3.0-tiny-int4"),
+            Some("Ling-3.0-tiny")
+        );
+        assert_eq!(
+            strip_repo_quant_suffix("Qwen3-30B-A3B-AWQ"),
+            Some("Qwen3-30B-A3B")
+        );
+        assert_eq!(
+            strip_repo_quant_suffix("Llama-3.1-8B-Instruct-bnb-4bit"),
+            Some("Llama-3.1-8B-Instruct")
+        );
+        assert_eq!(strip_repo_quant_suffix("Ling-3.0-tiny"), None);
+        assert_eq!(strip_repo_quant_suffix("gemma-3-27b-it"), None);
+        // A bare marker must not strip down to an empty query.
+        assert_eq!(strip_repo_quant_suffix("int4"), None);
+        assert_eq!(strip_repo_quant_suffix("awq-int4"), None);
     }
 
     #[test]
