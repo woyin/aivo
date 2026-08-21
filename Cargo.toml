@@ -47,7 +47,7 @@ aes-gcm = "0.10"
 pbkdf2 = "0.12"
 argon2 = "0.5"
 sha2 = "0.10"
-ed25519-dalek = "2"
+ed25519-dalek = { version = "2", default-features = false, features = ["std", "zeroize"] }
 # Direct OS-CSPRNG access (src/services/rng.rs); already in-tree via rustls
 # and the rand_core stack, so this links no additional code.
 getrandom = "0.3"
@@ -77,6 +77,10 @@ shlex = "1.3"
 unicode-width = "0.2"
 tempfile = "3.0"
 url = "2"
+# Transitive pin: keeps url's idna in punycode-only mode, dropping the ICU4X
+# unicode-table stack. Non-ASCII (IDN) hostnames must be pre-punycoded —
+# provider API hosts are ASCII, so nothing user-facing changes.
+idna_adapter = "~1.0"
 
 # Termux DNS fallback; see src/services/dns_resolver.rs. aarch64-only: Termux
 # devices are aarch64, and it keeps ~490 KB off the x86_64-musl size gate.
