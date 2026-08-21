@@ -39,6 +39,8 @@ pub(super) struct CapturingUi {
     pub(super) verify_records: Vec<crate::agent::verify::EvidenceRecord>,
     /// Every typed guard stop, in order.
     pub(super) stops: Vec<TurnStop>,
+    /// `session_message` transcript forms (✉ rows), in order.
+    pub(super) mail_rows: Vec<String>,
 }
 
 impl AgentUi for CapturingUi {
@@ -69,6 +71,9 @@ impl AgentUi for CapturingUi {
     }
     fn verify_evidence(&mut self, record: &crate::agent::verify::EvidenceRecord) {
         self.verify_records.push(record.clone());
+    }
+    fn session_message(&mut self, msg: &crate::services::session_mail::Message) {
+        self.mail_rows.push(msg.transcript_display());
     }
     fn notify_error(&mut self, t: &str) {
         self.errors.push(t.to_string());

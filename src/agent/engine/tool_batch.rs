@@ -391,7 +391,7 @@ Investigate, or call `exit_plan_mode` with your plan."
             } else if n == "list_sessions" {
                 self.list_sessions_result()
             } else if n == "send_session" {
-                self.send_session(&call.arguments).await
+                self.send_session(&call.arguments, &mut *ui).await
             } else if n == "take_note" {
                 // Durable scratchpad (deterministic merge, capped oldest-first). Held in the engine, so it runs in the ordered pass.
                 match notes::parse_note(&call.arguments) {

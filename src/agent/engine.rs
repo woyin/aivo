@@ -111,6 +111,8 @@ record honest: update the plan (mark steps blocked, or remove them with a reason
 `blocked` or `needs_user` with specifics.";
 /// Cap on unstarted-plan nudges per turn.
 const MAX_PLAN_NUDGES: usize = 1;
+/// Cap on unsent-mail-answer nudges per turn.
+const MAX_MAIL_REPLY_NUDGES: usize = 1;
 const PLAN_NUDGE: &str = "You set a plan this turn but haven't started any of its steps. \
 Execute the plan now, updating each step's status as you go. If the work is already done or \
 you can't proceed, call `update_plan` to reflect that (or say exactly what's blocking you), \
@@ -119,6 +121,15 @@ then finish.";
 /// Compaction window assumed when the model's real one is unknown (0); without it
 /// such models never compact and resend the whole transcript. A real window wins.
 pub(crate) const DEFAULT_CONTEXT_WINDOW: usize = 128_000;
+
+/// The incoming mail message a turn should answer. Unfulfilled at turn end:
+/// blocking (sender waits) → auto-deliver the final text; else one nudge.
+#[derive(Clone, Debug)]
+pub struct ReplyObligation {
+    pub peer: String,
+    pub msg_id: String,
+    pub blocking: bool,
+}
 
 /// One verification-plan run; `lines` are the `[self-verify]` marker lines of
 /// the checks that ran.
@@ -265,6 +276,8 @@ pub trait AgentUi: Send {
     fn turn_finished(&mut self, _report: &crate::agent::finish::FinishReport) {}
     /// A self-verification check finished (engine-observed, not model-claimed). Default no-op.
     fn verify_evidence(&mut self, _record: &verify::EvidenceRecord) {}
+    /// Peer mail surfaced mid-turn (wait reply / handed-over question). Default no-op.
+    fn session_message(&mut self, _msg: &crate::services::session_mail::Message) {}
     /// Like [`notify`](Self::notify) but for a genuine error (error hue). Default delegates to `notify`.
     fn notify_error(&mut self, text: &str) {
         self.notify(text);
@@ -611,6 +624,9 @@ pub struct AgentEngine {
     jobs: Option<crate::agent::jobs::SharedJobs>,
     /// Open-session mailbox; `None` → `list_sessions`/`send_session` unadvertised.
     session_mail: Option<crate::services::session_mail::SessionMail>,
+    reply_obligation: Option<ReplyObligation>,
+    /// Last non-empty assistant text this turn — the auto-reply body.
+    turn_last_text: Option<String>,
     /// User lifecycle hooks; `None` = none configured. Shared with sub-engines.
     hooks: Option<std::sync::Arc<crate::agent::hooks::HookSet>>,
     /// `--max-cost`: stop the turn at this estimated spend (USD; 0 = off).

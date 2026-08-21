@@ -2688,6 +2688,8 @@ pub(super) enum RuntimeEvent {
     AgentDiscardSegment,
     /// The engine consumed a mid-turn interjection — commit it at the injection point.
     AgentSteered(String),
+    /// Peer mail surfaced mid-turn, in `transcript_display` form; committed as a ✉ row.
+    AgentSessionMail(String),
     /// A background MCP connect finished. Carries the client (possibly empty) and
     /// the generation it started under; the event loop caches it and rebuilds the
     /// engine if it brought tools, but drops a result from a stale generation.
@@ -3378,6 +3380,8 @@ pub(super) struct CodeTuiApp {
     /// Session-mail messages seen waiting while a turn ran; the "arrives when
     /// this turn ends" notice fires only when this count grows.
     pub(super) mail_waiting_seen: usize,
+    /// Claimed mail the outgoing turn should answer; consumed on every dispatch route.
+    pub(super) pending_reply_obligation: Option<crate::agent::engine::ReplyObligation>,
     /// Mid-turn steering handoff to the engine task; leftovers reclaim into
     /// `queued_messages` at turn end, cleared with it on interrupt/cancel.
     pub(super) steering_queue: SteeringQueue,
@@ -3809,6 +3813,7 @@ impl CodeTuiApp {
             model_reasoning_efforts: Vec::new(),
             queued_messages: Vec::new(),
             mail_waiting_seen: 0,
+            pending_reply_obligation: None,
             steering_queue: SteeringQueue::default(),
             queued_commands: Vec::new(),
             queue_focus: None,

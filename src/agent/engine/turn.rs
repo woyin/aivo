@@ -71,6 +71,7 @@ impl AgentEngine {
         let mut completion_nudges = 0usize;
         let mut plan_nudges = 0usize;
         let mut truncated_nudges = 0usize;
+        let mut mail_nudges = 0usize;
         let mut empty_retries = 0usize;
         // Keeps a stale plan from an earlier turn from triggering the nudge.
         let mut plan_set_this_turn = false;
@@ -86,6 +87,7 @@ impl AgentEngine {
         self.turn_usage = SessionTokens::default();
         self.finish_report = None;
         self.finish_rejections = 0;
+        self.turn_last_text = None;
         // Last step's prompt+completion — the real context fill (`tokens` re-counts the prompt each step).
         let mut context_tokens = 0u64;
         let started = Instant::now();
@@ -360,6 +362,14 @@ impl AgentEngine {
                 continue;
             }
             self.messages.push(assistant_to_openai(&message));
+            if let Some(c) = message
+                .content
+                .as_deref()
+                .map(str::trim)
+                .filter(|c| !c.is_empty())
+            {
+                self.turn_last_text = Some(c.to_string());
+            }
 
             if message.tool_calls.is_empty() {
                 // A kept truncated partial isn't a finished answer — nudge the model
@@ -376,6 +386,20 @@ impl AgentEngine {
                     ui.notify_error(
                         "the connection dropped mid-reply — the answer above may be incomplete",
                     );
+                }
+                // Mail-opened turn that never sent anything back — one nudge; the model decides.
+                if mail_nudges < MAX_MAIL_REPLY_NUDGES
+                    && self.turn_last_text.is_some()
+                    && let Some(nudge) = self
+                        .reply_obligation
+                        .as_ref()
+                        .filter(|o| !o.blocking)
+                        .map(|o| mail_reply_nudge(&o.peer, &o.msg_id))
+                {
+                    mail_nudges += 1;
+                    ui.notify("nothing was sent to the messaging session — asking the model");
+                    self.push_text_turn("user", nudge);
+                    continue;
                 }
                 // A text-only turn that isn't actually done shouldn't be accepted as the
                 // final answer — nudge once (bounded). The assistant turn is already
@@ -582,6 +606,7 @@ impl AgentEngine {
             ui.notify(&format!("reached the step limit ({})", self.max_steps));
             ui.turn_stopped(TurnStop::StepLimit);
         }
+        self.fulfill_reply_obligation(ui);
         ui.footer(
             None,
             steps,

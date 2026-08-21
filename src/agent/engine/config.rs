@@ -92,6 +92,8 @@ impl AgentEngine {
             lsp: None,
             jobs: None,
             session_mail: None,
+            reply_obligation: None,
+            turn_last_text: None,
             hooks: None,
             max_cost_usd: 0.0,
             cost_pricing: None,
@@ -167,6 +169,12 @@ impl AgentEngine {
             self.tools_openai
                 .push(tool_to_openai(send_session_tool_spec()));
         }
+    }
+
+    /// Arm (or clear) the turn's reply obligation; set every turn so a stale
+    /// one can't leak forward.
+    pub fn set_reply_obligation(&mut self, obligation: Option<ReplyObligation>) {
+        self.reply_obligation = obligation;
     }
 
     /// Enable LSP diagnostics-after-edit rooted at `cwd` (default on; `AIVO_AGENT_LSP=0`

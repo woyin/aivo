@@ -445,12 +445,19 @@ impl CodeTuiApp {
         let route_agent = self.agent_capable() && !self.test_force_plain_route;
         #[cfg(not(test))]
         let route_agent = self.agent_capable();
+        let reply_obligation = self.pending_reply_obligation.take();
         if self.key.is_cursor_acp() {
             self.push_acp_checkpoint();
             self.spawn_cursor_turn(input, attachments);
         } else if route_agent {
-            self.spawn_agent_turn(input, attachments, vision_shim, placeholder_images)
-                .await;
+            self.spawn_agent_turn(
+                input,
+                attachments,
+                vision_shim,
+                placeholder_images,
+                reply_obligation,
+            )
+            .await;
         } else {
             // Plain chat's finish path never auto-continues — a goal reaching
             // here (key switched mid-loop) would stall armed, so disarm it.
@@ -579,6 +586,11 @@ impl CodeTuiApp {
                 crate::services::session_mail::short_sid(&msg.from)
             ),
         ));
+        self.pending_reply_obligation = Some(crate::agent::engine::ReplyObligation {
+            peer: msg.from.clone(),
+            msg_id: msg.id.clone(),
+            blocking: msg.awaiting_reply,
+        });
         self.dispatch_user_message_shown(msg.agent_frame(), None, Some(msg.transcript_display()))
             .await?;
         Ok(true)
@@ -839,6 +851,7 @@ impl CodeTuiApp {
         attachments: Vec<MessageAttachment>,
         vision_shim: Option<DescriberSource>,
         placeholder_images: bool,
+        reply_obligation: Option<crate::agent::engine::ReplyObligation>,
     ) {
         use crate::agent::engine::{AgentEngine, TurnCtx};
 
@@ -1173,6 +1186,7 @@ impl CodeTuiApp {
             };
             let mut engine = engine.lock().await;
             engine.set_context_window(context_window);
+            engine.set_reply_obligation(reply_obligation);
             engine.set_thinking_enabled(thinking_enabled);
             engine.set_web_search_enabled(web_search_enabled);
             engine.set_agent_tools_enabled(agent_tools_enabled);
@@ -4335,6 +4349,12 @@ impl crate::agent::engine::AgentUi for ChatAgentUi {
     fn context_usage(&mut self, tokens: u64, measured: bool) {
         self.tx
             .send(RuntimeEvent::AgentContext { tokens, measured })
+            .ok();
+    }
+
+    fn session_message(&mut self, msg: &crate::services::session_mail::Message) {
+        self.tx
+            .send(RuntimeEvent::AgentSessionMail(msg.transcript_display()))
             .ok();
     }
 

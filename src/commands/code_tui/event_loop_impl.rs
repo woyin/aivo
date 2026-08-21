@@ -161,6 +161,7 @@ impl CodeTuiApp {
             RuntimeEvent::AgentToolOutput { chunk } => self.push_tool_output(&chunk),
             RuntimeEvent::AgentToolResult { content } => self.apply_agent_tool_result(content),
             RuntimeEvent::AgentSteered(text) => self.apply_agent_steered(text),
+            RuntimeEvent::AgentSessionMail(display) => self.apply_agent_session_mail(display),
             RuntimeEvent::AgentDiscardSegment => self.discard_streamed_segment(),
             RuntimeEvent::McpConnected { client, generation } => {
                 // Drop a connect that started before a `/mcp` toggle changed the
@@ -942,6 +943,18 @@ impl CodeTuiApp {
             attachments: vec![],
         });
         self.notice = Some((MUTED(), "Interjection delivered".to_string()));
+    }
+
+    /// Commit mid-turn peer mail as a ✉ row (otherwise only a folded tool result).
+    pub(super) fn apply_agent_session_mail(&mut self, display: String) {
+        self.flush_pending_assistant();
+        self.history.push(ChatMessage {
+            model: None,
+            role: "user".to_string(),
+            content: display,
+            reasoning_content: None,
+            attachments: vec![],
+        });
     }
 
     /// Render an `update_plan` call as a SINGLE checklist card. The model resends

@@ -72,7 +72,11 @@ impl AgentEngine {
         Ok(out)
     }
 
-    pub(super) async fn send_session(&self, args: &Value) -> Result<String, String> {
+    pub(super) async fn send_session(
+        &mut self,
+        args: &Value,
+        ui: &mut dyn AgentUi,
+    ) -> Result<String, String> {
         let Some(mail) = &self.session_mail else {
             return Err("send_session: session mailbox not available here.".to_string());
         };
@@ -103,6 +107,11 @@ impl AgentEngine {
         let peer = mail
             .resolve_peer(target)
             .map_err(|e| format!("send_session: {e}"))?;
+        let obligation = match &self.reply_obligation {
+            Some(o) if o.peer == peer.session_id => Some(o.msg_id.clone()),
+            _ => None,
+        };
+        let reply_to = obligation.as_deref().or(reply_to);
         let own_cwd = crate::services::system_env::current_dir_string();
         let msg_id = if wait {
             mail.send_awaiting_reply(&peer.session_id, text, reply_to, own_cwd)
@@ -110,6 +119,9 @@ impl AgentEngine {
             mail.send(&peer.session_id, text, reply_to, own_cwd)
         }
         .map_err(|e| format!("send_session: delivery failed: {e}"))?;
+        if obligation.is_some() {
+            self.reply_obligation = None;
+        }
         let to = short_sid(&peer.session_id);
         if !wait {
             return Ok(format!(
@@ -126,6 +138,14 @@ as a new incoming message."
         let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
         loop {
             if let Some(reply) = mail.take_reply(&msg_id) {
+                ui.session_message(&reply);
+                // The exchange may continue — thread the next send to this
+                // reply, and nudge a turn that answers only locally.
+                self.reply_obligation = Some(ReplyObligation {
+                    peer: reply.from.clone(),
+                    msg_id: reply.id.clone(),
+                    blocking: false,
+                });
                 // The id lets a follow-up round set reply_to correctly.
                 return Ok(format!(
                     "Reply from session {} (message id: {}):\n{}",
@@ -138,6 +158,13 @@ as a new incoming message."
             // neither side would ever claim the other's mail. Hand its
             // question over instead of sitting out both timeouts.
             if let Some(cross) = mail.take_awaiting_from(&peer.session_id) {
+                ui.session_message(&cross);
+                // The handed-over question's sender is blocked on it.
+                self.reply_obligation = Some(ReplyObligation {
+                    peer: cross.from.clone(),
+                    msg_id: cross.id.clone(),
+                    blocking: true,
+                });
                 return Ok(format!(
                     "No reply yet — session {to} is itself blocked waiting for YOUR answer, \
 so it can't respond until you do. Its message:\n\n{frame}\n\n(Your own message stays \
@@ -161,6 +188,44 @@ resend unless you have something new to say.",
             tokio::time::sleep(std::time::Duration::from_millis(REPLY_POLL_MS)).await;
         }
     }
+
+    /// Turn-end backstop: an unfulfilled blocking obligation gets the turn's
+    /// final text as the reply; non-blocking just clears.
+    pub(super) fn fulfill_reply_obligation(&mut self, ui: &mut dyn AgentUi) {
+        let Some(ob) = self.reply_obligation.take() else {
+            return;
+        };
+        if !ob.blocking {
+            return;
+        }
+        let ReplyObligation { peer, msg_id, .. } = ob;
+        let Some(mail) = &self.session_mail else {
+            return;
+        };
+        let text = match &self.turn_last_text {
+            Some(t) => t.clone(),
+            None => match &self.finish_report {
+                Some(r) if !r.summary.trim().is_empty() => r.summary.clone(),
+                _ => return,
+            },
+        };
+        let own_cwd = crate::services::system_env::current_dir_string();
+        if mail.send(&peer, &text, Some(&msg_id), own_cwd).is_ok() {
+            ui.notify(&format!(
+                "answer auto-delivered to waiting session {}",
+                short_sid(&peer)
+            ));
+        }
+    }
+}
+
+pub(super) fn mail_reply_nudge(peer: &str, msg_id: &str) -> String {
+    format!(
+        "You haven't sent anything to the session whose message opened this turn — text in this \
+transcript does NOT reach it. If your answer above is meant for that session, send it now with \
+send_session(target=\"{}\", reply_to=\"{msg_id}\"). If no reply is needed, just finish.",
+        short_sid(peer)
+    )
 }
 
 fn age_label(millis: u64) -> String {
