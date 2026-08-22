@@ -108,6 +108,7 @@ pub(crate) mod code_agent_oneshot;
 pub(crate) mod code_request_builder;
 pub(crate) mod code_response_parser;
 pub(crate) mod code_tui_format;
+pub mod engine_assembly;
 pub mod guide;
 pub mod hf;
 pub mod info;

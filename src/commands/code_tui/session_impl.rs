@@ -3573,14 +3573,7 @@ is preserved."
 // `aivo code mcp add` shares them; re-exported for the call sites and tests here.
 pub(super) use crate::agent::mcp::{bare_url_to_config, dedupe_name, parse_mcp_add_input};
 
-/// Stable key for the per-repo project-MCP allow-list: the canonicalized cwd
-/// (symlinks resolved, so the same repo reached two ways shares one decision),
-/// falling back to the raw path when it can't be canonicalized.
-pub(super) fn canonical_dir_key(cwd: &str) -> String {
-    std::fs::canonicalize(cwd)
-        .map(|p| p.to_string_lossy().into_owned())
-        .unwrap_or_else(|_| cwd.to_string())
-}
+pub(super) use crate::agent::mcp::canonical_dir_key;
 
 /// Appended to a `-p/--project` add/install notice: repo-local skills are
 /// advertised to the model inside `<untrusted>` (the dir changes under `git

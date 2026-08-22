@@ -1622,26 +1622,7 @@ pub(super) struct PlanContinuePrompt {
 }
 
 /// Content digest of a repo's project `.mcp.json` stdio servers — the exact
-/// `(name, "command args…")` set the user is shown on the consent card, already
-/// sorted by name. An "always" approval is bound to this digest, so a later
-/// edit that swaps in a different command changes the hash and re-prompts rather
-/// than silently reusing the old consent. (Covers the spawn command + args; env
-/// is not yet folded in.)
-pub(super) fn project_mcp_digest(servers: &[(String, String)]) -> String {
-    use sha2::{Digest, Sha256};
-    let mut hasher = Sha256::new();
-    for (name, display) in servers {
-        hasher.update(name.as_bytes());
-        hasher.update([0u8]);
-        hasher.update(display.as_bytes());
-        hasher.update([0u8]);
-    }
-    hasher
-        .finalize()
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect()
-}
+pub(super) use crate::agent::mcp::project_mcp_digest;
 
 #[derive(Clone)]
 pub(super) enum Overlay {

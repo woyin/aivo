@@ -19,10 +19,9 @@ use std::path::Path;
 use futures::future::BoxFuture;
 use serde_json::{Value, json};
 
-use crate::agent::engine::{AgentEngine, AgentUi, TurnCtx, TurnStop};
+use crate::agent::engine::{AgentUi, TurnCtx, TurnStop};
 use crate::agent::finish::{FinishReport, FinishStatus};
 use crate::agent::protocol::Decision;
-use crate::agent::system_prompt::discover_project_guides;
 use crate::errors::ExitCode;
 use crate::services::image_generate::GeneratorSource;
 use crate::services::models_cache::ModelsCache;
@@ -269,25 +268,32 @@ async fn run_agent_captured(
     .min(u32::MAX as u64) as u32;
 
     let date = chrono::Local::now().format("%Y-%m-%d").to_string();
-    let guides = discover_project_guides(Path::new(&cwd));
-    // Same assembler as the TUI: disabled skills respected, create-agent advertised.
-    let disabled: std::collections::HashSet<String> = session_store
-        .get_disabled_skills()
-        .await
-        .unwrap_or_default()
-        .into_iter()
-        .collect();
-    let skills = crate::agent::skills::engine_skills(Path::new(&cwd), &disabled);
     let max_steps = cli_env_or(limits.max_steps, "AIVO_AGENT_MAX_STEPS", DEFAULT_MAX_STEPS);
-    let mut engine = AgentEngine::new(
-        &cwd,
+    let session_id = resumed
+        .as_ref()
+        .map(|s| s.session_id.clone())
+        .unwrap_or_else(crate::commands::code::new_code_session_id);
+    // Temp job/artifact dirs, keyed by pid + nonce so concurrent best-of-n
+    // candidates don't share them; killed/cleaned at run end.
+    let nonce = opts.nonce;
+    let jobs = crate::agent::jobs::JobTable::new(Some(
+        std::env::temp_dir().join(format!("aivo-jobs-{}-{nonce}", std::process::id())),
+    ));
+    let (mut engine, mail) = crate::commands::engine_assembly::EngineAssembly {
+        session_store,
+        cwd: &cwd,
         model,
-        &date,
-        &guides,
-        &skills,
+        base_url: &key.base_url,
         context_window,
         max_steps,
-    );
+        injected_context: injected_context.as_deref(),
+        jobs: jobs.clone(),
+        artifacts_dir: std::env::temp_dir()
+            .join(format!("aivo-artifacts-{}-{nonce}", std::process::id())),
+        session_id: &session_id,
+    }
+    .build()
+    .await;
     engine.set_output_budget(cli_env_or(
         limits.max_output_tokens,
         "AIVO_AGENT_MAX_OUTPUT_TOKENS",
@@ -315,41 +321,17 @@ async fn run_agent_captured(
         }
         Some(false) => {}
     }
-    if crate::services::provider_profile::is_aivo_starter_base(&key.base_url) {
-        engine.set_first_party();
-    }
-    if let Some(ctx) = injected_context.as_deref() {
-        engine.append_system_context(ctx);
-    }
     if let Some(directive) = opts.extra_directive.as_deref() {
         engine.append_system_context(directive);
     }
-    let subagents =
-        crate::agent::subagents::discover_subagents(Path::new(&cwd), session_store.config_dir());
-    engine.set_subagents(&subagents);
-    // Delegations re-resolve profiles from disk — a profile the model authors
-    // during this run is delegatable in the same run (headless has no next turn).
-    engine.set_agents_dir(session_store.config_dir());
-    // Persistent grant store: remembered "always allow"s survive across runs.
-    engine.set_grants_path(session_store.config_dir());
-    // Temp job/artifact dirs, keyed by pid + nonce so concurrent best-of-n
-    // candidates don't share them; killed/cleaned at run end.
-    let nonce = opts.nonce;
-    let jobs = crate::agent::jobs::JobTable::new(Some(
-        std::env::temp_dir().join(format!("aivo-jobs-{}-{nonce}", std::process::id())),
-    ));
-    engine.set_jobs(jobs.clone());
-    // Durable sub-agent reports: without this, a long headless run's delegated
-    // work gets stubbed away by in-run compaction.
-    engine.set_artifacts_dir(
-        std::env::temp_dir().join(format!("aivo-artifacts-{}-{nonce}", std::process::id())),
-    );
-    // LSP diagnostics-after-edit (default on; AIVO_AGENT_LSP=0 opts out).
-    engine.maybe_enable_lsp(Path::new(&cwd));
-    // User lifecycle hooks (~/.config/aivo/hooks.json).
-    engine.set_hooks(std::sync::Arc::new(
-        crate::agent::hooks::HookSet::load_default(),
-    ));
+    // MCP: same servers and opt-outs as the TUI; project stdio servers are
+    // consent-gated fail-closed (no card headless). Inline connect — a headless
+    // run has no UI to freeze, and the no-config case is empty + instant.
+    if let Some(ext) =
+        crate::commands::engine_assembly::headless_external_tools(session_store, &cwd).await
+    {
+        engine.set_external_tools(ext);
+    }
 
     // Resume: best fidelity first (exact engine log, else display text). The
     // session was resolved up front (for model restore); replay it into the engine.
@@ -367,20 +349,13 @@ async fn run_agent_captured(
             }
         }
     }
-    let session_id = resumed
-        .as_ref()
-        .map(|s| s.session_id.clone())
-        .unwrap_or_else(crate::commands::code::new_code_session_id);
     let import_fidelity = resumed.as_ref().and_then(|s| s.import_fidelity.clone());
     let resumed_messages = resumed.map(|s| s.messages).unwrap_or_default();
 
     // Open-session comms: a headless run is an open session too — register
-    // presence so a peer it messages can address a reply back, and take the tools.
-    let mail =
-        crate::services::session_mail::SessionMail::new(session_store.config_dir(), &session_id);
+    // presence on the assembly's mail so a peer it messages can address a reply back.
     let _mail_presence = crate::services::session_mail::PresenceGuard::new(mail.clone());
     let _ = mail.register(Some(cwd.clone()), Some(model.to_string()));
-    engine.set_session_mail(mail);
 
     // `--image-model` overrides loudly (an explicit flag must not silently
     // no-op); otherwise the `/config` generator resolves quietly like the TUI —

@@ -631,3 +631,108 @@ fn exec_finish_turn_blocked_exits_1_with_a_finished_event() {
     assert_eq!(finished["blocker"], "missing API key");
     assert_eq!(events.last().unwrap()["exit"], 1);
 }
+
+/// Python mock MCP stdio server (same protocol shape as the mcp.rs e2e).
+#[cfg(unix)]
+const MOCK_MCP_SERVER: &str = r#"
+import sys, json
+def send(o):
+    sys.stdout.write(json.dumps(o)+"\n"); sys.stdout.flush()
+for line in sys.stdin:
+    line=line.strip()
+    if not line: continue
+    m=json.loads(line)
+    method=m.get("method")
+    if method=="initialize":
+        send({"jsonrpc":"2.0","id":m["id"],"result":{"protocolVersion":"2024-11-05","capabilities":{},"serverInfo":{"name":"fake","version":"1"}}})
+    elif method=="tools/list":
+        send({"jsonrpc":"2.0","id":m["id"],"result":{"tools":[{"name":"echo","description":"echoes input","inputSchema":{"type":"object","properties":{"text":{"type":"string"}}}}]}})
+    elif method=="tools/call":
+        a=m["params"].get("arguments",{})
+        send({"jsonrpc":"2.0","id":m["id"],"result":{"content":[{"type":"text","text":"echoed: "+str(a.get("text",""))}]}})
+"#;
+
+#[cfg(unix)]
+fn python3_available() -> bool {
+    Command::new("python3")
+        .arg("--version")
+        .output()
+        .is_ok_and(|o| o.status.success())
+}
+
+/// USER-scope MCP servers (no local-code consent gate) are connected and their
+/// tools callable under `-e` — the headless path offers the same MCP surface as
+/// the TUI.
+#[cfg(unix)]
+#[test]
+fn exec_connects_user_scope_mcp_and_calls_its_tool() {
+    if !python3_available() {
+        return;
+    }
+    let env = ExecEnv::new();
+    let config = serde_json::json!({"mcpServers":{
+        "fake": {"command": "python3", "args": ["-c", MOCK_MCP_SERVER]}
+    }});
+    std::fs::write(env.config.join("mcp.json"), config.to_string()).unwrap();
+
+    let out = env.code_exec(
+        r#"[
+            {"tools": [{"name": "mcp__fake__echo", "args": {"text": "from oneshot"}}]},
+            {"text": "mcp tool ran"}
+        ]"#,
+        "call the echo tool",
+        &[],
+    );
+    assert!(out.status.success(), "stderr:\n{}", stderr_str(&out));
+    assert!(stdout_str(&out).contains("mcp tool ran"));
+    // The session transcript carries the server's real reply.
+    let err = stderr_str(&out);
+    let id = err
+        .lines()
+        .find(|l| l.contains("continue with --resume"))
+        .and_then(|l| l.split_whitespace().last())
+        .map(|s| s.trim_end_matches(']'))
+        .unwrap_or_else(|| panic!("no resume hint in stderr:\n{err}"));
+    let session = std::fs::read_to_string(env.session_file(id)).unwrap();
+    assert!(
+        session.contains("echoed: from oneshot"),
+        "MCP tool result missing from the transcript:\n{session}"
+    );
+}
+
+/// A repo's project `.mcp.json` STDIO server runs local code; with no TTY to ask
+/// consent on, `-e` must hold it back (fail closed) — the tool is not available.
+#[cfg(unix)]
+#[test]
+fn exec_holds_back_unapproved_project_stdio_mcp() {
+    if !python3_available() {
+        return;
+    }
+    let env = ExecEnv::new();
+    let config = serde_json::json!({"mcpServers":{
+        "fake": {"command": "python3", "args": ["-c", MOCK_MCP_SERVER]}
+    }});
+    std::fs::write(env.proj.path().join(".mcp.json"), config.to_string()).unwrap();
+
+    let out = env.code_exec(
+        r#"[
+            {"tools": [{"name": "mcp__fake__echo", "args": {"text": "sneaky"}}]},
+            {"text": "done anyway"}
+        ]"#,
+        "call the echo tool",
+        &[],
+    );
+    assert!(out.status.success(), "stderr:\n{}", stderr_str(&out));
+    let err = stderr_str(&out);
+    let id = err
+        .lines()
+        .find(|l| l.contains("continue with --resume"))
+        .and_then(|l| l.split_whitespace().last())
+        .map(|s| s.trim_end_matches(']'))
+        .unwrap_or_else(|| panic!("no resume hint in stderr:\n{err}"));
+    let session = std::fs::read_to_string(env.session_file(id)).unwrap();
+    assert!(
+        !session.contains("echoed: sneaky"),
+        "unapproved project stdio server ran headless:\n{session}"
+    );
+}

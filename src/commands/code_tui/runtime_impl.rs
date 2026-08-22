@@ -853,7 +853,7 @@ impl CodeTuiApp {
         placeholder_images: bool,
         reply_obligation: Option<crate::agent::engine::ReplyObligation>,
     ) {
-        use crate::agent::engine::{AgentEngine, TurnCtx};
+        use crate::agent::engine::TurnCtx;
 
         // Self-verify at declared-done: opt-in normally, default-on under goal mode.
         let self_correct =
@@ -917,21 +917,6 @@ impl CodeTuiApp {
                 } else {
                     None
                 };
-            let date = chrono::Local::now().format("%Y-%m-%d").to_string();
-            let guides = crate::agent::system_prompt::discover_project_guides(
-                std::path::Path::new(&real_cwd),
-            );
-            // Discovered skills minus `/skills`-disabled, plus the create-agent
-            // builtin (natural-language subagent authoring via the `skill` tool).
-            let disabled: std::collections::HashSet<String> = self
-                .session_store
-                .get_disabled_skills()
-                .await
-                .unwrap_or_default()
-                .into_iter()
-                .collect();
-            let skills =
-                crate::agent::skills::engine_skills(std::path::Path::new(&real_cwd), &disabled);
             // A `--max-context` override wins; otherwise resolve from catalog/snapshot.
             let context_window = match self.context_window_override {
                 Some(w) => w,
@@ -945,25 +930,21 @@ impl CodeTuiApp {
                 .unwrap_or(0),
             }
             .min(u32::MAX as u64) as u32;
-            let mut engine = AgentEngine::new(
-                &real_cwd,
-                &self.model,
-                &date,
-                &guides,
-                &skills,
+            let (mut engine, _mail) = crate::commands::engine_assembly::EngineAssembly {
+                session_store: &self.session_store,
+                cwd: &real_cwd,
+                model: &self.model,
+                base_url: &self.key.base_url,
                 context_window,
-                0,
-            );
+                max_steps: 0,
+                injected_context: self.injected_context.as_deref(),
+                jobs: self.jobs.clone(),
+                artifacts_dir: self.session_store.session_artifacts_dir(&self.session_id),
+                session_id: &self.session_id,
+            }
+            .build()
+            .await;
             engine.prefix_cache_seen = prior_prefix_cache;
-            // The bundled aivo-starter provider is first-party: brand the agent so it
-            // presents as aivo's assistant instead of disclosing the upstream model.
-            // BYOK keys stay honest (no branding).
-            if crate::services::provider_profile::is_aivo_starter_base(&self.key.base_url) {
-                engine.set_first_party();
-            }
-            if let Some(ctx) = self.injected_context.as_deref() {
-                engine.append_system_context(ctx);
-            }
             // Enable `/rewind` tree-checkpointing (top-level chat only — sub-engines
             // never call this, so they don't pay the git cost).
             engine.enable_rewind_checkpoints(&real_cwd);
@@ -979,33 +960,6 @@ impl CodeTuiApp {
                 effort_levels: self.model_reasoning_efforts.clone(),
                 inline_images: self.inline_images.caps.enabled(),
             });
-            // Share the live thinking toggle so the engine requests reasoning (on
-            // reasoning-capable models) only while thinking is on.
-            // Named specialist sub-agents (project `.aivo/agents`/`.claude/agents`,
-            // then `~/.config/aivo/agents`); the model delegates via `agent`.
-            let subagents = crate::agent::subagents::discover_subagents(
-                std::path::Path::new(&real_cwd),
-                self.session_store.config_dir(),
-            );
-            engine.set_subagents(&subagents);
-            // Delegations re-resolve profiles from disk, so one authored or edited
-            // mid-turn runs correctly even before the advert refreshes.
-            engine.set_agents_dir(self.session_store.config_dir());
-            // Persistent grant store so "always allow"s survive across sessions.
-            engine.set_grants_path(self.session_store.config_dir());
-            // Durable sub-agent reports under this session's artifacts dir (survive compaction).
-            engine.set_artifacts_dir(self.session_store.session_artifacts_dir(&self.session_id));
-            engine.set_jobs(self.jobs.clone());
-            engine.set_session_mail(crate::services::session_mail::SessionMail::new(
-                self.session_store.config_dir(),
-                &self.session_id,
-            ));
-            // LSP diagnostics-after-edit (default on; AIVO_AGENT_LSP=0 opts out).
-            engine.maybe_enable_lsp(std::path::Path::new(&real_cwd));
-            // User lifecycle hooks (~/.config/aivo/hooks.json).
-            engine.set_hooks(std::sync::Arc::new(
-                crate::agent::hooks::HookSet::load_default(),
-            ));
             // Carry prior conversation in, best fidelity first: a resumed session's
             // durable transcript, else the outgoing engine's messages on a model
             // switch (both verbatim), else the lossy text seed of display history.

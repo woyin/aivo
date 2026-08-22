@@ -306,6 +306,35 @@ pub fn project_stdio_servers(cwd: &Path) -> Vec<(String, String)> {
     out
 }
 
+/// Stable key for the per-repo project-MCP allow-list: the canonicalized cwd
+/// (symlinks resolved, so the same repo reached two ways shares one decision),
+/// falling back to the raw path when it can't be canonicalized.
+pub fn canonical_dir_key(cwd: &str) -> String {
+    std::fs::canonicalize(cwd)
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| cwd.to_string())
+}
+
+/// Digest of a [`project_stdio_servers`] set. An "always" approval is bound to
+/// this digest, so a later edit that swaps in a different command changes the
+/// hash and re-prompts rather than silently reusing the old consent. (Covers the
+/// spawn command + args; env is not yet folded in.)
+pub fn project_mcp_digest(servers: &[(String, String)]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    for (name, display) in servers {
+        hasher.update(name.as_bytes());
+        hasher.update([0u8]);
+        hasher.update(display.as_bytes());
+        hasher.update([0u8]);
+    }
+    hasher
+        .finalize()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
 /// Read the user `mcp.json` as a JSON object for a read-modify-write, preserving
 /// any sibling keys. `Ok(empty)` only when the file is genuinely absent (or
 /// blank); `Err` when it exists but is present-but-unparseable (a JSON typo) or
