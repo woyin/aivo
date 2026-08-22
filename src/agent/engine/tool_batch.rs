@@ -2,6 +2,8 @@
 
 use super::*;
 
+use crate::agent::permission::{self, PermissionAction, Resolution};
+
 impl AgentEngine {
     /// Execute one turn's batch of tool calls, appending a `tool` message for each
     /// in call order: classify + permission-gate up front, run side-effect-free
@@ -156,44 +158,49 @@ Investigate, or call `exit_plan_mode` with your plan."
             } else {
                 Vec::new()
             };
+            // At most one prompt per call: a remote gate that had to ask covers the
+            // confirm gate too; passed silently (grant), the confirm gate still applies.
             let allowed = if catastrophic || plan_bash {
-                let preview = tools::preview(n, &call.arguments);
-                // Allow and AlwaysAllow both run it once only — never remembered.
-                !matches!(
-                    ui.ask_permission(n, preview.as_deref(), true).await,
-                    Decision::Deny
+                self.resolve_permission(
+                    ctx,
+                    ui,
+                    PermissionAction::Once {
+                        ask_name: n,
+                        preview: tools::preview(n, &call.arguments),
+                    },
                 )
-            } else if remote_side_effect
-                && !self.grants.covers(n, &call.arguments, ctx.cwd)
-                && !self.grants.covers_remote(&remote_families)
-            {
-                let preview = tools::preview(n, &call.arguments);
-                match ui.ask_permission(n, preview.as_deref(), false).await {
-                    Decision::Allow => true,
-                    Decision::AlwaysAllow => {
-                        if remote_families.is_empty() {
-                            self.grants.remember(n, &call.arguments, ctx.cwd);
-                        } else {
-                            self.grants.remember_remote(&remote_families);
-                        }
-                        true
-                    }
-                    Decision::Deny => false,
-                }
-            } else if !needs_confirm
-                || ctx.auto_approve_enabled()
-                || self.grants.covers(n, &call.arguments, ctx.cwd)
-            {
-                true
+                .await
+                .allowed()
             } else {
-                let preview = tools::preview(n, &call.arguments);
-                match ui.ask_permission(n, preview.as_deref(), false).await {
-                    Decision::Allow => true,
-                    Decision::AlwaysAllow => {
-                        self.grants.remember(n, &call.arguments, ctx.cwd);
-                        true
-                    }
-                    Decision::Deny => false,
+                let remote = if remote_side_effect {
+                    self.resolve_permission(
+                        ctx,
+                        ui,
+                        PermissionAction::Remote {
+                            name: n,
+                            args: &call.arguments,
+                            families: &remote_families,
+                        },
+                    )
+                    .await
+                } else {
+                    Resolution::Covered
+                };
+                match remote {
+                    Resolution::Denied => false,
+                    Resolution::Approved => true,
+                    Resolution::Covered if !needs_confirm => true,
+                    Resolution::Covered => self
+                        .resolve_permission(
+                            ctx,
+                            ui,
+                            PermissionAction::Confirm {
+                                name: n,
+                                args: &call.arguments,
+                            },
+                        )
+                        .await
+                        .allowed(),
                 }
             };
             if !allowed {
@@ -786,11 +793,11 @@ Before calling `{tool}` again, make its arguments match this schema exactly:\n{s
                 "{command}\n\nThe workspace sandbox blocked this, and it names a protected \
 path (aivo's config dir or ~/.ssh). Re-run the full command with no write confinement?"
             );
-            if matches!(
-                ui.ask_permission("run_bash_unsandboxed", Some(&preview), true)
-                    .await,
-                Decision::Deny
-            ) {
+            let action = PermissionAction::Once {
+                ask_name: "run_bash_unsandboxed",
+                preview: Some(preview),
+            };
+            if !self.resolve_permission(ctx, ui, action).await.allowed() {
                 return outcome.result;
             }
             ui.notify(SANDBOX_ESCALATION_NOTICE);
@@ -800,26 +807,16 @@ path (aivo's config dir or ~/.ssh). Re-run the full command with no write confin
             .await;
         }
         // Scoped to the exact command so "always" doesn't blanket-escalate every bash call.
-        let ekey = format!("run_bash_unsandboxed\u{0}{command}");
-        let approved = ctx.auto_approve_enabled() || self.grants.covers_key(&ekey) || {
-            let preview = format!(
+        let action = PermissionAction::Escalated {
+            ask_name: "run_bash_unsandboxed",
+            key: permission::escalation_key("run_bash_unsandboxed", command),
+            preview: format!(
                 "{command}\n\nThe workspace sandbox blocked this — it writes outside {}. \
 Re-run the full command without write confinement?",
                 ctx.cwd.display()
-            );
-            match ui
-                .ask_permission("run_bash_unsandboxed", Some(&preview), false)
-                .await
-            {
-                Decision::Allow => true,
-                Decision::AlwaysAllow => {
-                    self.grants.remember_key(ekey);
-                    true
-                }
-                Decision::Deny => false,
-            }
+            ),
         };
-        if !approved {
+        if !self.resolve_permission(ctx, ui, action).await.allowed() {
             // Keep the blocked output + hint so the model sees the escalation was declined.
             return outcome.result;
         }
@@ -831,15 +828,14 @@ Re-run the full command without write confinement?",
             return escalated.result;
         }
         // Blocked again = a protected root — confirm per call, even under auto-approve.
-        let preview = format!(
-            "{command}\n\nStill blocked after escalation: it writes to a protected path \
+        let action = PermissionAction::Once {
+            ask_name: "run_bash_unsandboxed",
+            preview: Some(format!(
+                "{command}\n\nStill blocked after escalation: it writes to a protected path \
 (aivo's config dir or ~/.ssh). Re-run with no write confinement at all?"
-        );
-        if matches!(
-            ui.ask_permission("run_bash_unsandboxed", Some(&preview), true)
-                .await,
-            Decision::Deny
-        ) {
+            )),
+        };
+        if !self.resolve_permission(ctx, ui, action).await.allowed() {
             return escalated.result;
         }
         ui.notify(SANDBOX_ESCALATION_NOTICE);
@@ -869,38 +865,27 @@ Re-run the full command without write confinement?",
         let protected = outside
             .iter()
             .any(|p| tools::write_path_is_protected(p, ctx.cwd));
-        let approved = if protected {
-            let preview = format!(
-                "{name}: {joined}\n\nThis writes to a protected path (aivo's config dir or \
+        let action = if protected {
+            PermissionAction::Once {
+                ask_name: "write_outside_workspace",
+                preview: Some(format!(
+                    "{name}: {joined}\n\nThis writes to a protected path (aivo's config dir or \
 ~/.ssh), outside the workspace {}. Allow this write?",
-                ctx.cwd.display()
-            );
-            !matches!(
-                ui.ask_permission("write_outside_workspace", Some(&preview), true)
-                    .await,
-                Decision::Deny
-            )
+                    ctx.cwd.display()
+                )),
+            }
         } else {
             // Scoped to the exact targets so "always" doesn't blanket-open the filesystem.
-            let ekey = format!("write_outside_workspace\u{0}{joined}");
-            ctx.auto_approve_enabled() || self.grants.covers_key(&ekey) || {
-                let preview = format!(
+            PermissionAction::Escalated {
+                ask_name: "write_outside_workspace",
+                key: permission::escalation_key("write_outside_workspace", &joined),
+                preview: format!(
                     "{name}: {joined}\n\nThis writes outside the workspace {}. Allow the write?",
                     ctx.cwd.display()
-                );
-                match ui
-                    .ask_permission("write_outside_workspace", Some(&preview), false)
-                    .await
-                {
-                    Decision::Allow => true,
-                    Decision::AlwaysAllow => {
-                        self.grants.remember_key(ekey);
-                        true
-                    }
-                    Decision::Deny => false,
-                }
+                ),
             }
         };
+        let approved = self.resolve_permission(ctx, ui, action).await.allowed();
         if !approved {
             return Err(format!(
                 "refused: `{joined}` is outside the workspace and the user declined the \

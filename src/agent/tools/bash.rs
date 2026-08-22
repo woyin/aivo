@@ -430,9 +430,13 @@ pub(super) async fn run_bash_inner(
         // it so the engine can offer to re-run the command outside the sandbox on
         // approval, and tell the model this was a confinement block — not a real
         // failure — so it doesn't give up and ask the user to run it by hand.
-        if sandbox_enforced
-            && (out.contains("Operation not permitted") || out.contains("Permission denied"))
-        {
+        // Heuristic: match stderr only (kernel errors land there; stdout quoting
+        // these phrases is just output), and skip "Permission denied" on macOS —
+        // seatbelt denials are EPERM, so that phrase there is an ordinary
+        // unreadable file, not a sandbox block.
+        let denial = stderr.contains("Operation not permitted")
+            || (!cfg!(target_os = "macos") && stderr.contains("Permission denied"));
+        if sandbox_enforced && denial {
             sandbox_blocked = true;
             out.push_str(match confinement {
                 BashConfinement::Workspace => {

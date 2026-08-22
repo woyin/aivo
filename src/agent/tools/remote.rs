@@ -327,24 +327,19 @@ pub(super) fn remote_segment(base: &str, args: &[&str]) -> RemoteSeg {
 /// Powers [`is_remote_side_effect`] and the card's ⚠ label. Kept case-sensitive
 /// (unlike the destructive walk) because `curl -F` (form) ≠ `-f` (fail).
 pub fn bash_mutates_remote(cmd: &str) -> bool {
-    for seg in cmd.split(['\n', ';', '|', '&']) {
-        let all: Vec<&str> = seg.split_whitespace().collect();
-        let tokens = effective_command(&all); // see-through sudo/env/nice
-        let Some(&cmd0) = tokens.first() else {
-            continue;
-        };
+    for_each_simple_command(cmd, |seg, all| {
+        let tokens = effective_command(all); // see-through sudo/env/nice
+        let &cmd0 = tokens.first()?;
         let base = cmd0.rsplit('/').next().unwrap_or(cmd0).to_ascii_lowercase();
         // `sh -c 'curl -X POST …'` hides the real command in a quoted arg — rescan it.
         if INTERPRETERS.contains(&base.as_str())
             && interpreter_inline_code(seg).is_some_and(|inner| bash_mutates_remote(&inner))
         {
-            return true;
+            return Some(());
         }
-        if !matches!(remote_segment(&base, &tokens[1..]), RemoteSeg::Read) {
-            return true;
-        }
-    }
-    false
+        (!matches!(remote_segment(&base, &tokens[1..]), RemoteSeg::Read)).then_some(())
+    })
+    .is_some()
 }
 
 /// Grantable family prefixes of every remote-mutating segment, or empty when any
@@ -361,24 +356,25 @@ pub fn remote_mutation_prefixes(cmd: &str) -> Vec<String> {
 
 /// `false` = an opaque mutation somewhere; no prefix set can represent the command.
 pub(super) fn collect_remote_prefixes(cmd: &str, out: &mut Vec<String>) -> bool {
-    for seg in cmd.split(['\n', ';', '|', '&']) {
-        let all: Vec<&str> = seg.split_whitespace().collect();
-        let tokens = effective_command(&all);
-        let Some(&cmd0) = tokens.first() else {
-            continue;
-        };
+    // The walk short-circuits on `Some(())` = an unrepresentable (opaque) mutation.
+    for_each_simple_command(cmd, |seg, all| {
+        let tokens = effective_command(all);
+        let &cmd0 = tokens.first()?;
         let base = cmd0.rsplit('/').next().unwrap_or(cmd0).to_ascii_lowercase();
         if INTERPRETERS.contains(&base.as_str())
             && let Some(inner) = interpreter_inline_code(seg)
             && !collect_remote_prefixes(&inner, out)
         {
-            return false;
+            return Some(());
         }
         match remote_segment(&base, &tokens[1..]) {
-            RemoteSeg::Read => {}
-            RemoteSeg::Opaque => return false,
-            RemoteSeg::Verb(p) => out.push(p),
+            RemoteSeg::Read => None,
+            RemoteSeg::Opaque => Some(()),
+            RemoteSeg::Verb(p) => {
+                out.push(p);
+                None
+            }
         }
-    }
-    true
+    })
+    .is_none()
 }

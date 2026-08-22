@@ -8,6 +8,7 @@ mod external_tools;
 mod history;
 mod hooks;
 mod jobs;
+mod permission_table;
 mod plan_mode;
 mod plan_tracking;
 mod review_gate;

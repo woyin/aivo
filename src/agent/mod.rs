@@ -21,6 +21,7 @@ pub mod mcp;
 pub mod mcp_import;
 pub mod memory;
 pub mod notes;
+pub mod permission;
 pub mod plan;
 pub mod plan_mode;
 pub mod protocol;

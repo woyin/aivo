@@ -120,6 +120,41 @@ async fn confined_flags_block_then_unconfined_succeeds() {
     );
 }
 
+/// A failing command whose STDOUT merely quotes a denial phrase (grepping logs,
+/// cat of a build transcript) is not a sandbox block — no flag, no escalation.
+#[cfg(unix)]
+#[tokio::test]
+async fn denial_phrase_on_stdout_does_not_flag_sandbox_block() {
+    if !crate::agent::sandbox::active() {
+        return;
+    }
+    let dir = tmp();
+    let cmd =
+        json!({"command": "echo 'grep: Permission denied / Operation not permitted'; exit 1"});
+    let outcome = run_bash_confined(&cmd, &dir, None).await;
+    assert!(
+        !outcome.sandbox_blocked,
+        "stdout quoting a denial phrase must not read as a sandbox block"
+    );
+}
+
+/// macOS: a read denial ("Permission denied", EACCES on stderr) is not a
+/// seatbelt write-block (EPERM, "Operation not permitted") — must not flag.
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn read_denial_on_stderr_does_not_flag_sandbox_block_on_macos() {
+    if !crate::agent::sandbox::active() {
+        return;
+    }
+    let dir = tmp();
+    let cmd = json!({"command": "echo 'ls: /root: Permission denied' 1>&2; exit 1"});
+    let outcome = run_bash_confined(&cmd, &dir, None).await;
+    assert!(
+        !outcome.sandbox_blocked,
+        "an EACCES read denial must not read as a seatbelt write-block"
+    );
+}
+
 #[tokio::test]
 async fn run_bash_times_out() {
     let dir = tmp();

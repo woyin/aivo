@@ -512,7 +512,7 @@ pub struct AgentEngine {
     /// "Always"-approved actions. Scoped grants (exact / command-prefix / dir / tool);
     /// session-only unless a grant is safe to persist (see [`crate::agent::grant_store`]).
     /// A durable "always allow `rm …`" is a footgun, so dangerous acts stay exact+session.
-    grants: crate::agent::grant_store::GrantStore,
+    pub(crate) grants: crate::agent::grant_store::GrantStore,
     /// Tool+args the user denied this turn — identical re-issues auto-deny. Cleared
     /// per turn, on steering, and on plan exit (a deny may have been reversed).
     denied_sigs: std::collections::HashSet<String>,

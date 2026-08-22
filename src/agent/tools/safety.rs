@@ -168,6 +168,26 @@ pub fn is_readonly_command(args: &Value) -> bool {
         .unwrap_or(false)
 }
 
+/// Walk each simple command between control operators (newline, `;`, `|`, `&`):
+/// yields the raw segment plus its whitespace tokens (never empty), returning the
+/// first `Some` from `f`. The one skeleton under every bash classifier — the
+/// predicates differ per walk, the traversal must not.
+pub(super) fn for_each_simple_command<T>(
+    cmd: &str,
+    mut f: impl FnMut(&str, &[&str]) -> Option<T>,
+) -> Option<T> {
+    for seg in cmd.split(['\n', ';', '|', '&']) {
+        let tokens: Vec<&str> = seg.split_whitespace().collect();
+        if tokens.is_empty() {
+            continue;
+        }
+        if let Some(v) = f(seg, &tokens) {
+            return Some(v);
+        }
+    }
+    None
+}
+
 /// Every segment must be a known inspection binary with no write-capable syntax
 /// (substitution, non-pseudo-device redirect). Quotes are NOT parsed — a quoted
 /// `$(…)`/`>` fails closed (a prompt), never a false pass.
@@ -190,15 +210,12 @@ pub(super) fn bash_is_readonly(cmd: &str) -> bool {
         .replace(">&1", "")
         .replace(">&2", "");
     let mut saw_command = false;
-    for seg in scrubbed.split(['\n', ';', '|', '&']) {
-        let tokens: Vec<&str> = seg.split_whitespace().collect();
-        let Some(&cmd0) = tokens.first() else {
-            continue;
-        };
+    let write_capable = for_each_simple_command(&scrubbed, |_, tokens| {
         saw_command = true;
+        let cmd0 = tokens[0];
         // An env-var prefix (`FOO=bar cmd`) hides the real command.
         if cmd0.contains('=') {
-            return false;
+            return Some(());
         }
         let base = cmd0.rsplit('/').next().unwrap_or(cmd0);
         let ok = match base {
@@ -216,14 +233,13 @@ pub(super) fn bash_is_readonly(cmd: &str) -> bool {
                 matches!(*t, "-delete" | "-exec" | "-execdir" | "-ok" | "-okdir")
                     || t.starts_with("-fprint")
             }),
-            "git" => git_subcommand_is_readonly(&tokens),
+            "git" => git_subcommand_is_readonly(tokens),
             _ => false,
         };
-        if !ok {
-            return false;
-        }
-    }
-    saw_command
+        (!ok).then_some(())
+    })
+    .is_some();
+    saw_command && !write_capable
 }
 
 /// Any `>`/`>>` output redirect whose target is not a safe `/dev/` pseudo-device
@@ -383,11 +399,8 @@ pub fn bash_looks_destructive(cmd: &str) -> bool {
     }
 
     // Inspect the leading command of each segment between control operators.
-    for seg in lower.split(['\n', ';', '|', '&']) {
-        let tokens: Vec<&str> = seg.split_whitespace().collect();
-        let Some(&cmd0) = tokens.first() else {
-            continue;
-        };
+    let hit = for_each_simple_command(&lower, |seg, tokens| {
+        let cmd0 = tokens[0];
         let base = cmd0.rsplit('/').next().unwrap_or(cmd0); // strip a leading path
         // An inline-code interpreter (`sh -c '…'`, `python -c '…'`, `perl -e '…'`)
         // hides its real command inside a quoted argument the per-command walk
@@ -396,16 +409,16 @@ pub fn bash_looks_destructive(cmd: &str) -> bool {
         if INTERPRETERS.contains(&base)
             && interpreter_inline_code(seg).is_some_and(|inner| bash_looks_destructive(&inner))
         {
-            return true;
+            return Some(());
         }
         let flagged = match base {
-            "rm" => has_short_or_long(&tokens, &['r', 'f'], &["recursive", "force"]),
+            "rm" => has_short_or_long(tokens, &['r', 'f'], &["recursive", "force"]),
             "mkfs" | "shred" | "dd" => true,
             "chmod" | "chown" | "chgrp" => {
-                has_short_or_long(&tokens, &['r'], &["recursive"]) || tokens.contains(&"-R")
+                has_short_or_long(tokens, &['r'], &["recursive"]) || tokens.contains(&"-R")
             }
             "sudo" | "doas" | "su" => true,
-            "git" => git_is_destructive(&tokens),
+            "git" => git_is_destructive(tokens),
             // `-delete` removes matches; `-exec`/`-execdir` run an arbitrary
             // command per match (`find . -exec rm {} \;` is the classic deleter
             // that `-delete` alone misses).
@@ -414,9 +427,11 @@ pub fn bash_looks_destructive(cmd: &str) -> bool {
                 .any(|t| matches!(*t, "-delete" | "-exec" | "-execdir")),
             _ => false,
         };
-        if flagged {
-            return true;
-        }
+        flagged.then_some(())
+    })
+    .is_some();
+    if hit {
+        return true;
     }
 
     // Residual patterns the per-command walk doesn't structurally cover.
@@ -446,18 +461,15 @@ pub(super) fn bash_is_catastrophic(cmd: &str) -> bool {
         return true;
     }
 
-    for seg in lower.split(['\n', ';', '|', '&']) {
-        let all: Vec<&str> = seg.split_whitespace().collect();
-        let tokens = effective_command(&all); // see-through `sudo`/`env`/`nice`
-        let Some(&cmd0) = tokens.first() else {
-            continue;
-        };
+    let hit = for_each_simple_command(&lower, |seg, all| {
+        let tokens = effective_command(all); // see-through `sudo`/`env`/`nice`
+        let &cmd0 = tokens.first()?;
         let base = cmd0.rsplit('/').next().unwrap_or(cmd0);
         // `sh -c 'rm -rf /'` hides the real command in a quoted arg — rescan it.
         if INTERPRETERS.contains(&base)
             && interpreter_inline_code(seg).is_some_and(|inner| bash_is_catastrophic(&inner))
         {
-            return true;
+            return Some(());
         }
         let hit = match base {
             "rm" => {
@@ -479,12 +491,11 @@ pub(super) fn bash_is_catastrophic(cmd: &str) -> bool {
             "init" => matches!(tokens.get(1), Some(&"0") | Some(&"6")),
             _ => false,
         };
-        if hit || windows_seg_is_catastrophic(tokens) {
-            return true;
-        }
-    }
+        (hit || windows_seg_is_catastrophic(tokens)).then_some(())
+    })
+    .is_some();
 
-    redirects_to_real_device(&lower) // `cat img > /dev/sda`
+    hit || redirects_to_real_device(&lower) // `cat img > /dev/sda`
 }
 
 /// Windows half of [`bash_is_catastrophic`]: `run_bash` shells through PowerShell,
