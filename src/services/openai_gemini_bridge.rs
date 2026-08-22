@@ -396,6 +396,10 @@ pub fn convert_openai_chat_to_gemini_request(body: &Value, config: &OpenAIToGemi
                     contents.push(json!({ "role": "user", "parts": parts }));
                 }
                 _ => {
+                    // Consecutive `user` turns (the agent's reminder after tool
+                    // results) are fine — probed 200 on 2.5-flash and 3-flash-preview.
+                    // The grouping above is about parallel tool responses, not
+                    // alternation.
                     let parts = extract_openai_parts_for_gemini(message.get("content"));
                     contents.push(json!({
                         "role": "user",

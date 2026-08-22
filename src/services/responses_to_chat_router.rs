@@ -14,7 +14,7 @@
 //! `responses_chat_conversion.rs` and is re-exported here for backwards compatibility.
 use crate::constants::CONTENT_TYPE_JSON;
 use crate::services::anthropic_chat_request::ensure_assistant_reasoning_content_in_chat_request;
-use crate::services::anthropic_route_pipeline::inject_chat_completions_cache_control;
+use crate::services::anthropic_route_pipeline::inject_anthropic_cache_control;
 use crate::services::copilot_auth::CopilotTokenManager;
 use crate::services::device_fingerprint;
 use crate::services::http_debug::LoggedSend;
@@ -1606,24 +1606,22 @@ async fn forward_anthropic_protocol(
     client: &reqwest::Client,
     force_non_streaming: bool,
 ) -> Result<AttemptOutcome<Value>> {
-    let mut body_with_cache = body.clone();
-    // Only inject cache_control for Claude models — other providers don't
-    // honor it (e.g. Gemini uses a different caching model) and strict ones
-    // reject the unknown field outright.
-    if body_with_cache
-        .get("model")
-        .and_then(|m| m.as_str())
-        .is_some_and(|m| m.to_ascii_lowercase().contains("claude"))
-    {
-        inject_chat_completions_cache_control(&mut body_with_cache);
-    }
-
     let mut anthropic_body = translate_request(
-        &body_with_cache,
+        body,
         &RequestOptions::ChatToAnthropic {
             default_model: "claude-sonnet-4-5",
         },
     );
+    // Only inject cache_control for Claude models — other providers don't
+    // honor it (e.g. Gemini uses a different caching model) and strict ones
+    // reject the unknown field outright.
+    if body
+        .get("model")
+        .and_then(|m| m.as_str())
+        .is_some_and(|m| m.to_ascii_lowercase().contains("claude"))
+    {
+        inject_anthropic_cache_control(&mut anthropic_body);
+    }
     if force_non_streaming {
         anthropic_body["stream"] = json!(false);
     }

@@ -455,3 +455,42 @@ fn plan_mode_reminder_rides_requests_not_history() {
         "no reminder once plan mode is off"
     );
 }
+
+/// Rewriting a message the turn already built on costs the prompt cache
+/// every tool result behind it.
+#[test]
+fn plan_mode_reminder_rides_the_tail_not_an_earlier_message() {
+    let dir = tmp();
+    let mut engine = AgentEngine::new(&dir.display().to_string(), "m", "", &[], &[], 0, 0);
+    engine.set_plan_mode(true);
+    engine.begin_user_turn(Value::String("start".into()), "start".into());
+
+    engine.messages.push(json!({
+        "role": "assistant",
+        "content": Value::Null,
+        "tool_calls": [{
+            "id": "c1",
+            "type": "function",
+            "function": {"name": "read_file", "arguments": "{}"}
+        }]
+    }));
+    engine
+        .messages
+        .push(json!({"role": "tool", "tool_call_id": "c1", "content": "file body"}));
+
+    let out = engine.outgoing_messages();
+    assert_eq!(
+        out[..engine.messages.len()],
+        engine.messages[..],
+        "the reminder rewrote an earlier message"
+    );
+    let tail = out.last().unwrap();
+    assert_eq!(role(tail), "user");
+    assert!(
+        tail["content"]
+            .as_str()
+            .unwrap()
+            .contains(plan_mode::PLAN_TURN_REMINDER),
+        "the tail turn carries the reminder"
+    );
+}

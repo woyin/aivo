@@ -146,6 +146,44 @@ impl RequestPatch for CacheControlPatch {
     }
 }
 
+/// Breakpoints on the system prompt and the tail message's newest *durable* block.
+/// Marking the last user message instead (all the Chat Completions injector can do,
+/// since tool results are their own role there) ends the cached prefix at the turn's
+/// prompt, re-billing its tool results on every step; marking a trailing ephemeral
+/// block is worse still, since the next request replaces it.
+pub(crate) fn inject_anthropic_cache_control(body: &mut Value) {
+    if cache_control_breakpoint_count(body) < ANTHROPIC_CACHE_CONTROL_BREAKPOINT_LIMIT
+        && let Some(system) = body.get_mut("system")
+    {
+        inject_cache_control_on_last_block(system);
+    }
+    if cache_control_breakpoint_count(body) >= ANTHROPIC_CACHE_CONTROL_BREAKPOINT_LIMIT {
+        return;
+    }
+    let Some(content) = body
+        .get_mut("messages")
+        .and_then(|m| m.as_array_mut())
+        .and_then(|m| m.last_mut())
+        .and_then(|last| last.get_mut("content"))
+    else {
+        return;
+    };
+    let last_tool_result = content.as_array().and_then(|blocks| {
+        blocks
+            .iter()
+            .rposition(|b| b.get("type").and_then(Value::as_str) == Some("tool_result"))
+    });
+    match last_tool_result {
+        Some(i) => {
+            let block = &mut content[i];
+            if block.get("cache_control").is_none() {
+                block["cache_control"] = json!({"type": "ephemeral"});
+            }
+        }
+        None => inject_cache_control_on_last_block(content),
+    }
+}
+
 /// Inject `cache_control` markers on an OpenAI Chat Completions request body.
 /// Adds markers to the system message and last user message.
 pub(crate) fn inject_chat_completions_cache_control(body: &mut Value) {
@@ -176,7 +214,7 @@ pub(crate) fn inject_chat_completions_cache_control(body: &mut Value) {
     }
 }
 
-fn cache_control_breakpoint_count(value: &Value) -> usize {
+pub(crate) fn cache_control_breakpoint_count(value: &Value) -> usize {
     match value {
         Value::Object(obj) => {
             let here = obj

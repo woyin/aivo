@@ -3,7 +3,7 @@ use serde_json::{Value, json};
 use std::sync::Arc;
 
 use crate::constants::CONTENT_TYPE_JSON;
-use crate::services::anthropic_route_pipeline::inject_chat_completions_cache_control;
+use crate::services::anthropic_route_pipeline::inject_anthropic_cache_control;
 use crate::services::copilot_auth::CopilotTokenManager;
 use crate::services::device_fingerprint;
 use crate::services::effort::gpt5_chat_completions_rejects_tools_with_none_reasoning;
@@ -701,24 +701,22 @@ fn build_anthropic_request(body: &Value, client_wants_stream: bool) -> (String, 
         .unwrap_or("claude-sonnet-4-5")
         .to_string();
 
-    let mut body_with_cache = body.clone();
-    // Only inject cache_control for Claude models — other providers don't
-    // honor it (e.g. Gemini uses a different caching model) and strict ones
-    // reject the unknown field outright.
-    if body_with_cache
-        .get("model")
-        .and_then(|m| m.as_str())
-        .is_some_and(|m| m.to_ascii_lowercase().contains("claude"))
-    {
-        inject_chat_completions_cache_control(&mut body_with_cache);
-    }
-
     let mut anthropic_req = translate_request(
-        &body_with_cache,
+        body,
         &RequestOptions::ChatToAnthropic {
             default_model: "claude-sonnet-4-5",
         },
     );
+    // Only inject cache_control for Claude models — other providers don't
+    // honor it (e.g. Gemini uses a different caching model) and strict ones
+    // reject the unknown field outright.
+    if body
+        .get("model")
+        .and_then(|m| m.as_str())
+        .is_some_and(|m| m.to_ascii_lowercase().contains("claude"))
+    {
+        inject_anthropic_cache_control(&mut anthropic_req);
+    }
     anthropic_req["stream"] = json!(client_wants_stream);
 
     (fallback_model, anthropic_req)
@@ -955,6 +953,7 @@ async fn finalize_openai_response(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::services::anthropic_route_pipeline::cache_control_breakpoint_count;
     use http::Response as HttpResponse;
     use serde_json::json;
 
@@ -1184,6 +1183,79 @@ mod tests {
             request["messages"][0]["content"][0]["cache_control"]["type"],
             "ephemeral"
         );
+    }
+
+    /// Not on the turn's prompt, or the tool results behind it never cache.
+    #[test]
+    fn build_anthropic_request_marks_the_tail_not_the_user_prompt() {
+        let body = json!({
+            "model": "claude-sonnet-4-5",
+            "messages": [
+                {"role": "system", "content": "Be precise."},
+                {"role": "user", "content": "read the file"},
+                {"role": "assistant", "content": null, "tool_calls": [{
+                    "id": "c1",
+                    "type": "function",
+                    "function": {"name": "read_file", "arguments": "{}"}
+                }]},
+                {"role": "tool", "tool_call_id": "c1", "content": "file body"}
+            ]
+        });
+
+        let (_, request) = build_anthropic_request(&body, false);
+
+        let messages = request["messages"].as_array().unwrap();
+        let tail = messages.last().unwrap();
+        let blocks = tail["content"].as_array().unwrap();
+        assert_eq!(
+            blocks.last().unwrap()["cache_control"]["type"],
+            "ephemeral",
+            "the tail carries the breakpoint: {request:#}"
+        );
+        assert_eq!(request["system"][0]["cache_control"]["type"], "ephemeral");
+        // System + tail only — Anthropic allows at most four.
+        assert_eq!(cache_control_breakpoint_count(&request), 2);
+    }
+
+    /// Caching behind the engine's reminder turn would store a prefix the next
+    /// request replaces.
+    #[test]
+    fn build_anthropic_request_keeps_the_breakpoint_off_an_ephemeral_tail() {
+        let body = json!({
+            "model": "claude-sonnet-4-5",
+            "messages": [
+                {"role": "user", "content": "read the file"},
+                {"role": "assistant", "content": null, "tool_calls": [{
+                    "id": "c1",
+                    "type": "function",
+                    "function": {"name": "read_file", "arguments": "{}"}
+                }]},
+                {"role": "tool", "tool_call_id": "c1", "content": "file body"},
+                {"role": "user", "content": "<system-reminder>Plan mode is still active</system-reminder>"}
+            ]
+        });
+
+        let (_, request) = build_anthropic_request(&body, false);
+
+        let blocks = request["messages"].as_array().unwrap().last().unwrap()["content"]
+            .as_array()
+            .unwrap()
+            .clone();
+        let marked = blocks
+            .iter()
+            .position(|b| b.get("cache_control").is_some())
+            .expect("a breakpoint was placed");
+        assert_eq!(
+            blocks[marked]["type"], "tool_result",
+            "the breakpoint must sit on durable content: {blocks:#?}"
+        );
+        assert!(
+            blocks[marked + 1..]
+                .iter()
+                .any(|b| b["text"].as_str().is_some_and(|t| t.contains("reminder"))),
+            "the ephemeral block stays past the breakpoint: {blocks:#?}"
+        );
+        assert_eq!(cache_control_breakpoint_count(&request), 1);
     }
 
     #[test]

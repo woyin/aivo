@@ -348,22 +348,30 @@ impl AgentEngine {
                 obj.remove(super::SYNTHETIC_MARKER_KEY);
             }
         }
-        if self.read_only
-            && let Some(user) = out.iter_mut().rev().find(|m| role(m) == "user")
-            && let Some(content) = user.get_mut("content")
-        {
-            let owned = content.take();
-            *content = plan_mode::append_turn_reminder(owned);
+        // Reminders ride the request only, never `self.messages`, and must sit at
+        // the tail: folded in behind this turn's own output, the next request's
+        // prefix diverges there and re-bills every tool result uncached.
+        let mut reminders: Vec<String> = Vec::new();
+        if self.read_only {
+            reminders.push(plan_mode::PLAN_TURN_REMINDER.to_string());
         }
-        // Ephemeral running-jobs reminder (like the plan one), else the model claims a live server stopped.
         if let Some(jobs) = &self.jobs {
             let running = jobs.running_snapshot();
-            if !running.is_empty()
-                && let Some(user) = out.iter_mut().rev().find(|m| role(m) == "user")
-                && let Some(content) = user.get_mut("content")
-            {
-                let owned = content.take();
-                *content = append_running_jobs_reminder(owned, &running);
+            if !running.is_empty() {
+                reminders.push(running_jobs_reminder(&running));
+            }
+        }
+        if !reminders.is_empty()
+            && let Some(last) = out.last_mut()
+        {
+            let block = reminders.join("\n\n");
+            if role(last) == "user" {
+                if let Some(content) = last.get_mut("content") {
+                    let owned = content.take();
+                    *content = append_text_block(owned, &block);
+                }
+            } else {
+                out.push(json!({"role": "user", "content": block}));
             }
         }
         if self.substitute_images {
@@ -553,16 +561,19 @@ fn user_text(m: &Value) -> Option<String> {
     }
 }
 
-/// Append a `<system-reminder>` listing still-running jobs to outgoing user content (text or multimodal).
-fn append_running_jobs_reminder(content: Value, running: &[String]) -> Value {
-    let block = format!(
+fn running_jobs_reminder(running: &[String]) -> String {
+    format!(
         "<system-reminder>Background jobs still running right now (you started these via run_bash \
 with background: true):\n{}\nBefore telling the user a job finished or was stopped, confirm with \
 check_job {{\"id\": \"…\"}} — don't assume. Stop one with check_job {{\"id\": \"…\", \"kill\": \
 true}}.</system-reminder>",
         running.join("\n")
-    );
+    )
+}
+
+fn append_text_block(content: Value, block: &str) -> Value {
     match content {
+        Value::String(s) if s.trim().is_empty() => Value::String(block.to_string()),
         Value::String(s) => Value::String(format!("{s}\n\n{block}")),
         Value::Array(mut parts) => {
             parts.push(json!({"type": "text", "text": block}));

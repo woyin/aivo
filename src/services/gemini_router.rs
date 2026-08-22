@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::constants::CONTENT_TYPE_JSON;
 use crate::services::anthropic_chat_request::ensure_assistant_reasoning_content_in_chat_request;
-use crate::services::anthropic_route_pipeline::inject_chat_completions_cache_control;
+use crate::services::anthropic_route_pipeline::inject_anthropic_cache_control;
 use crate::services::copilot_auth::CopilotTokenManager;
 use crate::services::device_fingerprint;
 use crate::services::http_debug::LoggedSend;
@@ -349,6 +349,12 @@ async fn forward_to_provider(
 
         let (status, body_text, parsed) = match protocol {
             ProviderProtocol::Anthropic => {
+                let mut anthropic_req = translate_request(
+                    &req_body,
+                    &RequestOptions::ChatToAnthropic {
+                        default_model: "claude-sonnet-4-5",
+                    },
+                );
                 // Only inject cache_control for Claude models — other providers
                 // don't honor it (e.g. Gemini has a different caching model) and
                 // strict ones reject the unknown field outright.
@@ -357,14 +363,8 @@ async fn forward_to_provider(
                     .and_then(|m| m.as_str())
                     .is_some_and(|m| m.to_ascii_lowercase().contains("claude"))
                 {
-                    inject_chat_completions_cache_control(&mut req_body);
+                    inject_anthropic_cache_control(&mut anthropic_req);
                 }
-                let mut anthropic_req = translate_request(
-                    &req_body,
-                    &RequestOptions::ChatToAnthropic {
-                        default_model: "claude-sonnet-4-5",
-                    },
-                );
                 anthropic_req["stream"] = serde_json::json!(false);
                 let target_url = http_utils::build_target_url(
                     &config.target_base_url,
