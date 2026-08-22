@@ -929,14 +929,15 @@ fn anthropic_text_blocks_to_content(blocks: Vec<Value>) -> Value {
         return Value::String(String::new());
     }
 
+    // Always array form: collapsing to a bare string re-shapes the message once
+    // a cache_control breakpoint moves off it, breaking the prefix cache.
     if blocks.iter().all(is_plain_anthropic_text_block) {
-        return Value::String(
-            blocks
-                .iter()
-                .filter_map(|block| block.get("text").and_then(|v| v.as_str()))
-                .collect::<Vec<_>>()
-                .join("\n\n"),
-        );
+        let text = blocks
+            .iter()
+            .filter_map(|block| block.get("text").and_then(|v| v.as_str()))
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        return json!([{ "type": "text", "text": text }]);
     }
 
     Value::Array(blocks)
@@ -1036,7 +1037,10 @@ mod tests {
                 default_model: "gpt-4o",
             },
         );
-        assert_eq!(converted["system"], "Be precise.");
+        assert_eq!(
+            converted["system"],
+            json!([{"type": "text", "text": "Be precise."}])
+        );
         assert_eq!(converted["messages"][1]["content"][0]["type"], "tool_use");
         assert_eq!(
             converted["messages"][2]["content"][0]["type"],
@@ -2405,8 +2409,8 @@ mod tests {
     }
 
     #[test]
-    fn convert_openai_to_anthropic_text_only_still_collapses_to_string() {
-        // Regression: collapse-to-string for pure-text input must not change.
+    fn convert_openai_to_anthropic_text_only_merges_into_one_block() {
+        // Array form is load-bearing: string collapse broke the prefix cache.
         let body = json!({
             "model": "claude-sonnet-4",
             "messages": [{
@@ -2423,7 +2427,10 @@ mod tests {
                 default_model: "claude-sonnet-4",
             },
         );
-        assert_eq!(converted["messages"][0]["content"], "hello\n\nworld");
+        assert_eq!(
+            converted["messages"][0]["content"],
+            json!([{"type": "text", "text": "hello\n\nworld"}])
+        );
     }
 
     #[test]

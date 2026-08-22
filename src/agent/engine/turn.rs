@@ -253,6 +253,14 @@ impl AgentEngine {
             // Sum the real prompt/completion/cache split across steps (same parser as the serve, for a consistent index).
             if let Some(u) = &message.usage {
                 if let Some(split) = extract_usage_from_value(&json!({ "usage": u })) {
+                    crate::trace_ev!(
+                        "turn",
+                        "event=step_usage step={steps} prompt={} completion={} cache_read={} cache_write={}",
+                        split.prompt_tokens,
+                        split.completion_tokens,
+                        split.cache_read_input_tokens,
+                        split.cache_creation_input_tokens
+                    );
                     self.turn_usage = self.turn_usage.merge(SessionTokens {
                         prompt_tokens: split.prompt_tokens,
                         completion_tokens: split.completion_tokens,

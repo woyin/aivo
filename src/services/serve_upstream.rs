@@ -717,9 +717,54 @@ fn build_anthropic_request(body: &Value, client_wants_stream: bool) -> (String, 
     {
         inject_anthropic_cache_control(&mut anthropic_req);
     }
+    if crate::services::trace::enabled("anthropic") {
+        crate::services::trace::line(
+            "anthropic",
+            &format!(
+                "event=cache_breakpoints {}",
+                describe_cache_breakpoints(&anthropic_req)
+            ),
+        );
+    }
+    if crate::services::trace::enabled("anthropic-body") {
+        crate::services::trace::line(
+            "anthropic-body",
+            &serde_json::to_string(&anthropic_req).unwrap_or_default(),
+        );
+    }
     anthropic_req["stream"] = json!(client_wants_stream);
 
     (fallback_model, anthropic_req)
+}
+
+/// Coordinates of every `cache_control` breakpoint, for the `anthropic` trace scope.
+fn describe_cache_breakpoints(req: &Value) -> String {
+    let mut spots = Vec::new();
+    if let Some(blocks) = req.get("system").and_then(Value::as_array) {
+        for (j, b) in blocks.iter().enumerate() {
+            if b.get("cache_control").is_some() {
+                spots.push(format!("system[{j}]"));
+            }
+        }
+    }
+    if let Some(msgs) = req.get("messages").and_then(Value::as_array) {
+        for (i, m) in msgs.iter().enumerate() {
+            let role = m.get("role").and_then(Value::as_str).unwrap_or("?");
+            if let Some(blocks) = m.get("content").and_then(Value::as_array) {
+                for (j, b) in blocks.iter().enumerate() {
+                    if b.get("cache_control").is_some() {
+                        let ty = b.get("type").and_then(Value::as_str).unwrap_or("?");
+                        spots.push(format!("messages[{i}:{role}].content[{j}:{ty}]"));
+                    }
+                }
+            }
+        }
+    }
+    let n = req
+        .get("messages")
+        .and_then(Value::as_array)
+        .map_or(0, |m| m.len());
+    format!("messages={n} breakpoints={}", spots.join(","))
 }
 
 /// Rename the legacy `max_tokens` field to `max_completion_tokens` when the
@@ -1270,8 +1315,21 @@ mod tests {
 
         let (_, request) = build_anthropic_request(&body, false);
 
-        assert_eq!(request["system"], "Be precise.");
-        assert_eq!(request["messages"][0]["content"], "Hello");
+        assert_eq!(
+            request["system"],
+            json!([{"type": "text", "text": "Be precise."}])
+        );
+        assert_eq!(
+            request["messages"][0]["content"],
+            json!([{"type": "text", "text": "Hello"}])
+        );
+        assert!(
+            request["system"][0].get("cache_control").is_none()
+                && request["messages"][0]["content"][0]
+                    .get("cache_control")
+                    .is_none(),
+            "non-claude models must not get cache_control"
+        );
     }
 
     #[tokio::test]
