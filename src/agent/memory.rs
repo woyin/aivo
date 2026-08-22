@@ -145,16 +145,66 @@ pub fn load_entries(path: &Path) -> Vec<String> {
 pub enum RememberOutcome {
     Added(usize),
     Refreshed,
+    Replaced(usize),
 }
 
-/// Append one fact; an exact duplicate refreshes recency instead of stacking.
-pub fn remember(path: &Path, text: &str) -> Result<RememberOutcome, String> {
+/// Append one `[date]`-stamped fact; an exact duplicate refreshes recency and
+/// re-dates. `replaces` corrects in place: the one matching entry is removed.
+pub fn remember(
+    path: &Path,
+    text: &str,
+    date: &str,
+    replaces: Option<&str>,
+) -> Result<RememberOutcome, String> {
     let fact = normalize(text)?;
-    append_fact(path, HEADER, fact, whole_entry)
+    let stamped = if date.is_empty() {
+        fact
+    } else {
+        format!("[{date}] {fact}")
+    };
+    match replaces {
+        Some(needle) => replace_fact(path, stamped, needle),
+        None => append_fact(path, HEADER, stamped, fact_key),
+    }
 }
 
-fn whole_entry(e: &str) -> &str {
-    e
+/// Dedup key: the text without its `[date]` stamp, so re-remembering re-dates.
+fn fact_key(e: &str) -> &str {
+    e.strip_prefix('[')
+        .and_then(|rest| rest.split_once("] "))
+        .map_or(e, |(_, fact)| fact)
+}
+
+/// Remove the single entry matching `needle`, then add the corrected fact;
+/// zero or ambiguous matches fail loud so a correction never silently no-ops.
+fn replace_fact(path: &Path, stamped: String, needle: &str) -> Result<RememberOutcome, String> {
+    let needle_lc = needle.trim().to_lowercase();
+    if needle_lc.is_empty() {
+        return Err("remember: `replaces` is empty.".to_string());
+    }
+    let mut entries = load_entries(path);
+    let hits: Vec<usize> = entries
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| e.to_lowercase().contains(&needle_lc))
+        .map(|(i, _)| i)
+        .collect();
+    match hits.as_slice() {
+        [] => Err(format!(
+            "remember: no memory entry contains \"{needle}\" — check the wording with \
+memory_search, or drop `replaces` to add a new fact."
+        )),
+        [i] => {
+            entries.remove(*i);
+            dedup_push(&mut entries, HEADER, stamped, fact_key);
+            write_bullet_file(path, HEADER, &entries)?;
+            Ok(RememberOutcome::Replaced(entries.len()))
+        }
+        many => Err(format!(
+            "remember: `replaces` matches {} entries — quote more of the exact entry text.",
+            many.len()
+        )),
+    }
 }
 
 /// The topic part of a `<date>: <topic>` session entry, so the same topic
@@ -172,6 +222,22 @@ fn append_fact(
     key: fn(&str) -> &str,
 ) -> Result<RememberOutcome, String> {
     let mut entries = load_entries(path);
+    let refreshed = dedup_push(&mut entries, header, fact, key);
+    write_bullet_file(path, header, &entries)?;
+    Ok(if refreshed {
+        RememberOutcome::Refreshed
+    } else {
+        RememberOutcome::Added(entries.len())
+    })
+}
+
+/// Push under the dedup `key`, enforcing the caps oldest-first; true = refreshed.
+fn dedup_push(
+    entries: &mut Vec<String>,
+    header: &str,
+    fact: String,
+    key: fn(&str) -> &str,
+) -> bool {
     let refreshed = if let Some(pos) = entries.iter().position(|e| key(e) == key(&fact)) {
         entries.remove(pos);
         true
@@ -184,12 +250,7 @@ fn append_fact(
     {
         entries.remove(0);
     }
-    write_bullet_file(path, header, &entries)?;
-    Ok(if refreshed {
-        RememberOutcome::Refreshed
-    } else {
-        RememberOutcome::Added(entries.len())
-    })
+    refreshed
 }
 
 const SESSION_HEADER: &str = "# aivo session log\n\
@@ -298,7 +359,9 @@ future session, unlike `take_note` (which lasts only for the current session). U
 for things worth knowing weeks from now: a decision and its why, a user preference or correction, \
 a non-obvious constraint or gotcha. Don't save session progress, anything derivable from the \
 code, or secrets. One concise fact per call. Default scope is this project; use scope `global` \
-for a fact that applies across all projects (e.g. a personal preference)."
+for a fact that applies across all projects (e.g. a personal preference). When you discover an \
+existing memory entry is wrong or outdated, correct it in the same turn: pass `replaces` so the \
+stale entry is removed rather than left to mislead future sessions."
             .to_string(),
         parameters: json!({
             "type": "object",
@@ -311,6 +374,10 @@ for a fact that applies across all projects (e.g. a personal preference)."
                     "type": "string",
                     "enum": ["workspace", "global"],
                     "description": "`workspace` (default) = this project only; `global` = all projects."
+                },
+                "replaces": {
+                    "type": "string",
+                    "description": "Text identifying ONE existing memory entry this fact supersedes; that entry is removed. Quote enough of it to match uniquely."
                 }
             },
             "required": ["fact"]
@@ -340,7 +407,9 @@ injection only surfaces the most recent facts, so search when you need more."
     }
 }
 
-pub fn parse_remember(args: &serde_json::Value) -> Result<(String, MemoryScope), String> {
+pub fn parse_remember(
+    args: &serde_json::Value,
+) -> Result<(String, MemoryScope, Option<String>), String> {
     let fact = args
         .get("fact")
         .and_then(|v| v.as_str())
@@ -351,7 +420,12 @@ pub fn parse_remember(args: &serde_json::Value) -> Result<(String, MemoryScope),
             .ok_or_else(|| format!("remember: unknown scope '{s}' (use workspace or global)."))?,
         None => MemoryScope::default(),
     };
-    Ok((fact, scope))
+    let replaces = args
+        .get("replaces")
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+        .filter(|s| !s.trim().is_empty());
+    Ok((fact, scope, replaces))
 }
 
 pub fn parse_query(args: &serde_json::Value) -> Result<String, String> {
@@ -390,6 +464,7 @@ memory (durable facts, one `- ` bullet each) followed by recent SESSION LOG line
 topics). Produce the UPDATED curated memory:\n\
 - Merge related facts; keep each as one concise `- ` bullet.\n\
 - Resolve contradictions in favour of the most recent truth; drop anything a later session disproved.\n\
+- Keep each bullet's leading `[date]` stamp (the most recent when merging); leave undated bullets undated.\n\
 - Convert relative dates (\"today\", \"last week\") to absolute dates.\n\
 - Discard ephemera: greetings, tool-output noise, transient progress, \"next steps\".\n\
 - Preserve decisions and their rationale, user preferences and corrections, non-obvious constraints and gotchas.\n\
@@ -596,11 +671,11 @@ mod tests {
         let dir = tmp();
         let path = dir.join("mem.md");
         assert!(matches!(
-            remember(&path, "use ripgrep for search").unwrap(),
+            remember(&path, "use ripgrep for search", "", None).unwrap(),
             RememberOutcome::Added(1)
         ));
         assert!(matches!(
-            remember(&path, "tests need fast crypto feature").unwrap(),
+            remember(&path, "tests need fast crypto feature", "", None).unwrap(),
             RememberOutcome::Added(2)
         ));
         assert_eq!(
@@ -617,10 +692,10 @@ mod tests {
     fn duplicate_refreshes_recency_instead_of_stacking() {
         let dir = tmp();
         let path = dir.join("mem.md");
-        remember(&path, "a").unwrap();
-        remember(&path, "b").unwrap();
+        remember(&path, "a", "", None).unwrap();
+        remember(&path, "b", "", None).unwrap();
         assert!(matches!(
-            remember(&path, "a").unwrap(),
+            remember(&path, "a", "", None).unwrap(),
             RememberOutcome::Refreshed
         ));
         assert_eq!(load_entries(&path), vec!["b".to_string(), "a".to_string()]);
@@ -632,13 +707,13 @@ mod tests {
         let dir = tmp();
         let path = dir.join("mem.md");
         for i in 0..(MAX_ENTRIES + 5) {
-            remember(&path, &format!("fact {i}")).unwrap();
+            remember(&path, &format!("fact {i}"), "", None).unwrap();
         }
         let entries = load_entries(&path);
         assert_eq!(entries.len(), MAX_ENTRIES);
         assert_eq!(entries[0], "fact 5");
-        assert!(remember(&path, &"x".repeat(MAX_ENTRY_CHARS + 1)).is_err());
-        assert!(remember(&path, "  \n ").is_err());
+        assert!(remember(&path, &"x".repeat(MAX_ENTRY_CHARS + 1), "", None).is_err());
+        assert!(remember(&path, "  \n ", "", None).is_err());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -646,23 +721,82 @@ mod tests {
     fn newlines_collapse_to_one_line() {
         let dir = tmp();
         let path = dir.join("mem.md");
-        remember(&path, "line one\nline  two").unwrap();
+        remember(&path, "line one\nline  two", "", None).unwrap();
         assert_eq!(load_entries(&path), vec!["line one line two".to_string()]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn parse_remember_reads_fact_and_scope() {
-        let (fact, scope) = parse_remember(&json!({"fact": "use ripgrep"})).unwrap();
+    fn parse_remember_reads_fact_scope_and_replaces() {
+        let (fact, scope, replaces) = parse_remember(&json!({"fact": "use ripgrep"})).unwrap();
         assert_eq!(fact, "use ripgrep");
         assert_eq!(scope, MemoryScope::Workspace); // default
+        assert_eq!(replaces, None);
 
-        let (_, scope) =
+        let (_, scope, _) =
             parse_remember(&json!({"fact": "2-space indent", "scope": "global"})).unwrap();
         assert_eq!(scope, MemoryScope::Global);
 
+        let (_, _, replaces) =
+            parse_remember(&json!({"fact": "x", "replaces": "old claim"})).unwrap();
+        assert_eq!(replaces.as_deref(), Some("old claim"));
+        // Whitespace-only `replaces` is treated as absent, not an error.
+        let (_, _, replaces) = parse_remember(&json!({"fact": "x", "replaces": "  "})).unwrap();
+        assert_eq!(replaces, None);
+
         assert!(parse_remember(&json!({"scope": "global"})).is_err()); // missing fact
         assert!(parse_remember(&json!({"fact": "x", "scope": "bogus"})).is_err());
+    }
+
+    #[test]
+    fn dated_facts_stamp_and_dedup_across_dates() {
+        let dir = tmp();
+        let path = dir.join("mem.md");
+        remember(&path, "prefers tabs", "2026-08-01", None).unwrap();
+        assert_eq!(
+            load_entries(&path),
+            vec!["[2026-08-01] prefers tabs".to_string()]
+        );
+        assert!(matches!(
+            remember(&path, "prefers tabs", "2026-08-22", None).unwrap(),
+            RememberOutcome::Refreshed
+        ));
+        assert_eq!(
+            load_entries(&path),
+            vec!["[2026-08-22] prefers tabs".to_string()]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn replaces_corrects_one_entry_and_fails_loud_otherwise() {
+        let dir = tmp();
+        let path = dir.join("mem.md");
+        remember(&path, "aivo has no image pipeline", "2026-07-27", None).unwrap();
+        remember(&path, "release goes through R2", "2026-08-01", None).unwrap();
+
+        assert!(remember(&path, "x", "2026-08-22", Some("no such text")).is_err());
+        // "2026" hits both entries' date stamps.
+        assert!(remember(&path, "x", "2026-08-22", Some("2026")).is_err());
+        assert_eq!(load_entries(&path).len(), 2);
+
+        assert!(matches!(
+            remember(
+                &path,
+                "image pipeline exists (image_optimize.rs)",
+                "2026-08-22",
+                Some("no image pipeline"),
+            )
+            .unwrap(),
+            RememberOutcome::Replaced(2)
+        ));
+        let entries = load_entries(&path);
+        assert_eq!(entries.len(), 2);
+        assert!(entries.iter().all(|e| !e.contains("has no image pipeline")));
+        assert!(
+            entries.contains(&"[2026-08-22] image pipeline exists (image_optimize.rs)".to_string())
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -690,9 +824,9 @@ mod tests {
         let ws = dir.join("ws.md");
         let global = dir.join("global.md");
         let sessions = dir.join("ws.sessions.md");
-        remember(&ws, "auth uses JWT tokens with rotation").unwrap();
-        remember(&ws, "database is postgres").unwrap();
-        remember(&global, "prefer 2-space indentation").unwrap();
+        remember(&ws, "auth uses JWT tokens with rotation", "", None).unwrap();
+        remember(&ws, "database is postgres", "", None).unwrap();
+        remember(&global, "prefer 2-space indentation", "", None).unwrap();
         record_session_summary_at(&sessions, "2026-07-11: debugging the auth flow");
 
         let sources = [
@@ -812,7 +946,7 @@ mod tests {
         let memory = dir.join("ws.md");
         let log = dir.join("ws.sessions.md");
         let marker = dir.join("ws.dream");
-        remember(&memory, "stale fact to be replaced").unwrap();
+        remember(&memory, "stale fact to be replaced", "", None).unwrap();
         record_session_summary_at(&log, "2026-07-10: did A");
         record_session_summary_at(&log, "2026-07-11: did B");
         let consumed = load_entries(&log);
@@ -843,7 +977,7 @@ mod tests {
         let memory = dir.join("ws.md");
         let log = dir.join("ws.sessions.md");
         let marker = dir.join("ws.dream");
-        remember(&memory, "keep me").unwrap();
+        remember(&memory, "keep me", "", None).unwrap();
         record_session_summary_at(&log, "2026-07-10: nothing important");
         let consumed = load_entries(&log);
 

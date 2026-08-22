@@ -102,10 +102,15 @@ fn guide_ancestors(cwd: &Path) -> Vec<PathBuf> {
     Vec::new()
 }
 
-/// Split guides into (label, contents) to inline vs labels to point to lazily —
-/// missing, unreadable, empty, or over-cap files keep the pointer treatment.
-fn partition_guides(cwd: &str, guides: &[String]) -> (Vec<(String, String)>, Vec<String>) {
+/// `(label, contents)` pairs ready to inline verbatim.
+type InlinedGuides = Vec<(String, String)>;
+
+/// Split guides into (label, contents) to inline, memory files (own block, own
+/// framing), and labels to point to lazily — missing, unreadable, empty, or
+/// over-cap files keep the pointer treatment.
+fn partition_guides(cwd: &str, guides: &[String]) -> (InlinedGuides, InlinedGuides, Vec<String>) {
     let mut inlined = Vec::new();
+    let mut memory = Vec::new();
     let mut pointers = Vec::new();
     let mut total = 0usize;
     for label in guides {
@@ -122,7 +127,12 @@ fn partition_guides(cwd: &str, guides: &[String]) -> (Vec<(String, String)>, Vec
             // Memory rides outside the shared total — its 16 KiB cap exists so it
             // always inlines; big guide chains must not crowd it out.
             Ok(c) if crate::agent::memory::is_memory_path(&path) && c.len() <= GUIDE_INLINE_MAX => {
-                inlined.push((label.clone(), c.trim().to_string()));
+                let name = if path == crate::agent::memory::global_memory_path() {
+                    "aivo global memory"
+                } else {
+                    "aivo project memory"
+                };
+                memory.push((name.to_string(), c.trim().to_string()));
             }
             Ok(c) if c.len() <= GUIDE_INLINE_MAX && total + c.len() <= GUIDES_INLINE_TOTAL_MAX => {
                 total += c.len();
@@ -131,7 +141,7 @@ fn partition_guides(cwd: &str, guides: &[String]) -> (Vec<(String, String)>, Vec
             _ => pointers.push(label.clone()),
         }
     }
-    (inlined, pointers)
+    (inlined, memory, pointers)
 }
 
 pub(crate) fn system_prompt(cwd: &str, date: &str, guides: &[String], skills: &[Skill]) -> String {
@@ -216,10 +226,11 @@ you go — notes persist verbatim even after older conversation is compacted awa
 oriented across many steps. Reuse a note's `id` to revise it (decisions change) instead of \
 stacking near-duplicates. Skip it for quick work.\n\n\
 `remember` is different: it saves one durable fact to this project's persistent memory, injected \
-into every FUTURE session here (shown among the conventions as an `aivo project memory` file). \
-Use it sparingly for what's worth knowing weeks from now — a settled decision and its why, a user \
-preference or correction, a non-obvious gotcha. Never save session progress (that's `take_note`), \
-facts derivable from the code, or secrets.\n\n\
+into every FUTURE session here (the `aivo project memory` block). Use it sparingly for what's \
+worth knowing weeks from now — a settled decision and its why, a user preference or correction, \
+a non-obvious gotcha. Never save session progress (that's `take_note`), facts derivable from the \
+code, or secrets. When a saved memory turns out wrong or stale, fix it right then: `remember` \
+the corrected fact with `replaces` naming the old entry.\n\n\
 For a large, self-contained chunk of work — a deep investigation that would clutter your context, or \
 something a stronger model should handle — you can hand it to a fresh sub-agent with `subagent` (pass \
 `model` to use a stronger model) and build on its result. For ordinary steps, just use your own tools. \
@@ -258,7 +269,7 @@ of the workspace — reference files there by absolute path.",
             list.join(", ")
         ));
     }
-    let (inlined, pointers) = partition_guides(cwd, guides);
+    let (inlined, memory, pointers) = partition_guides(cwd, guides);
     if !inlined.is_empty() {
         p.push_str(
             "\n\nThis project's convention file(s) follow. When you act on this project — create \
@@ -270,6 +281,21 @@ the later (more specific) one wins.",
         for (label, content) in &inlined {
             p.push_str(&format!(
                 "\n\n<conventions from=\"{label}\">\n{content}\n</conventions>"
+            ));
+        }
+    }
+    if !memory.is_empty() {
+        p.push_str(
+            "\n\nYour persistent memory follows — facts you saved in past sessions, dated, \
+oldest first. They are point-in-time observations, not live state: a claim about the current \
+code, repo, or environment may have gone stale, so verify it still holds before acting on it \
+(the older the date, the more suspicion it deserves). Preferences and decisions age well; \
+\"X is missing/broken\" claims age worst. When an entry proves wrong or outdated, correct it \
+in the same turn: call `remember` with `replaces`.",
+        );
+        for (label, content) in &memory {
+            p.push_str(&format!(
+                "\n\n<memory from=\"{label}\">\n{content}\n</memory>"
             ));
         }
     }
@@ -330,6 +356,24 @@ mod tests {
             p.contains("remembered: the gateway drops the K"),
             "memory degraded to a pointer instead of inlining"
         );
+    }
+
+    /// Memory gets its own tagged block with framing, not a `<conventions>` one.
+    #[test]
+    fn memory_gets_own_block_with_staleness_framing() {
+        let dir = tmp();
+        let mem = crate::agent::memory::project_memory_path(&dir);
+        std::fs::create_dir_all(mem.parent().unwrap()).unwrap();
+        std::fs::write(&mem, "- [2026-08-01] the canary is red\n").unwrap();
+        let guides = vec![mem.display().to_string()];
+        let p = system_prompt(&dir.display().to_string(), "", &guides, &[]);
+        assert!(p.contains("<memory from=\"aivo project memory\">"));
+        assert!(p.contains("point-in-time observations"));
+        assert!(p.contains("`remember` with `replaces`"));
+        assert!(!p.contains("<conventions from=\"aivo project memory\">"));
+        // No memory file → no framing paragraph.
+        let p2 = system_prompt(&dir.display().to_string(), "", &[], &[]);
+        assert!(!p2.contains("point-in-time observations"));
     }
 
     #[test]

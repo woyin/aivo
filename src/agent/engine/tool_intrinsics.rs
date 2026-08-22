@@ -27,10 +27,15 @@ impl AgentEngine {
             },
             // Notify so a saved memory never lands silently (poison audit).
             "remember" => match crate::agent::memory::parse_remember(args) {
-                Ok((fact, scope)) => {
+                Ok((fact, scope, replaces)) => {
                     let path = crate::agent::memory::path_for_scope(ctx.cwd, scope);
                     let label = scope.label();
-                    match crate::agent::memory::remember(&path, &fact) {
+                    match crate::agent::memory::remember(
+                        &path,
+                        &fact,
+                        &self.date,
+                        replaces.as_deref(),
+                    ) {
                         Ok(crate::agent::memory::RememberOutcome::Added(count)) => {
                             // Global facts ride into every project — call that out.
                             if scope == crate::agent::memory::MemoryScope::Global {
@@ -47,6 +52,12 @@ into every future session. The user can audit or edit it via /memory."
                         }
                         Ok(crate::agent::memory::RememberOutcome::Refreshed) => {
                             Ok("Already remembered (recency refreshed).".to_string())
+                        }
+                        Ok(crate::agent::memory::RememberOutcome::Replaced(count)) => {
+                            ui.notify(&format!("memory corrected ({label}): {fact}"));
+                            Ok(format!(
+                                "Replaced the outdated entry ({count} saved, {label} scope)."
+                            ))
                         }
                         Err(e) => Err(e),
                     }
