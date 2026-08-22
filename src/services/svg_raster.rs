@@ -68,6 +68,12 @@ fn target_is_external(value: &str) -> bool {
 }
 
 pub fn rasterize_svg(bytes: &[u8]) -> Option<Vec<u8>> {
+    // Kill switch: the whole cascade shells out to host tools, so results are
+    // host-dependent — and the browser rungs under a quarantined $HOME pop
+    // macOS "keychain cannot be found" dialogs. The test sandbox sets this.
+    if std::env::var("AIVO_NO_SVG_RASTER").is_ok_and(|v| !v.is_empty() && v != "0") {
+        return None;
+    }
     let dir = tempfile::tempdir().ok()?;
     let src = dir.path().join("preview.svg");
     std::fs::write(&src, bytes).ok()?;
@@ -199,6 +205,9 @@ fn try_chrome_screenshot(browser: &Path, profile: &Path, src: &Path, out: &Path)
             "--no-first-run",
             "--hide-scrollbars",
             "--disable-gpu",
+            // Screenshots need no Safe Storage; without this a missing login
+            // keychain (fake $HOME) pops a blocking macOS dialog.
+            "--use-mock-keychain",
         ])
         .arg(src)
         .stdin(Stdio::null())

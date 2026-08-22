@@ -33,6 +33,10 @@ fn sandbox_process_env() {
         // Would otherwise leak into spawned aivo children that set their own
         // per-test HOME, collapsing their isolation onto one shared config dir.
         std::env::remove_var("AIVO_CONFIG_DIR");
+        // SVG previews shell out (rsvg-convert → … → real Chrome/Edge), so
+        // they're host-dependent — and a browser under this fake HOME pops
+        // macOS keychain dialogs. Inherited by spawned aivo children too.
+        std::env::set_var("AIVO_NO_SVG_RASTER", "1");
         // Ambient proxies would swallow 127.0.0.1 mock traffic. (Mirrors
         // PROXY_VARS in src/plugin/endpoint.rs — this std-only file can't
         // import the lib const.)
