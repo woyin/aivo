@@ -119,6 +119,11 @@ fn partition_guides(cwd: &str, guides: &[String]) -> (Vec<(String, String)>, Vec
         };
         match std::fs::read_to_string(&path) {
             Ok(c) if c.trim().is_empty() => {}
+            // Memory rides outside the shared total — its 16 KiB cap exists so it
+            // always inlines; big guide chains must not crowd it out.
+            Ok(c) if crate::agent::memory::is_memory_path(&path) && c.len() <= GUIDE_INLINE_MAX => {
+                inlined.push((label.clone(), c.trim().to_string()));
+            }
             Ok(c) if c.len() <= GUIDE_INLINE_MAX && total + c.len() <= GUIDES_INLINE_TOTAL_MAX => {
                 total += c.len();
                 inlined.push((label.clone(), c.trim().to_string()));
@@ -302,6 +307,29 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    /// Memory must inline verbatim even when a big guide chain exhausts the shared total.
+    #[test]
+    fn memory_inlines_even_when_guides_exhaust_the_total_budget() {
+        let dir = tmp();
+        // Two guides at the per-file cap exhaust the 48 KiB shared total exactly.
+        let big = "g".repeat(24 * 1024);
+        std::fs::write(dir.join("big1.md"), &big).unwrap();
+        std::fs::write(dir.join("big2.md"), &big).unwrap();
+        let mem = crate::agent::memory::project_memory_path(&dir);
+        std::fs::create_dir_all(mem.parent().unwrap()).unwrap();
+        std::fs::write(&mem, "- remembered: the gateway drops the K\n").unwrap();
+        let guides = vec![
+            dir.join("big1.md").display().to_string(),
+            dir.join("big2.md").display().to_string(),
+            mem.display().to_string(),
+        ];
+        let p = system_prompt(&dir.display().to_string(), "", &guides, &[]);
+        assert!(
+            p.contains("remembered: the gateway drops the K"),
+            "memory degraded to a pointer instead of inlining"
+        );
     }
 
     #[test]

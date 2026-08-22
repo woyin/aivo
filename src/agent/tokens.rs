@@ -50,6 +50,30 @@ pub(crate) fn usage_tokens(usage: &Option<Value>) -> u64 {
         + out
 }
 
+/// Prompt-side tokens from a `usage` object (cache included, completion excluded);
+/// 0 when the shape can't isolate the prompt — no sample beats a wrong one.
+pub(crate) fn prompt_usage_tokens(usage: &Option<Value>) -> u64 {
+    let Some(u) = usage else {
+        return 0;
+    };
+    let num = |k: &str| u.get(k).and_then(|x| x.as_u64());
+    if let Some(p) = num("prompt_tokens") {
+        return p;
+    }
+    if let Some(i) = num("input_tokens") {
+        return i
+            + num("cache_read_input_tokens").unwrap_or(0)
+            + num("cache_creation_input_tokens").unwrap_or(0);
+    }
+    match (
+        num("total_tokens"),
+        num("output_tokens").or_else(|| num("completion_tokens")),
+    ) {
+        (Some(t), Some(o)) => t.saturating_sub(o),
+        _ => 0,
+    }
+}
+
 /// Flatten a user content value (string or multimodal array) into an array of parts.
 pub(crate) fn content_to_parts(v: Value) -> Vec<Value> {
     match v {
@@ -234,6 +258,24 @@ mod tests {
             15
         );
         assert_eq!(usage_tokens(&None), 0);
+    }
+
+    #[test]
+    fn prompt_usage_tokens_isolates_the_prompt_side() {
+        let u =
+            json!({"prompt_tokens": 50_000, "completion_tokens": 5_000, "total_tokens": 55_000});
+        assert_eq!(prompt_usage_tokens(&Some(u)), 50_000);
+        let u = json!({"input_tokens": 1_000, "output_tokens": 5_000,
+            "cache_read_input_tokens": 49_000, "cache_creation_input_tokens": 0});
+        assert_eq!(prompt_usage_tokens(&Some(u)), 50_000);
+        let u = json!({"total_tokens": 55_000, "completion_tokens": 5_000});
+        assert_eq!(prompt_usage_tokens(&Some(u)), 50_000);
+        // Total alone can't isolate the prompt — no sample.
+        assert_eq!(
+            prompt_usage_tokens(&Some(json!({"total_tokens": 55_000}))),
+            0
+        );
+        assert_eq!(prompt_usage_tokens(&None), 0);
     }
 
     #[test]

@@ -35,6 +35,12 @@ pub fn project_memory_path(cwd: &Path) -> PathBuf {
     memory_dir().join(format!("{}.md", project_key(cwd)))
 }
 
+/// Whether a guide label points into the memory dir (memory gets its own
+/// inline allowance in `system_prompt`).
+pub fn is_memory_path(path: &Path) -> bool {
+    path.parent().is_some_and(|p| p == memory_dir())
+}
+
 /// Global tier: facts injected into every project.
 pub fn global_memory_path() -> PathBuf {
     memory_dir().join("GLOBAL.md")

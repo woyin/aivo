@@ -1021,15 +1021,20 @@ Fix the cause, or finish with status \"blocked\".",
         // One definition of "which paths does this tool touch", shared with the staleness
         // tracker and grant store (`apply_patch` carries many in its V4A body; the rest one).
         for path in crate::agent::file_tracker::tracked_paths(name, args) {
-            let path = path.trim();
-            if path.is_empty() || self.touched_files.iter().any(|p| p == path) {
-                continue;
-            }
-            if self.touched_files.len() >= MAX_TOUCHED_FILES {
-                self.touched_files.remove(0);
-            }
-            self.touched_files.push(path.to_string());
+            self.record_touched_path(&path);
         }
+    }
+
+    /// Dedup-append one touched path, dropping the oldest past the cap.
+    pub(super) fn record_touched_path(&mut self, path: &str) {
+        let path = path.trim();
+        if path.is_empty() || self.touched_files.iter().any(|p| p == path) {
+            return;
+        }
+        if self.touched_files.len() >= MAX_TOUCHED_FILES {
+            self.touched_files.remove(0);
+        }
+        self.touched_files.push(path.to_string());
     }
 
     // --- /rewind: tree checkpoints ---

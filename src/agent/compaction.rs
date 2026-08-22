@@ -53,6 +53,10 @@ the updated summary.";
 /// plan kept whole, touched-files trimmed oldest-first so pinning can't re-overflow.
 pub(crate) const PINNED_MAX_TOKENS: usize = 2_000;
 pub(crate) const SUMMARY_FOLD_PREFIX: &str = "[Summary of earlier conversation]";
+/// Bound the pinned block in a fold so restore can parse it back; copies in user
+/// input / summaries are ZWSP-defanged, so only the engine's fold carries authentic ones.
+pub(crate) const PINNED_BLOCK_BEGIN: &str = "[pinned working set]";
+pub(crate) const PINNED_BLOCK_END: &str = "[end pinned working set]";
 /// Percent of the compaction budget above which the preventive snip runs; below it
 /// there's ample headroom, so nothing is shed early.
 const SNIP_WATERMARK_PCT: usize = 60;
@@ -73,14 +77,23 @@ impl AgentEngine {
         }
     }
 
-    /// Tokens held back from the window for the response + the tool schemas actually being sent.
+    /// Tokens held back from the window for the response + the tool schemas being
+    /// sent; the schema estimate is calibrated onto the window's real-token ruler.
     pub(crate) fn compact_reserve(&self) -> usize {
         let schemas: usize = self
             .tools_openai
             .iter()
             .map(|t| estimate_str_tokens(&t.to_string()))
             .sum();
-        (RESPONSE_RESERVE + schemas).min(self.compaction_window() * RESERVE_MAX_WINDOW_PCT / 100)
+        let schemas_real = (schemas as f64 * self.token_calibration) as usize;
+        (RESPONSE_RESERVE + schemas_real)
+            .min(self.compaction_window() * RESERVE_MAX_WINDOW_PCT / 100)
+    }
+
+    /// Recent-window held out of compaction, capped at a third of the budget so
+    /// small windows keep something foldable.
+    pub(crate) fn keep_recent_budget(&self) -> usize {
+        keep_recent_tokens().min(self.compaction_budget_estimate() / 3)
     }
 
     /// Compaction budget in chars/4-estimate space: `(window - reserve) / calibration`,
@@ -92,13 +105,26 @@ impl AgentEngine {
         ((real as f64) / self.token_calibration).floor() as usize
     }
 
-    /// Fold a `(sent estimate, measured total)` sample into the calibration (measured
-    /// total dodges cache-accounting quirks). Rises at once on undershoot, eases down slowly.
-    pub(crate) fn update_calibration(&mut self, sent_estimate: usize, measured_total: u64) {
-        if sent_estimate < CALIBRATION_MIN_SAMPLE || measured_total == 0 {
+    /// Calibrate from the prompt side only — completion never sits in the next
+    /// request's prompt and would ratchet the ratio up.
+    pub(crate) fn record_calibration_sample(
+        &mut self,
+        sent_estimate: usize,
+        usage: &Option<Value>,
+    ) {
+        self.update_calibration(
+            sent_estimate,
+            crate::agent::tokens::prompt_usage_tokens(usage),
+        );
+    }
+
+    /// Fold a `(sent estimate, measured prompt)` sample into the calibration.
+    /// Rises at once on undershoot, eases down slowly.
+    pub(crate) fn update_calibration(&mut self, sent_estimate: usize, measured_prompt: u64) {
+        if sent_estimate < CALIBRATION_MIN_SAMPLE || measured_prompt == 0 {
             return;
         }
-        let ratio = calibration_ratio(measured_total, sent_estimate);
+        let ratio = calibration_ratio(measured_prompt, sent_estimate);
         // both operands >= 1.0, so the blend needs no floor
         self.token_calibration = if ratio > self.token_calibration {
             ratio
@@ -109,7 +135,8 @@ impl AgentEngine {
 
     /// Raise the calibration from an overflow rejection: use the cited token count if present, else nudge up.
     pub(crate) fn recalibrate_from_overflow(&mut self, err: &str) {
-        let estimate = estimate_tokens(&self.messages);
+        // Cited counts cover the whole request, schemas included.
+        let estimate = estimate_tokens(&self.messages) + estimate_tokens(&self.tools_openai);
         match parse_overflow_actual(err) {
             Some(actual) if estimate >= CALIBRATION_MIN_SAMPLE => {
                 // rise-only on overflow, unlike update_calibration's EMA
@@ -125,7 +152,7 @@ impl AgentEngine {
     /// round-trip could itself overflow mid-recovery). Clears stale tool output, then hard-trims.
     pub(crate) fn force_fit_budget(&mut self) {
         let budget = self.compaction_budget_estimate();
-        let mut cut = find_cut(&self.messages, keep_recent_tokens());
+        let mut cut = find_cut(&self.messages, self.keep_recent_budget());
         // Single long turn (resume) has no interior user boundary → fall back so `enforce_budget` doesn't drop it to `[system, user]`.
         if cut <= 1 {
             cut = find_cut(&self.messages, 0);
@@ -151,7 +178,7 @@ impl AgentEngine {
         if total <= budget {
             return 0;
         }
-        let mut cut = find_cut(&self.messages, keep_recent_tokens());
+        let mut cut = find_cut(&self.messages, self.keep_recent_budget());
         // Single long turn (resume) has no interior user boundary → summarize into the latest user turn.
         if cut <= 1 {
             cut = find_cut(&self.messages, 0);
@@ -252,7 +279,7 @@ impl AgentEngine {
 
     /// Whether a compaction could fold/clear anything — lets `/compact` skip a pointless round-trip.
     pub fn has_compactable_history(&self) -> bool {
-        let cut = find_cut(&self.messages, keep_recent_tokens());
+        let cut = find_cut(&self.messages, self.keep_recent_budget());
         cut > 1 || self.stale_tool_result_savings(cut) > 0
     }
 
@@ -264,7 +291,7 @@ impl AgentEngine {
         elapsed_secs: u64,
     ) {
         let before = self.estimated_context_tokens();
-        let cut = find_cut(&self.messages, keep_recent_tokens());
+        let cut = find_cut(&self.messages, self.keep_recent_budget());
         let tokens = if cut > 1 {
             self.summarize_range(ctx, ui, cut).await
         } else {
@@ -278,7 +305,7 @@ impl AgentEngine {
     /// `/compact fast`: clear stale tool output, no model call. Returns `(before, after)` calibrated estimate.
     pub fn compact_now_local(&mut self) -> (u64, u64) {
         let before = self.estimated_context_tokens();
-        let cut = find_cut(&self.messages, keep_recent_tokens());
+        let cut = find_cut(&self.messages, self.keep_recent_budget());
         self.clear_stale_tool_results(cut);
         (before, self.estimated_context_tokens())
     }
@@ -407,14 +434,10 @@ impl AgentEngine {
         if !self.prefix_cache_seen {
             return false;
         }
-        // A budget inside the keep-recent window can never age anything out; skip the scans.
-        if budget <= keep_recent_tokens() {
-            return false;
-        }
         if total.saturating_mul(100) < budget.saturating_mul(SNIP_WATERMARK_PCT) {
             return false;
         }
-        let cut = find_cut(&self.messages, keep_recent_tokens());
+        let cut = find_cut(&self.messages, self.keep_recent_budget());
         if cut <= 1 || self.stale_tool_result_savings(cut) < SNIP_MIN_RECLAIM {
             return false;
         }
@@ -611,11 +634,13 @@ impl AgentEngine {
         // The fold consumed the parked originals; surviving stubs summarize as stubs next time.
         self.snipped_originals.clear();
         let mut folded = format!("{SUMMARY_FOLD_PREFIX}\n{summary}");
-        // Pin plan + touched-files into the SAME fold so they never become a standalone same-role message.
+        // Pin plan + touched-files into the SAME fold so they never become a
+        // standalone same-role message.
         let pinned = self.render_pinned_block();
         if !pinned.is_empty() {
-            folded.push_str("\n\n");
-            folded.push_str(&pinned);
+            folded.push_str(&format!(
+                "\n\n{PINNED_BLOCK_BEGIN}\n{pinned}\n{PINNED_BLOCK_END}"
+            ));
         }
         let summary = folded;
         if self.messages.get(cut).map(role) == Some("user") {
@@ -663,10 +688,86 @@ fn summary_is_degenerate(summary: &str, transcript_len: usize) -> bool {
             && trimmed.chars().count() < MIN_SUMMARY_CHARS)
 }
 
-/// Defang an echoed fold marker with a zero-width space so only one authoritative marker survives.
+/// Defang echoed fold/pinned markers so only the engine's own survive.
 fn neutralize_summary(summary: &str) -> String {
-    let defanged = format!("[\u{200b}{}", &SUMMARY_FOLD_PREFIX[1..]);
-    summary.replace(SUMMARY_FOLD_PREFIX, &defanged)
+    [SUMMARY_FOLD_PREFIX, PINNED_BLOCK_BEGIN, PINNED_BLOCK_END]
+        .iter()
+        .fold(summary.to_string(), |acc, marker| {
+            acc.replace(marker, &format!("[\u{200b}{}", &marker[1..]))
+        })
+}
+
+/// Pinned working set parsed back out of a fold; evidence is absent — its
+/// marker lines re-derive via the evidence scan.
+pub(crate) struct PinnedWorkingSet {
+    pub(crate) plan: Vec<plan::PlanItem>,
+    pub(crate) notes: Vec<Note>,
+    pub(crate) files: Vec<String>,
+}
+
+/// Parse the LAST pinned block out of a fold message — later folds supersede;
+/// forged copies were defanged and never match line-exact.
+pub(crate) fn parse_pinned_block(text: &str) -> Option<PinnedWorkingSet> {
+    let lines: Vec<&str> = text.lines().collect();
+    let begin = lines.iter().rposition(|l| *l == PINNED_BLOCK_BEGIN)?;
+    let end = begin + lines[begin..].iter().position(|l| *l == PINNED_BLOCK_END)?;
+    let mut set = PinnedWorkingSet {
+        plan: Vec::new(),
+        notes: Vec::new(),
+        files: Vec::new(),
+    };
+    #[derive(PartialEq)]
+    enum Section {
+        Plan,
+        Notes,
+        Files,
+        Other,
+    }
+    let mut section = Section::Other;
+    for line in &lines[begin + 1..end] {
+        if let Some(heading) = line.strip_prefix("## ") {
+            section = match heading {
+                "Pinned Plan" => Section::Plan,
+                "Notes" => Section::Notes,
+                "Files touched" => Section::Files,
+                _ => Section::Other,
+            };
+            continue;
+        }
+        match section {
+            Section::Plan => {
+                if let Some(item) = plan::parse_checkbox_line(line) {
+                    set.plan.push(item);
+                }
+            }
+            Section::Notes => {
+                if let Some(body) = line.strip_prefix("- ") {
+                    let note = match body
+                        .strip_prefix('(')
+                        .and_then(|r| r.split_once(") "))
+                        .filter(|(id, _)| !id.is_empty())
+                    {
+                        Some((id, text)) => Note {
+                            id: Some(id.to_string()),
+                            text: text.to_string(),
+                        },
+                        None => Note {
+                            id: None,
+                            text: body.to_string(),
+                        },
+                    };
+                    set.notes.push(note);
+                }
+            }
+            Section::Files => {
+                if let Some(path) = line.strip_prefix("- ") {
+                    set.files.push(path.to_string());
+                }
+            }
+            Section::Other => {}
+        }
+    }
+    Some(set)
 }
 
 /// The artifact-pointer line, if any — the LAST match, since the real pointer is
@@ -821,6 +922,8 @@ mod tests {
     fn recalibrate_from_overflow_ignores_ratio_below_min_sample() {
         let mut e = engine();
         e.messages = vec![json!({"role":"system","content":"sys"})];
+        // Schemas count toward the sample now — drop them so the estimate stays tiny.
+        e.tools_openai.clear();
         assert!(estimate_tokens(&e.messages) < CALIBRATION_MIN_SAMPLE);
         e.recalibrate_from_overflow(
             "token count of 290000 exceeds the maximum allowed input length of 262112 tokens",
@@ -1084,12 +1187,6 @@ mod tests {
         assert!(total.saturating_mul(100) < big_budget.saturating_mul(SNIP_WATERMARK_PCT));
         assert!(!e.maybe_preventive_snip(big_budget, total, &mut ui));
 
-        // Budget inside the keep-recent window: structurally inert, skipped outright.
-        e.context_window = 28_000;
-        let small_budget = e.compaction_budget_estimate();
-        assert!(small_budget <= keep_recent_tokens());
-        assert!(!e.maybe_preventive_snip(small_budget, total, &mut ui));
-
         e.context_window = 50_000;
         e.prefix_cache_seen = false;
         let before = e.messages.clone();
@@ -1130,6 +1227,21 @@ mod tests {
         let before = e.messages.clone();
         assert!(!e.maybe_preventive_snip(budget, total, &mut ui));
         assert_eq!(e.messages, before, "below SNIP_MIN_RECLAIM nothing is shed");
+
+        // The proportional keep-window lets small windows age stale output out too.
+        let mut small = engine();
+        small.messages = transcript(&old_tool);
+        small.prefix_cache_seen = true;
+        small.context_window = 28_000;
+        let small_budget = small.compaction_budget_estimate();
+        assert!(small_budget < keep_recent_tokens());
+        let total = estimate_tokens(&small.messages);
+        assert!(small.maybe_preventive_snip(small_budget, total, &mut ui));
+        assert_eq!(
+            small.messages[3]["content"],
+            json!(TOOL_RESULT_CLEARED),
+            "small windows can now reclaim stale output preventively"
+        );
     }
 
     #[test]

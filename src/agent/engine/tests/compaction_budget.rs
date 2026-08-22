@@ -79,11 +79,67 @@ fn token_calibration_deflates_compaction_budget() {
     );
     engine.token_calibration = 1.2;
     let deflated = engine.compaction_budget_estimate();
-    assert_eq!(deflated, ((raw as f64) / 1.2).floor() as usize);
+    // The reserve itself grows with calibration; recompute before checking the division.
+    let raw_after = engine.compaction_window() - engine.compact_reserve();
+    assert_eq!(deflated, ((raw_after as f64) / 1.2).floor() as usize);
     assert!(
         deflated < raw,
         "calibration > 1 shrinks the estimate-space budget so denser-than-chars/4 \
          content still fits the real window"
+    );
+}
+
+/// Completion tokens must not inflate the calibration.
+#[test]
+fn calibration_sample_excludes_completion_tokens() {
+    let mut engine = AgentEngine::new("/tmp", "m", "", &[], &[], 0, 0);
+    engine.record_calibration_sample(
+        50_000,
+        &Some(json!({"prompt_tokens": 50_000, "completion_tokens": 5_000, "total_tokens": 55_000})),
+    );
+    assert_eq!(
+        engine.token_calibration, 1.0,
+        "a perfect prompt estimate must not be penalized for the reply's length"
+    );
+    // A real prompt-side undershoot still raises it.
+    engine.record_calibration_sample(
+        50_000,
+        &Some(json!({"prompt_tokens": 55_000, "completion_tokens": 5_000})),
+    );
+    assert!((engine.token_calibration - 1.1).abs() < 1e-9);
+}
+
+/// A flat 20k keep-window inside a 32k window would leave compaction ~2k of working space.
+#[test]
+fn keep_recent_scales_down_for_small_windows() {
+    let mut engine = AgentEngine::new("/tmp", "m", "", &[], &[], 0, 0);
+    engine.context_window = 32_000;
+    let budget = engine.compaction_budget_estimate();
+    assert!(
+        engine.keep_recent_budget() <= budget / 3,
+        "keep-recent ({}) must leave at least two thirds of the budget ({budget}) foldable",
+        engine.keep_recent_budget()
+    );
+}
+
+/// The schema estimate must be scaled to real-token space before being held out
+/// of the (real) window — otherwise a calibration of 2 halves its effect.
+#[test]
+fn compact_reserve_scales_schemas_by_calibration() {
+    let mut engine = AgentEngine::new("/tmp", "m", "", &[], &[], 0, 0);
+    engine.context_window = 262_144;
+    engine.token_calibration = 2.0;
+    let without = engine.compaction_budget_estimate();
+    let schema =
+        json!({"type":"function","function":{"name":"extra","description":"d".repeat(4_000)}});
+    let schema_est = crate::agent::tokens::estimate_str_tokens(&schema.to_string());
+    engine.tools_openai.push(schema);
+    let with = engine.compaction_budget_estimate();
+    let delta = without - with;
+    assert!(
+        (delta as i64 - schema_est as i64).abs() <= 1,
+        "an added schema must cost its full estimate ({schema_est}) in estimate space, \
+         not calibration-diluted {delta}"
     );
 }
 

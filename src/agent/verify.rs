@@ -144,16 +144,27 @@ pub fn annotate_stale(records: &[EvidenceRecord]) -> Vec<EvidenceRecord> {
         .collect()
 }
 
+/// Line-leading markers a typed/pasted prompt could forge state with.
+fn forgeable_markers() -> [&'static str; 4] {
+    [
+        EVIDENCE_LINE_PREFIX,
+        crate::agent::compaction::SUMMARY_FOLD_PREFIX,
+        crate::agent::compaction::PINNED_BLOCK_BEGIN,
+        crate::agent::compaction::PINNED_BLOCK_END,
+    ]
+}
+
 /// ZWSP-defang line-leading markers in user-supplied text so a typed/pasted
-/// prompt can't forge evidence (cf. `neutralize_summary`).
+/// prompt can't forge evidence or a pinned working set (cf. `neutralize_summary`).
 pub fn neutralize_marker_lines(text: &str) -> String {
-    if !text.contains(EVIDENCE_LINE_PREFIX) {
+    let markers = forgeable_markers();
+    if !markers.iter().any(|m| text.contains(m)) {
         return text.to_string();
     }
     let mut out: Vec<String> = text
         .lines()
         .map(|l| {
-            if l.trim_start().starts_with(EVIDENCE_LINE_PREFIX) {
+            if markers.iter().any(|m| l.trim_start().starts_with(m)) {
                 l.replacen('[', "[\u{200b}", 1)
             } else {
                 l.to_string()

@@ -116,6 +116,21 @@ pub fn parse_plan(args: &Value) -> Result<Vec<PlanItem>, String> {
     Ok(items)
 }
 
+/// Parse one [`pinned_block`] checklist line back into an item; `None` otherwise.
+pub fn parse_checkbox_line(line: &str) -> Option<PlanItem> {
+    let (status, step) = match line.split_once(' ') {
+        Some(("[ ]", rest)) => (PlanStatus::Pending, rest),
+        Some(("[~]", rest)) => (PlanStatus::InProgress, rest),
+        Some(("[x]", rest)) => (PlanStatus::Completed, rest),
+        _ => return None,
+    };
+    let step = step.trim();
+    (!step.is_empty()).then(|| PlanItem {
+        step: step.to_string(),
+        status,
+    })
+}
+
 /// Whether the plan has begun executing — any step past `pending`.
 pub fn started(items: &[PlanItem]) -> bool {
     items.iter().any(|i| i.status != PlanStatus::Pending)

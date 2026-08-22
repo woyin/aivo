@@ -3,6 +3,7 @@
 
 use super::*;
 
+use crate::agent::compaction;
 use crate::agent::tokens;
 use crate::services::vision_describe;
 
@@ -72,41 +73,73 @@ impl AgentEngine {
     /// the source of truth). Calls folded into a summary live on as text, so nothing
     /// visible is lost. Only meaningful right after restore.
     pub(super) fn rebuild_working_set_from_log(&mut self) {
-        // Collect first (immutable borrow), then apply — `record_touched_file` borrows mut.
-        let calls: Vec<(String, Value)> = self
+        enum Derived {
+            Call(String, Value),
+            // A fold's pinned block — sole carrier of state whose tool calls were drained.
+            Pinned(compaction::PinnedWorkingSet),
+        }
+        // Collect first (immutable borrow), then apply in message order —
+        // `record_touched_file` borrows mut, and calls after a fold refine its state.
+        let derived: Vec<Derived> = self
             .messages
             .iter()
-            .filter(|m| role(m) == "assistant")
-            .filter_map(|m| m.get("tool_calls").and_then(|c| c.as_array()))
-            .flatten()
-            .filter_map(|call| {
-                let name = call.pointer("/function/name").and_then(|v| v.as_str())?;
-                let args = call
-                    .pointer("/function/arguments")
-                    .and_then(|v| v.as_str())
-                    .and_then(|s| serde_json::from_str(s).ok())
-                    .unwrap_or(Value::Null);
-                Some((name.to_string(), args))
+            .flat_map(|m| match role(m) {
+                "assistant" => m
+                    .get("tool_calls")
+                    .and_then(|c| c.as_array())
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|call| {
+                        let name = call.pointer("/function/name").and_then(|v| v.as_str())?;
+                        let args = call
+                            .pointer("/function/arguments")
+                            .and_then(|v| v.as_str())
+                            .and_then(|s| serde_json::from_str(s).ok())
+                            .unwrap_or(Value::Null);
+                        Some(Derived::Call(name.to_string(), args))
+                    })
+                    .collect::<Vec<_>>(),
+                // Typed copies of the fold prefix were defanged — only real folds match.
+                "user" => user_text(m)
+                    .filter(|t| t.starts_with(compaction::SUMMARY_FOLD_PREFIX))
+                    .and_then(|t| compaction::parse_pinned_block(&t))
+                    .map(Derived::Pinned)
+                    .into_iter()
+                    .collect(),
+                _ => Vec::new(),
             })
             .collect();
-        for (name, args) in calls {
-            match name.as_str() {
-                "read_file" | "write_file" | "edit_file" | "multi_edit" => {
-                    self.record_touched_file(&name, &args);
-                }
-                "update_plan" => {
-                    if let Ok(mut items) = plan::parse_plan(&args) {
-                        plan::normalize_progress(&mut items);
-                        self.plan = items;
+        for item in derived {
+            match item {
+                Derived::Call(name, args) => match name.as_str() {
+                    "read_file" | "write_file" | "edit_file" | "multi_edit" => {
+                        self.record_touched_file(&name, &args);
                     }
-                }
-                "take_note" => {
-                    // Same deterministic merge as the live path, so resume can't drift from it.
-                    if let Ok(note) = notes::parse_note(&args) {
+                    "update_plan" => {
+                        if let Ok(mut items) = plan::parse_plan(&args) {
+                            plan::normalize_progress(&mut items);
+                            self.plan = items;
+                        }
+                    }
+                    "take_note" => {
+                        // Same deterministic merge as the live path, so resume can't drift from it.
+                        if let Ok(note) = notes::parse_note(&args) {
+                            notes::merge_note(&mut self.notes, note, MAX_NOTES);
+                        }
+                    }
+                    _ => {}
+                },
+                Derived::Pinned(pinned) => {
+                    if !pinned.plan.is_empty() {
+                        self.plan = pinned.plan;
+                    }
+                    for note in pinned.notes {
                         notes::merge_note(&mut self.notes, note, MAX_NOTES);
                     }
+                    for path in pinned.files {
+                        self.record_touched_path(&path);
+                    }
                 }
-                _ => {}
             }
         }
         // Evidence lives in user-role `[self-verify]` lines, not tool calls. Cleared

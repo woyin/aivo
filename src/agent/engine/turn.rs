@@ -69,6 +69,8 @@ impl AgentEngine {
         let mut steps = 0usize;
         let mut leaked_nudges = 0usize;
         let mut completion_nudges = 0usize;
+        // The unfinished-answer and unfinished-plan gates must not drain each other's budget.
+        let mut finish_nudges = 0usize;
         let mut plan_nudges = 0usize;
         let mut truncated_nudges = 0usize;
         let mut mail_nudges = 0usize;
@@ -139,8 +141,10 @@ impl AgentEngine {
                 tools,
                 extra,
             };
-            // Paired with measured usage below to calibrate; re-measured if overflow recovery shrinks the request.
-            let mut sent_estimate = estimate_tokens(&request.messages);
+            // Paired with measured usage below to calibrate (schemas ride in the
+            // prompt too); re-measured if overflow recovery shrinks the request.
+            let mut sent_estimate =
+                estimate_tokens(&request.messages) + estimate_tokens(&request.tools);
 
             ui.turn_start();
             // Seed the live context-fill; the measured total replaces it once the step returns.
@@ -205,7 +209,8 @@ impl AgentEngine {
                         self.recalibrate_from_overflow(&e.message);
                         self.force_fit_budget();
                         request.messages = self.outgoing_messages();
-                        sent_estimate = estimate_tokens(&request.messages);
+                        sent_estimate =
+                            estimate_tokens(&request.messages) + estimate_tokens(&request.tools);
                         ui.notify("context over the model's limit — compacting and retrying…");
                     }
                     Err(e) => {
@@ -243,7 +248,7 @@ impl AgentEngine {
             if message.usage.is_some() {
                 context_tokens = step_tokens;
                 ui.context_usage(step_tokens, true);
-                self.update_calibration(sent_estimate, step_tokens);
+                self.record_calibration_sample(sent_estimate, &message.usage);
             }
             // Sum the real prompt/completion/cache split across steps (same parser as the serve, for a consistent index).
             if let Some(u) = &message.usage {
@@ -464,14 +469,14 @@ impl AgentEngine {
                 // proceeds as before.
                 if self.require_completion
                     && !self.read_only
-                    && completion_nudges < MAX_COMPLETION_NUDGES
+                    && finish_nudges < MAX_COMPLETION_NUDGES
                     && plan::started(&self.plan)
                     && self
                         .plan
                         .iter()
                         .any(|i| i.status != plan::PlanStatus::Completed)
                 {
-                    completion_nudges += 1;
+                    finish_nudges += 1;
                     ui.notify("the plan has unfinished steps — asking the model to close out");
                     self.push_text_turn("user", FINISH_NUDGE.to_string());
                     continue;
