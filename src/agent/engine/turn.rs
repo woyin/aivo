@@ -323,7 +323,10 @@ impl AgentEngine {
                 // Nothing was recorded, so re-sending the identical request is safe.
                 if empty_retries < MAX_EMPTY_RETRIES {
                     empty_retries += 1;
-                    ui.notify("the model returned an empty response — retrying…");
+                    ui.notify(&format!(
+                        "the model returned an empty response — retrying ({empty_retries}/{MAX_EMPTY_RETRIES})…"
+                    ));
+                    tokio::time::sleep(retry_delay(empty_retries, None)).await;
                     continue;
                 }
                 // No answer = a failed turn: the error channel persists it, skips

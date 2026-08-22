@@ -232,14 +232,13 @@ async fn subagent_worktree_isolation_keeps_parent_tree_clean() {
 #[tokio::test]
 async fn subagent_no_answer_is_a_failed_tool_result() {
     let dir = tmp();
+    unsafe { std::env::set_var("AIVO_AGENT_RETRY_BASE_MS", "1") };
     let call = tool_call_sse("subagent", json!({"task": "do a thing"}));
-    let port = spawn_sse_sequence(vec![
-        call,
-        // Sub converges with no text at all — twice, past the empty-retry.
-        "data: [DONE]\n\n".to_string(),
-        "data: [DONE]\n\n".to_string(),
-        FINAL_TEXT_SSE.to_string(),
-    ]);
+    let mut responses = vec![call];
+    // Sub converges with no text at all, past the empty-retry budget.
+    responses.extend(std::iter::repeat_n("data: [DONE]\n\n".to_string(), 4));
+    responses.push(FINAL_TEXT_SSE.to_string());
+    let port = spawn_sse_sequence(responses);
     let client = reqwest::Client::builder().no_proxy().build().unwrap();
     let base = format!("http://127.0.0.1:{port}");
     let mut engine = AgentEngine::new(&dir.display().to_string(), "m", "", &[], &[], 0, 0);

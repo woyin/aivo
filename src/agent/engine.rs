@@ -48,7 +48,7 @@ const MAX_RETRIES: usize = 3;
 /// discards the partial and the step re-runs; more would re-render text already read.
 const DISCARD_RETRY_MAX_STREAMED: usize = 200;
 /// Retry budget for an empty completion (usually a transient provider/bridge glitch).
-const MAX_EMPTY_RETRIES: usize = 1;
+const MAX_EMPTY_RETRIES: usize = 3;
 /// Cap on continue-after-truncation nudges per turn.
 const MAX_TRUNCATED_NUDGES: usize = 1;
 const TRUNCATED_CONTINUE_NUDGE: &str = "Your reply was cut off mid-stream by a dropped \

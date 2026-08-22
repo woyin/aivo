@@ -507,12 +507,13 @@ async fn read_after_write_in_same_batch_sees_new_content() {
     assert!(ui.tool_errors.is_empty(), "errors: {:?}", ui.tool_errors);
 }
 
-/// An empty completion is retried once; a second empty fails the turn without
-/// recording an assistant message (empty → invalid Anthropic content array).
+/// An empty completion is retried up to the budget; exhausting it fails the turn
+/// without recording an assistant message (empty → invalid Anthropic content array).
 #[tokio::test]
 async fn empty_completion_is_not_recorded_as_assistant_turn() {
     let dir = tmp();
-    let port = spawn_sse_sequence(vec![EMPTY_SSE.to_string(), EMPTY_SSE.to_string()]);
+    unsafe { std::env::set_var("AIVO_AGENT_RETRY_BASE_MS", "1") };
+    let port = spawn_sse_sequence(vec![EMPTY_SSE.to_string(); 4]);
     let client = reqwest::Client::builder().no_proxy().build().unwrap();
     let base = format!("http://127.0.0.1:{port}");
     let mut engine = AgentEngine::new(&dir.display().to_string(), "m", "", &[], &[], 0, 0);
@@ -556,6 +557,7 @@ async fn empty_completion_is_not_recorded_as_assistant_turn() {
 #[tokio::test]
 async fn empty_completion_retry_recovers() {
     let dir = tmp();
+    unsafe { std::env::set_var("AIVO_AGENT_RETRY_BASE_MS", "1") };
     let port = spawn_sse_sequence(vec![EMPTY_SSE.to_string(), FINAL_TEXT_SSE.to_string()]);
     let client = reqwest::Client::builder().no_proxy().build().unwrap();
     let base = format!("http://127.0.0.1:{port}");
@@ -576,6 +578,37 @@ async fn empty_completion_retry_recovers() {
         ui.errors
     );
     assert!(ui.notices.iter().any(|n| n.contains("empty response")));
+    assert_eq!(engine.messages.last().unwrap()["content"], "done");
+}
+
+/// Two empties in a row must still recover within the retry budget.
+#[tokio::test]
+async fn empty_completion_double_empty_recovers() {
+    let dir = tmp();
+    unsafe { std::env::set_var("AIVO_AGENT_RETRY_BASE_MS", "1") };
+    let port = spawn_sse_sequence(vec![
+        EMPTY_SSE.to_string(),
+        EMPTY_SSE.to_string(),
+        FINAL_TEXT_SSE.to_string(),
+    ]);
+    let client = reqwest::Client::builder().no_proxy().build().unwrap();
+    let base = format!("http://127.0.0.1:{port}");
+    let mut engine = AgentEngine::new(&dir.display().to_string(), "m", "", &[], &[], 0, 0);
+    let mut ui = CapturingUi::default();
+    run_session(
+        &mut engine,
+        &turn_ctx(&client, &base, &dir),
+        Some("hi".into()),
+        &mut ui,
+    )
+    .await;
+
+    assert_eq!(ui.text, "done");
+    assert!(
+        ui.errors.is_empty(),
+        "double-empty must recover, not error: {:?}",
+        ui.errors
+    );
     assert_eq!(engine.messages.last().unwrap()["content"], "done");
 }
 
