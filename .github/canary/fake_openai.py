@@ -93,7 +93,8 @@ def pick_task_tool(tools):
     for t in tools or []:
         fn = t.get("function", t)
         name = (fn.get("name") or "").lower()
-        if name not in ("task", "dispatch_agent"):
+        # claude >=2.1.239 renamed Task -> Agent.
+        if name not in ("task", "agent", "dispatch_agent"):
             continue
         props = ((fn.get("parameters") or {}).get("properties")) or {}
         args = {}
@@ -103,6 +104,10 @@ def pick_task_tool(tools):
                 args[p] = "Create a file named canary_done.txt with content CANARY_OK"
             elif "description" in pl:
                 args[p] = "canary subagent"
+            elif "background" in pl:
+                # Agent defaults to background dispatch; a -p turn could end
+                # before the subagent's requests reach the fake.
+                args[p] = False
             elif "subagent" in pl or "agent" in pl:
                 args[p] = "general-purpose"
         return fn.get("name"), args
