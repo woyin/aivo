@@ -5,55 +5,32 @@ use super::*;
 
 /// Side-effecting tools the client must permission-gate before `execute`.
 pub fn is_mutating(name: &str) -> bool {
-    matches!(
-        name,
-        "write_file" | "edit_file" | "multi_edit" | "apply_patch" | "run_bash"
-    )
+    registry::traits(name).is_some_and(|t| t.mutating)
 }
 
 /// Tools plan mode strips from the advertised set: the file-mutating ones
 /// (`run_bash` stays, gated per call), `subagent` (its sub-engine isn't
 /// read-only), and `generate_image` (writes a file, bills an API call).
 pub fn hidden_in_plan_mode(name: &str) -> bool {
-    (is_mutating(name) && name != "run_bash") || matches!(name, "subagent" | "generate_image")
+    registry::traits(name).is_some_and(|t| t.plan_hidden)
 }
 
 /// Built-in tools that only read (filesystem or network) and share no mutable
 /// state, so several can run concurrently within one tool-call batch. A
 /// deliberate allowlist: writes and `run_bash` mutate the workspace; plan /
 /// skill / subagent and external (MCP) tools mutate the engine or need ordered
-/// permission handling, so they stay sequential even though they aren't here.
+/// permission handling, so they stay sequential even though they aren't marked.
 pub fn is_parallel_safe(name: &str) -> bool {
-    matches!(
-        name,
-        "read_file" | "glob" | "grep" | "web_fetch" | "web_search"
-    )
+    registry::traits(name).is_some_and(|t| t.parallel_safe)
 }
 
-/// Whether a tool only reads — never touches the workspace. A conservative
-/// allowlist: a missing read-only tool just costs a redundant `/rewind` snapshot,
-/// but classifying a mutating tool here would lose its rewind point. Kept distinct
-/// from [`is_parallel_safe`] on purpose — that answers a concurrency question, and
+/// Whether a tool only reads — never touches the workspace. Conservative:
+/// a missing read-only flag just costs a redundant `/rewind` snapshot, but
+/// marking a mutating tool would lose its rewind point. Kept distinct from
+/// [`is_parallel_safe`] on purpose — that answers a concurrency question, and
 /// e.g. `list_dir` is read-only here yet not parallel-run there.
 pub fn is_read_only(name: &str) -> bool {
-    matches!(
-        name,
-        "read_file"
-            | "list_dir"
-            | "glob"
-            | "grep"
-            | "web_fetch"
-            | "web_search"
-            // Session controls — change session state, not the workspace.
-            | "switch_model"
-            | "set_effort"
-            // Interactive prompt — reads the user's answer, touches nothing.
-            | "ask_user"
-            // Job control on a process the agent itself started; never touches files.
-            | "check_job"
-            // Loads deferred MCP schemas — engine state only, never the workspace.
-            | "search_tools"
-    )
+    registry::traits(name).is_some_and(|t| t.read_only)
 }
 
 /// Confirmation gate for destructive `run_bash`.
@@ -85,20 +62,10 @@ the user to approve the write or relaunch with `--add-dir <dir>`."
 /// The out-of-workspace targets of a write-tool call — empty when fully
 /// confined (or args don't parse; execution surfaces that error).
 pub fn escaping_write_paths(name: &str, args: &Value, cwd: &Path) -> Vec<String> {
-    let candidates: Vec<String> = match name {
-        "write_file" | "edit_file" | "multi_edit" => args
-            .get("path")
-            .and_then(|v| v.as_str())
-            .map(|p| vec![p.to_string()])
-            .unwrap_or_default(),
-        "apply_patch" => args
-            .get("input")
-            .and_then(|v| v.as_str())
-            .map(crate::agent::apply_patch::target_paths)
-            .unwrap_or_default(),
-        _ => Vec::new(),
-    };
-    candidates
+    if !crate::agent::file_tracker::is_write_tool(name) {
+        return Vec::new();
+    }
+    crate::agent::file_tracker::tracked_paths(name, args)
         .into_iter()
         .filter(|p| path_escapes_cwd(p, cwd))
         .collect()

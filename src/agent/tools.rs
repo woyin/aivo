@@ -20,6 +20,7 @@ mod files;
 pub(crate) use files::*;
 mod remote;
 pub use remote::*;
+pub mod registry;
 mod safety;
 pub use safety::*;
 mod search;
@@ -157,7 +158,8 @@ pub async fn execute(name: &str, args: &Value, cwd: &Path) -> Result<String, Str
         "web_search" => web_search(args).await,
         "run_bash" => run_bash(args, cwd).await,
         other => Err(format!(
-            "unknown tool `{other}` (available: read_file, list_dir, glob, grep, write_file, edit_file, multi_edit, web_fetch, web_search, run_bash)"
+            "unknown tool `{other}` (available: {})",
+            registry::workspace_exec_names()
         )),
     }
 }
@@ -183,11 +185,9 @@ pub async fn execute_write_unconfined(
 }
 
 fn refuse_writes_in_read_only(name: &str) -> Result<(), String> {
-    if matches!(
-        name,
-        "write_file" | "edit_file" | "multi_edit" | "apply_patch"
-    ) && crate::agent::sandbox::current_profile()
-        == crate::agent::sandbox::SandboxProfile::ReadOnly
+    if crate::agent::file_tracker::is_write_tool(name)
+        && crate::agent::sandbox::current_profile()
+            == crate::agent::sandbox::SandboxProfile::ReadOnly
     {
         return Err(format!(
             "{name}: refused — the read-only sandbox profile is active, so no files may be written."

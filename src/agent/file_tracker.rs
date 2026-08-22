@@ -69,28 +69,27 @@ impl FileTracker {
 /// extraction so tracking and the touched-files list stay in step. Shared with the
 /// grant store so "which files does this tool touch" has one definition.
 pub(crate) fn tracked_paths(name: &str, args: &Value) -> Vec<String> {
-    match name {
-        "read_file" | "write_file" | "edit_file" | "multi_edit" => args
-            .get("path")
-            .and_then(Value::as_str)
-            .map(|p| vec![p.to_string()])
-            .unwrap_or_default(),
-        "apply_patch" => args
+    if !crate::agent::tools::registry::traits(name).is_some_and(|t| t.path_tracked) {
+        return Vec::new();
+    }
+    // `apply_patch` carries its targets in the V4A body; the rest one `path` arg.
+    if name == "apply_patch" {
+        return args
             .get("input")
             .and_then(Value::as_str)
             .map(crate::agent::apply_patch::target_paths)
-            .unwrap_or_default(),
-        _ => Vec::new(),
+            .unwrap_or_default();
     }
+    args.get("path")
+        .and_then(Value::as_str)
+        .map(|p| vec![p.to_string()])
+        .unwrap_or_default()
 }
 
 /// The mutating file tools — those whose `tracked_paths` should be re-checked after a
 /// write. Excludes `read_file`, which carries a path but changes nothing.
 pub(crate) fn is_write_tool(name: &str) -> bool {
-    matches!(
-        name,
-        "write_file" | "edit_file" | "multi_edit" | "apply_patch"
-    )
+    crate::agent::tools::registry::traits(name).is_some_and(|t| t.file_write)
 }
 
 /// Stable key for a workspace path: `~`/cwd-resolved (matching the tools' own

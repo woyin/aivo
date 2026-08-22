@@ -15,12 +15,19 @@ impl AgentEngine {
         ui: &mut dyn AgentUi,
         tool_calls: &[ToolCall],
     ) -> (u64, Vec<(String, String)>) {
+        // Normalize aliased tool names once for the whole batch. External
+        // (`mcp__*`) names never normalize; routing that needs the raw advertised
+        // name still reads `call.name`.
+        let names: Vec<&str> = tool_calls
+            .iter()
+            .map(|c| subagents::normalize_tool_name(&c.name).unwrap_or(&c.name))
+            .collect();
         // Lazy `/rewind` checkpoint: snapshot the pre-edit (turn-start) tree the first
         // time a batch isn't entirely read-only. Conservative — anything off the
         // `is_read_only` allowlist triggers it. A turn resumed after an interrupt
         // (`changed` already recorded) also snapshots a `seg_tree` diff base, so the
         // resumed segment's diff excludes the user's edits made in between.
-        if !tool_calls.iter().all(|c| tools::is_read_only(&c.name)) {
+        if !names.iter().all(|n| tools::is_read_only(n)) {
             let need_tree = self.checkpoints.last().is_some_and(|c| c.tree.is_none());
             let need_seg = !need_tree
                 && self
@@ -62,8 +69,8 @@ impl AgentEngine {
         // A read placed after a mutation must see its effects: parallel-safe calls
         // past the first workspace-touching call run in the ordered pass instead.
         // Inline-resolved calls never reach the executor, so they don't count.
-        let barrier = tool_calls.iter().position(|c| {
-            let n = subagents::normalize_tool_name(&c.name).unwrap_or(&c.name);
+        let barrier = tool_calls.iter().enumerate().position(|(i, c)| {
+            let n = names[i];
             !matches!(n, "update_plan" | "finish_turn")
                 && (!tools::is_read_only(n)
                     || self.external.as_ref().is_some_and(|e| e.handles(&c.name)))
@@ -75,7 +82,7 @@ impl AgentEngine {
             if self.read_only && ctx.plan_exit_requested() {
                 self.set_plan_mode(false);
             }
-            let n = subagents::normalize_tool_name(&call.name).unwrap_or(&call.name);
+            let n = names[i];
             // The plan tool renders as a checklist card and never needs permission —
             // resolve it up front; its result still joins history (call↔result invariant).
             if n == "update_plan" {
@@ -234,7 +241,7 @@ Investigate, or call `exit_plan_mode` with your plan."
                 // was just read, not a stale prior-turn snapshot.
                 if result.is_ok() {
                     let call = &tool_calls[i];
-                    let n = subagents::normalize_tool_name(&call.name).unwrap_or(&call.name);
+                    let n = names[i];
                     self.file_tracker.record(n, &call.arguments, cwd);
                 }
                 outcomes[i] = Some(result);
@@ -253,10 +260,7 @@ Investigate, or call `exit_plan_mode` with your plan."
             sequential_idx
                 .iter()
                 .copied()
-                .take_while(|&i| {
-                    let c = &tool_calls[i];
-                    subagents::normalize_tool_name(&c.name).unwrap_or(&c.name) == "subagent"
-                })
+                .take_while(|&i| names[i] == "subagent")
                 .collect()
         };
         if subagent_idx.len() >= 2 {
@@ -335,19 +339,13 @@ Investigate, or call `exit_plan_mode` with your plan."
             let reviewed: Vec<usize> = sequential_idx
                 .iter()
                 .copied()
-                .filter(|&i| {
-                    let c = &tool_calls[i];
-                    let n = subagents::normalize_tool_name(&c.name).unwrap_or(&c.name);
-                    crate::agent::review::is_edit_tool(n)
-                })
+                .filter(|&i| crate::agent::review::is_edit_tool(names[i]))
                 .collect();
             if !reviewed.is_empty() {
                 let items: Vec<crate::agent::review::ReviewItem> = reviewed
                     .iter()
                     .map(|&i| {
-                        let c = &tool_calls[i];
-                        let n = subagents::normalize_tool_name(&c.name).unwrap_or(&c.name);
-                        crate::agent::review::review_item(i, n, &c.arguments)
+                        crate::agent::review::review_item(i, names[i], &tool_calls[i].arguments)
                     })
                     .collect();
                 if ui.review_edits(&items).await == crate::agent::review::ReviewDecision::Reject {
@@ -364,7 +362,7 @@ Investigate, or call `exit_plan_mode` with your plan."
         // Run the ordered calls one at a time — they mutate the engine or workspace, so concurrency is unsafe.
         for &i in &sequential_idx {
             let call = &tool_calls[i];
-            let n = subagents::normalize_tool_name(&call.name).unwrap_or(&call.name);
+            let n = names[i];
             // Fail closed if a mutating tool targets a file changed on disk since the
             // model read it — clobbering an external edit is worse than a re-read.
             if let Some(msg) = self.file_tracker.stale_block(n, &call.arguments, ctx.cwd) {
@@ -399,68 +397,9 @@ Investigate, or call `exit_plan_mode` with your plan."
                 self.list_sessions_result()
             } else if n == "send_session" {
                 self.send_session(&call.arguments, &mut *ui).await
-            } else if n == "take_note" {
-                // Durable scratchpad (deterministic merge, capped oldest-first). Held in the engine, so it runs in the ordered pass.
-                match notes::parse_note(&call.arguments) {
-                    Ok(note) => Ok(match notes::merge_note(&mut self.notes, note, MAX_NOTES) {
-                        notes::MergeOutcome::Added(n) => format!("Noted ({n} saved)."),
-                        notes::MergeOutcome::Updated(id) => format!("Updated note '{id}'."),
-                        notes::MergeOutcome::Refreshed => "Already noted (refreshed).".to_string(),
-                    }),
-                    Err(e) => Err(e),
-                }
-            } else if n == "remember" {
-                // Notify so a saved memory never lands silently (poison audit).
-                match crate::agent::memory::parse_remember(&call.arguments) {
-                    Ok((fact, scope)) => {
-                        let path = crate::agent::memory::path_for_scope(ctx.cwd, scope);
-                        let label = scope.label();
-                        match crate::agent::memory::remember(&path, &fact) {
-                            Ok(crate::agent::memory::RememberOutcome::Added(count)) => {
-                                // Global facts ride into every project — call that out.
-                                if scope == crate::agent::memory::MemoryScope::Global {
-                                    ui.notify(&format!(
-                                        "remembered (GLOBAL — injected into ALL projects): {fact}"
-                                    ));
-                                } else {
-                                    ui.notify(&format!("remembered ({label}): {fact}"));
-                                }
-                                Ok(format!(
-                                    "Remembered ({count} saved, {label} scope) — this is injected \
-into every future session. The user can audit or edit it via /memory."
-                                ))
-                            }
-                            Ok(crate::agent::memory::RememberOutcome::Refreshed) => {
-                                Ok("Already remembered (recency refreshed).".to_string())
-                            }
-                            Err(e) => Err(e),
-                        }
-                    }
-                    Err(e) => Err(e),
-                }
-            } else if n == "memory_search" {
-                match crate::agent::memory::parse_query(&call.arguments) {
-                    Ok(query) => Ok(crate::agent::memory::search_result_text(ctx.cwd, &query)),
-                    Err(e) => Err(e),
-                }
-            } else if n == "switch_model" {
-                match call.arguments.get("model").and_then(|v| v.as_str()) {
-                    Some(m) if !m.trim().is_empty() => ui.switch_chat_model(m.trim()).await,
-                    _ => Err("switch_model: missing `model`.".to_string()),
-                }
-            } else if n == "set_effort" {
-                match call.arguments.get("level").and_then(|v| v.as_str()) {
-                    Some(l) if !l.trim().is_empty() => ui.set_chat_effort(l.trim()).await,
-                    _ => Err("set_effort: missing `level`.".to_string()),
-                }
-            } else if n == "ask_user" {
-                match ask::parse_ask(&call.arguments) {
-                    Ok((question, options, allow_free_text, multi_select)) => ui
-                        .ask_user(&question, &options, allow_free_text, multi_select)
-                        .await
-                        .map(|answer| ask::confirmation(&answer)),
-                    Err(e) => Err(e),
-                }
+            } else if let Some(res) = self.run_tool_intrinsic(ctx, ui, n, &call.arguments).await {
+                // Engine-state intrinsics (notes/memory/session controls/schema search).
+                res
             } else if n == "exit_plan_mode" {
                 if !self.read_only {
                     Err(
@@ -486,26 +425,6 @@ planning is off) — continue with the task."
                         },
                         Err(e) => Err(e),
                     }
-                }
-            } else if n == "search_tools" {
-                // Deferred-MCP discovery: load matching schemas (engine state → ordered pass).
-                match call.arguments.get("query").and_then(|v| v.as_str()) {
-                    Some(q) if !q.trim().is_empty() => {
-                        let max = call
-                            .arguments
-                            .get("max_results")
-                            .and_then(|v| v.as_u64())
-                            .map(|v| v as usize)
-                            .unwrap_or(tool_search::SEARCH_DEFAULT_RESULTS)
-                            .clamp(1, tool_search::SEARCH_MAX_RESULTS);
-                        let hits = tool_search::rank(&self.deferred_tools, q.trim(), max);
-                        let loaded = self.load_deferred_tools(&hits);
-                        Ok(tool_search::format_loaded(
-                            &loaded,
-                            self.deferred_tools.len(),
-                        ))
-                    }
-                    _ => Err("missing required string argument `query`".to_string()),
                 }
             } else if let Some(ext) = self.external.clone().filter(|e| e.handles(&call.name)) {
                 // External tool — keyed on its raw advertised name (`mcp__*`), never normalized (matches the shadow check).
@@ -543,7 +462,7 @@ command in the foreground (drop `background`)."
                 // Run confined; a sandbox write-block offers an in-session escape hatch instead of a dead-end error.
                 self.run_bash_with_escalation(ctx, ui, &call.arguments)
                     .await
-            } else if matches!(n, "write_file" | "edit_file" | "multi_edit" | "apply_patch") {
+            } else if crate::agent::file_tracker::is_write_tool(n) {
                 // Same escape hatch as bash for an out-of-workspace target.
                 self.run_write_with_escalation(ctx, ui, n, &call.arguments)
                     .await
@@ -590,7 +509,7 @@ command in the foreground (drop `background`)."
                 if !matches!(outcomes[i], Some(Ok(_))) {
                     continue;
                 }
-                let n = subagents::normalize_tool_name(&call.name).unwrap_or(&call.name);
+                let n = names[i];
                 if !crate::agent::file_tracker::is_write_tool(n) {
                     continue;
                 }
@@ -616,7 +535,7 @@ command in the foreground (drop `background`)."
                 let Some(result) = outcomes[i].as_ref() else {
                     continue;
                 };
-                let n = subagents::normalize_tool_name(&call.name).unwrap_or(&call.name);
+                let n = names[i];
                 let Some(extra) = hooks
                     .post_tool_use(n, &call.arguments, result, ctx.cwd)
                     .await
@@ -635,7 +554,7 @@ command in the foreground (drop `background`)."
         // Emit results and append tool messages in call order (call↔result pairing intact).
         let mut repeated_reads: Vec<(String, String)> = Vec::new();
         for (i, call) in tool_calls.iter().enumerate() {
-            let n = subagents::normalize_tool_name(&call.name).unwrap_or(&call.name);
+            let n = names[i];
             let result = outcomes[i]
                 .take()
                 .unwrap_or_else(|| Err("tool produced no result".to_string()));

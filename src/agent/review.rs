@@ -5,12 +5,10 @@
 
 use serde_json::Value;
 
-/// The file tools this gate governs; `run_bash` and other side effects are out of scope.
-pub const EDIT_TOOLS: [&str; 4] = ["write_file", "edit_file", "multi_edit", "apply_patch"];
-
-/// True when `name` is one of the edit tools the review gate intercepts.
+/// True when `name` is one of the file-writing tools this gate intercepts;
+/// `run_bash` and other side effects are out of scope.
 pub fn is_edit_tool(name: &str) -> bool {
-    EDIT_TOOLS.contains(&name)
+    crate::agent::file_tracker::is_write_tool(name)
 }
 
 /// One pending edit awaiting review: the raw call (`tool` + `args`) the TUI diffs,
@@ -38,24 +36,12 @@ pub const REVIEW_REJECTED_DIRECTIVE: &str = "The user reviewed this edit and cho
 like different before editing this file again.";
 
 /// Best-effort extraction of the file paths a tool call targets, for the review
-/// heading. Mirrors how `tools::is_dangerous` reads paths; never touches disk.
+/// heading. Never touches disk; non-write tools yield nothing.
 pub fn edited_paths(name: &str, args: &Value) -> Vec<String> {
-    let one = |key: &str| {
-        args.get(key)
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string())
-            .into_iter()
-            .collect::<Vec<_>>()
-    };
-    match name {
-        "write_file" | "edit_file" | "multi_edit" => one("path"),
-        "apply_patch" => args
-            .get("input")
-            .and_then(|v| v.as_str())
-            .map(crate::agent::apply_patch::target_paths)
-            .unwrap_or_default(),
-        _ => Vec::new(),
+    if !is_edit_tool(name) {
+        return Vec::new();
     }
+    crate::agent::file_tracker::tracked_paths(name, args)
 }
 
 /// Build a [`ReviewItem`] for tool call `call_index` (assumed an edit tool).

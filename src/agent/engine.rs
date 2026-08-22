@@ -737,6 +737,7 @@ mod conversation;
 mod session_comms;
 mod subagent;
 mod tool_batch;
+mod tool_intrinsics;
 mod turn;
 
 pub(crate) use conversation::substitute_image_parts;
