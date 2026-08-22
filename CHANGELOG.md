@@ -1,5 +1,16 @@
 # Changelog
 
+## v0.46.3
+
+Agent execution is more reliable and consistent, with better prompt caching, compaction, permissions, memory handling, and MCP support in oneshot mode.
+
+- fix(cache): keep Anthropic prompt-cache content stable and add cache traces (b4052da7, 74782ac3)
+- fix(agent): improve compaction math and retry empty completions (d994fb52, bac1cd07)
+- improve(agent): unify engine setup, tool metadata, and permission handling (fd12650f, 268d4df1, 0c4143bf)
+- improve(agent): clarify memory facts and correction behavior (ec7aa02c)
+- fix(canary): follow Claude Code's Task-to-Agent tool rename (0a5b7a37)
+- fix(preview): never spawn real browsers from tests, mock the keychain on the chrome raster rung (ace00d34)
+
 ## v0.46.2
 
 Two long-standing spawn failures traced to their real causes: a cursor shell-hook write that raced a background process of aivo's own making, and a Windows `codex-app` probe that never looked where the Store package actually puts its runtime. The binary sheds another slice of dependency weight.
