@@ -173,9 +173,10 @@ fn decode_secret_hex(s: &str) -> Option<[u8; SECRET_LEN]> {
 /// which must degrade to v4, not hang the launch.
 #[cfg(all(not(test), any(target_os = "macos", target_os = "linux")))]
 mod subprocess {
-    use std::io::{Read, Write};
+    use std::io::Write;
     use std::process::{Command, Stdio};
-    use std::time::{Duration, Instant};
+    use std::sync::mpsc;
+    use std::time::Duration;
 
     const WATCHDOG: Duration = Duration::from_secs(10);
 
@@ -200,34 +201,25 @@ mod subprocess {
         {
             let _ = stdin.write_all(data.as_bytes());
         }
-        let deadline = Instant::now() + WATCHDOG;
-        loop {
-            match child.try_wait() {
-                Ok(Some(status)) => {
-                    let mut stdout = String::new();
-                    let mut stderr = String::new();
-                    if let Some(mut s) = child.stdout.take() {
-                        let _ = s.read_to_string(&mut stdout);
-                    }
-                    if let Some(mut s) = child.stderr.take() {
-                        let _ = s.read_to_string(&mut stderr);
-                    }
-                    return Some(RunOutput {
-                        code: status.code(),
-                        success: status.success(),
-                        stdout,
-                        stderr,
-                    });
-                }
-                Ok(None) => {
-                    if Instant::now() >= deadline {
-                        let _ = child.kill();
-                        let _ = child.wait();
-                        return None;
-                    }
-                    std::thread::sleep(Duration::from_millis(25));
-                }
-                Err(_) => return None,
+        // Polling `try_wait` cost a full ~25 ms sleep tick per read: the
+        // helper always outlived the first poll.
+        let pid = child.id();
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(child.wait_with_output());
+        });
+        match rx.recv_timeout(WATCHDOG) {
+            Ok(Ok(out)) => Some(RunOutput {
+                code: out.status.code(),
+                success: out.status.success(),
+                stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
+                stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+            }),
+            // The helper thread owns the handle, so signal the pid; its
+            // pending `wait_with_output` reaps.
+            _ => {
+                unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
+                None
             }
         }
     }
