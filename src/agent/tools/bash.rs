@@ -460,7 +460,7 @@ pub(super) async fn run_bash_inner(
                      interactive input (a password, prompt, or editor), a REPL, or a \
                      long-running server/watcher that never exits on its own, it can't run \
                      under the agent's non-interactive shell — use a non-interactive form, \
-                     re-run it with `background: true` and poll it with `check_job`, or ask \
+                     re-run it with `background: true` and wait on it with `check_job`, or ask \
                      the user to run it. If it's just slow, retry with a larger `timeout` \
                      (max {BASH_MAX_TIMEOUT}).",
                 )));
@@ -489,12 +489,14 @@ pub(super) async fn run_bash_inner(
         // it so the engine can offer to re-run the command outside the sandbox on
         // approval, and tell the model this was a confinement block — not a real
         // failure — so it doesn't give up and ask the user to run it by hand.
-        // Heuristic: match stderr only (kernel errors land there; stdout quoting
-        // these phrases is just output), and skip "Permission denied" on macOS —
-        // seatbelt denials are EPERM, so that phrase there is an ordinary
-        // unreadable file, not a sandbox block.
-        let denial = stderr.contains("Operation not permitted")
-            || (!cfg!(target_os = "macos") && stderr.contains("Permission denied"));
+        // Match both streams — harnesses like `cargo test` re-emit captured
+        // denials on stdout. Skip "Permission denied" on macOS: seatbelt denials
+        // are EPERM, so that phrase there is an ordinary unreadable file.
+        let denial_in = |s: &str| {
+            s.contains("Operation not permitted")
+                || (!cfg!(target_os = "macos") && s.contains("Permission denied"))
+        };
+        let denial = denial_in(&stderr) || denial_in(&stdout);
         if sandbox_enforced && denial {
             sandbox_blocked = true;
             out.push_str(match confinement {

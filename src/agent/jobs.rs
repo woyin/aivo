@@ -24,6 +24,8 @@ const TAIL_LINES: usize = 200;
 const TERM_GRACE: Duration = Duration::from_millis(1_500);
 const KILL_WAIT: Duration = Duration::from_millis(1_000);
 const KILL_POLL: Duration = Duration::from_millis(50);
+/// = the bash tool's max timeout.
+const CHECK_WAIT_MAX: Duration = Duration::from_secs(600);
 
 /// Shared handle to the process table; cloned into each engine via `set_jobs`.
 pub type SharedJobs = Arc<JobTable>;
@@ -266,6 +268,13 @@ can be up before its startup line flushes. Probe it directly, e.g. curl the port
         Ok(out)
     }
 
+    /// [`Self::check`] after blocking until the job finishes or `wait_secs` elapses.
+    pub async fn check_wait(&self, id: &str, wait_secs: u64) -> Result<String, String> {
+        let budget = Duration::from_secs(wait_secs).min(CHECK_WAIT_MAX);
+        self.wait_for_exit(id, budget).await;
+        self.check(id)
+    }
+
     /// Finished jobs the model hasn't seen yet, marked seen as taken — the engine
     /// folds these in at step boundaries so the model needn't busy-poll `check_job`.
     pub fn drain_finished_notices(&self) -> Vec<String> {
@@ -428,13 +437,15 @@ pub fn check_job_tool_spec() -> ToolSpec {
         name: "check_job".to_string(),
         description:
             "Check a background job started with run_bash `background: true`: returns its \
-status (running / exited with code / killed), runtime, and the tail of its log. Pass `kill: true` \
-to terminate the job and its whole process tree."
+status (running / exited with code / killed), runtime, and the tail of its log. To wait for a \
+job, pass `wait` seconds — one blocking call, never a rapid check_job polling loop. Pass \
+`kill: true` to terminate the job and its whole process tree."
                 .to_string(),
         parameters: json!({
             "type": "object",
             "properties": {
                 "id": {"type": "string", "description": "The job id run_bash returned (e.g. \"j1\")."},
+                "wait": {"type": "integer", "description": "Block up to this many seconds for the job to finish before reporting (max 600). Prefer one long wait over repeated polls."},
                 "kill": {"type": "boolean", "description": "Terminate the job and its whole process tree."}
             },
             "required": ["id"]
@@ -630,6 +641,27 @@ mod tests {
         jobs.spawn("exit 7", &dir).unwrap();
         let check = wait_for(&jobs, "j1", "exited with code").await;
         assert!(check.contains("exited with code 7"), "got: {check}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn jobs_check_wait_blocks_until_exit() {
+        let dir = tmp();
+        let jobs = table(&dir);
+        jobs.spawn("sleep 0.3; exit 5", &dir).unwrap();
+        let out = jobs.check_wait("j1", 10).await.unwrap();
+        assert!(out.contains("exited with code 5"), "got: {out}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn jobs_check_wait_reports_still_running_after_budget() {
+        let dir = tmp();
+        let jobs = table(&dir);
+        jobs.spawn("sleep 30", &dir).unwrap();
+        let out = jobs.check_wait("j1", 1).await.unwrap();
+        assert!(out.contains("running"), "got: {out}");
+        jobs.kill("j1").await.unwrap();
     }
 
     #[cfg(unix)]

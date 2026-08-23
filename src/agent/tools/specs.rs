@@ -156,13 +156,13 @@ instead.",
         ),
         spec(
             "run_bash",
-            "Run a shell command in the working directory. Each call is a fresh shell (cd does not persist). For plain file reads and searches prefer read_file/grep/glob — they run in parallel and page cleanly. Runs non-interactively with no TTY: interactive programs (editors, `ssh`/`sudo` prompts, TUIs) are refused, and long-running ones are killed at the timeout — use non-interactive flags. To start a server, watcher, or anything long-running, pass `background: true`: the command is detached and this returns immediately with a job id and log file; poll or stop it with `check_job`.",
+            "Run a shell command in the working directory. Each call is a fresh shell (cd does not persist). For plain file reads and searches prefer read_file/grep/glob — they run in parallel and page cleanly. Runs non-interactively with no TTY: interactive programs (editors, `ssh`/`sudo` prompts, TUIs) are refused, and long-running ones are killed at the timeout — use non-interactive flags. To start a server, watcher, or anything long-running, pass `background: true`: the command is detached and this returns immediately with a job id and log file; wait on, check, or stop it with `check_job`.",
             json!({
                 "type": "object",
                 "properties": {
                     "command": {"type": "string"},
                     "timeout": {"type": "integer", "description": "Seconds before the command is killed (default 120, max 600). Ignored with background."},
-                    "background": {"type": "boolean", "description": "Run detached in the background and return a job id + log file immediately (for servers/watchers). Poll or stop it with check_job."}
+                    "background": {"type": "boolean", "description": "Run detached in the background and return a job id + log file immediately (for servers/watchers). Check or stop it with check_job; to wait for it, use check_job's `wait` instead of polling."}
                 },
                 "required": ["command"]
             }),

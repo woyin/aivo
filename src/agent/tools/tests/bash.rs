@@ -84,6 +84,26 @@ async fn sandbox_confines_writes_to_workspace() {
     assert!(out.contains("workspace"), "missing sandbox hint: {out}");
 }
 
+/// A real seatbelt denial re-emitted on stdout still triggers the hint.
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn sandbox_hint_fires_on_stdout_denial() {
+    if !crate::agent::sandbox::active() {
+        return;
+    }
+    let dir = tmp();
+    let home = crate::services::system_env::home_dir().unwrap();
+    let outside = home.join(format!("aivo_sbx_stdout_{}.txt", std::process::id()));
+    let _ = std::fs::remove_file(&outside);
+    let cmd = format!("(echo hi > '{}') 2>&1; exit 1", outside.display());
+    let out = run_bash(&json!({"command": cmd}), &dir).await.unwrap();
+    let _ = std::fs::remove_file(&outside);
+    assert!(
+        out.contains("workspace"),
+        "missing sandbox hint on stdout denial: {out}"
+    );
+}
+
 /// `run_bash_confined` flags a sandbox-blocked out-of-workspace write (and
 /// emits the confinement hint), while `run_bash_unconfined` runs the same
 /// command with no confinement — so the write lands and no hint appears.
@@ -120,11 +140,11 @@ async fn confined_flags_block_then_unconfined_succeeds() {
     );
 }
 
-/// A failing command whose STDOUT merely quotes a denial phrase (grepping logs,
-/// cat of a build transcript) is not a sandbox block — no flag, no escalation.
+/// Stdout denials flag too (harnesses like `cargo test` re-emit captured
+/// denials there); a spurious flag only costs a declinable escalation prompt.
 #[cfg(unix)]
 #[tokio::test]
-async fn denial_phrase_on_stdout_does_not_flag_sandbox_block() {
+async fn denial_phrase_on_stdout_flags_sandbox_block() {
     if !crate::agent::sandbox::active() {
         return;
     }
@@ -133,8 +153,8 @@ async fn denial_phrase_on_stdout_does_not_flag_sandbox_block() {
         json!({"command": "echo 'grep: Permission denied / Operation not permitted'; exit 1"});
     let outcome = run_bash_confined(&cmd, &dir, None).await;
     assert!(
-        !outcome.sandbox_blocked,
-        "stdout quoting a denial phrase must not read as a sandbox block"
+        outcome.sandbox_blocked,
+        "a captured denial re-emitted on stdout must flag for escalation"
     );
 }
 

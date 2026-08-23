@@ -475,6 +475,11 @@ command in the foreground (drop `background`)."
                             .and_then(|v| v.as_str())
                             .unwrap_or("")
                             .trim();
+                        let wait = call
+                            .arguments
+                            .get("wait")
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(0);
                         if call
                             .arguments
                             .get("kill")
@@ -482,6 +487,8 @@ command in the foreground (drop `background`)."
                             .unwrap_or(false)
                         {
                             t.kill(id).await
+                        } else if wait > 0 {
+                            t.check_wait(id, wait).await
                         } else {
                             t.check(id)
                         }
