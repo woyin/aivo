@@ -1697,43 +1697,12 @@ impl CodeTuiApp {
             Overlay::None => {}
         }
 
-        if self.cards.mcp_consent.is_some() {
-            self.render_mcp_consent_card(frame, composer_area, outer);
-        } else if self.account.pending_logout.is_some() {
-            // Above the plan card: a direct `/logout` outranks the advisory prompt.
-            self.render_logout_confirm_card(frame, composer_area, outer);
-        } else if self.cards.plan_continue.is_some() {
-            self.render_plan_continue_card(frame, composer_area, outer);
-        } else if self.cards.permission().is_some() {
-            self.render_permission_card(frame, composer_area, outer);
-        } else if self.cards.ask().is_some() {
-            self.render_ask_user_card(frame, composer_area, outer);
-        } else if self.cards.plan_approval().is_some() {
-            let clamped = self.render_plan_approval_card(frame, composer_area, outer);
-            if let (Some(s), Some(p)) = (clamped, self.cards.plan_approval_mut()) {
-                p.scroll = s;
-            }
-        } else if self.cards.review().is_some() {
-            let clamped = self.render_review_card(frame, composer_area, outer);
-            if let (Some(s), Some(r)) = (clamped, self.cards.review_mut()) {
-                r.scroll = s;
-            }
-        } else if self.account.login.is_some() {
-            // Last: passive status — decision cards win the slot.
-            self.render_login_card(frame, composer_area, outer);
-        }
-
         // Cursor-addressed images float above cells, so surfaces drawn over the
         // transcript must suppress them for the frame — the post-draw flush then
         // deletes the stale placements. Virtual placements are exempt: covering
         // cells clips them naturally.
-        let covering_surface = !matches!(self.overlay, Overlay::None)
-            || self.visible_command_menu().is_some()
-            || self.cards.mcp_consent.is_some()
-            || self.cards.plan_continue.is_some()
-            || self.cards.any_agent_card()
-            || self.account.pending_logout.is_some()
-            || self.account.login.is_some();
+        let covering_surface =
+            !matches!(self.overlay, Overlay::None) || self.visible_command_menu().is_some();
         if covering_surface && !self.inline_images.caps.virtual_placement() {
             self.inline_images.desired.clear();
         }
@@ -1832,21 +1801,37 @@ impl CodeTuiApp {
         }
     }
 
+    /// Builds whichever decision card is up, in the key handlers' precedence
+    /// order. `max_total` includes the card's two border rows.
+    fn build_slot_card(&self, max_width: u16, max_total: u16) -> Option<SlotCard> {
+        if self.cards.mcp_consent.is_some() {
+            self.build_mcp_consent_card(max_width, max_total)
+        } else if self.account.pending_logout.is_some() {
+            // Above the plan card: a direct `/logout` outranks the advisory prompt.
+            self.build_logout_confirm_card(max_width)
+        } else if self.cards.plan_continue.is_some() {
+            self.build_plan_continue_card(max_width)
+        } else if self.cards.permission().is_some() {
+            self.build_permission_card(max_width, max_total)
+        } else if self.cards.ask().is_some() {
+            self.build_ask_user_card(max_width, max_total)
+        } else if self.cards.plan_approval().is_some() {
+            self.build_plan_approval_card(max_width, max_total)
+        } else if self.cards.review().is_some() {
+            self.build_review_card(max_width, max_total)
+        } else if self.account.login.is_some() {
+            // Last: passive status — decision cards win the slot.
+            self.build_login_card(max_width)
+        } else {
+            None
+        }
+    }
+
     /// Card asking whether to spawn a repo's project `.mcp.json` stdio servers
     /// (the local code-execution surface). Lists each server's exact command so
-    /// the risk is visible, then color-coded y/a/n keys. Anchored above the
-    /// composer like the permission card.
-    fn render_mcp_consent_card(
-        &self,
-        frame: &mut Frame<'_>,
-        composer_area: Rect,
-        frame_area: Rect,
-    ) {
-        let Some(prompt) = self.cards.mcp_consent.as_ref() else {
-            return;
-        };
-        let anchor = composer_area.y.saturating_sub(1);
-        let max_total = anchor.saturating_sub(frame_area.y).max(1);
+    /// the risk is visible, then color-coded y/a/n keys.
+    fn build_mcp_consent_card(&self, max_width: u16, max_total: u16) -> Option<SlotCard> {
+        let prompt = self.cards.mcp_consent.as_ref()?;
         // Fixed chrome: 2 borders + heading + note + blank-before-keys + keys = 6.
         // Whatever rows remain list the servers (trimmed if the screen is short).
         let chrome = 6usize;
@@ -1869,8 +1854,9 @@ impl CodeTuiApp {
         for (name, cmd) in &prompt.servers {
             content_w = content_w.max(display_width(&format!("{name}  {cmd}")));
         }
-        let max_width = composer_area.width.min(frame_area.width).max(1);
-        let width = (content_w as u16).saturating_add(4).clamp(1, max_width);
+        let width = (content_w as u16)
+            .saturating_add(4)
+            .clamp(1, max_width.max(1));
         let inner_width = usize::from(width.saturating_sub(4)).max(1);
 
         let mut lines: Vec<Line<'static>> = vec![Line::from(Span::styled(
@@ -1904,41 +1890,19 @@ impl CodeTuiApp {
         lines.push(Line::from(""));
         lines.push(keys);
 
-        let height = (lines.len() as u16 + 2).min(max_total);
-        let y = anchor.saturating_sub(height).max(frame_area.y);
-        let card = Rect {
-            x: composer_area.x,
-            y,
+        Some(SlotCard {
+            title: " mcp servers ",
+            border: WARNING(),
             width,
-            height,
-        };
-        clear_to_canvas(frame, card);
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(WARNING()))
-            .title(Span::styled(
-                " mcp servers ",
-                Style::default().fg(WARNING()).add_modifier(Modifier::BOLD),
-            ));
-        let inner = block.inner(card).inner(ratatui::layout::Margin {
-            vertical: 0,
-            horizontal: 1,
-        });
-        frame.render_widget(block, card);
-        frame.render_widget(Paragraph::new(Text::from(lines)), inner);
+            lines,
+            scroll: None,
+        })
     }
 
     /// The `/new` continue-the-plan card: continue the outgoing session's
     /// mid-execution checklist here, discard it, or Esc to keep it for `/plan resume`.
-    fn render_plan_continue_card(
-        &self,
-        frame: &mut Frame<'_>,
-        composer_area: Rect,
-        frame_area: Rect,
-    ) {
-        let Some(prompt) = self.cards.plan_continue.as_ref() else {
-            return;
-        };
+    fn build_plan_continue_card(&self, max_width: u16) -> Option<SlotCard> {
+        let prompt = self.cards.plan_continue.as_ref()?;
         let mut status = plan_steps_progress(&prompt.steps);
         let next_step = plan_next_step(&prompt.steps);
         if !next_step.is_empty() {
@@ -1970,26 +1934,17 @@ impl CodeTuiApp {
             Line::from(""),
             keys,
         ];
-        render_account_card(
-            frame,
-            composer_area,
-            frame_area,
-            "unfinished plan",
+        Some(build_account_card(
+            " unfinished plan ",
             ACCENT(),
             lines,
-        );
+            max_width,
+        ))
     }
 
     /// The `/logout` y/n confirm card (owns the keyboard, like MCP consent).
-    fn render_logout_confirm_card(
-        &self,
-        frame: &mut Frame<'_>,
-        composer_area: Rect,
-        frame_area: Rect,
-    ) {
-        let Some(account) = self.account.pending_logout.as_ref() else {
-            return;
-        };
+    fn build_logout_confirm_card(&self, max_width: u16) -> Option<SlotCard> {
+        let account = self.account.pending_logout.as_ref()?;
         let lines = vec![
             Line::from(vec![
                 Span::styled("Unlink this device from ", Style::default().fg(TEXT())),
@@ -2006,22 +1961,18 @@ impl CodeTuiApp {
             Line::from(""),
             account_keys_line(&[("y", ASSISTANT(), "sign out"), ("n", ERROR(), "cancel")]),
         ];
-        render_account_card(
-            frame,
-            composer_area,
-            frame_area,
-            "sign out of aivo",
+        Some(build_account_card(
+            " sign out of aivo ",
             WARNING(),
             lines,
-        );
+            max_width,
+        ))
     }
 
     /// The `/login` status card: code + URL + waiting state. Passive — it never
     /// owns the keyboard (see `handle_login_card_key`), so typing stays live.
-    fn render_login_card(&self, frame: &mut Frame<'_>, composer_area: Rect, frame_area: Rect) {
-        let Some(card) = self.account.login.as_ref() else {
-            return;
-        };
+    fn build_login_card(&self, max_width: u16) -> Option<SlotCard> {
+        let card = self.account.login.as_ref()?;
         let lines = vec![
             Line::from(vec![
                 Span::styled(
@@ -2047,24 +1998,20 @@ impl CodeTuiApp {
                 ("Esc", ERROR(), "cancel"),
             ]),
         ];
-        render_account_card(
-            frame,
-            composer_area,
-            frame_area,
-            "sign in to aivo",
+        Some(build_account_card(
+            " sign in to aivo ",
             ACCENT(),
             lines,
-        );
+            max_width,
+        ))
     }
 
-    /// Card asking the user to approve a mutating agent tool. Anchored directly
+    /// Card asking the user to approve a mutating agent tool. Sits directly
     /// above the composer (where the eye and cursor already are) rather than
     /// floating mid-screen, so the decision sits right next to the input. Shows
     /// the action, a preview (diff / command / path), and color-coded y/a/n keys.
-    fn render_permission_card(&self, frame: &mut Frame<'_>, composer_area: Rect, frame_area: Rect) {
-        let Some(pending) = self.cards.permission() else {
-            return;
-        };
+    fn build_permission_card(&self, max_width: u16, max_total: u16) -> Option<SlotCard> {
+        let pending = self.cards.permission()?;
         // Flag a run_bash card: locally destructive, or a remote mutation.
         // Destructive wins the label when both apply.
         let cmd = if pending.tool == "run_bash" {
@@ -2080,12 +2027,6 @@ impl CodeTuiApp {
             None
         };
         let destructive = flag_line.is_some();
-
-        // The card rests just above the composer's divider line (a narrower card
-        // would otherwise leave that full-width rule poking out past its right
-        // edge). Cap its height to the rows above so it never runs off the top.
-        let anchor = composer_area.y.saturating_sub(1);
-        let max_total = anchor.saturating_sub(frame_area.y).max(1);
 
         // Fixed chrome: 2 borders + heading + blank-before-keys + keys (+ the
         // destructive flag line). Whatever rows remain feed the preview block
@@ -2127,8 +2068,9 @@ impl CodeTuiApp {
         for raw in preview.iter().take(preview_take) {
             content_w = content_w.max(display_width(raw));
         }
-        let max_width = composer_area.width.min(frame_area.width).max(1);
-        let width = (content_w as u16).saturating_add(4).clamp(1, max_width);
+        let width = (content_w as u16)
+            .saturating_add(4)
+            .clamp(1, max_width.max(1));
         let inner_width = usize::from(width.saturating_sub(4)).max(1);
 
         let mut lines: Vec<Line<'static>> = vec![Line::from(Span::styled(
@@ -2163,40 +2105,21 @@ impl CodeTuiApp {
         lines.push(Line::from(""));
         lines.push(keys);
 
-        let height = (lines.len() as u16 + 2).min(max_total);
-        let y = anchor.saturating_sub(height).max(frame_area.y);
-        let card = Rect {
-            x: composer_area.x,
-            y,
+        Some(SlotCard {
+            title: " permission ",
+            border: ACCENT(),
             width,
-            height,
-        };
-        clear_to_canvas(frame, card);
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(ACCENT()))
-            .title(Span::styled(
-                " permission ",
-                Style::default().fg(ACCENT()).add_modifier(Modifier::BOLD),
-            ));
-        let inner = block.inner(card).inner(ratatui::layout::Margin {
-            vertical: 0,
-            horizontal: 1,
-        });
-        frame.render_widget(block, card);
-        frame.render_widget(Paragraph::new(Text::from(lines)), inner);
+            lines,
+            scroll: None,
+        })
     }
 
     /// The `ask_user` card: question, numbered pick-list (`❯` = highlighted), key
-    /// hint. Floats above the composer like the permission card, clamped to the
-    /// rows above.
-    fn render_ask_user_card(&self, frame: &mut Frame<'_>, composer_area: Rect, frame_area: Rect) {
-        let Some(ask) = self.cards.ask() else {
-            return;
-        };
-        let anchor = composer_area.y.saturating_sub(1);
-        let max_total = anchor.saturating_sub(frame_area.y).max(1);
-        let max_width = composer_area.width.min(frame_area.width).max(1);
+    /// hint. Sits above the composer like the permission card, clamped to the
+    /// slot's budget.
+    fn build_ask_user_card(&self, max_width: u16, max_total: u16) -> Option<SlotCard> {
+        let ask = self.cards.ask()?;
+        let max_width = max_width.max(1);
         let inner_cap = usize::from(max_width.saturating_sub(4)).max(1);
 
         // Question wraps to at most 3 lines; options render as "N. label — desc".
@@ -2354,42 +2277,20 @@ impl CodeTuiApp {
         lines.push(Line::from(""));
         lines.push(keys);
 
-        let height = (lines.len() as u16 + 2).min(max_total);
-        let y = anchor.saturating_sub(height).max(frame_area.y);
-        let card = Rect {
-            x: composer_area.x,
-            y,
+        Some(SlotCard {
+            title: " question ",
+            border: ACCENT(),
             width,
-            height,
-        };
-        clear_to_canvas(frame, card);
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(ACCENT()))
-            .title(Span::styled(
-                " question ",
-                Style::default().fg(ACCENT()).add_modifier(Modifier::BOLD),
-            ));
-        let inner = block.inner(card).inner(ratatui::layout::Margin {
-            vertical: 0,
-            horizontal: 1,
-        });
-        frame.render_widget(block, card);
-        frame.render_widget(Paragraph::new(Text::from(lines)), inner);
+            lines,
+            scroll: None,
+        })
     }
 
     /// The edit-review card: heading, the scrollable precomputed diff, and y/n keys.
-    /// Floats above the composer; returns the clamped scroll for write-back.
-    fn render_review_card(
-        &self,
-        frame: &mut Frame<'_>,
-        composer_area: Rect,
-        frame_area: Rect,
-    ) -> Option<u16> {
+    /// Carries the clamped scroll for write-back.
+    fn build_review_card(&self, max_width: u16, max_total: u16) -> Option<SlotCard> {
         let review = self.cards.review()?;
-        let anchor = composer_area.y.saturating_sub(1);
-        let max_total = anchor.saturating_sub(frame_area.y).max(1);
-        let max_width = composer_area.width.min(frame_area.width).max(1);
+        let max_width = max_width.max(1);
         let inner_width = usize::from(max_width.saturating_sub(4)).max(1);
 
         let heading = format!(
@@ -2431,44 +2332,21 @@ impl CodeTuiApp {
         lines.push(Line::from(""));
         lines.push(keys);
 
-        let height = (lines.len() as u16 + 2).min(max_total);
-        let y = anchor.saturating_sub(height).max(frame_area.y);
-        let card = Rect {
-            x: composer_area.x,
-            y,
+        Some(SlotCard {
+            title: " review edits ",
+            border: ACCENT(),
             width: max_width,
-            height,
-        };
-        clear_to_canvas(frame, card);
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(ACCENT()))
-            .title(Span::styled(
-                " review edits ",
-                Style::default().fg(ACCENT()).add_modifier(Modifier::BOLD),
-            ));
-        let inner = block.inner(card).inner(ratatui::layout::Margin {
-            vertical: 0,
-            horizontal: 1,
-        });
-        frame.render_widget(block, card);
-        frame.render_widget(Paragraph::new(Text::from(lines)), inner);
-        Some(u16::try_from(scroll).unwrap_or(u16::MAX))
+            lines,
+            scroll: Some(u16::try_from(scroll).unwrap_or(u16::MAX)),
+        })
     }
 
     /// The plan-approval card (`exit_plan_mode`): heading, the scrollable rendered
-    /// plan, and the three verdicts. Floats above the composer like the review card;
-    /// returns the clamped scroll for write-back.
-    fn render_plan_approval_card(
-        &self,
-        frame: &mut Frame<'_>,
-        composer_area: Rect,
-        frame_area: Rect,
-    ) -> Option<u16> {
+    /// plan, and the three verdicts. Sits above the composer like the review card;
+    /// carries the clamped scroll for write-back.
+    fn build_plan_approval_card(&self, max_width: u16, max_total: u16) -> Option<SlotCard> {
         let pending = self.cards.plan_approval()?;
-        let anchor = composer_area.y.saturating_sub(1);
-        let max_total = anchor.saturating_sub(frame_area.y).max(1);
-        let max_width = composer_area.width.min(frame_area.width).max(1);
+        let max_width = max_width.max(1);
         let inner_width = usize::from(max_width.saturating_sub(4)).max(1);
 
         // heading + blank + (plan…) + blank + 3 options + blank + keys + 2 borders;
@@ -2529,29 +2407,13 @@ impl CodeTuiApp {
         lines.push(Line::from(""));
         lines.push(plan_approval_keys_line());
 
-        let height = (lines.len() as u16 + 2).min(max_total);
-        let y = anchor.saturating_sub(height).max(frame_area.y);
-        let card = Rect {
-            x: composer_area.x,
-            y,
+        Some(SlotCard {
+            title: " plan ",
+            border: ACCENT(),
             width: max_width,
-            height,
-        };
-        clear_to_canvas(frame, card);
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(ACCENT()))
-            .title(Span::styled(
-                " plan ",
-                Style::default().fg(ACCENT()).add_modifier(Modifier::BOLD),
-            ));
-        let inner = block.inner(card).inner(ratatui::layout::Margin {
-            vertical: 0,
-            horizontal: 1,
-        });
-        frame.render_widget(block, card);
-        frame.render_widget(Paragraph::new(Text::from(lines)), inner);
-        Some(u16::try_from(scroll).unwrap_or(u16::MAX))
+            lines,
+            scroll: Some(u16::try_from(scroll).unwrap_or(u16::MAX)),
+        })
     }
 
     pub(super) fn render_main(&mut self, frame: &mut Frame<'_>, area: Rect) -> Rect {
@@ -2590,10 +2452,38 @@ impl CodeTuiApp {
             footer_height,
             plan_panel_height,
         );
+        // The active decision card gets its own slot so the transcript shrinks
+        // instead of being painted over. Cap: leave CARD_MIN_TRANSCRIPT rows
+        // when the screen allows, but never take the last row — a Length
+        // overflow would clip the composer/footer.
+        let card_avail = area.height.saturating_sub(
+            composer_height + footer_height + plan_panel_height + queue_panel_height,
+        );
+        let card_cap = card_avail
+            .saturating_sub(CARD_MIN_TRANSCRIPT)
+            .max(CARD_MIN_HEIGHT.min(card_avail.saturating_sub(1)))
+            .max(1);
+        let card_max_width = area.width.saturating_sub(2).max(1);
+        let slot_card = self.build_slot_card(card_max_width, card_cap);
+        if let Some(clamped) = slot_card.as_ref().and_then(|card| card.scroll) {
+            if let Some(p) = self.cards.plan_approval_mut() {
+                p.scroll = clamped;
+            } else if let Some(r) = self.cards.review_mut() {
+                r.scroll = clamped;
+            }
+        }
+        let card_slot_height = slot_card
+            .as_ref()
+            .map(|card| (card.lines.len() as u16).saturating_add(2).min(card_cap))
+            .unwrap_or(0);
         let max_transcript_height = area
             .height
             .saturating_sub(
-                composer_height + footer_height + plan_panel_height + queue_panel_height,
+                composer_height
+                    + footer_height
+                    + plan_panel_height
+                    + queue_panel_height
+                    + card_slot_height,
             )
             .max(1);
         let is_empty = self.is_transcript_empty();
@@ -2638,6 +2528,7 @@ impl CodeTuiApp {
         let stack_height = transcript_height
             .saturating_add(plan_panel_height)
             .saturating_add(queue_panel_height)
+            .saturating_add(card_slot_height)
             .saturating_add(composer_height)
             .saturating_add(footer_height)
             .min(area.height.max(1));
@@ -2646,15 +2537,18 @@ impl CodeTuiApp {
             .direction(Direction::Vertical)
             .constraints([Constraint::Length(stack_height), Constraint::Min(0)])
             .split(area);
-        // transcript / [plan panel] / [queue panel] / composer / footer — the
-        // plan and queue rows are present only when non-empty, so the indices
-        // below shift accordingly.
+        // transcript / [plan panel] / [queue panel] / [card slot] / composer /
+        // footer — the plan, queue, and card rows are present only when
+        // non-empty, so the indices below shift accordingly.
         let mut constraints = vec![Constraint::Length(transcript_height)];
         if plan_panel_height > 0 {
             constraints.push(Constraint::Length(plan_panel_height));
         }
         if queue_panel_height > 0 {
             constraints.push(Constraint::Length(queue_panel_height));
+        }
+        if card_slot_height > 0 {
+            constraints.push(Constraint::Length(card_slot_height));
         }
         constraints.push(Constraint::Length(composer_height));
         constraints.push(Constraint::Length(footer_height));
@@ -2673,6 +2567,13 @@ impl CodeTuiApp {
             None
         };
         let queue_panel_area = if queue_panel_height > 0 {
+            let a = chunks[chunk_idx];
+            chunk_idx += 1;
+            Some(a)
+        } else {
+            None
+        };
+        let card_slot_area = if card_slot_height > 0 {
             let a = chunks[chunk_idx];
             chunk_idx += 1;
             Some(a)
@@ -2827,6 +2728,10 @@ impl CodeTuiApp {
 
         if let Some(queue_panel_area) = queue_panel_area {
             self.render_queued_panel(frame, queue_panel_area, &queue_lines);
+        }
+
+        if let (Some(slot), Some(card)) = (card_slot_area, slot_card) {
+            render_slot_card(frame, slot, card);
         }
 
         // Leave one breathing row, then enclose the input in a rounded box.
@@ -3922,64 +3827,74 @@ fn permission_heading(tool: &str) -> String {
     }
 }
 
-/// Content-sized bordered card for the account flows. Placed below the
-/// composer's footer when the dead space there fits it (a short session must
-/// not cover the banner/transcript while empty rows sit unused); a full screen
-/// falls back to the above-the-composer permission-card slot.
-fn render_account_card(
-    frame: &mut Frame<'_>,
-    composer_area: Rect,
-    frame_area: Rect,
-    title: &str,
+/// A decision card built for the reserved slot between the panels and the
+/// composer; `scroll` carries a scrollable card's clamp for write-back.
+struct SlotCard {
+    title: &'static str,
     border: Color,
-    mut lines: Vec<Line<'static>>,
-) {
-    let needed = lines.len() as u16 + 2;
-    let anchor = composer_area.y.saturating_sub(1);
-    let above_budget = anchor.saturating_sub(frame_area.y).max(1);
-    // +3: the 2-row footer (status + hint bar) plus a blank gap.
-    let below_top = composer_area
-        .y
-        .saturating_add(composer_area.height)
-        .saturating_add(3);
-    let below_budget = frame_area
-        .y
-        .saturating_add(frame_area.height)
-        .saturating_sub(below_top);
-    let below = below_budget >= needed;
-    let budget = if below { below_budget } else { above_budget };
-    // Tight slot: shed spacer rows before clipping content (key hints).
-    if lines.len() as u16 + 2 > budget {
+    width: u16,
+    lines: Vec<Line<'static>>,
+    scroll: Option<u16>,
+}
+
+fn build_account_card(
+    title: &'static str,
+    border: Color,
+    lines: Vec<Line<'static>>,
+    max_width: u16,
+) -> SlotCard {
+    let content_w = lines.iter().map(Line::width).max().unwrap_or(0);
+    let width = (content_w as u16)
+        .saturating_add(4)
+        .clamp(1, max_width.max(1));
+    SlotCard {
+        title,
+        border,
+        width,
+        lines,
+        scroll: None,
+    }
+}
+
+/// Paints a built card into its slot. When even the builder-trimmed card
+/// overflows, spacer rows go first, then rows shed from the top — the
+/// key-hint row is the last thing to disappear.
+fn render_slot_card(frame: &mut Frame<'_>, slot: Rect, card: SlotCard) {
+    if slot.height == 0 || slot.width == 0 {
+        return;
+    }
+    clear_to_canvas(frame, slot);
+    let mut lines = card.lines;
+    let inner_h = usize::from(slot.height.saturating_sub(2)).max(1);
+    if lines.len() > inner_h {
         lines.retain(|l| l.width() > 0);
     }
-    let content_w = lines.iter().map(Line::width).max().unwrap_or(0);
-    let max_width = composer_area.width.min(frame_area.width).max(1);
-    let width = (content_w as u16).saturating_add(4).clamp(1, max_width);
-    let height = (lines.len() as u16 + 2).min(budget);
-    let y = if below {
-        below_top
-    } else {
-        anchor.saturating_sub(height).max(frame_area.y)
-    };
-    let card = Rect {
-        x: composer_area.x,
-        y,
+    if lines.len() > inner_h {
+        let drop = lines.len() - inner_h;
+        lines.drain(..drop);
+    }
+    let height = (lines.len() as u16 + 2).min(slot.height);
+    let width = card.width.min(slot.width.saturating_sub(1)).max(1);
+    let rect = Rect {
+        x: slot.x.saturating_add(1),
+        y: slot.bottom().saturating_sub(height),
         width,
         height,
     };
-    clear_to_canvas(frame, card);
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(border))
+        .border_style(Style::default().fg(card.border))
         .title(Span::styled(
-            format!(" {title} "),
-            Style::default().fg(border).add_modifier(Modifier::BOLD),
+            card.title,
+            Style::default()
+                .fg(card.border)
+                .add_modifier(Modifier::BOLD),
         ));
-    let inner = block.inner(card).inner(ratatui::layout::Margin {
+    let inner = block.inner(rect).inner(ratatui::layout::Margin {
         vertical: 0,
         horizontal: 1,
     });
-    frame.render_widget(block, card);
+    frame.render_widget(block, rect);
     frame.render_widget(Paragraph::new(Text::from(lines)), inner);
 }
 

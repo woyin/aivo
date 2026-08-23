@@ -160,10 +160,10 @@ async fn test_account_login_card_flow_and_stale_generation() {
         frame.contains("Enter open browser"),
         "key hints missing:\n{frame}"
     );
-    // Empty session parks the composer at top → the card takes the space below.
+    // The card lives in its reserved slot directly above the composer.
     assert!(
-        frame.find("Ask, plan, or build").unwrap() < frame.find("sign in to aivo").unwrap(),
-        "card should sit below the parked composer:\n{frame}"
+        frame.find("sign in to aivo").unwrap() < frame.find("Ask, plan, or build").unwrap(),
+        "card should sit above the composer:\n{frame}"
     );
 
     // A prompt stamped with a stale generation is ignored (card stays).

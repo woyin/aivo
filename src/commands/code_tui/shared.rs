@@ -461,6 +461,11 @@ pub(super) const SUB_BLOCK_INDENT: u16 = 2;
 /// The pinned plan panel never crushes the transcript below this many rows, and
 /// its body is also capped at a fraction of the screen (see `plan_panel_height`).
 pub(super) const PLAN_PANEL_MIN_TRANSCRIPT: u16 = 4;
+/// Transcript rows a decision card's slot leaves visible when the screen allows.
+pub(super) const CARD_MIN_TRANSCRIPT: u16 = 4;
+/// On short screens the slot still claims up to this — a blocking decision
+/// outranks scrollback.
+pub(super) const CARD_MIN_HEIGHT: u16 = 8;
 
 pub(super) const COMMAND_MENU_MAX_ROWS: usize = 7;
 pub(super) const PICKER_ROW_PREFIX_WIDTH: usize = 2;

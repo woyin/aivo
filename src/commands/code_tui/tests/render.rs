@@ -1238,10 +1238,10 @@ fn test_inline_image_flush_diffs_placements() {
     assert!(app.inline_images.transmitted.is_empty());
 }
 
-/// A decision card drops floating (cursor-addressed) placements for the
-/// frame but keeps virtual ones — those clip naturally via their cells.
+/// A decision card lives in its own layout slot below the transcript, so it
+/// covers nothing — placements survive under both protocols.
 #[test]
-fn test_ask_card_keeps_virtual_placements_drops_floating_ones() {
+fn test_ask_card_keeps_inline_placements() {
     use crate::services::terminal_graphics::{EncodedPreview, GraphicsCaps, PixelFormat, Protocol};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
@@ -1307,8 +1307,9 @@ fn test_ask_card_keeps_virtual_placements_drops_floating_ones() {
     let mut app = build(Protocol::KittyClassic);
     terminal.draw(|frame| app.render(frame)).unwrap();
     assert!(
-        app.inline_images.desired.is_empty(),
-        "floating placements must drop while a card covers the transcript"
+        !app.inline_images.desired.is_empty(),
+        "cursor-addressed placements must survive a slotted card — it no longer \
+         covers the transcript"
     );
 }
 
