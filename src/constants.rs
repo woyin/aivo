@@ -39,6 +39,10 @@ pub const KNOWN_TOOLS: &[&str] = &[
     "grok",
 ];
 
+/// Set on every child the interactive `aivo code` TUI spawns, so a second
+/// interactive `aivo code` can refuse to nest.
+pub const CODE_ACTIVE_ENV: &str = "AIVO_CODE_ACTIVE";
+
 /// Names a user must not register as an alias because they collide with
 /// built-in commands or shortcuts and would shadow `aivo <name>` / `aivo run
 /// <name>` dispatch. Includes top-level subcommands, the `ls` info alias, the

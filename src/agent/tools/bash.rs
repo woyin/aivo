@@ -111,6 +111,8 @@ pub(crate) enum InteractiveBlocker {
     GitRebaseInteractive,
     GitAddPatch,
     ContainerTty(String),
+    NestedAivo(String),
+    AgentTui(String),
 }
 
 impl InteractiveBlocker {
@@ -151,6 +153,15 @@ impl InteractiveBlocker {
                 "`{prog}` with an interactive TTY (`-it`) opens a session that will block here. \
                  Drop `-t` and pass the command non-interactively, or ask the user to run it."
             ),
+            Self::NestedAivo(cmd) => format!(
+                "`{cmd}` opens aivo's interactive UI, which can't run under the agent's shell. \
+                 Delegate parallel work with the subagent tool, or use the one-shot forms \
+                 `aivo code -p '<prompt>'` / `aivo code -e '<task>'`."
+            ),
+            Self::AgentTui(prog) => format!(
+                "`{prog}` opens an interactive agent TUI that will block here. Use its \
+                 non-interactive mode (e.g. `-p`/`--print`/`exec`), or ask the user to run it."
+            ),
         }
     }
 
@@ -188,6 +199,14 @@ impl InteractiveBlocker {
                 "`{prog} -it` opens an interactive session `!cmd` can't drive. Drop `-t` for a \
                  one-shot command, or run it in a separate terminal."
             ),
+            Self::NestedAivo(cmd) => format!(
+                "`{cmd}` would nest a second aivo UI inside this one. Use /new for a fresh \
+                 task, /resume to reopen a session, or run it in a separate terminal."
+            ),
+            Self::AgentTui(prog) => format!(
+                "`{prog}` opens a full-screen agent TUI, which `!cmd` can't drive. Run it in a \
+                 separate terminal."
+            ),
         }
     }
 
@@ -218,6 +237,42 @@ pub(super) fn blocking_git(args: &[String]) -> Option<InteractiveBlocker> {
     }
 }
 
+/// `aivo` forms that open the chat TUI or an interactive picker. Conservative:
+/// a tool shortcut with passthrough args may be non-interactive
+/// (`aivo claude -p x`), so only bare launches block.
+pub(super) fn blocking_aivo(args: &[String]) -> Option<InteractiveBlocker> {
+    use crate::constants::KNOWN_TOOLS;
+    let has = |flags: &[&str]| args.iter().any(|a| flags.contains(&a.as_str()));
+    if has(&["-h", "--help", "--help-json", "-v", "--version"]) {
+        return None;
+    }
+    let mut nonflags = args.iter().filter(|a| !a.starts_with('-'));
+    let bare_tool = |tool: &str| args.last().is_some_and(|last| last == tool);
+    match nonflags.next().map(String::as_str) {
+        Some(sub @ ("code" | "chat")) => {
+            if matches!(nonflags.next().map(String::as_str), Some("mcp" | "skills"))
+                || has(&["-p", "--prompt", "-e", "--exec"])
+            {
+                None
+            } else {
+                Some(InteractiveBlocker::NestedAivo(format!("aivo {sub}")))
+            }
+        }
+        Some("run") => match nonflags.next().map(String::as_str) {
+            None => Some(InteractiveBlocker::NestedAivo("aivo run".into())),
+            Some("code") => Some(InteractiveBlocker::NestedAivo("aivo run code".into())),
+            Some(tool) if KNOWN_TOOLS.contains(&tool) && bare_tool(tool) => {
+                Some(InteractiveBlocker::AgentTui(format!("aivo run {tool}")))
+            }
+            _ => None,
+        },
+        Some(tool) if KNOWN_TOOLS.contains(&tool) && bare_tool(tool) => {
+            Some(InteractiveBlocker::AgentTui(format!("aivo {tool}")))
+        }
+        _ => None,
+    }
+}
+
 pub(super) fn blocking_program(prog: &str, args: &[String]) -> Option<InteractiveBlocker> {
     let has = |flags: &[&str]| args.iter().any(|a| flags.contains(&a.as_str()));
     match prog {
@@ -240,6 +295,10 @@ pub(super) fn blocking_program(prog: &str, args: &[String]) -> Option<Interactiv
             if has(&["-it", "-ti"]) || (has(&["-i", "--interactive"]) && has(&["-t", "--tty"])) =>
         {
             Some(InteractiveBlocker::ContainerTty(prog.to_string()))
+        }
+        "aivo" => blocking_aivo(args),
+        tool if crate::constants::KNOWN_TOOLS.contains(&tool) && args.is_empty() => {
+            Some(InteractiveBlocker::AgentTui(tool.to_string()))
         }
         _ => None,
     }

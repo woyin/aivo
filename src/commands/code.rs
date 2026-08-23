@@ -986,6 +986,7 @@ impl CodeCommand {
             }
         }
 
+        refuse_nested_tui()?;
         if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
             anyhow::bail!(
                 "The interactive coding agent uses a full-screen TUI. Run it in a terminal, or go non-interactive: -e/--exec runs the agent (tools), -p/--prompt gets a plain reply."
@@ -1441,6 +1442,18 @@ fn sanitize_one_shot_message(message: String) -> Result<String> {
         anyhow::bail!("Prompt for -p/--prompt cannot be empty");
     }
     Ok(message)
+}
+
+/// Refuse a second interactive TUI inside a running `aivo code`. The `!cmd` PTY
+/// passes the TTY check, so the env marker is the only reliable signal; one-shot
+/// `-p`/`-e` runs return before this and stay nestable.
+fn refuse_nested_tui() -> Result<()> {
+    if std::env::var_os(crate::constants::CODE_ACTIVE_ENV).is_some() {
+        anyhow::bail!(
+            "Already inside an `aivo code` session — nested TUIs aren't supported. Use /new for a fresh task, /resume to reopen a session, or a subagent for parallel work."
+        );
+    }
+    Ok(())
 }
 
 fn ensure_picker_terminal(kind: &str, explicit_flag: &str) -> Result<()> {
@@ -3593,5 +3606,18 @@ data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"tex
             panic!("expected inline storage");
         };
         assert_eq!(BASE64.decode(data).unwrap(), pixel_png);
+    }
+
+    #[test]
+    fn nested_tui_guard_trips_only_on_marker() {
+        // SAFETY: no other test touches CODE_ACTIVE_ENV; cleared first so this
+        // passes when `cargo test` itself runs inside an aivo code session.
+        unsafe { std::env::remove_var(crate::constants::CODE_ACTIVE_ENV) };
+        assert!(refuse_nested_tui().is_ok());
+        unsafe { std::env::set_var(crate::constants::CODE_ACTIVE_ENV, "1") };
+        let err = refuse_nested_tui().unwrap_err();
+        assert!(err.to_string().contains("/new"), "got: {err}");
+        unsafe { std::env::remove_var(crate::constants::CODE_ACTIVE_ENV) };
+        assert!(refuse_nested_tui().is_ok());
     }
 }

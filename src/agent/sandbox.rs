@@ -192,6 +192,7 @@ pub struct ShellInvocation {
 /// prompt-capable tools forced non-interactive. Grow it here, not per call site.
 pub(crate) fn harden_headless(cmd: &mut std::process::Command) {
     cmd.env("GIT_TERMINAL_PROMPT", "0")
+        .env(crate::constants::CODE_ACTIVE_ENV, "1")
         .stdin(std::process::Stdio::null());
     // Unix-only: `true`/`cat` aren't launchable as editor/pager on Windows.
     #[cfg(unix)]

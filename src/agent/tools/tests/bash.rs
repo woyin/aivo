@@ -241,6 +241,17 @@ fn interactive_commands_are_refused_argument_aware() {
         "docker run -it ubuntu bash",
         "kubectl exec -it pod -- sh",
         "make && vim Cargo.toml",
+        "aivo code",
+        "aivo chat",
+        "aivo code hf:Qwen/Qwen2.5-0.5B-Instruct-GGUF",
+        "aivo run",
+        "aivo run code",
+        "aivo run claude",
+        "aivo claude",
+        "claude",
+        "codex",
+        "pi",
+        "git pull && aivo code",
     ] {
         assert!(
             interactive_block_reason(cmd).is_some(),
@@ -262,6 +273,19 @@ fn interactive_commands_are_refused_argument_aware() {
         "psql -c 'select 1'",
         "ls | grep foo",
         "echo \"ssh prod\"",
+        "aivo",
+        "aivo --help",
+        "aivo 'fix the login bug'",
+        "aivo code -p 'hi'",
+        "aivo code -e 'run the tests'",
+        "aivo code mcp list",
+        "aivo code skills",
+        "aivo code --help",
+        "aivo run claude -p hi",
+        "aivo claude --resume abc",
+        "claude -p 'hi'",
+        "codex exec 'fix it'",
+        "echo aivo code",
     ] {
         assert!(
             interactive_block_reason(cmd).is_none(),
@@ -306,10 +330,43 @@ fn tail_and_watch_stream_under_bang_but_agent_refuses() {
             "{cmd}"
         );
     }
-    for cmd in ["vim x", "top", "ssh host", "docker run -it ubuntu bash"] {
+    for cmd in [
+        "vim x",
+        "top",
+        "ssh host",
+        "docker run -it ubuntu bash",
+        "aivo code",
+        "aivo run",
+        "claude",
+    ] {
         assert!(
             interactive_block_reason(cmd).unwrap().blocks_bang_cmd(),
             "{cmd}"
         );
     }
+}
+
+#[test]
+fn nested_aivo_and_agent_tui_blockers() {
+    assert_eq!(
+        interactive_block_reason("aivo code"),
+        Some(InteractiveBlocker::NestedAivo("aivo code".into()))
+    );
+    assert_eq!(
+        interactive_block_reason("aivo run"),
+        Some(InteractiveBlocker::NestedAivo("aivo run".into()))
+    );
+    assert_eq!(
+        interactive_block_reason("aivo run pi"),
+        Some(InteractiveBlocker::AgentTui("aivo run pi".into()))
+    );
+    assert_eq!(
+        interactive_block_reason("grok"),
+        Some(InteractiveBlocker::AgentTui("grok".into()))
+    );
+    // The agent is steered to session orchestration; `!cmd` to chat commands.
+    let nested = InteractiveBlocker::NestedAivo("aivo code".into());
+    assert!(nested.agent_message().contains("subagent"));
+    assert!(nested.user_message().contains("/new"));
+    assert!(!nested.user_message().contains("ask the user"));
 }

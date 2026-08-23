@@ -155,6 +155,8 @@ pub(super) fn spawn_pty_shell(command: &str, cwd: &std::path::Path) -> std::io::
     cmd.env("PAGER", "cat");
     cmd.env("GIT_PAGER", "cat");
     cmd.env("GIT_TERMINAL_PROMPT", "0");
+    // The PTY passes the TUI's own TTY check, so a nested `aivo code` must self-refuse.
+    cmd.env(crate::constants::CODE_ACTIVE_ENV, "1");
     let child = pair.slave.spawn_command(cmd).map_err(to_io)?;
     // Drop the slave so the master reader sees EOF once the child exits.
     drop(pair.slave);
@@ -394,7 +396,8 @@ pub(super) fn spawn_pipe_shell(command: &str, cwd: &std::path::Path) -> std::io:
         // Neutralize pagers/credential prompts (matches the Unix PTY path's env).
         .env("PAGER", "cat")
         .env("GIT_PAGER", "cat")
-        .env("GIT_TERMINAL_PROMPT", "0");
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env(crate::constants::CODE_ACTIVE_ENV, "1");
     let mut child = cmd.spawn()?;
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
