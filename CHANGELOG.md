@@ -1,5 +1,15 @@
 # Changelog
 
+## v0.46.4
+
+Agent security holes from the core audit are closed, and nested agent TUIs are refused outright. Startup and the code TUI get small reliability wins.
+
+- feat(agent): refuse nested agent TUIs — bash blockers + AIVO_CODE_ACTIVE marker (0d06428f)
+- fix(agent): close the plan-mode/consent/protected-floor holes from the core audit (7581221a)
+- improve(cleanup): drop dead accessors and stale dead_code allows (b367f871)
+- improve(keys): keyring helper waits instead of polling, cutting ~13ms off startup (dad9f83d)
+- improve(code): decision cards get a reserved layout slot instead of covering the transcript (f18dd15a)
+
 ## v0.46.3
 
 Agent execution is more reliable and consistent, with better prompt caching, compaction, permissions, memory handling, and MCP support in oneshot mode.
