@@ -404,3 +404,81 @@ async fn external_tool_images_are_surfaced_only_for_vision_models() {
         );
     }
 }
+
+/// Plan mode is read-only, and an MCP server's tools can write anything — so
+/// they leave the advertised set with the built-in mutators and a call is refused.
+#[tokio::test]
+async fn external_tools_hide_and_refuse_in_plan_mode() {
+    struct WriterExt;
+    impl crate::agent::engine::ExternalTools for WriterExt {
+        fn specs(&self) -> Vec<Value> {
+            vec![json!({
+                "type": "function",
+                "function": {"name": "mcp__fs__write", "description": "d", "parameters": {"type": "object"}}
+            })]
+        }
+        fn handles(&self, name: &str) -> bool {
+            name == "mcp__fs__write"
+        }
+        fn call<'a>(
+            &'a self,
+            _name: &'a str,
+            _args: &'a Value,
+        ) -> BoxFuture<'a, Result<crate::agent::engine::ToolOutput, String>> {
+            Box::pin(async { Ok("wrote".to_string().into()) })
+        }
+    }
+
+    let dir = tmp();
+    let advertised = |e: &AgentEngine| {
+        e.tools_openai
+            .iter()
+            .any(|t| t["function"]["name"] == "mcp__fs__write")
+    };
+
+    // Entering plan mode with the source already attached stashes it.
+    let mut engine = AgentEngine::new(&dir.display().to_string(), "m", "", &[], &[], 0, 0);
+    engine.set_external_tools(std::sync::Arc::new(WriterExt));
+    assert!(advertised(&engine));
+    engine.set_plan_mode(true);
+    assert!(
+        !advertised(&engine),
+        "MCP tool still advertised in plan mode"
+    );
+    engine.set_plan_mode(false);
+    assert!(advertised(&engine), "MCP tool not restored on plan exit");
+
+    // Attaching while already in plan mode must not push it live either.
+    let mut engine = AgentEngine::new(&dir.display().to_string(), "m", "", &[], &[], 0, 0);
+    engine.set_plan_mode(true);
+    engine.set_external_tools(std::sync::Arc::new(WriterExt));
+    assert!(!advertised(&engine), "MCP tool leaked into plan mode");
+
+    // A call the model makes anyway is refused, not executed.
+    let call = tool_call_sse("mcp__fs__write", json!({}));
+    let port = spawn_sse_sequence(vec![call, FINAL_TEXT_SSE.to_string()]);
+    let client = reqwest::Client::builder().no_proxy().build().unwrap();
+    let base = format!("http://127.0.0.1:{port}");
+    let mut ui = CapturingUi::default();
+    run_session(
+        &mut engine,
+        &turn_ctx(&client, &base, &dir),
+        Some("write something".into()),
+        &mut ui,
+    )
+    .await;
+    assert!(
+        engine
+            .messages
+            .iter()
+            .any(|m| role(m) == "tool" && content_str(m).contains("Plan mode is read-only")),
+        "external call was not refused in plan mode"
+    );
+    assert!(
+        !engine
+            .messages
+            .iter()
+            .any(|m| role(m) == "tool" && content_str(m) == "wrote"),
+        "external tool executed during plan mode"
+    );
+}

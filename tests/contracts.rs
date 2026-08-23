@@ -87,6 +87,10 @@ fn removed_features_stay_removed() {
             "\"/detach\"",
             "/detach removed; [image #n] draft tags are the only attachment surface",
         ),
+        (
+            "mod packs",
+            "extension packs dropped in 4274b419; skills/agents/hooks/MCP install separately",
+        ),
     ];
     let mut violations = Vec::new();
     for f in rust_sources(&repo().join("src")) {

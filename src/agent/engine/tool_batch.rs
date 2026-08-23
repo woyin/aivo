@@ -706,11 +706,20 @@ Before calling `{tool}` again, make its arguments match this schema exactly:\n{s
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .trim();
-        // Heuristic floor; the escalated run's sandbox is the enforced backstop.
-        if tools::command_mentions_protected_path(command) {
+        // Only seatbelt enforces the protected floor on the escalated re-run;
+        // elsewhere escalation is a bare shell and the textual heuristic is all
+        // that's left, so confirm per call instead of waiving silently.
+        let floor_enforced = crate::agent::sandbox::escalated_sandbox_active();
+        if tools::command_mentions_protected_path(command) || !floor_enforced {
+            let why = if tools::command_mentions_protected_path(command) {
+                "and it names a protected path (aivo's config dir or ~/.ssh)"
+            } else {
+                "and on this platform re-running it lifts write confinement entirely — \
+protected paths (aivo's config dir, ~/.ssh) included"
+            };
             let preview = format!(
-                "{command}\n\nThe workspace sandbox blocked this, and it names a protected \
-path (aivo's config dir or ~/.ssh). Re-run the full command with no write confinement?"
+                "{command}\n\nThe workspace sandbox blocked this, {why}. Re-run the full \
+command with no write confinement?"
             );
             let action = PermissionAction::Once {
                 ask_name: "run_bash_unsandboxed",
@@ -773,27 +782,29 @@ Re-run the full command without write confinement?",
         args: &Value,
     ) -> Result<String, String> {
         let outside = tools::escaping_write_paths(name, args, ctx.cwd);
+        // Independent of `outside`: with cwd = $HOME a `~/.ssh/…` write never escapes.
+        let protected = tools::protected_write_paths(name, args, ctx.cwd);
         // Escalation must never bypass the read-only profile's refusal.
-        if outside.is_empty()
+        if (outside.is_empty() && protected.is_empty())
             || crate::agent::sandbox::current_profile()
                 == crate::agent::sandbox::SandboxProfile::ReadOnly
         {
             return tools::execute(name, args, ctx.cwd).await;
         }
-        let joined = outside.join(", ");
-        let protected = outside
-            .iter()
-            .any(|p| tools::write_path_is_protected(p, ctx.cwd));
-        let action = if protected {
+        // One approval covers the whole call, so preview and refusal name every target.
+        let mut targets = protected.clone();
+        targets.extend(outside.iter().filter(|p| !protected.contains(p)).cloned());
+        let action = if !protected.is_empty() {
+            let joined = targets.join(", ");
             PermissionAction::Once {
                 ask_name: "write_outside_workspace",
                 preview: Some(format!(
                     "{name}: {joined}\n\nThis writes to a protected path (aivo's config dir or \
-~/.ssh), outside the workspace {}. Allow this write?",
-                    ctx.cwd.display()
+~/.ssh). Allow this write?"
                 )),
             }
         } else {
+            let joined = outside.join(", ");
             // Scoped to the exact targets so "always" doesn't blanket-open the filesystem.
             PermissionAction::Escalated {
                 ask_name: "write_outside_workspace",
@@ -807,8 +818,9 @@ Re-run the full command without write confinement?",
         let approved = self.resolve_permission(ctx, ui, action).await.allowed();
         if !approved {
             return Err(format!(
-                "refused: `{joined}` is outside the workspace and the user declined the \
-write. Use a path inside {} instead, or ask the user to relaunch with `--add-dir`.",
+                "refused: `{}` is outside the workspace (or under a protected root) and the user \
+declined the write. Use a path inside {} instead, or ask the user to relaunch with `--add-dir`.",
+                targets.join(", "),
                 ctx.cwd.display()
             ));
         }

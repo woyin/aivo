@@ -644,15 +644,17 @@ impl AgentEngine {
         }
         let summary = folded;
         if self.messages.get(cut).map(role) == Some("user") {
-            let original = self.messages[cut]
-                .get("content")
-                .and_then(|c| c.as_str())
-                .unwrap_or("")
-                .to_string();
-            self.messages[cut]["content"] = if original.is_empty() {
-                json!(summary)
-            } else {
-                json!(format!("{summary}\n\n{original}"))
+            let original = self.messages[cut].get("content").cloned();
+            self.messages[cut]["content"] = match original {
+                // Multimodal: the summary joins as a leading text part —
+                // flattening to a string would drop the images.
+                Some(Value::Array(parts)) => {
+                    let mut merged = vec![json!({ "type": "text", "text": summary })];
+                    merged.extend(parts);
+                    Value::Array(merged)
+                }
+                Some(Value::String(s)) if !s.is_empty() => json!(format!("{summary}\n\n{s}")),
+                _ => json!(summary),
             };
             self.messages.drain(1..cut);
             self.rebase_checkpoints(cut, cut - 1); // drain removes cut-1 messages
@@ -1493,6 +1495,43 @@ mod tests {
             described.contains("a red Submit button") && !described.contains("[image]"),
             "cached description must ride the summary transcript: {described}"
         );
+    }
+
+    /// A compaction cut that lands on a multimodal user turn keeps the turn's
+    /// text AND its image parts — the summary joins as a leading text part.
+    #[test]
+    fn compaction_at_a_multimodal_cut_keeps_text_and_images() {
+        let mut e = engine();
+        let image = json!({
+            "type": "image_url",
+            "image_url": {"url": "data:image/png;base64,AAAA"}
+        });
+        e.messages = vec![
+            json!({"role":"system","content":"sys"}),
+            json!({"role":"user","content":"old"}),
+            json!({"role":"assistant","content":"reply"}),
+            json!({"role":"user","content":[
+                {"type":"text","text":"look at this screenshot"},
+                image.clone(),
+            ]}),
+        ];
+        e.apply_compaction(3, "earlier work");
+
+        let kept = &e.messages[1];
+        assert_eq!(role(kept), "user");
+        let parts = kept["content"]
+            .as_array()
+            .expect("multimodal content must stay an array");
+        assert_eq!(parts[0]["type"], "text");
+        assert!(
+            parts[0]["text"].as_str().unwrap().contains("earlier work"),
+            "summary must ride in as a leading text part: {parts:?}"
+        );
+        assert!(
+            parts.iter().any(|p| p["text"] == "look at this screenshot"),
+            "user text was dropped: {parts:?}"
+        );
+        assert!(parts.contains(&image), "image part was dropped: {parts:?}");
     }
 
     #[test]

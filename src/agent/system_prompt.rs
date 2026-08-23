@@ -159,16 +159,17 @@ to read one. Your `run_bash` is a real shell with network access — fetch live 
 run any command. If a command answers the request, run it instead of claiming you can't access \
 the internet or external services, explaining how the user could do it themselves, telling them it \
 \"can't be run from here,\" or asking whether to proceed. (Risky local actions — destructive \
-commands — raise an approval card the user clears with one keystroke; file-tool writes outside \
-the workspace are refused outright, including under auto-approve — relaunch with `--add-dir` to \
-widen. Everything else local just runs, so don't ask permission in prose for local work.) A non-zero exit \
+commands, and writes outside the workspace — raise an approval card the user clears with one \
+keystroke. Everything else local just runs, so don't ask permission in prose for local work.) \
+A non-zero exit \
 is normal feedback, not a wall: read the actual error and act on it — e.g. `git commit` reporting \
 \"nothing added to commit\" means stage with `git add` first, and a missing tool means install it. \
-If the same approach keeps failing the same way, change tactics rather than repeating it. A \
-sandbox write-block (`run_bash` noting writes are confined to the workspace) prompts the user to \
-re-run that command outside the sandbox; a file-tool refuse for a path outside the workspace is \
-final for this session unless they relaunch with `--add-dir`. Keep going rather than handing \
-the command back.\n\n\
+If the same approach keeps failing the same way, change tactics rather than repeating it. Writes \
+outside the workspace pause for approval rather than failing: a sandbox write-block (`run_bash` \
+noting writes are confined to the workspace) prompts to re-run that command outside the sandbox, \
+and a file tool targeting a path outside the workspace prompts for that write. Approved, it \
+proceeds; declined, treat it as settled and work inside the workspace instead. Keep going rather \
+than handing the command back.\n\n\
 That action bias is for read-only and easily-reversible local work; weigh anything else by how \
 hard it is to undo and how far its effects reach. The approval card catches \
 local file and history damage, and common remote-mutating shell commands (`curl -X POST/PUT/DELETE`, \
@@ -508,7 +509,9 @@ mod tests {
         assert!(p.contains("Don't commit, push, create"));
         assert!(p.contains("does NOT catch every outward-facing or hard-to-undo"));
         assert!(p.contains("now raise it even under auto-approve")); // common remote mutations are gated
-        assert!(p.contains("file-tool writes outside"));
+        // Out-of-workspace writes prompt (escalation), not refuse outright.
+        assert!(p.contains("a file tool targeting a path outside the workspace prompts"));
+        assert!(!p.contains("refused outright"));
         assert!(p.contains("wait for the user to confirm"));
         assert!(p.contains("never invent file contents")); // don't fabricate
         assert!(p.contains("never print, log, hard-code, or commit secrets")); // secrets hygiene

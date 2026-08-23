@@ -1041,7 +1041,7 @@ async fn project_mcp_preapproved_repo_skips_card() {
         .unwrap()
         .to_string_lossy()
         .into_owned();
-    let servers = crate::agent::mcp::project_stdio_servers(std::path::Path::new(&cwd));
+    let servers = crate::agent::mcp::project_gated_servers(std::path::Path::new(&cwd));
     app.session_store
         .set_project_mcp_approved(&dir_key, &project_mcp_digest(&servers))
         .await
@@ -1078,7 +1078,7 @@ async fn project_mcp_changed_config_reprompts() {
         r#"{"mcpServers":{"x":{"command":"aivo_no_such_binary_zzz"}}}"#,
     )
     .unwrap();
-    let orig = crate::agent::mcp::project_stdio_servers(std::path::Path::new(&cwd));
+    let orig = crate::agent::mcp::project_gated_servers(std::path::Path::new(&cwd));
     app.session_store
         .set_project_mcp_approved(&dir_key, &project_mcp_digest(&orig))
         .await
@@ -1099,10 +1099,11 @@ async fn project_mcp_changed_config_reprompts() {
     let _ = std::fs::remove_dir_all(&repo);
 }
 
-/// A repo with no project `.mcp.json` (or only HTTP servers) never raises the
-/// consent card — there's no local command to gate.
+/// An HTTP-only project `.mcp.json` still raises the consent card: the repo
+/// picked that endpoint, and connecting hands it the conversation. Only a repo
+/// with no project file at all skips the gate.
 #[tokio::test]
-async fn project_mcp_no_stdio_no_card() {
+async fn project_mcp_http_only_still_gated() {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let mut app = make_test_app(tx, rx);
     let repo = std::env::temp_dir().join(format!("aivo-consent-http-{}", std::process::id()));
@@ -1116,9 +1117,23 @@ async fn project_mcp_no_stdio_no_card() {
     let cwd = repo.to_str().unwrap().to_string();
 
     app.connect_mcp_with_consent(cwd, Default::default()).await;
-    assert!(
-        app.cards.mcp_consent.is_none(),
-        "HTTP-only project servers aren't gated (no local exec)"
-    );
+    let card = app
+        .cards
+        .mcp_consent
+        .as_ref()
+        .expect("HTTP project server must be gated");
+    assert_eq!(card.servers[0].0, "remote");
+    assert_eq!(card.servers[0].1, "https://h/mcp");
     let _ = std::fs::remove_dir_all(&repo);
+
+    // No project file → nothing to gate.
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    let bare = std::env::temp_dir().join(format!("aivo-consent-bare-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&bare);
+    std::fs::create_dir_all(&bare).unwrap();
+    app.connect_mcp_with_consent(bare.to_str().unwrap().to_string(), Default::default())
+        .await;
+    assert!(app.cards.mcp_consent.is_none());
+    let _ = std::fs::remove_dir_all(&bare);
 }

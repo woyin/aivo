@@ -1949,19 +1949,17 @@ is preserved."
             .collect()
     }
 
-    /// Connect MCP, gating a repo's project `.mcp.json` STDIO servers behind a
-    /// one-time consent — they would spawn arbitrary local commands the moment a
-    /// connect runs. User-scope servers (`~/.config/aivo/mcp.json`) and HTTP
-    /// (`url`) project servers connect freely (no local code execution). Until the
-    /// user approves (once / always-for-this-repo), project stdio servers are held
-    /// back from the connect; a consent card surfaces the exact commands.
+    /// Connect MCP, gating a repo's project `.mcp.json` servers behind a one-time
+    /// consent — stdio spawns local commands, `url` hands the conversation to a
+    /// repo-picked endpoint. User-scope servers connect freely. Until the user
+    /// approves, project servers are held back; a consent card shows the targets.
     pub(super) async fn connect_mcp_with_consent(
         &mut self,
         cwd: String,
         base_disabled: std::collections::HashSet<String>,
     ) {
-        let stdio = crate::agent::mcp::project_stdio_servers(std::path::Path::new(&cwd));
-        if stdio.is_empty() {
+        let gated = crate::agent::mcp::project_gated_servers(std::path::Path::new(&cwd));
+        if gated.is_empty() {
             self.start_mcp_connect(cwd, base_disabled);
             return;
         }
@@ -1970,7 +1968,7 @@ is preserved."
         // so a changed `.mcp.json` re-prompts instead of silently reusing consent.
         if self.project_mcp_consent == ProjectMcpConsent::Unknown {
             let dir_key = canonical_dir_key(&cwd);
-            let digest = project_mcp_digest(&stdio);
+            let digest = project_mcp_digest(&gated);
             if self
                 .session_store
                 .get_project_mcp_approved(&dir_key, &digest)
@@ -1983,16 +1981,16 @@ is preserved."
             self.start_mcp_connect(cwd, base_disabled);
             return;
         }
-        // Unknown or Denied → hold the project stdio servers back from the connect
-        // (user + HTTP project servers still come up).
+        // Unknown or Denied → hold the project servers back from the connect
+        // (user-scope servers still come up).
         let mut held = base_disabled.clone();
-        held.extend(stdio.iter().map(|(name, _)| name.clone()));
+        held.extend(gated.iter().map(|(name, _)| name.clone()));
         // Unknown → surface the consent card (unless one is already up).
         if self.project_mcp_consent == ProjectMcpConsent::Unknown
             && self.cards.mcp_consent.is_none()
         {
             self.cards.mcp_consent = Some(McpConsentPrompt {
-                servers: stdio,
+                servers: gated,
                 cwd: cwd.clone(),
                 base_disabled,
             });
@@ -2003,7 +2001,7 @@ is preserved."
     /// Resolve the project-MCP consent card. `y` runs the servers once (this
     /// session), `a` also remembers the approval for this repo, `n`/`Esc` denies
     /// (they stay held back). On approval the cached client/engine are dropped so
-    /// the reconnect includes the previously-held project stdio servers.
+    /// the reconnect includes the previously-held project servers.
     pub(super) async fn handle_mcp_consent_key(&mut self, key: KeyEvent) {
         let always = matches!(key.code, KeyCode::Char('a' | 'A'));
         let allow = always || matches!(key.code, KeyCode::Char('y' | 'Y'));
@@ -2031,8 +2029,8 @@ is preserved."
                 self.notice = Some((ERROR(), format!("Couldn't remember the approval: {e}")));
             }
         }
-        // Drop the cached client/engine so the reconnect picks up the project
-        // stdio servers held back on the first connect.
+        // Drop the cached client/engine so the reconnect picks up the servers
+        // held back on the first connect.
         self.reset_mcp_after_config_change();
         self.start_mcp_connect(prompt.cwd, prompt.base_disabled);
         self.refresh_mcp_overlay_status();
@@ -2063,7 +2061,7 @@ is preserved."
             .into_iter()
             .collect();
         // Kick the connect off first so the snapshot below reads "connecting…".
-        // Project stdio servers are gated (consent card) the same as on a turn.
+        // Project servers are gated (consent card) the same as on a turn.
         self.connect_mcp_with_consent(cwd.clone(), disabled.clone())
             .await;
         let mut items: Vec<McpServerRow> =
@@ -2164,7 +2162,7 @@ is preserved."
             .await
             .ok();
         if project {
-            self.allow_self_added_project_stdio();
+            self.allow_self_added_project_server();
             self.notice = Some((
                 MUTED(),
                 format!("Added MCP server `{name}` → ./.mcp.json (project — commit it to share)"),
@@ -2176,11 +2174,11 @@ is preserved."
         self.open_mcp_overlay().await
     }
 
-    /// The user just typed a project stdio server into `/mcp add -p` — that IS
+    /// The user just typed a project server into `/mcp add -p` — that IS
     /// the consent, so grant the run-once session approval (like pressing `y`).
     /// Never persisted: the digest guard still re-prompts other sessions, and a
     /// later hand-edit of `.mcp.json` re-prompts as usual.
-    fn allow_self_added_project_stdio(&mut self) {
+    fn allow_self_added_project_server(&mut self) {
         self.project_mcp_consent = ProjectMcpConsent::Allowed;
         self.cards.mcp_consent = None;
     }
@@ -2215,7 +2213,7 @@ is preserved."
                 .map(|s| s.name)
                 .collect();
         let mut added = Vec::new();
-        let mut added_stdio = false;
+        let mut added_gated = false;
         for (name_opt, value) in parsed {
             let name = dedupe_name(
                 name_opt.unwrap_or_else(|| crate::agent::mcp::derive_name_from_value(&value)),
@@ -2245,12 +2243,12 @@ is preserved."
             if let Some(url) = value.get("url").and_then(|u| u.as_str()) {
                 self.pending_mcp_auth.insert(name.clone(), url.to_string());
             }
-            added_stdio |= value.get("command").is_some();
+            added_gated |= value.get("command").is_some() || value.get("url").is_some();
             existing.insert(name.clone());
             added.push(name);
         }
-        if project && added_stdio {
-            self.allow_self_added_project_stdio();
+        if project && added_gated {
+            self.allow_self_added_project_server();
         }
         let label = if added.len() == 1 {
             "MCP server"
@@ -2341,7 +2339,7 @@ is preserved."
         };
         let mut added = Vec::new();
         let mut replaced = Vec::new();
-        let mut added_stdio = false;
+        let mut added_gated = false;
         for row in rows {
             let write = if project {
                 crate::agent::mcp::add_project_server_value(
@@ -2367,15 +2365,15 @@ is preserved."
                 self.pending_mcp_auth
                     .insert(row.name.clone(), url.to_string());
             }
-            added_stdio |= row.config.get("command").is_some();
+            added_gated |= row.config.get("command").is_some() || row.config.get("url").is_some();
             if row.exists {
                 replaced.push(row.name);
             } else {
                 added.push(row.name);
             }
         }
-        if project && added_stdio {
-            self.allow_self_added_project_stdio();
+        if project && added_gated {
+            self.allow_self_added_project_server();
         }
         let mut parts = Vec::new();
         if !added.is_empty() {

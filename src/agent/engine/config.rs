@@ -558,7 +558,10 @@ plan-approval card — suggest it when a task deserves real design discussion.{i
         {
             self.deferred_tools = specs;
         } else {
-            self.tools_openai.extend(specs);
+            // Via `advertise_tool`: plan mode must stash these, not leave them live.
+            for spec in specs {
+                self.advertise_tool(spec);
+            }
         }
         self.refresh_search_tools();
         self.external = Some(ext);
@@ -597,7 +600,10 @@ plan-approval card — suggest it when a task deserves real design discussion.{i
         }
         self.deferred_tools = kept;
         if !loaded.is_empty() {
-            self.tools_openai.extend(loaded.iter().cloned());
+            // `advertise_tool` so a load during plan mode stashes instead of going live.
+            for spec in loaded.iter().cloned() {
+                self.advertise_tool(spec);
+            }
             self.refresh_search_tools();
         }
         loaded

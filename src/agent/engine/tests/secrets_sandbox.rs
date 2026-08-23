@@ -219,3 +219,47 @@ async fn sandbox_block_reruns_outside_when_approved() {
         ui.notices
     );
 }
+
+/// The protected floor holds when the workspace CONTAINS a protected root: with
+/// `cwd = $HOME` a config-dir write never "escapes". Pure path math, runs everywhere.
+#[tokio::test]
+async fn protected_write_prompts_even_when_cwd_contains_the_root() {
+    let home = crate::services::system_env::home_dir().expect("test HOME");
+    let config = crate::services::paths::config_dir();
+    if !config.starts_with(&home) {
+        return; // AIVO_CONFIG_DIR points elsewhere; the containment case can't arise
+    }
+    std::fs::create_dir_all(&config).unwrap();
+    let target = config.join(format!("aivo_contained_{}.txt", std::process::id()));
+    let _ = std::fs::remove_file(&target);
+
+    let call = tool_call_sse(
+        "write_file",
+        json!({ "path": target.display().to_string(), "content": "pwn" }),
+    );
+    let port = spawn_sse_sequence(vec![call, FINAL_TEXT_SSE.to_string()]);
+    let client = reqwest::Client::builder().no_proxy().build().unwrap();
+    let base = format!("http://127.0.0.1:{port}");
+    let mut engine = AgentEngine::new(&home.display().to_string(), "m", "", &[], &[], 0, 0);
+    // `yes: true` — the Confirm tier is waived, exactly the auto-approve case.
+    let mut ui = CapturingUi {
+        deny: true,
+        ..Default::default()
+    };
+    run_session(
+        &mut engine,
+        &turn_ctx(&client, &base, &home),
+        Some("write it".into()),
+        &mut ui,
+    )
+    .await;
+
+    let existed = target.exists();
+    let _ = std::fs::remove_file(&target);
+    assert_eq!(
+        ui.ask_tools,
+        vec!["write_outside_workspace"],
+        "protected write under cwd was not gated"
+    );
+    assert!(!existed, "denied protected write still landed");
+}

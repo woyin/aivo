@@ -248,15 +248,50 @@ pub fn detect_plan(cwd: &Path) -> Vec<Validator> {
     plan
 }
 
+/// Single-quote one argv entry for the shell `wrap_shell` hands the command to.
+#[cfg(not(windows))]
+fn shell_quote(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('\'');
+    for ch in s.chars() {
+        if ch == '\'' {
+            out.push_str("'\\''");
+        } else {
+            out.push(ch);
+        }
+    }
+    out.push('\'');
+    out
+}
+
 /// Run `v` in `cwd`. `Inconclusive` never blocks the agent, but is NOT a pass —
 /// callers must not report it as verified.
 /// Takes the `Validator` by value: a borrow held across the await would make this
 /// future's Send-ness higher-ranked, breaking `buffer_unordered`/`tokio::spawn` callers.
 pub async fn run(v: Validator, cwd: &Path) -> Outcome {
-    let mut cmd = tokio::process::Command::new(&v.command[0]);
-    cmd.args(&v.command[1..])
-        .current_dir(cwd)
-        .stdin(std::process::Stdio::null());
+    // Repo-controlled command, model-triggered — run it under the same workspace
+    // sandbox as `run_bash`. Windows has no sandbox and PowerShell can't parse
+    // POSIX quoting, so the argv spawns directly there.
+    #[cfg(not(windows))]
+    let mut cmd = {
+        let command = v
+            .command
+            .iter()
+            .map(|a| shell_quote(a))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let inv = crate::agent::sandbox::wrap_shell(&command, cwd);
+        let mut cmd = tokio::process::Command::new(&inv.program);
+        cmd.args(&inv.args);
+        cmd
+    };
+    #[cfg(windows)]
+    let mut cmd = {
+        let mut cmd = tokio::process::Command::new(&v.command[0]);
+        cmd.args(&v.command[1..]);
+        cmd
+    };
+    cmd.current_dir(cwd).stdin(std::process::Stdio::null());
     let output = match tokio::time::timeout(VERIFY_TIMEOUT, cmd.output()).await {
         Ok(Ok(o)) => o,
         Ok(Err(_)) => return Outcome::Inconclusive("could not launch"),
@@ -264,6 +299,11 @@ pub async fn run(v: Validator, cwd: &Path) -> Outcome {
     };
     if output.status.success() {
         return Outcome::Pass;
+    }
+    // Shell exit 127/126 = absent/unexecutable validator — an uninstalled
+    // `pytest` must not read as a failing suite.
+    if matches!(output.status.code(), Some(126 | 127)) {
+        return Outcome::Inconclusive("could not launch");
     }
     Outcome::Fail(summarize_failure(&v.label, &output.stdout, &output.stderr))
 }

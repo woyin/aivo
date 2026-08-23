@@ -11,8 +11,9 @@ pub fn is_mutating(name: &str) -> bool {
 /// Tools plan mode strips from the advertised set: the file-mutating ones
 /// (`run_bash` stays, gated per call), `subagent` (its sub-engine isn't
 /// read-only), and `generate_image` (writes a file, bills an API call).
+/// A rowless name is an external (MCP) tool and hides too: it can write anything.
 pub fn hidden_in_plan_mode(name: &str) -> bool {
-    registry::traits(name).is_some_and(|t| t.plan_hidden)
+    registry::traits(name).is_none_or(|t| t.plan_hidden)
 }
 
 /// Built-in tools that only read (filesystem or network) and share no mutable
@@ -68,6 +69,18 @@ pub fn escaping_write_paths(name: &str, args: &Value, cwd: &Path) -> Vec<String>
     crate::agent::file_tracker::tracked_paths(name, args)
         .into_iter()
         .filter(|p| path_escapes_cwd(p, cwd))
+        .collect()
+}
+
+/// The protected-root targets of a write-tool call — from ALL tracked paths, not
+/// just escaping ones: with `cwd = $HOME`, `~/.ssh/…` never "escapes".
+pub fn protected_write_paths(name: &str, args: &Value, cwd: &Path) -> Vec<String> {
+    if !crate::agent::file_tracker::is_write_tool(name) {
+        return Vec::new();
+    }
+    crate::agent::file_tracker::tracked_paths(name, args)
+        .into_iter()
+        .filter(|p| write_path_is_protected(p, cwd))
         .collect()
 }
 

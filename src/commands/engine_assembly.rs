@@ -89,10 +89,9 @@ impl EngineAssembly<'_> {
 }
 
 /// Headless MCP connect for `-e`: same servers and `/mcp` opt-outs as the TUI,
-/// but with no way to show a consent card, project `.mcp.json` STDIO servers
-/// (local code execution) are held back unless a PRIOR interactive session
-/// stored an approval for this exact server set — fail closed, like the
-/// `AgentUi` defaults. Returns `None` when nothing is configured or connects.
+/// but with no way to show a consent card, project `.mcp.json` servers are held
+/// back unless a PRIOR interactive session stored an approval for this exact
+/// server set — fail closed. Returns `None` when nothing is configured or connects.
 pub async fn headless_external_tools(
     store: &SessionStore,
     cwd: &str,
@@ -103,12 +102,12 @@ pub async fn headless_external_tools(
         .unwrap_or_default()
         .into_iter()
         .collect();
-    let stdio = mcp::project_stdio_servers(Path::new(cwd));
-    if !stdio.is_empty() {
+    let gated = mcp::project_gated_servers(Path::new(cwd));
+    if !gated.is_empty() {
         let dir_key = mcp::canonical_dir_key(cwd);
-        let digest = mcp::project_mcp_digest(&stdio);
+        let digest = mcp::project_mcp_digest(&gated);
         if !store.get_project_mcp_approved(&dir_key, &digest).await {
-            held.extend(stdio.into_iter().map(|(name, _)| name));
+            held.extend(gated.into_iter().map(|(name, _)| name));
         }
     }
     let client = McpClient::connect_enabled_with_progress(Path::new(cwd), &held, |_, _| {}).await;
