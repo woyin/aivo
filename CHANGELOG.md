@@ -11,6 +11,7 @@ Agent security holes from the core audit are closed, and nested agent TUIs are r
 - improve(code): decision cards get a reserved layout slot instead of covering the transcript (f18dd15a)
 - fix(code): re-allow ClipboardPayload::Attachment dead_code on non-macOS (271f5ab3)
 - fix(agent): detect sandbox denials on stdout and add check_job blocking wait (bb6d8e2c)
+- fix(agent): degrade gracefully when seatbelt can't nest; test quarantine moves under target/ (f1385e21)
 
 ## v0.46.3
 
