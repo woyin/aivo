@@ -208,7 +208,7 @@ pub fn active() -> bool {
     }
     #[cfg(target_os = "macos")]
     {
-        Path::new(SANDBOX_EXEC).exists()
+        Path::new(SANDBOX_EXEC).exists() && nestable()
     }
     #[cfg(target_os = "linux")]
     {
@@ -222,6 +222,21 @@ pub fn active() -> bool {
 
 fn disabled() -> bool {
     current_profile() == SandboxProfile::Off
+}
+
+/// Seatbelt can't nest: under an outer sandbox `sandbox-exec` fails to apply
+/// and every bash call would die cryptically — probe once and fall back to
+/// the no-sandbox posture instead (outer confinement still applies).
+#[cfg(target_os = "macos")]
+fn nestable() -> bool {
+    use std::sync::OnceLock;
+    static NESTABLE: OnceLock<bool> = OnceLock::new();
+    *NESTABLE.get_or_init(|| {
+        std::process::Command::new(SANDBOX_EXEC)
+            .args(["-p", "(version 1)(allow default)", "/usr/bin/true"])
+            .output()
+            .is_ok_and(|o| o.status.success())
+    })
 }
 
 /// Legacy `AIVO_AGENT_NO_SANDBOX` opt-out (any value other than empty/`0`).
@@ -313,7 +328,10 @@ fn landlock_relaunch(
 pub fn escalated_sandbox_active() -> bool {
     #[cfg(target_os = "macos")]
     {
-        !disabled() && Path::new(SANDBOX_EXEC).exists() && !protected_write_roots().is_empty()
+        !disabled()
+            && Path::new(SANDBOX_EXEC).exists()
+            && nestable()
+            && !protected_write_roots().is_empty()
     }
     #[cfg(not(target_os = "macos"))]
     {

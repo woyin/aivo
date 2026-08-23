@@ -9,6 +9,8 @@ Agent security holes from the core audit are closed, and nested agent TUIs are r
 - improve(cleanup): drop dead accessors and stale dead_code allows (b367f871)
 - improve(keys): keyring helper waits instead of polling, cutting ~13ms off startup (dad9f83d)
 - improve(code): decision cards get a reserved layout slot instead of covering the transcript (f18dd15a)
+- fix(code): re-allow ClipboardPayload::Attachment dead_code on non-macOS (271f5ab3)
+- fix(agent): detect sandbox denials on stdout and add check_job blocking wait (bb6d8e2c)
 
 ## v0.46.3
 

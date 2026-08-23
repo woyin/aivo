@@ -11,7 +11,7 @@ cargo clippy && cargo fmt                          # Required clean before commi
 ```
 
 - After code changes, `cargo build && cargo install --path . --debug` before testing the binary — never test a stale build.
-- Tests are hermetic: a pre-main sandbox (`tests/support/mod.rs`) points `$HOME` at `~/.aivo-test-home/<pid>`, so tests can never touch the real config.
+- Tests are hermetic: a pre-main sandbox (`tests/support/mod.rs`) points `$HOME` at `target/.aivo-test-home/<pid>`, so tests can never touch the real config.
 
 ## Git & Release
 

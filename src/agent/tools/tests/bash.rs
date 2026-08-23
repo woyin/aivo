@@ -188,6 +188,13 @@ async fn run_bash_times_out() {
 #[cfg(unix)]
 #[tokio::test]
 async fn run_bash_runs_in_its_own_process_group() {
+    // An outer sandbox denies exec'ing `ps` — pgroup unobservable, skip.
+    let probe = std::process::Command::new("ps")
+        .args(["-o", "pgid=", "-p", &std::process::id().to_string()])
+        .output();
+    if !probe.is_ok_and(|o| o.status.success()) {
+        return;
+    }
     let dir = tmp();
     // Unconfined: macOS seatbelt denies `ps`; the spawn builder is shared.
     let out = run_bash_unconfined(&json!({"command":"ps -o pgid= -p $$"}), &dir, None)

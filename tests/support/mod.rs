@@ -3,23 +3,18 @@
 //! quarantine dir before main() so a test that forgets per-case isolation can
 //! never read or write the real user environment.
 //!
-//! The quarantine lives under the *real* home, NOT `temp_dir()`: the agent
-//! write-sandbox allowlists /tmp and $TMPDIR, and its enforcement tests need a
-//! HOME that writes are still blocked in (see e.g. `sandbox_confines_writes_to_
-//! workspace`). `tests/sandbox_linux.rs` omits this module for the same reason
-//! it exists — its assertions are about the real HOME's placement.
+//! The quarantine lives under `target/`, NOT `temp_dir()` or the real home:
+//! /tmp is inside the agent write-sandbox allowlist (would flip its
+//! HOME-must-be-blocked enforcement tests), and the real home is blocked when
+//! an outer sandbox drives `cargo test`. `tests/sandbox_linux.rs` omits this
+//! module — its assertions are about the real HOME's placement.
 
 /// Pre-main and therefore single-threaded: the env mutation is race-free.
 #[ctor::ctor(unsafe)]
 fn sandbox_process_env() {
-    // No home at all → fail loud rather than quarantine under temp_dir():
-    // temp paths sit inside the agent write-sandbox allowlist, which would
-    // silently flip its HOME-must-be-blocked enforcement tests.
-    let real_home = std::env::var_os("HOME")
-        .or_else(|| std::env::var_os("USERPROFILE"))
-        .map(std::path::PathBuf::from)
-        .expect("test sandbox requires HOME (or USERPROFILE) to be set");
-    let root = real_home.join(".aivo-test-home");
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("target")
+        .join(".aivo-test-home");
     sweep_stale_quarantines(&root);
     let home = root.join(std::process::id().to_string());
     // PID reuse could resurface state from an earlier run; start clean.
