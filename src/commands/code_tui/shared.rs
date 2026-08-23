@@ -2259,6 +2259,7 @@ pub(super) struct LocalCommandOutput {
     pub(super) stderr: String,
 }
 
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))] // Attachment only constructed on macOS (clipboard image)
 pub(super) enum ClipboardPayload {
     Text(String),
     Attachment(MessageAttachment),
