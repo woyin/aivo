@@ -16,7 +16,7 @@ cargo clippy && cargo fmt                          # Required clean before commi
 ## Git & Release
 
 - Squash merge to main; never commit unless asked.
-- Release: bump version in `Cargo.toml`, fmt/clippy/test, stage only `Cargo.toml` + `Cargo.lock` (never `git add -A`), commit `chore: release vX.Y.Z`, push main, wait for CI green on **all three runners** (`#[cfg(windows)]` code is invisible to Linux/macOS clippy), then tag. **Never tag before CI is green** — a failed release can't be re-cut on the same tag.
+- Release: bump version in `Cargo.toml`, fmt/clippy/test, stage only `Cargo.toml` + `Cargo.lock` + `CHANGELOG.md` (never `git add -A`), commit `chore: release vX.Y.Z`, push main, wait for CI green on **all three runners** (`#[cfg(windows)]` code is invisible to Linux/macOS clippy), then tag. **Never tag before CI is green** — a failed release can't be re-cut on the same tag.
 
 ## Architecture
 
