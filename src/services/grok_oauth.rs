@@ -490,11 +490,6 @@ impl GrokTokenManager {
             false
         }
     }
-
-    /// The current credential, for persisting rotated tokens after a run.
-    pub async fn current_credential(&self) -> GrokOAuthCredential {
-        self.creds.read().await.clone()
-    }
 }
 
 #[cfg(test)]

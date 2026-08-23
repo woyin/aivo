@@ -2259,7 +2259,6 @@ pub(super) struct LocalCommandOutput {
     pub(super) stderr: String,
 }
 
-#[allow(dead_code)]
 pub(super) enum ClipboardPayload {
     Text(String),
     Attachment(MessageAttachment),

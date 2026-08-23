@@ -147,7 +147,6 @@ impl LogStore {
             .await
     }
 
-    #[allow(dead_code)]
     pub async fn get(&self, id: &str) -> Result<Option<LogEntry>> {
         let id = id.to_string();
         self.read_with_fallback("log entry", move |conn| get_with_connection(conn, &id))

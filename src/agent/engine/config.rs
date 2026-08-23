@@ -530,11 +530,6 @@ plan-approval card — suggest it when a task deserves real design discussion.{i
         std::mem::take(&mut self.turn_usage)
     }
 
-    /// The turn's accepted `finish_turn` report, if the model ended it with one.
-    pub fn take_finish_report(&mut self) -> Option<crate::agent::finish::FinishReport> {
-        self.finish_report.take()
-    }
-
     /// Upstream model echoed by this session's responses, when any step carried one.
     pub fn billed_model(&self) -> Option<&str> {
         self.billed_model.as_deref()

@@ -621,10 +621,6 @@ impl CodexTokenManager {
             account_id: creds.account_id.clone(),
         })
     }
-
-    pub async fn current_credential(&self) -> CodexOAuthCredential {
-        self.creds.read().await.clone()
-    }
 }
 
 #[cfg(test)]

@@ -694,22 +694,10 @@ where
     }
 }
 
-/// Streams a reqwest Response as chunked HTTP to a stream.
-pub async fn write_streaming_response<W>(
-    socket: &mut W,
-    status: u16,
-    content_type: &str,
-    upstream: reqwest::Response,
-) -> Result<()>
-where
-    W: tokio::io::AsyncWrite + Unpin,
-{
-    write_streaming_response_with_prefix(socket, status, content_type, &[], upstream, |_| {}).await
-}
-
-/// Like `write_streaming_response`, but flushes `prefix` as the first chunk
-/// before draining `upstream`. Used when bytes were already read off the
-/// upstream (e.g. sniffing the SSE shape) and must be replayed to the client.
+/// Streams a reqwest Response as chunked HTTP to a stream, flushing `prefix`
+/// as the first chunk before draining `upstream`. `prefix` carries bytes
+/// already read off the upstream (e.g. sniffing the SSE shape) that must be
+/// replayed to the client.
 /// `on_chunk` observes each raw upstream chunk (prefix + body) — callers use it
 /// to sniff token usage off the forwarded stream without buffering it.
 pub async fn write_streaming_response_with_prefix<W>(

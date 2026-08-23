@@ -185,10 +185,6 @@ fn is_token_char(b: u8) -> bool {
 }
 
 /// Returns a copy of `headers` with sensitive values replaced by `[REDACTED]`.
-/// Retained as a pub helper for the in-module unit tests; production code
-/// goes through `collect_and_redact_headers` which operates on
-/// `reqwest::header::HeaderMap` directly.
-#[allow(dead_code)]
 pub fn redact_headers(headers: &BTreeMap<String, String>) -> BTreeMap<String, String> {
     headers
         .iter()

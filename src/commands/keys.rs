@@ -3918,7 +3918,6 @@ pub fn prompt_pick_key_without_activation(
 }
 
 // Picks a key from `keys` and activates it. Returns `Ok(None)` if cancelled.
-#[allow(dead_code)] // used by binary crate (key_resolution.rs)
 pub(crate) async fn prompt_select_key(
     session_store: &SessionStore,
     keys: &[ApiKey],
