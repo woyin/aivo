@@ -54,6 +54,11 @@ impl CodeTuiApp {
         }
     }
 
+    pub(super) fn current_welcome_tip(&self) -> &'static str {
+        let tips = welcome_tips_for(self.is_transcript_empty());
+        tips[self.welcome_tip_index % tips.len()]
+    }
+
     /// At the next user turn, drop a plan card that's fully completed (done marker)
     /// or unstarted (an abandoned proposal). A mid-execution plan is left alone.
     pub(super) fn clear_stale_plan(&mut self) {

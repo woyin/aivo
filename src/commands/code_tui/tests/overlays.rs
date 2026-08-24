@@ -531,7 +531,7 @@ async fn config_overlay_renders_live_values_and_focused_options() {
         assert!(!text.contains(hidden), "{hidden:?} leaked:\n{text}");
     }
     assert!(
-        !text.contains("on · esc"),
+        !text.contains("on · Esc"),
         "count badge still drawn:\n{text}"
     );
     assert!(

@@ -69,10 +69,10 @@ impl CodeTuiApp {
         // Same chrome as /skills and the session picker: title + count badge in
         // the top border, search row + gap + list + hint strip inside.
         let status = if picker.loading {
-            "loading · esc".to_string()
+            "loading · Esc".to_string()
         } else {
             format!(
-                "{} · esc",
+                "{} · Esc",
                 format_picker_match_count(
                     picker.filtered_items().len(),
                     picker.items.len(),
@@ -122,7 +122,7 @@ impl CodeTuiApp {
         let (lines, row_to_filtered_index) = if visible.is_empty() {
             (
                 vec![Line::from(Span::styled(
-                    "No matches",
+                    "No matches — keep typing or Esc",
                     Style::default().fg(MUTED()),
                 ))],
                 Vec::new(),
@@ -167,7 +167,7 @@ impl CodeTuiApp {
     ) -> OverlayRenderOut {
         // Same chrome as /skills and /mcp: title + count badge in the top border.
         let badge = format!(
-            "{} · esc",
+            "{} · Esc",
             format_session_match_count(picker.filtered_items().len(), picker.items.len())
         );
         let inner = overlay_shell(frame, area, "Sessions", Some((badge, MUTED())));
@@ -243,16 +243,16 @@ impl CodeTuiApp {
             chunks[2],
         );
         let footer: &[(&str, &str)] = if picker.pending_delete.is_some() {
-            &[("Enter/^D", "confirm delete"), ("Esc", "cancel")]
+            &[("Enter/Ctrl+D", "confirm delete"), ("Esc", "cancel")]
         } else if preview_pane.is_some() {
             &[
                 ("↑↓", "move"),
                 ("Enter", "open"),
                 ("PgUp", "preview"),
-                ("^D", "delete"),
+                ("Ctrl+D", "delete"),
             ]
         } else {
-            &[("↑↓", "move"), ("Enter", "open"), ("^D", "delete")]
+            &[("↑↓", "move"), ("Enter", "open"), ("Ctrl+D", "delete")]
         };
         render_footer_hints(frame, footer_rect, footer);
 
@@ -314,7 +314,7 @@ impl CodeTuiApp {
         area: Rect,
         scroll: u16,
     ) -> u16 {
-        let inner = overlay_shell(frame, area, "Help", Some(("esc".to_string(), MUTED())));
+        let inner = overlay_shell(frame, area, "Help", Some(("Esc".to_string(), MUTED())));
 
         let cmd_style = Style::default().fg(TEXT()).add_modifier(Modifier::BOLD);
         let key_style = Style::default().fg(ACCENT()).add_modifier(Modifier::BOLD);
@@ -423,7 +423,7 @@ impl CodeTuiApp {
         report: &crate::agent::engine::ContextReport,
         scroll: u16,
     ) -> u16 {
-        let inner = overlay_shell(frame, area, "Context", Some(("esc".to_string(), MUTED())));
+        let inner = overlay_shell(frame, area, "Context", Some(("Esc".to_string(), MUTED())));
         let width = usize::from(inner.width).max(1);
 
         // Anchor the split to the footer's measured fill so the two match.
@@ -601,7 +601,7 @@ impl CodeTuiApp {
         area: Rect,
         scroll: u16,
     ) -> u16 {
-        let inner = overlay_shell(frame, area, "Session", Some(("esc".to_string(), MUTED())));
+        let inner = overlay_shell(frame, area, "Session", Some(("Esc".to_string(), MUTED())));
         let width = usize::from(inner.width).max(1);
 
         // Provenance: a fork names its source agent; a native session says so.
@@ -675,7 +675,7 @@ impl CodeTuiApp {
             frame,
             area,
             "Sharing",
-            Some(("c copy · s stop · esc".to_string(), MUTED())),
+            Some(("c copy · s stop · Esc".to_string(), MUTED())),
         );
         let width = usize::from(inner.width).max(1);
         let mut lines: Vec<Line> = Vec::new();
@@ -726,7 +726,7 @@ impl CodeTuiApp {
                 frame,
                 area,
                 "Skills",
-                Some(("esc back".to_string(), MUTED())),
+                Some(("Esc back".to_string(), MUTED())),
             );
             if inner.height == 0 {
                 return OverlayRenderOut {
@@ -758,7 +758,7 @@ impl CodeTuiApp {
             .map(|i| i.name.as_str())
         {
             Line::from(Span::styled(
-                format!("Delete “{name}”?  ^D confirm · Esc cancel"),
+                format!("Delete “{name}”?  Ctrl+D confirm · Esc cancel"),
                 Style::default().fg(WARNING()).add_modifier(Modifier::BOLD),
             ))
         } else {
@@ -769,7 +769,7 @@ impl CodeTuiApp {
             frame,
             area,
             "Skills",
-            count_badge(state.adding.is_none(), enabled, state.items.len(), "esc"),
+            count_badge(state.adding.is_none(), enabled, state.items.len(), "Esc"),
         );
         if inner.height == 0 {
             return OverlayRenderOut::default();
@@ -813,7 +813,7 @@ impl CodeTuiApp {
             footer = vec![("Enter", "save"), ("Esc", "cancel")];
         } else if state.items.is_empty() {
             rows.push(Line::from(Span::styled(
-                "No skills yet — add one with ^A, or drop a <name>/SKILL.md folder in:",
+                "No skills yet — add one with Ctrl+A, or drop a <name>/SKILL.md folder in:",
                 Style::default().fg(MUTED()),
             )));
             for path in [
@@ -827,7 +827,7 @@ impl CodeTuiApp {
                     Style::default().fg(FAINT()),
                 )));
             }
-            footer = vec![("^A", "add"), ("Esc", "close")];
+            footer = vec![("Ctrl+A", "add"), ("Esc", "close")];
         } else if filtered.is_empty() {
             rows.push(Line::from(Span::styled(
                 format!("No skills match “{}”", state.query),
@@ -864,8 +864,8 @@ impl CodeTuiApp {
                 ("↑↓", "move"),
                 ("Space", "toggle"),
                 ("Tab", "view"),
-                ("^A", "add"),
-                ("^D", "remove"),
+                ("Ctrl+A", "add"),
+                ("Ctrl+D", "remove"),
             ];
         }
 
@@ -978,7 +978,7 @@ impl CodeTuiApp {
                 frame,
                 area,
                 "Install skills",
-                Some(("esc back".to_string(), MUTED())),
+                Some(("Esc back".to_string(), MUTED())),
             );
             if inner.height == 0 {
                 return OverlayRenderOut {
@@ -1002,11 +1002,11 @@ impl CodeTuiApp {
         let filtered = state.filtered_indices();
         let marked = state.items.iter().filter(|i| i.checked).count();
         let badge = if state.items.is_empty() {
-            ("esc".to_string(), MUTED())
+            ("Esc".to_string(), MUTED())
         } else {
             let color = if marked > 0 { ASSISTANT() } else { MUTED() };
             (
-                format!("{marked}/{} marked · esc", state.items.len()),
+                format!("{marked}/{} marked · Esc", state.items.len()),
                 color,
             )
         };
@@ -1111,7 +1111,7 @@ impl CodeTuiApp {
                 ("Space", "mark"),
                 ("Enter", "install"),
                 ("Esc", "cancel"),
-                ("^A", "all"),
+                ("Ctrl+A", "all"),
                 ("Tab", "view"),
             ];
         }
@@ -1214,7 +1214,7 @@ impl CodeTuiApp {
             frame,
             area,
             "Config",
-            Some(("remembered · esc".to_string(), MUTED())),
+            Some(("remembered · Esc".to_string(), MUTED())),
         );
         if inner.height == 0 {
             return OverlayRenderOut::default();
@@ -1481,7 +1481,7 @@ impl CodeTuiApp {
             area,
             ToggleListView {
                 title: &title,
-                badge: count_badge(true, on, state.items.len(), "esc back"),
+                badge: count_badge(true, on, state.items.len(), "Esc back"),
                 input_line,
                 rows,
                 selected_pos,
@@ -1507,7 +1507,7 @@ impl CodeTuiApp {
         let filtered = state.filtered_indices();
         if filtered.is_empty() {
             rows.push(Line::from(Span::styled(
-                format!("No servers match \"{}\".", state.query),
+                format!("No servers match “{}”", state.query),
                 Style::default().fg(MUTED()),
             )));
         }
@@ -1549,9 +1549,9 @@ impl CodeTuiApp {
                         "{marked}/{} marked · {}",
                         state.items.len(),
                         if state.parent.is_some() {
-                            "esc back"
+                            "Esc back"
                         } else {
-                            "esc"
+                            "Esc"
                         },
                     ),
                     if marked > 0 { ACCENT() } else { MUTED() },
@@ -1563,7 +1563,7 @@ impl CodeTuiApp {
                 footer: vec![
                     ("↑↓", "move"),
                     ("Space", "mark"),
-                    ("^A", "all"),
+                    ("Ctrl+A", "all"),
                     ("Enter", "add"),
                 ],
             },
@@ -1589,7 +1589,7 @@ impl CodeTuiApp {
                 frame,
                 area,
                 "Agents",
-                Some(("esc back".to_string(), MUTED())),
+                Some(("Esc back".to_string(), MUTED())),
             );
             if inner.height == 0 {
                 return OverlayRenderOut {
@@ -1617,14 +1617,14 @@ impl CodeTuiApp {
             .map(|i| i.name.as_str())
         {
             Line::from(Span::styled(
-                format!("Delete \u{201c}{name}\u{201d}?  ^D confirm \u{b7} Esc cancel"),
+                format!("Delete \u{201c}{name}\u{201d}?  Ctrl+D confirm \u{b7} Esc cancel"),
                 Style::default().fg(WARNING()).add_modifier(Modifier::BOLD),
             ))
         } else {
             search_input_line(&state.query, "filter sub-agents")
         };
 
-        let inner = overlay_shell(frame, area, "Agents", Some(("esc".to_string(), MUTED())));
+        let inner = overlay_shell(frame, area, "Agents", Some(("Esc".to_string(), MUTED())));
         if inner.height == 0 {
             return OverlayRenderOut::default();
         }
@@ -1707,7 +1707,7 @@ impl CodeTuiApp {
             footer = vec![
                 ("\u{2191}\u{2193}", "move"),
                 ("Tab", "view"),
-                ("^D", "remove"),
+                ("Ctrl+D", "remove"),
             ];
         }
 
@@ -1862,7 +1862,7 @@ impl CodeTuiApp {
                 frame,
                 area,
                 "MCP servers",
-                Some(("esc back".to_string(), MUTED())),
+                Some(("Esc back".to_string(), MUTED())),
             );
             if inner.height == 0 {
                 return OverlayRenderOut {
@@ -1894,7 +1894,7 @@ impl CodeTuiApp {
             .map(|i| i.name.as_str())
         {
             Line::from(Span::styled(
-                format!("Delete “{name}”?  ^D confirm · Esc cancel"),
+                format!("Delete “{name}”?  Ctrl+D confirm · Esc cancel"),
                 Style::default().fg(WARNING()).add_modifier(Modifier::BOLD),
             ))
         } else {
@@ -1905,7 +1905,7 @@ impl CodeTuiApp {
             frame,
             area,
             "MCP servers",
-            count_badge(state.adding.is_none(), on, state.items.len(), "esc"),
+            count_badge(state.adding.is_none(), on, state.items.len(), "Esc"),
         );
         if inner.height == 0 {
             return OverlayRenderOut::default();
@@ -1945,7 +1945,7 @@ impl CodeTuiApp {
             footer = vec![("Enter", "save"), ("Esc", "cancel")];
         } else if state.items.is_empty() {
             rows.push(Line::from(Span::styled(
-                "No servers yet — add one with ^A, or drop an \"mcpServers\" entry in:",
+                "No servers yet — add one with Ctrl+A, or drop an \"mcpServers\" entry in:",
                 Style::default().fg(MUTED()),
             )));
             for path in ["~/.config/aivo/mcp.json", ".mcp.json"] {
@@ -1954,7 +1954,7 @@ impl CodeTuiApp {
                     Style::default().fg(FAINT()),
                 )));
             }
-            footer = vec![("^A", "add"), ("Esc", "close")];
+            footer = vec![("Ctrl+A", "add"), ("Esc", "close")];
         } else if filtered.is_empty() {
             rows.push(Line::from(Span::styled(
                 format!("No servers match “{}”", state.query),
@@ -1986,8 +1986,8 @@ impl CodeTuiApp {
                 ("↑↓", "move"),
                 ("Space", "toggle"),
                 ("Tab", "view"),
-                ("^A", "add"),
-                ("^D", "rm"),
+                ("Ctrl+A", "add"),
+                ("Ctrl+D", "rm"),
                 ("^O", "auth"),
                 ("^X", "logout"),
                 ("^R", "retry"),
@@ -2769,10 +2769,10 @@ fn add_input_line(buffer: &str) -> Line<'static> {
     ])
 }
 
-/// Top-border badge for a toggle list: `on/total on · esc`; the esc hint alone
-/// when empty, `None` while adding. The esc affordance lives in the badge so
-/// every modal names its dismiss key in the same corner; `esc` is "esc back"
-/// for sub-modals that restore a parent.
+/// Top-border badge for a toggle list: `on/total on · Esc`; the Esc hint alone
+/// when empty, `None` while adding. The Esc affordance lives in the badge so
+/// every modal names its dismiss key in the same corner; sub-modals that restore
+/// a parent use `Esc back`.
 fn count_badge(show: bool, on: usize, total: usize, esc: &str) -> Option<(String, Color)> {
     if !show {
         return None;
@@ -2816,10 +2816,7 @@ const HELP_COMMAND_GROUPS: &[(&str, &[&str])] = &[
         ],
     ),
     ("Model & key", &["model", "key"]),
-    (
-        "Context",
-        &["attach", "detach", "compact", "context", "memory"],
-    ),
+    ("Context", &["attach", "compact", "context", "memory"]),
     (
         "Skills & tools",
         &["skills", "create-skill", "agents", "mcp"],

@@ -366,14 +366,20 @@ pub(super) const QUEUE_PANEL_MAX_ROWS: usize = 5;
 // above the divider, so the welcome screen's last line keeps the same single
 // blank gap above the prompt as a live conversation does (not a doubled gap).
 pub(super) const EMPTY_STATE_BOTTOM_GAP: u16 = 0;
-/// Rotating welcome-banner hints. Keep each terse; name a real affordance.
-pub(super) const WELCOME_TIPS: &[&str] = &[
+/// First-run welcome tips. A fresh session cycles only these so the first
+/// screen teaches `/help` and mode-switching, not power-user shortcuts.
+pub(super) const WELCOME_STARTER_TIPS: &[&str] = &[
+    "/help lists commands and keybindings",
+    "Shift+Tab cycles mode: normal → auto-approve → plan → review",
+    "Ctrl+R reopens a past session",
+];
+/// After the first message, the intro banner shows one of these instead
+/// (frozen — rotation only runs on the empty welcome screen).
+pub(super) const WELCOME_ADVANCED_TIPS: &[&str] = &[
     "start a line with ! to run a shell command",
-    "Shift+Tab cycles mode: normal → auto → plan → review",
     "/rewind undoes the agent's file edits",
     "/goal <task> keeps working on its own until it's done",
     "Esc interrupts the agent mid-turn — in /goal mode, press Esc twice",
-    "Ctrl+R reopens a past session",
     "/share creates a live web link to this session",
     "/effort changes how hard the model thinks",
     "/skills and /mcp manage the agent's extra tools",
@@ -387,6 +393,15 @@ pub(super) const WELCOME_TIPS: &[&str] = &[
     "type while the agent works to queue your next message",
     "/new starts a fresh session, keeping your keys",
 ];
+
+pub(super) fn welcome_tips_for(empty_transcript: bool) -> &'static [&'static str] {
+    if empty_transcript {
+        WELCOME_STARTER_TIPS
+    } else {
+        WELCOME_ADVANCED_TIPS
+    }
+}
+
 // In-box `❯ ` prompt flush to the border (matching the zero vertical padding),
 // with a 1-cell gap to the text.
 pub(super) const COMPOSER_PREFIX_WIDTH: u16 = 2;
@@ -511,7 +526,7 @@ pub(super) const SLASH_COMMANDS: &[SlashCommandSpec] = &[
     SlashCommandSpec {
         name: "exit",
         help_label: "/exit",
-        description: "leave the session",
+        description: "quit this session",
         takes_argument: false,
     },
     SlashCommandSpec {
@@ -541,7 +556,7 @@ pub(super) const SLASH_COMMANDS: &[SlashCommandSpec] = &[
     SlashCommandSpec {
         name: "copy",
         help_label: "/copy [n]",
-        description: "copy the latest reply (or Nth) to the clipboard",
+        description: "copy a past reply to the clipboard",
         takes_argument: true,
     },
     SlashCommandSpec {
@@ -553,7 +568,7 @@ pub(super) const SLASH_COMMANDS: &[SlashCommandSpec] = &[
     SlashCommandSpec {
         name: "agents",
         help_label: "/agents [rm <name>]",
-        description: "list or remove named sub-agents (ask in chat to create one)",
+        description: "list or remove named sub-agents",
         takes_argument: true,
     },
     SlashCommandSpec {
@@ -571,19 +586,19 @@ pub(super) const SLASH_COMMANDS: &[SlashCommandSpec] = &[
     SlashCommandSpec {
         name: "goal",
         help_label: "/goal <objective>",
-        description: "work autonomously toward a goal until done (project tests run after edits, when detected)",
+        description: "work until the goal is done",
         takes_argument: true,
     },
     SlashCommandSpec {
         name: "plan",
         help_label: "/plan [objective]",
-        description: "plan mode: investigate read-only, then approve the plan to execute it (go [-y] / save [file] / resume [file] / stop)",
+        description: "plan read-only, then build",
         takes_argument: true,
     },
     SlashCommandSpec {
         name: "rewind",
         help_label: "/rewind",
-        description: "rewind to an earlier turn (reverts file edits)",
+        description: "undo the agent's file edits",
         takes_argument: false,
     },
     SlashCommandSpec {
@@ -595,13 +610,13 @@ pub(super) const SLASH_COMMANDS: &[SlashCommandSpec] = &[
     SlashCommandSpec {
         name: "compact",
         help_label: "/compact [fast]",
-        description: "compact context now (fast = clear stale output, no model call)",
+        description: "summarize older turns to free context",
         takes_argument: true,
     },
     SlashCommandSpec {
         name: "context",
         help_label: "/context",
-        description: "break down what's filling the context window this session",
+        description: "what's filling the context window",
         takes_argument: false,
     },
     SlashCommandSpec {
@@ -613,7 +628,7 @@ pub(super) const SLASH_COMMANDS: &[SlashCommandSpec] = &[
     SlashCommandSpec {
         name: "memory",
         help_label: "/memory [dream]",
-        description: "show persistent memory (facts saved via `remember`); `dream` consolidates it now",
+        description: "show facts the agent has remembered",
         takes_argument: true,
     },
     SlashCommandSpec {
@@ -625,7 +640,7 @@ pub(super) const SLASH_COMMANDS: &[SlashCommandSpec] = &[
     SlashCommandSpec {
         name: "share",
         help_label: "/share [stop]",
-        description: "share this session to a viewer URL (stop to end)",
+        description: "share a live viewer link",
         takes_argument: true,
     },
     // aivo-provider only — hidden on BYOK keys (see `slash_command_visible`).
@@ -650,7 +665,7 @@ pub(super) const SLASH_COMMANDS: &[SlashCommandSpec] = &[
     SlashCommandSpec {
         name: "help",
         help_label: "/help",
-        description: "open help",
+        description: "show commands and keybindings",
         takes_argument: false,
     },
 ];
@@ -2999,7 +3014,7 @@ pub(super) struct CodeTuiApp {
     pub(super) last_subagents: Vec<crate::agent::subagents::Subagent>,
     /// Enabled MCP servers for the welcome chip; refreshed on `/mcp` changes.
     pub(super) mcp_configured_count: usize,
-    /// The [`WELCOME_TIPS`] entry showing now; advanced by `tick_welcome_tip`.
+    /// The welcome-tip entry showing now; advanced by `tick_welcome_tip`.
     pub(super) welcome_tip_index: usize,
     /// When the current tip was shown; `None` off the welcome screen so it restarts
     /// with a full interval on return.

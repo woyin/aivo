@@ -179,9 +179,14 @@ impl CodeTuiApp {
             .filter(|server| !disabled_mcp.contains(&server.name))
             .count();
         // Seed the rotating tip from the wall clock so it varies between launches.
+        let welcome_tips = if params.initial_history.is_empty() {
+            WELCOME_STARTER_TIPS
+        } else {
+            WELCOME_ADVANCED_TIPS
+        };
         let welcome_tip_index = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .map(|elapsed| elapsed.as_secs() as usize % WELCOME_TIPS.len())
+            .map(|elapsed| elapsed.as_secs() as usize % welcome_tips.len())
             .unwrap_or(0);
         // Job logs under the session's artifacts dir; re-rooted on `/new`/resume.
         let jobs = crate::agent::jobs::JobTable::new(Some(

@@ -1449,7 +1449,7 @@ fn test_skills_overlay_narrow_keeps_single_pane_and_drill_in() {
     terminal.draw(|frame| app.render(frame)).unwrap();
     let screen = test_screen(&terminal);
     assert!(
-        screen.contains("Instructions:") && screen.contains("esc back"),
+        screen.contains("Instructions:") && screen.contains("Esc back"),
         "narrow drill-in should render full-modal:\n{screen}"
     );
 }
@@ -1517,7 +1517,7 @@ fn test_skill_drill_in_renders_body_and_path() {
         "detail missing the SKILL.md body:\n{screen}"
     );
     assert!(
-        screen.contains("esc back"),
+        screen.contains("Esc back"),
         "detail missing back hint:\n{screen}"
     );
 }

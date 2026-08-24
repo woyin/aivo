@@ -227,10 +227,10 @@ pub(super) fn render_command_menu_rows(
     if menu.entries.is_empty() {
         return vec![Line::from(Span::styled(
             match menu.kind {
-                MenuKind::Commands => "No matching command",
-                MenuKind::AttachPath => "No matching path",
-                MenuKind::Effort => "No matching effort level",
-                MenuKind::Mention => "No matching sub-agent",
+                MenuKind::Commands => "No matching command — keep typing or Esc",
+                MenuKind::AttachPath => "No matching path — keep typing or Esc",
+                MenuKind::Effort => "No matching effort level — keep typing or Esc",
+                MenuKind::Mention => "No matching sub-agent — keep typing or Esc",
             },
             Style::default().fg(MUTED()),
         ))];
@@ -474,9 +474,9 @@ pub(super) fn render_session_picker_rows(
     let filtered = picker.filtered_items();
     if filtered.is_empty() || max_rows == 0 {
         let msg = if picker.items.is_empty() {
-            "No saved sessions yet"
+            "No saved sessions yet — send a message to start one"
         } else {
-            "No matches"
+            "No matches — keep typing or Esc"
         };
         return (
             vec![Line::from(Span::styled(msg, Style::default().fg(MUTED())))],

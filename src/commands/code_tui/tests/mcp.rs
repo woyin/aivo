@@ -843,7 +843,7 @@ fn test_mcp_drill_in_renders_command_and_footer() {
         "detail missing the command value:\n{screen}"
     );
     assert!(
-        screen.contains("esc back"),
+        screen.contains("Esc back"),
         "detail missing back hint:\n{screen}"
     );
 }

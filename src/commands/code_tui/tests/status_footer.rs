@@ -222,11 +222,14 @@ fn test_welcome_tip_wraps_whole_on_narrow_terminals() {
     // empty-state pane must size to the wrapped rows, not clip the tail.
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let mut app = make_test_app(tx, rx);
-    app.welcome_tip_index = 0; // "start a line with ! to run a shell command"
+    app.welcome_tip_index = 0; // "/help lists commands and keybindings"
 
     let (screen, _) = render_full_screen(&mut app, 36, 22);
     assert!(screen.contains("✻ Tip"), "tip line missing:\n{screen}");
-    assert!(screen.contains("command"), "tip tail clipped:\n{screen}");
+    assert!(
+        screen.contains("keybindings"),
+        "tip tail clipped:\n{screen}"
+    );
     assert!(
         !screen.contains("/help commands"),
         "essentials line should be gone:\n{screen}"
@@ -243,11 +246,11 @@ fn test_composer_rule_drops_cycle_hint_when_narrow() {
         line.spans.iter().map(|s| s.content.as_ref()).collect()
     }
     // Wide: badge + keybinding hint inset on the rule.
-    assert!(plain(app.composer_rule_line(80)).contains("↯ auto-approve (shift+tab)"));
+    assert!(plain(app.composer_rule_line(80)).contains("↯ auto-approve (Shift+Tab)"));
     // Phone-width: the hint goes first; the badge stays inset on the rule.
     let narrow = plain(app.composer_rule_line(44));
     assert!(narrow.contains("↯ auto-approve"), "narrow rule: {narrow:?}");
-    assert!(!narrow.contains("shift+tab"), "narrow rule: {narrow:?}");
+    assert!(!narrow.contains("Shift+Tab"), "narrow rule: {narrow:?}");
     assert!(narrow.starts_with('─'), "still reads as a rule: {narrow:?}");
     // Too narrow even for that: the bare badge.
     assert_eq!(plain(app.composer_rule_line(18)), "↯ auto-approve");
@@ -1225,7 +1228,7 @@ fn test_welcome_shows_capability_chip_and_tip() {
         skill_command("release", "Cut a release"),
     ];
     app.mcp_configured_count = 1;
-    app.welcome_tip_index = 0; // "start a line with ! to run a shell command"
+    app.welcome_tip_index = 0; // "/help lists commands and keybindings"
 
     let (screen, _) = render_full_screen(&mut app, 90, 24);
     assert!(
@@ -1237,7 +1240,7 @@ fn test_welcome_shows_capability_chip_and_tip() {
         "missing tip label + glyph:\n{screen}"
     );
     assert!(
-        screen.contains(WELCOME_TIPS[0]),
+        screen.contains(WELCOME_STARTER_TIPS[0]),
         "missing tip text:\n{screen}"
     );
     // The bare "Ready" filler is gone.
@@ -1410,7 +1413,7 @@ fn test_footer_is_single_status_row() {
         "auto badge on composer rule"
     );
     assert!(
-        full_screen(|a| a.agent_auto_approve = false).contains("normal (shift+tab)"),
+        full_screen(|a| a.agent_auto_approve = false).contains("normal (Shift+Tab)"),
         "normal mode shown on composer rule (discoverable)"
     );
     assert!(

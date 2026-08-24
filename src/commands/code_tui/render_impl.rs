@@ -1915,10 +1915,10 @@ impl CodeTuiApp {
             account_keys_line(&[
                 ("y", ASSISTANT(), "continue"),
                 ("n", ERROR(), "discard"),
-                ("esc", WARNING(), "later (/plan resume)"),
+                ("Esc", WARNING(), "later (/plan resume)"),
             ])
         } else {
-            let mut keys = account_keys_line(&[("esc", WARNING(), "later")]);
+            let mut keys = account_keys_line(&[("Esc", WARNING(), "later")]);
             keys.spans.push(Span::styled(
                 "    y/n type into your message — sending it keeps the plan for /plan resume",
                 Style::default().fg(MUTED()),
@@ -2814,7 +2814,7 @@ impl CodeTuiApp {
         } else {
             ("normal", Style::default().fg(MUTED()))
         };
-        const CYCLE_HINT: &str = " (shift+tab)";
+        const CYCLE_HINT: &str = " (Shift+Tab)";
         // Left title: `History {pos}/{total}` while recalling input (counts down
         // as you scroll back), else a live `/goal` step indicator so an
         // unattended loop stays visible. Never both in one frame.
@@ -3028,7 +3028,7 @@ impl CodeTuiApp {
         }
         if selected.is_some() {
             lines.push(Line::from(Span::styled(
-                "  enter edit · ctrl+d remove · alt+↑↓ move · esc back",
+                "  Enter edit · Ctrl+D remove · Alt+↑↓ move · Esc back",
                 Style::default().fg(FAINT()),
             )));
         }
@@ -3341,7 +3341,7 @@ impl CodeTuiApp {
                 Span::styled(chip, Style::default().fg(MUTED())),
             ]));
         }
-        let tip = WELCOME_TIPS[self.welcome_tip_index % WELCOME_TIPS.len()];
+        let tip = self.current_welcome_tip();
         lines.push(line_with_plain(vec![
             // MUTED hint (up from FAINT) so the tip reads on dim terminals.
             Span::styled("✻ Tip  ", Style::default().fg(ACCENT())),
@@ -3966,7 +3966,7 @@ fn permission_keys_line(tool: &str, once_only: bool, composing: bool) -> Line<'s
             keycap("⇧⇥", WARNING()),
             label(" allow"),
             gap(),
-            keycap("esc", ERROR()),
+            keycap("Esc", ERROR()),
             label(" deny"),
             gap(),
             label("y/a/n type into your message"),
@@ -4006,7 +4006,7 @@ fn ask_user_keys_line(allow_free_text: bool, multi_select: bool) -> Line<'static
     let mut spans = vec![keycap("↑↓"), label(" move")];
     if multi_select {
         spans.push(gap());
-        spans.push(keycap("space"));
+        spans.push(keycap("Space"));
         spans.push(label(" toggle"));
         spans.push(gap());
         spans.push(keycap("↵"));
@@ -4021,7 +4021,7 @@ fn ask_user_keys_line(allow_free_text: bool, multi_select: bool) -> Line<'static
         }
     }
     spans.push(gap());
-    spans.push(keycap("esc"));
+    spans.push(keycap("Esc"));
     spans.push(label(" dismiss"));
     Line::from(spans)
 }
@@ -4048,7 +4048,7 @@ fn plan_approval_keys_line() -> Line<'static> {
         gap(),
         label("type feedback"),
         gap(),
-        keycap("esc"),
+        keycap("Esc"),
         label(" dismiss"),
     ])
 }
@@ -4073,7 +4073,7 @@ fn review_keys_line() -> Line<'static> {
         keycap("↑↓"),
         label(" scroll"),
         gap(),
-        keycap("esc"),
+        keycap("Esc"),
         label(" reject"),
     ])
 }

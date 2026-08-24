@@ -558,7 +558,7 @@ fn test_queued_panel_rows_render_with_cap_and_more() {
     assert!(!screen.contains("· q6"), "{screen}");
     assert!(screen.contains("… +2 more"), "{screen}");
     assert!(
-        !screen.contains("enter edit"),
+        !screen.contains("Enter edit"),
         "no hint unfocused:\n{screen}"
     );
 
@@ -567,7 +567,7 @@ fn test_queued_panel_rows_render_with_cap_and_more() {
     let (screen, _rows) = render_full_screen(&mut app, 70, 20);
     assert!(screen.contains("▸ · q7"), "{screen}");
     assert!(screen.contains("… +2 earlier"), "{screen}");
-    assert!(screen.contains("enter edit · ctrl+d remove"), "{screen}");
+    assert!(screen.contains("Enter edit · Ctrl+D remove"), "{screen}");
 }
 
 #[test]

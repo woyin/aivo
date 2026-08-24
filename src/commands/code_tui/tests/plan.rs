@@ -709,12 +709,12 @@ async fn test_plan_badge_on_composer_rule() {
     assert!(!plain(&off).contains("plan"));
     assert!(plain(&off).contains("normal"), "normal mode shown");
     // Every mode carries the cycle hint.
-    assert!(plain(&off).contains("(shift+tab)"));
+    assert!(plain(&off).contains("(Shift+Tab)"));
 
     app.plan_mode = true;
     let on = app.composer_rule_line(80);
     assert!(plain(&on).contains("◇ plan"));
-    assert!(plain(&on).contains("(shift+tab)"));
+    assert!(plain(&on).contains("(Shift+Tab)"));
     // The rule dashes tint ACCENT in plan mode (FAINT otherwise).
     let dash_color = |line: &ratatui::text::Line<'_>| {
         line.spans

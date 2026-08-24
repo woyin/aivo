@@ -421,7 +421,7 @@ fn test_render_command_menu_rows_shows_empty_state() {
     };
     let lines = render_command_menu_rows(&menu, 32);
     let plain = plain_text_from_spans(&lines[0].spans);
-    assert_eq!(plain, "No matching command");
+    assert_eq!(plain, "No matching command — keep typing or Esc");
 }
 
 #[test]

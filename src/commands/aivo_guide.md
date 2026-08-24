@@ -20,7 +20,7 @@ Global options: `-h/--help`, `--help-json` (full command tree as JSON), `-v/--ve
 | Shortcut | Expands to | Notes |
 | --- | --- | --- |
 | `aivo <tool>` | `aivo run <tool>` | `claude`, `codex`, `gemini`, `opencode`, `pi`, `grok`, … |
-| `aivo <prompt>` | `aivo code -p <prompt>` | a bare string / piped stdin runs a one-shot prompt |
+| `aivo <prompt>` | `aivo code -p <prompt>` | quoted text with a space, or piped stdin; a single lowercase word is a command. TUI: `aivo code "<prompt>"` |
 | `aivo hf:… ` / `aivo https://…` | `aivo code <ref>` | open code on a local HuggingFace GGUF |
 | `aivo use` | `aivo keys use` | switch active key |
 | `aivo ping` | `aivo keys ping` | health-check keys |
@@ -192,7 +192,7 @@ Type `/help` for the full list. Slash commands:
 
 - Session: `/new`, `/resume [query]`, `/rewind` (undo edits), `/copy [n]`, `/config`, `/share [stop]`, `/help`, `/exit`
 - Model & key: `/model [name]`, `/key [id|name]`, `/effort [level]`
-- Context: `/attach <path>`, `/detach <n>`, `/compact [fast]`
+- Context: `/attach <path>`, `/compact [fast]`, `/context`, `/memory`
 - Skills & tools: `/skills`, `/create-skill`, `/mcp` (CLI twins: `aivo code skills`, `aivo code mcp`)
 - Autonomous: `/plan <objective>`, `/goal <objective>`
 

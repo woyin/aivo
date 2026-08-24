@@ -356,13 +356,13 @@ pub async fn run() -> ! {
                     eprintln!(
                         "  {}",
                         style::dim(
-                            "Expected a subcommand (mcp, skills), a model ref (`hf:<owner>/<repo>` or `https://huggingface.co/...`), or text to open the TUI with."
+                            "Expected a subcommand (mcp, skills), a model ref (`hf:<owner>/<repo>` or `https://huggingface.co/...`), or quoted text to send as the first TUI message."
                         ),
                     );
                     eprintln!(
                         "  {}",
                         style::dim(
-                            "A bare word reads as a subcommand — use -e \"...\" (agent), -p \"...\" (plain reply), or `aivo \"...\"` to open the TUI."
+                            "A bare word reads as a subcommand — use -e \"...\" (agent), -p \"...\" (plain reply), or `aivo code \"...\"` to open the TUI."
                         ),
                     );
                     process::exit(ExitCode::UserError.code());
@@ -1123,12 +1123,19 @@ fn print_help() {
     print_cmd("stats", "Show usage statistics");
     print_cmd("plugins", "Install, list, or remove plugins");
     print_cmd("update", "Update to the latest version");
+    print_cmd("guide", "Print the built-in usage guide");
     println!();
 
     println!("{}", style::bold("Shortcuts:"));
     let shortcuts: &[(&str, &str, &str)] = &[
         ("use", "keys use", "aivo keys use --help"),
+        ("ping", "keys ping", "aivo keys ping --help"),
         ("share", "logs share", "aivo logs share --help"),
+        (
+            "\"text\"",
+            "code -p",
+            "one-shot reply (must contain a space)",
+        ),
         ("hf:/url", "code <ref>", "open code with a local HF model"),
         (
             "key::model",
@@ -1152,6 +1159,7 @@ fn print_help() {
 
     println!("{}", style::bold("Examples:"));
     for cmd in [
+        "aivo code",
         "aivo \"tell me a short story\"",
         "aivo pi -k openrouter",
         "git diff | aivo \"summarize changes\"",
