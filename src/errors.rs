@@ -159,7 +159,7 @@ impl fmt::Display for CLIError {
             write!(f, "\n  {}", details)?;
         }
         if let Some(ref suggestion) = self.suggestion {
-            write!(f, "\n  Suggestion: {}", suggestion)?;
+            write!(f, "\n  {}", suggestion)?;
         }
         Ok(())
     }
@@ -203,6 +203,10 @@ mod tests {
         assert!(display.contains("Key not found"));
         assert!(display.contains("No key matching 'foo' was found"));
         assert!(display.contains("Run 'aivo keys'"));
+        assert!(
+            !display.contains("Suggestion:"),
+            "next-step line is unlabeled: {display}"
+        );
     }
 
     #[test]

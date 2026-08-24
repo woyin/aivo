@@ -667,7 +667,7 @@ pub(super) fn parse_slash_command(input: &str) -> Result<SlashCommand> {
         "usage" => Ok(SlashCommand::Usage),
         "help" => Ok(SlashCommand::Help),
         "" => anyhow::bail!("Type a command after '/'"),
-        other => anyhow::bail!("Unknown command '/{other}'"),
+        other => anyhow::bail!("Unknown command '/{other}' — /help lists commands"),
     }
 }
 

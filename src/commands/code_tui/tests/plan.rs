@@ -558,9 +558,7 @@ async fn test_cursor_plan_auto_continue_guards() {
     assert!(!app.sending);
 }
 
-/// Shift+Tab cycles the agent mode Claude Code-style: default → auto → plan →
-/// review → default, with the modes mutually exclusive. Mid-turn the plan step
-/// is skipped (the engine can't be restricted while a turn holds it).
+/// Shift+Tab: default → auto → review. Plan is `/plan`; leaving it lands on default.
 #[tokio::test]
 async fn test_shift_tab_cycles_agent_modes() {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
@@ -574,45 +572,43 @@ async fn test_shift_tab_cycles_agent_modes() {
     };
     assert_eq!(mode(&app), (false, false, false), "starts in default");
 
-    // default → auto.
     app.cycle_agent_mode().await;
     assert_eq!(mode(&app), (true, false, false));
 
-    // auto → plan (auto forced off: exclusive).
     app.cycle_agent_mode().await;
-    assert_eq!(mode(&app), (false, true, false), "auto cycles into plan");
-    assert!(
-        !app.auto_approve_flag
-            .load(std::sync::atomic::Ordering::Relaxed)
-    );
-
-    // plan → review (the drafted plan would survive; here there is none).
-    app.cycle_agent_mode().await;
-    assert_eq!(mode(&app), (false, false, true), "plan cycles into review");
+    assert_eq!(mode(&app), (false, false, true), "auto cycles into review");
     assert!(
         app.review_edits_flag
             .load(std::sync::atomic::Ordering::Relaxed),
         "live review flag follows"
     );
+    assert!(
+        !app.auto_approve_flag
+            .load(std::sync::atomic::Ordering::Relaxed)
+    );
 
-    // review → default.
     app.cycle_agent_mode().await;
     assert_eq!(mode(&app), (false, false, false), "full circle");
 
-    // Mid-turn: auto → review directly — plan entry is skipped while sending.
-    app.cycle_agent_mode().await; // default → auto
+    app.cycle_agent_mode().await;
     app.sending = true;
     app.cycle_agent_mode().await;
-    assert_eq!(mode(&app), (false, false, true), "plan is skipped mid-turn");
-    app.cycle_agent_mode().await; // review → default
+    assert_eq!(
+        mode(&app),
+        (false, false, true),
+        "auto still cycles into review mid-turn"
+    );
+    app.cycle_agent_mode().await;
     app.sending = false;
 
-    // Leaving plan mid-turn defers the engine restore (badge flips now).
     app.plan_mode = true;
     app.sending = true;
     app.cycle_agent_mode().await;
     assert!(!app.plan_mode);
-    assert!(app.agent_review_edits, "plan still cycles into review");
+    assert!(
+        !app.agent_review_edits && !app.agent_auto_approve,
+        "leaving plan lands on default"
+    );
     assert!(app.plan_exit_pending, "engine restore deferred to turn end");
 }
 
@@ -787,7 +783,6 @@ async fn test_shift_tab_cycles_modes_through_handle_key() {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let mut app = make_test_app(tx, rx);
     assert!(!app.agent_auto_approve && !app.plan_mode);
-    // Shift+Tab arrives as BackTab — normal → auto-approve.
     app.handle_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::NONE))
         .await
         .unwrap();
@@ -795,29 +790,22 @@ async fn test_shift_tab_cycles_modes_through_handle_key() {
         app.agent_auto_approve,
         "Shift+Tab should enable auto-approve"
     );
-    // The shared LIVE flag the running agent turn reads tracks the mode.
     assert!(
         app.auto_approve_flag
             .load(std::sync::atomic::Ordering::Relaxed),
         "live flag follows auto-approve ON"
     );
-    // The Tab+SHIFT form some terminals send — auto-approve → plan mode.
     app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::SHIFT))
         .await
         .unwrap();
-    assert!(app.plan_mode, "second press cycles into plan mode");
+    assert!(app.agent_review_edits, "second press cycles into review");
     assert!(!app.agent_auto_approve, "modes are mutually exclusive");
+    assert!(!app.plan_mode, "plan is not in the Shift+Tab ring");
     assert!(
         !app.auto_approve_flag
             .load(std::sync::atomic::Ordering::Relaxed),
         "live flag follows auto-approve OFF"
     );
-    // Third press — plan → review.
-    app.handle_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::NONE))
-        .await
-        .unwrap();
-    assert!(!app.plan_mode && app.agent_review_edits);
-    // Fourth press — review → default.
     app.handle_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::NONE))
         .await
         .unwrap();

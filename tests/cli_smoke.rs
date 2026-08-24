@@ -104,6 +104,52 @@ fn version_and_help_work_without_config() {
     assert!(help.contains("aivo"));
     assert!(help.contains("keys"));
     assert!(help.contains("run"));
+    assert!(help.contains("Get started"), "help:\n{help}");
+    assert!(help.contains("aivo code"), "help:\n{help}");
+}
+
+#[test]
+fn unknown_bare_word_points_at_oneshot_and_tui() {
+    let home = TempDir::new().unwrap();
+    let output = aivo(&home)
+        .args(["hello"])
+        .output()
+        .expect("spawn aivo hello");
+    assert!(
+        !output.status.success(),
+        "aivo hello should fail\nstdout:\n{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("unknown command `hello`"),
+        "stderr:\n{stderr}"
+    );
+    assert!(stderr.contains("aivo -p hello"), "stderr:\n{stderr}");
+    assert!(stderr.contains("aivo code"), "stderr:\n{stderr}");
+    assert!(
+        !stderr.contains("unrecognized subcommand"),
+        "must not fall through to clap:\n{stderr}"
+    );
+}
+
+#[test]
+fn nested_unknown_subcommand_keeps_clap_error() {
+    let home = TempDir::new().unwrap();
+    let output = aivo(&home)
+        .args(["account", "frobnicate"])
+        .output()
+        .expect("spawn aivo account frobnicate");
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("unrecognized subcommand"),
+        "clap's own error must survive:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("unknown command `account`"),
+        "intercept must not misfire on a real command:\n{stderr}"
+    );
 }
 
 #[test]

@@ -56,7 +56,7 @@ impl CodeTuiApp {
             self.notice = Some((
                 WARNING(),
                 if self.sending {
-                    "esc stops the agent's turn — Ctrl+C again exits aivo".to_string()
+                    "Esc stops the agent's turn — Ctrl+C again exits aivo".to_string()
                 } else {
                     "Press Ctrl+C again to exit".to_string()
                 },
@@ -675,25 +675,18 @@ impl CodeTuiApp {
         }
     }
 
-    /// Shift+Tab: cycle normal → auto-approve → plan → review → normal. Plan entry
-    /// falls through to review mid-turn (the engine can't be restricted while a
-    /// turn holds it) or when the key lacks the agent.
+    /// Shift+Tab: normal → auto-approve → review. Plan is `/plan`; leaving it lands on normal.
     pub(super) async fn cycle_agent_mode(&mut self) {
         if self.plan_mode {
             self.leave_plan_mode(false).await;
-            self.set_review_quiet(true);
-            self.show_toast("Review mode — approve each edit");
+            self.show_toast("Plan mode off — /plan to start again");
         } else if self.agent_review_edits {
             self.set_review_quiet(false);
             self.show_toast("Normal mode — risky actions ask first");
         } else if self.agent_auto_approve {
             self.set_auto_quiet(false);
-            if !self.sending && self.enter_plan_mode().await {
-                self.show_toast("Plan mode — read-only until you approve");
-            } else {
-                self.set_review_quiet(true);
-                self.show_toast("Review mode — approve each edit");
-            }
+            self.set_review_quiet(true);
+            self.show_toast("Review mode — approve each edit");
         } else {
             self.set_auto_quiet(true);
             self.show_toast("Auto-approve mode — tools run without asking");
@@ -1541,9 +1534,7 @@ impl CodeTuiApp {
             return Ok(Some(false));
         }
 
-        // Shift+Tab cycles the agent mode (normal → auto-approve → plan) —
-        // aligned with Claude Code's Shift+Tab permission-mode cycle. With the
-        // /config overlay open it belongs to the overlay (reverse value cycle).
+        // With /config open, Shift+Tab belongs to the overlay (reverse value cycle).
         if is_auto_approve_toggle(key) && !matches!(self.overlay, Overlay::Config(_)) {
             self.cycle_agent_mode().await;
             return Ok(Some(false));

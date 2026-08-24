@@ -820,14 +820,13 @@ is preserved."
                 "Answers directly, without a thinking block.".to_string()
             }
             (ConfigSetting::Approval, "auto-approve") => {
-                "Tools run unattended. Plan mode is still /plan (or Shift+Tab).".to_string()
+                "Tools run unattended. Plan mode is /plan.".to_string()
             }
             (ConfigSetting::Approval, "review") => {
                 "Approve each edit before it's applied.".to_string()
             }
             (ConfigSetting::Approval, _) => {
-                "Risky actions ask first. Plan mode is /plan (or Shift+Tab), not a standing setting."
-                    .to_string()
+                "Risky actions ask first. Plan mode is /plan, not a standing setting.".to_string()
             }
             (ConfigSetting::UseWebSearch, "on") => {
                 "The agent can search the web through aivo (daily quota).".to_string()
@@ -930,7 +929,6 @@ is preserved."
             ConfigSetting::InlineImages => switch(self.inline_images_enabled),
             ConfigSetting::Thinking => switch(self.thinking_enabled),
             ConfigSetting::Approval => {
-                // Plan mode is transient (via /plan / Shift+Tab), not a standing mode.
                 const OPTIONS: &[&str] = &["normal", "auto-approve", "review"];
                 let label = self.approval_mode_label();
                 ConfigSegments {

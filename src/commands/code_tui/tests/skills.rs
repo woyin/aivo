@@ -66,6 +66,7 @@ fn test_resolve_slash_command_skill_vs_builtin_vs_typo() {
     // An unknown name (not a built-in, not a skill) still errors.
     let err = app.resolve_slash_command("nope").unwrap_err().to_string();
     assert!(err.contains("Unknown command"), "{err}");
+    assert!(err.contains("/help lists commands"), "{err}");
 }
 
 #[test]

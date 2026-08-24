@@ -15,12 +15,20 @@ aivo <command> [options]
 
 Global options: `-h/--help`, `--help-json` (full command tree as JSON), `-v/--version`.
 
+**Get started:**
+
+```bash
+aivo code                     # built-in agent
+aivo claude                   # launch Claude Code (same for codex/gemini/…)
+aivo run                      # pick a tool
+```
+
 **Shortcuts** (bare forms that expand to a subcommand):
 
 | Shortcut | Expands to | Notes |
 | --- | --- | --- |
 | `aivo <tool>` | `aivo run <tool>` | `claude`, `codex`, `gemini`, `opencode`, `pi`, `grok`, … |
-| `aivo <prompt>` | `aivo code -p <prompt>` | quoted text with a space, or piped stdin; a single lowercase word is a command. TUI: `aivo code "<prompt>"` |
+| `aivo <prompt>` | `aivo code -p <prompt>` | quoted text with a space, or piped stdin; a single lowercase word is a command (`aivo hello` → `aivo -p hello` / `aivo code`). TUI: `aivo code "<prompt>"` |
 | `aivo hf:… ` / `aivo https://…` | `aivo code <ref>` | open code on a local HuggingFace GGUF |
 | `aivo use` | `aivo keys use` | switch active key |
 | `aivo ping` | `aivo keys ping` | health-check keys |
@@ -199,7 +207,7 @@ Type `/help` for the full list. Slash commands:
 Other input: `!cmd` runs a local shell command; `//` / `!!` escape to literal text.
 
 Keys: `Enter` send · `Ctrl+J` newline · `Tab` complete · `Ctrl+V` paste text/image ·
-`Ctrl+X Ctrl+E` edit draft in $EDITOR · `Shift+Tab` cycle mode (normal/auto-approve/plan/review) · `Ctrl+R` resume ·
+`Ctrl+X Ctrl+E` edit draft in $EDITOR · `Shift+Tab` cycle mode (normal/auto-approve/review) · `Ctrl+R` resume ·
 `Ctrl+O` pager for a `!cmd` · `Esc` cancel/close · `Ctrl+C` twice to exit.
 
 `/config` toggles: Thinking, Auto-approve tools, aivo web search, Agent tools (off = plain chat,

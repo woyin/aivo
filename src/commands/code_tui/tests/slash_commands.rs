@@ -359,7 +359,8 @@ fn test_notice_spans_splits_live_url_from_indicator() {
 #[test]
 fn test_parse_slash_command_unknown() {
     let err = parse_slash_command("wat").unwrap_err().to_string();
-    assert!(err.contains("Unknown command"));
+    assert!(err.contains("Unknown command"), "{err}");
+    assert!(err.contains("/help lists commands"), "{err}");
 }
 
 /// `/copy 0` is a usage error and out-of-range names the real count, instead of

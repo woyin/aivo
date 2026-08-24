@@ -128,17 +128,17 @@ async fn test_auto_approve_toggle_shows_toast_not_notice() {
         "toggle should flash a toast"
     );
 
-    // The next press cycles into plan mode — same toast-not-notice contract.
     app.handle_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::NONE))
         .await
         .unwrap();
     assert!(!app.agent_auto_approve);
-    assert!(app.plan_mode, "auto cycles into plan mode");
+    assert!(app.agent_review_edits, "auto cycles into review");
+    assert!(!app.plan_mode, "plan is not in the Shift+Tab ring");
     assert!(app.notice.is_none());
     assert!(
         app.toast
             .as_ref()
-            .is_some_and(|t| t.text.contains("Plan mode"))
+            .is_some_and(|t| t.text.contains("Review mode"))
     );
 }
 

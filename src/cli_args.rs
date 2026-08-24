@@ -67,15 +67,9 @@ pub(crate) fn rewrite_cli_args(
         return expand_bundle(&raw_args[0], bundle, &raw_args[2..]);
     }
 
-    // Bare-prompt shortcut: non-flag args interpreted as prompt text.
-    // `aivo hf:Qwen/...` / `aivo https://...` → `aivo code <ref>`
-    // `aivo alt::gpt-4o` / `aivo alt::` → `aivo code <ref>` (key::model)
-    // `aivo "tell me a story"` → `aivo code -p <text>` (one-shot prompt)
-    // A bare `[a-z0-9-]` word is never a prompt: falls through to clap's
-    // "unrecognized subcommand" with did-you-mean. The shell strips quotes,
-    // so `aivo "hello"` is indistinguishable from `aivo hello` and gets
-    // the same treatment; use `-p` to force a one-word prompt.
-    // Embedded whitespace, uppercase, punctuation, or non-ASCII marks a prompt.
+    // Bare prompt: hf:/https:/:: specs → `code <ref>`; anything else that isn't
+    // `[a-z0-9-]` → `code -p`. Bare words fall through so `run.rs` can recover
+    // them (the shell already stripped quotes, so `aivo "hello"` is `aivo hello`).
     let first = raw_args[1].as_str();
     if first.starts_with('-') || is_subcommand_shaped(first) {
         return raw_args;
@@ -94,9 +88,7 @@ pub(crate) fn rewrite_cli_args(
     rewritten
 }
 
-/// True when `s` looks like a subcommand name — only `[a-z0-9-]` chars.
-/// Gates the bare-prompt rewrite: anything with whitespace, uppercase,
-/// punctuation, or non-ASCII can't be a command name and is prompt-shaped.
+/// `[a-z0-9-]`-only — subcommand-shaped, not a bare prompt.
 pub(crate) fn is_subcommand_shaped(s: &str) -> bool {
     !s.is_empty()
         && s.chars()
@@ -1869,11 +1861,6 @@ mod tests {
 
     #[test]
     fn rewrite_bare_word_falls_through_to_clap() {
-        // A bare `[a-z0-9-]` word is never a prompt — short tokens, typos
-        // (`chta`), and real words (`hello`, `what`) all reach clap's
-        // "unrecognized subcommand" with did-you-mean. The shell collapses
-        // `aivo "hello"` to the same argv, so the quoted form necessarily
-        // behaves identically; `-p` forces a one-word prompt.
         for s in [
             "a", "ab", "hi", "yo", "hello", "what", "runs", "chta", "kyes", "claud", "logz",
             "modls", "gpt-4o",

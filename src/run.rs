@@ -187,7 +187,25 @@ pub async fn run() -> ! {
         process::exit(1);
     }
 
-    let args = Cli::parse_from(rewrite_cli_args(raw_args, &bundle_index));
+    let rewritten = rewrite_cli_args(raw_args, &bundle_index);
+    let args = match Cli::try_parse_from(&rewritten) {
+        Ok(args) => args,
+        Err(err) => {
+            // Nested `InvalidSubcommand` (`aivo account frobnicate`) shares this
+            // kind — only intercept when the rejected token is argv[1].
+            if err.kind() == clap::error::ErrorKind::InvalidSubcommand
+                && let Some(name) = rewritten.get(1)
+                && crate::cli_args::is_subcommand_shaped(name)
+                && err
+                    .get(clap::error::ContextKind::InvalidSubcommand)
+                    .is_some_and(|v| matches!(v, clap::error::ContextValue::String(s) if s == name))
+            {
+                print_unknown_top_level(name);
+                process::exit(ExitCode::UserError.code());
+            }
+            err.exit();
+        }
+    };
 
     // Handle --version and subcommand --help early, before any further service initialization.
     if args.version {
@@ -1093,6 +1111,20 @@ async fn load_bundle_index(
         .collect()
 }
 
+fn unknown_top_level_recovery(name: &str) -> [String; 2] {
+    [
+        format!("one-shot:  aivo -p {name}"),
+        "TUI:       aivo code".to_string(),
+    ]
+}
+
+fn print_unknown_top_level(name: &str) {
+    eprintln!("{} unknown command `{name}`", style::red("Error:"));
+    for line in unknown_top_level_recovery(name) {
+        eprintln!("  {}", style::dim(line));
+    }
+}
+
 /// Prints help information
 fn print_help() {
     println!(
@@ -1102,6 +1134,18 @@ fn print_help() {
     );
     println!();
     println!("{} aivo <command> [options]", style::bold("Usage:"));
+    println!();
+
+    println!("{}", style::bold("Get started:"));
+    let print_start = |cmd: &str, desc: &str| {
+        println!("  {}  {}", style::cyan(format!("{:<12}", cmd)), desc);
+    };
+    print_start("aivo code", "built-in agent");
+    print_start(
+        "aivo claude",
+        "launch Claude Code (same for codex/gemini/…)",
+    );
+    print_start("aivo run", "pick a tool");
     println!();
 
     println!("{}", style::bold("Commands:"));
@@ -1239,6 +1283,7 @@ async fn print_active_selection(session_store: &SessionStore) {
             style::dim("(change with: aivo use)"),
         );
     }
+    println!("  {}", style::dim("ready — try aivo code"));
 }
 
 /// Dump the entire CLI command tree (commands, flags, descriptions, env hints)
@@ -1474,5 +1519,38 @@ mod tests {
         assert_eq!(take_code_initial_prompt(&mut a), Ok(None));
         assert_eq!(a.prompt.as_deref(), Some("PFLAG"));
         assert_eq!(a.reference, None);
+    }
+
+    #[test]
+    fn bare_word_is_an_invalid_subcommand() {
+        let err = Cli::try_parse_from(["aivo", "hello"]).unwrap_err();
+        assert_eq!(err.kind(), clap::error::ErrorKind::InvalidSubcommand);
+        assert!(
+            matches!(
+                err.get(clap::error::ContextKind::InvalidSubcommand),
+                Some(clap::error::ContextValue::String(s)) if s == "hello"
+            ),
+            "context names the rejected token"
+        );
+    }
+
+    #[test]
+    fn nested_invalid_subcommand_names_the_nested_token() {
+        let err = Cli::try_parse_from(["aivo", "account", "frobnicate"]).unwrap_err();
+        assert_eq!(err.kind(), clap::error::ErrorKind::InvalidSubcommand);
+        assert!(
+            matches!(
+                err.get(clap::error::ContextKind::InvalidSubcommand),
+                Some(clap::error::ContextValue::String(s)) if s == "frobnicate"
+            ),
+            "context names the nested token, not `account`"
+        );
+    }
+
+    #[test]
+    fn unknown_top_level_recovery_points_at_oneshot_and_tui() {
+        let [oneshot, tui] = unknown_top_level_recovery("hello");
+        assert_eq!(oneshot, "one-shot:  aivo -p hello");
+        assert_eq!(tui, "TUI:       aivo code");
     }
 }

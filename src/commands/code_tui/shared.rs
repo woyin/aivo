@@ -370,7 +370,7 @@ pub(super) const EMPTY_STATE_BOTTOM_GAP: u16 = 0;
 /// screen teaches `/help` and mode-switching, not power-user shortcuts.
 pub(super) const WELCOME_STARTER_TIPS: &[&str] = &[
     "/help lists commands and keybindings",
-    "Shift+Tab cycles mode: normal → auto-approve → plan → review",
+    "Shift+Tab cycles mode: normal → auto-approve → review",
     "Ctrl+R reopens a past session",
 ];
 /// After the first message, the intro banner shows one of these instead
