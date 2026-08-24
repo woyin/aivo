@@ -102,7 +102,7 @@ fn redact_block(block: &mut ContentBlock, ctx: &RedactCtx, hits: &mut HashMap<St
             *text = scan_text(text, ctx, hits);
         }
         ContentBlock::ToolCall { arguments, .. } => {
-            redact_value(arguments, ctx, hits);
+            scan_value(arguments, ctx, hits);
         }
         ContentBlock::ToolResult { output, error, .. } => {
             *output = scan_text(output, ctx, hits);
@@ -114,19 +114,27 @@ fn redact_block(block: &mut ContentBlock, ctx: &RedactCtx, hits: &mut HashMap<St
     }
 }
 
-fn redact_value(v: &mut Value, ctx: &RedactCtx, hits: &mut HashMap<String, usize>) {
+/// Skipped by value walkers: a chance key-shaped match inside a base64 body
+/// would corrupt the media.
+pub fn is_base64_data_url(s: &str) -> bool {
+    s.starts_with("data:") && s.find(";base64,").is_some_and(|i| i < 256)
+}
+
+pub fn scan_value(v: &mut Value, ctx: &RedactCtx, hits: &mut HashMap<String, usize>) {
     match v {
         Value::String(s) => {
-            *s = scan_text(s, ctx, hits);
+            if !is_base64_data_url(s) {
+                *s = scan_text(s, ctx, hits);
+            }
         }
         Value::Array(arr) => {
             for item in arr {
-                redact_value(item, ctx, hits);
+                scan_value(item, ctx, hits);
             }
         }
         Value::Object(map) => {
             for (_, val) in map.iter_mut() {
-                redact_value(val, ctx, hits);
+                scan_value(val, ctx, hits);
             }
         }
         _ => {}
@@ -711,6 +719,21 @@ literal sk-1 should pass
         let (out, _) = scan(input, &ctx);
         assert_eq!(out, input);
         assert_eq!(out.len(), input.len());
+    }
+
+    #[test]
+    fn scan_value_masks_strings_but_skips_base64_data_urls() {
+        let ctx = RedactCtx::default();
+        let mut hits = HashMap::new();
+        let data_url = "data:image/png;base64,sk-BBBBBBBBBBBBBBBBBBBBBBBB";
+        let mut v = json!({
+            "text": "key sk-AAAAAAAAAAAAAAAAAAAAAAAA here",
+            "image_url": {"url": data_url},
+        });
+        scan_value(&mut v, &ctx, &mut hits);
+        assert!(v["text"].as_str().unwrap().contains("<redacted:api_key>"));
+        assert_eq!(v["image_url"]["url"], data_url, "media payload mangled");
+        assert_eq!(hits.get(CAT_API_KEY), Some(&1));
     }
 
     #[test]
