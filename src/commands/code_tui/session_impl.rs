@@ -742,6 +742,10 @@ is preserved."
                 label: "Footer cache hit",
             },
             ConfigRow {
+                setting: ConfigSetting::FooterPrice,
+                label: "Footer price",
+            },
+            ConfigRow {
                 setting: ConfigSetting::Approval,
                 label: "Mode",
             },
@@ -860,6 +864,11 @@ is preserved."
             (ConfigSetting::FooterCacheHit, _) => {
                 "No cache-hit figure in the footer.".to_string()
             }
+            (ConfigSetting::FooterPrice, "on") => {
+                "Footer shows the session's estimated spend (~$) next to the context meter."
+                    .to_string()
+            }
+            (ConfigSetting::FooterPrice, _) => "No spend figure in the footer.".to_string(),
             (ConfigSetting::VisionFallback, "custom") => {
                 "The picked model describes images the chat model can't read.".to_string()
             }
@@ -960,6 +969,7 @@ is preserved."
             ConfigSetting::AgentTools => switch(self.agent_tools_enabled),
             ConfigSetting::FooterTps => switch(self.footer_tps_enabled),
             ConfigSetting::FooterCacheHit => switch(self.footer_cache_enabled),
+            ConfigSetting::FooterPrice => switch(self.footer_price_enabled),
             ConfigSetting::VisionFallback => {
                 use crate::services::session_store::VisionFallbackMode;
                 const OPTIONS: &[&str] = &["aivo", "custom", "off"];
@@ -1091,6 +1101,7 @@ is preserved."
             ConfigSetting::AgentTools => self.set_agent_tools_enabled(target == 0).await,
             ConfigSetting::FooterTps => self.set_footer_tps_enabled(target == 0).await,
             ConfigSetting::FooterCacheHit => self.set_footer_cache_enabled(target == 0).await,
+            ConfigSetting::FooterPrice => self.set_footer_price_enabled(target == 0).await,
             ConfigSetting::VisionFallback => {
                 use crate::services::session_store::VisionFallbackMode;
                 let mode =
@@ -1202,6 +1213,19 @@ is preserved."
             "Footer cache hit off"
         });
         let _ = self.session_store.set_chat_footer_cache_enabled(on).await;
+    }
+
+    pub(super) async fn set_footer_price_enabled(&mut self, on: bool) {
+        if self.footer_price_enabled == on {
+            return;
+        }
+        self.footer_price_enabled = on;
+        self.show_toast(if on {
+            "Footer price on"
+        } else {
+            "Footer price off"
+        });
+        let _ = self.session_store.set_chat_footer_price_enabled(on).await;
     }
 
     /// `custom` is only ever set with a describer pair in hand (picker flow /

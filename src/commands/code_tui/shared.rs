@@ -1501,6 +1501,8 @@ pub(super) enum ConfigSetting {
     FooterTps,
     /// Footer prompt-cache hit-rate indicator.
     FooterCacheHit,
+    /// Footer session-spend (`~$`) suffix on the context meter.
+    FooterPrice,
     /// Describe images for text-only models (`aivo` / `custom` / `off`).
     VisionFallback,
     /// The agent's `generate_image` tool (`custom` / `off`).
@@ -3364,6 +3366,7 @@ pub(super) struct CodeTuiApp {
     /// Footer stat toggles (`/config`); remembered across sessions.
     pub(super) footer_tps_enabled: bool,
     pub(super) footer_cache_enabled: bool,
+    pub(super) footer_price_enabled: bool,
     /// Chat TUI color theme (`/config`); remembered across sessions.
     pub(super) theme: UiTheme,
     /// Whether the current model is known to support reasoning/thinking (from the
@@ -3826,6 +3829,7 @@ impl CodeTuiApp {
             agent_tools_enabled: true,
             footer_tps_enabled: true,
             footer_cache_enabled: true,
+            footer_price_enabled: true,
             theme: UiTheme::Dark,
             model_supports_thinking: false,
             model_image_input: None,

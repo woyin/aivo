@@ -122,6 +122,7 @@ impl CodeTuiApp {
             inline_images_enabled,
             footer_tps_enabled,
             footer_cache_enabled,
+            footer_price_enabled,
             theme: chat_theme,
             vision_fallback,
             vision_fallback_custom,
@@ -242,6 +243,7 @@ impl CodeTuiApp {
         app.inline_images_enabled = inline_images_enabled;
         app.footer_tps_enabled = footer_tps_enabled;
         app.footer_cache_enabled = footer_cache_enabled;
+        app.footer_price_enabled = footer_price_enabled;
         app.vision_fallback = vision_fallback;
         app.vision_fallback_custom = vision_fallback_custom;
         app.image_gen = image_gen;

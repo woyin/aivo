@@ -1551,6 +1551,8 @@ impl CodeTuiApp {
         self.overlay_detail_area = None;
         self.render_cache.overlay_hitbox = None;
         let composer_area = self.render_main(frame, outer);
+        // Surfaces drawn over the transcript this frame, for image suppression.
+        let mut covering: Vec<Rect> = Vec::new();
         if let Some(menu) = self.visible_command_menu() {
             let (area, placement) = command_menu_area(
                 composer_area,
@@ -1560,6 +1562,7 @@ impl CodeTuiApp {
             );
             self.command_menu.placement = Some(placement);
             self.render_command_menu(frame, area, &menu);
+            covering.push(area);
         }
         let body = outer;
 
@@ -1697,14 +1700,26 @@ impl CodeTuiApp {
             Overlay::None => {}
         }
 
-        // Cursor-addressed images float above cells, so surfaces drawn over the
-        // transcript must suppress them for the frame — the post-draw flush then
-        // deletes the stale placements. Virtual placements are exempt: covering
-        // cells clips them naturally.
-        let covering_surface =
-            !matches!(self.overlay, Overlay::None) || self.visible_command_menu().is_some();
-        if covering_surface && !self.inline_images.caps.virtual_placement() {
-            self.inline_images.desired.clear();
+        // Cursor-addressed images float above cells, so a surface drawn over
+        // the transcript suppresses the placements it covers for the frame —
+        // the post-draw flush then deletes/erases the stale ones. Placements
+        // it doesn't touch stay put: the bottom-anchored command menu must not
+        // blank an image at the top of the screen. Virtual placements are
+        // exempt: covering cells clips them naturally.
+        if !self.inline_images.caps.virtual_placement() {
+            let overlay_rect = self
+                .render_cache
+                .overlay_hitbox
+                .or_else(|| self.picker_hitbox.as_ref().map(|h| h.overlay_area));
+            if !matches!(self.overlay, Overlay::None) && overlay_rect.is_none() {
+                // An overlay that recorded no geometry: hide everything.
+                self.inline_images.desired.clear();
+            } else {
+                covering.extend(overlay_rect);
+                self.inline_images
+                    .desired
+                    .retain(|p| !covering.iter().any(|c| c.intersects(p.rect())));
+            }
         }
 
         // Snapshot the finished screen so a drag can copy from anywhere on it,
@@ -3766,10 +3781,11 @@ impl CodeTuiApp {
         (label, context_fill_color(pct))
     }
 
-    /// ` · ~$X.XX` session-spend suffix; empty only without any recorded spend.
+    /// ` · ~$X.XX` session-spend suffix; empty when toggled off (`/config`) or
+    /// without any recorded spend.
     /// Always `~`: snapshot list prices × parsed usage is an estimate, not a bill.
     pub(super) fn session_cost_label(&self) -> String {
-        if self.session_cost_usd <= 0.0 {
+        if !self.footer_price_enabled || self.session_cost_usd <= 0.0 {
             return String::new();
         }
         format!(" · ~${}", format_usd(self.session_cost_usd))

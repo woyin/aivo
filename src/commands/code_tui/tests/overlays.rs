@@ -585,9 +585,10 @@ async fn config_overlay_click_selects_list_row() {
         .clone()
         .expect("config list hitbox recorded");
     // Visual rows (split, with group gaps): Appearance, Theme, Inline images,
-    // Thinking, Footer tok/s, Footer cache hit, blank, Behavior, Mode,
-    // Web search, Agent tools, blank, Media, Vision fallback, Image generation.
-    let image_row = hitbox.list_area.y + 14;
+    // Thinking, Footer tok/s, Footer cache hit, Footer price, blank, Behavior,
+    // Mode, Web search, Agent tools, blank, Media, Vision fallback,
+    // Image generation.
+    let image_row = hitbox.list_area.y + 15;
     app.handle_mouse(left_click(hitbox.list_area.x, image_row))
         .await
         .unwrap();
@@ -1003,14 +1004,22 @@ async fn test_config_overlay_toggles_footer_stats_and_persists() {
         .iter()
         .position(|i| i.setting == ConfigSetting::FooterCacheHit)
         .expect("Footer cache hit row present");
+    let price_idx = state
+        .items
+        .iter()
+        .position(|i| i.setting == ConfigSetting::FooterPrice)
+        .expect("Footer price row present");
 
     assert_eq!(app.config_segments(ConfigSetting::FooterTps).active, 0);
     app.cycle_config_setting(tps_idx, CycleDir::Enter).await;
     assert!(!app.footer_tps_enabled);
     app.cycle_config_setting(cache_idx, CycleDir::Enter).await;
     assert!(!app.footer_cache_enabled);
+    app.cycle_config_setting(price_idx, CycleDir::Enter).await;
+    assert!(!app.footer_price_enabled);
 
     let toggles = app.session_store.get_chat_toggles().await;
     assert!(!toggles.footer_tps_enabled);
     assert!(!toggles.footer_cache_enabled);
+    assert!(!toggles.footer_price_enabled);
 }

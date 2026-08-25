@@ -89,6 +89,12 @@ pub(super) struct InlineImageState {
     pub(super) resize_settle: Option<std::time::Instant>,
 }
 
+impl PlacedImage {
+    pub(super) fn rect(&self) -> Rect {
+        Rect::new(self.x, self.y, self.cols, self.rows)
+    }
+}
+
 /// Placement ids derive from the screen row: the same image visible twice
 /// (or after a scroll) gets distinct, reproducible placements.
 fn placement_id(p: &PlacedImage) -> u32 {
