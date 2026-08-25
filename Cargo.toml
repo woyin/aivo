@@ -22,17 +22,22 @@ too_many_lines = "allow"
 
 [dependencies]
 # CLI
-clap = { version = "4.5", default-features = false, features = ["std", "derive", "error-context", "usage"] }
+# Help is hand-rolled (`print_help*`); clap's `usage`/`help`/`color`/`suggestions`
+# stay off. `error-context` is required for InvalidSubcommand recovery.
+clap = { version = "4.5", default-features = false, features = ["std", "derive", "error-context"] }
 console = "0.15"
-crossterm = "0.28"
-ratatui = { version = "0.30.2", default-features = false, features = ["crossterm_0_28", "layout-cache"] }
+crossterm = "0.29"
+# ratatui-crossterm defaults to 0.29. Enabling crossterm_0_28 alongside that
+# compiled both majors plus a second rustix (0.38). Stay on 0.29 only.
+ratatui = { version = "0.30.2", default-features = false, features = ["crossterm_0_29", "layout-cache"] }
 portable-pty = "0.9"
 
 # HTTP
 http = "1"
 # Keep env/system proxy support on so Termux and proxy-backed networks match curl.
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream", "system-proxy"] }
-tokio = { version = "1.43", features = ["rt", "macros", "process", "signal", "time", "fs", "net", "sync", "io-std", "io-util"] }
+# No `io-std`: stdin/stdout go through `std::io`, not tokio's async stdio.
+tokio = { version = "1.43", features = ["rt", "macros", "process", "signal", "time", "fs", "net", "sync", "io-util"] }
 tokio-tungstenite = { version = "0.29", features = ["rustls-tls-webpki-roots"] }
 
 # Serialization
