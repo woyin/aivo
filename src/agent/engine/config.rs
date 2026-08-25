@@ -51,6 +51,7 @@ impl AgentEngine {
             max_output_tokens: 0,
             grants: crate::agent::grant_store::GrantStore::default(),
             denied_sigs: Default::default(),
+            turn_dismissals: 0,
             skills: skills.to_vec(),
             subagents: Vec::new(),
             agents_dir: None,

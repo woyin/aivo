@@ -411,15 +411,23 @@ planning is off) — continue with the task."
                     match plan_mode::parse_exit_plan(&call.arguments) {
                         Ok(plan) => match ui.approve_plan(&plan).await {
                             Ok(PlanDecision::Approve) => {
+                                self.turn_dismissals = 0;
                                 // Restore tools now so this turn continues into execution.
                                 self.set_plan_mode(false);
                                 Ok(plan_mode::PLAN_APPROVED_RESULT.to_string())
                             }
                             Ok(PlanDecision::KeepPlanning { feedback }) => {
+                                self.turn_dismissals = 0;
                                 Ok(plan_mode::keep_planning_result(feedback.as_deref()))
                             }
                             Ok(PlanDecision::Discard) => {
+                                self.turn_dismissals = 0;
                                 Ok(plan_mode::PLAN_DISCARDED_RESULT.to_string())
+                            }
+                            // User action, not a tool failure (see the ask_user intrinsic).
+                            Err(e) if e == plan_mode::PLAN_APPROVAL_DISMISSED => {
+                                self.turn_dismissals += 1;
+                                Ok(e)
                             }
                             Err(e) => Err(e),
                         },

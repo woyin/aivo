@@ -2767,6 +2767,11 @@ fix the input or pick another route, and record the dead end with take_note"
                         "it kept attempting actions that were denied. Do NOT retry them — \
 pursue a materially different route, or state what's blocked and stop"
                     }
+                    TurnStop::DismissedLoop => {
+                        "the user dismissed its questions without answering. Do NOT re-ask — \
+treat that input as unavailable, continue what can proceed without it, and record the open \
+question with take_note"
+                    }
                     TurnStop::StepLimit => {
                         "it ran out of steps mid-work. Break the remaining work into smaller \
 pieces and keep going"

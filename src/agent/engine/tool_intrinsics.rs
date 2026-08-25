@@ -77,10 +77,24 @@ into every future session. The user can audit or edit it via /memory."
                 _ => Err("set_effort: missing `level`.".to_string()),
             },
             "ask_user" => match ask::parse_ask(args) {
-                Ok((question, options, allow_free_text, multi_select)) => ui
-                    .ask_user(&question, &options, allow_free_text, multi_select)
-                    .await
-                    .map(|answer| ask::confirmation(&answer)),
+                Ok((question, options, allow_free_text, multi_select)) => {
+                    match ui
+                        .ask_user(&question, &options, allow_free_text, multi_select)
+                        .await
+                    {
+                        Ok(answer) => {
+                            self.turn_dismissals = 0;
+                            Ok(ask::confirmation(&answer))
+                        }
+                        // User action, not a tool failure — an Err would hit the
+                        // failure guard, whose schema hint says to re-ask.
+                        Err(e) if e == ask::DISMISSED_DIRECTIVE => {
+                            self.turn_dismissals += 1;
+                            Ok(e)
+                        }
+                        Err(e) => Err(e),
+                    }
+                }
                 Err(e) => Err(e),
             },
             // Deferred-MCP discovery: load matching schemas (engine state).

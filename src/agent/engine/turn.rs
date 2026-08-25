@@ -110,6 +110,7 @@ impl AgentEngine {
         let mut denial_batches = 0usize;
         let mut denial_directive_sent = false;
         self.denied_sigs.clear();
+        self.turn_dismissals = 0;
         let mut converged = false;
 
         for _ in 0..self.max_steps {
@@ -548,6 +549,13 @@ impl AgentEngine {
                 break;
             }
 
+            if self.turn_dismissals >= DISMISS_STOP_AT {
+                ui.notify(STOP_DISMISSED);
+                ui.turn_stopped(TurnStop::DismissedLoop);
+                converged = true;
+                break;
+            }
+
             // Denial ladder (user denials only — plan-mode refusals have their own flow).
             if failures
                 .iter()
@@ -644,6 +652,8 @@ impl AgentEngine {
         }
         // An interjection may reverse a denial — let the next attempt re-prompt.
         self.denied_sigs.clear();
+        // Typed direction supersedes an earlier Esc — asking again is fine now.
+        self.turn_dismissals = 0;
         let block = format!(
             "<user_interjection>\n{}\n</user_interjection>\nThe user sent this while you were \
 working. Factor it in before continuing — it may change what to do next.",

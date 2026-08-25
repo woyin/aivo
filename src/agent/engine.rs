@@ -99,6 +99,10 @@ tell the user what was blocked and what they could do.";
 /// so a fail-closed headless run would otherwise grind to the step limit.
 const DENIAL_DIRECTIVE_AT: usize = 2;
 const DENIAL_STOP_AT: usize = 4;
+/// A second dismissed card means the model re-asked against the stop directive.
+const DISMISS_STOP_AT: usize = 2;
+pub(crate) const STOP_DISMISSED: &str =
+    "stopping: the user dismissed the question again — over to them";
 const DENIAL_RECOVERY_DIRECTIVE: &str = "[permission guard] Several actions were denied. Stop \
 pursuing the blocked approach — do not call tools for it again. Reply now: state what was \
 blocked, what you completed, and what the user could do to unblock it.";
@@ -156,6 +160,7 @@ pub enum TurnStop {
     NoProgress,
     ToolFailureLoop,
     DeniedLoop,
+    DismissedLoop,
     StepLimit,
     OutputBudget,
     CostBudget,
@@ -168,6 +173,7 @@ impl TurnStop {
             TurnStop::NoProgress => "noProgress",
             TurnStop::ToolFailureLoop => "toolFailureLoop",
             TurnStop::DeniedLoop => "deniedLoop",
+            TurnStop::DismissedLoop => "dismissedLoop",
             TurnStop::StepLimit => "stepLimit",
             TurnStop::OutputBudget => "outputBudget",
             TurnStop::CostBudget => "costBudget",
@@ -179,6 +185,7 @@ impl TurnStop {
             TurnStop::NoProgress => "the model repeated the same action with no progress",
             TurnStop::ToolFailureLoop => "a tool call kept failing the same way",
             TurnStop::DeniedLoop => "the model kept attempting actions the user denied",
+            TurnStop::DismissedLoop => "the user dismissed the model's question again",
             TurnStop::StepLimit => "reached the step limit",
             TurnStop::OutputBudget => "reached the per-turn output-token budget",
             TurnStop::CostBudget => "reached the cost budget",
@@ -516,6 +523,9 @@ pub struct AgentEngine {
     /// Tool+args the user denied this turn — identical re-issues auto-deny. Cleared
     /// per turn, on steering, and on plan exit (a deny may have been reversed).
     denied_sigs: std::collections::HashSet<String>,
+    /// Cards dismissed this turn; [`DISMISS_STOP_AT`] ends the turn. Reset per
+    /// turn, on an answered card, and on steering.
+    turn_dismissals: usize,
     /// Discovered SKILL.md skills, loaded on demand via the `skill` tool.
     skills: Vec<Skill>,
     /// Named specialist sub-agents (top-level engine only). The `subagent` tool's

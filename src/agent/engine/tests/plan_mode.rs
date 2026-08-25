@@ -323,6 +323,38 @@ async fn exit_plan_mode_discard_stays_read_only() {
     );
 }
 
+/// A dismissed approval card is an Ok result; plan mode stays on.
+#[tokio::test]
+async fn exit_plan_mode_dismissal_is_a_result_not_a_failure() {
+    let dir = tmp();
+    let exit = tool_call_sse("exit_plan_mode", json!({"plan": "1. do X"}));
+    let port = spawn_sse_sequence(vec![exit, FINAL_TEXT_SSE.to_string()]);
+    let client = reqwest::Client::builder().no_proxy().build().unwrap();
+    let base = format!("http://127.0.0.1:{port}");
+    let mut engine = AgentEngine::new(&dir.display().to_string(), "m", "", &[], &[], 0, 0);
+    engine.set_plan_mode(true);
+    // `plan_decision: None` → the mock UI dismisses the card.
+    let mut ui = CapturingUi::default();
+    run_session(
+        &mut engine,
+        &turn_ctx(&client, &base, &dir),
+        Some("plan it".into()),
+        &mut ui,
+    )
+    .await;
+
+    assert!(
+        ui.tool_errors.is_empty(),
+        "dismissal must not render as error"
+    );
+    assert!(engine.read_only);
+    assert!(
+        tool_result_texts(&engine)
+            .iter()
+            .any(|c| c.contains(plan_mode::PLAN_APPROVAL_DISMISSED))
+    );
+}
+
 /// An empty `plan` argument is a steering error, not a card.
 #[tokio::test]
 async fn exit_plan_mode_empty_plan_errors() {

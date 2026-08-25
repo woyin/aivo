@@ -441,6 +441,80 @@ async fn four_consecutive_denied_batches_stop_the_turn() {
     assert_eq!(ui.asks, 4, "each varied attempt prompts once");
 }
 
+/// A dismissed card is an Ok result — no failure rendering, no failure guard.
+#[tokio::test]
+async fn dismissed_question_is_a_result_not_a_failure() {
+    let dir = tmp();
+    let ask = tool_call_sse(
+        "ask_user",
+        json!({ "question": "Which one?", "options": ["a", "b"] }),
+    );
+    let port = spawn_sse_sequence(vec![ask, FINAL_TEXT_SSE.to_string()]);
+    let client = reqwest::Client::builder().no_proxy().build().unwrap();
+    let base = format!("http://127.0.0.1:{port}");
+    let mut engine = AgentEngine::new(&dir.display().to_string(), "m", "", &[], &[], 0, 0);
+    let mut ui = CapturingUi {
+        dismiss_asks: true,
+        ..Default::default()
+    };
+    run_session(
+        &mut engine,
+        &turn_ctx(&client, &base, &dir),
+        Some("pick".into()),
+        &mut ui,
+    )
+    .await;
+
+    assert!(
+        ui.tool_errors.is_empty(),
+        "dismissal must not render as error"
+    );
+    assert!(ui.stops.is_empty(), "one dismissal lets the model wrap up");
+    assert!(
+        tool_result_texts(&engine)
+            .iter()
+            .any(|t| t.contains("dismissed the question"))
+    );
+}
+
+/// A second dismissal ends the turn instead of hinting a retry.
+#[tokio::test]
+async fn second_dismissed_question_stops_the_turn() {
+    let dir = tmp();
+    let ask = tool_call_sse(
+        "ask_user",
+        json!({ "question": "Which one?", "options": ["a", "b"] }),
+    );
+    let port = spawn_sse_sequence(vec![
+        ask.clone(),
+        ask,
+        FINAL_TEXT_SSE.to_string(), // never reached
+    ]);
+    let client = reqwest::Client::builder().no_proxy().build().unwrap();
+    let base = format!("http://127.0.0.1:{port}");
+    let mut engine = AgentEngine::new(&dir.display().to_string(), "m", "", &[], &[], 0, 0);
+    let mut ui = CapturingUi {
+        dismiss_asks: true,
+        ..Default::default()
+    };
+    run_session(
+        &mut engine,
+        &turn_ctx(&client, &base, &dir),
+        Some("pick".into()),
+        &mut ui,
+    )
+    .await;
+
+    assert_eq!(ui.stops, vec![TurnStop::DismissedLoop]);
+    assert_eq!(ui.ask_user_questions.len(), 2);
+    assert!(
+        !tool_result_texts(&engine)
+            .iter()
+            .any(|t| t.contains("failed repeatedly")),
+        "the schema-retry hint must never fire on dismissals"
+    );
+}
+
 /// A denial-free batch resets the streak: interleaved useful work never stops the turn.
 #[tokio::test]
 async fn denial_streak_resets_on_a_clean_batch() {

@@ -30,6 +30,10 @@ pub(super) struct CapturingUi {
     pub(super) discards: usize,
     /// Each forwarded sub-agent step: `(agent, tool, step)`.
     pub(super) sub_activity: Vec<(String, String, usize)>,
+    /// `ask_user` replies with the dismissal directive (Esc) instead of an answer.
+    pub(super) dismiss_asks: bool,
+    /// The `question` of each `ask_user` call, in order.
+    pub(super) ask_user_questions: Vec<String>,
     /// Verdict `approve_plan` replies with (`None` → dismissed).
     pub(super) plan_decision: Option<crate::agent::protocol::PlanDecision>,
     /// The plan text of each `approve_plan` call, in order.
@@ -107,6 +111,24 @@ impl AgentUi for CapturingUi {
                 Decision::Deny
             } else {
                 Decision::Allow
+            }
+        })
+    }
+    fn ask_user<'a>(
+        &'a mut self,
+        question: &'a str,
+        options: &'a [crate::agent::ask::AskOption],
+        _: bool,
+        _: bool,
+    ) -> BoxFuture<'a, Result<String, String>> {
+        self.ask_user_questions.push(question.to_string());
+        let dismiss = self.dismiss_asks;
+        let answer = options.first().map(|o| o.label.clone()).unwrap_or_default();
+        Box::pin(async move {
+            if dismiss {
+                Err(crate::agent::ask::DISMISSED_DIRECTIVE.to_string())
+            } else {
+                Ok(answer)
             }
         })
     }
