@@ -2007,7 +2007,7 @@ impl CodeTuiApp {
                 if full_repaint {
                     terminal.swap_buffers();
                     for cell in &mut terminal.current_buffer_mut().content {
-                        cell.skip = true;
+                        cell.set_diff_option(ratatui::buffer::CellDiffOption::Skip);
                     }
                     terminal.swap_buffers();
                     last_stream_repaint = std::time::Instant::now();
