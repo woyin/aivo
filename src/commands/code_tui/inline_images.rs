@@ -30,6 +30,8 @@ const MIN_SOURCE_PX_PER_COL: u32 = 10;
 const MAX_TRANSMITTED: usize = 24;
 /// Debounce for resize re-transmit — a live drag is a resize-event burst.
 const RESIZE_SETTLE: std::time::Duration = std::time::Duration::from_millis(250);
+/// Debounce for sixel scroll re-placement — a wheel gesture is a scroll burst.
+const SCROLL_SETTLE: std::time::Duration = std::time::Duration::from_millis(200);
 const MAX_SOURCE_BYTES: u64 = 20 * 1024 * 1024;
 
 /// The reserved transcript row under an image: a zero-width space — invisible
@@ -87,6 +89,11 @@ pub(super) struct InlineImageState {
     /// force-rewrite to erase the stale pixels.
     pub(super) pending_clears: Vec<PlacedImage>,
     pub(super) resize_settle: Option<std::time::Instant>,
+    /// Sixel settle clock: a "move" is erase + full payload re-emission per
+    /// wheel tick (through tmux), so transcript placements are withheld until
+    /// the scroll rests.
+    pub(super) scroll_settle: Option<std::time::Instant>,
+    pub(super) last_scroll: usize,
 }
 
 impl PlacedImage {
@@ -123,7 +130,7 @@ pub(super) fn hash_inline(data: &str) -> u64 {
 
 /// File previews key on (path, len, mtime), so an agent re-editing an SVG
 /// yields a fresh key — and therefore a fresh render — automatically.
-fn file_key(path: &Path) -> Option<u64> {
+pub(super) fn file_key(path: &Path) -> Option<u64> {
     let meta = std::fs::metadata(path).ok()?;
     if meta.len() == 0 || meta.len() > MAX_SOURCE_BYTES {
         return None;
@@ -139,19 +146,17 @@ fn file_key(path: &Path) -> Option<u64> {
     }))
 }
 
-/// The image path a read/write/edit tool call touches (unresolved), plus
-/// whether the call CHANGES the file — mutating calls must wait for evidence
-/// the call executed, or the pre-write state gets pinned forever.
-/// `read_file` matters most: "show me x.svg" makes the agent read, not write.
-pub(super) fn file_tool_image_target(content: &str) -> Option<(String, bool)> {
+/// The image path a write/edit tool call touches (unresolved). Callers must
+/// wait for evidence the call executed, or the pre-write state gets pinned.
+/// `read_file` deliberately previews nothing — that's the preview pane's job.
+pub(super) fn file_tool_image_target(content: &str) -> Option<String> {
     let (name, args) = decode_tool_call(content);
     let name = canonical_tool_name(&name);
-    let mutates = matches!(name, "write_file" | "edit_file" | "multi_edit");
-    if !mutates && name != "read_file" {
+    if !matches!(name, "write_file" | "edit_file" | "multi_edit") {
         return None;
     }
     let path = args.get("path").and_then(|v| v.as_str())?;
-    has_image_extension(path).then(|| (path.to_string(), mutates))
+    has_image_extension(path).then(|| path.to_string())
 }
 
 /// Identity of one image mention: which history entry, roughly what it said,
@@ -187,11 +192,11 @@ fn materialize_inline(key: u64, data_b64: &str, mime: &str) -> Option<PathBuf> {
 
 /// Resolution matches the agent's own tool-path rules (absolute kept,
 /// `~` expanded, else joined onto the working dir).
-fn resolve_in(base: &str, path: &str) -> PathBuf {
+pub(super) fn resolve_in(base: &str, path: &str) -> PathBuf {
     crate::agent::tools::resolve(Path::new(base), path)
 }
 
-fn has_image_extension(path: &str) -> bool {
+pub(super) fn has_image_extension(path: &str) -> bool {
     let bytes = path.as_bytes();
     [".svg", ".png", ".jpg", ".jpeg"].iter().any(|ext| {
         bytes.len() >= ext.len()
@@ -229,7 +234,7 @@ fn dedup_same_stem(paths: Vec<String>) -> Vec<String> {
 
 /// Key for a URL preview — content-unknown until fetched, so the URL string
 /// itself is the identity (first fetch wins, like a pin).
-fn hash_url(url: &str) -> u64 {
+pub(super) fn hash_url(url: &str) -> u64 {
     keyed_hash("url", |h| url.hash(h))
 }
 
@@ -414,17 +419,45 @@ fn result_image_paths(result: &str) -> Vec<String> {
         .map(str::trim)
         .filter(|l| !l.is_empty())
         .collect();
+    let mut decorated = 0usize;
     let bare: Vec<&str> = lines
         .iter()
-        .map(|l| undecorate_path_line(l))
-        .filter(|l| !l.is_empty() && has_image_extension(l))
+        .filter_map(|l| {
+            let stripped = undecorate_path_line(l);
+            if stripped.is_empty() || !has_image_extension(stripped) {
+                return None;
+            }
+            if stripped != *l {
+                decorated += 1;
+            }
+            Some(stripped)
+        })
         .collect();
-    if bare.len() <= MAX_RESULT_PATH_PREVIEWS && images_are_the_answer(bare.len(), lines.len()) {
+    // Decorated lines (bullets, sizes) = the tool ANSWERING with images, so a
+    // minority share still previews; plain path lines only count when the
+    // whole result is image paths (a mixed listing stays quiet).
+    let deliberate = if decorated > 0 {
+        images_are_the_answer(bare.len(), lines.len())
+    } else {
+        !bare.is_empty() && bare.len() == lines.len() && lines.len() <= MAX_RESULT_PREVIEW_LINES
+    };
+    if bare.len() <= MAX_RESULT_PATH_PREVIEWS && deliberate {
         paths.extend(bare.iter().map(|s| s.to_string()));
     }
     paths.dedup();
     dedup_same_stem(paths)
 }
+
+pub(super) fn tool_call_name(content: &str) -> Option<String> {
+    serde_json::from_str::<serde_json::Value>(content)
+        .ok()?
+        .get("name")?
+        .as_str()
+        .map(str::to_string)
+}
+
+/// `list_dir` navigates — images its listings name are never the answer.
+const NO_RESULT_PREVIEW_TOOLS: &[&str] = &["list_dir"];
 
 fn images_are_the_answer(image_lines: usize, total_lines: usize) -> bool {
     image_lines > 0
@@ -448,7 +481,7 @@ fn prepare_bytes(bytes: Vec<u8>) -> Option<EncodedPreview> {
 }
 
 /// Blocking half of preview prep for local sources.
-fn prepare_preview_source(source: PreviewSource) -> Option<EncodedPreview> {
+pub(super) fn prepare_preview_source(source: PreviewSource) -> Option<EncodedPreview> {
     use base64::Engine as _;
     let bytes = match source {
         PreviewSource::InlineB64(data) => base64::engine::general_purpose::STANDARD
@@ -549,9 +582,42 @@ fn push_preview_rows(
     }
 }
 
+/// Like `preview_grid`, but bounded on BOTH axes — the pane is a fixed rect,
+/// not transcript flow.
+pub(super) fn pane_preview_grid(
+    px_w: u32,
+    px_h: u32,
+    max_cols: u16,
+    max_rows: u16,
+    protocol: Protocol,
+) -> Option<(u16, u16)> {
+    if px_w == 0 || px_h == 0 || max_cols < 4 || max_rows < 2 {
+        return None;
+    }
+    let px_per_col = if protocol == Protocol::HalfBlocks {
+        1
+    } else {
+        MIN_SOURCE_PX_PER_COL
+    };
+    let source_cap = u16::try_from((px_w / px_per_col).max(4)).unwrap_or(u16::MAX);
+    let aspect = f64::from(px_h) / f64::from(px_w);
+    let mut cols = max_cols.min(source_cap);
+    let mut rows = (aspect * f64::from(cols) * CELL_WIDTH_OVER_HEIGHT)
+        .round()
+        .max(1.0) as u16;
+    if rows > max_rows {
+        rows = max_rows;
+        cols = (f64::from(rows) / CELL_WIDTH_OVER_HEIGHT / aspect)
+            .round()
+            .max(1.0) as u16;
+        cols = cols.min(max_cols);
+    }
+    Some((cols, rows.max(1)))
+}
+
 /// One cell row of `▀` half-blocks from a cols-wide RGB grid: fg = the cell's
 /// upper pixel, bg = the lower.
-fn half_block_row(grid: &[u8], row: u16, cols: u16) -> Line<'static> {
+pub(super) fn half_block_row(grid: &[u8], row: u16, cols: u16) -> Line<'static> {
     let pixel = |x: u32, y: u32| -> Color {
         let i = ((y * u32::from(cols) + x) * 3) as usize;
         match grid.get(i..i + 3) {
@@ -575,7 +641,7 @@ fn half_block_row(grid: &[u8], row: u16, cols: u16) -> Line<'static> {
 impl CodeTuiApp {
     /// Base dir for tool-relative paths — the agent's real working dir, like
     /// the transcript's path display.
-    fn preview_base(&self) -> &str {
+    pub(super) fn preview_base(&self) -> &str {
         if self.real_cwd.is_empty() {
             &self.cwd
         } else {
@@ -583,7 +649,7 @@ impl CodeTuiApp {
         }
     }
 
-    fn ready_preview(&self, key: u64) -> Option<Arc<EncodedPreview>> {
+    pub(super) fn ready_preview(&self, key: u64) -> Option<Arc<EncodedPreview>> {
         match self.inline_images.previews.get(&key) {
             Some(PreviewSlot::Ready(preview)) => Some(Arc::clone(preview)),
             _ => None,
@@ -662,12 +728,11 @@ impl CodeTuiApp {
                     }
                 }
                 "tool_call" => {
-                    if let Some((path, mutates)) = file_tool_image_target(content) {
+                    if let Some(path) = file_tool_image_target(content) {
                         // A write/edit stats post-execution state: wait for
                         // evidence the call ran (a following entry or an
                         // inlined result), or the pre-write file gets pinned.
-                        let ran = !mutates
-                            || idx + 1 < self.history.len()
+                        let ran = idx + 1 < self.history.len()
                             || decode_tool_outcome(content).0.is_some();
                         if ran {
                             want_path(&mut pin_wants, &path);
@@ -675,6 +740,15 @@ impl CodeTuiApp {
                     }
                 }
                 "tool_result" => {
+                    let listing = idx
+                        .checked_sub(1)
+                        .and_then(|i| self.history.get(i))
+                        .filter(|m| m.role == "tool_call")
+                        .and_then(|m| tool_call_name(&m.content))
+                        .is_some_and(|n| NO_RESULT_PREVIEW_TOOLS.contains(&n.as_str()));
+                    if listing {
+                        continue;
+                    }
                     for path in result_image_paths(content) {
                         want_path(&mut pin_wants, &path);
                     }
@@ -728,7 +802,7 @@ impl CodeTuiApp {
 
     /// Downloads an image URL and preps it. Display-only, size-capped, and
     /// timed out; a failure just leaves the block unrendered.
-    fn spawn_url_preview(&mut self, key: u64, url: String) {
+    pub(super) fn spawn_url_preview(&mut self, key: u64, url: String) {
         if self.inline_images.previews.contains_key(&key) {
             return;
         }
@@ -902,7 +976,7 @@ impl CodeTuiApp {
         if !self.inline_images.caps.enabled() {
             return;
         }
-        let Some((path, _)) = file_tool_image_target(tool_call_content) else {
+        let Some(path) = file_tool_image_target(tool_call_content) else {
             return;
         };
         let Some(key) = self.lookup_pinned(idx, tool_call_content, &path) else {
@@ -928,8 +1002,12 @@ impl CodeTuiApp {
         seen: &mut HashSet<u64>,
         idx: usize,
         result: &str,
+        tool: Option<&str>,
         width: u16,
     ) {
+        if tool.is_some_and(|t| NO_RESULT_PREVIEW_TOOLS.contains(&t)) {
+            return;
+        }
         let mut mentions = result_image_paths(result);
         mentions.extend(result_image_urls(result));
         self.push_mention_preview_lines(lines, seen, idx, result, mentions, width);
@@ -1152,7 +1230,7 @@ impl CodeTuiApp {
                 }
                 "assistant" => check_all(text_image_paths(content))
                     .or_else(|| check_urls(text_image_urls(content))),
-                "tool_call" => file_tool_image_target(content).and_then(|(p, _)| check(&p)),
+                "tool_call" => file_tool_image_target(content).and_then(|p| check(&p)),
                 "tool_result" => check_all(result_image_paths(content))
                     .or_else(|| check_urls(result_image_urls(content))),
                 _ => None,
@@ -1212,6 +1290,11 @@ impl CodeTuiApp {
     pub(super) fn collect_desired_inline_images(&mut self, area: Rect) {
         self.inline_images.desired.clear();
         if !self.inline_images.caps.enabled() {
+            return;
+        }
+        // Mid-scroll sixel: leave `desired` empty so the flush erases the
+        // anchors once; the pane is exempt — pushed later at a fixed spot.
+        if self.sixel_scroll_hold() {
             return;
         }
         let Some(body) = self
@@ -1287,6 +1370,33 @@ impl CodeTuiApp {
         if self.inline_images.caps.emits_escapes() {
             self.inline_images.resize_settle = Some(std::time::Instant::now());
         }
+    }
+
+    /// Sixel only: `true` = the scroll is moving, withhold transcript placements.
+    pub(super) fn sixel_scroll_hold(&mut self) -> bool {
+        if self.inline_images.caps.protocol != Protocol::Sixel {
+            return false;
+        }
+        if self.transcript_scroll != self.inline_images.last_scroll {
+            self.inline_images.last_scroll = self.transcript_scroll;
+            self.inline_images.scroll_settle = Some(std::time::Instant::now());
+        }
+        self.inline_images
+            .scroll_settle
+            .is_some_and(|at| at.elapsed() < SCROLL_SETTLE)
+    }
+
+    /// The scroll rested — repaint once so the withheld placements return.
+    pub(super) fn tick_image_scroll_settle(&mut self) -> bool {
+        let settled = self
+            .inline_images
+            .scroll_settle
+            .is_some_and(|at| at.elapsed() >= SCROLL_SETTLE);
+        if !settled {
+            return false;
+        }
+        self.inline_images.scroll_settle = None;
+        true
     }
 
     /// Resize settled: forget terminal-side state so the flush re-sends.
@@ -1370,16 +1480,10 @@ mod tests {
     fn file_tool_image_target_matches_image_tools_only() {
         let write =
             serde_json::json!({"name": "write_file", "args": {"path": "pic.svg"}}).to_string();
-        assert_eq!(
-            file_tool_image_target(&write),
-            Some(("pic.svg".to_string(), true))
-        );
+        assert_eq!(file_tool_image_target(&write), Some("pic.svg".to_string()));
         let read =
             serde_json::json!({"name": "read_file", "args": {"path": "a/b.png"}}).to_string();
-        assert_eq!(
-            file_tool_image_target(&read),
-            Some(("a/b.png".to_string(), false))
-        );
+        assert!(file_tool_image_target(&read).is_none());
         let rs = serde_json::json!({"name": "read_file", "args": {"path": "main.rs"}}).to_string();
         assert!(file_tool_image_target(&rs).is_none());
         let grep = serde_json::json!({"name": "grep", "args": {"pattern": "x.svg"}}).to_string();
@@ -1571,6 +1675,16 @@ mod tests {
         assert!(result_image_paths("12 matches in 3 files").is_empty());
         let saved = "ok</untrusted>\n[image saved: /tmp/x.png (image/png)]";
         assert_eq!(result_image_paths(saved), vec!["/tmp/x.png".to_string()]);
+    }
+
+    #[test]
+    fn result_image_paths_stays_quiet_on_short_mixed_listing() {
+        let listing = "css-doodle-demo.html\ncircle.svg\nshot-1.png\nshot-2.png\nnotes.txt\n";
+        assert!(result_image_paths(listing).is_empty());
+        assert_eq!(
+            result_image_paths("circle.svg\nshot-1.png\n"),
+            vec!["circle.svg".to_string(), "shot-1.png".to_string()]
+        );
     }
 
     #[test]

@@ -644,6 +644,7 @@ pub(super) fn parse_slash_command(input: &str) -> Result<SlashCommand> {
                     .map_err(|_| anyhow::anyhow!("Usage: /copy [n]"))?,
             ),
         })),
+        "preview" => Ok(SlashCommand::Preview(argument)),
         "skills" => Ok(SlashCommand::Skills(argument)),
         "agents" => Ok(SlashCommand::Agents(argument)),
         "mcp" => Ok(SlashCommand::Mcp(argument)),

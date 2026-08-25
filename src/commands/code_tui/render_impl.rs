@@ -590,6 +590,7 @@ impl CodeTuiApp {
                                 &mut previewed,
                                 res_idx,
                                 content,
+                                Some(name.as_str()),
                                 text_width,
                             );
                         } else {
@@ -652,6 +653,7 @@ impl CodeTuiApp {
                         &mut previewed,
                         idx,
                         &message.content,
+                        tool.as_deref(),
                         text_width,
                     );
                 }
@@ -2400,6 +2402,9 @@ impl CodeTuiApp {
             width: area.width.saturating_sub(APP_LEFT_MARGIN),
             height: area.height.saturating_sub(APP_TOP_MARGIN),
         };
+        // The pane takes a full-height right column; everything else lays out
+        // in the left column.
+        let (area, preview_pane_area) = self.split_preview_pane(area);
         let composer_height = self.composer_height(area.width);
         // The footer is a single fixed row: just the status line. No hint bar, so
         // the layout never shifts up or down as turns start and finish.
@@ -2695,6 +2700,13 @@ impl CodeTuiApp {
             } else {
                 None
             };
+        }
+
+        // After `collect_desired_inline_images` (it clears `desired`), so the
+        // pane's placement survives into the post-draw flush.
+        self.preview_close_hits.clear();
+        if let Some(pane_area) = preview_pane_area {
+            self.render_preview_pane(frame, pane_area);
         }
 
         if let Some(plan_panel_area) = plan_panel_area {

@@ -24,6 +24,7 @@ impl CodeTuiApp {
             || self.toast.is_some()
             || self.drag_autoscroll.is_some()
             || self.selection_flash_until.is_some()
+            || self.preview_pane_loading()
     }
 
     /// Advance the welcome-screen tip once its interval elapses; returns `true`

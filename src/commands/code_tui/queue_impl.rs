@@ -173,6 +173,8 @@ pub(super) fn command_recall_text(command: &SlashCommand) -> String {
         SlashCommand::Attach(path) => format!("/attach {path}"),
         SlashCommand::Copy(None) => "/copy".to_string(),
         SlashCommand::Copy(Some(n)) => format!("/copy {n}"),
+        SlashCommand::Preview(None) => "/preview".to_string(),
+        SlashCommand::Preview(Some(target)) => format!("/preview {target}"),
         SlashCommand::Skills(arg) => with_arg("skills", arg),
         SlashCommand::Agents(arg) => with_arg("agents", arg),
         SlashCommand::Mcp(arg) => with_arg("mcp", arg),

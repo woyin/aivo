@@ -13,6 +13,7 @@ mod mouse;
 mod overlays;
 mod pickers;
 mod plan;
+mod preview_pane;
 mod queue;
 mod render;
 mod render_perf;

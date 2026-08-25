@@ -42,7 +42,7 @@ impl CodeTuiApp {
 
         let footer_text = if menu.entries.is_empty() {
             "Esc close · Enter submit"
-        } else if menu.kind == MenuKind::AttachPath {
+        } else if menu.kind == MenuKind::Path {
             "Esc close · Enter/Tab insert · ↑/↓ navigate"
         } else if menu.kind == MenuKind::Effort {
             "Esc close · Enter apply · Tab insert · ↑/↓ navigate"
@@ -2816,7 +2816,10 @@ const HELP_COMMAND_GROUPS: &[(&str, &[&str])] = &[
         ],
     ),
     ("Model & key", &["model", "key"]),
-    ("Context", &["attach", "compact", "context", "memory"]),
+    (
+        "Context",
+        &["attach", "preview", "compact", "context", "memory"],
+    ),
     (
         "Skills & tools",
         &["skills", "create-skill", "agents", "mcp"],

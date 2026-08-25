@@ -577,6 +577,10 @@ impl CodeTuiApp {
         self.flush_pending_assistant();
         self.clear_tool_output();
         self.turn_steps += 1;
+        // Pins at call time — validation matches the engine's `preview_call`.
+        if name == "preview" {
+            self.apply_preview_tool_call(&args);
+        }
         // Stamp the status-line action label for the in-flight step.
         let cwd = if self.real_cwd.is_empty() {
             self.cwd.clone()
@@ -1984,6 +1988,14 @@ impl CodeTuiApp {
                 needs_redraw = true;
             }
 
+            if self.tick_image_scroll_settle() {
+                needs_redraw = true;
+            }
+
+            if self.tick_preview_pane() {
+                needs_redraw = true;
+            }
+
             // Self-heal: full repaint mid-stream and once more when it settles.
             let streaming = self.sending || !self.incoming_buffer.is_empty();
             if streaming && last_stream_repaint.elapsed() >= STREAM_FULL_REPAINT_INTERVAL {
@@ -2501,6 +2513,15 @@ impl CodeTuiApp {
                     && rect_contains(hit, (mouse.column, mouse.row))
                 {
                     self.scroll_to_bottom();
+                    return Ok(false);
+                }
+                if !self.overlay.blocks_input()
+                    && self
+                        .preview_close_hits
+                        .iter()
+                        .any(|hit| rect_contains(*hit, (mouse.column, mouse.row)))
+                {
+                    self.close_preview_pane();
                     return Ok(false);
                 }
                 // Clicking the footer session id opens its detail overlay.

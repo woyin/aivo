@@ -27,6 +27,22 @@ fn test_parse_slash_command_with_argument() {
 }
 
 #[test]
+fn test_parse_slash_preview() {
+    assert_eq!(
+        parse_slash_command("preview assets/logo.svg").unwrap(),
+        SlashCommand::Preview(Some("assets/logo.svg".to_string()))
+    );
+    assert_eq!(
+        parse_slash_command("preview off").unwrap(),
+        SlashCommand::Preview(Some("off".to_string()))
+    );
+    assert_eq!(
+        parse_slash_command("preview").unwrap(),
+        SlashCommand::Preview(None)
+    );
+}
+
+#[test]
 fn test_parse_slash_share() {
     assert_eq!(
         parse_slash_command("share").unwrap(),

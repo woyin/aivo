@@ -603,6 +603,8 @@ pub struct AgentEngine {
     /// `/config` Image generation model; `Some` advertises `generate_image`.
     /// `None` → `generate_image` isn't advertised.
     image_source: Option<crate::services::image_generate::GeneratorSource>,
+    /// Client can show the side preview pane; `true` advertises `preview`.
+    preview_supported: bool,
     /// `/config` master switch; off → plain chat (no tools, no system prompt).
     agent_tools_enabled: bool,
     /// Whether this model can reason at all (snapshot). Cached at construction so the

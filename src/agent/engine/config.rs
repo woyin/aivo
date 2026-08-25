@@ -77,6 +77,7 @@ impl AgentEngine {
             thinking_enabled: true,
             use_web_search_enabled: true,
             image_source: None,
+            preview_supported: false,
             agent_tools_enabled: true,
             reasoning_capable: default_reasoning_effort(model).is_some(),
             read_only: false,
@@ -410,6 +411,20 @@ plan-approval card — suggest it when a task deserves real design discussion.{i
             self.plan_mode_stash.retain(|t| !is_gen(t));
         }
         self.image_source = source;
+    }
+
+    /// Idempotent, like `set_image_source`.
+    pub fn set_preview_supported(&mut self, on: bool) {
+        let is_preview = |t: &Value| t["function"]["name"].as_str() == Some("preview");
+        let has =
+            self.tools_openai.iter().any(is_preview) || self.plan_mode_stash.iter().any(is_preview);
+        if on && !has {
+            self.advertise_tool(tool_to_openai(tools::preview_tool_spec()));
+        } else if !on && has {
+            self.tools_openai.retain(|t| !is_preview(t));
+            self.plan_mode_stash.retain(|t| !is_preview(t));
+        }
+        self.preview_supported = on;
     }
 
     /// Add a tool spec — into the plan-mode stash when plan mode hides it. The TUI

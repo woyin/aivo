@@ -44,6 +44,30 @@ fn image_model_gates_generate_image_tool() {
 }
 
 #[test]
+fn preview_support_gates_preview_tool() {
+    let mut e = AgentEngine::new("/tmp", "deepseek-v4", "", &[], &[], 0, 0);
+    let has = |e: &AgentEngine| {
+        e.tools_openai
+            .iter()
+            .any(|t| t["function"]["name"].as_str() == Some("preview"))
+    };
+    assert!(!has(&e), "headless default → no tool");
+    e.set_preview_supported(true);
+    assert!(has(&e), "capable client advertises the tool");
+    e.set_preview_supported(true);
+    assert_eq!(
+        e.tools_openai
+            .iter()
+            .filter(|t| t["function"]["name"].as_str() == Some("preview"))
+            .count(),
+        1,
+        "idempotent — never a duplicate spec"
+    );
+    e.set_preview_supported(false);
+    assert!(!has(&e), "losing the capability removes the tool");
+}
+
+#[test]
 fn gemini_keeps_local_web_search_not_native_server_tool() {
     // Gemini 400s on google_search + function tools, and the agent always has function tools.
     let e = AgentEngine::new("/tmp", "gemini-2.5-flash", "", &[], &[], 0, 0);

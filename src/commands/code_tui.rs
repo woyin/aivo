@@ -69,6 +69,8 @@ mod input_impl;
 mod key_handler_impl;
 #[path = "code_tui/live_impl.rs"]
 mod live_impl;
+#[path = "code_tui/preview_pane.rs"]
+mod preview_pane;
 #[path = "code_tui/queue_impl.rs"]
 mod queue_impl;
 #[path = "code_tui/runtime_impl.rs"]
@@ -78,6 +80,7 @@ mod session_impl;
 
 use self::inline_images::*;
 use self::menu::*;
+use self::preview_pane::*;
 use self::render::*;
 pub(crate) use self::runtime_impl::skill_invocation_label;
 pub(crate) use self::shared::CodeTuiParams;

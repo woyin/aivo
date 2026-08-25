@@ -27,6 +27,31 @@ fn placement(y: u16) -> PlacedImage {
 }
 
 #[tokio::test]
+async fn sixel_scroll_movement_holds_placements_until_settled() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.inline_images.caps = sixel_caps();
+
+    assert!(!app.sixel_scroll_hold());
+    app.transcript_scroll = 5;
+    assert!(app.sixel_scroll_hold());
+    assert!(!app.tick_image_scroll_settle(), "still inside the debounce");
+    app.inline_images.scroll_settle =
+        Some(std::time::Instant::now() - std::time::Duration::from_secs(1));
+    assert!(app.tick_image_scroll_settle());
+    assert!(!app.sixel_scroll_hold(), "settled scroll no longer holds");
+
+    // Kitty-virtual scrolls placeholders as cells — never held.
+    app.inline_images.caps = GraphicsCaps {
+        protocol: Protocol::KittyVirtual,
+        tmux: false,
+        cell_px: (8, 16),
+    };
+    app.transcript_scroll = 9;
+    assert!(!app.sixel_scroll_hold());
+}
+
+#[tokio::test]
 async fn sixel_removal_queues_partial_clear_not_full_repaint() {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let mut app = make_test_app(tx, rx);

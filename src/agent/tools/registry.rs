@@ -66,6 +66,8 @@ pub static TOOL_TRAITS: &[ToolTraits] = &[
     // A sub-engine isn't read-only; image generation writes a file + bills a call.
     tool!("subagent", plan_hidden),
     tool!("generate_image", plan_hidden),
+    // Display only — no workspace touch.
+    tool!("preview", read_only),
     // Session controls / prompts / job+schema queries — engine state only.
     tool!("switch_model", read_only),
     tool!("set_effort", read_only),

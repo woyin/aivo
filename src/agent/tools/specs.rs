@@ -230,6 +230,28 @@ If a dedicated image-generation tool from an MCP server is available, prefer tha
     )
 }
 
+/// Advertised only when the client can show the pane (`set_preview_supported`).
+pub fn preview_tool_spec() -> ToolSpec {
+    spec(
+        "preview",
+        "Show a live preview of an image, SVG, or HTML file (or an image URL) in the user's \
+side preview pane. The pane tracks a file target and re-renders when it changes on disk, \
+so call it once and keep editing. Only call this when the user explicitly asks to \
+preview, show, or watch a visual file — creating or editing one is NOT a reason to open \
+the pane (the transcript already previews written files). Pass reload=true to force a \
+fresh render of the current target (for pages that draw differently each load). Pass \
+close=true to close the pane. Not for reading file contents (use read_file).",
+        json!({
+            "type": "object",
+            "properties": {
+                "target": {"type": "string", "description": "Path to an image/SVG/HTML file (workspace-relative or absolute), or an http(s) URL"},
+                "reload": {"type": "boolean", "description": "Re-render the currently pinned target even if the file is unchanged"},
+                "close": {"type": "boolean", "description": "Close the preview pane instead of opening one"}
+            }
+        }),
+    )
+}
+
 pub(super) fn apply_patch_spec() -> ToolSpec {
     spec(
         "apply_patch",

@@ -20,6 +20,53 @@ pub fn looks_like_svg(bytes: &[u8]) -> bool {
     trimmed.starts_with("<svg") || (trimmed.starts_with("<?xml") && text.contains("<svg"))
 }
 
+/// Sniffs an HTML document by content.
+pub fn looks_like_html(bytes: &[u8]) -> bool {
+    let head = &bytes[..bytes.len().min(1024)];
+    let Ok(text) = std::str::from_utf8(head) else {
+        return false;
+    };
+    let lower = text.trim_start().to_ascii_lowercase();
+    lower.starts_with("<!doctype html") || lower.starts_with("<html") || lower.contains("<html")
+}
+
+/// What the side preview pane can render; shared by the engine's `preview`
+/// vetting and the TUI pane's pipeline pick.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PreviewTargetKind {
+    Image,
+    Svg,
+    Html,
+}
+
+/// Extension first, content sniff for extensionless files; `None` = not renderable.
+pub fn classify_preview_target(path: &Path) -> Option<PreviewTargetKind> {
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(str::to_ascii_lowercase);
+    match ext.as_deref() {
+        Some("png" | "jpg" | "jpeg") => return Some(PreviewTargetKind::Image),
+        Some("svg") => return Some(PreviewTargetKind::Svg),
+        Some("html" | "htm") => return Some(PreviewTargetKind::Html),
+        _ => {}
+    }
+    let mut head = vec![0u8; 4096];
+    let n = std::fs::File::open(path)
+        .and_then(|mut f| std::io::Read::read(&mut f, &mut head))
+        .ok()?;
+    head.truncate(n);
+    if crate::services::image_optimize::sniff_format(&head).is_some() {
+        Some(PreviewTargetKind::Image)
+    } else if looks_like_svg(&head) {
+        Some(PreviewTargetKind::Svg)
+    } else if looks_like_html(&head) {
+        Some(PreviewTargetKind::Html)
+    } else {
+        None
+    }
+}
+
 /// Conservative external-reference sniff. The browser rungs (qlmanage,
 /// chrome) fetch external refs — a prompt-injected `<image href>` would be a
 /// zero-click beacon — so they only see markup this clears. Allowlists the
@@ -132,8 +179,9 @@ pub fn rasterize_svg(bytes: &[u8]) -> Option<Vec<u8>> {
     // A failed rung above may have left a partial `out`.
     let _ = std::fs::remove_file(&out);
     let profile = dir.path().join("chrome-profile");
+    let edge: u32 = RASTER_EDGE.parse().unwrap_or(1024);
     for browser in chrome_candidates() {
-        if try_chrome_screenshot(&browser, &profile, &src, &out)
+        if try_chrome_screenshot(&browser, &profile, src.as_os_str(), &out, (edge, edge))
             && let Ok(png) = std::fs::read(&out)
         {
             return Some(png);
@@ -142,6 +190,36 @@ pub fn rasterize_svg(bytes: &[u8]) -> Option<Vec<u8>> {
 
     None
 }
+
+/// Page (HTML file or http(s) URL) → PNG viewport screenshot, browser-only.
+/// Deliberately no external-ref gate: a page preview is an explicit request,
+/// and pages fetch subresources by design.
+pub fn rasterize_page(target: &str) -> Option<Vec<u8>> {
+    // Same kill switch as the SVG cascade (the test sandbox sets it).
+    if std::env::var("AIVO_NO_SVG_RASTER").is_ok_and(|v| !v.is_empty() && v != "0") {
+        return None;
+    }
+    let dir = tempfile::tempdir().ok()?;
+    let out = dir.path().join("page.png");
+    let profile = dir.path().join("chrome-profile");
+    for browser in chrome_candidates() {
+        if try_chrome_screenshot(
+            &browser,
+            &profile,
+            std::ffi::OsStr::new(target),
+            &out,
+            PAGE_VIEWPORT,
+        ) && let Ok(png) = std::fs::read(&out)
+        {
+            return Some(png);
+        }
+    }
+    None
+}
+
+/// 1024 wide = the terminal PNG-passthrough edge limit, so screenshots reach
+/// kitty full-res instead of the 512px re-encoded thumb.
+const PAGE_VIEWPORT: (u32, u32) = (1024, 640);
 
 /// Most-preferred first; missing candidates fail the spawn instantly.
 fn chrome_candidates() -> Vec<PathBuf> {
@@ -191,13 +269,19 @@ const CHROME_POLL: std::time::Duration = std::time::Duration::from_millis(120);
 /// Modern Chrome writes the screenshot but the process lingers (the
 /// self-exiting mode moved to chrome-headless-shell), so never wait for
 /// exit: poll for the artifact, then kill.
-fn try_chrome_screenshot(browser: &Path, profile: &Path, src: &Path, out: &Path) -> bool {
+fn try_chrome_screenshot(
+    browser: &Path,
+    profile: &Path,
+    target: &std::ffi::OsStr,
+    out: &Path,
+    (w, h): (u32, u32),
+) -> bool {
     use std::process::Stdio;
     // Null stdio: the crashpad child inherits pipes and outlives the kill.
     let Ok(mut child) = Command::new(browser)
         .arg("--headless")
         .arg(format!("--screenshot={}", out.display()))
-        .arg(format!("--window-size={RASTER_EDGE},{RASTER_EDGE}"))
+        .arg(format!("--window-size={w},{h}"))
         // Fresh profile, or a running browser steals the invocation.
         .arg(format!("--user-data-dir={}", profile.display()))
         .args([
@@ -209,7 +293,7 @@ fn try_chrome_screenshot(browser: &Path, profile: &Path, src: &Path, out: &Path)
             // keychain (fake $HOME) pops a blocking macOS dialog.
             "--use-mock-keychain",
         ])
-        .arg(src)
+        .arg(target)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -307,10 +391,53 @@ mod tests {
         let profile = dir.path().join("chrome-profile");
         let ok = chrome_candidates()
             .iter()
-            .any(|b| try_chrome_screenshot(b, &profile, &src, &out));
+            .any(|b| try_chrome_screenshot(b, &profile, src.as_os_str(), &out, (1024, 1024)));
         assert!(ok, "no chrome-family browser produced a screenshot");
         let png = std::fs::read(&out).unwrap();
         assert!(png.starts_with(&[0x89, b'P', b'N', b'G']));
+    }
+
+    #[test]
+    fn sniffs_html_content() {
+        assert!(looks_like_html(b"<!DOCTYPE html><html><body/></html>"));
+        assert!(looks_like_html(b"  <html lang=\"en\">"));
+        assert!(looks_like_html(b"<!-- x --><html>"));
+        assert!(!looks_like_html(b"<svg xmlns=\"x\"/>"));
+        assert!(!looks_like_html(&[0x89, b'P', b'N', b'G']));
+    }
+
+    #[test]
+    fn classifies_preview_targets() {
+        use PreviewTargetKind::*;
+        let dir = tempfile::tempdir().unwrap();
+        let write = |name: &str, bytes: &[u8]| {
+            let p = dir.path().join(name);
+            std::fs::write(&p, bytes).unwrap();
+            p
+        };
+        assert_eq!(classify_preview_target(&write("a.png", b"")), Some(Image));
+        assert_eq!(classify_preview_target(&write("a.svg", b"")), Some(Svg));
+        assert_eq!(classify_preview_target(&write("a.html", b"")), Some(Html));
+        assert_eq!(
+            classify_preview_target(&write("img", &[0x89, b'P', b'N', b'G', 0, 0])),
+            Some(Image)
+        );
+        assert_eq!(
+            classify_preview_target(&write("vector", b"<svg xmlns=\"x\"/>")),
+            Some(Svg)
+        );
+        assert_eq!(
+            classify_preview_target(&write("page", b"<!doctype html><html/>")),
+            Some(Html)
+        );
+        assert_eq!(
+            classify_preview_target(&write("code.rs", b"fn main() {}")),
+            None
+        );
+        assert_eq!(
+            classify_preview_target(&dir.path().join("missing.txt")),
+            None
+        );
     }
 
     #[test]

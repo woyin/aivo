@@ -1079,6 +1079,8 @@ impl CodeTuiApp {
         // `/config` "use aivo web search" toggle, applied like thinking each turn.
         let web_search_enabled = self.web_search_enabled;
         let agent_tools_enabled = self.agent_tools_enabled;
+        // The pane renders through the graphics stack — no protocol, no tool.
+        let preview_supported = self.inline_images.caps.enabled();
         // The model's catalog effort levels, so the engine's disable path only sends
         // a level the provider accepts (e.g. `aivo/starter` has no `none`).
         let reasoning_efforts = self.model_reasoning_efforts.clone();
@@ -1149,6 +1151,7 @@ impl CodeTuiApp {
             engine.set_web_search_enabled(web_search_enabled);
             engine.set_agent_tools_enabled(agent_tools_enabled);
             engine.set_image_source(image_source);
+            engine.set_preview_supported(preview_supported);
             engine.set_reasoning_efforts(reasoning_efforts);
             if let Some(effort) = reasoning_effort {
                 engine.set_reasoning_effort(effort);
@@ -1823,6 +1826,10 @@ impl CodeTuiApp {
             }
             SlashCommand::Copy(n) => {
                 self.copy_reply_to_clipboard(n)?;
+                Ok(false)
+            }
+            SlashCommand::Preview(arg) => {
+                self.run_preview_command(arg);
                 Ok(false)
             }
             SlashCommand::Skills(arg) => {

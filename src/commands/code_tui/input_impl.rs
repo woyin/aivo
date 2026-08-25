@@ -378,15 +378,17 @@ impl CodeTuiApp {
         command_usage_hint(self.draft[1..].trim_end())
     }
 
-    pub(super) fn active_attach_query(&self) -> Option<&str> {
-        if self.overlay.blocks_input()
-            || !self.draft.starts_with("/attach ")
-            || self.draft.starts_with("//")
-            || self.draft.contains('\n')
+    /// The (command, partial path) of a path-completing command being typed.
+    pub(super) fn active_path_query(&self) -> Option<(&'static str, &str)> {
+        if self.overlay.blocks_input() || self.draft.starts_with("//") || self.draft.contains('\n')
         {
             return None;
         }
-        Some(&self.draft["/attach ".len()..])
+        [("attach", "/attach "), ("preview", "/preview ")]
+            .into_iter()
+            .find_map(|(command, prefix)| {
+                self.draft.strip_prefix(prefix).map(|rest| (command, rest))
+            })
     }
 
     /// `/effort` arg filter. Off when the model has no levels, so the command
@@ -415,7 +417,7 @@ impl CodeTuiApp {
         if self.overlay.blocks_input()
             || self.last_subagents.is_empty()
             || self.active_command_query().is_some()
-            || self.active_attach_query().is_some()
+            || self.active_path_query().is_some()
         {
             return None;
         }
@@ -541,12 +543,12 @@ impl CodeTuiApp {
             return None;
         } else if let Some(query) = self.active_command_query() {
             (MenuKind::Commands, self.matching_command_entries(query))
-        } else if let Some(query) = self.active_attach_query() {
+        } else if let Some((command, query)) = self.active_path_query() {
             (
-                MenuKind::AttachPath,
+                MenuKind::Path,
                 // Suggest from the real launch dir (where relative paths actually
                 // resolve at queue time), NOT chat's empty sandbox (`self.cwd`).
-                collect_attach_path_suggestions(self.persist_cwd(), query)
+                collect_path_suggestions(self.persist_cwd(), command, query)
                     .into_iter()
                     .map(ComposerMenuEntry::Path)
                     .collect::<Vec<_>>(),
@@ -577,8 +579,8 @@ impl CodeTuiApp {
             (MenuKind::Effort, query.to_string())
         } else if let Some(query) = self.active_command_query() {
             (MenuKind::Commands, query.to_string())
-        } else if let Some(query) = self.active_attach_query() {
-            (MenuKind::AttachPath, query.to_string())
+        } else if let Some((_, query)) = self.active_path_query() {
+            (MenuKind::Path, query.to_string())
         } else if let Some((_, query)) = self.active_mention_query() {
             (MenuKind::Mention, query)
         } else {
@@ -608,8 +610,8 @@ impl CodeTuiApp {
             self.matching_effort_entries(&query).len()
         } else if self.active_command_query().is_some() {
             self.matching_command_entries(&query).len()
-        } else if self.active_attach_query().is_some() {
-            collect_attach_path_suggestions(self.persist_cwd(), &query).len()
+        } else if let Some((command, _)) = self.active_path_query() {
+            collect_path_suggestions(self.persist_cwd(), command, &query).len()
         } else {
             self.matching_mention_entries(&query).len()
         };
@@ -650,7 +652,7 @@ impl CodeTuiApp {
 
     pub(super) fn dismiss_command_menu(&mut self) -> bool {
         if (self.active_command_query().is_none()
-            && self.active_attach_query().is_none()
+            && self.active_path_query().is_none()
             && self.active_effort_query().is_none()
             && self.active_mention_query().is_none())
             || self.command_menu.dismissed

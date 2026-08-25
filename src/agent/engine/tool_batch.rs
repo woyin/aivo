@@ -465,6 +465,8 @@ planning is off) — continue with the task."
                         }
                         out.text
                     })
+            } else if n == "preview" {
+                self.preview_call(ctx, &call.arguments)
             } else if n == "run_bash" && jobs::wants_background(&call.arguments) {
                 // Detached job — no escalation flow (a spawn returns before a sandbox block shows).
                 match (
@@ -707,6 +709,49 @@ Before calling `{tool}` again, make its arguments match this schema exactly:\n{s
             text: saved_notes.trim_start().to_string(),
             images,
         })
+    }
+
+    /// The pane lives in the client — the TUI pins from these arguments — so
+    /// the engine only vets the target.
+    fn preview_call(&self, ctx: &TurnCtx<'_>, args: &Value) -> Result<String, String> {
+        if !self.preview_supported {
+            return Err("the preview pane isn't available in this run mode.".to_string());
+        }
+        if args.get("close").and_then(Value::as_bool).unwrap_or(false) {
+            return Ok("Closed the preview pane.".to_string());
+        }
+        let reload = args.get("reload").and_then(Value::as_bool).unwrap_or(false);
+        let Some(target) = args
+            .get("target")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        else {
+            if reload {
+                return Ok("Re-rendering the pinned preview.".to_string());
+            }
+            return Err(
+                "missing required string argument `target` (or pass reload=true / close=true)"
+                    .to_string(),
+            );
+        };
+        if target.starts_with("http://") || target.starts_with("https://") {
+            return Ok(format!("Previewing {target} in the side pane."));
+        }
+        let path = tools::resolve(ctx.cwd, target);
+        let meta =
+            std::fs::metadata(&path).map_err(|e| format!("preview target `{target}`: {e}"))?;
+        if !meta.is_file() {
+            return Err(format!("preview target `{target}` is not a file"));
+        }
+        if crate::services::svg_raster::classify_preview_target(&path).is_none() {
+            return Err(format!(
+                "preview target `{target}` isn't previewable — supported: PNG/JPEG images, SVG, HTML"
+            ));
+        }
+        Ok(format!(
+            "Previewing {target} in the side pane; it re-renders as the file changes on disk."
+        ))
     }
 
     /// Run a `run_bash` call confined to the workspace. If the OS sandbox blocks a

@@ -260,7 +260,7 @@ async fn test_selecting_attach_command_transitions_to_path_menu() {
 
     assert_eq!(app.draft, "/attach ");
     let menu = app.visible_command_menu().expect("attach path menu");
-    assert_eq!(menu.kind, MenuKind::AttachPath);
+    assert_eq!(menu.kind, MenuKind::Path);
     assert!(
         menu.entries
             .iter()
@@ -485,12 +485,12 @@ fn test_command_menu_uses_rounded_border() {
 }
 
 #[test]
-fn test_collect_attach_path_suggestions_lists_matching_entries() {
+fn test_collect_path_suggestions_lists_matching_entries() {
     let temp_dir = TempDir::new().unwrap();
     std::fs::write(temp_dir.path().join("alpha.txt"), "hi").unwrap();
     std::fs::create_dir(temp_dir.path().join("assets")).unwrap();
 
-    let entries = collect_attach_path_suggestions(temp_dir.path().to_str().unwrap(), "a");
+    let entries = collect_path_suggestions(temp_dir.path().to_str().unwrap(), "attach", "a");
 
     assert!(entries.iter().any(|entry| entry.label == "assets/"));
     assert!(entries.iter().any(|entry| entry.label == "alpha.txt"));
@@ -509,11 +509,29 @@ fn test_attach_query_uses_path_menu_and_tab_inserts_selected_path() {
     app.sync_command_menu_state();
 
     let menu = app.visible_command_menu().unwrap();
-    assert_eq!(menu.kind, MenuKind::AttachPath);
+    assert_eq!(menu.kind, MenuKind::Path);
     assert!(app.insert_selected_command());
     assert_eq!(app.draft, "/attach assets/");
     // Menu stays open after tab on a directory so the user can continue navigating.
     assert!(app.visible_command_menu().is_some());
+}
+
+#[test]
+fn test_preview_query_completes_paths_like_attach() {
+    let temp_dir = TempDir::new().unwrap();
+    std::fs::write(temp_dir.path().join("chart.svg"), "<svg/>").unwrap();
+
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.cwd = temp_dir.path().to_string_lossy().into_owned();
+    app.draft = "/preview ch".to_string();
+    app.cursor = app.draft.len();
+    app.sync_command_menu_state();
+
+    let menu = app.visible_command_menu().expect("preview path menu");
+    assert_eq!(menu.kind, MenuKind::Path);
+    assert!(app.insert_selected_command());
+    assert_eq!(app.draft, "/preview chart.svg");
 }
 
 /// The `@` mention menu: word-boundary trigger (mid-message ok, emails no),

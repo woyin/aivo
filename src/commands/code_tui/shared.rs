@@ -560,6 +560,12 @@ pub(super) const SLASH_COMMANDS: &[SlashCommandSpec] = &[
         takes_argument: true,
     },
     SlashCommandSpec {
+        name: "preview",
+        help_label: "/preview [path|url|reload|off]",
+        description: "pin a live preview pane (image, SVG, HTML)",
+        takes_argument: true,
+    },
+    SlashCommandSpec {
         name: "skills",
         help_label: "/skills [add|rm|update …]",
         description: "list, add, or remove agent skills",
@@ -691,9 +697,8 @@ pub(super) fn command_usage_hint(name: &str) -> Option<&'static str> {
         "key" => Some("[id|name]"),
         "resume" => Some("[query]"),
         "copy" => Some("[n]"),
-        // `attach` is deliberately omitted: typing `/attach ` opens path
-        // completion, which is more useful than a static `<path>` ghost — and a
-        // ghost would suppress that menu (see `visible_command_menu`).
+        // `attach`/`preview` deliberately omitted: a `<path>` ghost would
+        // suppress the path-completion menu (see `visible_command_menu`).
         _ => None,
     }
 }
@@ -1955,7 +1960,8 @@ pub(super) struct PathMenuEntry {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum MenuKind {
     Commands,
-    AttachPath,
+    /// Path completion for a command's file argument (`/attach`, `/preview`).
+    Path,
     Effort,
     /// `@name` sub-agent mentions in the composer.
     Mention,
@@ -2499,6 +2505,8 @@ pub(super) enum SlashCommand {
     Attach(String),
     /// Copy the Nth-latest assistant reply (default 1 = most recent) to the clipboard.
     Copy(Option<usize>),
+    /// Side preview pane: `<path|url>` pins, `off` closes, bare toggles off.
+    Preview(Option<String>),
     /// Agent skills: bare opens the overlay; `add …` / `rm <name>` manage them.
     Skills(Option<String>),
     /// Named sub-agents: bare opens the overlay; `rm <name>` deletes one.
@@ -3149,6 +3157,8 @@ pub(super) struct CodeTuiApp {
     pub(super) session_id_hit: Option<Rect>,
     /// Footer `● sharing` badge click region; `None` while not sharing.
     pub(super) share_badge_hit: Option<Rect>,
+    /// Preview pane `✕` click regions (header + hint); empty while not drawn.
+    pub(super) preview_close_hits: Vec<Rect>,
     /// The composer text region from the last render, for mouse cursor-placement
     /// and the key-handler's wrap math (it needs the width before the next frame).
     /// `None` until the first render.
@@ -3192,6 +3202,8 @@ pub(super) struct CodeTuiApp {
     pub(super) session_preview: SessionPreviewState,
     /// Inline transcript image previews (Kitty graphics); see `inline_images.rs`.
     pub(super) inline_images: InlineImageState,
+    /// The pinned side preview pane (`/preview`, agent `preview` tool).
+    pub(super) preview_pane: Option<PreviewPane>,
     /// `/config` inline-preview toggle; off keeps `inline_images.caps` disabled.
     pub(super) inline_images_enabled: bool,
     /// The kitty deletes on disable need the terminal writer — event loop only.
@@ -3750,6 +3762,7 @@ impl CodeTuiApp {
             last_max_scroll: None,
             transcript_hitbox: None,
             jump_to_bottom_hit: None,
+            preview_close_hits: Vec::new(),
             session_id_hit: None,
             share_badge_hit: None,
             composer_text_area: None,
@@ -3775,6 +3788,7 @@ impl CodeTuiApp {
             resume_restore_state: None,
             session_preview: SessionPreviewState::default(),
             inline_images: InlineImageState::default(),
+            preview_pane: None,
             inline_images_enabled: true,
             pending_inline_image_cleanup: false,
             detected_graphics_caps: crate::services::terminal_graphics::GraphicsCaps::default(),
