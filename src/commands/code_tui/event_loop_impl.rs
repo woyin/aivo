@@ -37,6 +37,12 @@ impl CodeTuiApp {
             RuntimeEvent::ResumeLoaded { request_id, result } => {
                 self.apply_resume_load_result(request_id, result).await?;
             }
+            // Advisory: never over a notice that landed first (e.g. -c summary).
+            RuntimeEvent::PlanHintReady(hint) => {
+                if self.notice.is_none() {
+                    self.notice = Some((MUTED(), hint));
+                }
+            }
             RuntimeEvent::ImagePreviewReady { key, preview } => {
                 let slot = match preview {
                     Some(p) => PreviewSlot::Ready(std::sync::Arc::new(*p)),
@@ -209,7 +215,21 @@ impl CodeTuiApp {
                         Some((ERROR(), format!("Authorization for `{name}` failed: {e}")));
                 }
             },
-            RuntimeEvent::AgentPlan(items) => self.apply_agent_plan(items),
+            RuntimeEvent::AgentPlan(items) => {
+                self.apply_agent_plan(items);
+                // Checkpoint now, not just at turn end — a crash/kill mid-execution
+                // must not lose completed steps. Off the event loop: the write is
+                // O(session file) and would stall rendering. The turn-end persist
+                // stays authoritative (it also handles the cleared-plan cleanup).
+                if let Some(plan) = self.current_plan_state() {
+                    self.plan_state_written.set(true);
+                    let store = self.session_store.clone();
+                    let session_id = self.session_id.clone();
+                    tokio::spawn(async move {
+                        let _ = store.set_plan_state(&session_id, Some(&plan)).await;
+                    });
+                }
+            }
             RuntimeEvent::AgentNotice(text) => {
                 // A connection-retry notice means we're recovering, not thinking.
                 self.retrying = text.contains("retrying");
@@ -1687,6 +1707,7 @@ impl CodeTuiApp {
         if loading.request_id != request_id {
             return Ok(());
         }
+        let continue_plan = loading.continue_plan;
 
         self.resume_task = None;
         match result {
@@ -1695,6 +1716,12 @@ impl CodeTuiApp {
                 self.loading_resume = None;
                 self.resume_restore_state = None;
                 self.notice = None;
+                // Bare `/plan` restored this session for its plan: dispatch the
+                // continue turn instead of asking the user to say it.
+                if continue_plan && let Some(steps) = self.unfinished_plan_steps() {
+                    self.resume_plan_from_session(PlanCarry::Interrupted(steps))
+                        .await;
+                }
             }
             Err(err) => {
                 self.loading_resume = None;

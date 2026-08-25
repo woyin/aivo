@@ -101,8 +101,7 @@ const DENIAL_DIRECTIVE_AT: usize = 2;
 const DENIAL_STOP_AT: usize = 4;
 /// A second dismissed card means the model re-asked against the stop directive.
 const DISMISS_STOP_AT: usize = 2;
-pub(crate) const STOP_DISMISSED: &str =
-    "stopping: the user dismissed the question again — over to them";
+pub(crate) const STOP_DISMISSED: &str = "stopping: question dismissed — over to the user";
 const DENIAL_RECOVERY_DIRECTIVE: &str = "[permission guard] Several actions were denied. Stop \
 pursuing the blocked approach — do not call tools for it again. Reply now: state what was \
 blocked, what you completed, and what the user could do to unblock it.";
@@ -437,6 +436,9 @@ pub struct TurnCtx<'a> {
     /// Live mid-turn plan-mode exit (chat TUI Shift+Tab), read per tool-call
     /// boundary so the running turn drops the plan floor. `None` outside the TUI.
     pub plan_exit: Option<&'a std::sync::atomic::AtomicBool>,
+    /// Live mid-turn plan-mode entry (the reverse ring direction), read per
+    /// tool-call boundary so the running turn goes read-only. `None` outside the TUI.
+    pub plan_enter: Option<&'a std::sync::atomic::AtomicBool>,
 }
 
 impl TurnCtx<'_> {
@@ -462,6 +464,11 @@ impl TurnCtx<'_> {
 
     pub fn plan_exit_requested(&self) -> bool {
         self.plan_exit
+            .is_some_and(|f| f.load(std::sync::atomic::Ordering::Relaxed))
+    }
+
+    pub fn plan_enter_requested(&self) -> bool {
+        self.plan_enter
             .is_some_and(|f| f.load(std::sync::atomic::Ordering::Relaxed))
     }
 }
@@ -526,6 +533,9 @@ pub struct AgentEngine {
     /// Cards dismissed this turn; [`DISMISS_STOP_AT`] ends the turn. Reset per
     /// turn, on an answered card, and on steering.
     turn_dismissals: usize,
+    /// The dismissal was the plan card — a re-presented plan suppresses too.
+    /// (A dismissed question doesn't set this.) Reset with `turn_dismissals`.
+    plan_card_dismissed: bool,
     /// Discovered SKILL.md skills, loaded on demand via the `skill` tool.
     skills: Vec<Skill>,
     /// Named specialist sub-agents (top-level engine only). The `subagent` tool's

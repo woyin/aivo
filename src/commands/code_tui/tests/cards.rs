@@ -132,13 +132,12 @@ async fn test_auto_approve_toggle_shows_toast_not_notice() {
         .await
         .unwrap();
     assert!(!app.agent_auto_approve);
-    assert!(app.agent_review_edits, "auto cycles into review");
-    assert!(!app.plan_mode, "plan is not in the Shift+Tab ring");
+    assert!(app.plan_mode, "auto cycles into plan");
     assert!(app.notice.is_none());
     assert!(
         app.toast
             .as_ref()
-            .is_some_and(|t| t.text.contains("Review mode"))
+            .is_some_and(|t| t.text.contains("Plan mode"))
     );
 }
 

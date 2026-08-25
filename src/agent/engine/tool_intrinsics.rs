@@ -77,6 +77,13 @@ into every future session. The user can audit or edit it via /memory."
                 _ => Err("set_effort: missing `level`.".to_string()),
             },
             "ask_user" => match ask::parse_ask(args) {
+                // A card was already Esc'd this turn — don't pop another; the
+                // auto-dismissal also advances the ladder, ending the turn.
+                Ok(_) if self.turn_dismissals > 0 => {
+                    self.turn_dismissals += 1;
+                    ui.notify("suppressed a repeat question — the user dismissed the previous one");
+                    Ok(ask::DISMISSED_DIRECTIVE.to_string())
+                }
                 Ok((question, options, allow_free_text, multi_select)) => {
                     match ui
                         .ask_user(&question, &options, allow_free_text, multi_select)
@@ -84,6 +91,7 @@ into every future session. The user can audit or edit it via /memory."
                     {
                         Ok(answer) => {
                             self.turn_dismissals = 0;
+                            self.plan_card_dismissed = false;
                             Ok(ask::confirmation(&answer))
                         }
                         // User action, not a tool failure — an Err would hit the

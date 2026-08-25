@@ -162,6 +162,7 @@ async fn plan_mode_readonly_bash_skips_prompt() {
         auto_approve: None,
         review_edits: None,
         plan_exit: None,
+        plan_enter: None,
     };
     run_session(&mut engine, &ctx, Some("inspect".into()), &mut ui).await;
 
@@ -355,6 +356,74 @@ async fn exit_plan_mode_dismissal_is_a_result_not_a_failure() {
     );
 }
 
+/// A re-presented plan after Esc is auto-dismissed — no second card.
+#[tokio::test]
+async fn second_plan_card_after_dismissal_is_suppressed() {
+    let dir = tmp();
+    let exit = tool_call_sse("exit_plan_mode", json!({"plan": "1. do X"}));
+    let revised = tool_call_sse("exit_plan_mode", json!({"plan": "1. do X, revised"}));
+    let port = spawn_sse_sequence(vec![
+        exit,
+        revised,
+        FINAL_TEXT_SSE.to_string(), // never reached
+    ]);
+    let client = reqwest::Client::builder().no_proxy().build().unwrap();
+    let base = format!("http://127.0.0.1:{port}");
+    let mut engine = AgentEngine::new(&dir.display().to_string(), "m", "", &[], &[], 0, 0);
+    engine.set_plan_mode(true);
+    // `plan_decision: None` → the mock UI dismisses the card.
+    let mut ui = CapturingUi::default();
+    run_session(
+        &mut engine,
+        &turn_ctx(&client, &base, &dir),
+        Some("plan it".into()),
+        &mut ui,
+    )
+    .await;
+
+    assert_eq!(
+        ui.approved_plans.len(),
+        1,
+        "the revised plan must not reach the user"
+    );
+    assert!(ui.notices.iter().any(|n| n.contains("suppressed")));
+    assert_eq!(ui.stops, vec![TurnStop::DismissedLoop]);
+    assert!(engine.read_only, "plan mode stays on");
+}
+
+/// A dismissed question suppresses further ask_user cards, but not the plan
+/// approval card — presenting the plan is the right response to Esc.
+#[tokio::test]
+async fn dismissed_question_does_not_suppress_plan_approval() {
+    let dir = tmp();
+    let ask = tool_call_sse(
+        "ask_user",
+        json!({ "question": "Which one?", "options": ["a", "b"] }),
+    );
+    let exit = tool_call_sse("exit_plan_mode", json!({"plan": "1. do X"}));
+    let port = spawn_sse_sequence(vec![ask, exit, FINAL_TEXT_SSE.to_string()]);
+    let client = reqwest::Client::builder().no_proxy().build().unwrap();
+    let base = format!("http://127.0.0.1:{port}");
+    let mut engine = AgentEngine::new(&dir.display().to_string(), "m", "", &[], &[], 0, 0);
+    engine.set_plan_mode(true);
+    let mut ui = CapturingUi {
+        dismiss_asks: true,
+        plan_decision: Some(PlanDecision::Approve),
+        ..Default::default()
+    };
+    run_session(
+        &mut engine,
+        &turn_ctx(&client, &base, &dir),
+        Some("plan it".into()),
+        &mut ui,
+    )
+    .await;
+
+    assert_eq!(ui.approved_plans.len(), 1, "the plan card still shows");
+    assert!(!engine.read_only, "approval exits plan mode");
+    assert!(ui.stops.is_empty(), "an approved plan resets the ladder");
+}
+
 /// An empty `plan` argument is a steering error, not a card.
 #[tokio::test]
 async fn exit_plan_mode_empty_plan_errors() {
@@ -440,12 +509,43 @@ async fn live_plan_exit_drops_floor_mid_turn() {
         auto_approve: None,
         review_edits: None,
         plan_exit: Some(&exit),
+        plan_enter: None,
     };
     run_session(&mut engine, &ctx, Some("go".into()), &mut ui).await;
 
     assert_eq!(ui.asks, 0, "the plan floor dropped before the call");
     assert!(!engine.read_only, "plan mode exited mid-turn");
     assert!(dir.join("probe.txt").exists(), "the command ran");
+}
+
+/// The live mid-turn plan ENTRY (Shift+Tab into plan while a turn runs) restricts
+/// the running turn at the next call boundary: the write is refused.
+#[tokio::test]
+async fn live_plan_enter_restricts_mid_turn() {
+    let dir = tmp();
+    let write = tool_call_sse("write_file", json!({"path": "out.txt", "content": "hi"}));
+    let port = spawn_sse_sequence(vec![write, FINAL_TEXT_SSE.to_string()]);
+    let client = reqwest::Client::builder().no_proxy().build().unwrap();
+    let base = format!("http://127.0.0.1:{port}");
+    let mut engine = AgentEngine::new(&dir.display().to_string(), "m", "", &[], &[], 0, 0);
+    let mut ui = CapturingUi::default();
+    let enter = std::sync::atomic::AtomicBool::new(true); // the chord already fired
+    let ctx = TurnCtx {
+        client: &client,
+        serve_base: &base,
+        auth: None,
+        cwd: &dir,
+        yes: true,
+        auto_approve_all: false,
+        auto_approve: None,
+        review_edits: None,
+        plan_exit: None,
+        plan_enter: Some(&enter),
+    };
+    run_session(&mut engine, &ctx, Some("go".into()), &mut ui).await;
+
+    assert!(engine.read_only, "plan mode entered mid-turn");
+    assert!(!dir.join("out.txt").exists(), "the write never ran");
 }
 
 /// The plan-mode reminder rides each request's latest user message — ephemeral,

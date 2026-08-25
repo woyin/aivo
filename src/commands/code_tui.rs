@@ -433,6 +433,12 @@ pub(super) async fn run_chat_tui(params: CodeTuiParams) -> Result<()> {
     };
     let mut app = CodeTuiApp::new(params).await?;
     app.refresh_context_window().await;
+    // An unfinished plan in this directory: one hint line, `/plan` continues it.
+    // Scanned in the background (it reads every same-cwd session file — too slow
+    // for the launch path); the event handler drops it if a notice landed first.
+    if app.agent_capable() {
+        app.spawn_plan_hint_scan();
+    }
     // Surface discovered skills as `/`-typeable slash commands (e.g. `/repo-study`)
     // before the first keystroke, so the command menu suggests them right away.
     app.refresh_skill_commands().await;

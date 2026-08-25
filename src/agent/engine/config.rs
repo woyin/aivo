@@ -52,6 +52,7 @@ impl AgentEngine {
             grants: crate::agent::grant_store::GrantStore::default(),
             denied_sigs: Default::default(),
             turn_dismissals: 0,
+            plan_card_dismissed: false,
             skills: skills.to_vec(),
             subagents: Vec::new(),
             agents_dir: None,

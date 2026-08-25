@@ -103,20 +103,9 @@ impl CodeTuiApp {
         }
 
         // The `/logout` confirm card likewise owns the keyboard until decided.
-        // Above plan-continue: a direct `/logout` outranks the advisory prompt.
         if self.account.pending_logout.is_some() {
             self.handle_logout_confirm_key(key);
             return Ok(false);
-        }
-
-        // The `/new` continue-the-plan prompt: decisions only on an empty
-        // composer; typing falls through to the editor. Skipped under an overlay
-        // so the picker's keys win.
-        if self.cards.plan_continue.is_some() && matches!(self.overlay, Overlay::None) {
-            if self.handle_plan_continue_key(key).await {
-                return Ok(false);
-            }
-            return self.handle_editor_key(key).await;
         }
 
         // A pending tool-permission card owns the decision keys (y/a/n), but only
@@ -557,7 +546,7 @@ impl CodeTuiApp {
     }
 
     /// Resolve by option index — approval also picks the exit mode: 0 approve +
-    /// auto, 1 approve + review, 2 keep planning. (Discard = Esc then `/plan stop`.)
+    /// auto, 1 approve + review, 2 keep planning. (Discard = Esc then `/plan exit`.)
     pub(super) fn pick_plan_approval_option(&mut self, idx: usize) {
         use crate::agent::protocol::PlanDecision;
         match idx {
@@ -675,18 +664,26 @@ impl CodeTuiApp {
         }
     }
 
-    /// Shift+Tab: normal → auto-approve → review. Plan is `/plan`; leaving it lands on normal.
+    /// Shift+Tab: cycle normal → auto-approve → plan → review → normal (Claude
+    /// Code's ring plus review). Keys without the native agent skip the plan stop.
+    /// Mid-turn entry restricts the RUNNING turn at its next tool-call boundary
+    /// (live flag); the drafted plan survives cycling through.
     pub(super) async fn cycle_agent_mode(&mut self) {
         if self.plan_mode {
             self.leave_plan_mode(false).await;
-            self.show_toast("Plan mode off — /plan to start again");
+            self.set_review_quiet(true);
+            self.show_toast("Review mode — approve each edit");
         } else if self.agent_review_edits {
             self.set_review_quiet(false);
             self.show_toast("Normal mode — risky actions ask first");
         } else if self.agent_auto_approve {
             self.set_auto_quiet(false);
-            self.set_review_quiet(true);
-            self.show_toast("Review mode — approve each edit");
+            if self.enter_plan_mode().await {
+                self.show_toast("Plan mode — read-only until you approve");
+            } else {
+                self.set_review_quiet(true);
+                self.show_toast("Review mode — approve each edit");
+            }
         } else {
             self.set_auto_quiet(true);
             self.show_toast("Auto-approve mode — tools run without asking");

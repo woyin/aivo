@@ -3167,15 +3167,19 @@ is preserved."
     /// plan back up. Turn ends reach this via `persist_history`; `/plan` enter/leave
     /// call it directly for idle-time changes. Best-effort; no-ops before the
     /// session first persists.
-    pub(super) async fn persist_plan_state(&self) {
+    pub(super) fn current_plan_state(&self) -> Option<crate::services::session_store::PlanState> {
         let steps = self.unfinished_plan_steps();
-        let plan = (self.plan_mode || self.pending_plan.is_some() || steps.is_some()).then(|| {
+        (self.plan_mode || self.pending_plan.is_some() || steps.is_some()).then(|| {
             crate::services::session_store::PlanState {
                 mode: self.plan_mode,
                 draft: self.pending_plan.clone(),
                 steps,
             }
-        });
+        })
+    }
+
+    pub(super) async fn persist_plan_state(&self) {
+        let plan = self.current_plan_state();
         // Nothing to write or clear: skip the round-trip (`set_plan_state` loads
         // the whole file before its own no-op check, and this runs every turn end).
         if plan.is_none() && !self.plan_state_written.get() {
@@ -3229,6 +3233,7 @@ is preserved."
         self.loading_resume = Some(LoadingResume {
             request_id,
             preview: preview.clone(),
+            continue_plan: false,
         });
 
         let session_store = self.session_store.clone();
@@ -3271,9 +3276,6 @@ is preserved."
         // session's thread (`/new` and key/model switches reset it the same way).
         self.agent_engine = None;
         self.cards.clear_agent_cards();
-        // Drop the `/new` continue prompt — `y` here would inject the old plan
-        // into the resumed conversation.
-        self.cards.plan_continue = None;
         // Plan/goal modes belong to the OLD conversation — a leaked plan card
         // indexes the replaced history and `/plan go` would run the old plan.
         self.plan_mode = false;
@@ -3386,9 +3388,9 @@ is preserved."
             self.notice = Some((
                 MUTED(),
                 if self.pending_plan.is_some() {
-                    "Resumed with an unfinished plan — approve on the card or /plan go; /plan stop to discard"
+                    "Resumed with an unfinished plan — approve on the card or /plan go; /plan exit to discard"
                 } else {
-                    "Resumed in plan mode — read-only until you approve a plan (/plan stop to leave)"
+                    "Resumed in plan mode — read-only until you approve a plan (/plan exit to leave)"
                 }
                 .to_string(),
             ));

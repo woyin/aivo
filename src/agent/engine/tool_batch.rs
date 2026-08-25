@@ -77,10 +77,12 @@ impl AgentEngine {
         });
 
         for (i, call) in tool_calls.iter().enumerate() {
-            // A live mid-turn plan exit (Shift+Tab), picked up at this call
-            // boundary so the rest of the turn runs unrestricted.
+            // Live mid-turn plan transitions (Shift+Tab), picked up at this call
+            // boundary: exit unrestricts the rest of the turn, entry restricts it.
             if self.read_only && ctx.plan_exit_requested() {
                 self.set_plan_mode(false);
+            } else if !self.read_only && ctx.plan_enter_requested() {
+                self.set_plan_mode(true);
             }
             let n = names[i];
             // The plan tool renders as a checklist card and never needs permission —
@@ -407,26 +409,37 @@ Investigate, or call `exit_plan_mode` with your plan."
 planning is off) — continue with the task."
                             .to_string(),
                     )
+                } else if self.plan_card_dismissed {
+                    // Esc'd plan card — don't pop a revised one.
+                    self.turn_dismissals += 1;
+                    ui.notify(
+                        "suppressed a repeat plan card — the user dismissed the previous one",
+                    );
+                    Ok(plan_mode::PLAN_APPROVAL_DISMISSED.to_string())
                 } else {
                     match plan_mode::parse_exit_plan(&call.arguments) {
                         Ok(plan) => match ui.approve_plan(&plan).await {
                             Ok(PlanDecision::Approve) => {
                                 self.turn_dismissals = 0;
+                                self.plan_card_dismissed = false;
                                 // Restore tools now so this turn continues into execution.
                                 self.set_plan_mode(false);
                                 Ok(plan_mode::PLAN_APPROVED_RESULT.to_string())
                             }
                             Ok(PlanDecision::KeepPlanning { feedback }) => {
                                 self.turn_dismissals = 0;
+                                self.plan_card_dismissed = false;
                                 Ok(plan_mode::keep_planning_result(feedback.as_deref()))
                             }
                             Ok(PlanDecision::Discard) => {
                                 self.turn_dismissals = 0;
+                                self.plan_card_dismissed = false;
                                 Ok(plan_mode::PLAN_DISCARDED_RESULT.to_string())
                             }
                             // User action, not a tool failure (see the ask_user intrinsic).
                             Err(e) if e == plan_mode::PLAN_APPROVAL_DISMISSED => {
                                 self.turn_dismissals += 1;
+                                self.plan_card_dismissed = true;
                                 Ok(e)
                             }
                             Err(e) => Err(e),

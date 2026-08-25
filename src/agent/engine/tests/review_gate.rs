@@ -76,6 +76,7 @@ async fn review_gate_reject_skips_write_but_runs_sibling() {
         auto_approve: None,
         review_edits: Some(&flag),
         plan_exit: None,
+        plan_enter: None,
     };
     let mut e = AgentEngine::new(&dir.display().to_string(), "m", "", &[], &[], 0, 0);
     let mut ui = ReviewUi {
@@ -123,6 +124,7 @@ async fn review_gate_approve_writes_the_edit() {
         auto_approve: None,
         review_edits: Some(&flag),
         plan_exit: None,
+        plan_enter: None,
     };
     let mut e = AgentEngine::new(&dir.display().to_string(), "m", "", &[], &[], 0, 0);
     let mut ui = ReviewUi::default();
@@ -157,6 +159,7 @@ async fn review_gate_none_skips_the_card() {
         auto_approve: None,
         review_edits: None,
         plan_exit: None,
+        plan_enter: None,
     };
     let mut e = AgentEngine::new(&dir.display().to_string(), "m", "", &[], &[], 0, 0);
     let mut ui = ReviewUi {
@@ -191,6 +194,7 @@ async fn review_gate_skips_when_no_edits() {
         auto_approve: None,
         review_edits: Some(&flag),
         plan_exit: None,
+        plan_enter: None,
     };
     let mut e = AgentEngine::new(&dir.display().to_string(), "m", "", &[], &[], 0, 0);
     let mut ui = ReviewUi {

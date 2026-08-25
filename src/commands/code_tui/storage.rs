@@ -436,24 +436,90 @@ pub(super) fn managed_plan_path(
         .join(format!("{slug}{}", plan_file_suffix(session_id)))
 }
 
+/// Other sessions' unfinished plans in `cwd_filter`, newest first:
+/// `(session_id, title, carry)`. Mid-execution wins over a stale draft;
+/// mode-only planning (no draft yet) has nothing to carry.
+pub(super) async fn plan_carry_candidates(
+    session_store: &SessionStore,
+    cwd_filter: Option<&str>,
+    exclude_id: &str,
+) -> Vec<(String, String, PlanCarry)> {
+    let Ok(mut entries) = session_store.all_chat_sessions().await else {
+        return Vec::new();
+    };
+    entries.sort_by(|left, right| right.updated_at.cmp(&left.updated_at));
+    let mut out = Vec::new();
+    for entry in entries {
+        if entry.session_id == exclude_id || cwd_filter.is_some_and(|dir| entry.cwd != dir) {
+            continue;
+        }
+        let Ok(Some(state)) = session_store.get_code_session(&entry.session_id).await else {
+            continue;
+        };
+        let Some(plan) = state.plan_state else {
+            continue;
+        };
+        if let Some(steps) = plan.steps {
+            out.push((entry.session_id, entry.title, PlanCarry::Continue(steps)));
+            continue;
+        }
+        let Some(draft) = plan.draft.filter(|draft| !draft.trim().is_empty()) else {
+            continue;
+        };
+        out.push((entry.session_id, entry.title, PlanCarry::Draft(draft)));
+    }
+    out
+}
+
+/// The session's managed plan files (any slug, matched by the `-<sid8>.md`
+/// suffix) — the one walk `archive`/`remove` below share.
+fn managed_plan_files(config_dir: &Path, session_id: &str) -> Vec<PathBuf> {
+    let suffix = plan_file_suffix(session_id);
+    let Ok(entries) = std::fs::read_dir(crate::services::paths::plans_dir(config_dir)) else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.ends_with(&suffix))
+        })
+        .collect()
+}
+
+/// Move the session's managed plan files into `plans/archive/` — a new objective
+/// supersedes the old plan without destroying the user-readable markdown. The
+/// archive dir is outside the picker's scan, so superseded plans stop resurfacing.
+/// Returns whether anything was archived.
+pub(super) fn archive_managed_plan_files(config_dir: &Path, session_id: &str) -> bool {
+    let files = managed_plan_files(config_dir, session_id);
+    if files.is_empty() {
+        return false;
+    }
+    let archive = crate::services::paths::plans_dir(config_dir).join("archive");
+    if std::fs::create_dir_all(&archive).is_err() {
+        return false;
+    }
+    let mut archived = false;
+    for path in files {
+        if let Some(name) = path.file_name()
+            && std::fs::rename(&path, archive.join(name)).is_ok()
+        {
+            archived = true;
+        }
+    }
+    archived
+}
+
 /// Delete a session's managed plan file(s), except `keep` (the one just
 /// written — a slug change would otherwise leave the old name behind).
 pub(super) fn remove_managed_plan_files(config_dir: &Path, session_id: &str, keep: Option<&Path>) {
-    let suffix = plan_file_suffix(session_id);
-    let Ok(entries) = std::fs::read_dir(crate::services::paths::plans_dir(config_dir)) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
+    for path in managed_plan_files(config_dir, session_id) {
         if keep.is_some_and(|k| k == path) {
             continue;
         }
-        if path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .is_some_and(|n| n.ends_with(&suffix))
-        {
-            let _ = std::fs::remove_file(&path);
-        }
+        let _ = std::fs::remove_file(&path);
     }
 }

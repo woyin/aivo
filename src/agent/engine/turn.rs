@@ -111,6 +111,7 @@ impl AgentEngine {
         let mut denial_directive_sent = false;
         self.denied_sigs.clear();
         self.turn_dismissals = 0;
+        self.plan_card_dismissed = false;
         let mut converged = false;
 
         for _ in 0..self.max_steps {
@@ -654,6 +655,7 @@ impl AgentEngine {
         self.denied_sigs.clear();
         // Typed direction supersedes an earlier Esc — asking again is fine now.
         self.turn_dismissals = 0;
+        self.plan_card_dismissed = false;
         let block = format!(
             "<user_interjection>\n{}\n</user_interjection>\nThe user sent this while you were \
 working. Factor it in before continuing — it may change what to do next.",

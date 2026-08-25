@@ -301,6 +301,7 @@ async fn test_maybe_start_live_share_defers_until_session_settles() {
     // A pending `--resume` load defers the start (it must pin the resumed session).
     app.loading_resume = Some(LoadingResume {
         request_id: 1,
+        continue_plan: false,
         preview: SessionPreview {
             key_id: "k".into(),
             key_name: "k".into(),

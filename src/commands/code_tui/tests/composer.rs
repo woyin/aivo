@@ -191,6 +191,7 @@ async fn paste_blocked_while_resume_loading() {
     let mut app = make_test_app(tx, rx);
     app.loading_resume = Some(LoadingResume {
         request_id: 1,
+        continue_plan: false,
         preview: SessionPreview {
             key_id: "k".into(),
             key_name: "k".into(),
@@ -239,6 +240,7 @@ async fn paste_burst_enter_blocked_while_resume_loading() {
     let mut app = make_test_app(tx, rx);
     app.loading_resume = Some(LoadingResume {
         request_id: 1,
+        continue_plan: false,
         preview: SessionPreview {
             key_id: "k".into(),
             key_name: "k".into(),

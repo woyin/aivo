@@ -258,6 +258,7 @@ pub(super) fn turn_ctx<'a>(
         auto_approve: None,
         review_edits: None,
         plan_exit: None,
+        plan_enter: None,
     }
 }
 

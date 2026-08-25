@@ -17,6 +17,7 @@ fn auto_approve_enabled_tracks_static_flag_and_live_toggle() {
         auto_approve: flag,
         review_edits: None,
         plan_exit: None,
+        plan_enter: None,
     };
     assert!(ctx(true, None).auto_approve_enabled());
     assert!(!ctx(false, None).auto_approve_enabled());
@@ -477,7 +478,8 @@ async fn dismissed_question_is_a_result_not_a_failure() {
     );
 }
 
-/// A second dismissal ends the turn instead of hinting a retry.
+/// A re-ask after a dismissal never shows a second card: the engine
+/// auto-dismisses it and ends the turn instead of hinting a retry.
 #[tokio::test]
 async fn second_dismissed_question_stops_the_turn() {
     let dir = tmp();
@@ -506,7 +508,15 @@ async fn second_dismissed_question_stops_the_turn() {
     .await;
 
     assert_eq!(ui.stops, vec![TurnStop::DismissedLoop]);
-    assert_eq!(ui.ask_user_questions.len(), 2);
+    assert_eq!(
+        ui.ask_user_questions.len(),
+        1,
+        "the re-ask must not reach the user"
+    );
+    assert!(
+        ui.notices.iter().any(|n| n.contains("suppressed")),
+        "the suppression is surfaced"
+    );
     assert!(
         !tool_result_texts(&engine)
             .iter()

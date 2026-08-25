@@ -405,9 +405,38 @@ async fn test_plan_capture_discard_and_status() {
     assert!(!app.plan_mode);
 }
 
+/// `/plan exit` returns to the mode plan was entered from.
+#[tokio::test]
+async fn test_plan_exit_restores_prior_mode() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+
+    // Entered from auto (the ring path): exit lands back on auto.
+    app.set_auto_quiet(true);
+    assert!(app.enter_plan_mode().await);
+    assert!(!app.agent_auto_approve, "plan quiets auto while on");
+    app.run_plan_command(Some("exit".to_string())).await;
+    assert!(!app.plan_mode);
+    assert!(app.agent_auto_approve, "back to auto-approve");
+    assert!(notice_text(&app).contains("back to auto-approve"));
+
+    // Entered from normal: exit lands on normal.
+    app.set_auto_quiet(false);
+    assert!(app.enter_plan_mode().await);
+    app.run_plan_command(Some("exit".to_string())).await;
+    assert!(!app.plan_mode && !app.agent_auto_approve && !app.agent_review_edits);
+
+    // Entered from review: restored too.
+    app.set_review_quiet(true);
+    assert!(app.enter_plan_mode().await);
+    assert!(!app.agent_review_edits, "plan quiets review while on");
+    app.run_plan_command(Some("exit".to_string())).await;
+    assert!(app.agent_review_edits, "back to review");
+}
+
 /// Approval-card verdicts, Claude Code-style: 1 = approve + auto-approve,
-/// 2 = approve + manual approval, 3 = keep planning. (Bare `/plan`'s kick-off
-/// dispatch is covered in `test_plan_bare_dispatches_kickoff`.)
+/// 2 = approve + manual approval, 3 = keep planning. (Bare `/plan`'s silent
+/// entry is covered in `test_plan_bare_enters_silently`.)
 #[tokio::test]
 async fn test_plan_mode_enter_and_approval_verdicts() {
     use crate::agent::protocol::PlanDecision;
@@ -558,7 +587,8 @@ async fn test_cursor_plan_auto_continue_guards() {
     assert!(!app.sending);
 }
 
-/// Shift+Tab: default → auto → review. Plan is `/plan`; leaving it lands on default.
+/// Shift+Tab: default → auto → plan → review → default, plan included (Claude
+/// Code's ring). Mid-turn entry arms the live flag instead of skipping.
 #[tokio::test]
 async fn test_shift_tab_cycles_agent_modes() {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
@@ -576,7 +606,10 @@ async fn test_shift_tab_cycles_agent_modes() {
     assert_eq!(mode(&app), (true, false, false));
 
     app.cycle_agent_mode().await;
-    assert_eq!(mode(&app), (false, false, true), "auto cycles into review");
+    assert_eq!(mode(&app), (false, true, false), "auto cycles into plan");
+
+    app.cycle_agent_mode().await;
+    assert_eq!(mode(&app), (false, false, true), "plan cycles into review");
     assert!(
         app.review_edits_flag
             .load(std::sync::atomic::Ordering::Relaxed),
@@ -590,26 +623,30 @@ async fn test_shift_tab_cycles_agent_modes() {
     app.cycle_agent_mode().await;
     assert_eq!(mode(&app), (false, false, false), "full circle");
 
+    // Mid-turn, plan entry arms the LIVE flag: the running turn restricts at
+    // its next tool-call boundary instead of the entry silently degrading.
     app.cycle_agent_mode().await;
     app.sending = true;
     app.cycle_agent_mode().await;
-    assert_eq!(
-        mode(&app),
-        (false, false, true),
-        "auto still cycles into review mid-turn"
+    assert_eq!(mode(&app), (false, true, false), "plan enters mid-turn too");
+    assert!(
+        app.plan_enter_flag
+            .load(std::sync::atomic::Ordering::Relaxed),
+        "the running turn sees the entry"
     );
-    app.cycle_agent_mode().await;
     app.sending = false;
 
     app.plan_mode = true;
     app.sending = true;
     app.cycle_agent_mode().await;
     assert!(!app.plan_mode);
-    assert!(
-        !app.agent_review_edits && !app.agent_auto_approve,
-        "leaving plan lands on default"
-    );
+    assert!(app.agent_review_edits, "leaving plan lands on review");
     assert!(app.plan_exit_pending, "engine restore deferred to turn end");
+    assert!(
+        !app.plan_enter_flag
+            .load(std::sync::atomic::Ordering::Relaxed),
+        "the exit clears a queued live entry"
+    );
 }
 
 /// Shift+Tab on a permission card during plan mode exits plan mode (live), enables
@@ -745,11 +782,10 @@ async fn test_plan_go_preserves_composer_draft() {
     assert_eq!(app.cursor, 4);
 }
 
-/// Bare `/plan` enters the mode AND dispatches the kick-off turn: the model
-/// gets the machine text, the transcript shows the compact `/plan`, and
-/// neither a composer draft nor ↑ recall picks it up.
+/// Bare `/plan` enters the mode silently: no kick-off turn, no card — just the
+/// composer hint. The draft is untouched.
 #[tokio::test]
-async fn test_plan_bare_dispatches_kickoff() {
+async fn test_plan_bare_enters_silently() {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let mut app = make_test_app(tx, rx);
     pin_to_plain_chat(&mut app);
@@ -759,23 +795,13 @@ async fn test_plan_bare_dispatches_kickoff() {
     app.run_plan_command(None).await;
 
     assert!(app.plan_mode, "bare /plan enters the mode");
-    assert!(app.sending, "the kick-off went out");
-    assert_eq!(
-        app.pending_submit.as_ref().unwrap().content,
-        super::super::runtime_impl::PLAN_KICKOFF_MESSAGE,
-        "the model receives the interview instructions"
-    );
-    assert_eq!(
-        app.history.last().unwrap().content,
-        "/plan",
-        "the transcript shows the compact command, not the machine text"
-    );
-    assert_eq!(app.draft, "note to self", "draft survives the dispatch");
-    assert_eq!(app.cursor, 4);
+    assert!(!app.sending, "no turn is dispatched");
     assert!(
-        app.draft_history.is_empty(),
-        "machine text never enters ↑ recall"
+        notice_text(&app).contains("describe what to plan"),
+        "the hint points at the composer"
     );
+    assert_eq!(app.draft, "note to self", "draft is untouched");
+    assert_eq!(app.cursor, 4);
 }
 
 #[tokio::test]
@@ -798,14 +824,17 @@ async fn test_shift_tab_cycles_modes_through_handle_key() {
     app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::SHIFT))
         .await
         .unwrap();
-    assert!(app.agent_review_edits, "second press cycles into review");
+    assert!(app.plan_mode, "second press cycles into plan");
     assert!(!app.agent_auto_approve, "modes are mutually exclusive");
-    assert!(!app.plan_mode, "plan is not in the Shift+Tab ring");
     assert!(
         !app.auto_approve_flag
             .load(std::sync::atomic::Ordering::Relaxed),
         "live flag follows auto-approve OFF"
     );
+    app.handle_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::NONE))
+        .await
+        .unwrap();
+    assert!(app.agent_review_edits, "third press cycles into review");
     app.handle_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::NONE))
         .await
         .unwrap();
@@ -939,7 +968,7 @@ async fn test_plan_resume_picker_lists_unfinished_plans() {
     let PickerValue::PlanResume(PlanCarry::Continue(steps)) = &executing.value else {
         panic!("expected a continue PlanResume value");
     };
-    assert!(steps.contains("reload nginx"));
+    assert!(steps.to_string().contains("reload nginx"));
 }
 
 /// `/plan resume` with nothing to pick up notices instead of an empty picker.
@@ -998,9 +1027,10 @@ async fn test_plan_resume_continues_executing_checklist() {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let mut app = make_test_app(tx, rx);
     pin_to_plain_chat(&mut app);
-    let steps = r#"[{"step":"a","status":"completed"},{"step":"b","status":"pending"}]"#;
+    let steps: serde_json::Value =
+        serde_json::json!([{"step":"a","status":"completed"},{"step":"b","status":"pending"}]);
 
-    app.resume_plan_from_session(PlanCarry::Continue(steps.to_string()))
+    app.resume_plan_from_session(PlanCarry::Continue(steps))
         .await;
 
     assert!(
@@ -1127,8 +1157,8 @@ async fn test_persist_plan_state_tracks_execution_checklist() {
     );
 }
 
-/// `/new` after a mid-execution plan returns the checklist for the continue
-/// prompt; a fresh session with no plan returns nothing and leaves no hint.
+/// `/new` after a mid-execution plan leaves the kept-plan hint; a fresh session
+/// with no plan leaves none.
 #[tokio::test]
 async fn test_new_chat_hands_off_leftover_plan() {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
@@ -1142,17 +1172,13 @@ async fn test_new_chat_hands_off_leftover_plan() {
         attachments: vec![],
     });
 
-    let handoff = app.start_new_chat().await;
+    app.start_new_chat().await;
 
-    let steps = handoff.expect("executing checklist handed off for the continue prompt");
-    assert!(
-        steps.to_string().contains("\"step\":\"b\""),
-        "checklist JSON: {steps:?}"
-    );
     assert!(app.history.is_empty(), "the new session starts fresh");
+    assert!(notice_text(&app).contains("/plan continues it"));
 
-    // No plan left → nothing to hand off, no hint.
-    assert!(app.start_new_chat().await.is_none());
+    // No plan left → no hint.
+    app.start_new_chat().await;
     assert!(app.notice.is_none());
 }
 
@@ -1172,21 +1198,19 @@ async fn test_new_chat_draft_hints_instead_of_auto() {
     app.plan_mode = true;
     app.pending_plan = Some("1. draft".to_string());
 
-    let handoff = app.start_new_chat().await;
+    app.start_new_chat().await;
 
-    assert!(handoff.is_none(), "a draft never auto-continues");
     let notice = notice_text(&app);
     assert!(
-        notice.contains("unapproved draft") && notice.contains("/plan resume"),
+        notice.contains("unapproved draft") && notice.contains("/plan"),
         "draft hint: {notice:?}"
     );
 }
 
-/// `/new` after a mid-execution plan arms the continue prompt instead of
-/// auto-continuing — nothing is dispatched until the user decides, and the
-/// card replaces the `/plan resume` hint notice.
+/// `/new` after a mid-execution plan keeps it on disk and hints — no card,
+/// nothing dispatched; bare `/plan` picks it up.
 #[tokio::test]
-async fn test_new_offers_continue_prompt_instead_of_auto() {
+async fn test_new_keeps_plan_and_hints() {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let mut app = make_test_app(tx, rx);
     app.session_id = "s-outgoing".to_string();
@@ -1201,49 +1225,18 @@ async fn test_new_offers_continue_prompt_instead_of_auto() {
 
     app.execute_slash_command(SlashCommand::New).await.unwrap();
 
-    let prompt = app.cards.plan_continue.as_ref().expect("prompt armed");
-    assert_eq!(plan_steps_progress(&prompt.steps), "1/2 steps done");
-    assert_eq!(plan_next_step(&prompt.steps), "b");
-    assert_eq!(prompt.prior_session_id, "s-outgoing");
-    assert!(!app.sending, "nothing dispatched until the user decides");
-    assert!(app.notice.is_none(), "the card replaces the hint notice");
-}
-
-/// `y` on the continue prompt carries the checklist into the fresh session —
-/// the same continuation `/plan resume` sends.
-#[tokio::test]
-async fn test_plan_continue_prompt_continues_on_y() {
-    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-    let mut app = make_test_app(tx, rx);
-    app.offer_plan_continue(
-        "s-prior".to_string(),
-        serde_json::json!([{"step":"a","status":"completed"},{"step":"b","status":"pending"}]),
-    );
-    pin_to_plain_chat(&mut app);
-
-    // An unrecognized key leaves the prompt up.
-    app.handle_plan_continue_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE))
-        .await;
-    assert!(app.cards.plan_continue.is_some());
-
-    app.handle_plan_continue_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE))
-        .await;
-
-    assert!(app.cards.plan_continue.is_none(), "prompt resolved");
-    assert!(app.sending, "the continuation went out");
-    let content = &app.pending_submit.as_ref().unwrap().content;
+    assert!(!app.sending, "nothing dispatched");
+    let notice = notice_text(&app);
     assert!(
-        content.contains("<carried-over-checklist>") && content.contains("\"step\":\"b\""),
-        "machine text embeds the checklist: {content:?}"
+        notice.contains("/plan continues it"),
+        "hint points at bare /plan: {notice:?}"
     );
 }
 
-/// `n` on the continue prompt discards: the old session's planState clears on
-/// disk, so the plan leaves the `/plan resume` picker too.
-#[tokio::test]
-async fn test_plan_continue_prompt_discards_on_n() {
-    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-    let mut app = make_test_app(tx, rx);
+/// Seed a persisted prior session ("s-old", cwd `/proj`) holding a
+/// mid-execution checklist, then leave the app in a fresh "s-new" session.
+async fn seed_prior_plan_session(app: &mut super::super::CodeTuiApp) {
+    app.real_cwd = "/proj".to_string();
     app.session_id = "s-old".to_string();
     app.session_store
         .save_code_session_with_id(
@@ -1270,53 +1263,78 @@ async fn test_plan_continue_prompt_discards_on_n() {
         attachments: vec![],
     });
     app.persist_plan_state().await;
-    // A managed save file for the outgoing session goes with the plan.
+    app.session_id = "s-new".to_string();
+    app.history.clear();
+    app.plan_state_written.set(false);
+}
+
+/// Bare `/plan` in a FRESH session with one unfinished plan nearby restores
+/// that session (full context beats carrying the bare checklist) and arms the
+/// auto-continue for when the load lands.
+#[tokio::test]
+async fn test_bare_plan_fresh_session_restores_plan_session() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    seed_prior_plan_session(&mut app).await;
+
+    app.run_plan_command(None).await;
+
+    assert!(
+        app.loading_resume.is_some(),
+        "a fresh session restores the plan's own session"
+    );
+    assert!(
+        app.loading_resume.as_ref().unwrap().continue_plan,
+        "the continue turn fires once the load lands"
+    );
+}
+
+/// The same single candidate mid-conversation only carries the checklist —
+/// restoring a session would clobber the current conversation.
+#[tokio::test]
+async fn test_bare_plan_mid_conversation_carries_checklist() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    seed_prior_plan_session(&mut app).await;
+    seed_two_exchanges(&mut app);
+    pin_to_plain_chat(&mut app);
+
+    app.run_plan_command(None).await;
+
+    assert!(app.loading_resume.is_none(), "no session swap mid-chat");
+    assert!(app.sending, "the carry went out");
+    let content = &app.pending_submit.as_ref().unwrap().content;
+    assert!(
+        content.contains("<carried-over-checklist>") && content.contains("\"step\":\"b\""),
+        "machine text embeds the checklist: {content:?}"
+    );
+}
+
+/// `/plan <objective>` over a drafted plan supersedes it: the draft clears and
+/// a managed save file moves to plans/archive/ instead of being destroyed.
+#[tokio::test]
+async fn test_new_objective_archives_superseded_plan() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.session_id = "s-old".to_string();
+    app.pending_plan = Some("# Old plan\n1. step".to_string());
     let plans_dir = crate::services::paths::plans_dir(app.session_store.config_dir());
     std::fs::create_dir_all(&plans_dir).unwrap();
     let managed = plans_dir.join(format!("old-plan{}", plan_file_suffix("s-old")));
     std::fs::write(&managed, "# Old plan\n").unwrap();
+    pin_to_plain_chat(&mut app);
 
-    app.execute_slash_command(SlashCommand::New).await.unwrap();
-    assert!(app.cards.plan_continue.is_some());
-    app.handle_plan_continue_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE))
+    app.run_plan_command(Some("build something new".to_string()))
         .await;
 
-    assert!(app.cards.plan_continue.is_none(), "prompt resolved");
-    let saved = app
-        .session_store
-        .get_code_session("s-old")
-        .await
-        .unwrap()
-        .unwrap();
+    assert!(app.pending_plan.is_none(), "the stale draft cleared");
+    assert!(!managed.exists(), "the managed file left the plans dir");
     assert!(
-        saved.plan_state.is_none(),
-        "discard clears the old session's planState"
-    );
-    assert!(!managed.exists(), "discard removes the managed save file");
-    let notice = notice_text(&app);
-    assert!(notice.contains("discarded"), "{notice:?}");
-}
-
-/// `Esc` on the continue prompt keeps the plan for `/plan resume`: planState
-/// stays on disk and the notice points there.
-#[tokio::test]
-async fn test_plan_continue_prompt_esc_keeps_for_resume() {
-    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-    let mut app = make_test_app(tx, rx);
-    app.offer_plan_continue(
-        "s-prior".to_string(),
-        serde_json::json!([{"step":"a","status":"completed"},{"step":"b","status":"pending"}]),
-    );
-
-    app.handle_plan_continue_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
-        .await;
-
-    assert!(app.cards.plan_continue.is_none(), "prompt dismissed");
-    assert!(!app.sending, "nothing dispatched");
-    let notice = notice_text(&app);
-    assert!(
-        notice.contains("/plan resume") && notice.contains("1/2 steps done"),
-        "kept-aside hint: {notice:?}"
+        plans_dir
+            .join("archive")
+            .join(managed.file_name().unwrap())
+            .exists(),
+        "…and landed in plans/archive/"
     );
 }
 
@@ -1454,9 +1472,10 @@ async fn test_new_esc_then_plan_resume_recovers_unpersisted_plan() {
     });
 
     app.execute_slash_command(SlashCommand::New).await.unwrap();
-    assert!(app.cards.plan_continue.is_some(), "prompt armed");
-    app.handle_plan_continue_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
-        .await;
+    assert!(
+        notice_text(&app).contains("/plan continues it"),
+        "the hint replaced the old prompt card"
+    );
 
     pin_to_plain_chat(&mut app);
     app.run_plan_command(Some("resume".to_string())).await;
@@ -1516,61 +1535,6 @@ async fn test_plan_resume_with_local_draft_hints_go() {
     assert!(!app.sending, "nothing dispatched for a draft");
     let notice = notice_text(&app);
     assert!(notice.contains("/plan go"), "{notice:?}");
-}
-
-/// Typing with the continue prompt up falls through to the composer (the card
-/// stays); mid-draft only Esc decides, and it leaves the draft intact.
-#[tokio::test]
-async fn test_plan_continue_prompt_falls_through_to_composer() {
-    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-    let mut app = make_test_app(tx, rx);
-    app.offer_plan_continue(
-        "s-prior".to_string(),
-        serde_json::json!([{"step":"a","status":"pending"}]),
-    );
-
-    app.handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE))
-        .await
-        .unwrap();
-    assert_eq!(app.draft, "x", "typed text reaches the composer");
-    assert!(app.cards.plan_continue.is_some(), "card stays up");
-
-    // Mid-draft, 'y' is message text — not a decision.
-    app.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE))
-        .await
-        .unwrap();
-    assert_eq!(app.draft, "xy");
-    assert!(app.cards.plan_continue.is_some());
-
-    // Esc always decides: "later", draft untouched.
-    app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
-        .await
-        .unwrap();
-    assert!(app.cards.plan_continue.is_none(), "Esc resolves to later");
-    assert_eq!(app.draft, "xy", "the draft survives");
-}
-
-/// Sending any message while the continue prompt is up implicitly defers it —
-/// the plan stays resumable, the card goes away.
-#[tokio::test]
-async fn test_dispatch_dismisses_continue_prompt() {
-    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-    let mut app = make_test_app(tx, rx);
-    app.offer_plan_continue(
-        "s-prior".to_string(),
-        serde_json::json!([{"step":"a","status":"pending"}]),
-    );
-    pin_to_plain_chat(&mut app);
-
-    app.dispatch_user_message("something else".to_string(), None)
-        .await
-        .unwrap();
-
-    assert!(
-        app.cards.plan_continue.is_none(),
-        "an outgoing turn implicitly defers the prompt"
-    );
-    assert!(app.sending);
 }
 
 /// A finished plan retires the session's managed save file along with its

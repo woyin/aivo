@@ -683,7 +683,8 @@ pub(super) fn command_usage_hint(name: &str) -> Option<&'static str> {
         "agents" => Some("[rm <name>]"),
         "create-skill" => Some("[what the skill should do]"),
         "goal" => Some("<objective> | stop"),
-        "plan" => Some("[objective] | go [-y] [guidance] | resume | stop"),
+        // go/resume/save/stop stay as hidden aliases; bare /plan continues by itself.
+        "plan" => Some("[objective] | exit"),
         "share" => Some("[stop]"),
         "compact" => Some("[fast]"),
         "model" => Some("[name]"),
@@ -1630,15 +1631,13 @@ pub(super) struct McpConsentPrompt {
     pub(super) base_disabled: std::collections::HashSet<String>,
 }
 
-/// The `/new` continue-the-plan prompt: the fresh session asks before picking
-/// up the outgoing session's mid-execution checklist (continue / discard / Esc
-/// keeps it for `/plan resume`).
-#[derive(Clone, Debug)]
-pub(super) struct PlanContinuePrompt {
-    /// The checklist carried on continue.
-    pub(super) steps: serde_json::Value,
-    /// The outgoing session, whose planState is cleared on discard.
-    pub(super) prior_session_id: String,
+/// The agent mode `/plan exit` returns to (modes are mutually exclusive).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) enum PlanPriorMode {
+    #[default]
+    Normal,
+    Auto,
+    Review,
 }
 
 /// Content digest of a repo's project `.mcp.json` stdio servers — the exact
@@ -1758,8 +1757,10 @@ impl PickerEntry {
 #[derive(Clone)]
 pub(super) enum PlanCarry {
     Draft(String),
-    Continue(String),
-    Interrupted(String),
+    /// Checklist steps stay parsed — display sites read progress directly and
+    /// only the machine message stringifies them.
+    Continue(serde_json::Value),
+    Interrupted(serde_json::Value),
 }
 
 #[derive(Clone)]
@@ -1863,6 +1864,9 @@ pub(super) struct PickerHitbox {
 pub(super) struct LoadingResume {
     pub(super) request_id: u64,
     pub(super) preview: SessionPreview,
+    /// Bare `/plan` restored this session for its plan: once the load lands,
+    /// auto-dispatch the continue turn. Scoped here so it dies with the load.
+    pub(super) continue_plan: bool,
 }
 
 /// A loaded `/resume` preview: the decrypted tail of one session's history.
@@ -2625,6 +2629,9 @@ pub(super) enum RuntimeEvent {
         request_id: u64,
         result: std::result::Result<LoadedSession, String>,
     },
+    /// The background startup scan found an unfinished plan in this cwd —
+    /// advisory only, so it never overwrites a notice that landed first.
+    PlanHintReady(String),
     /// A `/resume` preview finished loading. Content-addressed by
     /// `(session_id, updated_at)`: always cached, never "stale".
     SessionPreviewLoaded {
@@ -3246,8 +3253,10 @@ pub(super) struct CodeTuiApp {
     /// Last turn's engine guard-stop, consumed by the `/goal` continuation to steer past a dead end.
     pub(super) goal_guard_stop: Option<crate::agent::engine::TurnStop>,
     /// Plan mode is on: read-only, persists across turns/interrupts until the plan
-    /// is approved or `/plan stop`.
+    /// is approved or `/plan exit`.
     pub(super) plan_mode: bool,
+    /// Captured on plan entry; `/plan exit` returns there.
+    pub(super) plan_prior_mode: PlanPriorMode,
     /// Plan exited mid-turn but the live engine's tools are still stripped: restore
     /// them at the next safe async point (turn end / cancel / next dispatch), never
     /// while the model is still running.
@@ -3256,7 +3265,7 @@ pub(super) struct CodeTuiApp {
     /// (the aborted turn task can still hold the lock): re-apply at next dispatch.
     pub(super) agent_unsend_pending: bool,
     /// A drafted plan (a plan-mode reply that ended without `exit_plan_mode`),
-    /// awaiting `/plan go`. Cleared on execute, `/plan stop`, or `/new`.
+    /// awaiting `/plan go`. Cleared on execute, `/plan exit`, or `/new`.
     pub(super) pending_plan: Option<String>,
     /// History index of the plan reply, framed as the plan card; shifted on
     /// history removal (like `turn_durations`), cleared on execute/discard/`/new`.
@@ -3327,6 +3336,10 @@ pub(super) struct CodeTuiApp {
     /// a turn in flight; the running engine reads it per tool-call boundary and
     /// restores its tools (`plan_exit_pending` is the turn-end fallback).
     pub(super) plan_exit_flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Live mid-turn plan-mode ENTRY signal (Shift+Tab into plan with a turn in
+    /// flight); the running engine reads it per tool-call boundary and goes
+    /// read-only (the `spawn_agent_turn` mode sync is the turn-end fallback).
+    pub(super) plan_enter_flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// Whether a planState snapshot is (or may be) in the session file — lets
     /// `persist_plan_state` skip its round-trip for the common no-plan session.
     /// `Cell`: flipped from the `&self` persist path.
@@ -3490,9 +3503,6 @@ pub(super) struct AgentCards {
     /// Independent lifecycle: shown above any agent card and NOT dropped by
     /// [`Self::clear_agent_cards`] at turn teardown.
     pub(super) mcp_consent: Option<McpConsentPrompt>,
-    /// Pending `/new` continue-the-plan prompt. Like `mcp_consent`, its
-    /// lifecycle is independent of the agent-card slot.
-    pub(super) plan_continue: Option<PlanContinuePrompt>,
 }
 
 /// Typed views of `active` so call sites keep their per-card shape:
@@ -3775,6 +3785,7 @@ impl CodeTuiApp {
             goal_mode: None,
             goal_guard_stop: None,
             plan_mode: false,
+            plan_prior_mode: PlanPriorMode::default(),
             plan_exit_pending: false,
             agent_unsend_pending: false,
             pending_plan: None,
@@ -3795,6 +3806,7 @@ impl CodeTuiApp {
             agent_review_edits: false,
             review_edits_flag: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             plan_exit_flag: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            plan_enter_flag: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             plan_state_written: std::cell::Cell::new(false),
             thinking_enabled: true,
             web_search_enabled: true,

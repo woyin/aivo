@@ -899,6 +899,7 @@ mod tests {
             auto_approve: None,
             review_edits: None,
             plan_exit: None,
+            plan_enter: None,
         }
     }
 
