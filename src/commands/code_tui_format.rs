@@ -45,6 +45,15 @@ pub(super) fn format_token_count(tokens: u64, usage: Option<TokenUsage>) -> Stri
     }
 }
 
+/// One decimal under 10 tok/s, whole numbers above.
+pub(super) fn format_tps(tps: f64) -> String {
+    if tps < 10.0 {
+        format!("{tps:.1} tok/s")
+    } else {
+        format!("{} tok/s", tps.round() as u64)
+    }
+}
+
 /// USD figure: two decimals from a cent up, else two significant digits so a
 /// fraction-of-a-cent turn still shows.
 pub(super) fn format_usd(usd: f64) -> String {

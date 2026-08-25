@@ -1659,3 +1659,119 @@ fn test_humanize_count() {
     assert_eq!(humanize_count(1234), "1.2k");
     assert_eq!(humanize_count(12345), "12k");
 }
+
+#[test]
+fn test_format_tps_decimal_under_ten_whole_above() {
+    use super::super::code_tui_format::format_tps;
+    // 3.14 trips clippy::approx_constant.
+    assert_eq!(format_tps(3.42), "3.4 tok/s");
+    assert_eq!(format_tps(0.26), "0.3 tok/s");
+    assert_eq!(format_tps(42.6), "43 tok/s");
+}
+
+#[test]
+fn test_footer_tps_label_live_and_idle() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+
+    assert!(app.footer_tps_label().is_none());
+
+    // Live mid-turn.
+    app.sending = true;
+    app.request_started_at = Instant::now().checked_sub(std::time::Duration::from_secs(10));
+    app.turn_output_tokens = 36;
+    assert_eq!(app.footer_tps_label().unwrap(), "3.6 tok/s");
+
+    // Quiet gates: zero tokens, first second.
+    app.turn_output_tokens = 0;
+    assert!(app.footer_tps_label().is_none());
+    app.turn_output_tokens = 36;
+    app.request_started_at = Some(Instant::now());
+    assert!(app.footer_tps_label().is_none());
+
+    // Idle: frozen figure.
+    app.sending = false;
+    app.request_started_at = None;
+    app.last_turn_tps = Some(12.3);
+    assert_eq!(app.footer_tps_label().unwrap(), "12 tok/s");
+
+    app.footer_tps_enabled = false;
+    assert!(app.footer_tps_label().is_none());
+}
+
+#[test]
+fn test_capture_turn_tps_freezes_and_guards() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+
+    app.request_started_at = Instant::now().checked_sub(std::time::Duration::from_secs(10));
+    app.turn_output_tokens = 50;
+    app.capture_turn_tps();
+    let frozen = app.last_turn_tps.expect("captured");
+    assert!((4.5..5.5).contains(&frozen), "{frozen}");
+
+    // Tokenless, sub-second, and clockless (cancel) turns keep the prior figure.
+    app.turn_output_tokens = 0;
+    app.capture_turn_tps();
+    assert_eq!(app.last_turn_tps, Some(frozen));
+    app.turn_output_tokens = 400;
+    app.request_started_at = Some(Instant::now());
+    app.capture_turn_tps();
+    assert_eq!(app.last_turn_tps, Some(frozen));
+    app.request_started_at = None;
+    app.capture_turn_tps();
+    assert_eq!(app.last_turn_tps, Some(frozen));
+}
+
+#[test]
+fn test_cache_hit_pct_hides_without_cache_activity() {
+    use super::super::event_loop_impl::cache_hit_pct;
+    assert_eq!(cache_hit_pct(800, 0, 1_000), Some(80));
+    // Writes-only = a real cold 0%; no activity = hidden, not 0%.
+    assert_eq!(cache_hit_pct(0, 120, 1_000), Some(0));
+    assert_eq!(cache_hit_pct(0, 0, 1_000), None);
+    assert_eq!(cache_hit_pct(0, 0, 0), None);
+}
+
+#[test]
+fn test_footer_cache_label_reflects_last_turn() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+
+    assert!(app.footer_cache_label().is_none());
+    app.last_cache_hit_pct = Some(87);
+    assert_eq!(app.footer_cache_label().unwrap(), "cache:87%");
+
+    app.footer_cache_enabled = false;
+    assert!(app.footer_cache_label().is_none());
+}
+
+#[test]
+fn test_footer_stats_render_width_gated() {
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    fn footer_text(app: &mut CodeTuiApp, width: u16) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(width, 1)).unwrap();
+        terminal
+            .draw(|frame| app.render_footer(frame, frame.area()))
+            .unwrap();
+        let buf = terminal.backend().buffer();
+        (0..buf.area.width)
+            .map(|x| buf.cell((x, 0)).unwrap().symbol().to_string())
+            .collect()
+    }
+
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.last_turn_tps = Some(5.2);
+    app.last_cache_hit_pct = Some(64);
+
+    let wide = footer_text(&mut app, 100);
+    assert!(wide.contains("5.2 tok/s"), "{wide}");
+    assert!(wide.contains("cache:64%"), "{wide}");
+
+    let narrow = footer_text(&mut app, 60);
+    assert!(!narrow.contains("tok/s"), "{narrow}");
+    assert!(!narrow.contains("cache:"), "{narrow}");
+}

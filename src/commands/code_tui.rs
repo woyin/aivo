@@ -35,7 +35,7 @@ use super::code_tui_format::{
     footer_session_label, footer_workspace_candidates, format_picker_match_count,
     format_request_elapsed, format_session_group_label, format_session_match_count,
     format_session_time, format_time_ago_short, format_token_count, format_token_count_value,
-    format_usd, git_branch_for, truncate_for_display_width, truncate_for_width,
+    format_tps, format_usd, git_branch_for, truncate_for_display_width, truncate_for_width,
 };
 use super::*;
 
@@ -120,6 +120,8 @@ impl CodeTuiApp {
             web_search_enabled,
             agent_tools_enabled,
             inline_images_enabled,
+            footer_tps_enabled,
+            footer_cache_enabled,
             theme: chat_theme,
             vision_fallback,
             vision_fallback_custom,
@@ -238,6 +240,8 @@ impl CodeTuiApp {
         app.web_search_enabled = web_search_enabled;
         app.agent_tools_enabled = agent_tools_enabled;
         app.inline_images_enabled = inline_images_enabled;
+        app.footer_tps_enabled = footer_tps_enabled;
+        app.footer_cache_enabled = footer_cache_enabled;
         app.vision_fallback = vision_fallback;
         app.vision_fallback_custom = vision_fallback_custom;
         app.image_gen = image_gen;

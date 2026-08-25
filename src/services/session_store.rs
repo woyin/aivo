@@ -829,6 +829,9 @@ pub struct ChatToggles {
     pub agent_tools_enabled: bool,
     /// Inline transcript image previews (`/config`). Defaults on.
     pub inline_images_enabled: bool,
+    /// Footer tok/s and cache-hit stats (`/config`). Default on.
+    pub footer_tps_enabled: bool,
+    pub footer_cache_enabled: bool,
     /// Chat TUI color theme (`/config`). `None` = the user has never picked one,
     /// so startup auto-detects from the terminal background (falling back to dark);
     /// `Some` = an explicit choice that's always honored.
@@ -2162,6 +2165,18 @@ impl SessionStore {
         self.write_code_prefs(&prefs).await
     }
 
+    pub async fn set_chat_footer_tps_enabled(&self, on: bool) -> Result<()> {
+        let mut prefs = self.read_code_prefs().await;
+        prefs.insert("footerTps".into(), serde_json::Value::Bool(on));
+        self.write_code_prefs(&prefs).await
+    }
+
+    pub async fn set_chat_footer_cache_enabled(&self, on: bool) -> Result<()> {
+        let mut prefs = self.read_code_prefs().await;
+        prefs.insert("footerCacheHit".into(), serde_json::Value::Bool(on));
+        self.write_code_prefs(&prefs).await
+    }
+
     /// The persisted `/effort` reasoning level for `model` (remembered across
     /// `aivo code` sessions). Effort levels are model-specific, so they're stored
     /// per-model under `reasoningEffort: {<model>: <level>}` in code-prefs.json.
@@ -2263,6 +2278,8 @@ impl SessionStore {
             web_search_enabled: bool_or("useWebSearch", false),
             agent_tools_enabled: bool_or("agentTools", true),
             inline_images_enabled: bool_or("inlineImages", true),
+            footer_tps_enabled: bool_or("footerTps", true),
+            footer_cache_enabled: bool_or("footerCacheHit", true),
             // Absent or unparseable → None, so startup auto-detects.
             theme: prefs
                 .get("theme")

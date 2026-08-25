@@ -509,7 +509,8 @@ async fn config_overlay_renders_live_values_and_focused_options() {
     app.open_config_overlay();
 
     let render = |app: &mut CodeTuiApp| {
-        let mut terminal = Terminal::new(TestBackend::new(80, 26)).unwrap();
+        // 30 tall fits the full stacked list; shorter terminals scroll with the selection.
+        let mut terminal = Terminal::new(TestBackend::new(80, 30)).unwrap();
         terminal.draw(|frame| app.render(frame)).unwrap();
         let buffer = terminal.backend().buffer();
         (0..buffer.area.height)
@@ -584,9 +585,9 @@ async fn config_overlay_click_selects_list_row() {
         .clone()
         .expect("config list hitbox recorded");
     // Visual rows (split, with group gaps): Appearance, Theme, Inline images,
-    // Thinking, blank, Behavior, Mode, Web search, Agent tools, blank, Media,
-    // Vision fallback, Image generation.
-    let image_row = hitbox.list_area.y + 12;
+    // Thinking, Footer tok/s, Footer cache hit, blank, Behavior, Mode,
+    // Web search, Agent tools, blank, Media, Vision fallback, Image generation.
+    let image_row = hitbox.list_area.y + 14;
     app.handle_mouse(left_click(hitbox.list_area.x, image_row))
         .await
         .unwrap();
@@ -981,4 +982,35 @@ fn test_overlay_hides_input_cursor() {
     )));
 
     assert!(!app.should_show_input_cursor());
+}
+
+#[tokio::test]
+async fn test_config_overlay_toggles_footer_stats_and_persists() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+
+    app.open_config_overlay();
+    let Overlay::Config(state) = &app.overlay else {
+        panic!("expected config overlay");
+    };
+    let tps_idx = state
+        .items
+        .iter()
+        .position(|i| i.setting == ConfigSetting::FooterTps)
+        .expect("Footer tok/s row present");
+    let cache_idx = state
+        .items
+        .iter()
+        .position(|i| i.setting == ConfigSetting::FooterCacheHit)
+        .expect("Footer cache hit row present");
+
+    assert_eq!(app.config_segments(ConfigSetting::FooterTps).active, 0);
+    app.cycle_config_setting(tps_idx, CycleDir::Enter).await;
+    assert!(!app.footer_tps_enabled);
+    app.cycle_config_setting(cache_idx, CycleDir::Enter).await;
+    assert!(!app.footer_cache_enabled);
+
+    let toggles = app.session_store.get_chat_toggles().await;
+    assert!(!toggles.footer_tps_enabled);
+    assert!(!toggles.footer_cache_enabled);
 }

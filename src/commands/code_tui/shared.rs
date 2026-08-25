@@ -1497,6 +1497,10 @@ pub(super) enum ConfigSetting {
     Approval,
     UseWebSearch,
     AgentTools,
+    /// Footer generation-rate (tok/s) indicator.
+    FooterTps,
+    /// Footer prompt-cache hit-rate indicator.
+    FooterCacheHit,
     /// Describe images for text-only models (`aivo` / `custom` / `off`).
     VisionFallback,
     /// The agent's `generate_image` tool (`custom` / `off`).
@@ -3086,6 +3090,10 @@ pub(super) struct CodeTuiApp {
     /// A connection retry is in progress → status reads "Working", not
     /// "Thinking". Set on the retry notice, cleared on progress.
     pub(super) retrying: bool,
+    /// Last turn's generation rate, frozen by `capture_turn_tps`; not persisted.
+    pub(super) last_turn_tps: Option<f64>,
+    /// Last turn's cache-read share of the inclusive prompt; `None` = none reported.
+    pub(super) last_cache_hit_pct: Option<u8>,
     pub(super) last_usage: Option<TokenUsage>,
     /// Provider-measured usage streamed mid-turn (Anthropic reports it from
     /// `message_start`; OpenAI/Responses/Google only at the end). Drives the
@@ -3353,6 +3361,9 @@ pub(super) struct CodeTuiApp {
     /// aivo's hosted web_search; `/config` toggle, applied to the engine each turn.
     pub(super) web_search_enabled: bool,
     pub(super) agent_tools_enabled: bool,
+    /// Footer stat toggles (`/config`); remembered across sessions.
+    pub(super) footer_tps_enabled: bool,
+    pub(super) footer_cache_enabled: bool,
     /// Chat TUI color theme (`/config`); remembered across sessions.
     pub(super) theme: UiTheme,
     /// Whether the current model is known to support reasoning/thinking (from the
@@ -3716,6 +3727,8 @@ impl CodeTuiApp {
             turn_stream_chars_measured: 0,
             turn_steps: 0,
             retrying: false,
+            last_turn_tps: None,
+            last_cache_hit_pct: None,
             last_usage: None,
             live_usage: None,
             context_tokens: 0,
@@ -3811,6 +3824,8 @@ impl CodeTuiApp {
             thinking_enabled: true,
             web_search_enabled: true,
             agent_tools_enabled: true,
+            footer_tps_enabled: true,
+            footer_cache_enabled: true,
             theme: UiTheme::Dark,
             model_supports_thinking: false,
             model_image_input: None,

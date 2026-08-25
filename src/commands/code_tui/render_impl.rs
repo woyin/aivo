@@ -3474,6 +3474,15 @@ impl CodeTuiApp {
             tail.push(Span::styled(" · ", Style::default().fg(FAINT())));
             tail.push(Span::styled(effort, Style::default().fg(FAINT())));
         }
+        if area.width >= 70 {
+            for label in [self.footer_tps_label(), self.footer_cache_label()]
+                .into_iter()
+                .flatten()
+            {
+                tail.push(Span::styled(" · ", Style::default().fg(FAINT())));
+                tail.push(Span::styled(label, Style::default().fg(FAINT())));
+            }
+        }
         tail.push(Span::styled(" · ", Style::default().fg(FAINT())));
         tail.push(Span::styled(meter_label, Style::default().fg(meter_color)));
         let tail_w: usize = tail.iter().map(|s| display_width(s.content.as_ref())).sum();
@@ -3601,6 +3610,36 @@ impl CodeTuiApp {
         } else {
             Some("thinking off".to_string())
         }
+    }
+
+    /// Mid-turn: live throughput over the decision-wait-corrected turn clock
+    /// (tool runtime dilutes on purpose), quiet the first second. Idle: the
+    /// last turn's frozen figure.
+    pub(super) fn footer_tps_label(&self) -> Option<String> {
+        if !self.footer_tps_enabled {
+            return None;
+        }
+        if self.sending {
+            let started = self.request_started_at?;
+            let elapsed = started.elapsed().as_secs_f64();
+            let unmeasured = crate::agent::tokens::chars_to_tokens(
+                self.turn_stream_chars
+                    .saturating_sub(self.turn_stream_chars_measured),
+            );
+            let tokens = self.turn_output_tokens + unmeasured;
+            if elapsed < 1.0 || tokens == 0 {
+                return None;
+            }
+            return Some(format_tps(tokens as f64 / elapsed));
+        }
+        self.last_turn_tps.map(format_tps)
+    }
+
+    pub(super) fn footer_cache_label(&self) -> Option<String> {
+        if !self.footer_cache_enabled {
+            return None;
+        }
+        self.last_cache_hit_pct.map(|pct| format!("cache:{pct}%"))
     }
 
     /// Aggregate MCP health for the status line, or `None` with no configured

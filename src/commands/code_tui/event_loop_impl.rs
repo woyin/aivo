@@ -1011,6 +1011,23 @@ impl CodeTuiApp {
         })
     }
 
+    /// Must run on the finish paths before `request_started_at` clears;
+    /// sub-second or tokenless turns keep the prior figure.
+    pub(super) fn capture_turn_tps(&mut self) {
+        let Some(started) = self.request_started_at else {
+            return;
+        };
+        let elapsed = started.elapsed().as_secs_f64();
+        let unmeasured = crate::agent::tokens::chars_to_tokens(
+            self.turn_stream_chars
+                .saturating_sub(self.turn_stream_chars_measured),
+        );
+        let tokens = self.turn_output_tokens + unmeasured;
+        if elapsed >= 1.0 && tokens > 0 {
+            self.last_turn_tps = Some(tokens as f64 / elapsed);
+        }
+    }
+
     async fn finish_agent_turn(
         &mut self,
         _steps: usize,
@@ -1048,6 +1065,7 @@ impl CodeTuiApp {
         self.sending = false;
         self.subagent_rows.clear();
         self.clear_tool_output();
+        self.capture_turn_tps();
         self.request_started_at = None;
         self.response_task = None;
         self.pending_submit = None;
@@ -1105,6 +1123,11 @@ impl CodeTuiApp {
             self.session_tokens = self.session_tokens.merge(turn);
             turn_split = turn;
         }
+        self.last_cache_hit_pct = cache_hit_pct(
+            turn_split.cache_read_tokens,
+            turn_split.cache_write_tokens,
+            turn_split.prompt_tokens,
+        );
         // Capture a drafted plan before the persist (and before a queued message
         // flips `sending`) so it rides this turn-end save.
         self.capture_plan_draft();
@@ -1351,6 +1374,7 @@ impl CodeTuiApp {
         self.sending = false;
         self.subagent_rows.clear();
         self.clear_tool_output();
+        self.capture_turn_tps();
         self.request_started_at = None;
         self.response_task = None;
         // The turn's format belongs to the model that ran it — don't clobber a
@@ -1501,6 +1525,14 @@ impl CodeTuiApp {
         self.context_is_estimate = turn.usage.is_none();
         self.last_usage = turn.usage;
         self.live_usage = None;
+        // `turn.usage`, not the chars/4 estimate — that has no cache split.
+        self.last_cache_hit_pct = turn.usage.and_then(|u| {
+            cache_hit_pct(
+                u.cache_read_input_tokens,
+                u.cache_creation_input_tokens,
+                u.prompt_tokens,
+            )
+        });
 
         // The turn's reply for the log: the most recent assistant entry (the final
         // text, or the last flushed segment when the turn ended on a tool step).
@@ -3634,4 +3666,11 @@ fn sort_cheapest_first(models: Vec<ModelChoice>) -> Vec<ModelChoice> {
 /// Unknown models answer `false` — the picker won't offer them as describers.
 pub(super) fn model_reads_images(model: &str) -> bool {
     crate::services::model_metadata::snapshot_limits(model).is_some_and(|l| l.image_input)
+}
+
+/// `None` without any cache activity — providers that never report cache must
+/// hide the stat, not show a false 0%.
+pub(super) fn cache_hit_pct(read: u64, write: u64, prompt: u64) -> Option<u8> {
+    (prompt > 0 && read.saturating_add(write) > 0)
+        .then(|| (read.saturating_mul(100) / prompt).min(100) as u8)
 }

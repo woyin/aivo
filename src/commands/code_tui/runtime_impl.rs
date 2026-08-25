@@ -3699,6 +3699,8 @@ and keep each turn's work small"
         );
         self.format = seeded_chat_format(&self.key, &self.raw_model);
         self.last_usage = None;
+        self.last_turn_tps = None;
+        self.last_cache_hit_pct = None;
         self.context_tokens = 0;
         // Fresh session → fresh token tally (the index entry starts at zero).
         self.session_tokens = crate::services::session_store::SessionTokens::default();

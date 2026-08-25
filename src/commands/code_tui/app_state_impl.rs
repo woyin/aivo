@@ -196,6 +196,8 @@ impl CodeTuiApp {
         self.format = seeded_chat_format(&self.key, &self.raw_model);
         self.last_usage = None;
         self.live_usage = None;
+        self.last_turn_tps = None;
+        self.last_cache_hit_pct = None;
         self.context_tokens = 0;
         self.context_is_estimate = true;
         self.follow_output = true;

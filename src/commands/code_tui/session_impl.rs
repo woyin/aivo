@@ -734,6 +734,14 @@ is preserved."
                 label: "Thinking",
             },
             ConfigRow {
+                setting: ConfigSetting::FooterTps,
+                label: "Footer tok/s",
+            },
+            ConfigRow {
+                setting: ConfigSetting::FooterCacheHit,
+                label: "Footer cache hit",
+            },
+            ConfigRow {
                 setting: ConfigSetting::Approval,
                 label: "Mode",
             },
@@ -840,6 +848,18 @@ is preserved."
             (ConfigSetting::AgentTools, _) => {
                 "Plain chat: no tools, no system prompt.".to_string()
             }
+            (ConfigSetting::FooterTps, "on") => {
+                "Footer shows the generation rate — live during a turn, the last turn's when idle."
+                    .to_string()
+            }
+            (ConfigSetting::FooterTps, _) => "No tok/s figure in the footer.".to_string(),
+            (ConfigSetting::FooterCacheHit, "on") => {
+                "Footer shows the last turn's prompt-cache hit rate, when the provider reports cache usage."
+                    .to_string()
+            }
+            (ConfigSetting::FooterCacheHit, _) => {
+                "No cache-hit figure in the footer.".to_string()
+            }
             (ConfigSetting::VisionFallback, "custom") => {
                 "The picked model describes images the chat model can't read.".to_string()
             }
@@ -938,6 +958,8 @@ is preserved."
             }
             ConfigSetting::UseWebSearch => switch(self.web_search_enabled),
             ConfigSetting::AgentTools => switch(self.agent_tools_enabled),
+            ConfigSetting::FooterTps => switch(self.footer_tps_enabled),
+            ConfigSetting::FooterCacheHit => switch(self.footer_cache_enabled),
             ConfigSetting::VisionFallback => {
                 use crate::services::session_store::VisionFallbackMode;
                 const OPTIONS: &[&str] = &["aivo", "custom", "off"];
@@ -1067,6 +1089,8 @@ is preserved."
             }
             ConfigSetting::UseWebSearch => self.set_web_search_enabled(target == 0).await,
             ConfigSetting::AgentTools => self.set_agent_tools_enabled(target == 0).await,
+            ConfigSetting::FooterTps => self.set_footer_tps_enabled(target == 0).await,
+            ConfigSetting::FooterCacheHit => self.set_footer_cache_enabled(target == 0).await,
             ConfigSetting::VisionFallback => {
                 use crate::services::session_store::VisionFallbackMode;
                 let mode =
@@ -1152,6 +1176,32 @@ is preserved."
         self.thinking_enabled = on;
         self.show_toast(if on { "Thinking on" } else { "Thinking off" });
         let _ = self.session_store.set_chat_thinking_enabled(on).await;
+    }
+
+    pub(super) async fn set_footer_tps_enabled(&mut self, on: bool) {
+        if self.footer_tps_enabled == on {
+            return;
+        }
+        self.footer_tps_enabled = on;
+        self.show_toast(if on {
+            "Footer tok/s on"
+        } else {
+            "Footer tok/s off"
+        });
+        let _ = self.session_store.set_chat_footer_tps_enabled(on).await;
+    }
+
+    pub(super) async fn set_footer_cache_enabled(&mut self, on: bool) {
+        if self.footer_cache_enabled == on {
+            return;
+        }
+        self.footer_cache_enabled = on;
+        self.show_toast(if on {
+            "Footer cache hit on"
+        } else {
+            "Footer cache hit off"
+        });
+        let _ = self.session_store.set_chat_footer_cache_enabled(on).await;
     }
 
     /// `custom` is only ever set with a describer pair in hand (picker flow /
