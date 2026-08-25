@@ -83,6 +83,9 @@ pub(super) struct InlineImageState {
     /// What this frame's render wants on screen; virtual mode uses it purely
     /// as the transmit trigger, classic mode diffs it against `placed`.
     pub(super) desired: Vec<PlacedImage>,
+    /// Sixel mode: vanished placements whose cells the next render must
+    /// force-rewrite to erase the stale pixels.
+    pub(super) pending_clears: Vec<PlacedImage>,
     pub(super) resize_settle: Option<std::time::Instant>,
 }
 
@@ -1058,24 +1061,26 @@ impl CodeTuiApp {
 
     /// Sixel placement diff: emit new images at their cursor address (tmux
     /// composes them as pane content). Sixel has no delete command — when
-    /// anything disappears or moves, DON'T draw this frame: schedule a full
-    /// repaint whose cell rewrite clears the stale pixels; the next flush then
-    /// re-places everything against an empty `placed`. One blank-image frame,
-    /// hidden inside the synchronized updates. Returns true when that extra
-    /// frame is needed.
+    /// anything disappears or moves, DON'T draw this frame: queue the stale
+    /// rects for a cell rewrite that erases the pixels; the flush after it
+    /// re-places only what's missing. Returns true for that extra frame.
     fn flush_sixel(&mut self, out: &mut impl std::io::Write) -> bool {
         let desired = std::mem::take(&mut self.inline_images.desired);
         if desired == self.inline_images.placed {
             return false;
         }
-        let removed_or_moved = self
+        let removed: Vec<PlacedImage> = self
             .inline_images
             .placed
             .iter()
-            .any(|old| !desired.contains(old));
-        if removed_or_moved {
-            self.inline_images.placed = Vec::new();
-            self.pending_full_repaint = true;
+            .filter(|old| !desired.contains(old))
+            .copied()
+            .collect();
+        if !removed.is_empty() {
+            self.inline_images
+                .placed
+                .retain(|old| desired.contains(old));
+            self.inline_images.pending_clears.extend(removed);
             return true;
         }
         let mut seq = String::new();
@@ -1250,6 +1255,23 @@ impl CodeTuiApp {
     pub(super) fn note_cells_repainted(&mut self) {
         if self.inline_images.caps.protocol == Protocol::Sixel {
             self.inline_images.placed.clear();
+            self.inline_images.pending_clears.clear();
+        }
+    }
+
+    /// `AlwaysUpdate` bypasses the unchanged-cell diff shortcut, so the cells
+    /// under a vanished placement are re-emitted even when blank — erasing the
+    /// pixels without a full-screen repaint. (The next frame re-emits the rect
+    /// once more: `diff_option` participates in cell equality. Harmless.)
+    pub(super) fn mark_sixel_clear_cells(&mut self, buffer: &mut ratatui::buffer::Buffer) {
+        for stale in std::mem::take(&mut self.inline_images.pending_clears) {
+            for y in stale.y..stale.y.saturating_add(stale.rows) {
+                for x in stale.x..stale.x.saturating_add(stale.cols) {
+                    if let Some(cell) = buffer.cell_mut(ratatui::layout::Position::new(x, y)) {
+                        cell.set_diff_option(ratatui::buffer::CellDiffOption::AlwaysUpdate);
+                    }
+                }
+            }
         }
     }
 
@@ -1280,6 +1302,7 @@ impl CodeTuiApp {
     /// (external $EDITOR); data and placements must be re-sent from scratch.
     pub(super) fn reset_inline_image_terminal_state(&mut self) {
         self.inline_images.placed.clear();
+        self.inline_images.pending_clears.clear();
         self.inline_images.transmitted.clear();
         self.inline_images.transmit_order.clear();
     }

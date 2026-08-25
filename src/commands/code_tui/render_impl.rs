@@ -1714,6 +1714,7 @@ impl CodeTuiApp {
 
         self.render_toast(frame, outer);
         scrub_control_cells(frame.buffer_mut());
+        self.mark_sixel_clear_cells(frame.buffer_mut());
     }
 
     /// Captures the rendered screen into `screen_surface` for full-screen drag-copy.

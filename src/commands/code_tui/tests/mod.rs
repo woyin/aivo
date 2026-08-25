@@ -5,6 +5,7 @@ mod command_menu;
 mod composer;
 mod event_stream;
 mod goal;
+mod inline_images;
 mod local_commands;
 mod mcp;
 mod models_keys;
