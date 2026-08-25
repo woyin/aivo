@@ -934,6 +934,40 @@ fn test_clipboard_read_candidates_are_platform_specific() {
 }
 
 #[test]
+fn test_screen_surface_capture_keeps_wide_chars_contiguous() {
+    // Drag-copying the composer used to paste "你 好 世 界" instead of "你好世界".
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.draft = "你好世界".to_string();
+    render_full_screen(&mut app, 80, 16);
+
+    let surface = app.screen_surface.as_ref().expect("surface captured");
+    let row = surface
+        .rows
+        .iter()
+        .position(|r| r.contains("你"))
+        .expect("draft rendered into the captured surface");
+    assert!(
+        surface.rows[row].contains("你好世界"),
+        "wide chars must capture without spacer cells: {:?}",
+        surface.rows[row]
+    );
+
+    app.screen_selection = Some(TranscriptSelection {
+        anchor: TranscriptPoint { row, column: 0 },
+        focus: TranscriptPoint {
+            row,
+            column: row_display_width(&surface.rows[row]),
+        },
+    });
+    let copied = app.selected_screen_text().expect("selection copies");
+    assert!(
+        copied.contains("你好世界"),
+        "copied text must not gain spaces: {copied:?}"
+    );
+}
+
+#[test]
 fn test_empty_state_notice_selects_via_screen_surface() {
     use crate::services::share_live::LiveShareHandle;
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();

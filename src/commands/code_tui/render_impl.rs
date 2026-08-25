@@ -1745,8 +1745,14 @@ impl CodeTuiApp {
         let mut rows = Vec::with_capacity(usize::from(area.height));
         for y in area.y..area.y.saturating_add(area.height) {
             let mut row = String::with_capacity(usize::from(area.width));
+            // Cells behind a wide glyph reset to " " — skip them or CJK copy gains spaces.
+            let mut spacer_cells = 0u16;
             for x in area.x..area.x.saturating_add(area.width) {
                 if let Some(cell) = buffer.cell((x, y)) {
+                    if spacer_cells > 0 {
+                        spacer_cells -= 1;
+                        continue;
+                    }
                     // Image placeholder cells copy as blanks, not U+10EEEE noise.
                     if cell
                         .symbol()
@@ -1755,9 +1761,8 @@ impl CodeTuiApp {
                         row.push(' ');
                         continue;
                     }
-                    // Wide-char spacers carry an empty symbol, so the row's display
-                    // width stays equal to its column count.
                     row.push_str(cell.symbol());
+                    spacer_cells = row_display_width(cell.symbol()).saturating_sub(1);
                 }
             }
             rows.push(row);
