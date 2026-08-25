@@ -3493,11 +3493,13 @@ fn is_ctrl_char(event: &Event, ch: char) -> bool {
 }
 
 /// A provider 400 that means "this model can't take image content": the
-/// cross-vendor "image input" wording, or a serde-style deserialize rejection
-/// of the `image_url` content part (aivo's own gateway speaks this one).
+/// cross-vendor "image input" / "does not support image" wordings, or a
+/// serde-style rejection of the `image_url` part (aivo's own gateway).
 pub(super) fn is_image_input_rejection(err: &str) -> bool {
     let err = err.to_ascii_lowercase();
-    err.contains("image input") || (err.contains("unknown variant") && err.contains("image_url"))
+    err.contains("image input")
+        || err.contains("not support image")
+        || (err.contains("unknown variant") && err.contains("image_url"))
 }
 
 /// Lead an image-rejection 400 with an actionable line, for models the snapshot

@@ -349,7 +349,11 @@ impl CodeTuiApp {
         if self.model_image_input != Some(true) {
             let has_image_draft = self.draft_attachments.iter().any(|a| a.is_image());
             let known_text_only = self.model_image_input == Some(false);
-            if has_image_draft || self.history_has_image() || self.engine_history_has_images() {
+            if has_image_draft
+                || self.history_has_image()
+                || self.engine_history_has_images()
+                || self.pending_messages_have_images()
+            {
                 match self.resolve_describer().await {
                     Ok(src) => vision_shim = Some(src),
                     Err(refusal) if has_image_draft && known_text_only => {
@@ -617,6 +621,18 @@ impl CodeTuiApp {
             .as_ref()
             .and_then(|s| s.engine.try_lock().ok())
             .is_some_and(|e| e.history_has_images())
+    }
+
+    /// Image parts in a transcript stashed for the next rebuild — after a
+    /// key/model switch this is the only place tool images remain visible.
+    pub(super) fn pending_messages_have_images(&self) -> bool {
+        self.pending_agent_messages.as_ref().is_some_and(|msgs| {
+            msgs.iter().any(|m| {
+                m.get("content")
+                    .and_then(|c| c.as_array())
+                    .is_some_and(|parts| parts.iter().any(crate::agent::tokens::is_image_part))
+            })
+        })
     }
 
     /// True when the current key can drive the in-process agent (see `key_is_agent_capable`).
