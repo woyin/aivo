@@ -37,8 +37,9 @@ pub(super) fn ui_theme() -> UiTheme {
     }
 }
 
-/// Semantic colors for the chat TUI. Warm neutrals carry the structure; acid lime
-/// is reserved for the aivo mark, focus, and active choices.
+/// Semantic colors for the chat TUI. Neutral grays carry the structure (warm
+/// paper neutrals in light); acid lime is reserved for the aivo mark, focus,
+/// and active choices.
 #[derive(Clone, Copy)]
 pub(super) struct Palette {
     pub text: Color,
@@ -82,18 +83,23 @@ pub(super) struct Palette {
 }
 
 impl Palette {
-    /// Warm night: terminal black, paper-white ink, and the full acid-lime mark.
+    /// Neutral night: terminal black, the terminal's own ink, and the full
+    /// acid-lime mark. Body text is `Reset` so it always matches the host
+    /// terminal; safe because dark never paints text over its own canvas
+    /// (canvas: None) and every filled bar pairs its own fg (select_text,
+    /// jump_fg, delete_text). The gray ramp is desaturated to match Reset's
+    /// unknown hue — warmth lives only in the brand accents.
     pub const DARK: Self = Self {
-        text: Color::Rgb(237, 233, 226),
-        muted: Color::Rgb(163, 156, 143),
-        faint: Color::Rgb(112, 105, 93),
+        text: Color::Reset,
+        muted: Color::Rgb(156, 156, 156),
+        faint: Color::Rgb(106, 106, 106),
         accent: Color::Rgb(222, 252, 9), // #DEFC09
         assistant: Color::Rgb(171, 193, 116),
-        user: Color::Rgb(201, 192, 176),
+        user: Color::Rgb(193, 193, 193),
         tool: Color::Rgb(142, 164, 159),
         shell: Color::Rgb(215, 172, 80),
         link: Color::Rgb(143, 178, 222),
-        quote: Color::Rgb(154, 148, 126),
+        quote: Color::Rgb(147, 147, 147),
         error: Color::Rgb(228, 128, 114),
         warning: Color::Rgb(224, 180, 104),
         info: Color::Rgb(126, 184, 212),
@@ -107,7 +113,7 @@ impl Palette {
         diff_add_hl_bg: Color::Rgb(33, 84, 50),
         diff_del_hl_bg: Color::Rgb(92, 38, 38),
         select_bg: Color::Rgb(94, 102, 126),
-        select_text: Color::Rgb(243, 239, 231),
+        select_text: Color::Rgb(240, 240, 240),
         select_accent: Color::Rgb(222, 252, 9),
         // Mouse wash matches the menu selection bar exactly — one selection
         // color everywhere; the flash is the same hue a step brighter.
@@ -118,9 +124,9 @@ impl Palette {
         delete_accent: Color::Rgb(255, 174, 146),
         canvas: None,
         code: Color::Rgb(154, 205, 185),
-        toast_bg: Color::Rgb(23, 20, 15),
-        jump_fg: Color::Rgb(26, 23, 18),
-        jump_bg: Color::Rgb(231, 227, 219),
+        toast_bg: Color::Rgb(21, 21, 21),
+        jump_fg: Color::Rgb(22, 22, 22),
+        jump_bg: Color::Rgb(228, 228, 228),
     };
 
     /// Light brand linen: the same warm paper dark uses as ink, now as the
@@ -158,7 +164,7 @@ impl Palette {
         delete_bg: Color::Rgb(226, 206, 198),
         delete_text: Color::Rgb(116, 38, 24),
         delete_accent: Color::Rgb(166, 58, 35),
-        canvas: Some(Color::Rgb(237, 233, 226)), // brand paper, same as DARK.text
+        canvas: Some(Color::Rgb(237, 233, 226)), // brand paper
         code: Color::Rgb(38, 105, 98),
         toast_bg: Color::Rgb(226, 220, 208),
         jump_fg: Color::Rgb(237, 233, 226),
