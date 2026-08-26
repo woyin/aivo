@@ -502,9 +502,10 @@ pub(super) async fn run_bash_inner(
             out.push_str(match confinement {
                 BashConfinement::Workspace => {
                     "\n[note: blocked by the workspace write-sandbox, not a real command \
-failure — it wrote outside the agent's workspace. The user can approve re-running it \
-outside the sandbox; don't fall back to telling the user to run it by hand. To drop \
-confinement for the whole session, relaunch aivo with AIVO_AGENT_NO_SANDBOX=1.]"
+failure — it wrote outside the agent's workspace. The user can approve adding the target \
+directory to the session's writable roots, or re-running the command outside the sandbox; \
+don't fall back to telling the user to run it by hand. Relaunching with `--add-dir <dir>` \
+(or AIVO_AGENT_NO_SANDBOX=1) also works.]"
                 }
                 _ => {
                     "\n[note: blocked writing to a protected path (aivo's config dir or \

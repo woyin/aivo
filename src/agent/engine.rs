@@ -202,6 +202,9 @@ pub const SANDBOX_ESCALATION_NOTICE: &str = "re-running outside the workspace sa
 /// File-tool counterpart of [`SANDBOX_ESCALATION_NOTICE`].
 pub const WRITE_ESCALATION_NOTICE: &str = "writing outside the workspace (approved)";
 
+/// Prefix of the "add writable root" ack — the full notice carries the root path.
+pub const ADD_WRITE_ROOT_NOTICE: &str = "writable root added: ";
+
 /// One-line diagnostic to stderr, gated by `AIVO_DEBUG=1`.
 fn agent_debug(msg: &str) {
     if matches!(std::env::var("AIVO_DEBUG").as_deref(), Ok("1")) {

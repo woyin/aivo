@@ -29,20 +29,31 @@
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::OnceLock;
+use std::sync::RwLock;
 #[cfg(target_os = "linux")]
 use std::sync::atomic::{AtomicBool, Ordering};
 
-/// Extra writable roots from `--add-dir`, set once at CLI startup. Process-wide
-/// because confinement is process-level anyway (seatbelt profile / Landlock argv).
-static EXTRA_WRITE_ROOTS: OnceLock<Vec<PathBuf>> = OnceLock::new();
+/// Extra writable roots: `--add-dir` at startup plus mid-session approvals.
+/// Process-wide because confinement is process-level; the seatbelt profile and
+/// Landlock argv are rebuilt per command, so appends take effect immediately.
+static EXTRA_WRITE_ROOTS: RwLock<Vec<PathBuf>> = RwLock::new(Vec::new());
 
-/// Register `--add-dir` roots (first caller wins; callers validate existence).
-pub fn set_extra_write_roots(dirs: Vec<PathBuf>) {
-    let _ = EXTRA_WRITE_ROOTS.set(dirs);
+/// Append one root (`--add-dir` or an approved escalation). Canonicalized so
+/// containment checks agree across spellings (`/tmp` vs `/private/tmp`); the
+/// stored set stays minimal — covered roots are dropped, narrower ones collapsed.
+pub fn add_extra_write_root(dir: PathBuf) {
+    let dir = dir.canonicalize().unwrap_or(dir);
+    let mut roots = EXTRA_WRITE_ROOTS.write().unwrap();
+    if roots.iter().any(|r| dir.starts_with(r)) {
+        return;
+    }
+    roots.retain(|r| !r.starts_with(&dir));
+    roots.push(dir);
 }
 
-pub fn extra_write_roots() -> &'static [PathBuf] {
-    EXTRA_WRITE_ROOTS.get().map(Vec::as_slice).unwrap_or(&[])
+/// The list is at most a few entries, so the clone is cheap.
+pub fn extra_write_roots() -> Vec<PathBuf> {
+    EXTRA_WRITE_ROOTS.read().unwrap().clone()
 }
 
 /// Roots no escalation may open silently: aivo's config dir (key store) and
@@ -92,6 +103,13 @@ impl SandboxProfile {
 
     /// The accepted `--sandbox` values, for CLI help/validation.
     pub const VALUES: &'static [&'static str] = &["off", "workspace", "read-only", "strict"];
+
+    /// Whether the profile's write-allowlist includes the workspace and extra
+    /// roots — read-only never does, so e.g. an "add writable root" offer would
+    /// be a no-op there.
+    pub fn writes_workspace(self) -> bool {
+        self != Self::ReadOnly
+    }
 
     /// Child-network denial is macOS-only (Landlock can't gate network), so the
     /// only non-test caller is the macOS SBPL builder.
@@ -302,8 +320,8 @@ fn landlock_relaunch(
     command: &str,
     profile: SandboxProfile,
 ) -> ShellInvocation {
-    // First `--workspace` = cwd, extras are `--add-dir` roots; roots + profile
-    // must ride the argv (the OnceLock isn't inherited across the re-exec).
+    // First `--workspace` = cwd, extras are the extra write roots; roots +
+    // profile must ride the argv (globals aren't inherited across the re-exec).
     let mut args = vec![
         "__agent-sandbox".to_string(),
         "--profile".to_string(),
@@ -467,7 +485,7 @@ fn macos_profile(cwd: &Path, profile: SandboxProfile) -> String {
         writable.push("/opt/homebrew".into());
     }
     // Seatbelt matches the resolved path, so a symlinked cwd needs both forms.
-    if profile != SandboxProfile::ReadOnly {
+    if profile.writes_workspace() {
         writable.push(cwd.to_string_lossy().into_owned());
         if let Ok(canon) = cwd.canonicalize() {
             writable.push(canon.to_string_lossy().into_owned());
@@ -580,7 +598,7 @@ fn linux_writable_paths(cwd: &Path, profile: SandboxProfile) -> Vec<PathBuf> {
         // Package-manager prefix.
         candidates.push(PathBuf::from("/usr/local"));
     }
-    if profile != SandboxProfile::ReadOnly {
+    if profile.writes_workspace() {
         candidates.push(cwd.to_path_buf());
         if let Ok(canon) = cwd.canonicalize() {
             candidates.push(canon);
@@ -803,6 +821,25 @@ mod macos_tests {
         }
         assert!(!profile.contains("(deny file-read"));
         assert!(!profile.contains("(deny network"));
+    }
+
+    #[test]
+    fn runtime_added_root_lands_in_profile_and_dedupes() {
+        let dir = std::env::temp_dir().join(format!("aivo-addroot-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("nested")).unwrap();
+        let canon = dir.canonicalize().unwrap();
+        add_extra_write_root(dir.clone());
+        add_extra_write_root(dir.clone()); // idempotent
+        add_extra_write_root(dir.join("nested")); // covered by `dir` → dropped
+        let roots = extra_write_roots();
+        assert_eq!(roots.iter().filter(|r| **r == canon).count(), 1);
+        assert!(!roots.iter().any(|r| r.ends_with("nested")));
+        // The next command's profile picks the root up immediately.
+        let profile = macos_profile(Path::new("/Users/x/proj"), SandboxProfile::Workspace);
+        assert!(profile.contains(&format!("(subpath \"{}\")", canon.display())));
+        // Read-only still ignores extra roots entirely.
+        let ro = macos_profile(Path::new("/Users/x/proj"), SandboxProfile::ReadOnly);
+        assert!(!ro.contains(&format!("(subpath \"{}\")", canon.display())));
     }
 
     #[test]

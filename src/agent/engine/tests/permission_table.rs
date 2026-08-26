@@ -235,10 +235,10 @@ async fn permission_ladder_behavior_table() {
                     &json!({"command":"flyctl deploy --now"}),
                     &dir,
                 ),
-                Tier::Escalated => engine.grants.remember_key(escalation_key(
-                    "run_bash_unsandboxed",
-                    "flyctl deploy --now",
-                )),
+                Tier::Escalated => engine.grants.remember_key(
+                    escalation_key("run_bash_unsandboxed", "flyctl deploy --now"),
+                    false,
+                ),
                 Tier::Once => {}
             }
         }

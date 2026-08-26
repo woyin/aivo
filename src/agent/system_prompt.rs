@@ -265,7 +265,7 @@ the `curl` alias) and chain with `;` (not `&&`). Paths use `\\`.",
             .map(|r| format!("`{}`", r.display()))
             .collect();
         p.push_str(&format!(
-            "\n\nAdditional writable workspace root(s) (via --add-dir): {}. Treat them as part \
+            "\n\nAdditional writable workspace root(s): {}. Treat them as part \
 of the workspace — reference files there by absolute path.",
             list.join(", ")
         ));

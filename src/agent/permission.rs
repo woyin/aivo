@@ -31,7 +31,8 @@ pub(crate) enum PermissionAction<'a> {
     /// `-y`/auto-approve bypass, tool-call grant, AlwaysAllow remembers.
     Confirm { name: &'a str, args: &'a Value },
     /// Bespoke escalation (sandbox / out-of-workspace write): `-y`/auto-approve
-    /// bypass, session-scoped exact key.
+    /// bypass, exact-key grant. `add_write_root` keys persist across sessions;
+    /// the rest are session-scoped.
     Escalated {
         ask_name: &'a str,
         key: String,
@@ -116,7 +117,9 @@ impl AgentEngine {
                 match ui.ask_permission(ask_name, Some(&preview), false).await {
                     Decision::Allow => Resolution::Approved,
                     Decision::AlwaysAllow => {
-                        self.grants.remember_key(key);
+                        // A writable-root grant replays safely in a later
+                        // session; every other escalation stays session-scoped.
+                        self.grants.remember_key(key, ask_name == "add_write_root");
                         Resolution::Approved
                     }
                     Decision::Deny => Resolution::Denied,
@@ -126,7 +129,7 @@ impl AgentEngine {
     }
 }
 
-/// The session key an approved escalation is remembered under — one constructor
+/// The key an approved escalation is remembered under — one constructor
 /// (NUL separator, cf. `grant_store::exact_key`) so the two escalation sites
 /// can't drift apart in spelling.
 pub(crate) fn escalation_key(ask_name: &str, detail: &str) -> String {

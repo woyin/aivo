@@ -316,17 +316,13 @@ pub async fn run() -> ! {
         Commands::Code(mut code_args) => {
             maybe_init_http_debug(&code_args.debug).await;
             // Roots must exist (a typo'd root would silently allow nothing).
-            if !code_args.add_dir.is_empty() {
-                let mut roots = Vec::new();
-                for dir in &code_args.add_dir {
-                    let path = crate::services::system_env::expand_tilde(dir);
-                    if !path.is_dir() {
-                        eprintln!("{} --add-dir {dir}: not a directory", style::red("Error:"));
-                        process::exit(ExitCode::UserError.code());
-                    }
-                    roots.push(path);
+            for dir in &code_args.add_dir {
+                let path = crate::services::system_env::expand_tilde(dir);
+                if !path.is_dir() {
+                    eprintln!("{} --add-dir {dir}: not a directory", style::red("Error:"));
+                    process::exit(ExitCode::UserError.code());
                 }
-                crate::agent::sandbox::set_extra_write_roots(roots);
+                crate::agent::sandbox::add_extra_write_root(path);
             }
             if let Some(profile) = code_args
                 .sandbox

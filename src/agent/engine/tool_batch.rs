@@ -768,7 +768,7 @@ Before calling `{tool}` again, make its arguments match this schema exactly:\n{s
         ui: &mut dyn AgentUi,
         args: &Value,
     ) -> Result<String, String> {
-        let outcome =
+        let mut outcome =
             Self::pump_bash_progress(ui, |tx| tools::run_bash_confined(args, ctx.cwd, Some(tx)))
                 .await;
         if !outcome.sandbox_blocked {
@@ -806,6 +806,29 @@ command with no write confinement?"
                 tools::run_bash_unconfined(args, ctx.cwd, Some(tx))
             })
             .await;
+        }
+        // Narrow remedy first: open just the blocked directory instead of lifting
+        // confinement. Read-only ignores extra roots, so the offer would be a no-op there.
+        if crate::agent::sandbox::current_profile().writes_workspace()
+            && let Some(root) = tools::addable_root_for_command(command, ctx.cwd)
+        {
+            let preview = format!(
+                "{command}\n\nThe workspace sandbox blocked this — it touches {root}, \
+outside {cwd}. Add {root} to this session's writable roots and re-run?",
+                root = root.display(),
+                cwd = ctx.cwd.display()
+            );
+            if !self.offer_add_write_root(ctx, ui, &root, preview).await {
+                return outcome.result;
+            }
+            let rerun = Self::pump_bash_progress(ui, |tx| {
+                tools::run_bash_confined(args, ctx.cwd, Some(tx))
+            })
+            .await;
+            if !rerun.sandbox_blocked {
+                return rerun.result;
+            }
+            outcome = rerun; // the derived root wasn't (all of) it
         }
         // Scoped to the exact command so "always" doesn't blanket-escalate every bash call.
         let action = PermissionAction::Escalated {
@@ -864,6 +887,23 @@ Re-run the full command without write confinement?",
         {
             return tools::execute(name, args, ctx.cwd).await;
         }
+        // Narrow remedy first: one shared root covers every target — add it and
+        // run the normal confined path.
+        if protected.is_empty()
+            && let Some(root) = tools::addable_root_for_paths(&outside, ctx.cwd)
+        {
+            let joined = outside.join(", ");
+            let preview = format!(
+                "{name}: {joined}\n\nThis writes under {root}, outside the workspace {cwd}. \
+Add {root} to this session's writable roots?",
+                root = root.display(),
+                cwd = ctx.cwd.display()
+            );
+            if !self.offer_add_write_root(ctx, ui, &root, preview).await {
+                return Err(refuse_outside(&joined, ctx.cwd));
+            }
+            return tools::execute(name, args, ctx.cwd).await;
+        }
         // One approval covers the whole call, so preview and refusal name every target.
         let mut targets = protected.clone();
         targets.extend(outside.iter().filter(|p| !protected.contains(p)).cloned());
@@ -890,15 +930,37 @@ Re-run the full command without write confinement?",
         };
         let approved = self.resolve_permission(ctx, ui, action).await.allowed();
         if !approved {
-            return Err(format!(
-                "refused: `{}` is outside the workspace (or under a protected root) and the user \
-declined the write. Use a path inside {} instead, or ask the user to relaunch with `--add-dir`.",
-                targets.join(", "),
-                ctx.cwd.display()
-            ));
+            return Err(refuse_outside(&targets.join(", "), ctx.cwd));
         }
         ui.notify(WRITE_ESCALATION_NOTICE);
         tools::execute_write_unconfined(name, args, ctx.cwd).await
+    }
+
+    /// Offer to open `root` for this session after a workspace block; on
+    /// approval applies it immediately and posts the notice. "Always" persists
+    /// the (project, root) grant, so the root is silently re-added next session.
+    async fn offer_add_write_root(
+        &mut self,
+        ctx: &TurnCtx<'_>,
+        ui: &mut dyn AgentUi,
+        root: &std::path::Path,
+        preview: String,
+    ) -> bool {
+        let root_str = root.display().to_string();
+        let action = PermissionAction::Escalated {
+            ask_name: "add_write_root",
+            key: permission::escalation_key(
+                "add_write_root",
+                &format!("{}\u{0}{root_str}", ctx.cwd.display()),
+            ),
+            preview,
+        };
+        if !self.resolve_permission(ctx, ui, action).await.allowed() {
+            return false;
+        }
+        crate::agent::sandbox::add_extra_write_root(root.to_path_buf());
+        ui.notify(&format!("{ADD_WRITE_ROOT_NOTICE}{root_str}"));
+        true
     }
 
     /// Run a `run_bash` future, forwarding its live output chunks to the UI.
@@ -1032,4 +1094,13 @@ Fix the cause, or finish with status \"blocked\".",
 /// Turn-scoped denial signature — ignores the call id so an identical re-issue matches.
 fn deny_sig(name: &str, args: &Value) -> String {
     format!("{name}\u{0}{args}")
+}
+
+/// The one refusal wording for a declined out-of-workspace write.
+fn refuse_outside(targets: &str, cwd: &std::path::Path) -> String {
+    format!(
+        "refused: `{targets}` is outside the workspace (or under a protected root) and the user \
+declined the write. Use a path inside {} instead, or ask the user to relaunch with `--add-dir`.",
+        cwd.display()
+    )
 }

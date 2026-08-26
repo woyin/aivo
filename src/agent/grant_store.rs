@@ -104,9 +104,16 @@ impl GrantStore {
             .any(|g| matches!(g, GrantScope::Exact(k) if k == key))
     }
 
-    /// Remember a bespoke exact key for the session.
-    pub(crate) fn remember_key(&mut self, key: String) {
-        if !self.covers_key(&key) {
+    /// Remember a bespoke exact key — session-scoped, or on disk when the
+    /// grant is safe to replay in a later session.
+    pub(crate) fn remember_key(&mut self, key: String, persist: bool) {
+        if self.covers_key(&key) {
+            return;
+        }
+        if persist {
+            self.persistent.push(GrantScope::Exact(key));
+            self.save();
+        } else {
             self.session.push(GrantScope::Exact(key));
         }
     }
@@ -337,6 +344,19 @@ mod tests {
     }
 
     #[test]
+    fn persistent_key_survives_reload_session_key_does_not() {
+        let path = tmp().join("grants.json");
+        let key = "add_write_root\u{0}/proj\u{0}/repo";
+        let mut g = GrantStore::load(path.clone());
+        g.remember_key("run_bash_unsandboxed\u{0}cmd".into(), false);
+        g.remember_key(key.into(), true);
+        assert!(g.covers_key(key));
+        let g2 = GrantStore::load(path);
+        assert!(g2.covers_key(key));
+        assert!(!g2.covers_key("run_bash_unsandboxed\u{0}cmd"));
+    }
+
+    #[test]
     fn out_of_cwd_write_grants_the_target_directory_for_the_session() {
         let cwd = tmp();
         let outside = tmp(); // a sibling dir, not under cwd
@@ -429,7 +449,7 @@ mod tests {
         let mut g = GrantStore::default();
         let key = "run_bash_unsandboxed\u{0}make install".to_string();
         assert!(!g.covers_key(&key));
-        g.remember_key(key.clone());
+        g.remember_key(key.clone(), false);
         assert!(g.covers_key(&key));
         assert!(!g.covers_key("run_bash_unsandboxed\u{0}make uninstall"));
     }

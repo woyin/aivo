@@ -84,6 +84,136 @@ pub fn protected_write_paths(name: &str, args: &Value, cwd: &Path) -> Vec<String
         .collect()
 }
 
+/// The directory an approved "add writable root" should open for one escaping
+/// write target: the enclosing git checkout when there is one, else the
+/// target's deepest existing directory when that sits inside $HOME. `None`
+/// when the anchor would be too broad ($HOME itself, an ancestor of it, a
+/// filesystem root or top-level dir) or would open a protected root — those
+/// cases stay on the existing escalation cards. `home`/`protected` are injected
+/// so the policy is unit-testable without the process $HOME/config.
+pub(super) fn addable_root(
+    path: &str,
+    cwd: &Path,
+    home: Option<&Path>,
+    protected: &[PathBuf],
+) -> Option<PathBuf> {
+    let target = canonicalize_existing_ancestor(&resolve(cwd, path));
+    let home = home.map(canonicalize_existing_ancestor);
+    // Deepest existing directory (the file may not exist yet).
+    let mut dir = target.as_path();
+    while !dir.is_dir() {
+        dir = dir.parent()?;
+    }
+    let anchor = dir
+        .ancestors()
+        .find(|a| a.join(".git").exists()) // `.git` is a file in linked worktrees
+        .map(Path::to_path_buf)
+        .or_else(|| {
+            // No repo: bare system dirs aren't worth opening.
+            let home = home.as_deref()?;
+            (dir.starts_with(home) && dir != home).then(|| dir.to_path_buf())
+        })?;
+    if anchor.components().count() < 3 {
+        return None; // "/", "/etc" — too broad
+    }
+    if let Some(home) = &home
+        && (anchor == *home || home.starts_with(&anchor))
+    {
+        return None;
+    }
+    if protected
+        .iter()
+        .map(|r| canonicalize_existing_ancestor(r))
+        .any(|r| anchor.starts_with(&r) || r.starts_with(&anchor))
+    {
+        return None;
+    }
+    Some(anchor)
+}
+
+/// The one root an offer can name for a set of escaping file-tool targets.
+pub fn addable_root_for_paths(paths: &[String], cwd: &Path) -> Option<PathBuf> {
+    let (home, protected) = addable_env();
+    single_root(
+        paths
+            .iter()
+            .map(|p| addable_root(p, cwd, home.as_deref(), &protected)),
+        true,
+    )
+}
+
+/// [`addable_root_for_paths`] for a sandbox-blocked shell command. Path tokens
+/// are read/write-agnostic — a root the command only reads from can be offered;
+/// the card names it, so the user decides.
+pub fn addable_root_for_command(cmd: &str, cwd: &Path) -> Option<PathBuf> {
+    let (home, protected) = addable_env();
+    single_root(
+        command_escaping_paths(cmd, cwd)
+            .iter()
+            .map(|p| addable_root(p, cwd, home.as_deref(), &protected)),
+        false,
+    )
+}
+
+fn addable_env() -> (Option<PathBuf>, Vec<PathBuf>) {
+    (
+        crate::services::system_env::home_dir(),
+        crate::agent::sandbox::protected_write_roots(),
+    )
+}
+
+/// Collapse to one distinct root. `strict`: an underivable entry kills the
+/// offer (file-tool targets must all be covered); lenient skips it.
+fn single_root(roots: impl Iterator<Item = Option<PathBuf>>, strict: bool) -> Option<PathBuf> {
+    let mut single: Option<PathBuf> = None;
+    for r in roots {
+        match r {
+            None if strict => return None,
+            None => continue,
+            Some(r) => {
+                if single.as_ref().is_some_and(|prev| *prev != r) {
+                    return None;
+                }
+                single = Some(r);
+            }
+        }
+    }
+    single
+}
+
+/// Absolute-path tokens in a shell command that resolve outside the workspace.
+/// Best-effort — a miss only means the broader escalation card is shown instead.
+pub(super) fn command_escaping_paths(cmd: &str, cwd: &Path) -> Vec<String> {
+    let tokens =
+        shlex::split(cmd).unwrap_or_else(|| cmd.split_whitespace().map(str::to_string).collect());
+    let mut out: Vec<String> = Vec::new();
+    for tok in &tokens {
+        for piece in tok.split('=') {
+            let piece = piece
+                .trim_start_matches(|c: char| {
+                    matches!(c, '>' | '<' | '&' | '(') || c.is_ascii_digit()
+                })
+                .trim_end_matches([';', ')']);
+            // `$HOME/…` → `~/…` so `resolve` (inside the escape check) expands it.
+            let rewritten;
+            let piece = match ["$HOME/", "${HOME}/"]
+                .iter()
+                .find_map(|p| piece.strip_prefix(p))
+            {
+                Some(rest) => {
+                    rewritten = format!("~/{rest}");
+                    &rewritten
+                }
+                None => piece,
+            };
+            if (piece.starts_with('/') || piece.starts_with("~/")) && path_escapes_cwd(piece, cwd) {
+                out.push(piece.to_string());
+            }
+        }
+    }
+    out
+}
+
 /// Whether a write target resolves under a protected root — confirmed even
 /// under auto-approve.
 pub fn write_path_is_protected(path: &str, cwd: &Path) -> bool {
@@ -302,8 +432,8 @@ pub(super) fn git_subcommand_is_readonly(tokens: &[&str]) -> bool {
 /// canonicalizing the workspace root and the target's closest existing ancestor
 /// (the file itself may not exist yet) before comparing.
 pub(super) fn path_escapes_cwd(path: &str, cwd: &Path) -> bool {
-    // `--add-dir` roots are part of the workspace too.
-    path_escapes_roots(path, cwd, crate::agent::sandbox::extra_write_roots())
+    // Extra write roots (`--add-dir` / approved adds) are part of the workspace too.
+    path_escapes_roots(path, cwd, &crate::agent::sandbox::extra_write_roots())
 }
 
 pub(super) fn path_escapes_roots(path: &str, cwd: &Path, extra: &[PathBuf]) -> bool {

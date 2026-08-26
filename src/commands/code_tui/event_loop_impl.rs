@@ -542,12 +542,13 @@ impl CodeTuiApp {
         }
     }
 
-    /// Drop the sandbox-escalation ack on the agent's next output. Scoped to those
-    /// exact notices so an unrelated one sharing the slot survives.
+    /// Drop the sandbox-escalation ack on the agent's next output. Scoped to
+    /// these notices so an unrelated one sharing the slot survives.
     fn clear_sandbox_escalation_notice(&mut self) {
         if self.notice.as_ref().is_some_and(|(_, text)| {
             text == crate::agent::engine::SANDBOX_ESCALATION_NOTICE
                 || text == crate::agent::engine::WRITE_ESCALATION_NOTICE
+                || text.starts_with(crate::agent::engine::ADD_WRITE_ROOT_NOTICE)
         }) {
             self.notice = None;
         }

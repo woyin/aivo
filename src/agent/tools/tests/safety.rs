@@ -26,6 +26,117 @@ fn add_dir_roots_count_as_workspace_for_writes() {
 }
 
 #[test]
+fn addable_root_prefers_enclosing_repo() {
+    let cwd = tmp();
+    let repo = tmp();
+    std::fs::create_dir_all(repo.join(".git")).unwrap();
+    std::fs::create_dir_all(repo.join("sub")).unwrap();
+    let canon = repo.canonicalize().unwrap();
+    // Not-yet-created file deep in the checkout → the repo root, not the leaf dir.
+    let target = repo.join("sub/new/deep.txt").display().to_string();
+    assert_eq!(addable_root(&target, &cwd, None, &[]), Some(canon.clone()));
+    // Linked worktree: `.git` is a FILE, still a repo boundary.
+    let wt = tmp();
+    std::fs::write(wt.join(".git"), "gitdir: /elsewhere/.git/worktrees/wt").unwrap();
+    let target = wt.join("f.txt").display().to_string();
+    assert_eq!(
+        addable_root(&target, &cwd, None, &[]),
+        Some(wt.canonicalize().unwrap())
+    );
+}
+
+#[test]
+fn addable_root_fallback_needs_home_and_rejects_broad_or_protected_anchors() {
+    let cwd = tmp();
+    let home = tmp();
+    std::fs::create_dir_all(home.join("proj/data")).unwrap();
+    // No repo: deepest existing dir, but only inside $HOME…
+    let target = home.join("proj/data/out.txt").display().to_string();
+    assert_eq!(
+        addable_root(&target, &cwd, Some(&home), &[]),
+        Some(home.join("proj/data").canonicalize().unwrap())
+    );
+    // …never $HOME itself, and without a home no bare-dir fallback at all.
+    let at_home = home.join("out.txt").display().to_string();
+    assert_eq!(addable_root(&at_home, &cwd, Some(&home), &[]), None);
+    assert_eq!(addable_root(&target, &cwd, None, &[]), None);
+    // A repo that CONTAINS $HOME is too broad.
+    let base = tmp();
+    std::fs::create_dir_all(base.join(".git")).unwrap();
+    std::fs::create_dir_all(base.join("home")).unwrap();
+    let target = base.join("x.txt").display().to_string();
+    assert_eq!(
+        addable_root(&target, &cwd, Some(&base.join("home")), &[]),
+        None
+    );
+    // System paths ("/etc/…") have no repo and sit outside $HOME → no offer.
+    assert_eq!(addable_root("/etc/hosts", &cwd, Some(&home), &[]), None);
+    // An anchor that would open a protected root is refused.
+    let prot = tmp();
+    std::fs::create_dir_all(prot.join(".git")).unwrap();
+    let target = prot.join("id_rsa").display().to_string();
+    assert_eq!(
+        addable_root(&target, &cwd, None, std::slice::from_ref(&prot)),
+        None
+    );
+}
+
+#[test]
+fn addable_root_for_paths_requires_one_common_root() {
+    let cwd = tmp();
+    let repo = tmp();
+    std::fs::create_dir_all(repo.join(".git")).unwrap();
+    let a = repo.join("a.txt").display().to_string();
+    let b = repo.join("sub/b.txt").display().to_string();
+    let canon = repo.canonicalize().unwrap();
+    assert_eq!(
+        addable_root_for_paths(&[a.clone(), b], &cwd),
+        Some(canon.clone())
+    );
+    // A second, different repo in the same call → ambiguous, no offer.
+    let other = tmp();
+    std::fs::create_dir_all(other.join(".git")).unwrap();
+    let c = other.join("c.txt").display().to_string();
+    assert_eq!(addable_root_for_paths(&[a.clone(), c], &cwd), None);
+    // Any underivable target sinks the whole offer; empty input offers nothing.
+    assert_eq!(
+        addable_root_for_paths(&[a, "/etc/hosts".into()], &cwd),
+        None
+    );
+    assert_eq!(addable_root_for_paths(&[], &cwd), None);
+}
+
+#[test]
+fn command_paths_lexed_from_cd_redirects_and_flags() {
+    let cwd = tmp();
+    let repo = tmp();
+    std::fs::create_dir_all(repo.join(".git")).unwrap();
+    let canon = repo.canonicalize().unwrap();
+    let inside = cwd.join("local.txt");
+    let cmd = format!(
+        "cd {r} && git add . --output={r}/out.tsv > {r}/log.txt 2>&1; cat {i} relative.txt",
+        r = repo.display(),
+        i = inside.display()
+    );
+    let paths = command_escaping_paths(&cmd, &cwd);
+    assert!(paths.contains(&repo.display().to_string()));
+    assert!(paths.iter().all(|p| !p.contains("local.txt")));
+    assert!(paths.iter().all(|p| p.starts_with('/')));
+    assert_eq!(addable_root_for_command(&cmd, &cwd), Some(canon));
+    // Tokens with no derivable root (here: /dev/null) don't sink the offer…
+    let cmd = format!("git -C {} fetch > /dev/null", repo.display());
+    assert_eq!(
+        addable_root_for_command(&cmd, &cwd),
+        Some(repo.canonicalize().unwrap())
+    );
+    // …but two DIFFERENT derivable roots do.
+    let other = tmp();
+    std::fs::create_dir_all(other.join(".git")).unwrap();
+    let cmd = format!("cp {}/a {}/b", repo.display(), other.display());
+    assert_eq!(addable_root_for_command(&cmd, &cwd), None);
+}
+
+#[test]
 fn is_dangerous_gates_only_risky_shell_actions() {
     assert!(!is_dangerous("run_bash", &json!({"command":"cargo test"})));
     assert!(!is_dangerous(
