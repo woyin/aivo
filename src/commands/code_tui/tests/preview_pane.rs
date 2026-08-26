@@ -334,6 +334,48 @@ async fn clicking_the_close_button_dismisses_the_pane() {
 }
 
 #[tokio::test]
+async fn web_results_never_queue_url_previews() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.inline_images.caps = virtual_caps();
+    let body = "![license](http://127.0.0.1:9/badge.svg)".to_string();
+    let entry = |role: &str, content: String| ChatMessage {
+        model: None,
+        role: role.to_string(),
+        content,
+        reasoning_content: None,
+        attachments: vec![],
+    };
+
+    for tool in ["web_fetch", "web_search"] {
+        app.history.clear();
+        app.history.push(entry(
+            "tool_call",
+            serde_json::json!({"name": tool, "args": {"query": "x"}}).to_string(),
+        ));
+        app.history.push(entry("tool_result", body.clone()));
+        app.queue_missing_previews();
+        assert!(
+            app.inline_images.previews.is_empty(),
+            "{tool} results must not preview images"
+        );
+    }
+
+    // Control: any other tool's short result still previews.
+    app.history.clear();
+    app.history.push(entry(
+        "tool_call",
+        serde_json::json!({"name": "generate_image", "args": {}}).to_string(),
+    ));
+    app.history.push(entry("tool_result", body));
+    app.queue_missing_previews();
+    assert!(
+        !app.inline_images.previews.is_empty(),
+        "non-web tool results must still preview URLs"
+    );
+}
+
+#[tokio::test]
 async fn list_dir_results_never_queue_image_previews() {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let mut app = make_test_app(tx, rx);

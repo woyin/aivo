@@ -457,7 +457,9 @@ pub(super) fn tool_call_name(content: &str) -> Option<String> {
 }
 
 /// `list_dir` navigates — images its listings name are never the answer.
-const NO_RESULT_PREVIEW_TOOLS: &[&str] = &["list_dir"];
+/// Web results quote untrusted pages: badges are noise, and auto-GETting
+/// page-chosen URLs would let a fetched page beacon.
+const NO_RESULT_PREVIEW_TOOLS: &[&str] = &["list_dir", "web_fetch", "web_search"];
 
 fn images_are_the_answer(image_lines: usize, total_lines: usize) -> bool {
     image_lines > 0

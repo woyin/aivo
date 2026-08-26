@@ -236,9 +236,10 @@ pub fn preview_tool_spec() -> ToolSpec {
         "preview",
         "Show a live preview of an image, SVG, or HTML file (or an image URL) in the user's \
 side preview pane. The pane tracks a file target and re-renders when it changes on disk, \
-so call it once and keep editing. Only call this when the user explicitly asks to \
-preview, show, or watch a visual file — creating or editing one is NOT a reason to open \
-the pane (the transcript already previews written files). Pass reload=true to force a \
+so call it once and keep editing. Only call this when the user explicitly asks for the \
+preview pane or to watch/live-preview a file — creating or editing one is NOT a reason, \
+and \"show me X\" is NOT a reason either: to just show an image, mention its path or URL \
+in your reply and the transcript previews it inline. Pass reload=true to force a \
 fresh render of the current target (for pages that draw differently each load). Pass \
 close=true to close the pane. Not for reading file contents (use read_file).",
         json!({
