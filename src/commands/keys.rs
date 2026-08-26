@@ -57,6 +57,27 @@ fn term_read_line(prompt: &str) -> std::io::Result<String> {
 // the current value for in-place editing. Falls back to a plain cooked read when
 // stdin isn't a TTY (piped input, CI) — there `initial` is ignored and empty input
 // lets the caller keep its default.
+// Windows has no bracketed paste, so a pasted newline arrives as a bare Enter.
+// Peek past key-release records: real input right behind the Enter marks it as
+// pasted; a consumed event lands in `pending` for the caller's loop.
+fn enter_is_paste_newline(pending: &mut Option<crossterm::event::Event>) -> bool {
+    use crossterm::event::{self, Event, KeyEventKind};
+    if !cfg!(windows) {
+        return false;
+    }
+    while event::poll(std::time::Duration::from_millis(0)).unwrap_or(false) {
+        let Ok(next) = event::read() else { break };
+        if let Event::Key(k) = &next
+            && k.kind == KeyEventKind::Release
+        {
+            continue;
+        }
+        *pending = Some(next);
+        return true;
+    }
+    false
+}
+
 fn term_edit_line(prompt: &str, initial: &str) -> std::io::Result<String> {
     use std::io::Write;
 
@@ -113,8 +134,9 @@ fn term_edit_line(prompt: &str, initial: &str) -> std::io::Result<String> {
     let mut cursor = buf.len();
     let _ = render(&mut stdout, start_col, &buf, cursor);
 
+    let mut pending: Option<Event> = None;
     let result = loop {
-        match event::read() {
+        match pending.take().map(Ok).unwrap_or_else(event::read) {
             // On Windows, crossterm emits Press and Release for every key —
             // process Press only.
             Ok(Event::Key(KeyEvent {
@@ -125,6 +147,7 @@ fn term_edit_line(prompt: &str, initial: &str) -> std::io::Result<String> {
             })) => {
                 let ctrl = modifiers.contains(KeyModifiers::CONTROL);
                 match code {
+                    KeyCode::Enter if enter_is_paste_newline(&mut pending) => continue,
                     KeyCode::Enter => {
                         let _ = write!(stdout, "\r\n");
                         let _ = stdout.flush();
@@ -245,8 +268,9 @@ fn term_read_secret(prompt: &str) -> std::io::Result<String> {
     // the secret early, dumping the rest of the paste onto the next prompt.
     let _ = execute!(stdout, EnableBracketedPaste);
     let mut input = String::new();
+    let mut pending: Option<Event> = None;
     let result = loop {
-        match event::read() {
+        match pending.take().map(Ok).unwrap_or_else(event::read) {
             // On Windows, crossterm emits Press and Release for every key —
             // process Press only so secrets aren't doubled.
             Ok(Event::Key(KeyEvent {
@@ -255,6 +279,7 @@ fn term_read_secret(prompt: &str) -> std::io::Result<String> {
                 kind: KeyEventKind::Press,
                 ..
             })) => match code {
+                KeyCode::Enter if enter_is_paste_newline(&mut pending) => continue,
                 KeyCode::Enter => {
                     let _ = write!(stdout, "\r\n");
                     let _ = stdout.flush();

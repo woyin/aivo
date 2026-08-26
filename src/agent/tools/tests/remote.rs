@@ -39,6 +39,15 @@ fn remote_mutation_flags_outward_writes() {
     assert!(bash_mutates_remote("terraform destroy"));
     assert!(bash_mutates_remote("docker push repo/img:tag"));
     assert!(bash_mutates_remote("npm publish"));
+    // Windows spellings: shim suffixes, full paths, the PowerShell wrapper.
+    assert!(bash_mutates_remote("npm.cmd publish"));
+    assert!(bash_mutates_remote("docker.exe push repo/img:tag"));
+    assert!(bash_mutates_remote(
+        "C:\\Users\\u\\AppData\\Roaming\\npm\\npm.cmd publish"
+    ));
+    assert!(bash_mutates_remote("pwsh -Command \"npm publish\""));
+    assert!(bash_mutates_remote("powershell -Command \"npm publish\""));
+    assert!(!bash_mutates_remote("npm.cmd view left-pad"));
     assert!(bash_mutates_remote("cargo publish"));
     assert!(bash_mutates_remote("vercel deploy --prod"));
     assert!(bash_mutates_remote("flyctl deploy"));

@@ -9,6 +9,12 @@
 use std::path::Path;
 use std::time::Duration;
 
+/// PATH (and, on Windows, PATHEXT) lookup for a validator's program name.
+fn resolve_program(name: &str) -> Option<std::path::PathBuf> {
+    let dirs = crate::services::path_search::collect_path_dirs();
+    crate::services::path_search::find_in_dirs(name, &dirs)
+}
+
 /// A detected project validator: a human label + the argv to run in the workspace.
 #[derive(Clone)]
 pub struct Validator {
@@ -212,7 +218,9 @@ fn sanitize_detail(s: &str) -> String {
 /// ecosystems present. Only project-declared extras join — no implicit linters
 /// like clippy, which would force fixing pre-existing warnings.
 pub fn detect_plan(cwd: &Path) -> Vec<Validator> {
-    if cwd.join("run_tests.sh").is_file() {
+    // Without Git-Bash/MSYS there is no `sh` on Windows — fall through to the
+    // language validators instead of an always-Inconclusive one.
+    if cwd.join("run_tests.sh").is_file() && (cfg!(unix) || resolve_program("sh").is_some()) {
         return vec![Validator::new("run_tests.sh", &["sh", "run_tests.sh"])];
     }
     let mut plan = Vec::new();
@@ -287,7 +295,12 @@ pub async fn run(v: Validator, cwd: &Path) -> Outcome {
     };
     #[cfg(windows)]
     let mut cmd = {
-        let mut cmd = tokio::process::Command::new(&v.command[0]);
+        // `npm` & friends are `.cmd` shims — resolve through PATHEXT or the
+        // spawn always fails.
+        let program = resolve_program(&v.command[0])
+            .map(|p| p.into_os_string())
+            .unwrap_or_else(|| std::ffi::OsString::from(&v.command[0]));
+        let mut cmd = tokio::process::Command::new(program);
         cmd.args(&v.command[1..]);
         cmd
     };

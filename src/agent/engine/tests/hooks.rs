@@ -1,5 +1,9 @@
+// All tests here are #[cfg(unix)]; ungated imports warn on Windows builds.
+#[cfg(unix)]
 use super::super::*;
+#[cfg(unix)]
 use super::helpers::*;
+#[cfg(unix)]
 use serde_json::json;
 
 #[cfg(unix)] // every caller is a #[cfg(unix)] hook test; ungated it's dead code on Windows

@@ -339,7 +339,7 @@ impl Drop for GroupKillGuard {
             #[cfg(unix)]
             crate::agent::jobs::signal_group(pid as i32, libc::SIGKILL);
             #[cfg(windows)]
-            crate::agent::jobs::taskkill_tree_detached(pid);
+            let _ = crate::agent::jobs::taskkill_tree_detached(pid);
             #[cfg(not(any(unix, windows)))]
             let _ = pid;
         }

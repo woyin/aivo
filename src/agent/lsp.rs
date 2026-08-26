@@ -174,19 +174,31 @@ impl LspServer {
     /// Spawn `prog args`, run the `initialize`/`initialized` handshake, and leave it
     /// ready. `None` if the binary isn't on PATH or the handshake doesn't complete.
     fn start(prog: &str, args: &[&str], root: &Path) -> Option<LspServer> {
-        let stderr = if std::env::var("AIVO_LSP_TRACE").is_ok() {
-            Stdio::inherit()
-        } else {
-            Stdio::null()
+        let try_spawn = |program: &str| {
+            let stderr = if std::env::var("AIVO_LSP_TRACE").is_ok() {
+                Stdio::inherit()
+            } else {
+                Stdio::null()
+            };
+            Command::new(program)
+                .args(args)
+                .current_dir(root)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(stderr)
+                .spawn()
         };
-        let mut child = match Command::new(prog)
-            .args(args)
-            .current_dir(root)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(stderr)
-            .spawn()
-        {
+        let spawned = try_spawn(prog);
+        // Windows: the npm-installed servers are `.cmd` shims and CreateProcess
+        // only auto-appends `.exe` — retry like the MCP stdio spawn does.
+        #[cfg(windows)]
+        let spawned = match spawned {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => try_spawn(&format!("{prog}.cmd"))
+                .or_else(|_| try_spawn(&format!("{prog}.bat")))
+                .map_err(|_| e),
+            other => other,
+        };
+        let mut child = match spawned {
             Ok(c) => c,
             Err(e) => {
                 trace(&format!("spawn {prog} failed: {e}"));

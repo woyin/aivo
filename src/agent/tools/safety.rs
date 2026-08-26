@@ -197,12 +197,18 @@ pub(super) fn bash_is_readonly(cmd: &str) -> bool {
         if cmd0.contains('=') {
             return Some(());
         }
-        let base = cmd0.rsplit('/').next().unwrap_or(cmd0);
-        let ok = match base {
+        // PowerShell is case-insensitive — fold before matching.
+        let base = command_basename(cmd0).to_ascii_lowercase();
+        let ok = match base.as_str() {
             "cd" | "ls" | "pwd" | "cat" | "head" | "tail" | "wc" | "file" | "stat" | "du"
             | "df" | "which" | "date" | "echo" | "printf" | "tree" | "realpath" | "dirname"
             | "basename" | "uname" | "type" | "grep" | "egrep" | "fgrep" | "rg" | "jq" | "diff"
             | "cmp" | "cut" | "uniq" | "tr" | "nl" | "column" | "strings" | "true" => true,
+            // PowerShell's read-only cmdlets and their stock aliases.
+            "get-content" | "gc" | "get-childitem" | "gci" | "dir" | "get-item"
+            | "get-location" | "gl" | "get-date" | "get-command" | "select-string" | "sls"
+            | "select-object" | "measure-object" | "test-path" | "resolve-path"
+            | "write-output" => true,
             // `sort -o file` writes; plain sort only prints.
             "sort" => !tokens
                 .iter()
@@ -356,9 +362,35 @@ pub(super) fn lexical_normalize(p: &Path) -> PathBuf {
 /// invocation reads code from stdin (bare, `-`, `-c`, or `-s`); an interpreter
 /// given a script file or `-m module` is just consuming data and is left alone.
 pub(super) const INTERPRETERS: &[&str] = &[
-    "sh", "bash", "zsh", "fish", "dash", "ksh", "python", "python2", "python3", "node", "nodejs",
-    "ruby", "perl", "php", "pwsh",
+    "sh",
+    "bash",
+    "zsh",
+    "fish",
+    "dash",
+    "ksh",
+    "python",
+    "python2",
+    "python3",
+    "node",
+    "nodejs",
+    "ruby",
+    "perl",
+    "php",
+    "pwsh",
+    "powershell",
 ];
+
+/// Basename of a command word: splits on both separators and strips
+/// `.exe`/`.com`/`.cmd`/`.bat`, so `C:\…\npm.cmd` classifies as `npm`.
+pub(super) fn command_basename(cmd0: &str) -> &str {
+    let base = cmd0.rsplit(['\\', '/']).next().unwrap_or(cmd0);
+    for suffix in [".exe", ".com", ".cmd", ".bat"] {
+        if let Some(stripped) = base.strip_suffix(suffix) {
+            return stripped;
+        }
+    }
+    base
+}
 
 /// `/dev/` entries harmless to write to; anything else is a real device.
 pub(super) const SAFE_DEVICES: &[&str] = &[
@@ -381,7 +413,7 @@ pub fn bash_looks_destructive(cmd: &str) -> bool {
     // Inspect the leading command of each segment between control operators.
     let hit = for_each_simple_command(&lower, |seg, tokens| {
         let cmd0 = tokens[0];
-        let base = cmd0.rsplit('/').next().unwrap_or(cmd0); // strip a leading path
+        let base = command_basename(cmd0);
         // An inline-code interpreter (`sh -c '…'`, `python -c '…'`, `perl -e '…'`)
         // hides its real command inside a quoted argument the per-command walk
         // can't reach — it only reads the leading `sh`/`python`. Pull that program
@@ -405,9 +437,15 @@ pub fn bash_looks_destructive(cmd: &str) -> bool {
             "find" => tokens
                 .iter()
                 .any(|t| matches!(*t, "-delete" | "-exec" | "-execdir")),
+            // Remove-Item and its aliases; PS parameters abbreviate (`-rec`),
+            // so prefix-match. `/s`/`/q` cover `cmd`-style deleters.
+            "remove-item" | "ri" | "rd" | "rmdir" | "del" | "erase" => tokens
+                .iter()
+                .skip(1)
+                .any(|t| t.starts_with("-r") || t.starts_with("-f") || matches!(*t, "/s" | "/q")),
             _ => false,
         };
-        flagged.then_some(())
+        (flagged || windows_seg_is_catastrophic(tokens)).then_some(())
     })
     .is_some();
     if hit {
@@ -444,7 +482,7 @@ pub(super) fn bash_is_catastrophic(cmd: &str) -> bool {
     let hit = for_each_simple_command(&lower, |seg, all| {
         let tokens = effective_command(all); // see-through `sudo`/`env`/`nice`
         let &cmd0 = tokens.first()?;
-        let base = cmd0.rsplit('/').next().unwrap_or(cmd0);
+        let base = command_basename(cmd0);
         // `sh -c 'rm -rf /'` hides the real command in a quoted arg — rescan it.
         if INTERPRETERS.contains(&base)
             && interpreter_inline_code(seg).is_some_and(|inner| bash_is_catastrophic(&inner))
@@ -485,11 +523,7 @@ pub(super) fn windows_seg_is_catastrophic(tokens: &[&str]) -> bool {
     let Some(&cmd0) = tokens.first() else {
         return false;
     };
-    let base = cmd0.rsplit(['\\', '/']).next().unwrap_or(cmd0);
-    let base = base
-        .strip_suffix(".exe")
-        .or_else(|| base.strip_suffix(".com"))
-        .unwrap_or(base);
+    let base = command_basename(cmd0);
     let args = &tokens[1..];
     match base {
         "format-volume" | "clear-disk" | "stop-computer" | "restart-computer" => true,
@@ -547,7 +581,7 @@ pub(super) fn effective_command<'a>(tokens: &'a [&'a str]) -> &'a [&'a str] {
         let Some((&head, tail)) = rest.split_first() else {
             return rest;
         };
-        match head.rsplit('/').next().unwrap_or(head) {
+        match command_basename(head) {
             "sudo" | "doas" => {
                 rest = tail;
                 while let Some((&t, tl)) = rest.split_first() {
@@ -650,8 +684,8 @@ pub(super) fn pipes_into_interpreter(cmd: &str) -> bool {
         let Some(w) = words.next() else {
             return false;
         };
-        let base = w.rsplit('/').next().unwrap_or(w);
-        if !INTERPRETERS.contains(&base) {
+        let base = command_basename(w).to_ascii_lowercase();
+        if !INTERPRETERS.contains(&base.as_str()) {
             return false;
         }
         let rest: Vec<&str> = words.collect();
@@ -709,20 +743,21 @@ pub(super) fn shell_split(cmd: &str) -> Vec<String> {
 pub(super) fn interpreter_inline_code(seg: &str) -> Option<String> {
     let tokens = shell_split(seg);
     let first = tokens.first()?;
-    let base = first.rsplit('/').next().unwrap_or(first);
-    if !INTERPRETERS.contains(&base) {
+    // Case-insensitive: the remote walk passes segments through un-lowercased.
+    let base = command_basename(first).to_ascii_lowercase();
+    if !INTERPRETERS.contains(&base.as_str()) {
         return None;
     }
     let mut rest = tokens.iter().skip(1);
     while let Some(tok) = rest.next() {
         // `-c` (sh/bash/zsh/python/node), `-e`/`--eval` (perl/ruby/node),
-        // `-command` (pwsh, already lowercased) all introduce inline code as the
+        // `-command` (pwsh/powershell) all introduce inline code as the
         // following argument.
         let Some(flag) = tok.strip_prefix('-') else {
             continue;
         };
-        let flag = flag.trim_start_matches('-');
-        if matches!(flag, "c" | "e" | "eval" | "command") {
+        let flag = flag.trim_start_matches('-').to_ascii_lowercase();
+        if matches!(flag.as_str(), "c" | "e" | "eval" | "command") {
             return rest.next().cloned();
         }
     }

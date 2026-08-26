@@ -184,6 +184,15 @@ impl AIToolType {
         }
     }
 
+    /// Runnable installer behind [`Self::install_hint`]; `None` when the hint
+    /// is prose (Grok on Windows).
+    pub fn install_command(&self) -> Option<&'static str> {
+        if cfg!(not(unix)) && matches!(self, Self::Grok) {
+            return None;
+        }
+        Some(self.install_hint())
+    }
+
     /// Directories the tool's installer is known to drop its binary into,
     /// outside of the typical `$PATH`. Used as a fallback after a fresh
     /// install when PATH lookup fails (e.g. the Claude installer writes to
@@ -488,7 +497,8 @@ impl AILauncher {
                     anyhow::bail!("tool '{}' not found", tool.as_str());
                 };
 
-                if !std::io::stdin().is_terminal() {
+                // A prose-only hint isn't runnable — treat as plain not-installed.
+                if !std::io::stdin().is_terminal() || tool.install_command().is_none() {
                     not_installed()?;
                 }
 
@@ -516,10 +526,11 @@ impl AILauncher {
                     tool.as_str()
                 );
 
+                let install_cmd = tool.install_command().expect("gated above");
                 #[cfg(unix)]
                 let status = Command::new("sh")
                     .arg("-c")
-                    .arg(tool.install_hint())
+                    .arg(install_cmd)
                     .stdin(Stdio::inherit())
                     .stdout(Stdio::inherit())
                     .stderr(Stdio::inherit())
@@ -529,7 +540,7 @@ impl AILauncher {
                 #[cfg(not(unix))]
                 let status = Command::new("cmd")
                     .arg("/C")
-                    .arg(tool.install_hint())
+                    .arg(install_cmd)
                     .stdin(Stdio::inherit())
                     .stdout(Stdio::inherit())
                     .stderr(Stdio::inherit())
@@ -1767,6 +1778,49 @@ async fn quit_codex_app(tracked: &[i32]) {
     }
 }
 
+/// Windows mirror of the Unix two-tap flow: first Ctrl-C prints the hint, a
+/// second within 5s quits the app gracefully instead of killing aivo and
+/// leaving the GUI on a dead router.
+#[cfg(not(unix))]
+async fn handle_signal_quit_prompt(tracked: &mut Vec<i32>) -> bool {
+    use std::time::Duration;
+    use tokio::time::sleep;
+    eprintln!(
+        "  {} press Ctrl-C again within 5s to quit the Codex app (and aivo). Wait to keep both running.",
+        crate::style::yellow("aivo:")
+    );
+    tokio::select! {
+        r = tokio::signal::ctrl_c() => {
+            if r.is_err() {
+                return false;
+            }
+        }
+        _ = sleep(Duration::from_secs(5)) => {
+            eprintln!(
+                "  {} keeping the app open; resuming normal wait.",
+                crate::style::dim("aivo:")
+            );
+            return false;
+        }
+    }
+    eprintln!(
+        "  {} quitting the app gracefully...",
+        crate::style::yellow("aivo:")
+    );
+    quit_codex_app(tracked).await;
+    // Poll briefly until the pids drop, so the local router survives until the
+    // app actually finishes its quit handlers.
+    let quit_deadline = std::time::Instant::now() + Duration::from_secs(8);
+    while std::time::Instant::now() < quit_deadline {
+        tracked.retain(|pid| pid_alive(*pid));
+        if tracked.is_empty() {
+            break;
+        }
+        sleep(Duration::from_millis(400)).await;
+    }
+    true
+}
+
 #[cfg(not(unix))]
 async fn wait_for_codex_app_gui_exit() {
     use std::time::{Duration, Instant};
@@ -1774,7 +1828,15 @@ async fn wait_for_codex_app_gui_exit() {
     let gui_appear_deadline = Instant::now() + Duration::from_secs(30);
     let mut tracked: Vec<i32> = Vec::new();
     loop {
-        sleep(Duration::from_millis(1500)).await;
+        tokio::select! {
+            _ = sleep(Duration::from_millis(1500)) => {}
+            r = tokio::signal::ctrl_c() => {
+                if r.is_ok() && handle_signal_quit_prompt(&mut tracked).await {
+                    return;
+                }
+                continue;
+            }
+        }
         if tracked.is_empty() {
             // Sighting needs the full (powershell-backed) process scan; once
             // pids are tracked, per-tick liveness is a native syscall.

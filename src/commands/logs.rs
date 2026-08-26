@@ -465,7 +465,8 @@ impl LogsCommand {
                 }
                 io::stdout().flush()?;
             } else {
-                print!("\x1b[2J\x1b[H");
+                // console enables VT on Windows first; a raw escape prints literally.
+                let _ = console::Term::stdout().clear_screen();
                 println!(
                     "{} {}",
                     style::bold("Watching logs"),

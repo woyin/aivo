@@ -2141,8 +2141,25 @@ impl CodeTuiApp {
         // some earlier program's query late (seen over slow SSH), which would
         // otherwise be typed into the composer as `]11;rgb:…`.
         let mut esc = EscReassembly::Idle;
-        while event::poll(Duration::from_millis(0))? {
-            let event = event::read()?;
+        // Holds an event the Enter lookahead below already read past.
+        let mut pending: Option<Event> = None;
+        loop {
+            let event = match pending.take() {
+                Some(event) => event,
+                None => {
+                    if !event::poll(Duration::from_millis(0))? {
+                        break;
+                    }
+                    event::read()?
+                }
+            };
+            // Windows delivers a Release per keystroke; it isn't input and would
+            // fake "queued input" for the Enter lookahead below.
+            if let Event::Key(key) = &event
+                && key.kind == KeyEventKind::Release
+            {
+                continue;
+            }
             *needs_redraw = true;
             drained += 1;
 
@@ -2161,21 +2178,36 @@ impl CodeTuiApp {
             // burst where each newline is a bare Enter, which would submit the
             // draft once per line. Flag Enters with input still queued behind
             // them (or deep in the burst — the paste's own trailing newline).
+            // The lookahead skips Release records; a consumed real event is
+            // stashed in `pending`.
             if cfg!(windows)
                 && let Event::Key(key) = &event
                 && key.kind == KeyEventKind::Press
                 && matches!(key.code, KeyCode::Enter)
                 && !key.modifiers.contains(KeyModifiers::CONTROL)
             {
-                self.paste_burst_newline = event::poll(Duration::from_millis(0))?
-                    || drained > PASTE_BURST_MIN_PRIOR_EVENTS;
+                let mut queued_input = false;
+                while event::poll(Duration::from_millis(0))? {
+                    let next = event::read()?;
+                    if let Event::Key(k) = &next
+                        && k.kind == KeyEventKind::Release
+                    {
+                        continue;
+                    }
+                    pending = Some(next);
+                    queued_input = true;
+                    break;
+                }
+                self.paste_burst_newline = queued_input || drained > PASTE_BURST_MIN_PRIOR_EVENTS;
             }
             let handled = self.handle_terminal_event(event).await?;
             self.paste_burst_newline = false;
             if let Some(true) = handled {
                 return Ok(true);
             }
-            if drained >= MAX_INPUT_EVENTS_PER_TICK {
+            // A stashed lookahead event runs one iteration past the cap rather
+            // than be dropped.
+            if drained >= MAX_INPUT_EVENTS_PER_TICK && pending.is_none() {
                 break;
             }
         }

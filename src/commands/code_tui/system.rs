@@ -359,8 +359,12 @@ struct PipeChildKiller {
 impl ChildKiller for PipeChildKiller {
     fn kill(&mut self) -> std::io::Result<()> {
         if let Ok(mut child) = self.child.lock() {
-            // An already-exited child returns `InvalidInput` here; ignore it.
-            let _ = child.kill();
+            // Tree-kill: shell-only kill orphans children that hold the pipe
+            // write ends open and stall the reader join forever.
+            if !crate::agent::jobs::taskkill_tree_detached(child.id()) {
+                // An already-exited child returns `InvalidInput` here; ignore it.
+                let _ = child.kill();
+            }
         }
         Ok(())
     }
@@ -439,7 +443,9 @@ fn pipe_reader<R: Read>(
                         acc.clear();
                         if capped {
                             truncated.store(true, Ordering::Release);
-                            if let Ok(mut c) = child.lock() {
+                            if let Ok(mut c) = child.lock()
+                                && !crate::agent::jobs::taskkill_tree_detached(c.id())
+                            {
                                 let _ = c.kill();
                             }
                             break 'read;
@@ -526,7 +532,9 @@ pub(super) fn run_pipe_to_completion(shell: PipeShell, tx: UnboundedSender<Runti
         }
         if start.elapsed() >= SHELL_TIMEOUT {
             timed_out = true;
-            if let Ok(mut c) = child.lock() {
+            if let Ok(mut c) = child.lock()
+                && !crate::agent::jobs::taskkill_tree_detached(c.id())
+            {
                 let _ = c.kill();
             }
             break;

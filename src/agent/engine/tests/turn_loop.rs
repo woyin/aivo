@@ -2,7 +2,9 @@ use super::super::*;
 use super::helpers::*;
 use crate::agent::request::content_str;
 use serde_json::json;
+#[cfg(unix)] // only the #[cfg(unix)] mock-server tests use these
 use std::io::{Read, Write};
+#[cfg(unix)]
 use std::net::TcpListener;
 
 /// Full loop: first turn emits a write_file call, second turn answers with text → converges.

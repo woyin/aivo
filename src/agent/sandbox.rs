@@ -194,9 +194,11 @@ pub(crate) fn harden_headless(cmd: &mut std::process::Command) {
     cmd.env("GIT_TERMINAL_PROMPT", "0")
         .env(crate::constants::CODE_ACTIVE_ENV, "1")
         .stdin(std::process::Stdio::null());
-    // Unix-only: `true`/`cat` aren't launchable as editor/pager on Windows.
+    // `true` aborts editor-launching git commands; git resolves it via its own
+    // sh, Git for Windows included.
+    cmd.env("GIT_EDITOR", "true");
     #[cfg(unix)]
-    cmd.env("GIT_EDITOR", "true").env("PAGER", "cat");
+    cmd.env("PAGER", "cat");
 }
 
 /// Whether a write-confining sandbox is active for this process. Used by
@@ -368,12 +370,18 @@ pub fn bare_shell(command: &str) -> ShellInvocation {
     // prompt tells the model which shell it has via `shell_label`. POSIX `sh`
     // everywhere else.
     if cfg!(windows) {
+        // Args after `-Command` join into one line. Prologue: PS 5.1 writes
+        // redirected output in the OEM code page — force UTF-8. Epilogue:
+        // propagate a native exit code, which `-Command` alone doesn't; its
+        // leading newline survives a trailing PS comment in `command`.
         ShellInvocation {
             program: "powershell.exe".to_string(),
             args: vec![
                 "-NoProfile".to_string(),
                 "-Command".to_string(),
+                "[Console]::OutputEncoding=[Text.Encoding]::UTF8;".to_string(),
                 command.to_string(),
+                "\nif ($null -ne $LASTEXITCODE) { exit $LASTEXITCODE }".to_string(),
             ],
         }
     } else {
@@ -922,18 +930,19 @@ mod linux_tests {
 mod shell_tests {
     use super::*;
 
-    /// `bare_shell` always passes the command through as its LAST arg, and
-    /// `shell_label` names the program it picks — the two must agree per platform
-    /// (the system prompt relies on the label matching the real shell).
+    /// `bare_shell` always passes the command through unaltered as its own arg,
+    /// and `shell_label` names the program it picks — the two must agree per
+    /// platform (the system prompt relies on the label matching the real shell).
     #[test]
     fn bare_shell_and_label_agree_for_this_platform() {
         let inv = bare_shell("echo hi");
-        assert_eq!(inv.args.last().unwrap(), "echo hi");
         if cfg!(windows) {
+            assert!(inv.args.iter().any(|a| a == "echo hi"));
             assert_eq!(inv.program, "powershell.exe");
             assert_eq!(shell_label(), "PowerShell");
             assert!(inv.args.iter().any(|a| a == "-Command"));
         } else {
+            assert_eq!(inv.args.last().unwrap(), "echo hi");
             assert_eq!(inv.program, "sh");
             assert_eq!(shell_label(), "POSIX sh");
             assert_eq!(inv.args[0], "-c");

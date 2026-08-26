@@ -469,7 +469,12 @@ fn reap(job: &mut Job) {
 /// else (our signal or a still-unreaped job) is recorded as `Killed`.
 fn finalize_killed(job: &mut Job) {
     reap(job);
-    if !matches!(job.status, JobStatus::Exited(Some(_))) {
+    // Windows: `taskkill /F` exits the job with code 1 — our kill, not a crash.
+    let own_exit = match job.status {
+        JobStatus::Exited(Some(code)) => !(cfg!(windows) && code == 1),
+        _ => false,
+    };
+    if !own_exit {
         job.ended_at.get_or_insert_with(Instant::now);
         job.status = JobStatus::Killed;
     }
@@ -478,16 +483,18 @@ fn finalize_killed(job: &mut Job) {
 fn first_kill_signal(job: &Job) {
     #[cfg(unix)]
     signal_group(job.pgid, libc::SIGTERM);
-    // Detached: runs under the jobs mutex; must not block the runtime.
+    // Detached: runs under the jobs mutex; must not block the runtime. No
+    // console-tree SIGTERM analog on Windows, so this stage is already forceful.
     #[cfg(windows)]
-    taskkill_tree_detached(job.pid);
+    let _ = taskkill_tree_detached(job.pid);
 }
 
 fn hard_kill_signal(job: &mut Job) {
     #[cfg(unix)]
     signal_group(job.pgid, libc::SIGKILL);
+    // Detached for the same mutex reason; root-only fallback if taskkill can't launch.
     #[cfg(windows)]
-    if !taskkill_tree(job.pid) {
+    if !taskkill_tree_detached(job.pid) {
         let _ = job.child.start_kill();
     }
 }
@@ -504,25 +511,14 @@ pub(crate) fn signal_group(pgid: i32, sig: i32) {
 }
 
 /// `/T` kills the whole tree (`child.kill()` orphans grandchildren); detached so
-/// it never blocks the caller.
+/// it never blocks the caller. `false` when `taskkill` couldn't launch.
 #[cfg(windows)]
-pub(crate) fn taskkill_tree_detached(pid: u32) {
-    let _ = std::process::Command::new("taskkill")
-        .args(["/T", "/F", "/PID", &pid.to_string()])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn();
-}
-
-/// Blocking variant; reports whether `taskkill` ran so the hard kill can fall
-/// back to `child.kill()`.
-#[cfg(windows)]
-pub(crate) fn taskkill_tree(pid: u32) -> bool {
+pub(crate) fn taskkill_tree_detached(pid: u32) -> bool {
     std::process::Command::new("taskkill")
         .args(["/T", "/F", "/PID", &pid.to_string()])
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
-        .status()
+        .spawn()
         .is_ok()
 }
 

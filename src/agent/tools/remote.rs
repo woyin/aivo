@@ -330,7 +330,7 @@ pub fn bash_mutates_remote(cmd: &str) -> bool {
     for_each_simple_command(cmd, |seg, all| {
         let tokens = effective_command(all); // see-through sudo/env/nice
         let &cmd0 = tokens.first()?;
-        let base = cmd0.rsplit('/').next().unwrap_or(cmd0).to_ascii_lowercase();
+        let base = command_basename(cmd0).to_ascii_lowercase();
         // `sh -c 'curl -X POST …'` hides the real command in a quoted arg — rescan it.
         if INTERPRETERS.contains(&base.as_str())
             && interpreter_inline_code(seg).is_some_and(|inner| bash_mutates_remote(&inner))
@@ -360,7 +360,7 @@ pub(super) fn collect_remote_prefixes(cmd: &str, out: &mut Vec<String>) -> bool 
     for_each_simple_command(cmd, |seg, all| {
         let tokens = effective_command(all);
         let &cmd0 = tokens.first()?;
-        let base = cmd0.rsplit('/').next().unwrap_or(cmd0).to_ascii_lowercase();
+        let base = command_basename(cmd0).to_ascii_lowercase();
         if INTERPRETERS.contains(&base.as_str())
             && let Some(inner) = interpreter_inline_code(seg)
             && !collect_remote_prefixes(&inner, out)

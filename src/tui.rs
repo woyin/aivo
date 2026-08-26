@@ -272,6 +272,11 @@ impl FuzzySelect {
                     selection = 0;
                     page_start = 0;
                 }
+                FuzzyInput::Toggle => {
+                    query.push(' ');
+                    selection = 0;
+                    page_start = 0;
+                }
                 _ => {}
             }
         }
@@ -480,7 +485,7 @@ impl MultiSelect {
                 FuzzyInput::ToggleAll => {
                     toggle_all_enabled(&mut self.checked, &disabled, &filtered);
                 }
-                FuzzyInput::Text(t) if t == " " => {
+                FuzzyInput::Toggle => {
                     if view_count > 0 && !disabled[filtered[cursor]] {
                         let i = filtered[cursor];
                         self.checked[i] = !self.checked[i];
@@ -610,6 +615,9 @@ enum FuzzyInput {
     Backspace,
     /// Ctrl+A — `MultiSelect` toggle-all; `FuzzySelect` ignores it.
     ToggleAll,
+    /// A space keystroke: `MultiSelect` toggles, `FuzzySelect` appends to the
+    /// query. Pasted spaces arrive as `Text`.
+    Toggle,
     Text(String),
     Ignore,
 }
@@ -642,6 +650,17 @@ fn read_fuzzy_input() -> std::io::Result<FuzzyInput> {
                         FuzzyInput::ToggleAll
                     }
                     KeyCode::Backspace => FuzzyInput::Backspace,
+                    // No bracketed paste on Windows — input queued behind the
+                    // space marks it as paste text, not a toggle keystroke.
+                    KeyCode::Char(' ') => {
+                        if cfg!(windows)
+                            && event::poll(std::time::Duration::from_millis(0)).unwrap_or(false)
+                        {
+                            FuzzyInput::Text(" ".to_string())
+                        } else {
+                            FuzzyInput::Toggle
+                        }
+                    }
                     KeyCode::Char(c) if !c.is_control() => FuzzyInput::Text(c.to_string()),
                     _ => FuzzyInput::Ignore,
                 });

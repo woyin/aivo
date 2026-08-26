@@ -310,6 +310,11 @@ fn readonly_command_allowlist() {
     assert!(bash_is_readonly("echo hi 2>/dev/null"));
     assert!(bash_is_readonly("git status 2>&1 | tail -3"));
     assert!(bash_is_readonly("/usr/bin/git blame src/main.rs"));
+    // PowerShell inspection cmdlets (the Windows shell) and their aliases.
+    assert!(bash_is_readonly("Get-Content Cargo.toml"));
+    assert!(bash_is_readonly("Select-String -Pattern main src\\main.rs"));
+    assert!(bash_is_readonly("gci -Recurse src"));
+    assert!(!bash_is_readonly("Set-Content out.txt 'x'"));
 
     // Anything that can write, run hidden code, or isn't recognized fails closed.
     assert!(!bash_is_readonly("git push"));
@@ -373,4 +378,25 @@ fn catastrophic_floor_windows() {
     assert!(!bash_is_catastrophic("format-hex file.bin")); // not Format-Volume
     assert!(!bash_is_catastrophic("Get-ChildItem C:\\")); // read-only
     assert!(!bash_is_catastrophic("cipher /e .\\secret")); // encrypt, not /w
+}
+
+#[test]
+fn destructive_gate_windows() {
+    // PowerShell deleters confirm even when workspace-local.
+    assert!(bash_looks_destructive("Remove-Item -Recurse -Force .\\src"));
+    assert!(bash_looks_destructive("ri -rec .\\build"));
+    assert!(bash_looks_destructive("rd /s /q .\\node_modules"));
+    assert!(bash_looks_destructive("del /s *.log"));
+    assert!(bash_looks_destructive("Format-Volume -DriveLetter C"));
+    // Inline-code wrappers unwrap; suffixes and full paths don't hide the program.
+    assert!(bash_looks_destructive(
+        "powershell -Command \"Remove-Item -Recurse -Force .\\src\""
+    ));
+    assert!(bash_is_catastrophic(
+        "powershell.exe -Command \"Remove-Item -Recurse -Force C:\\\""
+    ));
+    assert!(bash_looks_destructive("C:\\WINDOWS\\system32\\shred.exe x"));
+    // Plain reads and single-file removals stay quiet.
+    assert!(!bash_looks_destructive("Remove-Item out.txt"));
+    assert!(!bash_looks_destructive("Get-ChildItem -Recurse src"));
 }
