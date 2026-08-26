@@ -1,5 +1,25 @@
 # Changelog
 
+## v0.47.0
+
+The code TUI gains a live side preview pane and richer footer telemetry, `/plan` is rebuilt around one artifact and one command, and a Windows audit closes several approval-gate bypasses. Terminal image and clipboard handling get a round of correctness fixes on top of ratatui 0.30.2.
+
+- feat(code): live side preview pane via /preview and the agent preview tool (ecb27119)
+- feat(code): footer tok/s and cache-hit stats with /config toggles (c7949338)
+- improve(code): redesign /plan around one artifact, one command, auto-persist (5954c79f)
+- fix(windows): close approval-gate bypasses and broken Windows paths (528b4452)
+- improve(code): web results never inline-preview; pane only on pane/watch asks (a4a45af0)
+- fix(code): stop drag-copy from interleaving spaces into wide-char text (99d4fcf2)
+- fix(code): substitute stashed transcript images before text-only model turns (b1676ae8)
+- improve(code): popup surfaces hide only the inline images they cover (bb5c1490)
+- improve(code): erase stale sixel pixels with localized cell rewrites (e2747485)
+- chore(deps): upgrade ratatui to 0.30.2 (8ce9e4f8)
+- improve(size): drop the dual crossterm stack and unused clap/tokio features (d0aae427)
+- improve(cli): guided help, bare-word recovery, plan out of Shift+Tab ring (093a041b)
+- improve(code): clarify TUI copy, key labels, and CLI help (75ef2dee)
+- fix(agent): treat card dismissals as results, not tool failures (edb4f881)
+- fix(share): skip base64 data URLs when redacting tool-call arguments (dd19c6d4)
+
 ## v0.46.4
 
 Agent security holes from the core audit are closed, and nested agent TUIs are refused outright. Startup and the code TUI get small reliability wins.
