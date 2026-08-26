@@ -118,7 +118,7 @@ fn test_picker_window_slides_only_at_the_edges() {
         preview_scroll_for: None,
     };
     // Move the selection then mimic the render loop's write-back.
-    let mut step = |picker: &mut PickerState, selected: usize| {
+    let step = |picker: &mut PickerState, selected: usize| {
         picker.selected = selected;
         let visible = picker.visible_items(5);
         picker.scroll_top = visible[0].0;

@@ -961,6 +961,7 @@ impl EnvironmentInjector {
 
         model_ids.sort();
         model_ids.dedup();
+        let mut variant_splices: Vec<(String, String)> = Vec::new();
         if !model_ids.is_empty() {
             let mut models = Map::new();
             for model_id in model_ids {
@@ -970,10 +971,11 @@ impl EnvironmentInjector {
                 let resolved = limits
                     .get(&model_id)
                     .or_else(|| limits.get(&format!("aivo/{model_id}")));
-                if let Some(l) = resolved
-                    && let (Some(context), Some(output)) = (l.context, l.output)
-                {
-                    entry["limit"] = json!({ "context": context, "output": output });
+                if let Some(l) = resolved {
+                    if let (Some(context), Some(output)) = (l.context, l.output) {
+                        entry["limit"] = json!({ "context": context, "output": output });
+                    }
+                    apply_opencode_reasoning_fields(&mut entry, l, &mut variant_splices);
                 }
                 models.insert(model_id.clone(), entry);
             }
@@ -997,10 +999,11 @@ impl EnvironmentInjector {
             );
         }
 
-        env.insert(
-            "OPENCODE_CONFIG_CONTENT".to_string(),
-            Value::Object(config).to_string(),
-        );
+        let mut config_str = Value::Object(config).to_string();
+        for (placeholder, variants_json) in &variant_splices {
+            config_str = config_str.replace(&format!("\"{placeholder}\""), variants_json);
+        }
+        env.insert("OPENCODE_CONFIG_CONTENT".to_string(), config_str);
         env
     }
 
@@ -1384,6 +1387,48 @@ fn build_pi_models_json(
         models_json["providers"]["aivo"]["compat"] = json!({ "supportsDeveloperRole": false });
     }
     models_json.to_string()
+}
+
+/// Without explicit `reasoning` + `variants`, opencode's ctrl+t cycle is a no-op.
+fn apply_opencode_reasoning_fields(
+    entry: &mut Value,
+    limits: &crate::services::model_metadata::ResolvedLimits,
+    variant_splices: &mut Vec<(String, String)>,
+) {
+    let reasoning =
+        !limits.reasoning_efforts.is_empty() || limits.caps.is_some_and(|c| c.reasoning);
+    if !reasoning {
+        return;
+    }
+    entry["reasoning"] = json!(true);
+    if let Some(variants_json) = opencode_reasoning_variants(&limits.reasoning_efforts) {
+        let placeholder = format!("__AIVO_VARIANTS_{}__", variant_splices.len());
+        entry["variants"] = json!(placeholder);
+        variant_splices.push((placeholder, variants_json));
+    }
+}
+
+/// Raw JSON, spliced over a placeholder: key order is the ctrl+t cycle order,
+/// serde_json's `Map` would alphabetize it (`preserve_order` costs ~32 KiB).
+/// `none` is dropped — the cycle's implicit no-variant step means "off".
+fn opencode_reasoning_variants(efforts: &[String]) -> Option<String> {
+    let mut seen: Vec<&str> = Vec::new();
+    for level in efforts {
+        if level != "none" && !seen.contains(&level.as_str()) {
+            seen.push(level);
+        }
+    }
+    if seen.is_empty() {
+        return None;
+    }
+    let entries: Vec<String> = seen
+        .iter()
+        .map(|level| {
+            let l = Value::String((*level).to_string()).to_string();
+            format!("{l}:{{\"reasoningEffort\":{l}}}")
+        })
+        .collect();
+    Some(format!("{{{}}}", entries.join(",")))
 }
 
 /// Set pi's `reasoning` / `thinkingLevelMap` from resolved catalog limits.
@@ -3340,6 +3385,91 @@ mod tests {
         assert_eq!(models["starter"]["limit"]["context"], 1_000_000);
         assert_eq!(models["starter"]["limit"]["output"], 384_000);
         assert!(models["mystery"].get("limit").is_none());
+    }
+
+    #[test]
+    fn for_opencode_advertises_reasoning_variants() {
+        let injector = EnvironmentInjector::new();
+        let key = test_key();
+        let mut limits = HashMap::new();
+        limits.insert(
+            "deepseek-v4-flash".to_string(),
+            crate::services::model_metadata::ResolvedLimits {
+                context: Some(1_050_000),
+                output: Some(384_000),
+                caps: None,
+                image_input: None,
+                reasoning_efforts: ["none", "low", "medium", "high", "max"]
+                    .map(String::from)
+                    .to_vec(),
+            },
+        );
+        limits.insert(
+            "plain-chat".to_string(),
+            crate::services::model_metadata::ResolvedLimits {
+                context: Some(128_000),
+                output: Some(8_000),
+                ..Default::default()
+            },
+        );
+        limits.insert(
+            "flag-only-reasoner".to_string(),
+            crate::services::model_metadata::ResolvedLimits {
+                context: Some(200_000),
+                output: Some(64_000),
+                caps: crate::services::model_metadata::snapshot_limits("o3"),
+                image_input: None,
+                reasoning_efforts: Vec::new(),
+            },
+        );
+        limits.insert(
+            "odd-effort".to_string(),
+            crate::services::model_metadata::ResolvedLimits {
+                context: Some(64_000),
+                output: Some(8_000),
+                caps: None,
+                image_input: None,
+                reasoning_efforts: vec!["ul\"tra".to_string()],
+            },
+        );
+        let discovered = vec![
+            "deepseek-v4-flash".to_string(),
+            "plain-chat".to_string(),
+            "flag-only-reasoner".to_string(),
+            "odd-effort".to_string(),
+        ];
+        let env = injector.for_opencode(&key, None, Some(&discovered), &limits);
+
+        let raw = env.get("OPENCODE_CONFIG_CONTENT").unwrap();
+        let config: Value = serde_json::from_str(raw).unwrap();
+        let models = &config["provider"]["aivo"]["models"];
+
+        let flash = &models["deepseek-v4-flash"];
+        assert_eq!(flash["reasoning"], true);
+        assert_eq!(flash["variants"]["high"]["reasoningEffort"], "high");
+        // Key order is only visible in the raw JSON — re-parsing alphabetizes.
+        assert!(
+            raw.contains(concat!(
+                "\"variants\":{",
+                "\"low\":{\"reasoningEffort\":\"low\"},",
+                "\"medium\":{\"reasoningEffort\":\"medium\"},",
+                "\"high\":{\"reasoningEffort\":\"high\"},",
+                "\"max\":{\"reasoningEffort\":\"max\"}}"
+            )),
+            "variants missing or out of ladder order: {raw}"
+        );
+
+        assert!(models["plain-chat"].get("reasoning").is_none());
+        assert!(models["plain-chat"].get("variants").is_none());
+
+        let flag_only = &models["flag-only-reasoner"];
+        assert_eq!(flag_only["reasoning"], true);
+        assert!(flag_only.get("variants").is_none());
+
+        assert_eq!(
+            models["odd-effort"]["variants"]["ul\"tra"]["reasoningEffort"],
+            "ul\"tra"
+        );
     }
 
     #[test]
