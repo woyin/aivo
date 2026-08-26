@@ -77,6 +77,8 @@ async fn test_apply_mcp_connected_refreshes_open_overlay() {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let mut app = make_test_app(tx, rx);
     app.overlay = Overlay::Mcp(McpOverlay {
+        list_scroll: 0,
+        scroll_selected: 0,
         items: vec![McpServerRow {
             name: "broken".to_string(),
             status: "connecting…".to_string(),
@@ -352,6 +354,8 @@ async fn project_mcp_server_connects_by_default_and_toggles_like_user() {
 
     // Toggling a project row off goes to the global opt-out, like a user server.
     app.overlay = Overlay::Mcp(McpOverlay {
+        list_scroll: 0,
+        scroll_selected: 0,
         items: vec![McpServerRow {
             name: "fs".to_string(),
             status: "1 tool".to_string(),
@@ -444,16 +448,16 @@ async fn test_mcp_overlay_wheel_scrolls_like_arrows() {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let mut app = make_test_app(tx, rx);
 
-    // List mode: the wheel moves the selection.
+    // List mode: the wheel pans the window; the selection stays on its item.
     app.overlay = Overlay::Mcp(mcp_overlay_fixture()); // 2 servers, selected 0
     app.handle_mouse(wheel(MouseEventKind::ScrollDown))
         .await
         .unwrap();
-    assert!(matches!(&app.overlay, Overlay::Mcp(s) if s.selected == 1));
+    assert!(matches!(&app.overlay, Overlay::Mcp(s) if s.selected == 0 && s.list_scroll == 3));
     app.handle_mouse(wheel(MouseEventKind::ScrollUp))
         .await
         .unwrap();
-    assert!(matches!(&app.overlay, Overlay::Mcp(s) if s.selected == 0));
+    assert!(matches!(&app.overlay, Overlay::Mcp(s) if s.selected == 0 && s.list_scroll == 0));
 
     // Drill-in: the wheel scrolls the tool list.
     let mut overlay = mcp_overlay_fixture();
@@ -484,10 +488,13 @@ async fn test_mcp_split_wheel_routes_by_pane() {
     app.handle_mouse(over_detail).await.unwrap();
     assert!(matches!(&app.overlay, Overlay::Mcp(s) if s.detail_scroll == 3 && s.selected == 0));
 
+    // Over the list the wheel pans; selection and detail scroll stay put.
     app.handle_mouse(wheel(MouseEventKind::ScrollDown))
         .await
         .unwrap();
-    assert!(matches!(&app.overlay, Overlay::Mcp(s) if s.selected == 1 && s.detail_scroll == 0));
+    assert!(
+        matches!(&app.overlay, Overlay::Mcp(s) if s.selected == 0 && s.detail_scroll == 3 && s.list_scroll == 3)
+    );
 }
 
 #[test]

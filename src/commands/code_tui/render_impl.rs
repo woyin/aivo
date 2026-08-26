@@ -1548,6 +1548,7 @@ impl CodeTuiApp {
             frame.render_widget(Block::default().style(Style::default().bg(canvas)), outer);
         }
         self.picker_hitbox = None;
+        self.scrollbar_hit = None;
         self.transcript_hitbox = None;
         self.render_cache.screen_region = None;
         self.overlay_detail_area = None;
@@ -1576,11 +1577,17 @@ impl CodeTuiApp {
                     _ => (centered_rect(68, 72, body), false),
                 };
                 let out = self.render_picker(frame, area, &picker, split);
+                self.scrollbar_hit = out.scrollbar;
                 self.overlay_detail_area = out.detail_area;
-                if let (Some(clamped), Overlay::Picker(p)) = (out.detail_scroll, &mut self.overlay)
-                {
-                    p.preview_scroll = clamped;
-                    p.preview_scroll_for = out.scroll_for;
+                if let Overlay::Picker(p) = &mut self.overlay {
+                    if let Some(start) = out.list_scroll {
+                        p.scroll_top = start;
+                        p.scroll_selected = p.selected;
+                    }
+                    if let Some(clamped) = out.detail_scroll {
+                        p.preview_scroll = clamped;
+                        p.preview_scroll_for = out.scroll_for;
+                    }
                 }
             }
             Overlay::Help { scroll } => {
@@ -1619,8 +1626,13 @@ impl CodeTuiApp {
                 let (area, split) = split_overlay_area(body, 84, 80, 64, 80);
                 self.set_overlay_regions(area);
                 let out = self.render_skills_overlay(frame, area, &skills, split);
+                self.scrollbar_hit = out.scrollbar;
                 self.overlay_detail_area = out.detail_area;
                 if let Overlay::Skills(s) = &mut self.overlay {
+                    if let Some(l) = out.list_scroll {
+                        s.list_scroll = l;
+                        s.scroll_selected = s.selected;
+                    }
                     if let Some(c) = out.detail_scroll {
                         s.detail_scroll = c;
                     }
@@ -1634,8 +1646,13 @@ impl CodeTuiApp {
                 let (area, split) = split_overlay_area(body, 84, 80, 64, 80);
                 self.set_overlay_regions(area);
                 let out = self.render_agents_overlay(frame, area, &agents, split);
+                self.scrollbar_hit = out.scrollbar;
                 self.overlay_detail_area = out.detail_area;
                 if let Overlay::Agents(s) = &mut self.overlay {
+                    if let Some(l) = out.list_scroll {
+                        s.list_scroll = l;
+                        s.scroll_selected = s.selected;
+                    }
                     if let Some(c) = out.detail_scroll {
                         s.detail_scroll = c;
                     }
@@ -1648,8 +1665,13 @@ impl CodeTuiApp {
                 let (area, split) = split_overlay_area(body, 84, 80, 64, 80);
                 self.set_overlay_regions(area);
                 let out = self.render_skill_install_overlay(frame, area, &pick, split);
+                self.scrollbar_hit = out.scrollbar;
                 self.overlay_detail_area = out.detail_area;
                 if let Overlay::SkillInstall(s) = &mut self.overlay {
+                    if let Some(l) = out.list_scroll {
+                        s.list_scroll = l;
+                        s.scroll_selected = s.selected;
+                    }
                     if let Some(c) = out.detail_scroll {
                         s.detail_scroll = c;
                     }
@@ -1662,8 +1684,13 @@ impl CodeTuiApp {
                 let (area, split) = split_overlay_area(body, 84, 80, 64, 80);
                 self.set_overlay_regions(area);
                 let out = self.render_mcp_overlay(frame, area, &mcp, split);
+                self.scrollbar_hit = out.scrollbar;
                 self.overlay_detail_area = out.detail_area;
                 if let Overlay::Mcp(s) = &mut self.overlay {
+                    if let Some(l) = out.list_scroll {
+                        s.list_scroll = l;
+                        s.scroll_selected = s.selected;
+                    }
                     if let Some(c) = out.detail_scroll {
                         s.detail_scroll = c;
                     }
@@ -1675,17 +1702,28 @@ impl CodeTuiApp {
             Overlay::McpTools(tools) => {
                 let area = centered_rect(64, 80, body);
                 self.set_overlay_regions(area);
-                self.render_mcp_tools_overlay(frame, area, &tools);
+                let (list_scroll, scrollbar) = self.render_mcp_tools_overlay(frame, area, &tools);
+                self.scrollbar_hit = scrollbar;
+                if let Overlay::McpTools(s) = &mut self.overlay {
+                    s.list_scroll = list_scroll;
+                    s.scroll_selected = s.selected;
+                }
             }
             Overlay::McpPaste(paste) => {
                 let area = centered_rect(64, 80, body);
                 self.set_overlay_regions(area);
-                self.render_mcp_paste_overlay(frame, area, &paste);
+                let (list_scroll, scrollbar) = self.render_mcp_paste_overlay(frame, area, &paste);
+                self.scrollbar_hit = scrollbar;
+                if let Overlay::McpPaste(s) = &mut self.overlay {
+                    s.list_scroll = list_scroll;
+                    s.scroll_selected = s.selected;
+                }
             }
             Overlay::Config(config) => {
                 let (area, split) = split_overlay_area(body, 84, 80, 72, 82);
                 self.set_overlay_regions(area);
                 let out = self.render_config_overlay(frame, area, &config, split);
+                self.scrollbar_hit = out.scrollbar;
                 self.overlay_detail_area = out.detail_area;
                 self.picker_hitbox = out.list_area.map(|list_area| PickerHitbox {
                     overlay_area: area,
@@ -1693,10 +1731,14 @@ impl CodeTuiApp {
                     row_to_filtered_index: out.list_row_index,
                     segment_hits: out.segment_hits,
                 });
-                if let Overlay::Config(s) = &mut self.overlay
-                    && let Some(c) = out.detail_scroll
-                {
-                    s.detail_scroll = c;
+                if let Overlay::Config(s) = &mut self.overlay {
+                    if let Some(l) = out.list_scroll {
+                        s.list_scroll = l;
+                        s.scroll_selected = s.selected;
+                    }
+                    if let Some(c) = out.detail_scroll {
+                        s.detail_scroll = c;
+                    }
                 }
             }
             Overlay::None => {}

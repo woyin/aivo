@@ -68,13 +68,14 @@ impl CodeTuiApp {
 
         // Same chrome as /skills and the session picker: title + count badge in
         // the top border, search row + gap + list + hint strip inside.
+        let filtered_len = picker.filtered_items().len();
         let status = if picker.loading {
             "loading · Esc".to_string()
         } else {
             format!(
                 "{} · Esc",
                 format_picker_match_count(
-                    picker.filtered_items().len(),
+                    filtered_len,
                     picker.items.len(),
                     picker_kind_noun(&picker.kind)
                 )
@@ -119,6 +120,10 @@ impl CodeTuiApp {
         }
 
         let visible = picker.visible_items(usize::from(chunks[2].height));
+        let window = visible
+            .first()
+            .zip(visible.last())
+            .map(|((start, _), (last, _))| (*start, *last + 1 - *start));
         let (lines, row_to_filtered_index) = if visible.is_empty() {
             (
                 vec![Line::from(Span::styled(
@@ -154,8 +159,15 @@ impl CodeTuiApp {
                 .wrap(Wrap { trim: false }),
             chunks[2],
         );
+        let scrollbar = window.and_then(|(start, count)| {
+            render_list_scrollbar(frame, chunks[2], start, count, filtered_len)
+        });
         render_footer_hints(frame, chunks[3], &[("↑↓", "move"), ("Enter", "select")]);
-        OverlayRenderOut::default()
+        OverlayRenderOut {
+            list_scroll: window.map(|(start, _)| start),
+            scrollbar,
+            ..Default::default()
+        }
     }
 
     pub(super) fn render_session_picker(
@@ -226,8 +238,9 @@ impl CodeTuiApp {
             chunks[0],
         );
 
-        let (lines, row_to_filtered_index) =
+        let (lines, row_to_filtered_index, row_start, total_rows) =
             render_session_picker_rows(picker, usize::from(chunks[2].height), chunks[2].width);
+        let window_rows = lines.len();
 
         self.picker_hitbox = Some(PickerHitbox {
             overlay_area: area,
@@ -242,6 +255,8 @@ impl CodeTuiApp {
                 .wrap(Wrap { trim: false }),
             chunks[2],
         );
+        // Row units — the same units `scroll_top` persists, so drags map back exactly.
+        let scrollbar = render_list_scrollbar(frame, chunks[2], row_start, window_rows, total_rows);
         let footer: &[(&str, &str)] = if picker.pending_delete.is_some() {
             &[("Enter/Ctrl+D", "confirm delete"), ("Esc", "cancel")]
         } else if preview_pane.is_some() {
@@ -257,7 +272,11 @@ impl CodeTuiApp {
         render_footer_hints(frame, footer_rect, footer);
 
         let Some(right) = preview_pane else {
-            return OverlayRenderOut::default();
+            return OverlayRenderOut {
+                list_scroll: Some(row_start),
+                scrollbar,
+                ..Default::default()
+            };
         };
         let selected =
             picker
@@ -277,6 +296,8 @@ impl CodeTuiApp {
             );
             return OverlayRenderOut {
                 detail_area: Some(right),
+                list_scroll: Some(row_start),
+                scrollbar,
                 ..Default::default()
             };
         };
@@ -297,6 +318,8 @@ impl CodeTuiApp {
             detail_scroll: Some(clamped),
             detail_area: Some(right),
             scroll_for: Some(preview.session_id),
+            list_scroll: Some(row_start),
+            scrollbar,
             ..Default::default()
         }
     }
@@ -317,7 +340,11 @@ impl CodeTuiApp {
         let inner = overlay_shell(frame, area, "Help", Some(("Esc".to_string(), MUTED())));
 
         let cmd_style = Style::default().fg(TEXT()).add_modifier(Modifier::BOLD);
-        let key_style = Style::default().fg(ACCENT()).add_modifier(Modifier::BOLD);
+        // Keys match the keycap convention (decision cards, approval rows);
+        // lime stays reserved for the mark, focus, and active choices.
+        let key_style = Style::default()
+            .fg(ASSISTANT())
+            .add_modifier(Modifier::BOLD);
         let section_style = Style::default().fg(MUTED()).add_modifier(Modifier::BOLD);
         let group_style = Style::default().fg(FAINT());
 
@@ -918,7 +945,7 @@ impl CodeTuiApp {
             None => (footer, Vec::new()),
         };
 
-        render_toggle_list_body(
+        let (list_scroll, scrollbar) = render_toggle_list_body(
             frame,
             list_pane,
             ToggleListView {
@@ -927,13 +954,19 @@ impl CodeTuiApp {
                 input_line,
                 rows,
                 selected_pos,
+                scroll_top: state.list_scroll,
+                follow_selection: state.scroll_selected != state.selected,
                 detail: detail_line(detail, usize::from(list_pane.width).max(1)),
                 footer: body_footer,
             },
         );
 
         let Some((right, footer_rect)) = split_panes else {
-            return OverlayRenderOut::default();
+            return OverlayRenderOut {
+                list_scroll: Some(list_scroll),
+                scrollbar,
+                ..Default::default()
+            };
         };
         render_footer_hints(frame, footer_rect, &strip_footer);
         let detail_scroll = match selected_item {
@@ -959,6 +992,8 @@ impl CodeTuiApp {
             detail_scroll,
             detail_area: Some(right),
             scroll_for: None,
+            list_scroll: Some(list_scroll),
+            scrollbar,
             ..Default::default()
         }
     }
@@ -1154,7 +1189,7 @@ impl CodeTuiApp {
             None => (footer, Vec::new()),
         };
 
-        render_toggle_list_body(
+        let (list_scroll, scrollbar) = render_toggle_list_body(
             frame,
             list_pane,
             ToggleListView {
@@ -1163,13 +1198,19 @@ impl CodeTuiApp {
                 input_line: search_input_line(&state.query, "filter skills"),
                 rows,
                 selected_pos,
+                scroll_top: state.list_scroll,
+                follow_selection: state.scroll_selected != state.selected,
                 detail: detail_line(detail, usize::from(list_pane.width).max(1)),
                 footer: body_footer,
             },
         );
 
         let Some((right, footer_rect)) = split_panes else {
-            return OverlayRenderOut::default();
+            return OverlayRenderOut {
+                list_scroll: Some(list_scroll),
+                scrollbar,
+                ..Default::default()
+            };
         };
         render_footer_hints(frame, footer_rect, &strip_footer);
         let detail_scroll = match selected_item {
@@ -1196,6 +1237,8 @@ impl CodeTuiApp {
             detail_scroll,
             detail_area: Some(right),
             scroll_for: None,
+            list_scroll: Some(list_scroll),
+            scrollbar,
             ..Default::default()
         }
     }
@@ -1271,13 +1314,26 @@ impl CodeTuiApp {
             (body, None)
         };
 
+        let mut list_scroll = state.list_scroll;
+        let mut scrollbar = None;
         if list_pane.height > 0 {
             let view_h = usize::from(list_pane.height);
-            let offset = selected_pos.saturating_sub(view_h.saturating_sub(1));
+            let total_rows = rows.len();
+            // Up-clamp one above the selection so a group header scrolls in with it.
+            list_scroll = if state.scroll_selected != state.selected {
+                state
+                    .list_scroll
+                    .min(selected_pos.saturating_sub(1))
+                    .max((selected_pos + 1).saturating_sub(view_h))
+                    .min(total_rows.saturating_sub(view_h))
+            } else {
+                state.list_scroll.min(total_rows.saturating_sub(view_h))
+            };
             frame.render_widget(
-                Paragraph::new(Text::from(rows)).scroll((offset as u16, 0)),
+                Paragraph::new(Text::from(rows)).scroll((list_scroll as u16, 0)),
                 list_pane,
             );
+            scrollbar = render_list_scrollbar(frame, list_pane, list_scroll, view_h, total_rows);
         }
 
         let Some(detail_area) = detail_pane else {
@@ -1285,6 +1341,8 @@ impl CodeTuiApp {
             return OverlayRenderOut {
                 list_area: Some(list_pane),
                 list_row_index: row_index,
+                list_scroll: Some(list_scroll),
+                scrollbar,
                 ..Default::default()
             };
         };
@@ -1327,6 +1385,8 @@ impl CodeTuiApp {
             list_row_index: row_index,
             segment_hits,
             scroll_for: None,
+            list_scroll: Some(list_scroll),
+            scrollbar,
         }
     }
 
@@ -1435,7 +1495,7 @@ impl CodeTuiApp {
         frame: &mut Frame<'_>,
         area: Rect,
         state: &McpToolsOverlay,
-    ) {
+    ) -> (usize, Option<ScrollbarHit>) {
         let on = state.items.iter().filter(|i| i.enabled).count();
         let input_line = search_input_line(&state.query, "type to filter tools…");
         let inner_width = usize::from(area.width).saturating_sub(6).max(1);
@@ -1485,10 +1545,12 @@ impl CodeTuiApp {
                 input_line,
                 rows,
                 selected_pos,
+                scroll_top: state.list_scroll,
+                follow_selection: state.scroll_selected != state.selected,
                 detail: Vec::new(),
                 footer: vec![("↑↓", "move"), ("Space", "toggle")],
             },
-        );
+        )
     }
 
     /// The multi-server paste picker: choose which pasted servers to add. An
@@ -1498,7 +1560,7 @@ impl CodeTuiApp {
         frame: &mut Frame<'_>,
         area: Rect,
         state: &McpPasteOverlay,
-    ) {
+    ) -> (usize, Option<ScrollbarHit>) {
         let marked = state.items.iter().filter(|i| i.checked).count();
         let input_line = search_input_line(&state.query, "type to filter…");
         let inner_width = usize::from(area.width).saturating_sub(6).max(1);
@@ -1559,6 +1621,8 @@ impl CodeTuiApp {
                 input_line,
                 rows,
                 selected_pos,
+                scroll_top: state.list_scroll,
+                follow_selection: state.scroll_selected != state.selected,
                 detail: Vec::new(),
                 footer: vec![
                     ("↑↓", "move"),
@@ -1567,7 +1631,7 @@ impl CodeTuiApp {
                     ("Enter", "add"),
                 ],
             },
-        );
+        )
     }
 
     /// One-line detail for the selected `/skills` row: where the skill lives (home
@@ -1738,7 +1802,7 @@ impl CodeTuiApp {
             None => (footer, Vec::new()),
         };
 
-        render_toggle_list_body(
+        let (list_scroll, scrollbar) = render_toggle_list_body(
             frame,
             list_pane,
             ToggleListView {
@@ -1747,13 +1811,19 @@ impl CodeTuiApp {
                 input_line,
                 rows,
                 selected_pos,
+                scroll_top: state.list_scroll,
+                follow_selection: state.scroll_selected != state.selected,
                 detail: detail_line(detail, usize::from(list_pane.width).max(1)),
                 footer: body_footer,
             },
         );
 
         let Some((right, footer_rect)) = split_panes else {
-            return OverlayRenderOut::default();
+            return OverlayRenderOut {
+                list_scroll: Some(list_scroll),
+                scrollbar,
+                ..Default::default()
+            };
         };
         render_footer_hints(frame, footer_rect, &strip_footer);
         let detail_scroll = match selected_item {
@@ -1778,6 +1848,8 @@ impl CodeTuiApp {
         OverlayRenderOut {
             detail_scroll,
             detail_area: Some(right),
+            list_scroll: Some(list_scroll),
+            scrollbar,
             ..Default::default()
         }
     }
@@ -2031,7 +2103,7 @@ impl CodeTuiApp {
             None => (footer, Vec::new()),
         };
 
-        render_toggle_list_body(
+        let (list_scroll, scrollbar) = render_toggle_list_body(
             frame,
             list_pane,
             ToggleListView {
@@ -2040,13 +2112,19 @@ impl CodeTuiApp {
                 input_line,
                 rows,
                 selected_pos,
+                scroll_top: state.list_scroll,
+                follow_selection: state.scroll_selected != state.selected,
                 detail: detail_line(detail, usize::from(list_pane.width).max(1)),
                 footer: body_footer,
             },
         );
 
         let Some((right, footer_rect)) = split_panes else {
-            return OverlayRenderOut::default();
+            return OverlayRenderOut {
+                list_scroll: Some(list_scroll),
+                scrollbar,
+                ..Default::default()
+            };
         };
         render_footer_hints(frame, footer_rect, &strip_footer);
         let detail_scroll = match selected_row {
@@ -2072,6 +2150,8 @@ impl CodeTuiApp {
             detail_scroll,
             detail_area: Some(right),
             scroll_for: None,
+            list_scroll: Some(list_scroll),
+            scrollbar,
             ..Default::default()
         }
     }
@@ -2366,6 +2446,10 @@ struct ToggleListView<'a> {
     /// Line index within `rows` to keep on screen, so the list scrolls to follow
     /// the selection (each item spans two lines plus a separator).
     selected_pos: usize,
+    /// Persisted window start; the clamped value returns for write-back.
+    scroll_top: usize,
+    /// Selection moved since last render → the window slides to keep it visible.
+    follow_selection: bool,
     /// Detail block for the selected item, shown just above the footer.
     detail: Vec<Line<'a>>,
     /// `(key, label)` hints rendered along the footer.
@@ -2407,16 +2491,26 @@ fn overlay_shell(
 
 /// Shell + body for a whole-modal toggle overlay; `/skills` and
 /// `/mcp` draw their own shell and call [`render_toggle_list_body`] directly.
-fn render_toggle_list(frame: &mut Frame<'_>, area: Rect, mut view: ToggleListView) {
+/// Returns the clamped window start to persist plus the scrollbar's geometry.
+fn render_toggle_list(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    mut view: ToggleListView,
+) -> (usize, Option<ScrollbarHit>) {
     let inner = overlay_shell(frame, area, view.title, view.badge.take());
-    render_toggle_list_body(frame, inner, view);
+    render_toggle_list_body(frame, inner, view)
 }
 
 /// The toggle overlay's body (input row, list anchored to the selection, detail
 /// line, footer) inside an already-drawn shell; `view.title`/`badge` unused here.
-fn render_toggle_list_body(frame: &mut Frame<'_>, inner: Rect, view: ToggleListView) {
+/// Returns the clamped window start to persist plus the scrollbar's geometry.
+fn render_toggle_list_body(
+    frame: &mut Frame<'_>,
+    inner: Rect,
+    view: ToggleListView,
+) -> (usize, Option<ScrollbarHit>) {
     if inner.height == 0 {
-        return;
+        return (view.scroll_top, None);
     }
 
     frame.render_widget(Paragraph::new(view.input_line), Rect { height: 1, ..inner });
@@ -2430,13 +2524,25 @@ fn render_toggle_list_body(frame: &mut Frame<'_>, inner: Rect, view: ToggleListV
         height: inner.height.saturating_sub(1 + gap + detail_h + footer_h),
         ..inner
     };
+    let mut offset = view.scroll_top;
+    let mut scrollbar = None;
     if list_area.height > 0 {
         let view_h = usize::from(list_area.height);
-        let offset = view.selected_pos.saturating_sub(view_h.saturating_sub(1));
+        let total_rows = view.rows.len();
+        // selected_pos anchors the item's second line; the up-clamp keeps the name row too.
+        offset = if view.follow_selection {
+            view.scroll_top
+                .min(view.selected_pos.saturating_sub(1))
+                .max((view.selected_pos + 1).saturating_sub(view_h))
+                .min(total_rows.saturating_sub(view_h))
+        } else {
+            view.scroll_top.min(total_rows.saturating_sub(view_h))
+        };
         frame.render_widget(
             Paragraph::new(Text::from(view.rows)).scroll((offset as u16, 0)),
             list_area,
         );
+        scrollbar = render_list_scrollbar(frame, list_area, offset, view_h, total_rows);
     }
 
     if detail_h > 0 {
@@ -2461,6 +2567,7 @@ fn render_toggle_list_body(frame: &mut Frame<'_>, inner: Rect, view: ToggleListV
             &view.footer,
         );
     }
+    (offset, scrollbar)
 }
 
 fn render_footer_hints(frame: &mut Frame<'_>, area: Rect, hints: &[(&str, &str)]) {
@@ -2507,6 +2614,44 @@ fn render_vertical_rule(frame: &mut Frame<'_>, area: Rect) {
             ..area
         },
     );
+}
+
+/// Thumb-only scrollbar in the blank gutter column right of a windowed list;
+/// no-op when everything fits. `start`/`visible`/`total` share the caller's unit.
+fn render_list_scrollbar(
+    frame: &mut Frame<'_>,
+    list_area: Rect,
+    start: usize,
+    visible: usize,
+    total: usize,
+) -> Option<ScrollbarHit> {
+    let track = Rect {
+        x: list_area.x + list_area.width,
+        width: 1,
+        ..list_area
+    };
+    if total <= visible || visible == 0 || track.height == 0 || track.right() > frame.area().right()
+    {
+        return None;
+    }
+    let hit = ScrollbarHit {
+        track,
+        start,
+        visible,
+        total,
+    };
+    let (thumb_y, thumb_h, _, _) = hit.thumb();
+    let lines: Vec<Line> = (0..usize::from(track.height))
+        .map(|row| {
+            if (thumb_y..thumb_y + thumb_h).contains(&row) {
+                Line::from(Span::styled("█", Style::default().fg(FAINT())))
+            } else {
+                Line::from("")
+            }
+        })
+        .collect();
+    frame.render_widget(Paragraph::new(Text::from(lines)), track);
+    Some(hit)
 }
 
 /// A faint `─` rule across `area` — stacked `/config` separates list from inspector.

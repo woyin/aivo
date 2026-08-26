@@ -1050,6 +1050,10 @@ pub(super) struct AgentsOverlay {
     pub(super) pending_delete: Option<usize>,
     pub(super) viewing: Option<usize>,
     pub(super) detail_scroll: u16,
+    /// Persisted list-window start (rows), written back after render.
+    pub(super) list_scroll: usize,
+    /// `selected` at last render; equality marks `list_scroll` as a wheel pan.
+    pub(super) scroll_selected: usize,
 }
 
 impl AgentsOverlay {
@@ -1111,6 +1115,10 @@ pub(super) struct SkillsOverlay {
     pub(super) pending_delete: Option<usize>,
     pub(super) viewing: Option<usize>,
     pub(super) detail_scroll: u16,
+    /// Persisted list-window start (rows), written back after render.
+    pub(super) list_scroll: usize,
+    /// `selected` at last render; equality marks `list_scroll` as a wheel pan.
+    pub(super) scroll_selected: usize,
 }
 
 impl SkillsOverlay {
@@ -1225,6 +1233,10 @@ pub(super) struct SkillInstallOverlay {
     pub(super) query: String,
     pub(super) viewing: Option<usize>,
     pub(super) detail_scroll: u16,
+    /// Persisted list-window start (rows), written back after render.
+    pub(super) list_scroll: usize,
+    /// `selected` at last render; equality marks `list_scroll` as a wheel pan.
+    pub(super) scroll_selected: usize,
 }
 
 impl SkillInstallOverlay {
@@ -1332,6 +1344,10 @@ pub(super) struct McpOverlay {
     pub(super) pending_delete: Option<usize>,
     pub(super) viewing: Option<usize>,
     pub(super) detail_scroll: u16,
+    /// Persisted list-window start (rows), written back after render.
+    pub(super) list_scroll: usize,
+    /// `selected` at last render; equality marks `list_scroll` as a wheel pan.
+    pub(super) scroll_selected: usize,
 }
 
 impl McpOverlay {
@@ -1403,6 +1419,10 @@ pub(super) struct McpToolsOverlay {
     pub(super) items: Vec<McpToolRow>,
     pub(super) selected: usize,
     pub(super) query: String,
+    /// Persisted list-window start (rows), written back after render.
+    pub(super) list_scroll: usize,
+    /// `selected` at last render; equality marks `list_scroll` as a wheel pan.
+    pub(super) scroll_selected: usize,
 }
 
 impl McpToolsOverlay {
@@ -1457,6 +1477,10 @@ pub(super) struct McpPasteOverlay {
     pub(super) items: Vec<McpPasteRow>,
     pub(super) selected: usize,
     pub(super) query: String,
+    /// Persisted list-window start (rows), written back after render.
+    pub(super) list_scroll: usize,
+    /// `selected` at last render; equality marks `list_scroll` as a wheel pan.
+    pub(super) scroll_selected: usize,
 }
 
 impl McpPasteOverlay {
@@ -1556,6 +1580,10 @@ pub(super) struct ConfigOverlay {
     pub(super) error: Option<(ConfigSetting, String)>,
     /// Right-pane (or stacked detail) scroll; reset when the selection moves.
     pub(super) detail_scroll: u16,
+    /// Persisted list-window start (rows), written back after render.
+    pub(super) list_scroll: usize,
+    /// `selected` at last render; equality marks `list_scroll` as a wheel pan.
+    pub(super) scroll_selected: usize,
 }
 
 impl ConfigOverlay {
@@ -1852,6 +1880,13 @@ pub(super) struct PickerState {
     pub(super) preview_scroll: u16,
     /// Session the scroll belongs to; a selection mismatch reads as 0 (re-anchor).
     pub(super) preview_scroll_for: Option<String>,
+    /// First visible list position (item index generic / row index session),
+    /// written back after each render.
+    pub(super) scroll_top: usize,
+    /// `selected` at last render; equality marks a `scroll_top` change as a
+    /// wheel pan that may leave the selection off-screen. Init usize::MAX so
+    /// the first frame follows the selection.
+    pub(super) scroll_selected: usize,
 }
 
 /// Renderer→dispatch report: the clamped scroll to write back (renderers get a
@@ -1867,6 +1902,43 @@ pub(super) struct OverlayRenderOut {
     pub(super) list_row_index: Vec<Option<usize>>,
     /// Inspector segmented-control pills: clickable rect → option index.
     pub(super) segment_hits: Vec<(Rect, usize)>,
+    /// Clamped list-window start to persist (`scroll_top`/`list_scroll`).
+    pub(super) list_scroll: Option<usize>,
+    /// The list scrollbar's geometry from this render, for thumb dragging.
+    pub(super) scrollbar: Option<ScrollbarHit>,
+}
+
+/// A rendered list scrollbar: the 1-column track plus the window it maps, in
+/// the owning list's units. Dragging inverts [`Self::thumb`].
+#[derive(Clone, Copy, Debug)]
+pub(super) struct ScrollbarHit {
+    pub(super) track: Rect,
+    pub(super) start: usize,
+    pub(super) visible: usize,
+    pub(super) total: usize,
+}
+
+impl ScrollbarHit {
+    /// `(thumb_y, thumb_h, run, max_start)` — `run` is the travel span in rows.
+    pub(super) fn thumb(&self) -> (usize, usize, usize, usize) {
+        let track_h = usize::from(self.track.height);
+        let thumb_h = (track_h * self.visible / self.total).max(1);
+        let run = track_h - thumb_h;
+        let max_start = self.total - self.visible;
+        let thumb_y = (run * self.start.min(max_start) + max_start / 2)
+            .checked_div(max_start)
+            .unwrap_or(0);
+        (thumb_y, thumb_h, run, max_start)
+    }
+
+    /// The window start for a drag with the thumb's top at `thumb_y` rows.
+    pub(super) fn start_for_thumb_y(&self, thumb_y: usize) -> usize {
+        let (_, _, run, max_start) = self.thumb();
+        if run == 0 {
+            return self.start;
+        }
+        (thumb_y.min(run) * max_start + run / 2) / run
+    }
 }
 
 #[derive(Clone, Default)]
@@ -2101,6 +2173,8 @@ impl PickerState {
             pending_delete: None,
             preview_scroll: 0,
             preview_scroll_for: None,
+            scroll_top: 0,
+            scroll_selected: usize::MAX,
         }
     }
 
@@ -2120,6 +2194,8 @@ impl PickerState {
             pending_delete: None,
             preview_scroll: 0,
             preview_scroll_for: None,
+            scroll_top: 0,
+            scroll_selected: usize::MAX,
         }
     }
 
@@ -2154,6 +2230,9 @@ impl PickerState {
         )
     }
 
+    /// Window at the persisted `scroll_top`, slid only as far as needed to keep
+    /// a moved selection visible; unmoved selection = wheel pan owns the offset.
+    /// The caller writes the first returned index back to `scroll_top`.
     pub(super) fn visible_items(&self, max_rows: usize) -> Vec<(usize, &PickerEntry)> {
         let filtered = self.filtered_items();
         if filtered.is_empty() || max_rows == 0 {
@@ -2161,9 +2240,34 @@ impl PickerState {
         }
 
         let selected = self.selected.min(filtered.len().saturating_sub(1));
-        let mut start = selected;
-        let mut used_rows = filtered[selected].1.row_height();
+        let mut start = if self.scroll_selected == selected {
+            self.scroll_top.min(filtered.len() - 1)
+        } else {
+            // Topmost start that still shows the whole selected row.
+            let mut min_start = selected;
+            let mut used_rows = filtered[selected].1.row_height();
+            while min_start > 0 {
+                let next_height = filtered[min_start - 1].1.row_height();
+                if used_rows + next_height > max_rows {
+                    break;
+                }
+                used_rows += next_height;
+                min_start -= 1;
+            }
+            self.scroll_top.clamp(min_start, selected)
+        };
 
+        let mut end = start;
+        let mut used_rows = 0usize;
+        while end < filtered.len() {
+            let next_height = filtered[end].1.row_height();
+            if end > start && used_rows + next_height > max_rows {
+                break;
+            }
+            used_rows += next_height;
+            end += 1;
+        }
+        // Fill the last page from above when the tail leaves slack.
         while start > 0 {
             let next_height = filtered[start - 1].1.row_height();
             if used_rows + next_height > max_rows {
@@ -2171,16 +2275,6 @@ impl PickerState {
             }
             used_rows += next_height;
             start -= 1;
-        }
-
-        let mut end = selected + 1;
-        while end < filtered.len() {
-            let next_height = filtered[end].1.row_height();
-            if used_rows + next_height > max_rows {
-                break;
-            }
-            used_rows += next_height;
-            end += 1;
         }
 
         filtered[start..end]
@@ -3163,6 +3257,10 @@ pub(super) struct CodeTuiApp {
     pub(super) session_id_hit: Option<Rect>,
     /// Footer `● sharing` badge click region; `None` while not sharing.
     pub(super) share_badge_hit: Option<Rect>,
+    /// The open overlay's list scrollbar from the last render, if any.
+    pub(super) scrollbar_hit: Option<ScrollbarHit>,
+    /// Active thumb drag: grab row-offset inside the thumb.
+    pub(super) scrollbar_drag: Option<u16>,
     /// Preview pane `✕` click regions (header + hint); empty while not drawn.
     pub(super) preview_close_hits: Vec<Rect>,
     /// The composer text region from the last render, for mouse cursor-placement
@@ -3768,6 +3866,8 @@ impl CodeTuiApp {
             last_max_scroll: None,
             transcript_hitbox: None,
             jump_to_bottom_hit: None,
+            scrollbar_hit: None,
+            scrollbar_drag: None,
             preview_close_hits: Vec::new(),
             session_id_hit: None,
             share_badge_hit: None,

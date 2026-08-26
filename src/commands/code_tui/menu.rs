@@ -470,11 +470,13 @@ pub(super) fn session_picker_item_lines(
     ])]
 }
 
+/// Returns the window rows, the start row (written back to `scroll_top`), and
+/// the total row count — start/total feed the scrollbar in the same row units.
 pub(super) fn render_session_picker_rows(
     picker: &PickerState,
     max_rows: usize,
     width: u16,
-) -> (Vec<Line<'static>>, Vec<Option<usize>>) {
+) -> (Vec<Line<'static>>, Vec<Option<usize>>, usize, usize) {
     let filtered = picker.filtered_items();
     if filtered.is_empty() || max_rows == 0 {
         let msg = if picker.items.is_empty() {
@@ -485,6 +487,8 @@ pub(super) fn render_session_picker_rows(
         return (
             vec![Line::from(Span::styled(msg, Style::default().fg(MUTED())))],
             Vec::new(),
+            0,
+            0,
         );
     }
 
@@ -517,41 +521,60 @@ pub(super) fn render_session_picker_rows(
     }
 
     if all_rows.len() <= max_rows {
+        let total = all_rows.len();
         let (lines, row_map): (Vec<_>, Vec<_>) = all_rows
             .into_iter()
             .map(|(line, index, _)| (line, index))
             .unzip();
-        return (lines, row_map);
+        return (lines, row_map, 0, total);
     }
 
-    let selected_row = all_rows
+    // Slide the persisted start only when a moved selection would leave the window.
+    let selected_last = all_rows
         .iter()
         .rposition(|(_, index, is_item)| *is_item && *index == Some(picker.selected))
         .unwrap_or(0);
-    let mut start = selected_row.saturating_sub(max_rows / 2);
-    let mut end = (start + max_rows).min(all_rows.len());
-    if end - start < max_rows {
-        start = end.saturating_sub(max_rows);
-    }
+    let selected_first = all_rows
+        .iter()
+        .position(|(_, index, is_item)| *is_item && *index == Some(picker.selected))
+        .unwrap_or(0);
+    let min_start = (selected_last + 1).saturating_sub(max_rows);
+    let max_start = all_rows.len().saturating_sub(max_rows);
+    let follow = picker.scroll_selected != picker.selected;
+    let mut start = if follow {
+        picker
+            .scroll_top
+            .min(selected_first)
+            .max(min_start)
+            .min(max_start)
+    } else {
+        picker.scroll_top.min(max_start)
+    };
+    // Never split a multi-line item at the window's top edge.
     while start > 0
         && all_rows[start].2
         && all_rows[start - 1].2
         && all_rows[start].1 == all_rows[start - 1].1
     {
         start -= 1;
-        end = (start + max_rows).min(all_rows.len());
     }
-    if start > 0 && all_rows[start].1.is_some() && all_rows[start - 1].1.is_none() {
+    // Pull the group header above the first item into view when there's slack.
+    if follow
+        && start > min_start
+        && start > 0
+        && all_rows[start].1.is_some()
+        && all_rows[start - 1].1.is_none()
+    {
         start -= 1;
-        end = (start + max_rows).min(all_rows.len());
     }
+    let end = (start + max_rows).min(all_rows.len());
 
     let (lines, row_map): (Vec<_>, Vec<_>) = all_rows[start..end]
         .iter()
         .cloned()
         .map(|(line, index, _)| (line, index))
         .unzip();
-    (lines, row_map)
+    (lines, row_map, start, all_rows.len())
 }
 
 pub(super) fn picker_entry_lines(

@@ -771,6 +771,8 @@ is preserved."
             .and_then(|setting| items.iter().position(|item| item.setting == setting))
             .unwrap_or(0);
         self.overlay = Overlay::Config(ConfigOverlay {
+            list_scroll: 0,
+            scroll_selected: usize::MAX,
             items,
             selected,
             error: None,
@@ -1422,6 +1424,8 @@ is preserved."
         // (add/install/remove all reopen this overlay, so it's the convergence point).
         self.skill_commands = enabled_skill_commands(&items);
         self.overlay = Overlay::Skills(SkillsOverlay {
+            list_scroll: 0,
+            scroll_selected: usize::MAX,
             items,
             selected: 0,
             query: String::new(),
@@ -1464,6 +1468,8 @@ is preserved."
                 })
                 .collect();
         self.overlay = Overlay::Agents(AgentsOverlay {
+            list_scroll: 0,
+            scroll_selected: usize::MAX,
             items,
             selected: 0,
             query: String::new(),
@@ -1843,6 +1849,8 @@ is preserved."
         self.staged_skill_install = Some((staged, project));
         self.notice = None;
         self.overlay = Overlay::SkillInstall(SkillInstallOverlay {
+            list_scroll: 0,
+            scroll_selected: usize::MAX,
             source,
             project,
             items,
@@ -2157,6 +2165,8 @@ is preserved."
         // Refresh the welcome chip's MCP count — every add/remove reopens here.
         self.mcp_configured_count = items.iter().filter(|i| i.enabled).count();
         self.overlay = Overlay::Mcp(McpOverlay {
+            list_scroll: 0,
+            scroll_selected: usize::MAX,
             items,
             selected: 0,
             query: String::new(),
@@ -2378,6 +2388,8 @@ is preserved."
             }
         };
         self.overlay = Overlay::McpPaste(McpPasteOverlay {
+            list_scroll: 0,
+            scroll_selected: usize::MAX,
             parent,
             project,
             items,
@@ -2698,6 +2710,8 @@ is preserved."
             }
         };
         self.overlay = Overlay::McpTools(McpToolsOverlay {
+            list_scroll: 0,
+            scroll_selected: usize::MAX,
             server: name,
             parent,
             items,

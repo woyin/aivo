@@ -145,6 +145,8 @@ pub(super) fn skill_command(name: &str, description: &str) -> SkillCommand {
 pub(super) fn skills_overlay_fixture() -> SkillsOverlay {
     use crate::agent::skills::SkillScope;
     SkillsOverlay {
+        list_scroll: 0,
+        scroll_selected: 0,
         items: vec![
             SkillToggle {
                 name: "brandkit".to_string(),
@@ -175,6 +177,8 @@ pub(super) fn skills_overlay_fixture() -> SkillsOverlay {
 pub(super) fn mcp_overlay_fixture() -> McpOverlay {
     use crate::agent::mcp::ServerScope;
     McpOverlay {
+        list_scroll: 0,
+        scroll_selected: 0,
         items: vec![
             McpServerRow {
                 name: "filesystem".to_string(),

@@ -69,6 +69,8 @@ fn test_key_filter_does_not_match_across_full_url_path() {
 #[test]
 fn test_picker_visible_items_track_selection_for_single_line_rows() {
     let picker = PickerState {
+        scroll_top: 0,
+        scroll_selected: 0,
         title: "Select model",
         query: String::new(),
         items: (0..6)
@@ -92,11 +94,226 @@ fn test_picker_visible_items_track_selection_for_single_line_rows() {
     assert_eq!(visible[2].0, 4);
 }
 
+/// The window stays put while the cursor moves inside it; it slides only when
+/// the cursor crosses an edge.
+#[test]
+fn test_picker_window_slides_only_at_the_edges() {
+    let mut picker = PickerState {
+        scroll_top: 0,
+        scroll_selected: 0,
+        title: "Select model",
+        query: String::new(),
+        items: (0..20)
+            .map(|index| PickerEntry {
+                label: format!("item-{index}"),
+                search_text: format!("item-{index}"),
+                value: PickerValue::Model(format!("item-{index}")),
+            })
+            .collect(),
+        loading: false,
+        selected: 0,
+        kind: PickerKind::Session,
+        pending_delete: None,
+        preview_scroll: 0,
+        preview_scroll_for: None,
+    };
+    // Move the selection then mimic the render loop's write-back.
+    let mut step = |picker: &mut PickerState, selected: usize| {
+        picker.selected = selected;
+        let visible = picker.visible_items(5);
+        picker.scroll_top = visible[0].0;
+        picker.scroll_selected = selected;
+        picker.scroll_top
+    };
+
+    for selected in 0..5 {
+        assert_eq!(step(&mut picker, selected), 0, "window moved early");
+    }
+    assert_eq!(step(&mut picker, 5), 1, "bottom edge slides by one");
+    assert_eq!(step(&mut picker, 2), 1, "moving up inside stays put");
+    assert_eq!(step(&mut picker, 1), 1);
+    assert_eq!(step(&mut picker, 0), 0, "top edge slides up");
+    assert_eq!(step(&mut picker, 19), 15, "wrap bottom-aligns");
+}
+
+/// The wheel pans the window and leaves the selection on its item.
+#[tokio::test]
+async fn test_picker_wheel_pans_window_without_moving_selection() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    let items = (0..40)
+        .map(|index| PickerEntry {
+            label: format!("key-{index}"),
+            search_text: format!("key-{index}"),
+            value: PickerValue::Model(format!("key-{index}")),
+        })
+        .collect();
+    app.overlay = Overlay::Picker(Box::new(PickerState::ready(
+        "Switch key",
+        String::new(),
+        items,
+        PickerKind::Key {
+            target: KeySelectionTarget::Switch,
+        },
+    )));
+    render_full_screen(&mut app, 60, 20);
+
+    app.handle_mouse(wheel(MouseEventKind::ScrollDown))
+        .await
+        .unwrap();
+    let Overlay::Picker(p) = &app.overlay else {
+        panic!("picker closed")
+    };
+    assert_eq!((p.selected, p.scroll_top), (0, 3), "wheel should pan only");
+
+    render_full_screen(&mut app, 60, 20);
+    let Overlay::Picker(p) = &app.overlay else {
+        panic!("picker closed")
+    };
+    assert_eq!(p.scroll_top, 3, "render clamp must honor the pan");
+    assert_eq!(p.selected, 0, "selection must stay put");
+
+    app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE))
+        .await
+        .unwrap();
+    render_full_screen(&mut app, 60, 20);
+    let Overlay::Picker(p) = &app.overlay else {
+        panic!("picker closed")
+    };
+    assert_eq!(p.selected, 1);
+    assert_eq!(
+        p.scroll_top, 1,
+        "keyboard nav should snap back to the selection"
+    );
+}
+
+/// Press on the track grabs the thumb, drags pan the window, release ends the
+/// drag — the selection never moves.
+#[tokio::test]
+async fn test_picker_scrollbar_thumb_drag_pans_window() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    let items = (0..40)
+        .map(|index| PickerEntry {
+            label: format!("key-{index}"),
+            search_text: format!("key-{index}"),
+            value: PickerValue::Model(format!("key-{index}")),
+        })
+        .collect();
+    app.overlay = Overlay::Picker(Box::new(PickerState::ready(
+        "Switch key",
+        String::new(),
+        items,
+        PickerKind::Key {
+            target: KeySelectionTarget::Switch,
+        },
+    )));
+    render_full_screen(&mut app, 60, 20);
+    let hit = app
+        .scrollbar_hit
+        .expect("overflowing list renders a scrollbar");
+    let (_, _, _, max_start) = hit.thumb();
+    let at = |kind, row| MouseEvent {
+        kind,
+        column: hit.track.x,
+        row,
+        modifiers: KeyModifiers::NONE,
+    };
+
+    app.handle_mouse(at(MouseEventKind::Down(MouseButton::Left), hit.track.y))
+        .await
+        .unwrap();
+    app.handle_mouse(at(
+        MouseEventKind::Drag(MouseButton::Left),
+        hit.track.y + hit.track.height - 1,
+    ))
+    .await
+    .unwrap();
+    let Overlay::Picker(p) = &app.overlay else {
+        panic!("picker closed")
+    };
+    assert_eq!(p.selected, 0, "drag must not move the selection");
+    assert_eq!(p.scroll_top, max_start, "drag to the bottom = max scroll");
+
+    app.handle_mouse(at(
+        MouseEventKind::Up(MouseButton::Left),
+        hit.track.y + hit.track.height - 1,
+    ))
+    .await
+    .unwrap();
+    assert!(app.scrollbar_drag.is_none(), "release must end the drag");
+    let (screen, _) = render_full_screen(&mut app, 60, 20);
+    assert!(screen.contains("key-39"), "tail not shown:\n{screen}");
+}
+
+/// Overflow shows a thumb that moves with the window; a fitting list draws
+/// nothing. The scan stays inside the modal — the header logo also uses `█`.
+#[test]
+fn test_picker_scrollbar_thumb_tracks_overflow() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    let picker = |selected: usize, count: usize| PickerState {
+        scroll_top: 0,
+        scroll_selected: 0,
+        title: "Switch key",
+        query: String::new(),
+        items: (0..count)
+            .map(|index| PickerEntry {
+                label: format!("key-{index}"),
+                search_text: format!("key-{index}"),
+                value: PickerValue::Model(format!("key-{index}")),
+            })
+            .collect(),
+        loading: false,
+        selected,
+        kind: PickerKind::Key {
+            target: KeySelectionTarget::Switch,
+        },
+        pending_delete: None,
+        preview_scroll: 0,
+        preview_scroll_for: None,
+    };
+    let thumb_rows = |rows: &[String]| -> Vec<usize> {
+        let top = rows.iter().position(|r| r.contains("Switch key")).unwrap();
+        let right = rows[top].chars().position(|c| c == '╮').unwrap();
+        let bottom = top
+            + rows[top..]
+                .iter()
+                .position(|r| r.chars().nth(right) == Some('╯'))
+                .unwrap();
+        (top + 1..bottom)
+            .filter(|&y| rows[y].chars().nth(right - 1) == Some('█'))
+            .collect()
+    };
+
+    app.overlay = Overlay::Picker(Box::new(picker(0, 40)));
+    let (top, rows) = render_full_screen(&mut app, 60, 20);
+    let at_start = thumb_rows(&rows);
+    assert!(!at_start.is_empty(), "overflow should draw a thumb:\n{top}");
+
+    app.overlay = Overlay::Picker(Box::new(picker(39, 40)));
+    let (bottom_screen, rows) = render_full_screen(&mut app, 60, 20);
+    let at_end = thumb_rows(&rows);
+    assert!(
+        at_end.first() > at_start.first(),
+        "thumb should move down with the window:\n{bottom_screen}"
+    );
+
+    app.overlay = Overlay::Picker(Box::new(picker(0, 3)));
+    let (fits, rows) = render_full_screen(&mut app, 60, 20);
+    assert!(
+        thumb_rows(&rows).is_empty(),
+        "a fitting list must not draw a scrollbar:\n{fits}"
+    );
+}
+
 #[test]
 fn test_picker_ranks_substring_hits_above_subsequence_noise() {
     // "glm-" is a scattered subsequence of "google/gemini-…"; real glm models
     // must outrank that noise.
     let picker = PickerState {
+        scroll_top: 0,
+        scroll_selected: 0,
         title: "Select model",
         query: "glm-".to_string(),
         items: [
@@ -139,6 +356,8 @@ fn test_picker_ranks_substring_hits_above_subsequence_noise() {
 #[test]
 fn test_picker_navigation_wraps() {
     let mut picker = PickerState {
+        scroll_top: 0,
+        scroll_selected: 0,
         title: "Select model",
         query: String::new(),
         items: (0..3)
@@ -261,6 +480,8 @@ fn test_picker_visible_items_respect_single_line_session_rows() {
         origin: None,
     };
     let picker = PickerState {
+        scroll_top: 0,
+        scroll_selected: 0,
         title: "Resume",
         query: String::new(),
         items: vec![
@@ -336,7 +557,7 @@ fn test_session_picker_header_targets_newest_session() {
         PickerKind::Session,
     );
 
-    let (lines, row_map) = render_session_picker_rows(&picker, 8, 48);
+    let (lines, row_map, _, _) = render_session_picker_rows(&picker, 8, 48);
     let first = plain_text_from_spans(&lines[0].spans);
 
     assert_eq!(row_map.first().copied(), Some(Some(0)));
@@ -386,7 +607,7 @@ fn test_grouped_session_picker_short_view_shows_selected_session_row() {
         PickerKind::Session,
     );
 
-    let (lines, row_map) = render_session_picker_rows(&picker, 1, 48);
+    let (lines, row_map, _, _) = render_session_picker_rows(&picker, 1, 48);
     let only = plain_text_from_spans(&lines[0].spans);
 
     assert!(only.contains("Newest chat"));

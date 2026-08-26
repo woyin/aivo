@@ -393,6 +393,8 @@ fn test_skills_filter_ranks_name_matches_first() {
         body: String::new(),
     };
     let mut overlay = SkillsOverlay {
+        list_scroll: 0,
+        scroll_selected: 0,
         // "big old dear" contains b-o-l-d-e-r as a subsequence.
         items: vec![
             skill("alpha", "big old dear"),
@@ -763,6 +765,8 @@ fn test_skill_install_overlay_renders_picker() {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let mut app = make_test_app(tx, rx);
     app.overlay = Overlay::SkillInstall(SkillInstallOverlay {
+        list_scroll: 0,
+        scroll_selected: 0,
         source: "github:anthropics/skills".to_string(),
         project: false,
         items: vec![
@@ -887,6 +891,8 @@ async fn test_skill_install_loading_state_renders_and_esc_closes() {
 #[test]
 fn test_skill_install_picker_marks_installed_for_update() {
     let mut state = SkillInstallOverlay {
+        list_scroll: 0,
+        scroll_selected: 0,
         source: "github:o/r".to_string(),
         project: false,
         items: vec![
@@ -1368,16 +1374,16 @@ async fn test_skills_overlay_wheel_scrolls_like_arrows() {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let mut app = make_test_app(tx, rx);
 
-    // List mode: the wheel moves the selection (the list follows it).
+    // List mode: the wheel pans the window; the selection stays on its item.
     app.overlay = Overlay::Skills(skills_overlay_fixture()); // 2 items, selected 0
     app.handle_mouse(wheel(MouseEventKind::ScrollDown))
         .await
         .unwrap();
-    assert!(matches!(&app.overlay, Overlay::Skills(s) if s.selected == 1));
+    assert!(matches!(&app.overlay, Overlay::Skills(s) if s.selected == 0 && s.list_scroll == 3));
     app.handle_mouse(wheel(MouseEventKind::ScrollUp))
         .await
         .unwrap();
-    assert!(matches!(&app.overlay, Overlay::Skills(s) if s.selected == 0));
+    assert!(matches!(&app.overlay, Overlay::Skills(s) if s.selected == 0 && s.list_scroll == 0));
 
     // Drill-in: the wheel scrolls the body, leaving the selection put.
     let mut overlay = skills_overlay_fixture();

@@ -741,6 +741,8 @@ async fn test_overlay_backdrop_click_steps_back_like_esc() {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let mut app = make_test_app(tx, rx);
     app.overlay = Overlay::Skills(SkillsOverlay {
+        list_scroll: 0,
+        scroll_selected: 0,
         items: Vec::new(),
         selected: 0,
         query: "abc".to_string(),
@@ -916,6 +918,8 @@ fn test_agents_overlay_empty_state_fits_narrow_terminals() {
             row.chars()
                 .skip(left + 1)
                 .take(right.saturating_sub(left + 1))
+                // The margin-column scrollbar thumb isn't part of the copy.
+                .filter(|c| *c != '█')
                 .collect::<String>()
         })
         .collect::<Vec<_>>()

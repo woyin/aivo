@@ -3160,6 +3160,41 @@ impl CodeTuiApp {
     }
 
     async fn handle_overlay_mouse(&mut self, mouse: MouseEvent) -> Result<Option<bool>> {
+        // Scrollbar thumb drag — before all other routing so it never falls
+        // through to text selection. Off-thumb track presses jump-then-drag.
+        match mouse.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                // A missed release can strand the flag; any fresh press resets it.
+                self.scrollbar_drag = None;
+                if let Some(hit) = self.scrollbar_hit
+                    && (hit.track.x..=hit.track.x + 1).contains(&mouse.column)
+                    && (hit.track.y..hit.track.y + hit.track.height).contains(&mouse.row)
+                {
+                    let (thumb_y, thumb_h, _, _) = hit.thumb();
+                    let rel = usize::from(mouse.row - hit.track.y);
+                    let grab = if (thumb_y..thumb_y + thumb_h).contains(&rel) {
+                        (rel - thumb_y) as u16
+                    } else {
+                        (thumb_h / 2) as u16
+                    };
+                    self.scrollbar_drag = Some(grab);
+                    self.apply_scrollbar_drag(mouse.row);
+                    return Ok(Some(false));
+                }
+            }
+            MouseEventKind::Drag(MouseButton::Left) if self.scrollbar_drag.is_some() => {
+                if self.scrollbar_hit.is_some() {
+                    self.apply_scrollbar_drag(mouse.row);
+                    return Ok(Some(false));
+                }
+                self.scrollbar_drag = None;
+            }
+            MouseEventKind::Up(MouseButton::Left) if self.scrollbar_drag.is_some() => {
+                self.scrollbar_drag = None;
+                return Ok(Some(false));
+            }
+            _ => {}
+        }
         // A left press/drag/release over a non-picker overlay falls through to the
         // screen selection, so the help / skills / mcp bodies are selectable; wheel +
         // picker clicks stay handled below. A press on the backdrop dismisses one
@@ -3247,11 +3282,7 @@ impl CodeTuiApp {
                     if state.viewing.is_some() || over_detail {
                         state.detail_scroll = wheel_scroll(state.detail_scroll, up);
                     } else if state.adding.is_none() {
-                        if up {
-                            state.select_prev();
-                        } else {
-                            state.select_next();
-                        }
+                        state.list_scroll = wheel_pan(state.list_scroll, up);
                     }
                 }
                 Ok(Some(false))
@@ -3265,10 +3296,8 @@ impl CodeTuiApp {
                 if let Overlay::Agents(state) = &mut self.overlay {
                     if state.viewing.is_some() || over_detail {
                         state.detail_scroll = wheel_scroll(state.detail_scroll, up);
-                    } else if up {
-                        state.select_prev();
                     } else {
-                        state.select_next();
+                        state.list_scroll = wheel_pan(state.list_scroll, up);
                     }
                 }
                 Ok(Some(false))
@@ -3282,10 +3311,8 @@ impl CodeTuiApp {
                 if let Overlay::SkillInstall(state) = &mut self.overlay {
                     if state.viewing.is_some() || over_detail {
                         state.detail_scroll = wheel_scroll(state.detail_scroll, up);
-                    } else if up {
-                        state.select_prev();
                     } else {
-                        state.select_next();
+                        state.list_scroll = wheel_pan(state.list_scroll, up);
                     }
                 }
                 Ok(Some(false))
@@ -3300,11 +3327,7 @@ impl CodeTuiApp {
                     if state.viewing.is_some() || over_detail {
                         state.detail_scroll = wheel_scroll(state.detail_scroll, up);
                     } else if state.adding.is_none() {
-                        if up {
-                            state.select_prev();
-                        } else {
-                            state.select_next();
-                        }
+                        state.list_scroll = wheel_pan(state.list_scroll, up);
                     }
                 }
                 Ok(Some(false))
@@ -3313,11 +3336,7 @@ impl CodeTuiApp {
             (Overlay::McpTools(_), MouseEventKind::ScrollUp | MouseEventKind::ScrollDown) => {
                 let up = matches!(mouse.kind, MouseEventKind::ScrollUp);
                 if let Overlay::McpTools(state) = &mut self.overlay {
-                    if up {
-                        state.select_prev();
-                    } else {
-                        state.select_next();
-                    }
+                    state.list_scroll = wheel_pan(state.list_scroll, up);
                 }
                 Ok(Some(false))
             }
@@ -3325,11 +3344,7 @@ impl CodeTuiApp {
             (Overlay::McpPaste(_), MouseEventKind::ScrollUp | MouseEventKind::ScrollDown) => {
                 let up = matches!(mouse.kind, MouseEventKind::ScrollUp);
                 if let Overlay::McpPaste(state) = &mut self.overlay {
-                    if up {
-                        state.select_prev();
-                    } else {
-                        state.select_next();
-                    }
+                    state.list_scroll = wheel_pan(state.list_scroll, up);
                 }
                 Ok(Some(false))
             }
@@ -3342,10 +3357,8 @@ impl CodeTuiApp {
                 if let Overlay::Config(state) = &mut self.overlay {
                     if over_detail {
                         state.detail_scroll = wheel_scroll(state.detail_scroll, up);
-                    } else if up {
-                        state.select_prev();
                     } else {
-                        state.select_next();
+                        state.list_scroll = wheel_pan(state.list_scroll, up);
                     }
                 }
                 Ok(Some(false))
@@ -3373,10 +3386,8 @@ impl CodeTuiApp {
                                 });
                         picker.preview_scroll = wheel_scroll(picker.preview_scroll, !up);
                         picker.preview_scroll_for = sid;
-                    } else if up {
-                        picker.select_prev();
                     } else {
-                        picker.select_next();
+                        picker.scroll_top = wheel_pan(picker.scroll_top, up);
                     }
                 }
                 Ok(Some(false))
@@ -3386,6 +3397,27 @@ impl CodeTuiApp {
             }
             (Overlay::Picker(_), _) => Ok(Some(false)),
             (Overlay::None, _) => Ok(None),
+        }
+    }
+
+    /// Pan the open overlay's list to the dragged pointer row; like a wheel
+    /// pan, the selection stays put.
+    fn apply_scrollbar_drag(&mut self, row: u16) {
+        let (Some(hit), Some(grab)) = (self.scrollbar_hit, self.scrollbar_drag) else {
+            return;
+        };
+        let rel = usize::from(row.max(hit.track.y) - hit.track.y);
+        let start = hit.start_for_thumb_y(rel.saturating_sub(usize::from(grab)));
+        match &mut self.overlay {
+            Overlay::Picker(p) => p.scroll_top = start,
+            Overlay::Skills(s) => s.list_scroll = start,
+            Overlay::Agents(s) => s.list_scroll = start,
+            Overlay::SkillInstall(s) => s.list_scroll = start,
+            Overlay::Mcp(s) => s.list_scroll = start,
+            Overlay::McpTools(s) => s.list_scroll = start,
+            Overlay::McpPaste(s) => s.list_scroll = start,
+            Overlay::Config(s) => s.list_scroll = start,
+            _ => {}
         }
     }
 
@@ -3501,6 +3533,16 @@ pub(super) enum FragStep {
 
 /// Steps an overlay scroll offset by one mouse-wheel notch (`up` decreases it).
 /// Clamping is left to the renderer, so over-scrolling past the end is harmless.
+/// Wheel pan for the usize list-window offsets; the render clamp bounds it.
+fn wheel_pan(offset: usize, up: bool) -> usize {
+    const WHEEL_LINES: usize = 3;
+    if up {
+        offset.saturating_sub(WHEEL_LINES)
+    } else {
+        offset.saturating_add(WHEEL_LINES)
+    }
+}
+
 fn wheel_scroll(offset: u16, up: bool) -> u16 {
     const WHEEL_LINES: u16 = 3;
     if up {
