@@ -1593,7 +1593,8 @@ impl CodeTuiApp {
             Overlay::Help { scroll } => {
                 let area = centered_rect(72, 88, body);
                 self.set_overlay_regions(area);
-                let clamped = self.render_help_overlay(frame, area, scroll);
+                let (clamped, bar) = self.render_help_overlay(frame, area, scroll);
+                self.scrollbar_hit = bar;
                 if let Overlay::Help { scroll } = &mut self.overlay {
                     *scroll = clamped;
                 }
@@ -1601,7 +1602,8 @@ impl CodeTuiApp {
             Overlay::Context { report, scroll } => {
                 let area = centered_rect(72, 88, body);
                 self.set_overlay_regions(area);
-                let clamped = self.render_context_overlay(frame, area, &report, scroll);
+                let (clamped, bar) = self.render_context_overlay(frame, area, &report, scroll);
+                self.scrollbar_hit = bar;
                 if let Overlay::Context { scroll, .. } = &mut self.overlay {
                     *scroll = clamped;
                 }
@@ -1609,7 +1611,8 @@ impl CodeTuiApp {
             Overlay::Session { scroll } => {
                 let area = centered_rect(64, 60, body);
                 self.set_overlay_regions(area);
-                let clamped = self.render_session_overlay(frame, area, scroll);
+                let (clamped, bar) = self.render_session_overlay(frame, area, scroll);
+                self.scrollbar_hit = bar;
                 if let Overlay::Session { scroll } = &mut self.overlay {
                     *scroll = clamped;
                 }
@@ -1617,7 +1620,8 @@ impl CodeTuiApp {
             Overlay::Share { scroll } => {
                 let area = centered_rect_fixed(64, 9, body);
                 self.set_overlay_regions(area);
-                let clamped = self.render_share_overlay(frame, area, scroll);
+                let (clamped, bar) = self.render_share_overlay(frame, area, scroll);
+                self.scrollbar_hit = bar;
                 if let Overlay::Share { scroll } = &mut self.overlay {
                     *scroll = clamped;
                 }

@@ -1941,6 +1941,13 @@ impl ScrollbarHit {
     }
 }
 
+/// The glyphs `render_list_scrollbar` draws the thumb with (half-width bar +
+/// quadrant end caps) — tests filter/scan the modal margin column by this set.
+#[cfg(test)]
+pub(super) fn is_scrollbar_thumb_char(c: char) -> bool {
+    matches!(c, '▐' | '▗' | '▝')
+}
+
 #[derive(Clone, Default)]
 pub(super) struct PickerHitbox {
     pub(super) overlay_area: Rect,

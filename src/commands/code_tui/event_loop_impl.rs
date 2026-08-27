@@ -3424,6 +3424,10 @@ impl CodeTuiApp {
             Overlay::McpTools(s) => s.list_scroll = start,
             Overlay::McpPaste(s) => s.list_scroll = start,
             Overlay::Config(s) => s.list_scroll = start,
+            Overlay::Help { scroll }
+            | Overlay::Context { scroll, .. }
+            | Overlay::Session { scroll }
+            | Overlay::Share { scroll } => *scroll = start.min(usize::from(u16::MAX)) as u16,
             _ => {}
         }
     }

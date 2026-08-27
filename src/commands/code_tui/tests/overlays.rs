@@ -88,6 +88,52 @@ async fn test_help_overlay_groups_lists_every_command_and_scrolls() {
     assert!(matches!(app.overlay, Overlay::None));
 }
 
+/// An overflowing `/help` body draws the gutter scrollbar like every other
+/// modal, and dragging its thumb pans the scroll offset.
+#[tokio::test]
+async fn test_help_overlay_overflow_draws_draggable_scrollbar() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.open_help_overlay();
+
+    // Short terminal: the body overflows, so the thumb + hit must appear.
+    render_full_screen(&mut app, 90, 20);
+    let hit = app
+        .scrollbar_hit
+        .expect("overflowing help body renders a scrollbar");
+    let (_, _, _, max_start) = hit.thumb();
+    let at = |kind, row| MouseEvent {
+        kind,
+        column: hit.track.x,
+        row,
+        modifiers: KeyModifiers::NONE,
+    };
+    app.handle_mouse(at(MouseEventKind::Down(MouseButton::Left), hit.track.y))
+        .await
+        .unwrap();
+    app.handle_mouse(at(
+        MouseEventKind::Drag(MouseButton::Left),
+        hit.track.y + hit.track.height - 1,
+    ))
+    .await
+    .unwrap();
+    let Overlay::Help { scroll } = app.overlay else {
+        panic!("help overlay closed by the drag")
+    };
+    assert_eq!(
+        usize::from(scroll),
+        max_start,
+        "drag to the bottom = max scroll"
+    );
+
+    // A tall render fits everything — no scrollbar, and the offset re-clamps to 0.
+    render_full_screen(&mut app, 90, 140);
+    assert!(
+        app.scrollbar_hit.is_none(),
+        "fitting body must not draw a scrollbar"
+    );
+}
+
 #[tokio::test]
 async fn test_account_commands_gated_to_aivo_key() {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
@@ -919,7 +965,7 @@ fn test_agents_overlay_empty_state_fits_narrow_terminals() {
                 .skip(left + 1)
                 .take(right.saturating_sub(left + 1))
                 // The margin-column scrollbar thumb isn't part of the copy.
-                .filter(|c| *c != '█')
+                .filter(|c| !is_scrollbar_thumb_char(*c))
                 .collect::<String>()
         })
         .collect::<Vec<_>>()

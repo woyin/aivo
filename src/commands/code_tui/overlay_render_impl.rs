@@ -341,7 +341,7 @@ impl CodeTuiApp {
         frame: &mut Frame<'_>,
         area: Rect,
         scroll: u16,
-    ) -> u16 {
+    ) -> (u16, Option<ScrollbarHit>) {
         let inner = overlay_shell(frame, area, "Help", Some(("Esc".to_string(), MUTED())));
 
         let cmd_style = Style::default().fg(TEXT()).add_modifier(Modifier::BOLD);
@@ -454,7 +454,7 @@ impl CodeTuiApp {
         area: Rect,
         report: &crate::agent::engine::ContextReport,
         scroll: u16,
-    ) -> u16 {
+    ) -> (u16, Option<ScrollbarHit>) {
         let inner = overlay_shell(frame, area, "Context", Some(("Esc".to_string(), MUTED())));
         let width = usize::from(inner.width).max(1);
 
@@ -632,7 +632,7 @@ impl CodeTuiApp {
         frame: &mut Frame<'_>,
         area: Rect,
         scroll: u16,
-    ) -> u16 {
+    ) -> (u16, Option<ScrollbarHit>) {
         let inner = overlay_shell(frame, area, "Session", Some(("Esc".to_string(), MUTED())));
         let width = usize::from(inner.width).max(1);
 
@@ -702,7 +702,7 @@ impl CodeTuiApp {
         frame: &mut Frame<'_>,
         area: Rect,
         scroll: u16,
-    ) -> u16 {
+    ) -> (u16, Option<ScrollbarHit>) {
         let inner = overlay_shell(
             frame,
             area,
@@ -1374,7 +1374,8 @@ impl CodeTuiApp {
             footer.push(("PgDn", "scroll"));
         }
         render_footer_hints(frame, footer_rect, &footer);
-        let clamped = render_detail_lines(frame, inspector, lines, state.detail_scroll);
+        // The list's hit wins for dragging; the inspector thumb is display-only.
+        let (clamped, _) = render_detail_lines(frame, inspector, lines, state.detail_scroll);
         let segment_hits = state
             .items
             .get(state.selected)
@@ -2296,7 +2297,7 @@ impl CodeTuiApp {
                 Style::default().fg(MUTED()),
             )));
         }
-        render_detail_lines(frame, area, lines, scroll)
+        render_detail_lines(frame, area, lines, scroll).0
     }
 
     /// `/skills` detail (split right pane / narrow drill-in): location, full
@@ -2423,7 +2424,7 @@ impl CodeTuiApp {
                 }
             }
         }
-        render_detail_lines(frame, area, lines, scroll)
+        render_detail_lines(frame, area, lines, scroll).0
     }
 }
 
@@ -2646,13 +2647,20 @@ fn render_list_scrollbar(
         total,
     };
     let (thumb_y, thumb_h, _, _) = hit.thumb();
+    // Half-width bar hugging the border side; quadrant caps round the ends.
+    // Short thumbs (long lists) stay solid — caps alone would be a faint notch.
     let lines: Vec<Line> = (0..usize::from(track.height))
         .map(|row| {
-            if (thumb_y..thumb_y + thumb_h).contains(&row) {
-                Line::from(Span::styled("█", Style::default().fg(FAINT())))
+            let glyph = if !(thumb_y..thumb_y + thumb_h).contains(&row) {
+                return Line::from("");
+            } else if thumb_h >= 3 && row == thumb_y {
+                "▗"
+            } else if thumb_h >= 3 && row == thumb_y + thumb_h - 1 {
+                "▝"
             } else {
-                Line::from("")
-            }
+                "▐"
+            };
+            Line::from(Span::styled(glyph, Style::default().fg(MUTED())))
         })
         .collect();
     frame.render_widget(Paragraph::new(Text::from(lines)), track);
@@ -3175,18 +3183,24 @@ fn render_session_preview_pane(
 }
 
 /// Render a scrollable Enter drill-in panel: `lines` in the body, with a scroll
-/// hint + position footer when the content overflows. Returns the scroll offset
-/// clamped to the real content height so the caller can write it back —
-/// over-scrolling (e.g. `End`) lands exactly at the bottom rather than off the end.
-fn render_detail_lines(frame: &mut Frame<'_>, area: Rect, lines: Vec<Line>, scroll: u16) -> u16 {
+/// hint + position footer and a gutter scrollbar when the content overflows.
+/// Returns the scroll offset clamped to the real content height so the caller
+/// can write it back — over-scrolling (e.g. `End`) lands exactly at the bottom
+/// rather than off the end — plus the scrollbar's geometry for thumb dragging.
+fn render_detail_lines(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    lines: Vec<Line>,
+    scroll: u16,
+) -> (u16, Option<ScrollbarHit>) {
     if area.height == 0 {
-        return 0;
+        return (0, None);
     }
     let total = lines.len();
     // No footer when the content fits — the shell badge already names the dismiss key.
     if total <= usize::from(area.height) {
         frame.render_widget(Paragraph::new(Text::from(lines)), area);
-        return 0;
+        return (0, None);
     }
     let body_h = usize::from(area.height.saturating_sub(1));
     let max_scroll = (total.saturating_sub(body_h)) as u16;
@@ -3214,16 +3228,15 @@ fn render_detail_lines(frame: &mut Frame<'_>, area: Rect, lines: Vec<Line>, scro
         },
     );
     if body_h == 0 {
-        return scroll;
+        return (scroll, None);
     }
-    frame.render_widget(
-        Paragraph::new(Text::from(lines)).scroll((scroll, 0)),
-        Rect {
-            height: area.height.saturating_sub(1),
-            ..area
-        },
-    );
-    scroll
+    let body = Rect {
+        height: area.height.saturating_sub(1),
+        ..area
+    };
+    frame.render_widget(Paragraph::new(Text::from(lines)).scroll((scroll, 0)), body);
+    let bar = render_list_scrollbar(frame, body, usize::from(scroll), body_h, total);
+    (scroll, bar)
 }
 
 /// Greedy word-wrap to `width` display columns (for error text / descriptions

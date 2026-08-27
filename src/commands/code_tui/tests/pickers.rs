@@ -282,7 +282,12 @@ fn test_picker_scrollbar_thumb_tracks_overflow() {
                 .position(|r| r.chars().nth(right) == Some('╯'))
                 .unwrap();
         (top + 1..bottom)
-            .filter(|&y| rows[y].chars().nth(right - 1) == Some('█'))
+            .filter(|&y| {
+                rows[y]
+                    .chars()
+                    .nth(right - 1)
+                    .is_some_and(is_scrollbar_thumb_char)
+            })
             .collect()
     };
 
