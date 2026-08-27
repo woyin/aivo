@@ -43,7 +43,7 @@ pub(crate) fn rewrite_cli_args(
         return rewritten;
     }
 
-    if matches!(raw_args[1].as_str(), "-p" | "--prompt" | "-x" | "--execute") {
+    if matches!(raw_args[1].as_str(), "-p" | "--prompt") {
         let mut rewritten = vec![raw_args[0].clone(), "code".to_string()];
         rewritten.extend_from_slice(&raw_args[1..]);
         return rewritten;
@@ -1781,22 +1781,6 @@ mod tests {
     }
 
     #[test]
-    fn rewrite_injects_code_for_legacy_x_alias() {
-        assert_eq!(
-            rewrite_cli_args(args(&["aivo", "-x", "hello"]), &no_bundles()),
-            args(&["aivo", "code", "-x", "hello"])
-        );
-    }
-
-    #[test]
-    fn rewrite_injects_code_for_legacy_execute_alias() {
-        assert_eq!(
-            rewrite_cli_args(args(&["aivo", "--execute", "hello"]), &no_bundles()),
-            args(&["aivo", "code", "--execute", "hello"])
-        );
-    }
-
-    #[test]
     fn rewrite_treats_multiword_top_level_arg_as_prompt() {
         assert_eq!(
             rewrite_cli_args(args(&["aivo", "hello world"]), &no_bundles()),
@@ -1964,8 +1948,8 @@ mod tests {
     #[test]
     fn rewrite_keeps_explicit_code() {
         assert_eq!(
-            rewrite_cli_args(args(&["aivo", "code", "-x", "hello"]), &no_bundles()),
-            args(&["aivo", "code", "-x", "hello"])
+            rewrite_cli_args(args(&["aivo", "code", "-p", "hello"]), &no_bundles()),
+            args(&["aivo", "code", "-p", "hello"])
         );
     }
 
@@ -2277,7 +2261,7 @@ mod tests {
     fn needs_bundle_lookup_rejects_flags() {
         assert!(!needs_bundle_lookup(&args(&["aivo", "-h"])));
         assert!(!needs_bundle_lookup(&args(&["aivo", "--version"])));
-        assert!(!needs_bundle_lookup(&args(&["aivo", "-x", "hello"])));
+        assert!(!needs_bundle_lookup(&args(&["aivo", "-p", "hello"])));
     }
 
     #[test]

@@ -593,13 +593,6 @@ impl CodeTuiApp {
                     "Keeping planning — still read-only"
                 });
             }
-            // Unreachable from the card (no discard option); kept for completeness.
-            PlanDecision::Discard => {
-                self.plan_mode = false;
-                self.pending_plan = None;
-                self.plan_card_idx = None;
-                self.plan_exit_pending = true;
-            }
         }
         let _ = pending.reply.send(Ok(decision));
     }

@@ -995,8 +995,6 @@ pub struct CodeArgs {
     #[arg(
         short = 'p',
         long = "prompt",
-        visible_short_alias = 'x',
-        visible_alias = "execute",
         value_name = "PROMPT",
         num_args = 0..=1,
         default_missing_value = ""
@@ -1808,26 +1806,6 @@ mod tests {
     #[test]
     fn test_chat_args_prompt_long_flag() {
         let cli = Cli::try_parse_from(["aivo", "chat", "--prompt", "hello world"]).unwrap();
-        if let Some(Commands::Code(chat_args)) = cli.command {
-            assert_eq!(chat_args.prompt, Some("hello world".to_string()));
-        } else {
-            panic!("Expected Chat command");
-        }
-    }
-
-    #[test]
-    fn test_chat_args_prompt_legacy_short_alias_x() {
-        let cli = Cli::try_parse_from(["aivo", "chat", "-x", "hello"]).unwrap();
-        if let Some(Commands::Code(chat_args)) = cli.command {
-            assert_eq!(chat_args.prompt, Some("hello".to_string()));
-        } else {
-            panic!("Expected Chat command");
-        }
-    }
-
-    #[test]
-    fn test_chat_args_prompt_legacy_long_alias_execute() {
-        let cli = Cli::try_parse_from(["aivo", "chat", "--execute", "hello world"]).unwrap();
         if let Some(Commands::Code(chat_args)) = cli.command {
             assert_eq!(chat_args.prompt, Some("hello world".to_string()));
         } else {

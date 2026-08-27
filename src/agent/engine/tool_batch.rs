@@ -431,11 +431,6 @@ planning is off) — continue with the task."
                                 self.plan_card_dismissed = false;
                                 Ok(plan_mode::keep_planning_result(feedback.as_deref()))
                             }
-                            Ok(PlanDecision::Discard) => {
-                                self.turn_dismissals = 0;
-                                self.plan_card_dismissed = false;
-                                Ok(plan_mode::PLAN_DISCARDED_RESULT.to_string())
-                            }
                             // User action, not a tool failure (see the ask_user intrinsic).
                             Err(e) if e == plan_mode::PLAN_APPROVAL_DISMISSED => {
                                 self.turn_dismissals += 1;

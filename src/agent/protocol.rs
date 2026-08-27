@@ -70,7 +70,6 @@ pub enum Decision {
 pub enum PlanDecision {
     Approve,
     KeepPlanning { feedback: Option<String> },
-    Discard,
 }
 
 #[cfg(test)]

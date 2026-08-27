@@ -1318,7 +1318,6 @@ fn print_help_json() {
             { "alias": "code mcp", "expands_to": ["code mcp"], "note": "MCP servers are managed under `aivo code`; resolves to the hidden command named \"code mcp\"" },
             { "alias": "code skills", "expands_to": ["code skills"], "note": "Skills are managed under `aivo code`; resolves to the hidden command named \"code skills\"" },
             { "alias": "-p", "expands_to": ["code", "-p"] },
-            { "alias": "-x", "expands_to": ["code", "-x"], "deprecated": true, "replaced_by": "-p" },
             { "alias": "<text>", "expands_to": ["code", "-p", "<text>"], "note": "Top-level arg that can't be a command name (whitespace, uppercase, punctuation, non-ASCII) → one-shot code prompt; bare [a-z0-9-] words fall through as subcommands" },
             { "alias": "hf:<ref> | http(s)://<url>", "expands_to": ["code", "<ref>"], "note": "Top-level HF/URL arg → code with that model" },
             { "alias": "claude", "expands_to": ["run", "claude"] },

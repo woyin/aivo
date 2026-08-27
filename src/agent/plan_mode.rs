@@ -80,9 +80,6 @@ conversation so far and call `exit_plan_mode` again when it's ready."
     }
 }
 
-pub const PLAN_DISCARDED_RESULT: &str = "The user discarded the plan and cancelled planning. \
-STOP: do not implement anything. End your turn; the user will say how to proceed.";
-
 pub const PLAN_APPROVAL_DISMISSED: &str = "The user dismissed the plan without deciding — they \
 did NOT approve it. Plan mode stays on. End your turn; the user will approve, give feedback, or \
 stop planning.";
