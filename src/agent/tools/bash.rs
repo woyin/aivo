@@ -484,36 +484,42 @@ pub(super) async fn run_bash_inner(
     let mut sandbox_blocked = false;
     if code != 0 {
         out.push_str(&format!("\n[exit {code}]"));
-        // A blocked write surfaces as EPERM ("Operation not permitted", macOS
-        // seatbelt) or EACCES/EPERM ("Permission denied", Linux Landlock). Flag
-        // it so the engine can offer to re-run the command outside the sandbox on
-        // approval, and tell the model this was a confinement block — not a real
-        // failure — so it doesn't give up and ask the user to run it by hand.
-        // Match both streams — harnesses like `cargo test` re-emit captured
-        // denials on stdout. Skip "Permission denied" on macOS: seatbelt denials
-        // are EPERM, so that phrase there is an ordinary unreadable file.
-        let denial_in = |s: &str| {
-            s.contains("Operation not permitted")
-                || (!cfg!(target_os = "macos") && s.contains("Permission denied"))
-        };
-        let denial = denial_in(&stderr) || denial_in(&stdout);
-        if sandbox_enforced && denial {
-            sandbox_blocked = true;
-            out.push_str(match confinement {
-                BashConfinement::Workspace => {
-                    "\n[note: blocked by the workspace write-sandbox, not a real command \
+    }
+    // Seatbelt denies with EPERM, Landlock with EACCES/EPERM. Harnesses like
+    // `cargo test` re-emit captured denials on stdout, so match both streams; on
+    // macOS "Permission denied" is an ordinary unreadable file, not a block.
+    let denial_in = |s: &str| {
+        s.contains("Operation not permitted")
+            || (!cfg!(target_os = "macos") && s.contains("Permission denied"))
+    };
+    let denial = denial_in(&stderr) || denial_in(&stdout);
+    // `… | tail` / `; echo $?` masks the failing step's status, so exit 0 alone
+    // can't clear a denial — an escaping path stands in as the evidence. The
+    // command's own paths cover a denial line that names a relative one.
+    let masked_corroborated = || {
+        stderr
+            .lines()
+            .chain(stdout.lines())
+            .filter(|l| denial_in(l))
+            .any(|l| denial_line_names_escaping_path(l, cwd))
+            || !command_escaping_paths(command, cwd).is_empty()
+    };
+    if sandbox_enforced && denial && (code != 0 || masked_corroborated()) {
+        sandbox_blocked = true;
+        out.push_str(match confinement {
+            BashConfinement::Workspace => {
+                "\n[note: blocked by the workspace write-sandbox, not a real command \
 failure — it wrote outside the agent's workspace. The user can approve adding the target \
 directory to the session's writable roots, or re-running the command outside the sandbox; \
 don't fall back to telling the user to run it by hand. Relaunching with `--add-dir <dir>` \
 (or AIVO_AGENT_NO_SANDBOX=1) also works.]"
-                }
-                _ => {
-                    "\n[note: blocked writing to a protected path (aivo's config dir or \
+            }
+            _ => {
+                "\n[note: blocked writing to a protected path (aivo's config dir or \
 ~/.ssh) — the sandbox escalation deliberately excludes these. Only the user's explicit \
 per-command confirmation can open them.]"
-                }
-            });
-        }
+            }
+        });
     }
     if out.is_empty() {
         out.push_str("(no output)");

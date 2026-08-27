@@ -26,6 +26,29 @@ fn add_dir_roots_count_as_workspace_for_writes() {
 }
 
 #[test]
+fn denial_line_path_corroboration_needs_an_escaping_absolute_path() {
+    let cwd = tmp();
+    let outside = tmp();
+    let line = format!(
+        "fatal: Unable to create '{}/.git/refs/x.lock': Operation not permitted",
+        outside.display()
+    );
+    assert!(denial_line_names_escaping_path(&line, &cwd));
+    let line = format!("cp: {}/f.txt: Operation not permitted", outside.display());
+    assert!(denial_line_names_escaping_path(&line, &cwd));
+    assert!(!denial_line_names_escaping_path(
+        "rm: internal/regression/regression_test.go: Operation not permitted",
+        &cwd
+    ));
+    let line = format!("touch: {}/f.txt: Operation not permitted", cwd.display());
+    assert!(!denial_line_names_escaping_path(&line, &cwd));
+    assert!(!denial_line_names_escaping_path(
+        "Operation not permitted",
+        &cwd
+    ));
+}
+
+#[test]
 fn addable_root_prefers_enclosing_repo() {
     let cwd = tmp();
     let repo = tmp();

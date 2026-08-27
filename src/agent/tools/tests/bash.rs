@@ -158,6 +158,94 @@ async fn denial_phrase_on_stdout_flags_sandbox_block() {
     );
 }
 
+/// A masked exit status (`… 2>&1 | tail`) still flags when the denial line
+/// names the out-of-workspace target.
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn masked_exit_denial_with_pathed_line_still_flags() {
+    if !crate::agent::sandbox::active() {
+        return;
+    }
+    let dir = tmp();
+    let home = crate::services::system_env::home_dir().unwrap();
+    let outside = home.join(format!("aivo_masked_{}.txt", std::process::id()));
+    let _ = std::fs::remove_file(&outside);
+    let cmd = format!("touch '{}' 2>&1 | tail -1", outside.display());
+    let outcome = run_bash_confined(&json!({"command": cmd}), &dir, None).await;
+    let _ = std::fs::remove_file(&outside);
+    assert!(
+        outcome.sandbox_blocked,
+        "a pathed denial with a masked exit code must still flag for escalation"
+    );
+    assert!(outcome.result.unwrap().contains("write-sandbox"));
+}
+
+/// A relative-path denial line can't corroborate; the command's `cd <outside>` does.
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn masked_exit_denial_corroborated_by_command_cd_target() {
+    if !crate::agent::sandbox::active() {
+        return;
+    }
+    let dir = tmp();
+    let home = crate::services::system_env::home_dir().unwrap();
+    let name = format!("aivo_masked_rel_{}", std::process::id());
+    let cmd = format!("cd '{}' && touch {name} 2>&1 | tail -1", home.display());
+    let outcome = run_bash_confined(&json!({"command": cmd}), &dir, None).await;
+    let _ = std::fs::remove_file(home.join(&name));
+    assert!(
+        outcome.sandbox_blocked,
+        "a relative-path denial after `cd <outside>` must still flag for escalation"
+    );
+}
+
+/// Flagging alone isn't enough: a derivable repo root is what makes the engine
+/// offer the narrow add-write-root card instead of dropping confinement wholesale.
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn masked_denial_in_outside_repo_flags_and_derives_repo_root() {
+    if !crate::agent::sandbox::active() {
+        return;
+    }
+    let cwd = tmp();
+    let home = crate::services::system_env::home_dir().unwrap();
+    let repo = home.join(format!("aivo_field_repo_{}", std::process::id()));
+    std::fs::create_dir_all(repo.join(".git/refs/heads")).unwrap();
+    let canon = repo.canonicalize().unwrap();
+    let cmd = format!(
+        "touch '{}/.git/refs/heads/x.lock' 2>&1 | tail -1",
+        repo.display()
+    );
+    let outcome = run_bash_confined(&json!({"command": cmd}), &cwd, None).await;
+    let derived = addable_root_for_command(&cmd, &cwd);
+    let _ = std::fs::remove_dir_all(&repo);
+    assert!(
+        outcome.sandbox_blocked,
+        "the field shape (masked exit, out-of-tree repo) must flag for escalation"
+    );
+    assert_eq!(
+        derived,
+        Some(canon),
+        "a flagged block must derive the repo root so the narrow card is offered"
+    );
+}
+
+/// Exit 0 with no path evidence: output that merely says the phrase isn't a block.
+#[cfg(unix)]
+#[tokio::test]
+async fn masked_exit_denial_without_path_evidence_does_not_flag() {
+    if !crate::agent::sandbox::active() {
+        return;
+    }
+    let dir = tmp();
+    let cmd = json!({"command": "echo 'Operation not permitted'"});
+    let outcome = run_bash_confined(&cmd, &dir, None).await;
+    assert!(
+        !outcome.sandbox_blocked,
+        "an exit-0 denial phrase with no path evidence must not flag"
+    );
+}
+
 /// macOS: a read denial ("Permission denied", EACCES on stderr) is not a
 /// seatbelt write-block (EPERM, "Operation not permitted") — must not flag.
 #[cfg(target_os = "macos")]

@@ -214,6 +214,17 @@ pub(super) fn command_escaping_paths(cmd: &str, cwd: &Path) -> Vec<String> {
     out
 }
 
+/// Evidence a masked exit code can't provide. Relative targets never qualify:
+/// they resolve against an unknowable in-command `cd`.
+pub(super) fn denial_line_names_escaping_path(line: &str, cwd: &Path) -> bool {
+    // git quotes the target (`Unable to create '<p>'`), coreutils delimits with colons.
+    let quoted = line.split('\'').skip(1).step_by(2);
+    let fields = line.split(':').map(str::trim);
+    quoted
+        .chain(fields)
+        .any(|p| (p.starts_with('/') || p.starts_with("~/")) && path_escapes_cwd(p, cwd))
+}
+
 /// Whether a write target resolves under a protected root — confirmed even
 /// under auto-approve.
 pub fn write_path_is_protected(path: &str, cwd: &Path) -> bool {
