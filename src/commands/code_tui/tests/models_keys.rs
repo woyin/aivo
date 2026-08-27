@@ -622,12 +622,86 @@ async fn test_key_picker_focuses_active_key() {
     app.session_store = store.clone();
     app.key = key_b_full;
 
-    app.open_key_picker(None).await.unwrap();
+    app.open_key_picker(None, None).await.unwrap();
 
     let Overlay::Picker(picker) = &app.overlay else {
         panic!("expected key picker");
     };
     assert_eq!(picker.selected, 1, "active key is focused");
+}
+
+#[tokio::test]
+async fn test_key_switch_esc_returns_to_key_picker() {
+    let temp_dir = TempDir::new().unwrap();
+    let store = SessionStore::with_path(temp_dir.path().join("config.json"));
+    let key_a = store
+        .add_key_with_protocol("a", "https://a.example.com", None, "sk-a")
+        .await
+        .unwrap();
+    let key_b_id = store
+        .add_key_with_protocol("b", "https://b.example.com", None, "sk-b")
+        .await
+        .unwrap();
+    let key_a_full = store.get_key_by_id(&key_a).await.unwrap().unwrap();
+    let key_b_full = store.get_key_by_id(&key_b_id).await.unwrap().unwrap();
+
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.session_store = store.clone();
+    app.key = key_a_full;
+
+    // Esc while loading.
+    app.begin_key_switch(key_b_full.clone()).await.unwrap();
+    app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+        .await
+        .unwrap();
+    let Overlay::Picker(picker) = &app.overlay else {
+        panic!("expected key picker after Esc while loading");
+    };
+    assert!(
+        matches!(
+            picker.kind,
+            PickerKind::Key {
+                target: KeySelectionTarget::Switch
+            }
+        ),
+        "back to the key picker, not closed"
+    );
+    assert_eq!(picker.selected, 1, "drilled-into key stays focused");
+    assert_eq!(app.key.id, key_a, "no switch happened");
+
+    // Abandoned load resolving late.
+    app.tx
+        .send(RuntimeEvent::ModelsLoaded(Err("no listing".to_string())))
+        .unwrap();
+    app.handle_runtime_events().await.unwrap();
+    assert!(
+        matches!(&app.overlay, Overlay::Picker(p) if matches!(
+            p.kind,
+            PickerKind::Key {
+                target: KeySelectionTarget::Switch
+            }
+        )),
+        "stale models result is dropped"
+    );
+
+    // Esc after populate.
+    app.begin_key_switch(key_b_full).await.unwrap();
+    app.populate_model_picker(vec![choice("model-a"), choice("model-b")]);
+    app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+        .await
+        .unwrap();
+    let Overlay::Picker(picker) = &app.overlay else {
+        panic!("expected key picker after Esc from populated picker");
+    };
+    assert!(matches!(
+        picker.kind,
+        PickerKind::Key {
+            target: KeySelectionTarget::Switch
+        }
+    ));
+    assert_eq!(picker.selected, 1, "drilled-into key stays focused");
+    assert_eq!(app.key.id, key_a, "no switch happened");
 }
 
 #[tokio::test]

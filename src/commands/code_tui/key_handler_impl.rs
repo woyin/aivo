@@ -20,6 +20,7 @@ enum OverlayKeyAction {
     OpenMcpTools(usize),
     ToggleMcpTool(usize),
     ApplyMcpPaste,
+    ReturnToKeyPicker(String),
     /// `/config` row, direction −1/+1.
     StepConfigSetting(usize, i32),
     CycleConfigSetting {
@@ -787,6 +788,10 @@ impl CodeTuiApp {
                 self.apply_mcp_paste().await?;
                 Ok(Some(false))
             }
+            OverlayKeyAction::ReturnToKeyPicker(key_id) => {
+                self.open_key_picker(None, Some(key_id)).await?;
+                Ok(Some(false))
+            }
             OverlayKeyAction::StepConfigSetting(row, dir) => {
                 self.step_config_setting(row, dir).await;
                 Ok(Some(false))
@@ -1317,6 +1322,9 @@ impl CodeTuiApp {
             Overlay::Picker(picker) => {
                 if picker.loading {
                     if matches!(key.code, KeyCode::Esc) {
+                        if let Some(key_id) = picker.kind.key_picker_home() {
+                            return OverlayKeyAction::ReturnToKeyPicker(key_id.to_string());
+                        }
                         if let Some(setting) = picker.kind.config_home() {
                             self.open_config_overlay_at(setting);
                         } else {
@@ -1328,6 +1336,9 @@ impl CodeTuiApp {
 
                 match key.code {
                     KeyCode::Esc => {
+                        if let Some(key_id) = picker.kind.key_picker_home() {
+                            return OverlayKeyAction::ReturnToKeyPicker(key_id.to_string());
+                        }
                         if let Some(setting) = picker.kind.config_home() {
                             self.open_config_overlay_at(setting);
                         } else {

@@ -1619,6 +1619,13 @@ impl CodeTuiApp {
         &mut self,
         result: std::result::Result<Vec<ModelChoice>, String>,
     ) -> Result<()> {
+        // Stale once Esc dismissed the loading picker — don't stomp the new overlay.
+        if !matches!(
+            &self.overlay,
+            Overlay::Picker(p) if p.loading && matches!(p.kind, PickerKind::Model { .. })
+        ) {
+            return Ok(());
+        }
         match result {
             Ok(models) => {
                 if let Some(index) = self.populate_model_picker(models) {

@@ -386,11 +386,11 @@ is preserved."
                 self.begin_key_switch(key).await?;
                 return Ok(());
             }
-            self.open_key_picker(Some(query)).await?;
+            self.open_key_picker(Some(query), None).await?;
             return Ok(());
         }
 
-        self.open_key_picker(None).await
+        self.open_key_picker(None, None).await
     }
 
     /// Always via the model picker (saved model focused) so an old choice is
@@ -406,7 +406,12 @@ is preserved."
         Ok(())
     }
 
-    pub(super) async fn open_key_picker(&mut self, query: Option<String>) -> Result<()> {
+    /// `focus` overrides the active-key default (Esc-back refocuses the drilled key).
+    pub(super) async fn open_key_picker(
+        &mut self,
+        query: Option<String>,
+        focus: Option<String>,
+    ) -> Result<()> {
         let keys = self.session_store.get_keys().await?;
         if keys.is_empty() {
             self.notice = Some((ERROR(), "No saved keys".to_string()));
@@ -421,11 +426,12 @@ is preserved."
                 target: KeySelectionTarget::Switch,
             },
         );
+        let focus_id = focus.as_deref().unwrap_or(&self.key.id);
         picker.selected = picker
             .filtered_items()
             .iter()
             .position(
-                |(_, item)| matches!(&item.value, PickerValue::Key(key) if key.id == self.key.id),
+                |(_, item)| matches!(&item.value, PickerValue::Key(key) if key.id == focus_id),
             )
             .unwrap_or(0);
         self.overlay = Overlay::Picker(Box::new(picker));

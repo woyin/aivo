@@ -160,7 +160,14 @@ impl CodeTuiApp {
         let scrollbar = window.and_then(|(start, count)| {
             render_list_scrollbar(frame, chunks[2], start, count, filtered_len)
         });
-        render_footer_hints(frame, chunks[3], &[("↑↓", "move"), ("Enter", "select")]);
+        let chained =
+            picker.kind.key_picker_home().is_some() || picker.kind.config_home().is_some();
+        let footer: &[(&str, &str)] = if chained {
+            &[("↑↓", "move"), ("Enter", "select"), ("Esc", "back")]
+        } else {
+            &[("↑↓", "move"), ("Enter", "select")]
+        };
+        render_footer_hints(frame, chunks[3], footer);
         OverlayRenderOut {
             list_scroll: window.map(|(start, _)| start),
             scrollbar,

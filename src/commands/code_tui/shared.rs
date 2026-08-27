@@ -1860,6 +1860,17 @@ impl PickerKind {
             _ => None,
         }
     }
+
+    /// Drill-in from the `/key` picker — Esc re-opens it focused on this key.
+    pub(super) fn key_picker_home(&self) -> Option<&str> {
+        match self {
+            Self::Model {
+                target: ModelSelectionTarget::KeySwitch { key, .. },
+                ..
+            } => Some(&key.id),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Clone)]
