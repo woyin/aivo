@@ -37,10 +37,14 @@ impl CodeTuiApp {
             RuntimeEvent::ResumeLoaded { request_id, result } => {
                 self.apply_resume_load_result(request_id, result).await?;
             }
-            // Advisory: never over a notice that landed first (e.g. -c summary).
-            RuntimeEvent::PlanHintReady(hint) => {
-                if self.notice.is_none() {
-                    self.notice = Some((MUTED(), hint));
+            // A newer notice wins — the stale tip drops.
+            RuntimeEvent::PlanHintReady { expect, tip } => {
+                if self
+                    .notice
+                    .as_ref()
+                    .is_some_and(|(_, text)| *text == expect)
+                {
+                    self.notice = Some((MUTED(), tip));
                 }
             }
             RuntimeEvent::ImagePreviewReady { key, preview } => {

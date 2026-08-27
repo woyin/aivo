@@ -2894,83 +2894,32 @@ and keep each turn's work small"
         plan_carry_candidates(&self.session_store, scope, &self.session_id).await
     }
 
-    /// Bare `/plan` with work in flight: continue it. This session's interrupted
-    /// checklist or drafted plan first, then other sessions' plans in this cwd —
-    /// a fresh session restores the plan's own session (full context) and
-    /// auto-continues; mid-conversation only the artifact carries over. `false`
-    /// when there's nothing to continue (the caller enters plan mode fresh).
-    pub(super) async fn bare_plan_continues(&mut self) -> bool {
-        if let Some(steps) = self.unfinished_plan_steps() {
-            self.resume_plan_from_session(PlanCarry::Interrupted(steps))
-                .await;
-            return true;
-        }
-        if self.pending_plan.is_some() {
-            if self.enter_plan_mode().await {
-                self.notice = Some((
-                    MUTED(),
-                    "Plan mode — a plan is drafted: approve on the card or /plan go".to_string(),
-                ));
-            }
-            return true;
-        }
-        let mut candidates = self.scan_plan_candidates().await;
-        match candidates.len() {
-            0 => false,
-            1 => {
-                let (session_id, _title, carry) = candidates.remove(0);
-                if self.history.is_empty()
-                    && let Ok(snapshots) =
-                        load_resume_snapshots(&self.session_store, Some(&self.real_cwd)).await
-                    && let Some(snapshot) =
-                        snapshots.into_iter().find(|s| s.session_id == session_id)
-                {
-                    self.begin_resume_load(snapshot);
-                    if let Some(loading) = self.loading_resume.as_mut() {
-                        loading.continue_plan = true;
-                    }
-                    return true;
-                }
-                self.resume_plan_from_session(carry).await;
-                true
-            }
-            _ => {
-                self.open_plan_resume_picker_with(candidates, String::new())
-                    .await;
-                true
-            }
-        }
-    }
-
-    /// Startup hint, computed off the launch path: the scan reads every
-    /// same-cwd session file, so it runs in the background and posts a
-    /// [`RuntimeEvent::PlanHintReady`] when (and if) it finds something.
-    pub(super) fn spawn_plan_hint_scan(&self) {
+    /// Bare `/plan`'s old-plan tip, backgrounded because the scan reads every
+    /// same-cwd session file. Replaces the entry notice `expect` only while it
+    /// still shows.
+    pub(super) fn spawn_plan_tip_scan(&self, expect: &str) {
         let store = self.session_store.clone();
         let cwd = self.real_cwd.clone();
         let session_id = self.session_id.clone();
         let tx = self.tx.clone();
+        let expect = expect.to_string();
         tokio::spawn(async move {
             let scope = (!cwd.is_empty()).then_some(cwd.as_str());
             let candidates = plan_carry_candidates(&store, scope, &session_id).await;
-            let Some((_, title, carry)) = candidates.first() else {
+            if candidates.is_empty() {
                 return;
-            };
-            let hint = match carry {
-                PlanCarry::Continue(steps) | PlanCarry::Interrupted(steps) => format!(
-                    "Unfinished plan: {title} — {} · /plan continues it",
-                    plan_steps_progress(steps)
-                ),
-                PlanCarry::Draft(_) => {
-                    format!("Unfinished plan: {title} — awaiting approval · /plan continues it")
-                }
-            };
-            let more = candidates.len() - 1;
-            let _ = tx.send(RuntimeEvent::PlanHintReady(if more > 0 {
-                format!("{hint} (+{more} more)")
+            }
+            let count = if candidates.len() == 1 {
+                "an unfinished plan".to_string()
             } else {
-                hint
-            }));
+                format!("{} unfinished plans", candidates.len())
+            };
+            let _ = tx.send(RuntimeEvent::PlanHintReady {
+                expect,
+                tip: format!(
+                    "Plan mode — describe what to plan · {count} in this directory: /plan list"
+                ),
+            });
         });
     }
 
@@ -2990,6 +2939,9 @@ and keep each turn's work small"
         // Suffixes of sessions that made a row (plus this one) — their managed
         // save files would be duplicates, so exclude them below.
         let mut rowed_suffixes = vec![plan_file_suffix(&self.session_id)];
+        // Rows drop session ids — keep the sole candidate's for the restore below.
+        let sole_candidate_id = (candidates.len() == 1 && self.unfinished_plan_steps().is_none())
+            .then(|| candidates[0].0.clone());
         // THIS session first: an interrupted checklist continues right here;
         // without a row `/plan resume` would deny a plan sitting in the transcript.
         if let Some(steps) = self.unfinished_plan_steps() {
@@ -3039,6 +2991,18 @@ and keep each turn's work small"
         // Session rows only — a lone saved FILE may come from another project
         // (the plans dir is global), so show the picker rather than surprise.
         if items.len() == 1 && session_rows == 1 && query.is_empty() {
+            if self.history.is_empty()
+                && let Some(session_id) = sole_candidate_id
+                && let Ok(snapshots) =
+                    load_resume_snapshots(&self.session_store, Some(&self.real_cwd)).await
+                && let Some(snapshot) = snapshots.into_iter().find(|s| s.session_id == session_id)
+            {
+                self.begin_resume_load(snapshot);
+                if let Some(loading) = self.loading_resume.as_mut() {
+                    loading.continue_plan = true;
+                }
+                return;
+            }
             let PickerValue::PlanResume(carry) = items.remove(0).value else {
                 unreachable!("plan picker rows are PlanResume");
             };
@@ -3106,6 +3070,10 @@ and keep each turn's work small"
                 "A turn is running — /plan resume again when it finishes".to_string(),
             ));
             return;
+        }
+        // The continuation must not run against the read-only plan tools.
+        if self.plan_mode && !matches!(carry, PlanCarry::Draft(_)) {
+            self.leave_plan_mode(true).await;
         }
         match carry {
             PlanCarry::Continue(steps) => {
@@ -3344,10 +3312,6 @@ and keep each turn's work small"
                     self.queue_command(SlashCommand::Plan(None), "/plan");
                     return;
                 }
-                // Something unfinished nearby: continue it instead of a blank slate.
-                if self.agent_capable() && self.bare_plan_continues().await {
-                    return;
-                }
                 let goal_stopped = self.goal_mode.is_some();
                 if !self.enter_plan_mode().await {
                     self.notice = Some((
@@ -3357,15 +3321,28 @@ and keep each turn's work small"
                     ));
                     return;
                 }
-                self.notice = Some((
-                    MUTED(),
-                    if goal_stopped {
+                // Local artifacts win the notice; old plans are only ever a tip.
+                if self.unfinished_plan_steps().is_some() {
+                    self.notice = Some((
+                        MUTED(),
+                        "Plan mode — this session has an interrupted plan: /plan resume continues it"
+                            .to_string(),
+                    ));
+                } else if self.pending_plan.is_some() {
+                    self.notice = Some((
+                        MUTED(),
+                        "Plan mode — a plan is drafted: approve on the card or /plan go"
+                            .to_string(),
+                    ));
+                } else {
+                    let text = if goal_stopped {
                         "Goal mode stopped — plan mode on, describe what to plan"
                     } else {
                         "Plan mode — describe what to plan (read-only until you approve)"
-                    }
-                    .to_string(),
-                ));
+                    };
+                    self.notice = Some((MUTED(), text.to_string()));
+                    self.spawn_plan_tip_scan(text);
+                }
             }
             _ => {
                 if self.sending {
@@ -3728,12 +3705,12 @@ and keep each turn's work small"
         self.notice = if handoff_steps.is_some() {
             Some((
                 MUTED(),
-                "Unfinished plan kept — /plan continues it".to_string(),
+                "Unfinished plan kept — /plan resume continues it".to_string(),
             ))
         } else if draft_hint {
             Some((
                 MUTED(),
-                "The previous session left an unfinished plan (unapproved draft) — /plan continues it here"
+                "The previous session left an unfinished plan (unapproved draft) — /plan resume continues it here"
                     .to_string(),
             ))
         } else {

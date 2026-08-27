@@ -804,6 +804,71 @@ async fn test_plan_bare_enters_silently() {
     assert_eq!(app.cursor, 4);
 }
 
+/// Bare `/plan` over this session's interrupted checklist enters the mode and
+/// points at `/plan resume` — it never auto-continues execution.
+#[tokio::test]
+async fn test_plan_bare_with_interrupted_checklist_points_at_resume() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    pin_to_plain_chat(&mut app);
+    app.history.push(ChatMessage {
+        model: None,
+        role: "plan".to_string(),
+        content: r#"[{"step":"a","status":"completed"},{"step":"b","status":"in_progress"}]"#
+            .to_string(),
+        reasoning_content: None,
+        attachments: vec![],
+    });
+
+    app.run_plan_command(None).await;
+
+    assert!(app.plan_mode, "bare /plan enters the mode");
+    assert!(!app.sending, "the checklist does not auto-continue");
+    assert!(
+        notice_text(&app).contains("/plan resume continues it"),
+        "the notice points at the explicit path"
+    );
+}
+
+/// The plan tip is advisory: it upgrades the entry notice in place, but once
+/// anything newer shows it drops instead of clobbering.
+#[tokio::test]
+async fn test_plan_tip_never_clobbers_newer_notice() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let tx2 = tx.clone();
+    let mut app = make_test_app(tx, rx);
+    app.notice = Some((MUTED(), "something newer".to_string()));
+
+    tx2.send(RuntimeEvent::PlanHintReady {
+        expect: "Plan mode — describe what to plan (read-only until you approve)".to_string(),
+        tip: "Plan mode — describe what to plan · an unfinished plan in this directory: /plan list"
+            .to_string(),
+    })
+    .unwrap();
+    app.handle_runtime_events().await.unwrap();
+    assert_eq!(
+        notice_text(&app),
+        "something newer",
+        "a stale tip never replaces a newer notice"
+    );
+
+    app.notice = Some((
+        MUTED(),
+        "Plan mode — describe what to plan (read-only until you approve)".to_string(),
+    ));
+    tx2.send(RuntimeEvent::PlanHintReady {
+        expect: "Plan mode — describe what to plan (read-only until you approve)".to_string(),
+        tip: "Plan mode — describe what to plan · an unfinished plan in this directory: /plan list"
+            .to_string(),
+    })
+    .unwrap();
+    app.handle_runtime_events().await.unwrap();
+    assert!(
+        notice_text(&app).contains("/plan list"),
+        "the live entry notice upgrades to the tip"
+    );
+}
+
 #[tokio::test]
 async fn test_shift_tab_cycles_modes_through_handle_key() {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
@@ -1082,6 +1147,8 @@ async fn test_plan_resume_single_candidate_carries_directly() {
         )
         .await
         .unwrap();
+    // Mid-conversation — an empty session would restore the plan's own session.
+    seed_two_exchanges(&mut app);
     pin_to_plain_chat(&mut app);
 
     app.run_plan_command(Some("resume".to_string())).await;
@@ -1175,7 +1242,7 @@ async fn test_new_chat_hands_off_leftover_plan() {
     app.start_new_chat().await;
 
     assert!(app.history.is_empty(), "the new session starts fresh");
-    assert!(notice_text(&app).contains("/plan continues it"));
+    assert!(notice_text(&app).contains("/plan resume continues it"));
 
     // No plan left → no hint.
     app.start_new_chat().await;
@@ -1208,7 +1275,7 @@ async fn test_new_chat_draft_hints_instead_of_auto() {
 }
 
 /// `/new` after a mid-execution plan keeps it on disk and hints — no card,
-/// nothing dispatched; bare `/plan` picks it up.
+/// nothing dispatched; `/plan resume` picks it up.
 #[tokio::test]
 async fn test_new_keeps_plan_and_hints() {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
@@ -1228,8 +1295,8 @@ async fn test_new_keeps_plan_and_hints() {
     assert!(!app.sending, "nothing dispatched");
     let notice = notice_text(&app);
     assert!(
-        notice.contains("/plan continues it"),
-        "hint points at bare /plan: {notice:?}"
+        notice.contains("/plan resume continues it"),
+        "hint points at /plan resume: {notice:?}"
     );
 }
 
@@ -1268,16 +1335,47 @@ async fn seed_prior_plan_session(app: &mut super::super::CodeTuiApp) {
     app.plan_state_written.set(false);
 }
 
-/// Bare `/plan` in a FRESH session with one unfinished plan nearby restores
+/// Bare `/plan` never surfaces old plans: with an unfinished plan nearby it
+/// still just enters plan mode, and the background tip upgrades the entry
+/// notice to point at `/plan list`.
+#[tokio::test]
+async fn test_bare_plan_with_old_plans_enters_mode_and_tips() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    seed_prior_plan_session(&mut app).await;
+    pin_to_plain_chat(&mut app);
+
+    app.run_plan_command(None).await;
+
+    assert!(app.plan_mode, "bare /plan only enters the mode");
+    assert!(app.loading_resume.is_none(), "no session restore");
+    assert!(!app.sending, "nothing dispatched");
+    assert!(notice_text(&app).contains("describe what to plan"));
+    // Pump until the spawned tip lands.
+    for _ in 0..100 {
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        app.handle_runtime_events().await.unwrap();
+        if notice_text(&app).contains("/plan list") {
+            break;
+        }
+    }
+    let notice = notice_text(&app);
+    assert!(
+        notice.contains("an unfinished plan in this directory: /plan list"),
+        "tip counts old plans and points at /plan list: {notice:?}"
+    );
+}
+
+/// `/plan resume` in a FRESH session with one unfinished plan nearby restores
 /// that session (full context beats carrying the bare checklist) and arms the
 /// auto-continue for when the load lands.
 #[tokio::test]
-async fn test_bare_plan_fresh_session_restores_plan_session() {
+async fn test_plan_resume_fresh_session_restores_plan_session() {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let mut app = make_test_app(tx, rx);
     seed_prior_plan_session(&mut app).await;
 
-    app.run_plan_command(None).await;
+    app.run_plan_command(Some("resume".to_string())).await;
 
     assert!(
         app.loading_resume.is_some(),
@@ -1292,14 +1390,14 @@ async fn test_bare_plan_fresh_session_restores_plan_session() {
 /// The same single candidate mid-conversation only carries the checklist —
 /// restoring a session would clobber the current conversation.
 #[tokio::test]
-async fn test_bare_plan_mid_conversation_carries_checklist() {
+async fn test_plan_resume_mid_conversation_carries_checklist() {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let mut app = make_test_app(tx, rx);
     seed_prior_plan_session(&mut app).await;
     seed_two_exchanges(&mut app);
     pin_to_plain_chat(&mut app);
 
-    app.run_plan_command(None).await;
+    app.run_plan_command(Some("resume".to_string())).await;
 
     assert!(app.loading_resume.is_none(), "no session swap mid-chat");
     assert!(app.sending, "the carry went out");
@@ -1473,19 +1571,21 @@ async fn test_new_esc_then_plan_resume_recovers_unpersisted_plan() {
 
     app.execute_slash_command(SlashCommand::New).await.unwrap();
     assert!(
-        notice_text(&app).contains("/plan continues it"),
+        notice_text(&app).contains("/plan resume continues it"),
         "the hint replaced the old prompt card"
     );
 
     pin_to_plain_chat(&mut app);
     app.run_plan_command(Some("resume".to_string())).await;
 
-    // Single candidate + empty filter → carried directly into this session.
-    assert!(app.sending, "the kept-aside plan carried back in");
-    let content = &app.pending_submit.as_ref().unwrap().content;
+    // Restorable only because /new persisted the abandoned session.
     assert!(
-        content.contains("<carried-over-checklist>") && content.contains("\"step\":\"b\""),
-        "machine text embeds the recovered checklist: {content:?}"
+        app.loading_resume.is_some(),
+        "the kept-aside session restores"
+    );
+    assert!(
+        app.loading_resume.as_ref().unwrap().continue_plan,
+        "the continue turn fires once the load lands"
     );
 }
 

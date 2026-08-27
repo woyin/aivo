@@ -689,8 +689,8 @@ pub(super) fn command_usage_hint(name: &str) -> Option<&'static str> {
         "agents" => Some("[rm <name>]"),
         "create-skill" => Some("[what the skill should do]"),
         "goal" => Some("<objective> | stop"),
-        // go/resume/save/stop stay as hidden aliases; bare /plan continues by itself.
-        "plan" => Some("[objective] | exit"),
+        // go/resume/save/stop stay as hidden aliases.
+        "plan" => Some("[objective] | list | exit"),
         "share" => Some("[stop]"),
         "compact" => Some("[fast]"),
         "model" => Some("[name]"),
@@ -2731,9 +2731,12 @@ pub(super) enum RuntimeEvent {
         request_id: u64,
         result: std::result::Result<LoadedSession, String>,
     },
-    /// The background startup scan found an unfinished plan in this cwd —
-    /// advisory only, so it never overwrites a notice that landed first.
-    PlanHintReady(String),
+    /// Bare-`/plan` scan result: `tip` replaces the notice only while it
+    /// still reads `expect` (the entry notice).
+    PlanHintReady {
+        expect: String,
+        tip: String,
+    },
     /// A `/resume` preview finished loading. Content-addressed by
     /// `(session_id, updated_at)`: always cached, never "stale".
     SessionPreviewLoaded {
