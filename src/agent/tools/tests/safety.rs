@@ -106,6 +106,9 @@ fn addable_root_for_paths_requires_one_common_root() {
     assert_eq!(addable_root_for_paths(&[], &cwd), None);
 }
 
+// The command lexer assumes POSIX paths (`/` prefix, shlex escaping); it's only
+// reached after a sandbox block, which Windows never produces.
+#[cfg(unix)]
 #[test]
 fn command_paths_lexed_from_cd_redirects_and_flags() {
     let cwd = tmp();
