@@ -1517,10 +1517,9 @@ mod tests {
             assert!(plugin_serve(&key(base)).is_servable(), "{base}");
         }
         // Single-CLI OAuth credentials are native-agent-only — blocked.
-        for base in [CLAUDE_OAUTH_SENTINEL] {
-            assert_eq!(plugin_serve(&key(base)), PluginServe::Blocked, "{base}");
-            assert!(!plugin_serve(&key(base)).is_servable(), "{base}");
-        }
+        let claude = key(CLAUDE_OAUTH_SENTINEL);
+        assert_eq!(plugin_serve(&claude), PluginServe::Blocked);
+        assert!(!plugin_serve(&claude).is_servable());
     }
 
     #[test]
