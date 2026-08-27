@@ -1,5 +1,25 @@
 # Changelog
 
+## v0.48.0
+
+Thinking effort collapses into one unified scale on `ctrl+t`, list modals get a draggable scrollbar, and the sandbox offers a narrow writable root before asking for the broad escalation. The agent memory feature is removed — durable project facts belong in AGENTS.md.
+
+- feat(code): one unified thinking scale — off + levels on ctrl+t and /config (c25fa75b)
+- feat(code): draggable scrollbar and stable windowing for list modals (7d27f69f)
+- feat(code): offer adding a writable root before the broad sandbox escalation (dfd46395)
+- improve(code): remove the agent memory feature (38eb9743)
+- improve(code): bare /plan only enters plan mode — old plans move behind /plan list (241e033a)
+- improve(code): dark theme inherits terminal ink and drops the warm cast (d762c432)
+- improve(keys): drop the legacy gemini-oauth sentinel and its compat paths (cc70363f)
+- improve(cli): drop the dead PlanDecision::Discard path and the -x alias (1de83b48)
+- fix(chat): heal 400s rejecting the requested reasoning effort (80efd043)
+- fix(code): give detail overlays the modal scrollbar, slimmer and rounded (216b1165)
+- fix(code): Esc in the /key model picker returns to the key list (327482f3)
+- fix(opencode): advertise reasoning variants so ctrl+t effort cycling works (e8183651)
+- fix(opencode): keep the catalog spelling for the requested launch model (4d395b4d)
+- fix(test): gate POSIX command-lexer test off Windows (e0944a02)
+- chore(data): re-sync model limits from models.dev (a29d09a5)
+
 ## v0.47.0
 
 The code TUI gains a live side preview pane and richer footer telemetry, `/plan` is rebuilt around one artifact and one command, and a Windows audit closes several approval-gate bypasses. Terminal image and clipboard handling get a round of correctness fixes on top of ratatui 0.30.2.
