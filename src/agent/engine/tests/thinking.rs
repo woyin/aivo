@@ -177,7 +177,7 @@ fn effort_floor_overrides_off_grade_requests() {
     );
     engine.set_reasoning_effort("none".into());
     assert_eq!(engine.thinking_request(), (Some("none"), false));
-    assert_eq!(engine.raise_effort_floor().as_deref(), Some("low"));
+    assert_eq!(engine.raise_effort_floor("").as_deref(), Some("low"));
     assert_eq!(engine.thinking_request(), (Some("low"), false));
 
     // The thinking-off path (which resolves to "none" here) floors too.
@@ -192,18 +192,31 @@ fn effort_floor_overrides_off_grade_requests() {
     // A catalog with nothing above off can't heal — no guessed level.
     let mut only_off = AgentEngine::new("/tmp", "m", "", &[], &[], 0, 0);
     only_off.set_reasoning_efforts(vec!["none".into()]);
-    assert_eq!(only_off.raise_effort_floor(), None);
+    assert_eq!(only_off.raise_effort_floor(""), None);
+
+    // The rejection's own allowed list outranks the catalog.
+    let mut stale = AgentEngine::new("/tmp", "laguna-nova", "", &[], &[], 0, 0);
+    stale.set_reasoning_efforts(["none", "low", "medium"].map(String::from).to_vec());
+    stale.set_reasoning_effort("none".into());
+    assert_eq!(
+        stale
+            .raise_effort_floor(
+                r#"{"error":{"message":"Invalid option: expected one of \"medium\"|\"high\"","param":"reasoning_effort"}}"#
+            )
+            .as_deref(),
+        Some("medium")
+    );
+    assert_eq!(stale.thinking_request(), (Some("medium"), false));
 }
 
-/// First request → the gpt-5.4+ tools/none 400; retry → a normal completion.
+/// First request → the given effort 400; retry → a normal completion.
 /// Every request body lands in `captured`.
-fn spawn_effort_400_then_ok(captured: Arc<Mutex<Vec<String>>>) -> u16 {
+fn spawn_effort_400_then_ok(captured: Arc<Mutex<Vec<String>>>, body: &'static str) -> u16 {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
     std::thread::spawn(move || {
         if let Ok((mut sock, _)) = listener.accept() {
             captured.lock().unwrap().push(drain_request(&mut sock));
-            let body = r#"{"error":{"code":"tools_require_reasoning_effort","message":"GPT-5.4+ Chat Completions does not support tools with reasoning_effort: \"none\". Switch to a higher effort or use the Responses API.","type":"invalid_request_error"}}"#;
             let resp = format!(
                 "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                 body.len()
@@ -229,7 +242,10 @@ fn spawn_effort_400_then_ok(captured: Arc<Mutex<Vec<String>>>) -> u16 {
 async fn tools_effort_400_floors_and_retries() {
     let dir = tmp();
     let captured = Arc::new(Mutex::new(Vec::new()));
-    let port = spawn_effort_400_then_ok(captured.clone());
+    let port = spawn_effort_400_then_ok(
+        captured.clone(),
+        r#"{"error":{"code":"tools_require_reasoning_effort","message":"GPT-5.4+ Chat Completions does not support tools with reasoning_effort: \"none\". Switch to a higher effort or use the Responses API.","type":"invalid_request_error"}}"#,
+    );
     let client = reqwest::Client::builder().no_proxy().build().unwrap();
     let base = format!("http://127.0.0.1:{port}");
     let mut engine = AgentEngine::new(
@@ -278,4 +294,59 @@ async fn tools_effort_400_floors_and_retries() {
     );
     // Later turns reuse the engine — the floor keeps them from re-400ing.
     assert_eq!(engine.thinking_request(), (Some("low"), false));
+}
+
+/// The catalog advertises "none" but the route's schema doesn't (gpt-5.6 via
+/// gateway): the 400 floors to the error's own allowed list and retries.
+#[tokio::test]
+async fn invalid_effort_option_400_floors_and_retries() {
+    let dir = tmp();
+    let captured = Arc::new(Mutex::new(Vec::new()));
+    let port = spawn_effort_400_then_ok(
+        captured.clone(),
+        r#"{"error":{"message":"Invalid option: expected one of \"low\"|\"medium\"|\"high\"|\"xhigh\"|\"max\"","type":"invalid_request_error","param":"reasoning_effort"}}"#,
+    );
+    let client = reqwest::Client::builder().no_proxy().build().unwrap();
+    let base = format!("http://127.0.0.1:{port}");
+    let mut engine = AgentEngine::new(
+        &dir.display().to_string(),
+        "laguna-nova",
+        "",
+        &[],
+        &[],
+        0,
+        0,
+    );
+    engine.set_reasoning_efforts(["none", "low", "medium", "high"].map(String::from).to_vec());
+    engine.set_reasoning_effort("none".into());
+
+    let mut ui = CapturingUi::default();
+    run_session(
+        &mut engine,
+        &turn_ctx(&client, &base, &dir),
+        Some("hi".into()),
+        &mut ui,
+    )
+    .await;
+
+    let reqs = captured.lock().unwrap();
+    assert_eq!(reqs.len(), 2, "one rejection, one healed retry");
+    assert!(reqs[0].contains("\"reasoning_effort\":\"none\""));
+    assert!(
+        reqs[1].contains("\"reasoning_effort\":\"low\""),
+        "retry uses the error's lowest allowed level"
+    );
+    assert_eq!(ui.text, "done");
+    assert!(
+        ui.errors.is_empty(),
+        "healed, not terminal: {:?}",
+        ui.errors
+    );
+    assert!(
+        ui.notices
+            .last()
+            .is_some_and(|n| n.contains("rejected the requested level")),
+        "notices: {:?}",
+        ui.notices
+    );
 }

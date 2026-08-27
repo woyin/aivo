@@ -460,12 +460,14 @@ plan-approval card — suggest it when a task deserves real design discussion.{i
             .find(|l| !crate::services::model_metadata::effort_level_is_off(l))
     }
 
-    /// Raise the session's effort floor to the lowest advertised thinking level
-    /// and return it — the reaction to an upstream `tools_require_reasoning_effort`
-    /// 400. `None` when the catalog has nothing above off (heal impossible;
-    /// guessing a level 400s other providers).
-    pub(crate) fn raise_effort_floor(&mut self) -> Option<String> {
-        let level = self.lowest_real_effort()?.to_string();
+    /// Raise the session's effort floor and return it — the reaction to an
+    /// upstream effort 400. The rejection's own allowed list wins over the
+    /// lowest advertised level (the catalog was wrong). `None` = heal impossible.
+    pub(crate) fn raise_effort_floor(&mut self, err: &str) -> Option<String> {
+        let level = crate::services::model_metadata::effort_rejection_fallback(err)
+            .filter(|l| !crate::services::model_metadata::effort_level_is_off(l))
+            .map(str::to_string)
+            .or_else(|| Some(self.lowest_real_effort()?.to_string()))?;
         self.effort_floor = Some(level.clone());
         Some(level)
     }

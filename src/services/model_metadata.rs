@@ -372,6 +372,46 @@ pub fn gpt_rejects_none_with_tools(model: &str) -> bool {
     gpt_version_at_least(model, 5, 4)
 }
 
+/// Allowed-list markers in an invalid-`reasoning_effort` 400 — stale catalogs
+/// advertise levels some routes refuse, so the error's list is authoritative.
+const EFFORT_LIST_MARKERS: &[&str] = &[
+    "expected one of",
+    "supported values",
+    "must be one of",
+    "invalid enum value",
+];
+
+/// An upstream 400 rejecting the `reasoning_effort` value itself (distinct from
+/// `tools_require_reasoning_effort`).
+pub fn is_invalid_effort_value_error(err: &str) -> bool {
+    let e = err.to_ascii_lowercase();
+    (e.contains("reasoning_effort") || e.contains("reasoning.effort"))
+        && EFFORT_LIST_MARKERS.iter().any(|m| e.contains(m))
+}
+
+/// Lowest effort level the rejection's allowed list admits, or `None` when no
+/// recognizable list follows (heal impossible). Only text after the marker
+/// counts, so a "received 'none'" echo can't be re-sent.
+pub fn effort_rejection_fallback(err: &str) -> Option<&'static str> {
+    let e = err.to_ascii_lowercase();
+    if !is_invalid_effort_value_error(&e) {
+        return None;
+    }
+    let start = EFFORT_LIST_MARKERS
+        .iter()
+        .filter_map(|m| e.find(m).map(|i| i + m.len()))
+        .min()?;
+    // Token match, not substring: "high" ≠ "xhigh", "max" ≠ "maximum".
+    let listed = |s: &str| {
+        e[start..]
+            .split(|c: char| !c.is_ascii_alphanumeric())
+            .any(|w| w == s)
+    };
+    ["none", "minimal", "low", "medium", "high", "xhigh", "max"]
+        .into_iter()
+        .find(|&level| listed(level))
+}
+
 /// The wire form of "thinking off" for `model` with catalog `efforts`:
 /// `(Some(level), false)` when an effort value expresses it — the lowest "off"
 /// the catalog advertises (gpt-5 diverged: 5.0 `minimal`, 5.1+ `none`, codex
@@ -837,6 +877,36 @@ mod tests {
             "gpt-4o",
         ] {
             assert!(!gpt_rejects_none_with_tools(id), "{id} must keep none");
+        }
+    }
+
+    #[test]
+    fn invalid_effort_value_error_detects_and_parses_allowed_list() {
+        // The gpt-5.6-through-gateway shape (Zod wording): detect + lowest allowed.
+        let zod = r#"{"error":{"message":"Invalid option: expected one of \"low\"|\"medium\"|\"high\"|\"xhigh\"|\"max\"","type":"invalid_request_error","param":"reasoning_effort"}}"#;
+        assert!(is_invalid_effort_value_error(zod));
+        assert_eq!(effort_rejection_fallback(zod), Some("low"));
+
+        // OpenAI-style wording; the echoed rejected value sits BEFORE the
+        // marker and must not be re-sent.
+        let openai = r#"Invalid value: 'none' for reasoning_effort. Supported values are: 'minimal', 'low', 'medium', and 'high'."#;
+        assert!(is_invalid_effort_value_error(openai));
+        assert_eq!(effort_rejection_fallback(openai), Some("minimal"));
+
+        // Responses-API param spelling.
+        let responses = r#"{"error":{"message":"Invalid option: expected one of \"medium\"|\"high\"","param":"reasoning.effort"}}"#;
+        assert_eq!(effort_rejection_fallback(responses), Some("medium"));
+
+        // Not this error class: tools+off (own heal), overflow, list without
+        // the param name, param without a list.
+        for other in [
+            r#"GPT-5.4+ Chat Completions does not support tools with reasoning_effort: "none"."#,
+            "upstream 400: maximum context length exceeded",
+            r#"Invalid option: expected one of "auto"|"required" for tool_choice"#,
+            "upstream 400: unsupported reasoning_effort value",
+        ] {
+            assert!(!is_invalid_effort_value_error(other), "{other}");
+            assert_eq!(effort_rejection_fallback(other), None, "{other}");
         }
     }
 

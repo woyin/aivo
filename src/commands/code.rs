@@ -1856,6 +1856,48 @@ where
     Err(last_err.unwrap_or_else(|| anyhow::anyhow!("Request failed")))
 }
 
+/// The request's injected `reasoning_effort` slot (chat or Responses shape).
+fn effort_field_mut(request: &mut serde_json::Value) -> Option<&mut serde_json::Value> {
+    if request.get("reasoning_effort").is_some() {
+        return request.get_mut("reasoning_effort");
+    }
+    request
+        .get_mut("reasoning")
+        .and_then(|r| r.get_mut("effort"))
+}
+
+/// [`send_with_retry`] plus a one-shot heal for a 400 rejecting the injected
+/// `reasoning_effort`: stale catalogs advertise levels some routes refuse, so
+/// retry once with the error's own lowest allowed level.
+async fn send_with_effort_heal<F>(
+    request: &mut serde_json::Value,
+    mut build_request: F,
+) -> Result<reqwest::Response>
+where
+    F: FnMut(&serde_json::Value) -> reqwest::RequestBuilder,
+{
+    let mut healed = false;
+    loop {
+        let response = send_with_retry(|| build_request(request)).await?;
+        if healed
+            || response.status() != reqwest::StatusCode::BAD_REQUEST
+            || effort_field_mut(request).is_none()
+        {
+            return Ok(response);
+        }
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        match crate::services::model_metadata::effort_rejection_fallback(&body) {
+            Some(level) => {
+                *effort_field_mut(request).expect("checked above") = serde_json::json!(level);
+                healed = true;
+            }
+            // Body consumed — surface the same error the caller would have.
+            None => anyhow::bail!("API returned {} — {}", status, body),
+        }
+    }
+}
+
 /// Sends a chat completion request and prints the response.
 /// Tries streaming first; falls back to non-streaming if the server returns a 5xx error.
 /// Returns the full assistant message content.
@@ -1880,12 +1922,12 @@ where
     }
 
     // Try streaming first; fall back to non-streaming on server errors
-    let request = build_openai_chat_request(model, messages, true, None)?;
+    let mut request = build_openai_chat_request(model, messages, true, None)?;
 
-    let mut response = send_with_retry(|| {
+    let mut response = send_with_effort_heal(&mut request, |req| {
         with_auth(client.post(&url), key)
             .header("Content-Type", CONTENT_TYPE_JSON)
-            .json(&request)
+            .json(req)
     })
     .await?;
 
@@ -2013,12 +2055,12 @@ async fn send_non_streaming<F>(
 where
     F: FnMut(ChatResponseChunk) -> Result<()>,
 {
-    let request = build_openai_chat_request(model, messages, false, None)?;
+    let mut request = build_openai_chat_request(model, messages, false, None)?;
 
-    let response = send_with_retry(|| {
+    let response = send_with_effort_heal(&mut request, |req| {
         with_auth(client.post(url), key)
             .header("Content-Type", CONTENT_TYPE_JSON)
-            .json(&request)
+            .json(req)
     })
     .await?;
 
@@ -2128,10 +2170,10 @@ where
         .await;
     }
 
-    let request = build_openai_chat_request(model, messages, true, None)?;
+    let mut request = build_openai_chat_request(model, messages, true, None)?;
     let initiator = copilot_initiator_from_openai(&request);
 
-    let mut response = send_with_retry(|| {
+    let mut response = send_with_effort_heal(&mut request, |req| {
         client
             .post(&url)
             .header("Authorization", format!("Bearer {}", copilot_token))
@@ -2140,7 +2182,7 @@ where
             .header("Copilot-Integration-Id", COPILOT_INTEGRATION_ID)
             .header("Openai-Intent", COPILOT_OPENAI_INTENT)
             .header(COPILOT_INITIATOR_HEADER, initiator)
-            .json(&request)
+            .json(req)
     })
     .await?;
 
@@ -2282,10 +2324,10 @@ async fn send_copilot_non_streaming<F>(
 where
     F: FnMut(ChatResponseChunk) -> Result<()>,
 {
-    let request = build_openai_chat_request(model, messages, false, None)?;
+    let mut request = build_openai_chat_request(model, messages, false, None)?;
     let initiator = copilot_initiator_from_openai(&request);
 
-    let response = send_with_retry(|| {
+    let response = send_with_effort_heal(&mut request, |req| {
         client
             .post(url)
             .header("Authorization", format!("Bearer {}", copilot_token))
@@ -2294,7 +2336,7 @@ where
             .header("Copilot-Integration-Id", COPILOT_INTEGRATION_ID)
             .header("Openai-Intent", COPILOT_OPENAI_INTENT)
             .header(COPILOT_INITIATOR_HEADER, initiator)
-            .json(&request)
+            .json(req)
     })
     .await?;
 
@@ -2339,9 +2381,9 @@ where
         .await;
     }
 
-    let request = build_responses_request(model, messages, true)?;
+    let mut request = build_responses_request(model, messages, true)?;
 
-    let mut response = send_with_retry(|| {
+    let mut response = send_with_effort_heal(&mut request, |req| {
         client
             .post(&url)
             .header("Authorization", format!("Bearer {}", copilot_token))
@@ -2349,7 +2391,7 @@ where
             .header("Editor-Version", COPILOT_EDITOR_VERSION)
             .header("Copilot-Integration-Id", COPILOT_INTEGRATION_ID)
             .header("Openai-Intent", COPILOT_OPENAI_INTENT)
-            .json(&request)
+            .json(req)
     })
     .await?;
 
@@ -2451,9 +2493,9 @@ async fn send_copilot_responses_non_streaming<F>(
 where
     F: FnMut(ChatResponseChunk) -> Result<()>,
 {
-    let request = build_responses_request(model, messages, false)?;
+    let mut request = build_responses_request(model, messages, false)?;
 
-    let response = send_with_retry(|| {
+    let response = send_with_effort_heal(&mut request, |req| {
         client
             .post(url)
             .header("Authorization", format!("Bearer {}", copilot_token))
@@ -2461,7 +2503,7 @@ where
             .header("Editor-Version", COPILOT_EDITOR_VERSION)
             .header("Copilot-Integration-Id", COPILOT_INTEGRATION_ID)
             .header("Openai-Intent", COPILOT_OPENAI_INTENT)
-            .json(&request)
+            .json(req)
     })
     .await?;
 
@@ -2536,12 +2578,12 @@ where
         .await;
     }
 
-    let request = build_responses_request(model, messages, true)?;
+    let mut request = build_responses_request(model, messages, true)?;
 
-    let mut response = send_with_retry(|| {
+    let mut response = send_with_effort_heal(&mut request, |req| {
         with_auth(client.post(&url), key)
             .header("Content-Type", CONTENT_TYPE_JSON)
-            .json(&request)
+            .json(req)
     })
     .await?;
 
@@ -2631,12 +2673,12 @@ async fn send_responses_non_streaming<F>(
 where
     F: FnMut(ChatResponseChunk) -> Result<()>,
 {
-    let request = build_responses_request(model, messages, false)?;
+    let mut request = build_responses_request(model, messages, false)?;
 
-    let response = send_with_retry(|| {
+    let response = send_with_effort_heal(&mut request, |req| {
         with_auth(client.post(url), key)
             .header("Content-Type", CONTENT_TYPE_JSON)
-            .json(&request)
+            .json(req)
     })
     .await?;
 

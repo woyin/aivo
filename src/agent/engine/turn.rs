@@ -208,23 +208,29 @@ impl AgentEngine {
                             estimate_tokens(&request.messages) + estimate_tokens(&request.tools);
                         ui.notify("context over the model's limit — compacting and retrying…");
                     }
-                    // Upstream refuses tools with an off-grade effort (gpt-5.4+
-                    // chat completions): floor at the lowest advertised level
-                    // and retry — reactive, so future models with the same rule
-                    // heal without a version table.
+                    // Upstream refuses the effort (tools with an off-grade level, or a
+                    // value outside the route's allowed list): floor and retry.
                     Err(e)
                         if !effort_floored
                             && !streamed_any
-                            && is_tools_require_effort_error(&e.message)
-                            && let Some(level) = self.raise_effort_floor() =>
+                            && (is_tools_require_effort_error(&e.message)
+                                || crate::services::model_metadata::is_invalid_effort_value_error(
+                                    &e.message,
+                                ))
+                            && let Some(level) = self.raise_effort_floor(&e.message) =>
                     {
                         effort_floored = true;
                         self.write_thinking_extra(&mut request.extra);
                         // Best-effort: headless hosts decline; the floor still covers them.
                         let _ = ui.set_chat_effort(&level).await;
                         // After the state change, so this explanation wins the notice slot.
+                        let cause = if is_tools_require_effort_error(&e.message) {
+                            "can't turn thinking off while tools are on"
+                        } else {
+                            "rejected the requested level"
+                        };
                         ui.notify(&format!(
-                            "{} can't turn thinking off while tools are on — reasoning effort set to {level}",
+                            "{} {cause} — reasoning effort set to {level}",
                             self.model
                         ));
                     }
