@@ -240,7 +240,9 @@ impl CodeTuiApp {
                 self.notice = Some((MUTED(), text));
             }
             // Typed early-stop (guard stop / step limit) — remembered for /goal steering.
-            RuntimeEvent::AgentTurnStop(stop) => self.goal_guard_stop = Some(stop),
+            RuntimeEvent::AgentTurnStop(stop) => {
+                self.goal_guard_stop = Some(stop);
+            }
             RuntimeEvent::AgentError(text) => self.apply_agent_error(text),
             RuntimeEvent::AgentPermission {
                 tool,
@@ -1813,19 +1815,6 @@ impl CodeTuiApp {
         if !self.history.is_empty() {
             let _ = self.persist_history().await;
         }
-
-        // Searchable session topic for `memory_search` — user text only
-        // (shell commands can embed secrets).
-        if !self.real_cwd.is_empty()
-            && let Some(topic) = self.history.iter().find(|m| m.role == "user")
-        {
-            let date = chrono::Local::now().format("%Y-%m-%d").to_string();
-            crate::agent::memory::record_session_summary(
-                std::path::Path::new(&self.real_cwd),
-                &topic.content,
-                &date,
-            );
-        }
     }
 
     /// Debounced `/resume` preview loader: after the selection rests on an
@@ -1921,7 +1910,6 @@ impl CodeTuiApp {
         // Open the cursor session now (no-op for other keys) so its connect
         // overlaps the user typing their first message.
         self.prewarm_cursor_session();
-        self.spawn_startup_dream();
         // Repaint only on change; an idle chat draws nothing.
         let mut needs_redraw = true;
         let mut was_streaming = false;

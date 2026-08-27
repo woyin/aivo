@@ -658,9 +658,6 @@ pub(super) fn parse_slash_command(input: &str) -> Result<SlashCommand> {
         "mcp" => Ok(SlashCommand::Mcp(argument)),
         "goal" => Ok(SlashCommand::Goal(argument)),
         "plan" => Ok(SlashCommand::Plan(argument)),
-        "memory" => Ok(SlashCommand::Memory {
-            dream: argument.as_deref() == Some("dream"),
-        }),
         "create-skill" => Ok(SlashCommand::CreateSkill(argument)),
         "rewind" | "undo" | "unwind" => Ok(SlashCommand::Rewind),
         "config" => Ok(SlashCommand::Config),

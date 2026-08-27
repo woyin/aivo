@@ -180,9 +180,6 @@ pub(super) fn command_recall_text(command: &SlashCommand) -> String {
         SlashCommand::Mcp(arg) => with_arg("mcp", arg),
         SlashCommand::Goal(arg) => with_arg("goal", arg),
         SlashCommand::Plan(arg) => with_arg("plan", arg),
-        SlashCommand::Memory { dream } => {
-            if *dream { "/memory dream" } else { "/memory" }.to_string()
-        }
         SlashCommand::CreateSkill(arg) => with_arg("create-skill", arg),
         SlashCommand::Skill { name, argument } => with_arg(name, argument),
         SlashCommand::Rewind => "/rewind".to_string(),

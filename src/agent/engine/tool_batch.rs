@@ -399,8 +399,8 @@ Investigate, or call `exit_plan_mode` with your plan."
                 self.list_sessions_result()
             } else if n == "send_session" {
                 self.send_session(&call.arguments, &mut *ui).await
-            } else if let Some(res) = self.run_tool_intrinsic(ctx, ui, n, &call.arguments).await {
-                // Engine-state intrinsics (notes/memory/session controls/schema search).
+            } else if let Some(res) = self.run_tool_intrinsic(ui, n, &call.arguments).await {
+                // Engine-state intrinsics (notes/session controls/schema search).
                 res
             } else if n == "exit_plan_mode" {
                 if !self.read_only {
@@ -658,7 +658,7 @@ command in the foreground (drop `background`)."
     }
 
     /// Corrective hint for a repeatedly-failing tool: the exact error plus the tool's
-    /// JSON schema, so the model can fix its arguments. `None` if the tool isn't in the
+    /// JSON schema so the model can fix its arguments. `None` if the tool isn't in the
     /// current tool set (e.g. a hallucinated name) — nothing useful to echo.
     pub(super) fn tool_failure_hint(&self, tool: &str, error: &str) -> Option<String> {
         let schema = self.tools_openai.iter().find_map(|t| {

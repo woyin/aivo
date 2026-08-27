@@ -638,12 +638,6 @@ pub(super) const SLASH_COMMANDS: &[SlashCommandSpec] = &[
         takes_argument: false,
     },
     SlashCommandSpec {
-        name: "memory",
-        help_label: "/memory [dream]",
-        description: "show facts the agent has remembered",
-        takes_argument: true,
-    },
-    SlashCommandSpec {
         name: "share",
         help_label: "/share [stop]",
         description: "share a live viewer link",
@@ -2092,7 +2086,8 @@ pub(super) enum ComposerMenuEntry {
 impl ComposerMenuEntry {
     pub(super) fn label(&self) -> String {
         match self {
-            Self::Command(command) => command.command_label(),
+            // Help label, not the bare name, so arg-taking commands show their argument.
+            Self::Command(command) => command.help_label.to_string(),
             Self::Skill(skill) => skill.command_label(),
             Self::Path(path) => path.label.clone(),
             Self::Agent(agent) => format!("@{}", agent.name),
@@ -2610,10 +2605,6 @@ pub(super) enum SlashCommand {
     /// implementation plan; `go` executes it in a fresh context; bare shows
     /// status, `stop` discards the pending plan.
     Plan(Option<String>),
-    /// Show this project's persistent memory (`remember` facts); `dream` consolidates it now.
-    Memory {
-        dream: bool,
-    },
     /// Built-in `create-skill` command: starts the guided create/improve-a-skill
     /// workflow. The optional argument is the initial intent (what the skill
     /// should do); bare just opens the workflow.

@@ -87,8 +87,15 @@ fn test_matching_command_entries_includes_skills_after_builtins() {
     let model_entries = app.matching_command_entries("model");
     let model_labels: Vec<String> = model_entries.iter().map(ComposerMenuEntry::label).collect();
     assert_eq!(
-        model_labels.iter().filter(|l| *l == "/model").count(),
+        model_labels
+            .iter()
+            .filter(|l| *l == "/model [name]")
+            .count(),
         1,
+        "the built-in appears exactly once, advertising its argument"
+    );
+    assert!(
+        !model_labels.iter().any(|l| l == "/model"),
         "a skill must not duplicate or shadow a built-in command"
     );
 }

@@ -37,6 +37,7 @@ Settled constraints — don't re-add or work around. Greppable ones are enforced
 - No hardcoded provider/model data — derive from `/v1/models` or the models.dev sync.
 - Never `terminal.clear()` in the code TUI; no progress bars or emoji in TUI output.
 - `/review`, `/vision`, and `/detach` commands are removed; no OSC 11 theme auto-detection (default dark).
+- The agent memory feature (`remember`/`memory_search` tools, `/memory`, dream consolidation) is removed — durable project facts belong in AGENTS.md. If memory ever returns, design it from scratch against real usage.
 - Never modify a launched coding agent's own config files — aivo injects env vars and override dirs instead.
 - Help stays hand-rolled (`print_help*`), never clap-generated.
 - One agent engine serves the code TUI and oneshot — no second execution path for the same feature.

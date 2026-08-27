@@ -1,4 +1,4 @@
-//! Engine-state intrinsics: tools that read or mutate the ENGINE (notes, memory,
+//! Engine-state intrinsics: tools that read or mutate the ENGINE (notes,
 //! session controls, deferred-schema search), not the workspace. Pulled out of
 //! `execute_tool_batch` so its dispatch chain stays routing-only.
 
@@ -10,7 +10,6 @@ impl AgentEngine {
     /// they borrow engine state or await the user.
     pub(super) async fn run_tool_intrinsic(
         &mut self,
-        ctx: &TurnCtx<'_>,
         ui: &mut dyn AgentUi,
         name: &str,
         args: &Value,
@@ -23,49 +22,6 @@ impl AgentEngine {
                     notes::MergeOutcome::Updated(id) => format!("Updated note '{id}'."),
                     notes::MergeOutcome::Refreshed => "Already noted (refreshed).".to_string(),
                 }),
-                Err(e) => Err(e),
-            },
-            // Notify so a saved memory never lands silently (poison audit).
-            "remember" => match crate::agent::memory::parse_remember(args) {
-                Ok((fact, scope, replaces)) => {
-                    let path = crate::agent::memory::path_for_scope(ctx.cwd, scope);
-                    let label = scope.label();
-                    match crate::agent::memory::remember(
-                        &path,
-                        &fact,
-                        &self.date,
-                        replaces.as_deref(),
-                    ) {
-                        Ok(crate::agent::memory::RememberOutcome::Added(count)) => {
-                            // Global facts ride into every project — call that out.
-                            if scope == crate::agent::memory::MemoryScope::Global {
-                                ui.notify(&format!(
-                                    "remembered (GLOBAL — injected into ALL projects): {fact}"
-                                ));
-                            } else {
-                                ui.notify(&format!("remembered ({label}): {fact}"));
-                            }
-                            Ok(format!(
-                                "Remembered ({count} saved, {label} scope) — this is injected \
-into every future session. The user can audit or edit it via /memory."
-                            ))
-                        }
-                        Ok(crate::agent::memory::RememberOutcome::Refreshed) => {
-                            Ok("Already remembered (recency refreshed).".to_string())
-                        }
-                        Ok(crate::agent::memory::RememberOutcome::Replaced(count)) => {
-                            ui.notify(&format!("memory corrected ({label}): {fact}"));
-                            Ok(format!(
-                                "Replaced the outdated entry ({count} saved, {label} scope)."
-                            ))
-                        }
-                        Err(e) => Err(e),
-                    }
-                }
-                Err(e) => Err(e),
-            },
-            "memory_search" => match crate::agent::memory::parse_query(args) {
-                Ok(query) => Ok(crate::agent::memory::search_result_text(ctx.cwd, &query)),
                 Err(e) => Err(e),
             },
             "switch_model" => match args.get("model").and_then(|v| v.as_str()) {

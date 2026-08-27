@@ -19,7 +19,6 @@ pub mod json_schema;
 pub mod lsp;
 pub mod mcp;
 pub mod mcp_import;
-pub mod memory;
 pub mod notes;
 pub mod permission;
 pub mod plan;

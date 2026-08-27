@@ -95,6 +95,18 @@ fn removed_features_stay_removed() {
             "mod packs",
             "extension packs dropped in 4274b419; skills/agents/hooks/MCP install separately",
         ),
+        (
+            "agent::memory",
+            "agent memory removed 2026-08 (unused in practice); rebuild from scratch or not at all",
+        ),
+        (
+            "\"/memory\"",
+            "agent memory removed 2026-08; durable project facts belong in AGENTS.md",
+        ),
+        (
+            "\"memory_search\"",
+            "agent memory removed 2026-08; no remember/memory_search tools",
+        ),
     ];
     let mut violations = Vec::new();
     for f in rust_sources(&repo().join("src")) {

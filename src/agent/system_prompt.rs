@@ -32,17 +32,7 @@ const GUIDE_WALK_CAP: usize = 32;
 /// own (bare names; others absolute). Symlinked duplicates collapse to one entry.
 pub fn discover_project_guides(cwd: &Path) -> Vec<String> {
     let global = crate::services::paths::config_dir();
-    let mut guides = discover_project_guides_at(cwd, Some(&global));
-    // Memory rides in as guides: global first, project second (later wins).
-    let global_memory = crate::agent::memory::global_memory_path();
-    if global_memory.is_file() {
-        guides.push(global_memory.display().to_string());
-    }
-    let memory = crate::agent::memory::project_memory_path(cwd);
-    if memory.is_file() {
-        guides.push(memory.display().to_string());
-    }
-    guides
+    discover_project_guides_at(cwd, Some(&global))
 }
 
 /// [`discover_project_guides`] with the global config dir injectable for tests.
@@ -105,12 +95,10 @@ fn guide_ancestors(cwd: &Path) -> Vec<PathBuf> {
 /// `(label, contents)` pairs ready to inline verbatim.
 type InlinedGuides = Vec<(String, String)>;
 
-/// Split guides into (label, contents) to inline, memory files (own block, own
-/// framing), and labels to point to lazily — missing, unreadable, empty, or
-/// over-cap files keep the pointer treatment.
-fn partition_guides(cwd: &str, guides: &[String]) -> (InlinedGuides, InlinedGuides, Vec<String>) {
+/// Split guides into (label, contents) to inline and labels to point to lazily —
+/// missing, unreadable, empty, or over-cap files keep the pointer treatment.
+fn partition_guides(cwd: &str, guides: &[String]) -> (InlinedGuides, Vec<String>) {
     let mut inlined = Vec::new();
-    let mut memory = Vec::new();
     let mut pointers = Vec::new();
     let mut total = 0usize;
     for label in guides {
@@ -124,16 +112,6 @@ fn partition_guides(cwd: &str, guides: &[String]) -> (InlinedGuides, InlinedGuid
         };
         match std::fs::read_to_string(&path) {
             Ok(c) if c.trim().is_empty() => {}
-            // Memory rides outside the shared total — its 16 KiB cap exists so it
-            // always inlines; big guide chains must not crowd it out.
-            Ok(c) if crate::agent::memory::is_memory_path(&path) && c.len() <= GUIDE_INLINE_MAX => {
-                let name = if path == crate::agent::memory::global_memory_path() {
-                    "aivo global memory"
-                } else {
-                    "aivo project memory"
-                };
-                memory.push((name.to_string(), c.trim().to_string()));
-            }
             Ok(c) if c.len() <= GUIDE_INLINE_MAX && total + c.len() <= GUIDES_INLINE_TOTAL_MAX => {
                 total += c.len();
                 inlined.push((label.clone(), c.trim().to_string()));
@@ -141,7 +119,7 @@ fn partition_guides(cwd: &str, guides: &[String]) -> (InlinedGuides, InlinedGuid
             _ => pointers.push(label.clone()),
         }
     }
-    (inlined, memory, pointers)
+    (inlined, pointers)
 }
 
 pub(crate) fn system_prompt(cwd: &str, date: &str, guides: &[String], skills: &[Skill]) -> String {
@@ -270,7 +248,7 @@ of the workspace — reference files there by absolute path.",
             list.join(", ")
         ));
     }
-    let (inlined, memory, pointers) = partition_guides(cwd, guides);
+    let (inlined, pointers) = partition_guides(cwd, guides);
     if !inlined.is_empty() {
         p.push_str(
             "\n\nThis project's convention file(s) follow. When you act on this project — create \
@@ -282,21 +260,6 @@ the later (more specific) one wins.",
         for (label, content) in &inlined {
             p.push_str(&format!(
                 "\n\n<conventions from=\"{label}\">\n{content}\n</conventions>"
-            ));
-        }
-    }
-    if !memory.is_empty() {
-        p.push_str(
-            "\n\nYour persistent memory follows — facts you saved in past sessions, dated, \
-oldest first. They are point-in-time observations, not live state: a claim about the current \
-code, repo, or environment may have gone stale, so verify it still holds before acting on it \
-(the older the date, the more suspicion it deserves). Preferences and decisions age well; \
-\"X is missing/broken\" claims age worst. When an entry proves wrong or outdated, correct it \
-in the same turn: call `remember` with `replaces`.",
-        );
-        for (label, content) in &memory {
-            p.push_str(&format!(
-                "\n\n<memory from=\"{label}\">\n{content}\n</memory>"
             ));
         }
     }
@@ -334,47 +297,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
-    }
-
-    /// Memory must inline verbatim even when a big guide chain exhausts the shared total.
-    #[test]
-    fn memory_inlines_even_when_guides_exhaust_the_total_budget() {
-        let dir = tmp();
-        // Two guides at the per-file cap exhaust the 48 KiB shared total exactly.
-        let big = "g".repeat(24 * 1024);
-        std::fs::write(dir.join("big1.md"), &big).unwrap();
-        std::fs::write(dir.join("big2.md"), &big).unwrap();
-        let mem = crate::agent::memory::project_memory_path(&dir);
-        std::fs::create_dir_all(mem.parent().unwrap()).unwrap();
-        std::fs::write(&mem, "- remembered: the gateway drops the K\n").unwrap();
-        let guides = vec![
-            dir.join("big1.md").display().to_string(),
-            dir.join("big2.md").display().to_string(),
-            mem.display().to_string(),
-        ];
-        let p = system_prompt(&dir.display().to_string(), "", &guides, &[]);
-        assert!(
-            p.contains("remembered: the gateway drops the K"),
-            "memory degraded to a pointer instead of inlining"
-        );
-    }
-
-    /// Memory gets its own tagged block with framing, not a `<conventions>` one.
-    #[test]
-    fn memory_gets_own_block_with_staleness_framing() {
-        let dir = tmp();
-        let mem = crate::agent::memory::project_memory_path(&dir);
-        std::fs::create_dir_all(mem.parent().unwrap()).unwrap();
-        std::fs::write(&mem, "- [2026-08-01] the canary is red\n").unwrap();
-        let guides = vec![mem.display().to_string()];
-        let p = system_prompt(&dir.display().to_string(), "", &guides, &[]);
-        assert!(p.contains("<memory from=\"aivo project memory\">"));
-        assert!(p.contains("point-in-time observations"));
-        assert!(p.contains("`remember` with `replaces`"));
-        assert!(!p.contains("<conventions from=\"aivo project memory\">"));
-        // No memory file → no framing paragraph.
-        let p2 = system_prompt(&dir.display().to_string(), "", &[], &[]);
-        assert!(!p2.contains("point-in-time observations"));
     }
 
     #[test]

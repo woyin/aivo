@@ -138,7 +138,6 @@ struct CapturedRun {
     cwd: String,
     model: String,
     prompt: String,
-    date: String,
     started: std::time::Instant,
 }
 
@@ -267,7 +266,6 @@ async fn run_agent_captured(
     }
     .min(u32::MAX as u64) as u32;
 
-    let date = chrono::Local::now().format("%Y-%m-%d").to_string();
     let max_steps = cli_env_or(limits.max_steps, "AIVO_AGENT_MAX_STEPS", DEFAULT_MAX_STEPS);
     let session_id = resumed
         .as_ref()
@@ -542,7 +540,6 @@ no prose, no markdown fences, nothing else."
         cwd,
         model: effective_model,
         prompt: prompt_for_log,
-        date,
         started,
     })
 }
@@ -606,8 +603,6 @@ async fn finalize(
             cap.started.elapsed(),
         )
         .await;
-        // Searchable session topic — user text only (shell commands can embed secrets).
-        crate::agent::memory::record_session_summary(Path::new(&cap.cwd), &cap.prompt, &cap.date);
     }
     cap.ui.session_saved = Some(resumable);
     // Always close the stream so a machine consumer sees a terminal event.

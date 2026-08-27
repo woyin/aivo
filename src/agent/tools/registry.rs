@@ -61,8 +61,6 @@ pub static TOOL_TRAITS: &[ToolTraits] = &[
     tool!("finish_turn"),
     tool!("skill"),
     tool!("take_note"),
-    tool!("remember"),
-    tool!("memory_search"),
     // A sub-engine isn't read-only; image generation writes a file + bills a call.
     tool!("subagent", plan_hidden),
     tool!("generate_image", plan_hidden),

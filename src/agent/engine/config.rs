@@ -28,8 +28,6 @@ impl AgentEngine {
         specs.push(plan::plan_tool_spec());
         specs.push(crate::agent::finish::finish_tool_spec());
         specs.push(notes::note_tool_spec());
-        specs.push(crate::agent::memory::memory_tool_spec());
-        specs.push(crate::agent::memory::memory_search_tool_spec());
         specs.push(subagent_tool_spec(&[]));
         let mut tools_openai: Vec<Value> = specs.into_iter().map(tool_to_openai).collect();
         // Native-search providers get the server tool instead of the local one (mutually exclusive).

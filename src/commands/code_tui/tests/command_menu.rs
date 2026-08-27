@@ -17,14 +17,10 @@ fn test_visible_command_menu_filters_and_hides_escaped_slash() {
     app.cursor = 3;
     app.sync_command_menu_state();
     let menu = app.visible_command_menu().unwrap();
-    assert_eq!(menu.entries.len(), 2); // "mo" → model + memory
+    assert_eq!(menu.entries.len(), 1); // "mo" → model
     assert!(matches!(
         menu.entries[0],
         ComposerMenuEntry::Command(command) if command.name == "model"
-    ));
-    assert!(matches!(
-        menu.entries[1],
-        ComposerMenuEntry::Command(command) if command.name == "memory"
     ));
     assert_eq!(menu.selected, Some(0));
 
