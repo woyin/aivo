@@ -58,7 +58,6 @@ mod tests {
     use super::*;
     use crate::services::claude_oauth::CLAUDE_OAUTH_SENTINEL;
     use crate::services::codex_oauth::CODEX_OAUTH_SENTINEL;
-    use crate::services::gemini_oauth::GEMINI_OAUTH_SENTINEL;
 
     fn make_key(name: &str, base_url: &str) -> ApiKey {
         ApiKey::new_with_protocol(
@@ -74,17 +73,12 @@ mod tests {
     fn chat_disables_launch_only_oauth_but_allows_provider_oauth() {
         let claude = make_key("claude", CLAUDE_OAUTH_SENTINEL);
         let codex = make_key("codex", CODEX_OAUTH_SENTINEL);
-        let gemini = make_key("gemini", GEMINI_OAUTH_SENTINEL);
         let regular = make_key("openrouter", "https://openrouter.ai/api/v1");
 
         let ctx = KeyCompatContext::Chat;
         assert_eq!(ctx.incompat_reason(&claude), Some("needs `aivo claude`"));
         // Codex is a provider credential — `aivo code` accepts it like grok.
         assert!(ctx.incompat_reason(&codex).is_none());
-        assert_eq!(
-            ctx.incompat_reason(&gemini),
-            Some("Gemini sign-in removed — re-add with an API key")
-        );
         assert!(ctx.incompat_reason(&regular).is_none());
     }
 
@@ -115,13 +109,11 @@ mod tests {
     fn opencode_and_pi_disable_launch_only_oauth() {
         let claude = make_key("claude", CLAUDE_OAUTH_SENTINEL);
         let codex = make_key("codex", CODEX_OAUTH_SENTINEL);
-        let gemini = make_key("gemini", GEMINI_OAUTH_SENTINEL);
 
         for tool in [AIToolType::Opencode, AIToolType::Pi] {
             let ctx = KeyCompatContext::Tool(tool);
             assert!(ctx.incompat_reason(&claude).is_some());
             assert!(ctx.incompat_reason(&codex).is_none());
-            assert!(ctx.incompat_reason(&gemini).is_some());
         }
     }
 
@@ -136,7 +128,7 @@ mod tests {
         let ctx = KeyCompatContext::Plugin {
             allow_cursor: false,
         };
-        // Claude/Gemini OAuth are native-agent-only; codex (provider) is allowed.
+        // Claude OAuth is native-agent-only; codex (provider) is allowed.
         assert!(
             ctx.incompat_reason(&make_key("cl", CLAUDE_OAUTH_SENTINEL))
                 .is_some()
@@ -144,10 +136,6 @@ mod tests {
         assert!(
             ctx.incompat_reason(&make_key("cx", CODEX_OAUTH_SENTINEL))
                 .is_none()
-        );
-        assert!(
-            ctx.incompat_reason(&make_key("gm", GEMINI_OAUTH_SENTINEL))
-                .is_some()
         );
         assert_eq!(
             ctx.incompat_reason(&make_key("cur", "cursor")),

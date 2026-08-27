@@ -1107,7 +1107,6 @@ mod tests {
         use crate::services::claude_oauth::CLAUDE_OAUTH_SENTINEL;
         use crate::services::codex_oauth::CODEX_OAUTH_SENTINEL;
         use crate::services::cursor_acp::{CURSOR_ACP_SENTINEL, CURSOR_SHADOW_PREFIX};
-        use crate::services::gemini_oauth::GEMINI_OAUTH_SENTINEL;
         use crate::services::grok_oauth::GROK_OAUTH_SENTINEL;
         use crate::services::kimi_oauth::KIMI_OAUTH_SENTINEL;
 
@@ -1120,10 +1119,6 @@ mod tests {
             .unwrap();
         store
             .add_key_with_protocol("codex", CODEX_OAUTH_SENTINEL, None, "{\"token\":\"t\"}")
-            .await
-            .unwrap();
-        store
-            .add_key_with_protocol("gemini", GEMINI_OAUTH_SENTINEL, None, "{\"token\":\"t\"}")
             .await
             .unwrap();
         store
@@ -1155,7 +1150,7 @@ mod tests {
         let (exported, report) = store.export_keys(None).await.unwrap();
         assert_eq!(exported.len(), 1);
         assert_eq!(exported[0].name, "alpha");
-        assert_eq!(report.skipped_oauth, 7);
+        assert_eq!(report.skipped_oauth, 6);
 
         let (by_id, report) = store
             .export_keys(Some(&["claude".to_string()]))

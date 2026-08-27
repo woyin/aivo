@@ -46,7 +46,6 @@ pub mod embedded_assets;
 pub mod environment_injector;
 pub mod export_crypto;
 pub mod fake_model;
-pub mod gemini_oauth;
 pub mod gemini_router;
 pub mod global_stats;
 pub mod grok_home;

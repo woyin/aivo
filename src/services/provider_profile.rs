@@ -145,7 +145,6 @@ pub fn is_oauth_or_copilot_base(base_url: &str) -> bool {
     is_copilot_base(base_url)
         || base_url == crate::services::claude_oauth::CLAUDE_OAUTH_SENTINEL
         || base_url == crate::services::codex_oauth::CODEX_OAUTH_SENTINEL
-        || base_url == crate::services::gemini_oauth::GEMINI_OAUTH_SENTINEL
         || base_url == crate::services::grok_oauth::GROK_OAUTH_SENTINEL
         || base_url == crate::services::kimi_oauth::KIMI_OAUTH_SENTINEL
 }

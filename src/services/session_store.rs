@@ -270,15 +270,6 @@ impl ApiKey {
         self.base_url == crate::services::claude_oauth::CLAUDE_OAUTH_SENTINEL
     }
 
-    /// True when this entry is a legacy Gemini Google-OAuth credential bundle
-    /// for the `gemini` CLI (encrypted token JSON in `key`). The OAuth sign-in
-    /// flow has been removed; such keys are recognized only so they're redacted,
-    /// excluded from exports, and rejected at launch rather than mistaken for a
-    /// plain API key. See `services::gemini_oauth`.
-    pub fn is_gemini_oauth(&self) -> bool {
-        self.base_url == crate::services::gemini_oauth::GEMINI_OAUTH_SENTINEL
-    }
-
     /// True when this entry stores a SuperGrok OAuth credential — a *provider*
     /// bearer usable by any coding agent, not a single-CLI credential.
     pub fn is_grok_oauth(&self) -> bool {
@@ -298,12 +289,11 @@ impl ApiKey {
     }
 
     /// True when this entry is any of the multi-account OAuth variants
-    /// (Codex/Claude/Gemini/Grok/Kimi) — used by callers that share the same
+    /// (Codex/Claude/Grok/Kimi) — used by callers that share the same
     /// "OAuth entries lack a REST endpoint / hold a credential blob" semantics.
     pub fn is_any_oauth(&self) -> bool {
         self.is_codex_oauth()
             || self.is_claude_oauth()
-            || self.is_gemini_oauth()
             || self.is_grok_oauth()
             || self.is_kimi_oauth()
     }
@@ -313,8 +303,6 @@ impl ApiKey {
             "aivo claude"
         } else if self.is_codex_oauth() {
             "aivo codex"
-        } else if self.is_gemini_oauth() {
-            "aivo gemini"
         } else if self.is_grok_oauth() || self.is_kimi_oauth() {
             "aivo code"
         } else {
@@ -327,8 +315,6 @@ impl ApiKey {
     pub fn oauth_run_requirement(&self) -> Option<&'static str> {
         if self.is_claude_oauth() {
             Some("needs `aivo claude`")
-        } else if self.is_gemini_oauth() {
-            Some("Gemini sign-in removed — re-add with an API key")
         } else {
             // Grok/Codex are provider credentials usable by any agent; `aivo
             // codex` still prefers native launch via `is_codex_family`.
@@ -344,8 +330,6 @@ impl ApiKey {
             "Claude Code"
         } else if self.is_codex_oauth() {
             "Codex ChatGPT"
-        } else if self.is_gemini_oauth() {
-            "Gemini"
         } else if self.is_grok_oauth() {
             "SuperGrok"
         } else if self.is_kimi_oauth() {
@@ -374,8 +358,6 @@ impl ApiKey {
             Some("<Claude OAuth>")
         } else if self.is_codex_oauth() {
             Some("<Codex OAuth>")
-        } else if self.is_gemini_oauth() {
-            Some("<Gemini OAuth>")
         } else if self.is_grok_oauth() {
             Some("<SuperGrok OAuth>")
         } else if self.is_kimi_oauth() {

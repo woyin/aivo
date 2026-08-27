@@ -1624,9 +1624,6 @@ mod tests {
         assert!(!key_is_agent_capable(&make(
             crate::services::claude_oauth::CLAUDE_OAUTH_SENTINEL
         )));
-        assert!(!key_is_agent_capable(&make(
-            crate::services::gemini_oauth::GEMINI_OAUTH_SENTINEL
-        )));
         assert!(!key_is_agent_capable(&make("cursor")));
     }
 

@@ -23,11 +23,6 @@ pub async fn relogin_key(session_store: &SessionStore, key: &ApiKey) -> Result<A
             .map_err(|e| e.context("codex re-login"))?;
         let json = creds.to_json()?;
         persist(session_store, key, &json).await
-    } else if key.is_gemini_oauth() {
-        Err(anyhow!(
-            "Gemini OAuth sign-in has been removed — re-add '{}' with a Gemini API key (`aivo keys add`).",
-            key.display_name()
-        ))
     } else if key.is_claude_oauth() {
         let creds = crate::services::claude_oauth::spawn_setup_token_and_capture()
             .await

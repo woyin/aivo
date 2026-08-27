@@ -1407,7 +1407,6 @@ mod tests {
     use crate::services::claude_oauth::CLAUDE_OAUTH_SENTINEL;
     use crate::services::codex_oauth::CODEX_OAUTH_SENTINEL;
     use crate::services::cursor_acp::CURSOR_ACP_SENTINEL;
-    use crate::services::gemini_oauth::GEMINI_OAUTH_SENTINEL;
     use crate::services::huggingface::{HF_LOCAL_KEY_ID, HfModelRef, local_takeover_key};
     use crate::services::session_store::ApiKey;
 
@@ -1518,7 +1517,7 @@ mod tests {
             assert!(plugin_serve(&key(base)).is_servable(), "{base}");
         }
         // Single-CLI OAuth credentials are native-agent-only — blocked.
-        for base in [CLAUDE_OAUTH_SENTINEL, GEMINI_OAUTH_SENTINEL] {
+        for base in [CLAUDE_OAUTH_SENTINEL] {
             assert_eq!(plugin_serve(&key(base)), PluginServe::Blocked, "{base}");
             assert!(!plugin_serve(&key(base)).is_servable(), "{base}");
         }

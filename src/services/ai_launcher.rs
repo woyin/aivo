@@ -1079,13 +1079,6 @@ impl AILauncher {
         if is_copilot_base(&key.base_url) {
             return Ok(key);
         }
-        // Legacy Gemini OAuth entries (sign-in flow removed) have no REST
-        // endpoint, so no router protocol applies. They're rejected before
-        // launch via `oauth_incompat_reason`; this guard just avoids seeding a
-        // bogus route if such a key reaches protocol resolution another way.
-        if key.is_gemini_oauth() {
-            return Ok(key);
-        }
         // Default guess only — see resolve_claude_protocol.
         let proto = preferred_gemini_protocol(&key.base_url);
         seed_default_route(&mut key, "gemini", proto.as_str());

@@ -4788,10 +4788,9 @@ mod tests {
         use crate::services::claude_oauth::CLAUDE_OAUTH_SENTINEL;
         use crate::services::codex_oauth::CODEX_OAUTH_SENTINEL;
         use crate::services::cursor_acp::{CURSOR_ACP_SENTINEL, CURSOR_SHADOW_PREFIX};
-        use crate::services::gemini_oauth::GEMINI_OAUTH_SENTINEL;
 
         let cursor_shadow_secret = format!("{CURSOR_SHADOW_PREFIX}testaccount1");
-        let cases: [(&str, &str, &str); 5] = [
+        let cases: [(&str, &str, &str); 4] = [
             (
                 CLAUDE_OAUTH_SENTINEL,
                 "must-not-leak-this-credential-blob",
@@ -4801,11 +4800,6 @@ mod tests {
                 CODEX_OAUTH_SENTINEL,
                 "must-not-leak-this-credential-blob",
                 "<Codex OAuth>",
-            ),
-            (
-                GEMINI_OAUTH_SENTINEL,
-                "must-not-leak-this-credential-blob",
-                "<Gemini OAuth>",
             ),
             ("copilot", "must-not-leak-this-credential-blob", "<Copilot>"),
             (
