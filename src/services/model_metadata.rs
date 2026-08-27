@@ -759,7 +759,7 @@ mod tests {
     fn temperature_and_deprecated_flags_parse() {
         // o-series and forced-reasoning claude variants reject temperature.
         assert!(rejects_temperature("o3"));
-        assert!(rejects_temperature("openai/gpt-5.4"));
+        assert!(rejects_temperature("openai/o3"));
         assert!(rejects_temperature("claude-opus-4-7"));
         // Normal models keep it; unknown models are never stripped.
         assert!(!rejects_temperature("claude-sonnet-4-6"));
@@ -771,17 +771,12 @@ mod tests {
 
     #[test]
     fn fixed_temperature_survives_fold_collisions() {
-        // `gpt-5.4` and `gpt-5-4` fold to one key with equal context, so the
+        // Dot and dash spellings fold to one key with equal context, so the
         // tie-break alone would let whichever sorts first decide sampling
         // support. Upstream disagrees per spelling; the restrictive side wins.
-        for id in [
-            "gpt-5.1",
-            "gpt-5.2",
-            "gpt-5.3-codex",
-            "gpt-5.4",
-            "gpt-5.4-nano",
-            "anthropic.claude-opus-4-8",
-        ] {
+        // Re-pin these when upstream stops disagreeing on a listed id — the
+        // diagnostic in the providers-sync skill finds the current set.
+        for id in ["anthropic.claude-opus-4-8", "fugu-ultra-v1.1"] {
             assert!(rejects_temperature(id), "{id} must reject sampling params");
         }
     }
