@@ -1155,9 +1155,16 @@ impl AILauncher {
                 });
             }
         };
-        if let Some(requested_model) = requested_model {
+        if let Some(mut requested_model) = requested_model {
+            // Canonicalize to the catalog spelling — a bare `starter` would
+            // shadow `aivo/starter` in the limits map with an empty entry.
             if !models.contains(&requested_model) {
-                models.push(requested_model.clone());
+                let prefixed = format!("aivo/{requested_model}");
+                if models.contains(&prefixed) {
+                    requested_model = prefixed;
+                } else {
+                    models.push(requested_model.clone());
+                }
             }
             models.sort();
             models.dedup();
@@ -2560,6 +2567,43 @@ mod tests {
                 .env_vars
                 .contains_key("CLAUDE_CODE_MAX_OUTPUT_TOKENS")
         );
+    }
+
+    #[tokio::test]
+    async fn resolve_opencode_model_canonicalizes_to_catalog_spelling() {
+        let (store, launcher, _tmp) = test_launcher_with_store().await;
+        let key = test_insert_key(&store, crate::constants::AIVO_STARTER_SENTINEL).await;
+        launcher
+            .cache
+            .set(
+                &key.base_url,
+                vec!["aivo/starter".to_string(), "openai/gpt-5.6-sol".to_string()],
+            )
+            .await;
+
+        for requested in ["aivo/starter", "starter"] {
+            let (selected, models) = launcher
+                .resolve_opencode_model_config(&key, Some(requested))
+                .await
+                .unwrap();
+            assert_eq!(
+                selected.as_deref(),
+                Some("aivo/starter"),
+                "requested {requested:?} must resolve to the catalog spelling"
+            );
+            assert!(
+                !models.iter().any(|m| m == "starter"),
+                "bare `starter` must not be pushed as an extra catalog entry: {models:?}"
+            );
+        }
+
+        // Unknown in either spelling: stripped and pushed as before.
+        let (selected, models) = launcher
+            .resolve_opencode_model_config(&key, Some("aivo/custom-x"))
+            .await
+            .unwrap();
+        assert_eq!(selected.as_deref(), Some("custom-x"));
+        assert!(models.iter().any(|m| m == "custom-x"));
     }
 
     #[tokio::test]
