@@ -158,6 +158,14 @@ pub(crate) fn is_context_overflow_error(err: &str) -> bool {
     PHRASES.iter().any(|p| e.contains(p))
 }
 
+/// An upstream 400 refusing tools with an off-grade effort (gpt-5.4+ chat
+/// completions: `tools_require_reasoning_effort`, "does not support tools with
+/// reasoning_effort"). Healed by flooring the effort, not surfaced as terminal.
+pub(crate) fn is_tools_require_effort_error(err: &str) -> bool {
+    err.contains("tools_require_reasoning_effort")
+        || err.contains("does not support tools with reasoning_effort")
+}
+
 /// Best-effort real token count from an overflow error, for one-shot calibration.
 /// Only integers next to a token-context keyword count (so request-ids/timestamps
 /// aren't picked); commas stripped; no floor, so small-window models still calibrate.
@@ -221,6 +229,23 @@ mod tests {
         ));
         assert!(!is_retryable_error("403 forbidden: network policy blocked"));
         assert!(!is_retryable_error("bad request: malformed timeout field"));
+    }
+
+    #[test]
+    fn tools_require_effort_error_classifies_by_code_or_phrase() {
+        assert!(is_tools_require_effort_error(
+            r#"upstream 400 Bad Request: {"error":{"code":"tools_require_reasoning_effort","message":"GPT-5.4+ Chat Completions does not support tools with reasoning_effort: \"none\".","type":"invalid_request_error"}}"#
+        ));
+        // Phrase fallback for gateways that strip the code.
+        assert!(is_tools_require_effort_error(
+            "does not support tools with reasoning_effort: 'none'"
+        ));
+        assert!(!is_tools_require_effort_error(
+            "upstream 400: maximum context length exceeded"
+        ));
+        assert!(!is_tools_require_effort_error(
+            "upstream 400: unsupported reasoning_effort value"
+        ));
     }
 
     #[test]

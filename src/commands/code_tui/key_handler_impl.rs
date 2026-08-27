@@ -1577,6 +1577,11 @@ impl CodeTuiApp {
                 }
                 true
             }
+            // Ctrl+T steps the thinking ring (off + effort levels).
+            KeyCode::Char('t') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.cycle_reasoning_effort().await;
+                true
+            }
             // Ctrl+D is left for the composer's delete-forward (emacs `delete-char`);
             // PageDown / Ctrl+Down scroll the transcript down.
             KeyCode::Up if key.modifiers.contains(KeyModifiers::CONTROL) => {

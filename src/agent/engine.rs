@@ -22,8 +22,8 @@ use crate::agent::protocol::{
 };
 use crate::agent::request::{assistant_to_openai, role, tool_to_openai};
 use crate::agent::retry::{
-    error_is_retryable, is_context_overflow_error, resolve_max_steps, retry_delay,
-    retryable_error_label, terminal_error_notice,
+    error_is_retryable, is_context_overflow_error, is_tools_require_effort_error,
+    resolve_max_steps, retry_delay, retryable_error_label, terminal_error_notice,
 };
 use crate::agent::secrets_guard;
 use crate::agent::skills::{self, Skill};
@@ -598,6 +598,10 @@ pub struct AgentEngine {
     reasoning_effort: Option<String>,
     /// Catalog-advertised effort levels (set per turn); used to pick a valid "off". See `thinking_request`.
     reasoning_efforts: Vec<String>,
+    /// Raised after an upstream `tools_require_reasoning_effort` 400: some models
+    /// (gpt-5.4+ chat completions) refuse tools with an off-grade effort. Survives
+    /// turns (the engine is reused per key+model); a model switch rebuilds and clears it.
+    effort_floor: Option<String>,
     /// Whether the model is asked to think this turn. Off makes [`Self::thinking_request`]
     /// emit a disable signal. Set per turn from the `/config` toggle.
     thinking_enabled: bool,

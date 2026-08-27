@@ -136,82 +136,6 @@ fn test_insert_selected_command_omits_space_for_zero_arg_command() {
     assert!(app.visible_command_menu().is_none());
 }
 
-#[test]
-fn test_effort_menu_filters_inline_and_preselects_current_level() {
-    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-    let mut app = make_test_app(tx, rx);
-    app.model_reasoning_efforts = vec!["low".into(), "medium".into(), "high".into()];
-    app.reasoning_effort = Some("high".into());
-    app.draft = "/effort".to_string();
-    app.cursor = app.draft.len();
-    app.sync_command_menu_state();
-
-    let menu = app.visible_command_menu().expect("effort menu");
-    assert_eq!(menu.kind, MenuKind::Effort);
-    assert_eq!(menu.selected, Some(2));
-    assert_eq!(menu.entries[2].label(), "high  (current)");
-    assert!(matches!(app.overlay, Overlay::None));
-
-    app.draft = "/effort H".to_string();
-    app.cursor = app.draft.len();
-    app.sync_command_menu_state();
-    let menu = app.visible_command_menu().expect("filtered effort menu");
-    assert_eq!(menu.entries.len(), 1);
-    assert_eq!(menu.entries[0].label(), "high  (current)");
-    assert!(menu.entries[0].description().is_empty());
-}
-
-#[test]
-fn test_effort_menu_tab_inserts_explicit_command() {
-    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-    let mut app = make_test_app(tx, rx);
-    app.model_reasoning_efforts = vec!["low".into(), "medium".into(), "high".into()];
-    app.draft = "/effort h".to_string();
-    app.cursor = app.draft.len();
-    app.sync_command_menu_state();
-
-    assert!(app.insert_selected_command());
-    assert_eq!(app.draft, "/effort high");
-    assert!(app.visible_command_menu().is_none());
-}
-
-#[tokio::test]
-async fn test_selecting_effort_command_transitions_to_level_menu() {
-    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-    let mut app = make_test_app(tx, rx);
-    app.model_reasoning_efforts = vec!["low".into(), "medium".into(), "high".into()];
-    app.draft = "/eff".to_string();
-    app.cursor = app.draft.len();
-    app.sync_command_menu_state();
-
-    app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
-        .await
-        .unwrap();
-
-    assert_eq!(app.draft, "/effort ");
-    let menu = app.visible_command_menu().expect("effort level menu");
-    assert_eq!(menu.kind, MenuKind::Effort);
-    assert_eq!(menu.entries.len(), 3);
-}
-
-#[tokio::test]
-async fn test_effort_menu_esc_cancels_and_clears_scaffolding_draft() {
-    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-    let mut app = make_test_app(tx, rx);
-    app.model_reasoning_efforts = vec!["low".into(), "medium".into(), "high".into()];
-    app.draft = "/effort".to_string();
-    app.cursor = app.draft.len();
-    app.sync_command_menu_state();
-
-    app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
-        .await
-        .unwrap();
-
-    assert!(app.visible_command_menu().is_none());
-    assert_eq!(app.draft, "");
-    assert_eq!(app.cursor, 0);
-}
-
 #[tokio::test]
 async fn test_esc_keeps_partially_typed_command_draft() {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
@@ -226,20 +150,6 @@ async fn test_esc_keeps_partially_typed_command_draft() {
 
     assert!(app.visible_command_menu().is_none());
     assert_eq!(app.draft, "/mo");
-}
-
-#[tokio::test]
-async fn test_bare_effort_command_reopens_level_menu() {
-    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-    let mut app = make_test_app(tx, rx);
-    app.model_reasoning_efforts = vec!["low".into(), "medium".into(), "high".into()];
-
-    app.run_effort_command(None).await;
-
-    assert_eq!(app.draft, "/effort ");
-    let menu = app.visible_command_menu().expect("effort level menu");
-    assert_eq!(menu.kind, MenuKind::Effort);
-    assert_eq!(menu.entries.len(), 3);
 }
 
 #[tokio::test]
@@ -265,29 +175,6 @@ async fn test_selecting_attach_command_transitions_to_path_menu() {
         menu.entries
             .iter()
             .any(|entry| entry.label() == "alpha.txt")
-    );
-}
-
-#[tokio::test]
-async fn test_effort_menu_enter_applies_level_inline() {
-    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-    let mut app = make_test_app(tx, rx);
-    app.model_reasoning_efforts = vec!["low".into(), "medium".into(), "high".into()];
-    app.reasoning_effort = Some("medium".into());
-    app.draft = "/effort h".to_string();
-    app.cursor = app.draft.len();
-    app.sync_command_menu_state();
-
-    app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
-        .await
-        .unwrap();
-
-    assert_eq!(app.reasoning_effort.as_deref(), Some("high"));
-    assert!(app.draft.is_empty());
-    assert!(app.visible_command_menu().is_none());
-    assert_eq!(
-        app.draft_history.last().map(String::as_str),
-        Some("/effort high")
     );
 }
 
@@ -372,12 +259,11 @@ async fn test_escape_dismisses_command_menu_until_query_changes() {
 }
 
 #[tokio::test]
-async fn test_escape_closes_effort_menu_without_interrupting_active_turn() {
+async fn test_escape_closes_command_menu_without_interrupting_active_turn() {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let mut app = make_test_app(tx, rx);
-    app.model_reasoning_efforts = vec!["low".into(), "medium".into(), "high".into()];
     app.sending = true;
-    app.draft = "/effort".to_string();
+    app.draft = "/mod".to_string();
     app.cursor = app.draft.len();
     app.sync_command_menu_state();
     assert!(app.visible_command_menu().is_some());

@@ -74,6 +74,7 @@ impl AgentEngine {
             artifact_seq: AtomicUsize::new(1),
             reasoning_effort: default_reasoning_effort(model),
             reasoning_efforts: Vec::new(),
+            effort_floor: None,
             thinking_enabled: true,
             use_web_search_enabled: true,
             image_source: None,
@@ -451,11 +452,66 @@ plan-approval card — suggest it when a task deserves real design discussion.{i
         self.reasoning_efforts.iter().any(|e| e == level)
     }
 
+    /// Lowest advertised non-off level — what off-grade requests are floored to.
+    fn lowest_real_effort(&self) -> Option<&str> {
+        self.reasoning_efforts
+            .iter()
+            .map(String::as_str)
+            .find(|l| !crate::services::model_metadata::effort_level_is_off(l))
+    }
+
+    /// Raise the session's effort floor to the lowest advertised thinking level
+    /// and return it — the reaction to an upstream `tools_require_reasoning_effort`
+    /// 400. `None` when the catalog has nothing above off (heal impossible;
+    /// guessing a level 400s other providers).
+    pub(crate) fn raise_effort_floor(&mut self) -> Option<String> {
+        let level = self.lowest_real_effort()?.to_string();
+        self.effort_floor = Some(level.clone());
+        Some(level)
+    }
+
     /// Thinking control for this step: `(reasoning_effort, emit_thinking_disabled)`.
-    /// Enabled → resolved level. Disabled → the lowest "off" the catalog advertises
-    /// (gpt-5 diverged: 5.0 `minimal`, 5.1+ `none`, codex `low` — a guess 400s);
-    /// a depth-only scale with no off (aivo/starter, Anthropic) → `thinking:{type:"disabled"}`.
+    /// Enabled → resolved level. Disabled → `thinking_off_wire`'s translation.
+    /// Off-grade outcomes are floored (reactively via `effort_floor`,
+    /// proactively for gpt-5.4+ with tools) so the request never 400s.
     pub(super) fn thinking_request(&self) -> (Option<&str>, bool) {
+        let (effort, disable) = self.thinking_request_unfloored();
+        let offish =
+            disable || effort.is_some_and(crate::services::model_metadata::effort_level_is_off);
+        if !offish {
+            return (effort, disable);
+        }
+        if let Some(floor) = self.effort_floor.as_deref() {
+            return (Some(floor), false);
+        }
+        if self.agent_tools_enabled
+            && crate::services::model_metadata::gpt_rejects_none_with_tools(&self.model)
+        {
+            // "low" when the catalog is silent — the same family guess the
+            // o-series off path makes.
+            return (Some(self.lowest_real_effort().unwrap_or("low")), false);
+        }
+        (effort, disable)
+    }
+
+    /// Write the thinking controls onto a request's `extra` map. The serve
+    /// translates `reasoning_effort` per upstream; `thinking:{type:"disabled"}`
+    /// is the off-switch where the scale has no "off".
+    pub(super) fn write_thinking_extra(&self, extra: &mut Map<String, Value>) {
+        let (effort, disable) = self.thinking_request();
+        if let Some(effort) = effort {
+            extra.insert("reasoning_effort".into(), json!(effort));
+        } else {
+            extra.remove("reasoning_effort");
+        }
+        if disable {
+            extra.insert("thinking".into(), json!({ "type": "disabled" }));
+        } else {
+            extra.remove("thinking");
+        }
+    }
+
+    fn thinking_request_unfloored(&self) -> (Option<&str>, bool) {
         if self.thinking_enabled {
             // A level carried across a model switch may not exist here (→ 400);
             // omit rather than guess.
@@ -471,30 +527,7 @@ plan-approval card — suggest it when a task deserves real design discussion.{i
         if !capable {
             return (None, false);
         }
-        let lower = self.model.to_ascii_lowercase();
-        let name = lower.rsplit('/').next().unwrap_or(&lower);
-        let rejects_minimal = crate::services::model_metadata::gpt_rejects_effort_minimal(name);
-        if self.effort_is_valid("none") {
-            (Some("none"), false)
-        } else if self.effort_is_valid("minimal") && !rejects_minimal {
-            (Some("minimal"), false)
-        } else if name.starts_with("o1")
-            || name.starts_with("o3")
-            || name.starts_with("o4")
-            || name.contains("codex")
-        {
-            (Some("low"), false)
-        } else if name.starts_with("gpt-5") {
-            if self.effort_is_valid("low") {
-                (Some("low"), false)
-            } else if rejects_minimal {
-                (Some("none"), false)
-            } else {
-                (Some("minimal"), false)
-            }
-        } else {
-            (None, true)
-        }
+        crate::services::model_metadata::thinking_off_wire(&self.model, &self.reasoning_efforts)
     }
 
     /// Enable `/rewind` tree-checkpointing (top-level chat only, to avoid the git cost). Idempotent.

@@ -123,15 +123,7 @@ impl AgentEngine {
             if self.agent_tools_enabled {
                 extra.insert("tool_choice".into(), json!("auto"));
             }
-            // Thinking control (see `thinking_request`); the serve translates
-            // `reasoning_effort` per upstream. `thinking:{type:"disabled"}` = the off-switch where the scale has no "off".
-            let (effort, disable_thinking) = self.thinking_request();
-            if let Some(effort) = effort {
-                extra.insert("reasoning_effort".into(), json!(effort));
-            }
-            if disable_thinking {
-                extra.insert("thinking".into(), json!({ "type": "disabled" }));
-            }
+            self.write_thinking_extra(&mut extra);
             let tools = if self.agent_tools_enabled {
                 self.tools_openai.clone()
             } else {
@@ -154,6 +146,7 @@ impl AgentEngine {
             // Auto-retry transient failures with backoff.
             let mut retries = 0usize;
             let mut forced_compactions = 0usize;
+            let mut effort_floored = false;
             let mut terminal_error = false;
             let mut message = loop {
                 let mut streamed_any = false;
@@ -214,6 +207,26 @@ impl AgentEngine {
                         sent_estimate =
                             estimate_tokens(&request.messages) + estimate_tokens(&request.tools);
                         ui.notify("context over the model's limit — compacting and retrying…");
+                    }
+                    // Upstream refuses tools with an off-grade effort (gpt-5.4+
+                    // chat completions): floor at the lowest advertised level
+                    // and retry — reactive, so future models with the same rule
+                    // heal without a version table.
+                    Err(e)
+                        if !effort_floored
+                            && !streamed_any
+                            && is_tools_require_effort_error(&e.message)
+                            && let Some(level) = self.raise_effort_floor() =>
+                    {
+                        effort_floored = true;
+                        self.write_thinking_extra(&mut request.extra);
+                        // Best-effort: headless hosts decline; the floor still covers them.
+                        let _ = ui.set_chat_effort(&level).await;
+                        // After the state change, so this explanation wins the notice slot.
+                        ui.notify(&format!(
+                            "{} can't turn thinking off while tools are on — reasoning effort set to {level}",
+                            self.model
+                        ));
                     }
                     Err(e) => {
                         ui.notify_error(&terminal_error_notice(&e));

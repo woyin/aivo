@@ -183,7 +183,6 @@ pub(super) fn command_recall_text(command: &SlashCommand) -> String {
         SlashCommand::Memory { dream } => {
             if *dream { "/memory dream" } else { "/memory" }.to_string()
         }
-        SlashCommand::Effort(arg) => with_arg("effort", arg),
         SlashCommand::CreateSkill(arg) => with_arg("create-skill", arg),
         SlashCommand::Skill { name, argument } => with_arg(name, argument),
         SlashCommand::Rewind => "/rewind".to_string(),

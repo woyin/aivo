@@ -2573,6 +2573,14 @@ impl CodeTuiApp {
                     self.open_share_overlay();
                     return Ok(false);
                 }
+                // Clicking the footer effort badge opens /config on the Thinking row.
+                if !self.overlay.blocks_input()
+                    && let Some(hit) = self.effort_badge_hit
+                    && rect_contains(hit, (mouse.column, mouse.row))
+                {
+                    self.open_config_overlay_at(ConfigSetting::Thinking);
+                    return Ok(false);
+                }
                 // A press in the composer also drops the caret there; a drag still selects.
                 if self.should_show_input_cursor()
                     && !self.overlay.blocks_input()

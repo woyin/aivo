@@ -22,61 +22,45 @@ async fn test_session_pricing_falls_back_to_billed_model() {
     assert!(app.session_pricing().is_some(), "billed model resolves");
 }
 
+/// The `/config` Thinking row is one scale — off, then the catalog levels.
+/// Picking a level turns thinking on; picking off remembers the level.
 #[tokio::test]
-async fn effort_command_sets_level_enables_thinking_and_validates() {
+async fn thinking_config_row_is_one_scale_with_off() {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let mut app = make_test_app(tx, rx);
+    app.model = "m".to_string();
     app.model_reasoning_efforts = vec!["low".into(), "medium".into(), "high".into()];
-    app.thinking_enabled = false;
-    app.reasoning_effort = None;
+    app.thinking_enabled = true;
+    app.reasoning_effort = Some("medium".into());
 
-    // `/effort high` also turns thinking on — picking an effort implies you want the model to reason.
-    app.run_effort_command(Some("HIGH".into())).await;
+    let segs = app.config_segments(ConfigSetting::Thinking);
+    assert_eq!(segs.options, &["off", "low", "medium", "high"]);
+    assert_eq!(segs.active, 2, "medium = level index 1, after off");
+
+    app.open_config_overlay_at(ConfigSetting::Thinking);
+    let Overlay::Config(state) = &app.overlay else {
+        panic!("expected config overlay");
+    };
+    let row = state
+        .items
+        .iter()
+        .position(|i| i.setting == ConfigSetting::Thinking)
+        .expect("Thinking row present");
+
+    app.step_config_setting(row, 1).await;
     assert_eq!(app.reasoning_effort.as_deref(), Some("high"));
-    assert!(app.thinking_enabled, "setting effort must turn thinking on");
+    assert!(app.thinking_enabled);
 
-    // An unknown level errors and leaves the choice unchanged.
-    app.run_effort_command(Some("bogus".into())).await;
+    // All the way left is off — the level stays remembered for re-enable.
+    app.step_config_setting(row, -3).await;
+    assert!(!app.thinking_enabled);
     assert_eq!(app.reasoning_effort.as_deref(), Some("high"));
-    assert!(app.notice.as_ref().is_some_and(|(c, _)| *c == ERROR()));
+    assert_eq!(app.config_segments(ConfigSetting::Thinking).active, 0);
 
-    app.run_effort_command(None).await;
-    assert!(matches!(app.overlay, Overlay::None));
-    assert_eq!(app.draft, "/effort ");
-    let menu = app.visible_command_menu().expect("effort menu");
-    assert_eq!(menu.kind, MenuKind::Effort);
-    assert_eq!(menu.entries.len(), 3);
-}
-
-#[tokio::test]
-async fn effort_command_bare_does_not_clobber_unrelated_draft() {
-    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-    let mut app = make_test_app(tx, rx);
-    app.model_reasoning_efforts = vec!["low".into(), "medium".into(), "high".into()];
-    app.draft = "still typing".to_string();
-    app.cursor = app.draft.len();
-
-    app.run_effort_command(None).await;
-
-    assert_eq!(app.draft, "still typing");
-    assert!(
-        app.notice
-            .as_ref()
-            .is_some_and(|(_, text)| text.contains("choose an effort inline"))
-    );
-}
-
-#[tokio::test]
-async fn effort_command_noop_when_model_has_no_levels() {
-    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-    let mut app = make_test_app(tx, rx);
-    app.model_reasoning_efforts.clear();
-    app.run_effort_command(None).await;
-    assert!(
-        matches!(app.overlay, Overlay::None),
-        "no dropdown or overlay without levels"
-    );
-    assert!(app.notice.as_ref().is_some_and(|(c, _)| *c == MUTED()));
+    // Picking a level from off turns thinking back on.
+    app.step_config_setting(row, 2).await;
+    assert!(app.thinking_enabled);
+    assert_eq!(app.reasoning_effort.as_deref(), Some("medium"));
 }
 
 #[test]
@@ -89,10 +73,10 @@ fn test_footer_effort_label_reports_thinking_off_on_capable_models() {
     assert_eq!(app.footer_effort_label(), None);
 
     app.model_supports_thinking = true;
-    assert_eq!(app.footer_effort_label().as_deref(), Some("thinking off"));
+    assert_eq!(app.footer_effort_label().as_deref(), Some("off"));
 
     app.thinking_enabled = true;
-    assert_ne!(app.footer_effort_label().as_deref(), Some("thinking off"));
+    assert_ne!(app.footer_effort_label().as_deref(), Some("off"));
 
     // A cursor-derived label wins over the local toggles.
     app.cursor_effort_label = Some("max".to_string());
@@ -143,6 +127,173 @@ async fn test_apply_reasoning_effort_rejects_foreign_level() {
 
     app.apply_reasoning_effort("high".to_string()).await;
     assert_eq!(app.reasoning_effort.as_deref(), Some("high"));
+}
+
+/// A binary catalog ([none, high], poolside laguna-style) must default to the
+/// thinking side: the provider ships thinking ON by default, so the off level
+/// can't win the middle-pick fallback.
+#[tokio::test]
+async fn effective_effort_default_skips_native_off() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.model = "laguna-s-2.1".to_string();
+    app.model_reasoning_efforts = vec!["none".into(), "high".into()];
+    app.thinking_enabled = true;
+    app.reasoning_effort = None;
+
+    assert_eq!(app.effective_reasoning_effort().as_deref(), Some("high"));
+    assert_eq!(
+        app.config_segments(ConfigSetting::Thinking).active,
+        1,
+        "the row highlights high, not none"
+    );
+
+    // A wider catalog missing the default level skips off-equivalents too:
+    // the middle of [low, high, max] is high, not the list's byte-middle.
+    app.model_reasoning_efforts = vec!["minimal".into(), "low".into(), "high".into(), "max".into()];
+    assert_eq!(app.effective_reasoning_effort().as_deref(), Some("high"));
+}
+
+/// gpt-5.4+ with agent tools on has NO off state — the provider refuses
+/// tools + none, so the scale is levels-only and stale off choices clamp to
+/// the lowest level that actually ships.
+#[tokio::test]
+async fn thinking_scale_drops_off_when_tools_forbid_it() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.model = "gpt-5.6-sol".to_string();
+    app.model_reasoning_efforts = ["none", "low", "medium", "high"].map(String::from).to_vec();
+    app.agent_tools_enabled = true;
+    app.thinking_enabled = true;
+
+    let segs = app.config_segments(ConfigSetting::Thinking);
+    assert_eq!(segs.options, &["low", "medium", "high"], "no off, no none");
+    assert_eq!(segs.active, 1, "default medium");
+
+    // An off request collapses into the toggle; with tools it can't ship, so
+    // the footer shows the substitute the engine sends, not "thinking off".
+    app.apply_reasoning_effort("none".to_string()).await;
+    assert!(!app.thinking_enabled);
+    assert!(
+        app.reasoning_effort.is_none(),
+        "off is never a stored level"
+    );
+    app.model_supports_thinking = true;
+    assert_eq!(app.footer_effort_label().as_deref(), Some("low"));
+    app.thinking_enabled = true;
+
+    // Ctrl+T rings the levels alone: high wraps to low, thinking stays on.
+    app.reasoning_effort = Some("high".into());
+    app.cycle_reasoning_effort().await;
+    assert_eq!(app.reasoning_effort.as_deref(), Some("low"));
+    assert!(app.thinking_enabled);
+
+    // Plain chat (tools off) brings the off pill back — as aivo's word.
+    app.agent_tools_enabled = false;
+    assert_eq!(
+        app.config_segments(ConfigSetting::Thinking).options,
+        &["off", "low", "medium", "high"]
+    );
+}
+
+/// A catalog spelling its off as `none`/`minimal` surfaces the unified `off`
+/// pill — the provider's off word never appears as a level; the engine's
+/// translation (`thinking_off_wire`) sends the right spelling.
+#[tokio::test]
+async fn thinking_scale_unifies_native_off_spellings() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.model = "m".to_string();
+    app.model_reasoning_efforts = vec!["none".into(), "low".into(), "high".into()];
+    app.thinking_enabled = true;
+    app.reasoning_effort = Some("low".into());
+
+    let segs = app.config_segments(ConfigSetting::Thinking);
+    assert_eq!(segs.options, &["off", "low", "high"], "one off vocabulary");
+    assert_eq!(segs.active, 1);
+
+    // Thinking off highlights the off pill.
+    app.thinking_enabled = false;
+    assert_eq!(app.config_segments(ConfigSetting::Thinking).active, 0);
+    app.thinking_enabled = true;
+
+    // The ring passes through off: high wraps to off, off resumes at low.
+    app.reasoning_effort = Some("high".into());
+    app.cycle_reasoning_effort().await;
+    assert!(!app.thinking_enabled, "top of the scale wraps to off");
+    app.cycle_reasoning_effort().await;
+    assert!(app.thinking_enabled);
+    assert_eq!(app.reasoning_effort.as_deref(), Some("low"));
+
+    // Segment picks skip the off pill when mapping to levels.
+    app.open_config_overlay_at(ConfigSetting::Thinking);
+    let Overlay::Config(state) = &app.overlay else {
+        panic!("expected config overlay");
+    };
+    let row = state
+        .items
+        .iter()
+        .position(|i| i.setting == ConfigSetting::Thinking)
+        .expect("Thinking row present");
+    app.step_config_setting(row, 1).await;
+    assert_eq!(app.reasoning_effort.as_deref(), Some("high"));
+
+    // o-series style: off would just alias `low` on the wire — no off pill,
+    // and the footer reports the `low` that actually ships when the global
+    // toggle is off.
+    app.model = "o3".to_string();
+    app.model_reasoning_efforts = vec!["low".into(), "medium".into(), "high".into()];
+    app.reasoning_effort = None;
+    assert_eq!(
+        app.config_segments(ConfigSetting::Thinking).options,
+        &["low", "medium", "high"],
+        "off→low alias would duplicate the low pill"
+    );
+    app.model_supports_thinking = true;
+    app.thinking_enabled = false;
+    assert_eq!(app.footer_effort_label().as_deref(), Some("low"));
+    app.thinking_enabled = true;
+}
+
+/// Ctrl+T steps one ring — off → low → … → high → off. A thinking-capable
+/// model without levels just toggles; a model with no thinking gets a notice.
+#[tokio::test]
+async fn test_cycle_reasoning_effort_rings_through_off() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.model = "m".to_string();
+    app.model_reasoning_efforts = vec!["low".to_string(), "medium".to_string(), "high".to_string()];
+    app.thinking_enabled = true;
+
+    // No explicit choice yet: the effective default is "medium", so the ring
+    // continues at "high", not the list head.
+    app.cycle_reasoning_effort().await;
+    assert_eq!(app.reasoning_effort.as_deref(), Some("high"));
+    assert!(app.thinking_enabled);
+
+    // Top of the scale wraps to off; the level stays remembered.
+    app.cycle_reasoning_effort().await;
+    assert!(!app.thinking_enabled);
+    assert_eq!(app.reasoning_effort.as_deref(), Some("high"));
+
+    // Off resumes at the lowest level.
+    app.cycle_reasoning_effort().await;
+    assert!(app.thinking_enabled);
+    assert_eq!(app.reasoning_effort.as_deref(), Some("low"));
+
+    // Thinking-capable but no catalog levels: a plain toggle.
+    app.model_reasoning_efforts.clear();
+    app.model_supports_thinking = true;
+    app.cycle_reasoning_effort().await;
+    assert!(!app.thinking_enabled);
+    app.cycle_reasoning_effort().await;
+    assert!(app.thinking_enabled);
+
+    // No thinking at all: notice only, nothing flips.
+    app.model_supports_thinking = false;
+    app.cycle_reasoning_effort().await;
+    assert!(app.thinking_enabled, "unchanged without thinking support");
+    assert!(app.notice.as_ref().unwrap().1.contains("no thinking"));
 }
 
 /// Opening the model picker mid-turn must NOT cancel the in-flight turn (it

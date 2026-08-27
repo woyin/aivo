@@ -3527,6 +3527,7 @@ impl CodeTuiApp {
         // target; re-armed below when shown.
         self.session_id_hit = None;
         self.share_badge_hit = None;
+        self.effort_badge_hit = None;
         let width = usize::from(area.width);
         let glue_w = 3usize; // " · "
 
@@ -3544,9 +3545,17 @@ impl CodeTuiApp {
             tail.push(Span::styled(" · ", Style::default().fg(FAINT())));
             tail.push(Span::styled(mcp_label, Style::default().fg(mcp_color)));
         }
+        // Taken at the push site so a span reorder can't drift the click target.
+        let mut effort_rel_in_tail = None;
         if let Some(effort) = self.footer_effort_label() {
             // A static setting: FAINT, a step under the meter it introduces.
             tail.push(Span::styled(" · ", Style::default().fg(FAINT())));
+            // Cursor's tier is part of the model id — /config can't change it,
+            // so that badge stays inert.
+            if self.cursor_effort_label.is_none() {
+                let rel: usize = tail.iter().map(|s| display_width(s.content.as_ref())).sum();
+                effort_rel_in_tail = Some((rel, display_width(&effort)));
+            }
             tail.push(Span::styled(effort, Style::default().fg(FAINT())));
         }
         if area.width >= 70 {
@@ -3669,12 +3678,22 @@ impl CodeTuiApp {
                 height: area.height.max(1),
             });
         }
+        if let Some((rel, effort_w)) = effort_rel_in_tail {
+            let tail_origin = width.saturating_sub(tail_w.saturating_sub(rel));
+            self.effort_badge_hit = Some(Rect {
+                x: area.x + tail_origin as u16,
+                y: area.y,
+                width: effort_w as u16,
+                height: area.height.max(1),
+            });
+        }
         frame.render_widget(Paragraph::new(Line::from(spans)), area);
     }
 
     /// Effort tier for the status line: Cursor's from the model id, else the
-    /// engine's level while thinking is on, else "thinking off" (nothing on
-    /// models that can't think at all).
+    /// engine's level while thinking is on, else the off pill's word — or the
+    /// level the engine substitutes for off (nothing on models that can't
+    /// think at all).
     pub(super) fn footer_effort_label(&self) -> Option<String> {
         if let Some(label) = self.cursor_effort_label.as_deref() {
             Some(label.to_string())
@@ -3682,8 +3701,27 @@ impl CodeTuiApp {
             None
         } else if self.thinking_enabled {
             self.effective_reasoning_effort()
+        } else if self.thinking_off_unavailable() {
+            // Off unrepresentable (tools forbid it): the engine substitutes the
+            // lowest real level — show that, never a false "thinking off".
+            self.model_reasoning_efforts
+                .iter()
+                .find(|l| !crate::services::model_metadata::effort_level_is_off(l))
+                .cloned()
         } else {
-            Some("thinking off".to_string())
+            match crate::services::model_metadata::thinking_off_wire(
+                &self.model,
+                &self.model_reasoning_efforts,
+            ) {
+                // Off maps to a plain level here (o-series `low`): show what ships.
+                (Some(level), _)
+                    if !crate::services::model_metadata::effort_level_is_off(level) =>
+                {
+                    Some(level.to_string())
+                }
+                // Same word as the scale's pill — the badge sits in the level slot.
+                _ => Some("off".to_string()),
+            }
         }
     }
 

@@ -1,4 +1,8 @@
 use super::super::*;
+use super::helpers::*;
+use std::io::Write;
+use std::net::TcpListener;
+use std::sync::{Arc, Mutex};
 
 #[test]
 fn default_reasoning_effort_gates_on_model_capability() {
@@ -73,7 +77,9 @@ fn thinking_request_disables_per_provider_disable_form() {
     has_none.set_thinking_enabled(false);
     assert_eq!(has_none.thinking_request(), (Some("none"), false));
 
-    // gpt-5.4 lists `none` but not `minimal` → catalog wins (c5d6b17 regression).
+    // gpt-5.4+ refuses tools + `none` (`tools_require_reasoning_effort`), so
+    // with agent tools on (the default) the off request is proactively floored
+    // to the lowest advertised thinking level — no 400 round-trip.
     let mut g54 = AgentEngine::new("/tmp", "gpt-5.4", "", &[], &[], 0, 0);
     g54.set_reasoning_efforts(
         ["none", "low", "medium", "high", "xhigh"]
@@ -81,11 +87,18 @@ fn thinking_request_disables_per_provider_disable_form() {
             .to_vec(),
     );
     g54.set_thinking_enabled(false);
+    assert_eq!(g54.thinking_request(), (Some("low"), false));
+    // Plain chat (no tools): `none` is valid and ships (c5d6b17 regression).
+    g54.set_agent_tools_enabled(false);
     assert_eq!(g54.thinking_request(), (Some("none"), false));
 
-    // No catalog: the 5.1+ heuristic guesses `none`, never the 400ing `minimal`.
+    // No catalog: with tools the proactive clause guesses `low` (same family
+    // guess as o-series); without tools the 5.1+ heuristic guesses `none`,
+    // never the 400ing `minimal`.
     let mut g54_bare = AgentEngine::new("/tmp", "gpt-5.4", "", &[], &[], 0, 0);
     g54_bare.set_thinking_enabled(false);
+    assert_eq!(g54_bare.thinking_request(), (Some("low"), false));
+    g54_bare.set_agent_tools_enabled(false);
     assert_eq!(g54_bare.thinking_request(), (Some("none"), false));
 
     // A stale catalog advertising `minimal` for 5.1+ must not resurrect it.
@@ -129,4 +142,140 @@ fn thinking_request_disables_per_provider_disable_form() {
     let mut plain = AgentEngine::new("/tmp", "gpt-4o", "", &[], &[], 0, 0);
     plain.set_thinking_enabled(false);
     assert_eq!(plain.thinking_request(), (None, false));
+}
+
+#[test]
+fn gpt54_tools_constraint_is_proactive() {
+    // Explicit "none" with tools on ships the lowest advertised level — the
+    // known constraint never costs a 400 round-trip.
+    let mut g56 = AgentEngine::new("/tmp", "gpt-5.6-sol", "", &[], &[], 0, 0);
+    g56.set_reasoning_efforts(["none", "low", "medium", "high"].map(String::from).to_vec());
+    g56.set_reasoning_effort("none".into());
+    assert_eq!(g56.thinking_request(), (Some("low"), false));
+
+    // Real levels pass through untouched.
+    g56.set_reasoning_effort("medium".into());
+    assert_eq!(g56.thinking_request(), (Some("medium"), false));
+
+    // Plain chat (no tools): none is valid again.
+    g56.set_reasoning_effort("none".into());
+    g56.set_agent_tools_enabled(false);
+    assert_eq!(g56.thinking_request(), (Some("none"), false));
+}
+
+#[test]
+fn effort_floor_overrides_off_grade_requests() {
+    // The `tools_require_reasoning_effort` 400 raises the floor to the lowest
+    // advertised thinking level; off-grade outcomes then send it instead.
+    // A non-gpt id: the reactive floor must work on its own, without the
+    // proactive gpt-5.4+ clause.
+    let mut engine = AgentEngine::new("/tmp", "laguna-nova", "", &[], &[], 0, 0);
+    engine.set_reasoning_efforts(
+        ["none", "low", "medium", "high", "xhigh", "max"]
+            .map(String::from)
+            .to_vec(),
+    );
+    engine.set_reasoning_effort("none".into());
+    assert_eq!(engine.thinking_request(), (Some("none"), false));
+    assert_eq!(engine.raise_effort_floor().as_deref(), Some("low"));
+    assert_eq!(engine.thinking_request(), (Some("low"), false));
+
+    // The thinking-off path (which resolves to "none" here) floors too.
+    engine.set_thinking_enabled(false);
+    assert_eq!(engine.thinking_request(), (Some("low"), false));
+
+    // A real level is untouched by the floor.
+    engine.set_thinking_enabled(true);
+    engine.set_reasoning_effort("high".into());
+    assert_eq!(engine.thinking_request(), (Some("high"), false));
+
+    // A catalog with nothing above off can't heal — no guessed level.
+    let mut only_off = AgentEngine::new("/tmp", "m", "", &[], &[], 0, 0);
+    only_off.set_reasoning_efforts(vec!["none".into()]);
+    assert_eq!(only_off.raise_effort_floor(), None);
+}
+
+/// First request → the gpt-5.4+ tools/none 400; retry → a normal completion.
+/// Every request body lands in `captured`.
+fn spawn_effort_400_then_ok(captured: Arc<Mutex<Vec<String>>>) -> u16 {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        if let Ok((mut sock, _)) = listener.accept() {
+            captured.lock().unwrap().push(drain_request(&mut sock));
+            let body = r#"{"error":{"code":"tools_require_reasoning_effort","message":"GPT-5.4+ Chat Completions does not support tools with reasoning_effort: \"none\". Switch to a higher effort or use the Responses API.","type":"invalid_request_error"}}"#;
+            let resp = format!(
+                "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = sock.write_all(resp.as_bytes());
+        }
+        if let Ok((mut sock, _)) = listener.accept() {
+            captured.lock().unwrap().push(drain_request(&mut sock));
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{FINAL_TEXT_SSE}",
+                FINAL_TEXT_SSE.len()
+            );
+            let _ = sock.write_all(resp.as_bytes());
+        }
+    });
+    port
+}
+
+/// End-to-end: the 400 is healed in-flight — floored retry, no terminal error,
+/// and the floor sticks for the session's later requests. A non-gpt id: this
+/// is the last-resort path for providers the proactive clause can't predict.
+#[tokio::test]
+async fn tools_effort_400_floors_and_retries() {
+    let dir = tmp();
+    let captured = Arc::new(Mutex::new(Vec::new()));
+    let port = spawn_effort_400_then_ok(captured.clone());
+    let client = reqwest::Client::builder().no_proxy().build().unwrap();
+    let base = format!("http://127.0.0.1:{port}");
+    let mut engine = AgentEngine::new(
+        &dir.display().to_string(),
+        "laguna-nova",
+        "",
+        &[],
+        &[],
+        0,
+        0,
+    );
+    engine.set_reasoning_efforts(["none", "low", "medium", "high"].map(String::from).to_vec());
+    engine.set_reasoning_effort("none".into());
+
+    let mut ui = CapturingUi::default();
+    run_session(
+        &mut engine,
+        &turn_ctx(&client, &base, &dir),
+        Some("hi".into()),
+        &mut ui,
+    )
+    .await;
+
+    let reqs = captured.lock().unwrap();
+    assert_eq!(reqs.len(), 2, "one rejection, one healed retry");
+    assert!(reqs[0].contains("\"reasoning_effort\":\"none\""));
+    assert!(
+        reqs[1].contains("\"reasoning_effort\":\"low\""),
+        "retry floors to low"
+    );
+    assert_eq!(ui.text, "done");
+    assert!(
+        ui.errors.is_empty(),
+        "healed, not terminal: {:?}",
+        ui.errors
+    );
+    // The host was told the level that actually ships (badge/persistence follow),
+    // and the explanation lands after it so it wins the notice slot.
+    assert_eq!(ui.efforts, vec!["low".to_string()]);
+    assert!(
+        ui.notices
+            .last()
+            .is_some_and(|n| n.contains("can't turn thinking off")),
+        "notices: {:?}",
+        ui.notices
+    );
+    // Later turns reuse the engine — the floor keeps them from re-400ing.
+    assert_eq!(engine.thinking_request(), (Some("low"), false));
 }

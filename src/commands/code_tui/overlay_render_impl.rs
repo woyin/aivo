@@ -44,8 +44,6 @@ impl CodeTuiApp {
             "Esc close · Enter submit"
         } else if menu.kind == MenuKind::Path {
             "Esc close · Enter/Tab insert · ↑/↓ navigate"
-        } else if menu.kind == MenuKind::Effort {
-            "Esc close · Enter apply · Tab insert · ↑/↓ navigate"
         } else {
             "Esc close · Enter run · Tab insert · ↑/↓ navigate"
         };
@@ -1375,7 +1373,7 @@ impl CodeTuiApp {
             .get(state.selected)
             .map(|item| {
                 let segs = self.config_segments(item.setting);
-                config_segment_hitboxes(inspector, clamped, line_count, 1, segs.options)
+                config_segment_hitboxes(inspector, clamped, line_count, 1, &segs.options)
             })
             .unwrap_or_default();
         OverlayRenderOut {
@@ -1423,7 +1421,7 @@ impl CodeTuiApp {
             }
             rows.push(config_value_line(
                 &format!("  {}", item.label),
-                self.config_list_value(item.setting),
+                &self.config_list_value(item.setting),
                 pos == state.selected,
                 width,
                 erred,
@@ -1449,7 +1447,7 @@ impl CodeTuiApp {
             item.label.to_string(),
             Style::default().fg(TEXT()).add_modifier(Modifier::BOLD),
         )));
-        lines.push(config_segment_line(segs.options, segs.active));
+        lines.push(config_segment_line(&segs.options, segs.active));
         if let Some((_, message)) = state.error.as_ref().filter(|(s, _)| *s == item.setting) {
             lines.push(Line::from(""));
             lines.push(Line::from(Span::styled(
@@ -2732,7 +2730,7 @@ fn toggle_list_rows(
 
 /// Segmented control for the focused `/config` row. The live value is a filled
 /// pill so it reads as a switch, not a label.
-fn config_segment_line(options: &[&str], active: usize) -> Line<'static> {
+fn config_segment_line(options: &[String], active: usize) -> Line<'static> {
     let mut spans: Vec<Span<'static>> = Vec::new();
     for (i, opt) in options.iter().enumerate() {
         if i > 0 {
@@ -2765,7 +2763,7 @@ fn config_segment_hitboxes(
     scroll: u16,
     line_count: usize,
     segment_line: u16,
-    options: &[&str],
+    options: &[String],
 ) -> Vec<(Rect, usize)> {
     if inspector.width == 0 || inspector.height == 0 {
         return Vec::new();
@@ -3035,6 +3033,7 @@ const HELP_KEYBINDINGS: &[(&str, &[(&str, &str)])] = &[
         &[
             ("Ctrl+R", "resume a saved session"),
             ("Shift+Tab", "cycle mode (normal/auto-approve/review)"),
+            ("Ctrl+T", "cycle thinking (off + effort levels)"),
             ("Esc", "cancel / close overlay"),
             ("Ctrl+C", "exit (press twice to confirm)"),
         ],

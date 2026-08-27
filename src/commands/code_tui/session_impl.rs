@@ -1,5 +1,6 @@
 use super::*;
 use crate::commands::models::fetch_models_for_select;
+use crate::services::model_metadata::effort_level_is_off;
 
 impl CodeTuiApp {
     pub(super) fn open_model_picker(
@@ -74,65 +75,21 @@ impl CodeTuiApp {
         // Snapshot vision support (None when absent); live catalog wins.
         self.model_image_input = limits.image_input;
         // This model's remembered effort, dropped if no longer a valid level.
+        // Off-grade values drop too — off lives in the thinking toggle, never
+        // in the level.
         self.reasoning_effort = match self
             .session_store
             .get_chat_reasoning_effort(&self.model)
             .await
         {
-            Some(level) if self.model_reasoning_efforts.contains(&level) => Some(level),
+            Some(level)
+                if self.model_reasoning_efforts.contains(&level)
+                    && !effort_level_is_off(&level) =>
+            {
+                Some(level)
+            }
             _ => None,
         };
-    }
-
-    /// `/effort [level]`. Bare reopens the inline menu; no levels → notice.
-    pub(super) async fn run_effort_command(&mut self, arg: Option<String>) {
-        if self.model_reasoning_efforts.is_empty() {
-            // Cursor has no effort param — the tier is part of the model id.
-            let msg = if self.key.is_cursor_acp() {
-                format!(
-                    "{} bakes effort into the name — use /model to pick a tier (…-high, …-max)",
-                    self.model
-                )
-            } else {
-                format!("{} has no reasoning-effort levels", self.model)
-            };
-            self.notice = Some((MUTED(), msg));
-            return;
-        }
-        match arg.map(|s| s.trim().to_ascii_lowercase()) {
-            Some(level) if self.model_reasoning_efforts.contains(&level) => {
-                self.apply_reasoning_effort(level).await;
-            }
-            Some(level) => {
-                self.notice = Some((
-                    ERROR(),
-                    format!(
-                        "unknown effort '{level}' (choose: {})",
-                        self.model_reasoning_efforts.join(", ")
-                    ),
-                ));
-            }
-            None => self.restore_effort_menu(),
-        }
-    }
-
-    /// Reopen the level menu. Don't clobber a draft the user is already typing.
-    fn restore_effort_menu(&mut self) {
-        let draft = self.draft.trim();
-        if !draft.is_empty() && draft != "/effort" {
-            self.notice = Some((
-                MUTED(),
-                format!(
-                    "choose an effort inline (available: {})",
-                    self.model_reasoning_efforts.join(", ")
-                ),
-            ));
-            return;
-        }
-        self.draft = "/effort ".to_string();
-        self.cursor = self.draft.len();
-        self.command_menu.reset();
-        self.sync_command_menu_state();
     }
 
     /// Set the reasoning effort: remember it (per-model) and persist it. The
@@ -141,6 +98,12 @@ impl CodeTuiApp {
     /// event loop on an in-flight turn's guard. Choosing an effort implies you
     /// want the model to think, so this also turns thinking on if it was off.
     pub(super) async fn apply_reasoning_effort(&mut self, level: String) {
+        // Under the unified scale an off-grade value IS the off switch — e.g.
+        // the agent's `set_effort` tool asking for "none".
+        if effort_level_is_off(&level) {
+            self.set_thinking_enabled(false).await;
+            return;
+        }
         // A stale picker can apply a level from a model the agent switched away
         // from mid-turn — refuse instead of 400ing later turns.
         if !self.model_reasoning_efforts.is_empty()
@@ -167,24 +130,104 @@ impl CodeTuiApp {
         self.notice = Some((MUTED(), format!("reasoning effort: {level}")));
     }
 
-    /// The effort the engine will request: the user's `/effort` choice, else —
-    /// for a model with levels — the default (env or `medium`) if valid, else the
-    /// middle level; `None` when the model has no levels. Keeps the footer badge in
-    /// step with what's sent and lets catalog-only models reason by default.
+    /// gpt-5.4+ refuses tools + an off-grade effort, so with agent tools on
+    /// these models have NO off state at all (see `gpt_rejects_none_with_tools`;
+    /// the engine substitutes on the wire, this keeps the UI in step).
+    pub(super) fn thinking_off_unavailable(&self) -> bool {
+        self.agent_tools_enabled
+            && crate::services::model_metadata::gpt_rejects_none_with_tools(&self.model)
+    }
+
+    /// The Thinking scale's real levels: the catalog minus off-grade values —
+    /// those are spellings of "off" and surface as the unified `off` pill, not
+    /// as levels (see `thinking_off_selectable`).
+    pub(super) fn displayed_reasoning_levels(&self) -> Vec<String> {
+        self.model_reasoning_efforts
+            .iter()
+            .filter(|l| !effort_level_is_off(l))
+            .cloned()
+            .collect()
+    }
+
+    /// Whether the unified `off` pill exists for this model right now: only
+    /// where the engine's off translation (`thinking_off_wire`) goes genuinely
+    /// below the lowest real level — an off-grade effort value or the
+    /// `thinking:{disabled}` struct. o-series/codex map off to plain `low`
+    /// (a pill that duplicates `low` would lie about saving reasoning), and
+    /// gpt-5.4+ with tools on refuses off outright.
+    pub(super) fn thinking_off_selectable(&self) -> bool {
+        if self.thinking_off_unavailable() {
+            return false;
+        }
+        match crate::services::model_metadata::thinking_off_wire(
+            &self.model,
+            &self.model_reasoning_efforts,
+        ) {
+            (Some(level), _) => effort_level_is_off(level),
+            (None, disable) => disable,
+        }
+    }
+
+    /// Ctrl+T: step the thinking scale — off → lowest level → … → highest →
+    /// off. One ring with the `/config` Thinking row; models whose off isn't
+    /// selectable ring over the levels alone. A thinking-capable model without
+    /// catalog levels just toggles on/off.
+    pub(super) async fn cycle_reasoning_effort(&mut self) {
+        let levels = self.displayed_reasoning_levels();
+        if levels.is_empty() {
+            if self.model_supports_thinking {
+                let on = self.thinking_enabled;
+                self.set_thinking_enabled(!on).await;
+            } else {
+                self.notice = Some((MUTED(), format!("{} has no thinking to cycle", self.model)));
+            }
+            return;
+        }
+        if !self.thinking_enabled {
+            let level = levels[0].clone();
+            self.apply_reasoning_effort(level).await;
+            return;
+        }
+        let pos = self
+            .effective_reasoning_effort()
+            .and_then(|cur| levels.iter().position(|l| *l == cur));
+        match pos {
+            Some(idx) if idx + 1 < levels.len() => {
+                let level = levels[idx + 1].clone();
+                self.apply_reasoning_effort(level).await;
+            }
+            // Highest level (or an unknown one) wraps around — through off
+            // where it exists, else straight back to the lowest level.
+            _ if self.thinking_off_selectable() => self.set_thinking_enabled(false).await,
+            _ => {
+                let level = levels[0].clone();
+                self.apply_reasoning_effort(level).await;
+            }
+        }
+    }
+
+    /// The effort the engine will request while thinking is on: the user's
+    /// choice, else the default (env or `medium`) if valid, else the middle
+    /// real level; `None` when the model has no levels. Keeps the footer badge
+    /// in step with what's sent and lets catalog-only models reason by default.
     pub(super) fn effective_reasoning_effort(&self) -> Option<String> {
         if let Some(level) = &self.reasoning_effort {
             return Some(level.clone());
         }
-        if self.model_reasoning_efforts.is_empty() {
+        // Runs every footer render: borrow the levels, clone only the pick.
+        let levels: Vec<&String> = self
+            .model_reasoning_efforts
+            .iter()
+            .filter(|l| !effort_level_is_off(l))
+            .collect();
+        if levels.is_empty() {
             return None;
         }
         let default = crate::agent::engine::default_reasoning_effort_level();
-        if self.model_reasoning_efforts.contains(&default) {
-            Some(default)
-        } else {
-            let mid = (self.model_reasoning_efforts.len() - 1) / 2;
-            self.model_reasoning_efforts.get(mid).cloned()
+        if levels.iter().any(|l| **l == default) {
+            return Some(default);
         }
+        Some(levels[(levels.len() - 1) / 2].clone())
     }
 
     /// `/model <name>`: apply the named model verbatim, no catalog lookup.
@@ -805,7 +848,7 @@ is preserved."
     /// glossary of every alternative (those sit in the segmented control).
     pub(super) fn config_active_help(&self, setting: ConfigSetting) -> String {
         let segs = self.config_segments(setting);
-        let opt = segs.options.get(segs.active).copied().unwrap_or("");
+        let opt = segs.options.get(segs.active).map_or("", String::as_str);
         match (setting, opt) {
             (ConfigSetting::Theme, "light") => {
                 "Light palette for the whole TUI. Applies immediately.".to_string()
@@ -830,8 +873,16 @@ is preserved."
                 "This model has no thinking; the toggle is remembered for models that do."
                     .to_string()
             }
-            (ConfigSetting::Thinking, _) => {
-                "Answers directly, without a thinking block.".to_string()
+            (ConfigSetting::Thinking, "off") => {
+                "Answers directly, without reasoning first.".to_string()
+            }
+            (ConfigSetting::Thinking, level) if self.thinking_off_unavailable() => {
+                format!(
+                    "The model reasons at {level} effort. It can't turn thinking off while agent tools are on."
+                )
+            }
+            (ConfigSetting::Thinking, level) => {
+                format!("The model reasons at {level} effort before answering. Thinking is shown folded.")
             }
             (ConfigSetting::Approval, "auto-approve") => {
                 "Tools run unattended. Plan mode is /plan.".to_string()
@@ -921,12 +972,12 @@ is preserved."
     }
 
     /// List-row value: the live model when a custom pick is on, else the segment label.
-    pub(super) fn config_list_value(&self, setting: ConfigSetting) -> &str {
+    pub(super) fn config_list_value(&self, setting: ConfigSetting) -> String {
         if let Some(model) = self.config_current_model(setting) {
-            return model;
+            return model.to_string();
         }
         let segs = self.config_segments(setting);
-        segs.options.get(segs.active).copied().unwrap_or("")
+        segs.options.get(segs.active).cloned().unwrap_or_default()
     }
 
     pub(super) fn config_has_drill_in(&self, setting: ConfigSetting) -> bool {
@@ -944,28 +995,53 @@ is preserved."
     /// Segmented values for `setting` and which is live — read fresh so the
     /// rendered row can't drift from its flag.
     pub(super) fn config_segments(&self, setting: ConfigSetting) -> ConfigSegments {
-        const ON_OFF: &[&str] = &["on", "off"];
-        let switch = |on: bool| ConfigSegments {
-            options: ON_OFF,
-            active: if on { 0 } else { 1 },
+        let owned = |options: &[&str], active: usize| ConfigSegments {
+            options: options.iter().map(|s| s.to_string()).collect(),
+            active,
         };
+        let switch = |on: bool| owned(&["on", "off"], if on { 0 } else { 1 });
         match setting {
-            ConfigSetting::Theme => ConfigSegments {
-                options: &["dark", "light"],
-                active: match self.theme {
+            ConfigSetting::Theme => owned(
+                &["dark", "light"],
+                match self.theme {
                     UiTheme::Dark => 0,
                     UiTheme::Light => 1,
                 },
-            },
+            ),
             ConfigSetting::InlineImages => switch(self.inline_images_enabled),
-            ConfigSetting::Thinking => switch(self.thinking_enabled),
+            // One unified scale: `off` (when selectable, see
+            // `thinking_off_selectable`) then the levels in catalog order;
+            // without levels a plain toggle.
+            ConfigSetting::Thinking => {
+                let levels = self.displayed_reasoning_levels();
+                if levels.is_empty() {
+                    switch(self.thinking_enabled)
+                } else {
+                    let off = self.thinking_off_selectable();
+                    let offset = usize::from(off);
+                    let active = if !self.thinking_enabled && off {
+                        0
+                    } else {
+                        // Thinking on — or off unrepresentable: what actually ships.
+                        self.effective_reasoning_effort()
+                            .and_then(|cur| levels.iter().position(|l| *l == cur))
+                            .map_or(0, |i| i + offset)
+                    };
+                    let mut options = Vec::with_capacity(levels.len() + 1);
+                    if off {
+                        options.push("off".to_string());
+                    }
+                    options.extend(levels);
+                    ConfigSegments { options, active }
+                }
+            }
             ConfigSetting::Approval => {
                 const OPTIONS: &[&str] = &["normal", "auto-approve", "review"];
                 let label = self.approval_mode_label();
-                ConfigSegments {
-                    options: OPTIONS,
-                    active: OPTIONS.iter().position(|o| *o == label).unwrap_or(0),
-                }
+                owned(
+                    OPTIONS,
+                    OPTIONS.iter().position(|o| *o == label).unwrap_or(0),
+                )
             }
             ConfigSetting::UseWebSearch => switch(self.web_search_enabled),
             ConfigSetting::AgentTools => switch(self.agent_tools_enabled),
@@ -974,27 +1050,25 @@ is preserved."
             ConfigSetting::FooterPrice => switch(self.footer_price_enabled),
             ConfigSetting::VisionFallback => {
                 use crate::services::session_store::VisionFallbackMode;
-                const OPTIONS: &[&str] = &["aivo", "custom", "off"];
-                ConfigSegments {
-                    options: OPTIONS,
-                    active: match self.vision_fallback {
+                owned(
+                    &["aivo", "custom", "off"],
+                    match self.vision_fallback {
                         VisionFallbackMode::Gateway => 0,
                         VisionFallbackMode::Custom => 1,
                         VisionFallbackMode::Off => 2,
                     },
-                }
+                )
             }
             ConfigSetting::ImageGen => {
                 use crate::services::session_store::ImageGenMode;
-                const OPTIONS: &[&str] = &["aivo", "custom", "off"];
-                ConfigSegments {
-                    options: OPTIONS,
-                    active: match self.image_gen {
+                owned(
+                    &["aivo", "custom", "off"],
+                    match self.image_gen {
                         ImageGenMode::Gateway => 0,
                         ImageGenMode::Custom => 1,
                         ImageGenMode::Off => 2,
                     },
-                }
+                )
             }
         }
     }
@@ -1094,9 +1168,21 @@ is preserved."
                 self.set_theme(next).await;
             }
             ConfigSetting::InlineImages => self.set_inline_images_enabled(target == 0).await,
-            ConfigSetting::Thinking => self.set_thinking_enabled(target == 0).await,
+            ConfigSetting::Thinking => {
+                let levels = self.displayed_reasoning_levels();
+                if levels.is_empty() {
+                    self.set_thinking_enabled(target == 0).await;
+                } else {
+                    let off = self.thinking_off_selectable();
+                    if off && target == 0 {
+                        self.set_thinking_enabled(false).await;
+                    } else if let Some(level) = levels.get(target - usize::from(off)).cloned() {
+                        self.apply_reasoning_effort(level).await;
+                    }
+                }
+            }
             ConfigSetting::Approval => {
-                let mode = segs.options.get(target).copied().unwrap_or("normal");
+                let mode = segs.options.get(target).map_or("normal", String::as_str);
                 self.set_approval_mode(mode).await;
             }
             ConfigSetting::UseWebSearch => self.set_web_search_enabled(target == 0).await,
@@ -1107,7 +1193,7 @@ is preserved."
             ConfigSetting::VisionFallback => {
                 use crate::services::session_store::VisionFallbackMode;
                 let mode =
-                    VisionFallbackMode::parse(segs.options.get(target).copied().unwrap_or(""));
+                    VisionFallbackMode::parse(segs.options.get(target).map_or("", String::as_str));
                 match mode {
                     // Unconfigured `custom` opens the key→model picker; the mode
                     // only flips once something is picked (Esc leaves it as-is).
@@ -1121,7 +1207,7 @@ is preserved."
                 use crate::services::session_store::ImageGenMode;
                 // `parse` reads the PERSISTED vocabulary ("gateway"); the row
                 // shows `aivo`, which would parse to the Off default.
-                let mode = match segs.options.get(target).copied().unwrap_or("") {
+                let mode = match segs.options.get(target).map_or("", String::as_str) {
                     "aivo" => ImageGenMode::Gateway,
                     "custom" => ImageGenMode::Custom,
                     _ => ImageGenMode::Off,

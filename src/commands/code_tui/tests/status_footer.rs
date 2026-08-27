@@ -1577,6 +1577,51 @@ fn test_delegating_spinner_label_drops_subagent_word() {
     );
 }
 
+/// The footer effort badge is a click target for `/config`'s Thinking row —
+/// the hitbox must sit exactly on the rendered label.
+#[tokio::test]
+async fn footer_effort_badge_click_opens_config_thinking() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.model = "m".to_string();
+    app.model_supports_thinking = true;
+    app.model_reasoning_efforts = vec!["low".into(), "medium".into(), "high".into()];
+    app.thinking_enabled = true;
+    app.reasoning_effort = Some("medium".into());
+
+    let (screen, rows) = render_full_screen(&mut app, 90, 12);
+    let hit = app.effort_badge_hit.expect("effort badge hitbox armed");
+    let row: Vec<char> = rows[usize::from(hit.y)].chars().collect();
+    let hit_text: String = row[usize::from(hit.x)..usize::from(hit.x + hit.width)]
+        .iter()
+        .collect();
+    assert_eq!(hit_text, "medium", "hitbox misaligned:\n{screen}");
+
+    // The click drops the user on /config with Thinking focused.
+    app.handle_mouse(crossterm::event::MouseEvent {
+        kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+        column: hit.x,
+        row: hit.y,
+        modifiers: crossterm::event::KeyModifiers::NONE,
+    })
+    .await
+    .unwrap();
+    let Overlay::Config(state) = &app.overlay else {
+        panic!("expected config overlay after badge click");
+    };
+    assert_eq!(
+        state.items[state.selected].setting,
+        ConfigSetting::Thinking,
+        "Thinking row focused"
+    );
+
+    // Cursor's tier badge is part of the model id — it must stay inert.
+    app.overlay = Overlay::None;
+    app.cursor_effort_label = Some("max".to_string());
+    let _ = render_full_screen(&mut app, 90, 12);
+    assert!(app.effort_badge_hit.is_none(), "cursor tier badge armed");
+}
+
 #[test]
 fn test_footer_shows_share_badge_only_when_sharing() {
     use crate::services::share_live::LiveShareHandle;

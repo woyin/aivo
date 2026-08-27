@@ -196,16 +196,11 @@ impl CodeTuiApp {
                     SlashCommand::Skill { .. } | SlashCommand::CreateSkill(_)
                 );
                 let was_attach = matches!(command, SlashCommand::Attach(_));
-                let restore_effort_menu = matches!(command, SlashCommand::Effort(None))
-                    && !self.model_reasoning_efforts.is_empty();
                 let typed = self.draft.trim().to_string();
                 match self.execute_slash_command(command).await {
                     Ok(should_exit) => {
                         self.draft_history_index = None;
                         self.draft_history_stash = None;
-                        if restore_effort_menu {
-                            return Ok(should_exit);
-                        }
                         if recordable {
                             self.record_draft_history(&typed);
                         }
@@ -1858,10 +1853,6 @@ impl CodeTuiApp {
                 } else {
                     self.run_memory_command();
                 }
-                Ok(false)
-            }
-            SlashCommand::Effort(arg) => {
-                self.run_effort_command(arg).await;
                 Ok(false)
             }
             SlashCommand::CreateSkill(arg) => {

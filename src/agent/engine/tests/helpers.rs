@@ -45,6 +45,8 @@ pub(super) struct CapturingUi {
     pub(super) stops: Vec<TurnStop>,
     /// `session_message` transcript forms (✉ rows), in order.
     pub(super) mail_rows: Vec<String>,
+    /// Each `set_chat_effort` level, in order (the default declines instead).
+    pub(super) efforts: Vec<String>,
 }
 
 impl AgentUi for CapturingUi {
@@ -81,6 +83,10 @@ impl AgentUi for CapturingUi {
     }
     fn notify_error(&mut self, t: &str) {
         self.errors.push(t.to_string());
+    }
+    fn set_chat_effort<'a>(&'a mut self, level: &'a str) -> BoxFuture<'a, Result<String, String>> {
+        self.efforts.push(level.to_string());
+        Box::pin(async { Ok(String::new()) })
     }
     fn turn_stopped(&mut self, stop: TurnStop) {
         self.stops.push(stop);
@@ -184,14 +190,15 @@ pub(super) fn batch_tool_call_sse(calls: &[(&str, &str, Value)]) -> String {
     format!("data: {delta}\n\ndata: [DONE]\n\n")
 }
 
-/// Drain the full request before replying: closing with unread bytes RSTs the
-/// response (Windows), and the engine's retry then eats the next scripted body.
-pub(super) fn drain_request(sock: &mut std::net::TcpStream) {
+/// Drain the full request before replying and return it whole: closing with
+/// unread bytes RSTs the response (Windows), and the engine's retry then eats
+/// the next scripted body.
+pub(super) fn drain_request(sock: &mut std::net::TcpStream) -> String {
     let mut data = Vec::new();
     let mut buf = [0u8; 16384];
     loop {
         let n = match sock.read(&mut buf) {
-            Ok(0) | Err(_) => return,
+            Ok(0) | Err(_) => break,
             Ok(n) => n,
         };
         data.extend_from_slice(&buf[..n]);
@@ -207,9 +214,10 @@ pub(super) fn drain_request(sock: &mut std::net::TcpStream) {
             })
             .unwrap_or(0);
         if data.len() >= pos + 4 + body_len {
-            return;
+            break;
         }
     }
+    String::from_utf8_lossy(&data).into_owned()
 }
 
 pub(super) fn spawn_sse_sequence(bodies: Vec<String>) -> u16 {

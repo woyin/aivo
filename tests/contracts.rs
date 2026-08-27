@@ -88,6 +88,10 @@ fn removed_features_stay_removed() {
             "/detach removed; [image #n] draft tags are the only attachment surface",
         ),
         (
+            "\"/effort\"",
+            "/effort removed; Ctrl+T and the /config Thinking row set the effort",
+        ),
+        (
             "mod packs",
             "extension packs dropped in 4274b419; skills/agents/hooks/MCP install separately",
         ),

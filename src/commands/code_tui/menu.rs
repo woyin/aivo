@@ -233,7 +233,6 @@ pub(super) fn render_command_menu_rows(
             match menu.kind {
                 MenuKind::Commands => "No matching command — keep typing or Esc",
                 MenuKind::Path => "No matching path — keep typing or Esc",
-                MenuKind::Effort => "No matching effort level — keep typing or Esc",
                 MenuKind::Mention => "No matching sub-agent — keep typing or Esc",
             },
             Style::default().fg(MUTED()),

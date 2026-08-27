@@ -320,10 +320,17 @@ pub fn rejects_temperature(model: &str) -> bool {
     snapshot_limits(model).is_some_and(|limits| !limits.temperature)
 }
 
-/// gpt-5.1+ 400s `reasoning_effort: "minimal"` (`none` replaced it) but stale
-/// catalogs still advertise it. Matches folded/vendor-prefixed spellings and
-/// the fused aggregator form (`gpt-52` = 5.2); unknown ids return false.
-pub fn gpt_rejects_effort_minimal(model: &str) -> bool {
+/// A catalog effort level that means "thinking off" on the wire (`none`, or
+/// `minimal` on the gpt-5.0 models that lack `none`). What the engine's
+/// disabled path sends; the code TUI's Thinking scale treats it as its off.
+pub fn effort_level_is_off(level: &str) -> bool {
+    level == "none" || level == "minimal"
+}
+
+/// Whether `model` is a GPT of version ≥ `req_major.req_minor`. Matches
+/// folded/vendor-prefixed spellings and the fused aggregator form
+/// (`gpt-52` = 5.2); unknown ids return false.
+fn gpt_version_at_least(model: &str, req_major: u32, req_minor: u32) -> bool {
     let folded = fold(model);
     folded.match_indices("gpt-").any(|(i, _)| {
         let rest = &folded[i + 4..];
@@ -343,10 +350,61 @@ pub fn gpt_rejects_effort_minimal(model: &str) -> bool {
             }
         };
         match (major, minor) {
-            (Ok(major), Ok(minor)) => major > 5 || (major == 5 && minor >= 1),
+            (Ok(major), Ok(minor)) => {
+                major > req_major || (major == req_major && minor >= req_minor)
+            }
             _ => false,
         }
     })
+}
+
+/// gpt-5.1+ 400s `reasoning_effort: "minimal"` (`none` replaced it) but stale
+/// catalogs still advertise it.
+pub fn gpt_rejects_effort_minimal(model: &str) -> bool {
+    gpt_version_at_least(model, 5, 1)
+}
+
+/// gpt-5.4+ Chat Completions 400s tools + `reasoning_effort: "none"`
+/// (`tools_require_reasoning_effort`); `none` stays valid without tools and on
+/// the Responses API, so this can't be a snapshot-load strip like `minimal` —
+/// the engine and the TUI's Thinking scale consult it alongside the tools flag.
+pub fn gpt_rejects_none_with_tools(model: &str) -> bool {
+    gpt_version_at_least(model, 5, 4)
+}
+
+/// The wire form of "thinking off" for `model` with catalog `efforts`:
+/// `(Some(level), false)` when an effort value expresses it — the lowest "off"
+/// the catalog advertises (gpt-5 diverged: 5.0 `minimal`, 5.1+ `none`, codex
+/// `low` — a guess 400s) — else `(None, true)` = `thinking:{type:"disabled"}`
+/// (Anthropic, depth-only scales). Shared by the engine's disabled path and
+/// the code TUI: the unified "off" pill only appears where this goes below the
+/// lowest real level.
+pub fn thinking_off_wire(model: &str, efforts: &[String]) -> (Option<&'static str>, bool) {
+    let valid = |level: &str| efforts.iter().any(|e| e == level);
+    let lower = model.to_ascii_lowercase();
+    let name = lower.rsplit('/').next().unwrap_or(&lower);
+    let rejects_minimal = gpt_rejects_effort_minimal(name);
+    if valid("none") {
+        (Some("none"), false)
+    } else if valid("minimal") && !rejects_minimal {
+        (Some("minimal"), false)
+    } else if name.starts_with("o1")
+        || name.starts_with("o3")
+        || name.starts_with("o4")
+        || name.contains("codex")
+    {
+        (Some("low"), false)
+    } else if name.starts_with("gpt-5") {
+        if valid("low") {
+            (Some("low"), false)
+        } else if rejects_minimal {
+            (Some("none"), false)
+        } else {
+            (Some("minimal"), false)
+        }
+    } else {
+        (None, true)
+    }
 }
 
 /// Capability sets for this process's local llama-server. Static because
@@ -751,6 +809,34 @@ mod tests {
             "claude-opus-4-8",
         ] {
             assert!(!gpt_rejects_effort_minimal(id), "{id} must keep minimal");
+        }
+    }
+
+    #[test]
+    fn gpt_rejects_none_with_tools_is_5_4_plus() {
+        for id in [
+            "gpt-5.4",
+            "gpt-5.4-mini",
+            "gpt-5.6-sol",
+            "openai/gpt-5.6-terra",
+            "openai-gpt-54", // fused aggregator spelling
+            "gpt-6",
+        ] {
+            assert!(
+                gpt_rejects_none_with_tools(id),
+                "{id} must floor none+tools"
+            );
+        }
+        for id in [
+            "gpt-5.1",
+            "gpt-5.2",
+            "gpt-5",
+            "gpt-5-codex",
+            "o3",
+            "laguna-s-2.1",
+            "gpt-4o",
+        ] {
+            assert!(!gpt_rejects_none_with_tools(id), "{id} must keep none");
         }
     }
 

@@ -387,7 +387,7 @@ pub(super) const WELCOME_ADVANCED_TIPS: &[&str] = &[
     "/goal <task> keeps working on its own until it's done",
     "Esc interrupts the agent mid-turn — in /goal mode, press Esc twice",
     "/share creates a live web link to this session",
-    "/effort changes how hard the model thinks",
+    "Ctrl+T changes how hard the model thinks",
     "/skills and /mcp manage the agent's extra tools",
     "ask the agent to create a subagent for a task — a reviewer, an architect …",
     "/compact summarizes older turns to free up context",
@@ -641,12 +641,6 @@ pub(super) const SLASH_COMMANDS: &[SlashCommandSpec] = &[
         name: "memory",
         help_label: "/memory [dream]",
         description: "show facts the agent has remembered",
-        takes_argument: true,
-    },
-    SlashCommandSpec {
-        name: "effort",
-        help_label: "/effort [level]",
-        description: "set how hard the model thinks",
         takes_argument: true,
     },
     SlashCommandSpec {
@@ -1556,7 +1550,8 @@ pub(super) enum CycleDir {
 /// The segmented values a `/config` row can hold and which one is live. Read live
 /// (see `config_segments`) so a row can't drift from the flag it mirrors.
 pub(super) struct ConfigSegments {
-    pub(super) options: &'static [&'static str],
+    /// Owned: the Thinking row's options come from the model's catalog levels.
+    pub(super) options: Vec<String>,
     pub(super) active: usize,
 }
 
@@ -2040,7 +2035,6 @@ pub(super) enum MenuKind {
     Commands,
     /// Path completion for a command's file argument (`/attach`, `/preview`).
     Path,
-    Effort,
     /// `@name` sub-agent mentions in the composer.
     Mention,
 }
@@ -2077,17 +2071,10 @@ pub(super) struct AgentMention {
 }
 
 #[derive(Clone)]
-pub(super) struct EffortMenuEntry {
-    pub(super) level: String,
-    pub(super) current: bool,
-}
-
-#[derive(Clone)]
 pub(super) enum ComposerMenuEntry {
     Command(&'static SlashCommandSpec),
     Skill(SkillCommand),
     Path(PathMenuEntry),
-    Effort(EffortMenuEntry),
     Agent(AgentMention),
 }
 
@@ -2097,13 +2084,6 @@ impl ComposerMenuEntry {
             Self::Command(command) => command.command_label(),
             Self::Skill(skill) => skill.command_label(),
             Self::Path(path) => path.label.clone(),
-            Self::Effort(effort) => {
-                if effort.current {
-                    format!("{}  (current)", effort.level)
-                } else {
-                    effort.level.clone()
-                }
-            }
             Self::Agent(agent) => format!("@{}", agent.name),
         }
     }
@@ -2113,7 +2093,6 @@ impl ComposerMenuEntry {
             Self::Command(command) => command.description,
             Self::Skill(skill) => &skill.description,
             Self::Path(path) => &path.description,
-            Self::Effort(_) => "",
             Self::Agent(agent) => &agent.description,
         }
     }
@@ -2624,8 +2603,6 @@ pub(super) enum SlashCommand {
     Memory {
         dream: bool,
     },
-    /// `/effort [level]` — inline menu, or set the level directly.
-    Effort(Option<String>),
     /// Built-in `create-skill` command: starts the guided create/improve-a-skill
     /// workflow. The optional argument is the initial intent (what the skill
     /// should do); bare just opens the workflow.
@@ -3257,6 +3234,9 @@ pub(super) struct CodeTuiApp {
     pub(super) session_id_hit: Option<Rect>,
     /// Footer `● sharing` badge click region; `None` while not sharing.
     pub(super) share_badge_hit: Option<Rect>,
+    /// Footer effort badge click region — opens `/config` on the Thinking row.
+    /// `None` when no effort badge is shown (or it's Cursor's model-id tier).
+    pub(super) effort_badge_hit: Option<Rect>,
     /// The open overlay's list scrollbar from the last render, if any.
     pub(super) scrollbar_hit: Option<ScrollbarHit>,
     /// Active thumb drag: grab row-offset inside the thumb.
@@ -3871,6 +3851,7 @@ impl CodeTuiApp {
             preview_close_hits: Vec::new(),
             session_id_hit: None,
             share_badge_hit: None,
+            effort_badge_hit: None,
             composer_text_area: None,
             composer_scroll: 0,
             transcript_selection: None,

@@ -28,7 +28,7 @@ mod tests {
             "aivo models",
             "aivo code",
             "/model",
-            "/effort",
+            "Ctrl+T",
         ] {
             assert!(guide.contains(needle), "guide should mention `{needle}`");
         }

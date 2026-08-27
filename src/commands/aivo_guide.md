@@ -199,7 +199,7 @@ back for a fix. `AIVO_AGENT_SELF_CORRECT=0` opts out.
 Type `/help` for the full list. Slash commands:
 
 - Session: `/new`, `/resume [query]`, `/rewind` (undo edits), `/copy [n]`, `/config`, `/share [stop]`, `/help`, `/exit`
-- Model & key: `/model [name]`, `/key [id|name]`, `/effort [level]`
+- Model & key: `/model [name]`, `/key [id|name]`
 - Context: `/attach <path>`, `/compact [fast]`, `/context`, `/memory`
 - Skills & tools: `/skills`, `/create-skill`, `/mcp` (CLI twins: `aivo code skills`, `aivo code mcp`)
 - Autonomous: `/plan <objective>`, `/goal <objective>`
@@ -208,10 +208,10 @@ Other input: `!cmd` runs a local shell command; `//` / `!!` escape to literal te
 
 Keys: `Enter` send · `Ctrl+J` newline · `Tab` complete · `Ctrl+V` paste text/image ·
 `Ctrl+X Ctrl+E` edit draft in $EDITOR · `Shift+Tab` cycle mode (normal/auto-approve/review) · `Ctrl+R` resume ·
-`Ctrl+O` pager for a `!cmd` · `Esc` cancel/close · `Ctrl+C` twice to exit.
+`Ctrl+T` cycle thinking (off + effort levels) · `Ctrl+O` pager for a `!cmd` · `Esc` cancel/close · `Ctrl+C` twice to exit.
 
-`/config` toggles: Thinking, Auto-approve tools, aivo web search, Agent tools (off = plain chat,
-no tools). The agent can also change the live model/effort itself when you ask (it calls its
+`/config` toggles: Thinking (off + the model's effort levels), Auto-approve tools, aivo web search,
+Agent tools (off = plain chat, no tools). The agent can also change the live model/effort itself when you ask (it calls its
 `switch_model` / `set_effort` tools); a key change it hands back to you via `/key`.
 
 ### Skills & MCP servers — `aivo code skills`, `aivo code mcp`
