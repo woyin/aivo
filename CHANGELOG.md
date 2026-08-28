@@ -1,5 +1,17 @@
 # Changelog
 
+## v0.48.1
+
+The code TUI makes short-lived thinking changes visible with a fading center toast, while sandbox denial handling identifies masked or protected-path failures without futile escalation. Custom key setup accepts the base URL and API key in either order, and shared goal sessions are more reliable.
+
+- improve(code): flash Ctrl+T thinking changes as a fading center toast (49692800)
+- fix(test): gate denial-line tests to unix, whose paths they assume (b7c4d75f)
+- improve(keys): accept base URL and API key in either order when adding a custom key (c6faa3f3)
+- feat(code): deny shell reads of credential paths in every macOS sandbox profile (bf516e34)
+- fix(code): skip the futile escalated re-run when the denial names a protected root (a9fb99c2)
+- fix(code): flag sandbox denials whose exit code the command masked (17af82ae)
+- fix: share in-flight goal sessions (#36) (969be454)
+
 ## v0.48.0
 
 Thinking effort collapses into one unified scale on `ctrl+t`, list modals get a draggable scrollbar, and the sandbox offers a narrow writable root before asking for the broad escalation. The agent memory feature is removed — durable project facts belong in AGENTS.md.
