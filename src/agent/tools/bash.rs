@@ -519,9 +519,9 @@ pub(super) async fn run_bash_inner(
         // The workspace note's remedies can't open a protected root.
         out.push_str(
             if blocked_protected || confinement != BashConfinement::Workspace {
-                "\n[note: blocked writing to a protected path (aivo's config dir or \
-~/.ssh) — the sandbox escalation deliberately excludes these. Only the user's explicit \
-per-command confirmation can open them.]"
+                "\n[note: blocked on a protected path (~/.ssh or \
+~/.gnupg) — the sandbox escalation deliberately excludes these, reads included. Only \
+the user's explicit per-command confirmation can open them.]"
             } else {
                 "\n[note: blocked by the workspace write-sandbox, not a real command \
 failure — it wrote outside the agent's workspace. The user can approve adding the target \

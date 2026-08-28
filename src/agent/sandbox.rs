@@ -2,10 +2,13 @@
 //! confine a shell command's file WRITES to the workspace (cwd) plus temp dirs
 //! and the common dev-tool caches, while leaving reads, process exec, and the
 //! network open — the agent is still expected to fetch live data and inspect the
-//! system (see the engine's system prompt). This is the safety counterpart to
-//! the heuristic destructive-command gate: the heuristic catches `rm -rf` inside
-//! the workspace (which the sandbox allows), the sandbox catches a stray write
-//! to `/etc` or `~/.ssh` (which the heuristic misses).
+//! system (see the engine's system prompt). The one read carve-out is credential
+//! material ([`protected_read_roots`]): open reads plus open network would
+//! exfiltrate keys silently.
+//! This is the safety counterpart to the heuristic destructive-command gate: the
+//! heuristic catches `rm -rf` inside the workspace (which the sandbox allows),
+//! the sandbox catches a stray write to `/etc` or `~/.ssh` (which the heuristic
+//! misses).
 //!
 //! Backends:
 //! - **macOS** via `sandbox-exec` (Apple seatbelt) — an external wrapper binary
@@ -56,12 +59,26 @@ pub fn extra_write_roots() -> Vec<PathBuf> {
     EXTRA_WRITE_ROOTS.read().unwrap().clone()
 }
 
-/// Roots no escalation may open silently: aivo's config dir (key store) and
-/// `~/.ssh`. Deliberately tiny — broadening it re-breaks routine dotfile edits.
+/// Roots no escalation may open silently: `~/.ssh` and `~/.gnupg`. Deliberately
+/// tiny — broadening it re-breaks routine dotfile edits; aivo's own config dir
+/// stays out so `aivo keys …` works from the agent shell.
 pub fn protected_write_roots() -> Vec<PathBuf> {
-    let mut roots = vec![crate::services::paths::config_dir()];
+    let mut roots = Vec::new();
     if let Some(home) = crate::services::system_env::home_dir() {
         roots.push(home.join(".ssh"));
+        roots.push(home.join(".gnupg"));
+    }
+    roots
+}
+
+/// Credential material the shell may never read. macOS-only (Landlock can't
+/// carve a deny out of open reads — `read_file`'s secret card is the gate there).
+#[cfg(any(test, target_os = "macos"))]
+fn protected_read_roots() -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    if let Some(home) = crate::services::system_env::home_dir() {
+        roots.push(home.join(".ssh"));
+        roots.push(home.join(".gnupg"));
     }
     roots
 }
@@ -510,10 +527,9 @@ fn macos_profile(cwd: &Path, profile: SandboxProfile) -> String {
     if profile == SandboxProfile::Workspace
         && let Some(home) = crate::services::system_env::home_dir()
     {
-        // Dev-tool caches, deliberately NOT `~/.config`: that holds aivo's own
-        // encrypted key store (`~/.config/aivo`) and every app's config, which
-        // the agent shouldn't be able to silently rewrite. A command that
-        // genuinely needs to write there hits the escalation prompt instead.
+        // Dev-tool caches and aivo's own config dir (`aivo keys …`), deliberately
+        // NOT `~/.config` as a whole: other apps' config shouldn't be silently
+        // rewritable.
         for sub in [
             ".cache",
             ".cargo",
@@ -526,6 +542,11 @@ fn macos_profile(cwd: &Path, profile: SandboxProfile) -> String {
         ] {
             writable.push(home.join(sub).to_string_lossy().into_owned());
         }
+        writable.push(
+            crate::services::paths::config_dir()
+                .to_string_lossy()
+                .into_owned(),
+        );
     }
 
     let mut profile_str = String::from("(version 1)\n(allow default)\n");
@@ -542,26 +563,70 @@ fn macos_profile(cwd: &Path, profile: SandboxProfile) -> String {
         profile_str.push_str(&format!("    (subpath \"{}\")\n", sbpl_escape(trimmed)));
     }
     profile_str.push_str(")\n");
+    push_read_denies(&mut profile_str);
     profile_str
 }
 
+/// Raw + canonical spellings of a path (seatbelt matches the resolved path).
+#[cfg(target_os = "macos")]
+fn sbpl_spellings(path: &Path) -> Vec<PathBuf> {
+    let mut out = vec![path.to_path_buf()];
+    if let Ok(canon) = path.canonicalize()
+        && canon != *path
+    {
+        out.push(canon);
+    }
+    out
+}
+
+/// `file-read-data` only, so `ls -la ~` doesn't trip a metadata denial; the
+/// `~/.ssh` startup files are re-allowed so ssh-agent-backed git keeps working.
+#[cfg(target_os = "macos")]
+fn push_read_denies(profile: &mut String) {
+    let denied: Vec<PathBuf> = protected_read_roots()
+        .iter()
+        .flat_map(|r| sbpl_spellings(r))
+        .collect();
+    // A filterless `(deny file-read-data)` would deny all reads.
+    if denied.is_empty() {
+        return;
+    }
+    profile.push_str("(deny file-read-data\n");
+    for p in denied {
+        profile.push_str(&format!(
+            "    (subpath \"{}\")\n",
+            sbpl_escape(&p.to_string_lossy())
+        ));
+    }
+    profile.push_str(")\n");
+    let Some(home) = crate::services::system_env::home_dir() else {
+        return;
+    };
+    profile.push_str("(allow file-read-data\n");
+    for dir in sbpl_spellings(&home.join(".ssh")) {
+        for f in ["config", "known_hosts", "known_hosts.old"] {
+            profile.push_str(&format!(
+                "    (literal \"{}\")\n",
+                sbpl_escape(&dir.join(f).to_string_lossy())
+            ));
+        }
+        profile.push_str(&format!(
+            "    (regex #\"^{}/[^/]*\\.pub$\")\n",
+            sbpl_regex_escape(&dir.to_string_lossy())
+        ));
+    }
+    profile.push_str(")\n");
+}
+
 /// Everything writable EXCEPT the protected roots (last matching rule wins, so
-/// the deny sits after the allow). Raw + canonical spellings, like `macos_profile`.
+/// the deny sits after the allow); credential reads stay denied too.
 #[cfg(target_os = "macos")]
 fn macos_escalated_profile() -> String {
-    let mut denied: Vec<String> = Vec::new();
-    for root in protected_write_roots() {
-        denied.push(root.to_string_lossy().into_owned());
-        if let Ok(canon) = root.canonicalize() {
-            denied.push(canon.to_string_lossy().into_owned());
-        }
-    }
     // A filterless `(deny file-write*)` would deny everything.
-    let subpaths: Vec<String> = denied
+    let subpaths: Vec<String> = protected_write_roots()
         .iter()
-        .map(|p| p.trim_end_matches('/'))
-        .filter(|p| !p.is_empty())
-        .map(|p| format!("    (subpath \"{}\")\n", sbpl_escape(p)))
+        .flat_map(|r| sbpl_spellings(r))
+        .map(|p| format!("    (subpath \"{}\")\n", sbpl_escape(&p.to_string_lossy())))
         .collect();
     let mut profile = String::from("(version 1)\n(allow default)\n");
     if !subpaths.is_empty() {
@@ -571,6 +636,7 @@ fn macos_escalated_profile() -> String {
         }
         profile.push_str(")\n");
     }
+    push_read_denies(&mut profile);
     profile
 }
 
@@ -578,6 +644,19 @@ fn macos_escalated_profile() -> String {
 #[cfg(target_os = "macos")]
 fn sbpl_escape(s: &str) -> String {
     s.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+/// Escape a literal path for use inside an SBPL `regex #"…"` filter.
+#[cfg(target_os = "macos")]
+fn sbpl_regex_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        if "\\^$.|?*+()[]{}\"".contains(c) {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -616,10 +695,9 @@ fn linux_writable_paths(cwd: &Path, profile: SandboxProfile) -> Vec<PathBuf> {
     if profile == SandboxProfile::Workspace
         && let Some(home) = crate::services::system_env::home_dir()
     {
-        // Dev-tool caches, deliberately NOT `~/.config`: that holds aivo's own
-        // encrypted key store (`~/.config/aivo`) and every app's config, which
-        // the agent shouldn't be able to silently rewrite. A command that
-        // genuinely needs to write there hits the escalation prompt instead.
+        // Dev-tool caches and aivo's own config dir (`aivo keys …`), deliberately
+        // NOT `~/.config` as a whole: other apps' config shouldn't be silently
+        // rewritable.
         for sub in [
             ".cache",
             ".cargo",
@@ -631,6 +709,7 @@ fn linux_writable_paths(cwd: &Path, profile: SandboxProfile) -> Vec<PathBuf> {
         ] {
             candidates.push(home.join(sub));
         }
+        candidates.push(crate::services::paths::config_dir());
     }
     // Landlock add_rule fails on a non-existent path; only keep present ones.
     candidates.retain(|p| p.exists());
@@ -776,10 +855,15 @@ mod macos_tests {
         assert!(profile.contains("(subpath \"/Users/x/proj\")"));
         // Temp is always writable (macOS $TMPDIR lives under /var/folders).
         assert!(profile.contains("/private/var/folders"));
-        // Reads/exec/network are not denied.
         assert!(profile.contains("(allow default)"));
-        assert!(!profile.contains("(deny file-read"));
         assert!(!profile.contains("(deny network"));
+        assert!(profile.contains("(deny file-read-data"));
+        assert!(!profile.contains("(deny file-read*"));
+        assert!(profile.contains(".gnupg"));
+        assert!(!profile.contains("config.json"));
+        assert!(profile.contains("(allow file-read-data"));
+        assert!(profile.contains("known_hosts"));
+        assert!(profile.contains("\\.pub$"));
         // Package prefixes writable under Workspace only.
         assert!(profile.contains("/opt/homebrew"));
     }
@@ -793,9 +877,8 @@ mod macos_tests {
         assert!(profile.contains("(deny network*)"));
         // Temp scratch stays writable so read-only tools can still run.
         assert!(profile.contains("/private/var/folders"));
-        // Reads still open.
         assert!(profile.contains("(allow default)"));
-        assert!(!profile.contains("(deny file-read"));
+        assert!(profile.contains("(deny file-read-data"));
     }
 
     #[test]
@@ -815,12 +898,57 @@ mod macos_tests {
         assert!(!profile.contains("(allow file-write*"));
         assert!(profile.contains("(deny file-write*"));
         let config = crate::services::paths::config_dir();
-        assert!(profile.contains(&format!("(subpath \"{}\")", config.display())));
+        assert!(!profile.contains(&format!("(subpath \"{}\")", config.display())));
         if let Some(home) = crate::services::system_env::home_dir() {
             assert!(profile.contains(&format!("(subpath \"{}\")", home.join(".ssh").display())));
+            // `mv ~/.gnupg/… /tmp && cat` stays closed after escalation.
+            assert!(profile.contains(&format!("(subpath \"{}\")", home.join(".gnupg").display())));
         }
-        assert!(!profile.contains("(deny file-read"));
+        assert!(profile.contains("(deny file-read-data"));
         assert!(!profile.contains("(deny network"));
+    }
+
+    /// End-to-end through the kernel: the profile must parse under `sandbox-exec`
+    /// and enforce the read-deny. Fast-passes where seatbelt can't nest.
+    #[test]
+    fn read_denies_enforced_by_seatbelt() {
+        if !nestable() {
+            return;
+        }
+        let home = crate::services::system_env::home_dir().unwrap();
+        let ssh = home.join(".ssh");
+        std::fs::create_dir_all(&ssh).unwrap();
+        std::fs::write(ssh.join("id_test"), "PRIVATE").unwrap();
+        std::fs::write(ssh.join("known_hosts"), "host key").unwrap();
+        let config = crate::services::paths::config_dir();
+        std::fs::create_dir_all(config.join("logs")).unwrap();
+        std::fs::write(config.join("config.json"), "{}").unwrap();
+        std::fs::write(config.join("logs").join("logs.db"), "db").unwrap();
+        let profile = macos_profile(&home, SandboxProfile::Workspace);
+        let run = |cmd: &str| {
+            std::process::Command::new(SANDBOX_EXEC)
+                .args(["-p", &profile, "sh", "-c", cmd])
+                .output()
+                .unwrap()
+        };
+        {
+            let secret = ssh.join("id_test");
+            let out = run(&format!("cat {}", secret.display()));
+            assert!(
+                !out.status.success(),
+                "read of {} not denied",
+                secret.display()
+            );
+            assert!(String::from_utf8_lossy(&out.stderr).contains("Operation not permitted"));
+        }
+        for ok in [
+            format!("cat {}", ssh.join("known_hosts").display()),
+            format!("cat {}", config.join("config.json").display()),
+            format!("cat {}", config.join("logs").join("logs.db").display()),
+            format!("ls -la {}", home.display()),
+        ] {
+            assert!(run(&ok).status.success(), "`{ok}` blocked");
+        }
     }
 
     #[test]

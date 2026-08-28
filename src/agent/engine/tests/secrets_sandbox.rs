@@ -141,10 +141,12 @@ async fn bash_write_to_protected_root_prompts_even_under_auto_approve() {
         return;
     }
     let dir = tmp();
-    let config = crate::services::paths::config_dir();
+    let ssh = crate::services::system_env::home_dir()
+        .unwrap()
+        .join(".ssh");
     // The write must fail on the sandbox (EPERM), not on a missing parent (ENOENT).
-    std::fs::create_dir_all(&config).unwrap();
-    let target = config.join(format!("aivo_floor_{}.txt", std::process::id()));
+    std::fs::create_dir_all(&ssh).unwrap();
+    let target = ssh.join(format!("aivo_floor_{}.txt", std::process::id()));
     let _ = std::fs::remove_file(&target);
     let cmd = format!("echo pwn > '{}'", target.display());
     let bash = tool_call_sse("run_bash", json!({ "command": cmd }));
@@ -170,9 +172,9 @@ async fn bash_write_to_protected_root_prompts_even_under_auto_approve() {
     assert!(!existed, "denied protected write still landed");
 }
 
-/// A protected write whose command never NAMES the path (`aivo keys add`
-/// computes it internally; the denial line is the only evidence) skips the
-/// futile escalated re-run: one confirm, then straight to unconfined.
+/// A protected write whose command never NAMES the path (a script computes it;
+/// the denial line is the only evidence) skips the futile escalated re-run: one
+/// confirm, then straight to unconfined.
 #[cfg(target_os = "macos")]
 #[tokio::test]
 async fn denial_named_protected_root_skips_escalated_rerun() {
@@ -180,9 +182,11 @@ async fn denial_named_protected_root_skips_escalated_rerun() {
         return;
     }
     let dir = tmp();
-    let config = crate::services::paths::config_dir();
-    std::fs::create_dir_all(&config).unwrap();
-    let target = config.join(format!("aivo_denial_floor_{}.txt", std::process::id()));
+    let ssh = crate::services::system_env::home_dir()
+        .unwrap()
+        .join(".ssh");
+    std::fs::create_dir_all(&ssh).unwrap();
+    let target = ssh.join(format!("aivo_denial_floor_{}.txt", std::process::id()));
     let _ = std::fs::remove_file(&target);
     // Indirection keeps the path out of the command text.
     let pathfile = dir.join("target-path.txt");
@@ -280,16 +284,13 @@ async fn sandbox_block_reruns_outside_when_approved() {
 }
 
 /// The protected floor holds when the workspace CONTAINS a protected root: with
-/// `cwd = $HOME` a config-dir write never "escapes". Pure path math, runs everywhere.
+/// `cwd = $HOME` a `~/.ssh` write never "escapes". Pure path math, runs everywhere.
 #[tokio::test]
 async fn protected_write_prompts_even_when_cwd_contains_the_root() {
     let home = crate::services::system_env::home_dir().expect("test HOME");
-    let config = crate::services::paths::config_dir();
-    if !config.starts_with(&home) {
-        return; // AIVO_CONFIG_DIR points elsewhere; the containment case can't arise
-    }
-    std::fs::create_dir_all(&config).unwrap();
-    let target = config.join(format!("aivo_contained_{}.txt", std::process::id()));
+    let ssh = home.join(".ssh");
+    std::fs::create_dir_all(&ssh).unwrap();
+    let target = ssh.join(format!("aivo_contained_{}.txt", std::process::id()));
     let _ = std::fs::remove_file(&target);
 
     let call = tool_call_sse(

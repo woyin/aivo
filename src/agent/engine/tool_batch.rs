@@ -750,9 +750,10 @@ Before calling `{tool}` again, make its arguments match this schema exactly:\n{s
     }
 
     /// Run a `run_bash` call confined to the workspace. If the OS sandbox blocks a
-    /// write, offer to re-run outside the sandbox (same approval flow) instead of a
-    /// dead-end error. Auto-approve / a prior "always" skip that prompt; off a TTY it
-    /// fails closed, so the blocked result (with its hint) flows back.
+    /// write (or a protected-path read), offer to re-run outside the sandbox (same
+    /// approval flow) instead of a dead-end error. Auto-approve / a prior "always"
+    /// skip that prompt; off a TTY it fails closed, so the blocked result (with its
+    /// hint) flows back.
     ///
     /// The approved re-run still denies the protected roots where enforceable;
     /// a command that hits (or names) one is confirmed per call even under
@@ -784,17 +785,17 @@ Before calling `{tool}` again, make its arguments match this schema exactly:\n{s
             outcome.blocked_protected || tools::command_mentions_protected_path(command);
         if hits_protected || !floor_enforced {
             let why = if tools::command_mentions_protected_path(command) {
-                "and it names a protected path (aivo's config dir or ~/.ssh)"
+                "and it names a protected path (~/.ssh or ~/.gnupg)"
             } else if outcome.blocked_protected {
-                "and the denial shows it writes to a protected path (aivo's config dir \
-or ~/.ssh), which the sandbox escalation deliberately excludes"
+                "and the denial shows it touches a protected path (~/.ssh or \
+~/.gnupg), which the sandbox escalation deliberately excludes"
             } else {
-                "and on this platform re-running it lifts write confinement entirely — \
-protected paths (aivo's config dir, ~/.ssh) included"
+                "and on this platform re-running it lifts confinement entirely — \
+protected paths (~/.ssh, ~/.gnupg) included"
             };
             let preview = format!(
                 "{command}\n\nThe workspace sandbox blocked this, {why}. Re-run the full \
-command with no write confinement?"
+command with no sandbox confinement?"
             );
             let action = PermissionAction::Once {
                 ask_name: "run_bash_unsandboxed",
@@ -857,8 +858,8 @@ Re-run the full command without write confinement?",
         let action = PermissionAction::Once {
             ask_name: "run_bash_unsandboxed",
             preview: Some(format!(
-                "{command}\n\nStill blocked after escalation: it writes to a protected path \
-(aivo's config dir or ~/.ssh). Re-run with no write confinement at all?"
+                "{command}\n\nStill blocked after escalation: it touches a protected path \
+(~/.ssh or ~/.gnupg). Re-run with no confinement at all?"
             )),
         };
         if !self.resolve_permission(ctx, ui, action).await.allowed() {
@@ -914,8 +915,8 @@ Add {root} to this session's writable roots?",
             PermissionAction::Once {
                 ask_name: "write_outside_workspace",
                 preview: Some(format!(
-                    "{name}: {joined}\n\nThis writes to a protected path (aivo's config dir or \
-~/.ssh). Allow this write?"
+                    "{name}: {joined}\n\nThis writes to a protected path (~/.ssh or \
+~/.gnupg). Allow this write?"
                 )),
             }
         } else {

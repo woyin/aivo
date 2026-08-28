@@ -153,10 +153,12 @@ async fn confined_block_on_protected_root_sets_blocked_protected() {
         return;
     }
     let dir = tmp();
-    let config = crate::services::paths::config_dir();
+    let ssh = crate::services::system_env::home_dir()
+        .unwrap()
+        .join(".ssh");
     // The write must fail on the sandbox (EPERM), not on a missing parent (ENOENT).
-    std::fs::create_dir_all(&config).unwrap();
-    let target = config.join(format!("aivo_prot_flag_{}.txt", std::process::id()));
+    std::fs::create_dir_all(&ssh).unwrap();
+    let target = ssh.join(format!("aivo_prot_flag_{}.txt", std::process::id()));
     let _ = std::fs::remove_file(&target);
     let cmd = json!({ "command": format!("touch '{}'", target.display()) });
     let outcome = run_bash_confined(&cmd, &dir, None).await;

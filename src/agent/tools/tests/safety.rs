@@ -59,12 +59,18 @@ fn denial_line_path_corroboration_needs_an_escaping_absolute_path() {
 #[test]
 fn denial_line_protected_root_detection() {
     let cwd = tmp();
+    let home = crate::services::system_env::home_dir().unwrap();
+    let line = format!(
+        "Error: Failed to open lock file: {:?}: Operation not permitted (os error 1)",
+        home.join(".gnupg").join("gnupg.lock")
+    );
+    assert!(denial_line_names_protected_path(&line, &cwd));
     let config = crate::services::paths::config_dir();
     let line = format!(
         "Error: Failed to open lock file: {:?}: Operation not permitted (os error 1)",
         config.join("config.lock")
     );
-    assert!(denial_line_names_protected_path(&line, &cwd));
+    assert!(!denial_line_names_protected_path(&line, &cwd));
     let line = "ssh: ~/.ssh/id_ed25519: Operation not permitted";
     assert!(denial_line_names_protected_path(line, &cwd));
     // An ordinary out-of-workspace path is escaping but not protected.
@@ -261,14 +267,15 @@ fn escaping_write_paths_flags_only_outside_targets() {
 }
 
 #[test]
-fn protected_write_paths_cover_config_and_ssh_only() {
+fn protected_write_paths_cover_ssh_and_gnupg_only() {
     let dir = tmp();
     let config = crate::services::paths::config_dir();
-    assert!(write_path_is_protected(
+    assert!(!write_path_is_protected(
         &config.join("config.json").display().to_string(),
         &dir
     ));
     assert!(write_path_is_protected("~/.ssh/authorized_keys", &dir));
+    assert!(write_path_is_protected("~/.gnupg/pubring.kbx", &dir));
     assert!(!write_path_is_protected("~/notes.txt", &dir));
     assert!(!write_path_is_protected("in-repo.txt", &dir));
 }
@@ -276,7 +283,7 @@ fn protected_write_paths_cover_config_and_ssh_only() {
 #[test]
 fn command_mentions_protected_path_matches_common_spellings() {
     let config = crate::services::paths::config_dir();
-    assert!(command_mentions_protected_path(&format!(
+    assert!(!command_mentions_protected_path(&format!(
         "cat x > {}/config.json",
         config.display()
     )));

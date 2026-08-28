@@ -1035,7 +1035,9 @@ pub struct CodeArgs {
     /// (default — confine shell writes to the workspace + caches), `read-only`
     /// (no writes anywhere, no child network — also blocks the agent's own edit
     /// tools), or `strict` (writes confined to the workspace + temp, no child
-    /// network). Child-network denial is macOS-only (Landlock can't gate network).
+    /// network). Every profile also denies shell reads of credential paths
+    /// (~/.ssh keys, ~/.gnupg, aivo's key store). Child-network and read denial
+    /// are macOS-only (Landlock can't express either).
     #[arg(
         long = "sandbox",
         value_name = "PROFILE",

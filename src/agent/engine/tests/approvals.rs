@@ -744,11 +744,14 @@ async fn write_file_outside_workspace_prompts_and_deny_refuses() {
     );
 }
 
-/// A write under aivo's own config dir prompts even under auto-approve.
+/// A write under `~/.ssh` prompts even under auto-approve.
 #[tokio::test]
 async fn write_file_to_protected_root_prompts_even_under_auto_approve() {
     let dir = tmp();
-    let target = crate::services::paths::config_dir().join("pwned.json");
+    let target = crate::services::system_env::home_dir()
+        .expect("test HOME")
+        .join(".ssh")
+        .join("pwned_key");
     let sse = tool_call_sse(
         "write_file",
         json!({"path": target.display().to_string(), "content": "PWN"}),
