@@ -25,6 +25,7 @@ fn add_dir_roots_count_as_workspace_for_writes() {
     ));
 }
 
+#[cfg(unix)]
 #[test]
 fn denial_line_path_corroboration_needs_an_escaping_absolute_path() {
     let cwd = tmp();
@@ -56,6 +57,7 @@ fn denial_line_path_corroboration_needs_an_escaping_absolute_path() {
 
 /// A denial line naming a path under a protected root is the evidence that lets
 /// the engine skip the escalated re-run (whose profile denies the same roots).
+#[cfg(unix)]
 #[test]
 fn denial_line_protected_root_detection() {
     let cwd = tmp();
