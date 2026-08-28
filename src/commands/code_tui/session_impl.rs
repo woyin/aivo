@@ -178,14 +178,15 @@ impl CodeTuiApp {
             if self.model_supports_thinking {
                 let on = self.thinking_enabled;
                 self.set_thinking_enabled(!on).await;
+                self.flash_thinking_state();
             } else {
-                self.notice = Some((MUTED(), format!("{} has no thinking to cycle", self.model)));
+                self.show_center_toast(format!("{} has no thinking to cycle", self.model));
             }
             return;
         }
         if !self.thinking_enabled {
             let level = levels[0].clone();
-            self.apply_reasoning_effort(level).await;
+            self.cycle_to_effort(level).await;
             return;
         }
         let pos = self
@@ -194,16 +195,40 @@ impl CodeTuiApp {
         match pos {
             Some(idx) if idx + 1 < levels.len() => {
                 let level = levels[idx + 1].clone();
-                self.apply_reasoning_effort(level).await;
+                self.cycle_to_effort(level).await;
             }
             // Highest level (or an unknown one) wraps around — through off
             // where it exists, else straight back to the lowest level.
-            _ if self.thinking_off_selectable() => self.set_thinking_enabled(false).await,
+            _ if self.thinking_off_selectable() => {
+                self.set_thinking_enabled(false).await;
+                self.flash_thinking_state();
+            }
             _ => {
                 let level = levels[0].clone();
-                self.apply_reasoning_effort(level).await;
+                self.cycle_to_effort(level).await;
             }
         }
+    }
+
+    /// A Ctrl+T step onto `level`: the fading flash replaces the lingering
+    /// notice `apply_reasoning_effort` leaves.
+    async fn cycle_to_effort(&mut self, level: String) {
+        self.apply_reasoning_effort(level).await;
+        self.notice = None;
+        self.flash_thinking_state();
+    }
+
+    /// Center-toast the thinking state the cycle just landed on.
+    fn flash_thinking_state(&mut self) {
+        let text = if !self.thinking_enabled {
+            "Thinking off".to_string()
+        } else {
+            match self.effective_reasoning_effort() {
+                Some(level) => format!("Thinking: {level}"),
+                None => "Thinking on".to_string(),
+            }
+        };
+        self.show_center_toast(text);
     }
 
     /// The effort the engine will request while thinking is on: the user's

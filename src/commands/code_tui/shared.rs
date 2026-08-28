@@ -415,6 +415,9 @@ pub(super) const DEFAULT_CHAT_SCROLL_SPEED: usize = 3;
 pub(super) const MAX_CHAT_SCROLL_SPEED: usize = 50;
 pub(super) const TOAST_DURATION: Duration = Duration::from_secs(3);
 pub(super) const TOAST_FADE_AFTER: Duration = Duration::from_secs(2);
+// Center toasts overlap the transcript, so they get out of the way faster.
+pub(super) const CENTER_TOAST_DURATION: Duration = Duration::from_millis(2000);
+pub(super) const CENTER_TOAST_FADE_AFTER: Duration = Duration::from_millis(1200);
 /// How long the selection stays lit in the bright "just copied" color before
 /// it auto-clears (amp-style flash). Kept short so it reads as a confirmation.
 pub(super) const SELECTION_FLASH_DURATION: Duration = Duration::from_millis(550);
@@ -2577,14 +2580,35 @@ pub(super) struct ClickTracker {
     pub(super) count: u8,
 }
 
-/// A brief floating confirmation (top-right) that auto-expires and fades — used
-/// for copy confirmations and transient mode toggles (e.g. auto-approve), so
-/// they flash and vanish instead of lingering in the transcript.
+/// A brief floating confirmation that auto-expires and fades — used for copy
+/// confirmations and transient mode toggles (e.g. auto-approve), so they flash
+/// and vanish instead of lingering in the transcript.
 #[derive(Clone, Debug)]
 pub(super) struct Toast {
     pub(super) text: String,
-    pub(super) created_at: Instant,
     pub(super) expires_at: Instant,
+    pub(super) anchor: ToastAnchor,
+}
+
+/// `Corner`: quiet confirmations bottom-right. `Center`: mid-transcript, for
+/// state flips the eye must not miss (e.g. the Ctrl+T thinking cycle).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum ToastAnchor {
+    Corner,
+    Center,
+}
+
+/// Blend `from` toward `to` (t: 0→1); non-`Rgb` pairs snap at halfway.
+pub(super) fn fade_color(from: Color, to: Color, t: f32) -> Color {
+    let t = t.clamp(0.0, 1.0);
+    match (from, to) {
+        (Color::Rgb(r1, g1, b1), Color::Rgb(r2, g2, b2)) => {
+            let mix = |a: u8, b: u8| (f32::from(a) + (f32::from(b) - f32::from(a)) * t) as u8;
+            Color::Rgb(mix(r1, r2), mix(g1, g2), mix(b1, b2))
+        }
+        _ if t < 0.5 => from,
+        _ => to,
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

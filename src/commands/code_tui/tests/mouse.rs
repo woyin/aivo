@@ -258,8 +258,8 @@ fn test_copy_toast_expires_without_touching_transcript_notice() {
     app.notice = None;
     app.toast = Some(Toast {
         text: "Copied selection".to_string(),
-        created_at: Instant::now() - TOAST_DURATION,
         expires_at: Instant::now() - Duration::from_millis(1),
+        anchor: ToastAnchor::Corner,
     });
     let backend = TestBackend::new(40, 8);
     let mut terminal = Terminal::new(backend).unwrap();
@@ -285,8 +285,8 @@ fn test_copy_toast_anchors_bottom_right() {
     app.composer_text_area = Some(Rect::new(0, 10, 40, 2));
     app.toast = Some(Toast {
         text: "Copied 5 chars".to_string(),
-        created_at: Instant::now(),
         expires_at: Instant::now() + TOAST_DURATION,
+        anchor: ToastAnchor::Corner,
     });
     let mut terminal = Terminal::new(TestBackend::new(40, 12)).unwrap();
     terminal
@@ -311,6 +311,43 @@ fn test_copy_toast_anchors_bottom_right() {
         "toast must not render at the top: {:?}",
         row_text(0)
     );
+}
+
+#[test]
+fn test_center_toast_floats_mid_transcript() {
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.notice = None;
+    app.composer_text_area = Some(Rect::new(0, 18, 40, 2));
+    app.toast = Some(Toast {
+        text: "Thinking: high".to_string(),
+        expires_at: Instant::now() + CENTER_TOAST_DURATION,
+        anchor: ToastAnchor::Center,
+    });
+    let mut terminal = Terminal::new(TestBackend::new(40, 20)).unwrap();
+    terminal
+        .draw(|frame| app.render_toast(frame, frame.area()))
+        .unwrap();
+    let buf = terminal.backend().buffer();
+
+    let row_text = |y: u16| -> String {
+        (0..40)
+            .map(|x| buf.cell((x, y)).unwrap().symbol().to_owned())
+            .collect()
+    };
+    // Transcript = rows 0–16, so the chip's text row lands mid-transcript.
+    let text_row = (0..20)
+        .find(|y| row_text(*y).contains("Thinking: high"))
+        .expect("center toast text rendered");
+    assert!(
+        (7..=9).contains(&text_row),
+        "text row should sit mid-transcript, got {text_row}"
+    );
+    let start = row_text(text_row).find("Thinking").unwrap();
+    assert!((9..=13).contains(&start), "unexpected left margin {start}");
 }
 
 #[tokio::test]

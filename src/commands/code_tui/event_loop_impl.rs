@@ -2925,11 +2925,20 @@ impl CodeTuiApp {
     /// toggles). Unlike `notice`, it fades on its own instead of lingering until
     /// the next turn.
     pub(super) fn show_toast(&mut self, text: impl Into<String>) {
-        let created_at = Instant::now();
         self.toast = Some(Toast {
             text: text.into(),
-            created_at,
-            expires_at: created_at + TOAST_DURATION,
+            expires_at: Instant::now() + TOAST_DURATION,
+            anchor: ToastAnchor::Corner,
+        });
+    }
+
+    /// Flash a fading hint centered over the transcript — for state flips whose
+    /// only other trace is a footer badge. Shares the one toast slot.
+    pub(super) fn show_center_toast(&mut self, text: impl Into<String>) {
+        self.toast = Some(Toast {
+            text: text.into(),
+            expires_at: Instant::now() + CENTER_TOAST_DURATION,
+            anchor: ToastAnchor::Center,
         });
     }
 

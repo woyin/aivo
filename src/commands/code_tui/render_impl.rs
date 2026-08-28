@@ -3226,35 +3226,55 @@ impl CodeTuiApp {
 
         let text_width = display_width(&toast.text).min(usize::from(area.width));
         let toast_width = (text_width as u16).saturating_add(4).min(area.width.max(1));
-        // Anchor bottom-right: float on the last transcript row, just above the
-        // composer rule, so the confirmation appears near where the user acted
-        // without clobbering the divider, composer, or footer. Falls back to the
-        // top edge before the first layout records the composer area.
-        let anchor_y = self
-            .composer_text_area
-            .map(|c| c.y.saturating_sub(2))
-            .unwrap_or(area.y);
-        let toast_area = Rect {
-            x: area
-                .x
-                .saturating_add(area.width.saturating_sub(toast_width)),
-            y: anchor_y,
-            width: toast_width,
-            height: 1,
+        let (toast_area, fade_window) = match toast.anchor {
+            // Last transcript row, above the composer rule, near where the user acted.
+            ToastAnchor::Corner => (
+                Rect {
+                    x: area
+                        .x
+                        .saturating_add(area.width.saturating_sub(toast_width)),
+                    y: self
+                        .composer_text_area
+                        .map(|c| c.y.saturating_sub(2))
+                        .unwrap_or(area.y),
+                    width: toast_width,
+                    height: 1,
+                },
+                TOAST_DURATION - TOAST_FADE_AFTER,
+            ),
+            // Mid-transcript chip: 3 rows where there's room, 1 otherwise.
+            ToastAnchor::Center => {
+                let region = self
+                    .composer_text_area
+                    .map(|c| c.y.saturating_sub(1))
+                    .unwrap_or(area.bottom())
+                    .saturating_sub(area.y);
+                let height = if region >= 5 { 3 } else { 1 };
+                (
+                    Rect {
+                        x: area
+                            .x
+                            .saturating_add(area.width.saturating_sub(toast_width) / 2),
+                        y: area.y.saturating_add(region.saturating_sub(height) / 2),
+                        width: toast_width,
+                        height,
+                    },
+                    CENTER_TOAST_DURATION - CENTER_TOAST_FADE_AFTER,
+                )
+            }
         };
-        let color = if now.duration_since(toast.created_at) >= TOAST_FADE_AFTER {
-            FAINT()
-        } else {
-            ACCENT()
-        };
+        // Cells have no alpha: fading = blending the text into the pill bg.
+        let remaining = toast.expires_at.duration_since(now).as_secs_f32();
+        let t = 1.0 - (remaining / fade_window.as_secs_f32()).min(1.0);
+        let color = fade_color(ACCENT(), palette().toast_bg, t);
+        let mut lines = vec![Line::default(); usize::from(toast_area.height / 2)];
+        lines.push(
+            Line::from(Span::styled(&toast.text, Style::default().fg(color)))
+                .alignment(ratatui::layout::Alignment::Center),
+        );
         clear_to_canvas(frame, toast_area);
         frame.render_widget(
-            Paragraph::new(Line::from(vec![
-                Span::raw(" "),
-                Span::styled(&toast.text, Style::default().fg(color)),
-                Span::raw(" "),
-            ]))
-            .style(Style::default().bg(palette().toast_bg)),
+            Paragraph::new(lines).style(Style::default().bg(palette().toast_bg)),
             toast_area,
         );
     }

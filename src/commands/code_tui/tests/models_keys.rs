@@ -270,11 +270,17 @@ async fn test_cycle_reasoning_effort_rings_through_off() {
     app.cycle_reasoning_effort().await;
     assert_eq!(app.reasoning_effort.as_deref(), Some("high"));
     assert!(app.thinking_enabled);
+    // Each step flashes a center toast, never a notice that would pile up.
+    let toast = app.toast.as_ref().unwrap();
+    assert_eq!(toast.text, "Thinking: high");
+    assert_eq!(toast.anchor, ToastAnchor::Center);
+    assert!(app.notice.is_none(), "cycle leaves no lingering notice");
 
     // Top of the scale wraps to off; the level stays remembered.
     app.cycle_reasoning_effort().await;
     assert!(!app.thinking_enabled);
     assert_eq!(app.reasoning_effort.as_deref(), Some("high"));
+    assert_eq!(app.toast.as_ref().unwrap().text, "Thinking off");
 
     // Off resumes at the lowest level.
     app.cycle_reasoning_effort().await;
@@ -289,11 +295,13 @@ async fn test_cycle_reasoning_effort_rings_through_off() {
     app.cycle_reasoning_effort().await;
     assert!(app.thinking_enabled);
 
-    // No thinking at all: notice only, nothing flips.
+    // No thinking at all: a fading flash only, nothing flips.
     app.model_supports_thinking = false;
     app.cycle_reasoning_effort().await;
     assert!(app.thinking_enabled, "unchanged without thinking support");
-    assert!(app.notice.as_ref().unwrap().1.contains("no thinking"));
+    let toast = app.toast.as_ref().unwrap();
+    assert!(toast.text.contains("no thinking"));
+    assert_eq!(toast.anchor, ToastAnchor::Center);
 }
 
 /// Opening the model picker mid-turn must NOT cancel the in-flight turn (it
