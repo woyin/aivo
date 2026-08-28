@@ -79,6 +79,15 @@ fn enter_is_paste_newline(pending: &mut Option<crossterm::event::Event>) -> bool
 }
 
 fn term_edit_line(prompt: &str, initial: &str) -> std::io::Result<String> {
+    term_edit_line_masked(prompt, initial, |_| false)
+}
+
+// `term_edit_line` that echoes `*` per char whenever `should_mask(buf)` holds.
+fn term_edit_line_masked(
+    prompt: &str,
+    initial: &str,
+    should_mask: impl Fn(&[char]) -> bool,
+) -> std::io::Result<String> {
     use std::io::Write;
 
     if !crate::tui::prompt_interactive() {
@@ -106,17 +115,26 @@ fn term_edit_line(prompt: &str, initial: &str) -> std::io::Result<String> {
         start_col: u16,
         buf: &[char],
         cursor: usize,
+        masked: bool,
     ) -> std::io::Result<()> {
-        let cursor_w: u16 = buf[..cursor]
-            .iter()
-            .map(|c| UnicodeWidthChar::width(*c).unwrap_or(0) as u16)
-            .sum();
+        let cursor_w: u16 = if masked {
+            cursor as u16
+        } else {
+            buf[..cursor]
+                .iter()
+                .map(|c| UnicodeWidthChar::width(*c).unwrap_or(0) as u16)
+                .sum()
+        };
         queue!(
             stdout,
             MoveToColumn(start_col),
             Clear(ClearType::UntilNewLine)
         )?;
-        write!(stdout, "{}", buf.iter().collect::<String>())?;
+        if masked {
+            write!(stdout, "{}", "*".repeat(buf.len()))?;
+        } else {
+            write!(stdout, "{}", buf.iter().collect::<String>())?;
+        }
         queue!(stdout, MoveToColumn(start_col.saturating_add(cursor_w)))?;
         stdout.flush()
     }
@@ -132,7 +150,7 @@ fn term_edit_line(prompt: &str, initial: &str) -> std::io::Result<String> {
 
     let mut buf: Vec<char> = initial.chars().collect();
     let mut cursor = buf.len();
-    let _ = render(&mut stdout, start_col, &buf, cursor);
+    let _ = render(&mut stdout, start_col, &buf, cursor, should_mask(&buf));
 
     let mut pending: Option<Event> = None;
     let result = loop {
@@ -210,7 +228,7 @@ fn term_edit_line(prompt: &str, initial: &str) -> std::io::Result<String> {
                     }
                     _ => continue,
                 }
-                let _ = render(&mut stdout, start_col, &buf, cursor);
+                let _ = render(&mut stdout, start_col, &buf, cursor, should_mask(&buf));
             }
             // Insert pasted text at the cursor, stripping control chars (newlines,
             // tabs) so a multi-line paste doesn't submit early or smuggle bytes in.
@@ -219,7 +237,7 @@ fn term_edit_line(prompt: &str, initial: &str) -> std::io::Result<String> {
                     buf.insert(cursor, c);
                     cursor += 1;
                 }
-                let _ = render(&mut stdout, start_col, &buf, cursor);
+                let _ = render(&mut stdout, start_col, &buf, cursor, should_mask(&buf));
             }
             Ok(_) => {}
             Err(e) => break Err(e),
@@ -568,6 +586,81 @@ async fn fetch_export_from_url(url: &str) -> Result<String> {
         total.extend_from_slice(&chunk);
     }
     String::from_utf8(total).context("export file body is not valid UTF-8")
+}
+
+/// Sizes the echo erase in `mask_echoed_secret` — keep plain ASCII.
+const DUAL_CREDENTIAL_PROMPT: &str = "Base URL or API key: ";
+
+/// Scheme-less URL (`host[:port][/path]`) rather than an API key — such input
+/// gets the "must start with http(s)://" error instead of being stored as a secret.
+fn looks_like_schemeless_url(input: &str) -> bool {
+    if !input
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '/' | ':'))
+    {
+        return false;
+    }
+    let host = input.split(['/', ':']).next().unwrap_or("");
+    if host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    let labels: Vec<&str> = host.split('.').collect();
+    if labels.len() < 2 || labels.iter().any(|l| l.is_empty()) {
+        return false;
+    }
+    let ipv4 = labels.len() == 4 && labels.iter().all(|l| l.chars().all(|c| c.is_ascii_digit()));
+    let last = labels.last().unwrap();
+    ipv4 || (last.len() >= 2 && last.chars().all(|c| c.is_ascii_alphabetic()))
+}
+
+/// Masked ⟺ the input would be classified as an API key on submit. Kicks in
+/// after 5 chars so short input and URLs being typed stay readable.
+fn credential_should_mask(buf: &[char]) -> bool {
+    if buf.len() <= 5 {
+        return false;
+    }
+    let s: String = buf.iter().collect();
+    !["http://", "https://"]
+        .iter()
+        .any(|p| s.starts_with(p) || p.starts_with(&s))
+        && !looks_like_schemeless_url(&s)
+}
+
+/// Erases the dual prompt's echoed rows, leaving only a masked key preview.
+fn mask_echoed_secret(key: &str) {
+    use std::io::Write;
+    let mut stdout = std::io::stdout();
+    if crate::tui::prompt_interactive() {
+        use crossterm::cursor::{MoveToColumn, MoveUp};
+        use crossterm::execute;
+        use crossterm::terminal::{self, Clear, ClearType};
+        use unicode_width::UnicodeWidthStr;
+        let cols = match terminal::size() {
+            Ok((c, _)) if c > 0 => c as usize,
+            _ => 80,
+        };
+        let width = DUAL_CREDENTIAL_PROMPT.len() + UnicodeWidthStr::width(key);
+        // Round down at exact column multiples (xenl terminals defer the wrap)
+        // and cap at the cursor row so a paste taller than the screen can't
+        // clear unrelated lines above.
+        let rows = ((width.saturating_sub(1) / cols + 1) as u16)
+            .min(crossterm::cursor::position().map_or(u16::MAX, |(_, row)| row));
+        if rows > 0 {
+            let _ = execute!(
+                stdout,
+                MoveUp(rows),
+                MoveToColumn(0),
+                Clear(ClearType::FromCursorDown)
+            );
+        }
+    }
+    let _ = writeln!(
+        stdout,
+        "{} {}",
+        style::dim("API Key:"),
+        style::cyan(key_preview(key))
+    );
+    let _ = stdout.flush();
 }
 
 // Creates a safe preview of an API key, handling short keys without panicking.
@@ -3095,21 +3188,45 @@ impl KeysCommand {
     }
 
     async fn add_custom_interactive(&self, name: &str) -> Result<ExitCode> {
-        keys_ui::step_header(3, 3, "Credentials", "base URL, then API key");
+        keys_ui::step_header(3, 3, "Credentials", "base URL and API key, either order");
+        // Either credential may come first, so a key already on the clipboard
+        // isn't lost to copying the URL.
+        let mut pasted_key: Option<String> = None;
         let base_url = loop {
-            let input = term_read_line(&style::dim("Base URL: "))?;
+            let input = if pasted_key.is_none() {
+                term_edit_line_masked(
+                    &style::dim(DUAL_CREDENTIAL_PROMPT),
+                    "",
+                    credential_should_mask,
+                )?
+            } else {
+                term_read_line(&style::dim("Base URL: "))?
+            };
             if input.is_empty() {
                 continue;
             }
-            match validate_base_url(&input) {
-                Ok(()) => break input,
-                Err(msg) => {
-                    eprintln!("{} {}", style::red("Error:"), msg);
+            if input.starts_with("http://") || input.starts_with("https://") {
+                match validate_base_url(&input) {
+                    Ok(()) => break input,
+                    Err(msg) => {
+                        eprintln!("{} {}", style::red("Error:"), msg);
+                    }
                 }
+            } else if pasted_key.is_none() && !looks_like_schemeless_url(&input) {
+                mask_echoed_secret(&input);
+                pasted_key = Some(input);
+            } else {
+                eprintln!(
+                    "{} URL must start with http:// or https://",
+                    style::red("Error:")
+                );
             }
         };
 
-        let key = prompt_secret("API Key: ", "an API key")?;
+        let key = match pasted_key {
+            Some(key) => key,
+            None => prompt_secret("API Key: ", "an API key")?,
+        };
 
         let name = if name.is_empty() {
             self.derived_key_name(&base_url).await
@@ -4772,6 +4889,49 @@ mod tests {
         ] {
             assert_eq!(key_preview(input), expected, "input: {input:?}");
         }
+    }
+
+    #[test]
+    fn schemeless_url_detection_splits_urls_from_keys() {
+        for url in [
+            "api.example.com",
+            "api.example.com/v1",
+            "www.Example.COM/openai/v1",
+            "localhost",
+            "localhost:11434/v1",
+            "127.0.0.1:8080",
+            "192.168.1.10/v1",
+            "host.docker.internal:11434",
+        ] {
+            assert!(looks_like_schemeless_url(url), "should be URL: {url:?}");
+        }
+        for key in [
+            "sk-proj-abc123DEF456ghi789",
+            "sk-ant-api03-AbC_dEf-123",
+            "gsk_abc123def456",
+            "AIzaSyA-1234567890_abcdef",
+            "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.abc123XYZ",
+            "token+with/slash",
+            "example.com.",
+        ] {
+            assert!(!looks_like_schemeless_url(key), "should be key: {key:?}");
+        }
+    }
+
+    #[test]
+    fn credential_mask_kicks_in_after_five_non_url_chars() {
+        let mask = |s: &str| credential_should_mask(&s.chars().collect::<Vec<_>>());
+        assert!(!mask("sk-ab"));
+        assert!(!mask(""));
+        assert!(!mask("https:"));
+        assert!(!mask("http:/"));
+        assert!(!mask("https://api.example.com"));
+        assert!(!mask("api.example.com"));
+        assert!(!mask("localhost:11434"));
+        assert!(mask("sk-abc"));
+        assert!(mask("sk-ant-api03-AbC_dEf"));
+        assert!(mask("gsk_abc123"));
+        assert!(mask("httpsX"));
     }
 
     #[test]
