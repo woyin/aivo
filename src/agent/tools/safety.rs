@@ -214,15 +214,26 @@ pub(super) fn command_escaping_paths(cmd: &str, cwd: &Path) -> Vec<String> {
     out
 }
 
-/// Evidence a masked exit code can't provide. Relative targets never qualify:
-/// they resolve against an unknowable in-command `cd`.
-pub(super) fn denial_line_names_escaping_path(line: &str, cwd: &Path) -> bool {
-    // git quotes the target (`Unable to create '<p>'`), coreutils delimits with colons.
-    let quoted = line.split('\'').skip(1).step_by(2);
+/// Path tokens in a denial line: git single-quotes, Rust `{:?}` double-quotes,
+/// coreutils colon-delimits. Relative paths never qualify (unknowable in-command `cd`).
+fn denial_line_paths(line: &str) -> impl Iterator<Item = &str> {
+    let single = line.split('\'').skip(1).step_by(2);
+    let double = line.split('"').skip(1).step_by(2);
     let fields = line.split(':').map(str::trim);
-    quoted
+    single
+        .chain(double)
         .chain(fields)
-        .any(|p| (p.starts_with('/') || p.starts_with("~/")) && path_escapes_cwd(p, cwd))
+        .filter(|p| p.starts_with('/') || p.starts_with("~/"))
+}
+
+/// Evidence a masked exit code can't provide.
+pub(super) fn denial_line_names_escaping_path(line: &str, cwd: &Path) -> bool {
+    denial_line_paths(line).any(|p| path_escapes_cwd(p, cwd))
+}
+
+/// Evidence the denial hit the protected floor itself.
+pub(super) fn denial_line_names_protected_path(line: &str, cwd: &Path) -> bool {
+    denial_line_paths(line).any(|p| write_path_is_protected(p, cwd))
 }
 
 /// Whether a write target resolves under a protected root — confirmed even

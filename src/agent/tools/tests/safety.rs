@@ -46,6 +46,30 @@ fn denial_line_path_corroboration_needs_an_escaping_absolute_path() {
         "Operation not permitted",
         &cwd
     ));
+    // Rust's `{:?}` double-quotes the path (`anyhow` context on a PathBuf).
+    let line = format!(
+        "Error: Failed to open lock file: {:?}: Operation not permitted (os error 1)",
+        outside.join("config.lock")
+    );
+    assert!(denial_line_names_escaping_path(&line, &cwd));
+}
+
+/// A denial line naming a path under a protected root is the evidence that lets
+/// the engine skip the escalated re-run (whose profile denies the same roots).
+#[test]
+fn denial_line_protected_root_detection() {
+    let cwd = tmp();
+    let config = crate::services::paths::config_dir();
+    let line = format!(
+        "Error: Failed to open lock file: {:?}: Operation not permitted (os error 1)",
+        config.join("config.lock")
+    );
+    assert!(denial_line_names_protected_path(&line, &cwd));
+    let line = "ssh: ~/.ssh/id_ed25519: Operation not permitted";
+    assert!(denial_line_names_protected_path(line, &cwd));
+    // An ordinary out-of-workspace path is escaping but not protected.
+    let line = format!("cp: {}/f.txt: Operation not permitted", tmp().display());
+    assert!(!denial_line_names_protected_path(&line, &cwd));
 }
 
 #[test]

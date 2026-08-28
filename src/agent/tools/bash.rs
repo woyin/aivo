@@ -11,6 +11,9 @@ use super::*;
 pub struct BashOutcome {
     pub result: Result<String, String>,
     pub sandbox_blocked: bool,
+    /// A denial line named a protected root — the escalated re-run would fail
+    /// identically, so the engine skips it.
+    pub blocked_protected: bool,
 }
 
 /// Live `run_bash` output chunks for the UI; never changes the final result.
@@ -392,6 +395,7 @@ pub(super) async fn run_bash_inner(
     let early = |result| BashOutcome {
         result,
         sandbox_blocked: false,
+        blocked_protected: false,
     };
     let command = match arg_str(args, "command") {
         Ok(c) => c,
@@ -504,22 +508,28 @@ pub(super) async fn run_bash_inner(
             .any(|l| denial_line_names_escaping_path(l, cwd))
             || !command_escaping_paths(command, cwd).is_empty()
     };
+    let mut blocked_protected = false;
     if sandbox_enforced && denial && (code != 0 || masked_corroborated()) {
         sandbox_blocked = true;
-        out.push_str(match confinement {
-            BashConfinement::Workspace => {
+        blocked_protected = stderr
+            .lines()
+            .chain(stdout.lines())
+            .filter(|l| denial_in(l))
+            .any(|l| denial_line_names_protected_path(l, cwd));
+        // The workspace note's remedies can't open a protected root.
+        out.push_str(
+            if blocked_protected || confinement != BashConfinement::Workspace {
+                "\n[note: blocked writing to a protected path (aivo's config dir or \
+~/.ssh) — the sandbox escalation deliberately excludes these. Only the user's explicit \
+per-command confirmation can open them.]"
+            } else {
                 "\n[note: blocked by the workspace write-sandbox, not a real command \
 failure — it wrote outside the agent's workspace. The user can approve adding the target \
 directory to the session's writable roots, or re-running the command outside the sandbox; \
 don't fall back to telling the user to run it by hand. Relaunching with `--add-dir <dir>` \
 (or AIVO_AGENT_NO_SANDBOX=1) also works.]"
-            }
-            _ => {
-                "\n[note: blocked writing to a protected path (aivo's config dir or \
-~/.ssh) — the sandbox escalation deliberately excludes these. Only the user's explicit \
-per-command confirmation can open them.]"
-            }
-        });
+            },
+        );
     }
     if out.is_empty() {
         out.push_str("(no output)");
@@ -537,6 +547,7 @@ per-command confirmation can open them.]"
     BashOutcome {
         result: Ok(result),
         sandbox_blocked,
+        blocked_protected,
     }
 }
 

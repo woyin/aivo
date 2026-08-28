@@ -126,6 +126,10 @@ async fn confined_flags_block_then_unconfined_succeeds() {
         confined.sandbox_blocked,
         "out-of-workspace write was not flagged as blocked"
     );
+    assert!(
+        !confined.blocked_protected,
+        "an ordinary out-of-workspace block must not read as the protected floor"
+    );
     assert!(!outside.exists(), "confined write escaped the sandbox");
     assert!(confined.result.unwrap().contains("write-sandbox"));
 
@@ -138,6 +142,33 @@ async fn confined_flags_block_then_unconfined_succeeds() {
         !out.contains("write-sandbox"),
         "unconfined output carried a sandbox hint: {out}"
     );
+}
+
+/// A denial line naming a protected root sets `blocked_protected` and gets the
+/// protected note, even at the workspace tier.
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn confined_block_on_protected_root_sets_blocked_protected() {
+    if !crate::agent::sandbox::active() {
+        return;
+    }
+    let dir = tmp();
+    let config = crate::services::paths::config_dir();
+    // The write must fail on the sandbox (EPERM), not on a missing parent (ENOENT).
+    std::fs::create_dir_all(&config).unwrap();
+    let target = config.join(format!("aivo_prot_flag_{}.txt", std::process::id()));
+    let _ = std::fs::remove_file(&target);
+    let cmd = json!({ "command": format!("touch '{}'", target.display()) });
+    let outcome = run_bash_confined(&cmd, &dir, None).await;
+    let existed = target.exists();
+    let _ = std::fs::remove_file(&target);
+    assert!(!existed, "confined protected write escaped the sandbox");
+    assert!(outcome.sandbox_blocked, "protected write was not flagged");
+    assert!(
+        outcome.blocked_protected,
+        "a denial naming a protected root must set blocked_protected"
+    );
+    assert!(outcome.result.unwrap().contains("protected path"));
 }
 
 /// Stdout denials flag too (harnesses like `cargo test` re-emit captured

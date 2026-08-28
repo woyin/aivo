@@ -170,6 +170,62 @@ async fn bash_write_to_protected_root_prompts_even_under_auto_approve() {
     assert!(!existed, "denied protected write still landed");
 }
 
+/// A protected write whose command never NAMES the path (`aivo keys add`
+/// computes it internally; the denial line is the only evidence) skips the
+/// futile escalated re-run: one confirm, then straight to unconfined.
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn denial_named_protected_root_skips_escalated_rerun() {
+    if !crate::agent::sandbox::active() {
+        return;
+    }
+    let dir = tmp();
+    let config = crate::services::paths::config_dir();
+    std::fs::create_dir_all(&config).unwrap();
+    let target = config.join(format!("aivo_denial_floor_{}.txt", std::process::id()));
+    let _ = std::fs::remove_file(&target);
+    // Indirection keeps the path out of the command text.
+    let pathfile = dir.join("target-path.txt");
+    std::fs::write(&pathfile, target.display().to_string()).unwrap();
+    let cmd = format!("touch \"$(cat '{}')\"", pathfile.display());
+    let bash = tool_call_sse("run_bash", json!({ "command": cmd }));
+    let port = spawn_sse_sequence(vec![bash, FINAL_TEXT_SSE.to_string()]);
+    let client = reqwest::Client::builder().no_proxy().build().unwrap();
+    let base = format!("http://127.0.0.1:{port}");
+    let mut engine = AgentEngine::new(&dir.display().to_string(), "m", "", &[], &[], 0, 0);
+    let mut ui = CapturingUi {
+        always_allow: true,
+        ..Default::default()
+    };
+    run_session(
+        &mut engine,
+        &turn_ctx(&client, &base, &dir),
+        Some("write config".into()),
+        &mut ui,
+    )
+    .await;
+
+    let existed = target.exists();
+    let _ = std::fs::remove_file(&target);
+    assert_eq!(
+        ui.ask_tools,
+        vec!["run_bash_unsandboxed"],
+        "the protected floor must be confirmed exactly once"
+    );
+    // Auto-approve covers the escalated tier without an ask but still notifies,
+    // so the notice count is what proves the re-run was skipped.
+    assert_eq!(
+        ui.notices
+            .iter()
+            .filter(|n| n.contains("outside the workspace sandbox"))
+            .count(),
+        1,
+        "expected a single re-run (no escalated attempt): {:?}",
+        ui.notices
+    );
+    assert!(existed, "approved protected write did not run unconfined");
+}
+
 /// Approving the escalation re-runs outside the sandbox, so the blocked out-of-workspace write now succeeds.
 #[cfg(target_os = "macos")]
 #[tokio::test]

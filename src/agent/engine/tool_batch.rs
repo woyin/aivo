@@ -778,9 +778,16 @@ Before calling `{tool}` again, make its arguments match this schema exactly:\n{s
         // elsewhere escalation is a bare shell and the textual heuristic is all
         // that's left, so confirm per call instead of waiving silently.
         let floor_enforced = crate::agent::sandbox::escalated_sandbox_active();
-        if tools::command_mentions_protected_path(command) || !floor_enforced {
+        // The escalated profile denies the same roots, so a protected hit skips
+        // that futile re-run (which would double-run earlier side effects).
+        let hits_protected =
+            outcome.blocked_protected || tools::command_mentions_protected_path(command);
+        if hits_protected || !floor_enforced {
             let why = if tools::command_mentions_protected_path(command) {
                 "and it names a protected path (aivo's config dir or ~/.ssh)"
+            } else if outcome.blocked_protected {
+                "and the denial shows it writes to a protected path (aivo's config dir \
+or ~/.ssh), which the sandbox escalation deliberately excludes"
             } else {
                 "and on this platform re-running it lifts write confinement entirely — \
 protected paths (aivo's config dir, ~/.ssh) included"
