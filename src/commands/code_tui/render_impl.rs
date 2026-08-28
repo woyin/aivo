@@ -808,10 +808,25 @@ impl CodeTuiApp {
         push_block(lines, bars, indent_sub_block(block), Some(SHELL()));
     }
 
+    /// A terminal agent error lands twice — the transient notice and a durable
+    /// `error` transcript entry. While that entry is the transcript's last
+    /// message the notice would repeat it directly beneath, so it stays hidden.
+    fn notice_repeats_last_error(&self) -> bool {
+        match (&self.notice, self.history.last()) {
+            (Some((color, text)), Some(last)) => {
+                *color == ERROR() && last.role == "error" && last.content == *text
+            }
+            _ => false,
+        }
+    }
+
     fn push_notice_block(&self, lines: &mut Vec<StyledLine>, bars: &mut Vec<Option<Color>>) {
         let Some((color, _)) = notice_display(self.notice.as_ref()) else {
             return;
         };
+        if self.notice_repeats_last_error() {
+            return;
+        }
         lines.push(blank_line());
         bars.push(None);
         let mut block = Vec::new();
@@ -1299,6 +1314,8 @@ impl CodeTuiApp {
             text.as_ref().hash(&mut hasher);
             format!("{color:?}").hash(&mut hasher);
         }
+        // History isn't hashed here, and the notice's visibility depends on it.
+        self.notice_repeats_last_error().hash(&mut hasher);
         hasher.finish()
     }
 

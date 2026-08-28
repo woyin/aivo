@@ -890,6 +890,15 @@ async fn test_agent_error_persists_in_transcript() {
         plain.contains("✗ the provider rejected this API key"),
         "{plain}"
     );
+    // The notice mirrors the entry it sits under — render the durable line only.
+    assert!(
+        !plain.contains("Error: the provider rejected"),
+        "notice duplicated the transcript error entry: {plain}"
+    );
+    // A later unrelated error notice (no matching entry) still renders.
+    app.notice = Some((ERROR(), "boom".to_string()));
+    let plain = app.build_transcript().plain_lines.join("\n");
+    assert!(plain.contains("Error: boom"), "{plain}");
     // Never seeded back to the model on an engine rebuild.
     assert!(
         super::super::runtime_impl::agent_seed_turns(&app.history, &Default::default()).is_empty(),
