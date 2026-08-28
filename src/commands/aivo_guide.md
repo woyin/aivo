@@ -211,8 +211,8 @@ Keys: `Enter` send · `Ctrl+J` newline · `Tab` complete · `Ctrl+V` paste text/
 `Ctrl+T` cycle thinking (off + effort levels) · `Ctrl+O` pager for a `!cmd` · `Esc` cancel/close · `Ctrl+C` twice to exit.
 
 `/config` toggles: Thinking (off + the model's effort levels), Auto-approve tools, aivo web search,
-Agent tools (off = plain chat, no tools). The agent can also change the live model/effort itself when you ask (it calls its
-`switch_model` / `set_effort` tools); a key change it hands back to you via `/key`.
+Agent tools (off = plain chat, no tools). The agent can also change the live model, key/provider, and effort itself when you
+ask (it calls its `switch_model` / `switch_key` / `set_effort` tools); the switch applies from your next message.
 
 ### Skills & MCP servers — `aivo code skills`, `aivo code mcp`
 

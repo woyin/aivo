@@ -28,6 +28,17 @@ impl AgentEngine {
                 Some(m) if !m.trim().is_empty() => ui.switch_chat_model(m.trim()).await,
                 _ => Err("switch_model: missing `model`.".to_string()),
             },
+            "switch_key" => match args.get("key").and_then(|v| v.as_str()) {
+                Some(k) if !k.trim().is_empty() => {
+                    let model = args
+                        .get("model")
+                        .and_then(|v| v.as_str())
+                        .map(str::trim)
+                        .filter(|m| !m.is_empty());
+                    ui.switch_chat_key(k.trim(), model).await
+                }
+                _ => Err("switch_key: missing `key`.".to_string()),
+            },
             "set_effort" => match args.get("level").and_then(|v| v.as_str()) {
                 Some(l) if !l.trim().is_empty() => ui.set_chat_effort(l.trim()).await,
                 _ => Err("set_effort: missing `level`.".to_string()),

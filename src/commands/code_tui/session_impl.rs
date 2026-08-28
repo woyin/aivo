@@ -336,6 +336,71 @@ is preserved."
         ))
     }
 
+    /// Back the agent's `switch_key` tool: move the session onto `requested`, landing on `model`
+    /// (else that key's last-used one). Applies next turn, like `switch_model`.
+    ///
+    /// Deliberately NOT `complete_key_switch`: this runs mid-turn with the engine lock held, so
+    /// its `reset_engine_preserving_conversation` would fall back to the lossy history seed. The
+    /// next-turn rebuild fires on the changed `key_id` and replays the conversation verbatim.
+    pub(super) async fn agent_switch_key(
+        &mut self,
+        requested: String,
+        model: Option<String>,
+    ) -> std::result::Result<String, String> {
+        let keys = self
+            .session_store
+            .get_keys()
+            .await
+            .map_err(|e| format!("couldn't read the saved keys: {e}"))?;
+        let mut key = resolve_key_request(requested.trim(), &keys)?;
+        SessionStore::decrypt_key_secret(&mut key)
+            .map_err(|e| format!("couldn't unlock key {}: {e}", key.display_name()))?;
+
+        let raw_model = match model.as_deref().map(str::trim).filter(|m| !m.is_empty()) {
+            Some(m) => {
+                let choices = load_model_choices(&self.client, &key, &self.cache).await;
+                resolve_model_request(m, &choices)?
+            }
+            None => match self.session_store.get_code_model(&key.id).await {
+                Ok(Some(m)) => m,
+                _ => {
+                    let choices = load_model_choices(&self.client, &key, &self.cache).await;
+                    return Err(pick_a_model_error(&key, &choices));
+                }
+            },
+        };
+
+        if key.id == self.key.id && self.raw_model == raw_model {
+            return Ok(format!(
+                "Already using {} with {raw_model}.",
+                key.display_name()
+            ));
+        }
+
+        self.key = key;
+        self.raw_model = raw_model.clone();
+        self.model = CodeCommand::transform_model_for_provider(&self.key.base_url, &raw_model);
+        self.billed_model = None;
+        self.copilot_tm = copilot_token_manager_for_key(&self.key);
+        self.format = seeded_chat_format(&self.key, &raw_model);
+        // Auth changed — a live cursor session can't carry across it.
+        self.cursor_acp_session = None;
+        self.persist_model_selection(&raw_model)
+            .await
+            .map_err(|e| format!("couldn't save the key switch: {e}"))?;
+        self.refresh_context_window().await;
+
+        let name = self.key.display_name().to_string();
+        self.notice = Some((
+            MUTED(),
+            format!("Agent switched to {name} / {raw_model} — applies from the next turn"),
+        ));
+        Ok(format!(
+            "Switched to {name} on {raw_model}. It takes effect on the user's next message; the \
+conversation is preserved."
+        ))
+    }
+
     /// Back the agent's `set_effort` tool: validate `level` against the model's levels and apply it.
     pub(super) async fn agent_set_effort(
         &mut self,
@@ -3988,6 +4053,62 @@ pub(super) fn resolve_model_request(
             ))
         }
     }
+}
+
+/// Resolve the agent's requested key against the saved keys: exact id > exact name >
+/// unique case-insensitive substring. Ambiguity/miss names the candidates back.
+pub(super) fn resolve_key_request(
+    requested: &str,
+    keys: &[ApiKey],
+) -> std::result::Result<ApiKey, String> {
+    if keys.is_empty() {
+        return Err("there are no saved keys — the user has to run `aivo keys add`.".to_string());
+    }
+    let needle = requested.to_ascii_lowercase();
+    let name = |k: &ApiKey| k.display_name().to_ascii_lowercase();
+    if let Some(k) = keys.iter().find(|k| k.id == requested) {
+        return Ok(k.clone());
+    }
+    let exact: Vec<&ApiKey> = keys.iter().filter(|k| name(k) == needle).collect();
+    let matches = if exact.is_empty() {
+        keys.iter().filter(|k| name(k).contains(&needle)).collect()
+    } else {
+        exact
+    };
+    match matches.as_slice() {
+        [one] => Ok((*one).clone()),
+        [] => Err(format!(
+            "no saved key matches '{requested}'. Saved keys: {}.",
+            key_names(keys.iter())
+        )),
+        many => Err(format!(
+            "'{requested}' is ambiguous — matches: {}. Ask the user which one, or suggest /key.",
+            key_names(many.iter().copied())
+        )),
+    }
+}
+
+fn key_names<'a>(keys: impl Iterator<Item = &'a ApiKey>) -> String {
+    keys.take(12)
+        .map(|k| k.display_name())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn pick_a_model_error(key: &ApiKey, choices: &[ModelChoice]) -> String {
+    let name = key.display_name();
+    if choices.is_empty() {
+        return format!("{name} has no remembered model and its model list couldn't be fetched.");
+    }
+    format!(
+        "{name} has no remembered model — call switch_key again with `model` set. Available: {}.",
+        choices
+            .iter()
+            .take(10)
+            .map(|c| c.id.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    )
 }
 
 /// Two base URLs resolve to the same provider (same wire protocol). The starter

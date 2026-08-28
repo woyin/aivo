@@ -28,12 +28,14 @@ fn chat_session_context_injects_facts_and_tools() {
     assert!(p.contains("interactive `aivo code` session"));
     assert!(p.contains("gpt-5") && p.contains("openrouter") && p.contains("high"));
     assert!(p.contains("/model") && p.contains("switch_model") && p.contains("/key"));
+    assert!(p.contains("switch_key"));
     assert!(p.contains("BEFORE you build on one answer"));
     assert!(p.contains("/plan"));
     // Previews on: don't narrate or `open` an image.
     assert!(p.contains("DOES render images") && p.contains("never run `open`"));
     let names = tool_names(&e);
     assert!(names.contains(&"switch_model".to_string()));
+    assert!(names.contains(&"switch_key".to_string()));
     assert!(names.contains(&"set_effort".to_string()));
     assert!(names.contains(&"ask_user".to_string()));
     // single-system-message invariant + idempotent
@@ -74,6 +76,7 @@ async fn session_control_tools_route_to_ui_callbacks() {
     #[derive(Default)]
     struct SwitchUi {
         switched: Vec<String>,
+        keys: Vec<(String, Option<String>)>,
         efforts: Vec<String>,
         asked: Vec<(String, Vec<String>, bool, bool)>,
     }
@@ -96,6 +99,14 @@ async fn session_control_tools_route_to_ui_callbacks() {
             model: &'a str,
         ) -> BoxFuture<'a, Result<String, String>> {
             self.switched.push(model.to_string());
+            Box::pin(async { Ok("switched".to_string()) })
+        }
+        fn switch_chat_key<'a>(
+            &'a mut self,
+            key: &'a str,
+            model: Option<&'a str>,
+        ) -> BoxFuture<'a, Result<String, String>> {
+            self.keys.push((key.to_string(), model.map(str::to_string)));
             Box::pin(async { Ok("switched".to_string()) })
         }
         fn set_chat_effort<'a>(
@@ -139,6 +150,17 @@ async fn session_control_tools_route_to_ui_callbacks() {
             name: "set_effort".into(),
             arguments: json!({"level": "high"}),
         },
+        // Blank `model` is the same as omitting it — the key keeps its own.
+        ToolCall {
+            id: "2b".into(),
+            name: "switch_key".into(),
+            arguments: json!({"key": " opencode-zen ", "model": "  "}),
+        },
+        ToolCall {
+            id: "2c".into(),
+            name: "switch_key".into(),
+            arguments: json!({"key": "openrouter", "model": "big-pickle"}),
+        },
         ToolCall {
             id: "3".into(),
             name: "ask_user".into(),
@@ -151,6 +173,13 @@ async fn session_control_tools_route_to_ui_callbacks() {
     ];
     e.execute_tool_batch(&ctx, &mut ui, &calls).await;
     assert_eq!(ui.switched, vec!["opus".to_string()]);
+    assert_eq!(
+        ui.keys,
+        vec![
+            ("opencode-zen".to_string(), None),
+            ("openrouter".to_string(), Some("big-pickle".to_string())),
+        ]
+    );
     assert_eq!(ui.efforts, vec!["high".to_string()]);
     assert_eq!(
         ui.asked,

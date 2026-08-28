@@ -319,6 +319,16 @@ pub trait AgentUi: Send {
             Err("Switching model is only available in interactive `aivo code`.".to_string())
         })
     }
+    /// The `switch_key` tool. Default declines — only the chat TUI drives it.
+    fn switch_chat_key<'a>(
+        &'a mut self,
+        _key: &'a str,
+        _model: Option<&'a str>,
+    ) -> BoxFuture<'a, Result<String, String>> {
+        Box::pin(async {
+            Err("Switching key is only available in interactive `aivo code`.".to_string())
+        })
+    }
     /// The `set_effort` tool. Default declines — only the chat TUI drives it.
     fn set_chat_effort<'a>(&'a mut self, _level: &'a str) -> BoxFuture<'a, Result<String, String>> {
         Box::pin(async {

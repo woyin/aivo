@@ -4331,6 +4331,27 @@ impl crate::agent::engine::AgentUi for ChatAgentUi {
         })
     }
 
+    fn switch_chat_key<'a>(
+        &'a mut self,
+        key: &'a str,
+        model: Option<&'a str>,
+    ) -> futures::future::BoxFuture<'a, Result<String, String>> {
+        let tx = self.tx.clone();
+        let key = key.to_string();
+        let model = model.map(str::to_string);
+        Box::pin(async move {
+            let (reply, rx) = tokio::sync::oneshot::channel();
+            if tx
+                .send(RuntimeEvent::AgentSwitchKey { key, model, reply })
+                .is_err()
+            {
+                return Err("session is no longer running".to_string());
+            }
+            rx.await
+                .unwrap_or_else(|_| Err("session is no longer running".to_string()))
+        })
+    }
+
     fn set_chat_effort<'a>(
         &'a mut self,
         level: &'a str,

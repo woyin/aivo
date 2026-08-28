@@ -413,6 +413,7 @@ mod tests {
             "`generate_image`",
             "`exit_plan_mode`",
             "`switch_model`",
+            "`switch_key`",
             "`set_effort`",
             "`ask_user`",
         ] {

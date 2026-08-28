@@ -790,7 +790,7 @@ async fn test_apply_model_skips_last_selection_for_hf_synthetic_key() {
     );
 }
 
-// ---- agent session-control tools (switch_model / set_effort) ----
+// ---- agent session-control tools (switch_model / switch_key / set_effort) ----
 
 fn model_choice(id: &str) -> ModelChoice {
     ModelChoice {
@@ -867,6 +867,96 @@ async fn agent_switch_model_noops_when_already_on_it() {
     app.raw_model = "gpt-5".to_string();
     let msg = app.agent_switch_model("GPT-5".to_string()).await.unwrap();
     assert!(msg.contains("Already using gpt-5"));
+}
+
+async fn keys_fixture(store: &SessionStore) -> Vec<ApiKey> {
+    for (name, url) in [
+        ("opencode-zen", "https://zen.example.com"),
+        ("openrouter", "https://or.example.com"),
+        ("openrouter-work", "https://or2.example.com"),
+    ] {
+        store
+            .add_key_with_protocol(name, url, None, "sk-x")
+            .await
+            .unwrap();
+    }
+    store.get_keys().await.unwrap()
+}
+
+#[tokio::test]
+async fn resolve_key_request_exact_name_beats_substring() {
+    let temp_dir = TempDir::new().unwrap();
+    let store = SessionStore::with_path(temp_dir.path().join("config.json"));
+    let keys = keys_fixture(&store).await;
+    use super::super::session_impl::resolve_key_request;
+
+    // "openrouter" is a substring of "openrouter-work" too — the exact name wins.
+    assert_eq!(
+        resolve_key_request("OpenRouter", &keys).unwrap().name,
+        "openrouter"
+    );
+    assert_eq!(
+        resolve_key_request("zen", &keys).unwrap().name,
+        "opencode-zen"
+    );
+    let id = keys[0].id.clone();
+    assert_eq!(resolve_key_request(&id, &keys).unwrap().id, id);
+}
+
+#[tokio::test]
+async fn resolve_key_request_ambiguous_and_missing() {
+    let temp_dir = TempDir::new().unwrap();
+    let store = SessionStore::with_path(temp_dir.path().join("config.json"));
+    let keys = keys_fixture(&store).await;
+    use super::super::session_impl::resolve_key_request;
+
+    let err = resolve_key_request("router", &keys).unwrap_err();
+    assert!(err.contains("ambiguous") && err.contains("openrouter-work"));
+
+    let miss = resolve_key_request("groq", &keys).unwrap_err();
+    assert!(miss.contains("no saved key matches") && miss.contains("opencode-zen"));
+
+    assert!(
+        resolve_key_request("anything", &[])
+            .unwrap_err()
+            .contains("no saved keys")
+    );
+}
+
+#[tokio::test]
+async fn agent_switch_key_lands_on_the_keys_remembered_model() {
+    // No `model` arg + a remembered model = no catalog fetch, so this stays offline.
+    let temp_dir = TempDir::new().unwrap();
+    let store = SessionStore::with_path(temp_dir.path().join("config.json"));
+    let from = store
+        .add_key_with_protocol("starter", "https://a.example.com", None, "sk-a")
+        .await
+        .unwrap();
+    let to = store
+        .add_key_with_protocol("opencode-zen", "https://zen.example.com", None, "sk-b")
+        .await
+        .unwrap();
+    store.set_code_model(&to, "big-pickle").await.unwrap();
+
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.session_store = store.clone();
+    app.key = store.get_key_by_id(&from).await.unwrap().unwrap();
+    app.raw_model = "aivo/starter".to_string();
+    seed_two_exchanges(&mut app);
+
+    let msg = app.agent_switch_key("zen".to_string(), None).await.unwrap();
+    assert!(msg.contains("opencode-zen") && msg.contains("big-pickle"));
+    assert_eq!(app.key.id, to);
+    assert_eq!(app.raw_model, "big-pickle");
+    assert_eq!(app.history.len(), 4, "conversation untouched");
+
+    // Idempotent: asking again short-circuits without a fetch.
+    let again = app
+        .agent_switch_key("opencode-zen".to_string(), None)
+        .await
+        .unwrap();
+    assert!(again.contains("Already using"));
 }
 
 /// Assistant turns are stamped with their dispatch-time model, and the

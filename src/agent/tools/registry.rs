@@ -68,6 +68,7 @@ pub static TOOL_TRAITS: &[ToolTraits] = &[
     tool!("preview", read_only),
     // Session controls / prompts / job+schema queries — engine state only.
     tool!("switch_model", read_only),
+    tool!("switch_key", read_only),
     tool!("set_effort", read_only),
     tool!("ask_user", read_only),
     tool!("check_job", read_only),

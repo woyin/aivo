@@ -2875,11 +2875,16 @@ pub(super) enum RuntimeEvent {
         once_only: bool,
         reply: tokio::sync::oneshot::Sender<crate::agent::protocol::Decision>,
     },
-    /// The agent's `switch_model`/`set_effort` tools: apply the change and reply to the
-    /// waiting engine task (Ok = confirmation, Err = why not). Same oneshot pattern as
+    /// The agent's `switch_model`/`switch_key`/`set_effort` tools: apply the change and reply
+    /// to the waiting engine task (Ok = confirmation, Err = why not). Same oneshot pattern as
     /// [`AgentPermission`](Self::AgentPermission).
     AgentSwitchModel {
         model: String,
+        reply: tokio::sync::oneshot::Sender<std::result::Result<String, String>>,
+    },
+    AgentSwitchKey {
+        key: String,
+        model: Option<String>,
         reply: tokio::sync::oneshot::Sender<std::result::Result<String, String>>,
     },
     AgentSetEffort {

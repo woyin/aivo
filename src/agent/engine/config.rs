@@ -220,7 +220,7 @@ impl AgentEngine {
     }
 
     /// Interactive chat only: append the live session facts + switch guidance to the system
-    /// prompt (in place, like [`Self::set_first_party`]) and advertise `switch_model`/`set_effort`.
+    /// prompt (in place, like [`Self::set_first_party`]) and advertise the session controls.
     pub fn set_chat_session_context(&mut self, ctx: ChatSessionContext) {
         if self.session_controls {
             return;
@@ -228,6 +228,8 @@ impl AgentEngine {
         self.session_controls = true;
         self.tools_openai
             .push(tool_to_openai(switch_model_tool_spec()));
+        self.tools_openai
+            .push(tool_to_openai(switch_key_tool_spec()));
         self.tools_openai
             .push(tool_to_openai(set_effort_tool_spec()));
         self.tools_openai
@@ -258,11 +260,11 @@ an external viewer unless the user explicitly asks you to open it."
             "This is an interactive `aivo code` session (not a plain shell). Live setup — model: \
 `{model}`, provider: `{provider}`{effort_clause}. When the user asks what model, provider, or \
 effort they're on, answer from these facts directly. The user can change them live with the \
-slash commands `/model [name]`, `/key [name]` (switches provider/key — starts a fresh chat), \
-and `/effort [level]`. You can change the model or reasoning effort YOURSELF when the user asks: \
-call `switch_model` (pass the model id or a distinctive part) or `set_effort` — don't tell the \
-user you're unable to switch. For a key/provider change, tell them to run `/key` (it starts a new \
-chat, so you shouldn't do it for them). {levels_clause} When you need a decision from the user and \
+slash commands `/model [name]`, `/key [name]` (switches provider/key) and `/effort [level]`. You \
+can change the model, the provider/key, or reasoning effort YOURSELF when the user asks: call \
+`switch_model` (pass the model id or a distinctive part), `switch_key` (pass the key name; add \
+`model` when the model they want lives on that key), or `set_effort` — don't tell the user you're \
+unable to switch. {levels_clause} When you need a decision from the user and \
 the answer is one of a few options — a yes/no, a this-or-that, approving a plan — call `ask_user` \
 with those options so they can pick, instead of ending your turn with a plain-text question; the \
 answer returns as the tool result and you continue. Ask in prose only for genuinely open-ended \
@@ -717,6 +719,27 @@ ambiguous or unavailable you'll get candidates back — relay them or suggest `/
                 "model": {"type": "string", "description": "Model id, or a distinctive part of it, to switch to."}
             },
             "required": ["model"]
+        }),
+    }
+}
+
+/// Engine-handled — routed to `AgentUi::switch_chat_key`.
+pub(super) fn switch_key_tool_spec() -> ToolSpec {
+    ToolSpec {
+        name: "switch_key".to_string(),
+        description: "Switch the API key / provider powering THIS aivo code session when the user \
+asks for a different one. Pass the saved key's name or a distinctive part. Models belong to a \
+key, so when the user names a model the current provider doesn't have, pass `model` too — one \
+call, not two. Without it the key's last-used model is kept. Takes effect on the user's next \
+message and the conversation is preserved. Ambiguous or unknown names come back with candidates."
+            .to_string(),
+        parameters: json!({
+            "type": "object",
+            "properties": {
+                "key": {"type": "string", "description": "Saved key name or id, or a distinctive part of it."},
+                "model": {"type": "string", "description": "Model to use on the new key; omit to keep its last-used one."}
+            },
+            "required": ["key"]
         }),
     }
 }

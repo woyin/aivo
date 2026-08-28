@@ -1525,6 +1525,14 @@ pub(super) fn tool_action_label(name: &str, args: &serde_json::Value, cwd: &str)
             format!("switching model to {m}")
         };
     }
+    if name == "switch_key" {
+        let k = args.get("key").and_then(|v| v.as_str()).unwrap_or("");
+        return if k.is_empty() {
+            "switching key".to_string()
+        } else {
+            format!("switching key to {k}")
+        };
+    }
     if name == "set_effort" {
         let l = args.get("level").and_then(|v| v.as_str()).unwrap_or("");
         return if l.is_empty() {

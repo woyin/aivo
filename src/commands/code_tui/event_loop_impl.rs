@@ -264,6 +264,10 @@ impl CodeTuiApp {
                 let result = self.agent_switch_model(model).await;
                 let _ = reply.send(result);
             }
+            RuntimeEvent::AgentSwitchKey { key, model, reply } => {
+                let result = self.agent_switch_key(key, model).await;
+                let _ = reply.send(result);
+            }
             RuntimeEvent::AgentSetEffort { level, reply } => {
                 let result = self.agent_set_effort(level).await;
                 let _ = reply.send(result);
