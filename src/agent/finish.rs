@@ -59,7 +59,10 @@ pub fn finish_tool_spec() -> ToolSpec {
     ToolSpec {
         name: "finish_turn".to_string(),
         description: "End your turn with an explicit outcome report. Call this ALONE (no other \
-tool calls in the same step) as your final action on non-trivial tasks. Use status `done` only \
+tool calls in the same step) as your final action on non-trivial tasks. Write your substantive \
+answer as a text message BEFORE calling this — `summary` is a one-to-two-sentence record for the \
+log, not a substitute for the answer; on a review or investigation, don't let it swallow findings \
+that belong in your text. Use status `done` only \
 when the task is genuinely complete — a premature done (unfinished plan steps, failing checks) \
 will be rejected. Use `blocked` when you cannot proceed and `needs_user` when only the user can \
 decide; both require a concrete `blocker`. List commands you ran as `verification` evidence and \
