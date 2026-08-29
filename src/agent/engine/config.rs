@@ -80,6 +80,7 @@ impl AgentEngine {
             agent_tools_enabled: true,
             reasoning_capable: default_reasoning_effort(model).is_some(),
             read_only: false,
+            ask_mode: false,
             plan_mode_stash: Vec::new(),
             require_completion: false,
             self_correct: false,
@@ -284,13 +285,26 @@ plan-approval card — suggest it when a task deserves real design discussion.{i
         }
     }
 
-    /// Reversible read-only mode. On: stash file-mutating tools + `subagent`,
+    /// Plan mode on? (`read_only` is shared with ask mode — see `ask_mode`.)
+    pub(super) fn plan_mode_on(&self) -> bool {
+        self.read_only && !self.ask_mode
+    }
+
+    pub(super) fn ask_mode_on(&self) -> bool {
+        self.ask_mode
+    }
+
+    /// Reversible read-only plan mode. On: stash file-mutating tools + `subagent`,
     /// advertise `exit_plan_mode`, append the directive. Off: restore the stashed
     /// specs verbatim (no rebuild — history survives into same-turn execution).
-    /// `run_bash` stays offered (confirmation-gated). Idempotent both ways.
+    /// `run_bash` stays offered (confirmation-gated). Idempotent both ways;
+    /// entering while ask mode is on leaves ask mode first (mutually exclusive).
     pub fn set_plan_mode(&mut self, on: bool) {
-        if on == self.read_only {
+        if on == self.plan_mode_on() {
             return;
+        }
+        if on && self.ask_mode {
+            self.set_ask_mode(false);
         }
         self.read_only = on;
         if on {
@@ -313,6 +327,45 @@ plan-approval card — suggest it when a task deserves real design discussion.{i
             self.denied_sigs.clear();
         }
         let directive = format!("\n\n{}", plan_mode::PLAN_MODE_DIRECTIVE);
+        if let Some(content) = self.messages.first_mut().and_then(|m| m.get_mut("content"))
+            && let Some(s) = content.as_str()
+        {
+            *content = Value::String(if on {
+                format!("{s}{directive}")
+            } else {
+                s.replacen(&directive, "", 1)
+            });
+        }
+    }
+
+    /// Reversible read-only ask (research/learning) mode: plan mode's stash
+    /// mechanics with a different directive and NO exit tool — only the user
+    /// leaves it. Entering leaves plan mode first (mutually exclusive).
+    pub fn set_ask_mode(&mut self, on: bool) {
+        if on == self.ask_mode {
+            return;
+        }
+        if on && self.plan_mode_on() {
+            self.set_plan_mode(false);
+        }
+        self.ask_mode = on;
+        self.read_only = on;
+        if on {
+            let (stashed, kept) = std::mem::take(&mut self.tools_openai)
+                .into_iter()
+                .partition(|t| {
+                    let name = t["function"]["name"].as_str().unwrap_or("");
+                    tools::hidden_in_plan_mode(name)
+                });
+            self.plan_mode_stash = stashed;
+            self.tools_openai = kept;
+        } else {
+            self.tools_openai
+                .extend(std::mem::take(&mut self.plan_mode_stash));
+            // An ask-mode deny often means "not in this mode" — exiting reverses it.
+            self.denied_sigs.clear();
+        }
+        let directive = format!("\n\n{}", crate::agent::ask_mode::ASK_MODE_DIRECTIVE);
         if let Some(content) = self.messages.first_mut().and_then(|m| m.get_mut("content"))
             && let Some(s) = content.as_str()
         {
@@ -428,9 +481,9 @@ plan-approval card — suggest it when a task deserves real design discussion.{i
         self.preview_supported = on;
     }
 
-    /// Add a tool spec — into the plan-mode stash when plan mode hides it. The TUI
-    /// re-runs these setters every turn AFTER `set_plan_mode`, so a live push
-    /// would leak the tool into plan mode and duplicate it on exit.
+    /// Add a tool spec — into the read-only stash when plan/ask mode hides it. The
+    /// TUI re-runs these setters every turn AFTER the mode setters, so a live push
+    /// would leak the tool into a read-only mode and duplicate it on exit.
     pub(super) fn advertise_tool(&mut self, spec: Value) {
         let hidden = spec["function"]["name"]
             .as_str()

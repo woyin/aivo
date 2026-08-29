@@ -334,50 +334,120 @@ pub(super) fn bash_is_readonly(cmd: &str) -> bool {
     {
         return false;
     }
-    // Drop fd-dups (`2>&1`, `>&2`, …) before the walk: their `&` would otherwise
-    // read as a control operator and mint a bogus `1`/`2` segment.
-    let scrubbed = cmd
-        .replace("2>&1", "")
-        .replace("1>&2", "")
-        .replace(">&1", "")
-        .replace(">&2", "");
+    let scrubbed = scrub_fd_dups(cmd);
     let mut saw_command = false;
     let write_capable = for_each_simple_command(&scrubbed, |_, tokens| {
         saw_command = true;
-        let cmd0 = tokens[0];
-        // An env-var prefix (`FOO=bar cmd`) hides the real command.
-        if cmd0.contains('=') {
-            return Some(());
-        }
-        // PowerShell is case-insensitive — fold before matching.
-        let base = command_basename(cmd0).to_ascii_lowercase();
-        let ok = match base.as_str() {
-            "cd" | "ls" | "pwd" | "cat" | "head" | "tail" | "wc" | "file" | "stat" | "du"
-            | "df" | "which" | "date" | "echo" | "printf" | "tree" | "realpath" | "dirname"
-            | "basename" | "uname" | "type" | "grep" | "egrep" | "fgrep" | "rg" | "jq" | "diff"
-            | "cmp" | "cut" | "uniq" | "tr" | "nl" | "column" | "strings" | "true" => true,
-            // PowerShell's read-only cmdlets and their stock aliases.
-            "get-content" | "gc" | "get-childitem" | "gci" | "dir" | "get-item"
-            | "get-location" | "gl" | "get-date" | "get-command" | "select-string" | "sls"
-            | "select-object" | "measure-object" | "test-path" | "resolve-path"
-            | "write-output" => true,
-            // `sort -o file` writes; plain sort only prints.
-            "sort" => !tokens
-                .iter()
-                .any(|t| *t == "-o" || t.starts_with("--output")),
-            // `-delete` removes matches; `-exec` family runs arbitrary commands;
-            // `-fprint*` writes files.
-            "find" => !tokens.iter().any(|t| {
-                matches!(*t, "-delete" | "-exec" | "-execdir" | "-ok" | "-okdir")
-                    || t.starts_with("-fprint")
-            }),
-            "git" => git_subcommand_is_readonly(tokens),
-            _ => false,
-        };
-        (!ok).then_some(())
+        (!simple_command_is_readonly(tokens)).then_some(())
     })
     .is_some();
     saw_command && !write_capable
+}
+
+/// Drop fd-dups (`2>&1`, `>&2`, …) before a walk: their `&` would otherwise
+/// read as a control operator and mint a bogus `1`/`2` segment.
+fn scrub_fd_dups(cmd: &str) -> String {
+    cmd.replace("2>&1", "")
+        .replace("1>&2", "")
+        .replace(">&1", "")
+        .replace(">&2", "")
+}
+
+/// The tokens with harmless env-var prefixes (`TZ=Asia/Shanghai date`) skipped.
+/// `None` when nothing but assignments remain or the head still carries `=`
+/// (`PATH=`, `LD_PRELOAD=`, unknown vars hide the real command): fail closed.
+fn strip_env_prefix<'a>(tokens: &'a [&'a str]) -> Option<&'a [&'a str]> {
+    let mut idx = 0;
+    while idx < tokens.len() && is_harmless_env_prefix(tokens[idx]) {
+        idx += 1;
+    }
+    let rest = &tokens[idx..];
+    match rest.first() {
+        Some(c0) if !c0.contains('=') => Some(rest),
+        _ => None,
+    }
+}
+
+/// One simple command (between control operators) proven read-only.
+fn simple_command_is_readonly(tokens: &[&str]) -> bool {
+    let Some(tokens) = strip_env_prefix(tokens) else {
+        return false;
+    };
+    // PowerShell is case-insensitive — fold before matching.
+    let base = command_basename(tokens[0]).to_ascii_lowercase();
+    match base.as_str() {
+        "cd" | "ls" | "pwd" | "cat" | "head" | "tail" | "wc" | "file" | "stat" | "du" | "df"
+        | "which" | "date" | "echo" | "printf" | "tree" | "realpath" | "dirname" | "basename"
+        | "uname" | "type" | "grep" | "egrep" | "fgrep" | "rg" | "jq" | "diff" | "cmp" | "cut"
+        | "uniq" | "tr" | "nl" | "column" | "strings" | "true" | "whoami" | "hostname"
+        | "uptime" | "id" | "arch" | "nproc" | "sw_vers" | "ps" | "shasum" | "md5" | "md5sum"
+        | "sha256sum" | "hexdump" | "od" | "cal" => true,
+        // PowerShell's read-only cmdlets and their stock aliases.
+        "get-content" | "gc" | "get-childitem" | "gci" | "dir" | "get-item" | "get-location"
+        | "gl" | "get-date" | "get-command" | "select-string" | "sls" | "select-object"
+        | "measure-object" | "test-path" | "resolve-path" | "write-output" => true,
+        // `sort -o file` writes; plain sort only prints.
+        "sort" => !tokens
+            .iter()
+            .any(|t| *t == "-o" || t.starts_with("--output")),
+        // These flags make `find` delete, write, or run arbitrary commands.
+        "find" => !tokens.iter().any(|t| {
+            matches!(*t, "-delete" | "-exec" | "-execdir" | "-ok" | "-okdir")
+                || t.starts_with("-fprint")
+        }),
+        "git" => git_subcommand_is_readonly(tokens),
+        _ => false,
+    }
+}
+
+/// The distinct non-read-only program basenames a command runs — the scope an
+/// ask-mode "always allow" remembers. `None` when the command carries
+/// write-capable syntax (substitution, file redirects) or an unparseable head:
+/// those stay exact-grant, never broadened.
+pub fn bash_nonreadonly_programs(args: &Value) -> Option<Vec<String>> {
+    let cmd = args.get("command").and_then(|c| c.as_str())?.trim();
+    if cmd.is_empty()
+        || cmd.contains("$(")
+        || cmd.contains('`')
+        || cmd.contains("<(")
+        || cmd.contains(">(")
+        || has_file_write_redirect(cmd)
+    {
+        return None;
+    }
+    let scrubbed = scrub_fd_dups(cmd);
+    let mut programs: Vec<String> = Vec::new();
+    let unparseable = for_each_simple_command(&scrubbed, |_, tokens| {
+        if simple_command_is_readonly(tokens) {
+            return None;
+        }
+        let Some(rest) = strip_env_prefix(tokens) else {
+            return Some(());
+        };
+        programs.push(command_basename(rest[0]).to_ascii_lowercase());
+        None
+    })
+    .is_some();
+    if unparseable || programs.is_empty() {
+        return None;
+    }
+    programs.sort();
+    programs.dedup();
+    Some(programs)
+}
+
+/// A leading `VAR=value` word whose variable is known-inert: it tweaks
+/// timezone/locale/formatting but can't redirect which binary runs or inject code
+/// (unlike `PATH=`, `LD_PRELOAD=`, `GIT_DIR=`). The value is literal — substitution
+/// and backticks were rejected before tokenizing.
+fn is_harmless_env_prefix(token: &str) -> bool {
+    let Some((name, _)) = token.split_once('=') else {
+        return false;
+    };
+    matches!(
+        name,
+        "TZ" | "LANG" | "LC_ALL" | "LC_TIME" | "LC_COLLATE" | "LC_NUMERIC" | "NO_COLOR"
+    )
 }
 
 /// Any `>`/`>>` output redirect whose target is not a safe `/dev/` pseudo-device

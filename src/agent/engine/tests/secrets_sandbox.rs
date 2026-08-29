@@ -26,9 +26,10 @@ async fn reading_dotenv_prompts_and_deny_blocks_it() {
         yes: false,
         auto_approve_all: false,
         auto_approve: None,
-        review_edits: None,
         plan_exit: None,
         plan_enter: None,
+        ask_exit: None,
+        ask_enter: None,
     };
     let mut ui = CapturingUi {
         deny: true,
@@ -104,9 +105,10 @@ async fn sandbox_block_prompts_to_run_unsandboxed_and_respects_deny() {
         yes: false,
         auto_approve_all: false,
         auto_approve: None,
-        review_edits: None,
         plan_exit: None,
         plan_enter: None,
+        ask_exit: None,
+        ask_enter: None,
     };
     let mut ui = CapturingUi {
         deny: true,
@@ -255,9 +257,10 @@ async fn sandbox_block_reruns_outside_when_approved() {
         yes: false,
         auto_approve_all: false,
         auto_approve: None,
-        review_edits: None,
         plan_exit: None,
         plan_enter: None,
+        ask_exit: None,
+        ask_enter: None,
     };
     let mut ui = CapturingUi {
         always_allow: true,

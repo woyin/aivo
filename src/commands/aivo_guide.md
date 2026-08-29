@@ -207,7 +207,7 @@ Type `/help` for the full list. Slash commands:
 Other input: `!cmd` runs a local shell command; `//` / `!!` escape to literal text.
 
 Keys: `Enter` send · `Ctrl+J` newline · `Tab` complete · `Ctrl+V` paste text/image ·
-`Ctrl+X Ctrl+E` edit draft in $EDITOR · `Shift+Tab` cycle mode (normal/auto-approve/review) · `Ctrl+R` resume ·
+`Ctrl+X Ctrl+E` edit draft in $EDITOR · `Shift+Tab` cycle mode (default/auto-approve/plan/ask) · `Ctrl+R` resume ·
 `Ctrl+T` cycle thinking (off + effort levels) · `Ctrl+O` pager for a `!cmd` · `Esc` cancel/close · `Ctrl+C` twice to exit.
 
 `/config` toggles: Thinking (off + the model's effort levels), Auto-approve tools, aivo web search,

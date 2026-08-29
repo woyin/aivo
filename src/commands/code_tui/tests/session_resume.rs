@@ -819,6 +819,7 @@ async fn test_resume_restores_unfinished_plan() {
         import_fidelity: None,
         plan_state: Some(crate::services::session_store::PlanState {
             mode: true,
+            ask: false,
             draft: Some(plan_text.to_string()),
             steps: None,
         }),

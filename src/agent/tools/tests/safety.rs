@@ -480,6 +480,40 @@ fn readonly_command_allowlist() {
     assert!(bash_is_readonly("echo hi 2>/dev/null"));
     assert!(bash_is_readonly("git status 2>&1 | tail -3"));
     assert!(bash_is_readonly("/usr/bin/git blame src/main.rs"));
+    // Inert env prefixes (timezone/locale) don't hide the command…
+    assert!(bash_is_readonly("TZ='Asia/Shanghai' date"));
+    assert!(bash_is_readonly("TZ=Europe/Paris LC_TIME=fr_FR date"));
+    // …but binary-redirecting / code-injecting ones still fail closed.
+    assert!(!bash_is_readonly("PATH=/tmp date"));
+    assert!(!bash_is_readonly("LD_PRELOAD=/tmp/e.so ls"));
+    assert!(!bash_is_readonly("GIT_DIR=/x git status"));
+    assert!(!bash_is_readonly("TZ=UTC")); // bare assignment, no command
+    assert!(!bash_is_readonly("TZ=$(rm -rf /) date")); // substitution rejected
+}
+
+#[test]
+fn nonreadonly_programs_scope_the_ask_grant() {
+    let progs = |cmd: &str| bash_nonreadonly_programs(&json!({ "command": cmd }));
+    // Read-only segments drop out; the rest reduce to deduped basenames.
+    assert_eq!(
+        progs("curl -s \"wttr.in/Chengdu?format=j1\" 2>&1 | head -n 200"),
+        Some(vec!["curl".to_string()])
+    );
+    assert_eq!(
+        progs("cd /x && cargo tree | head -5"),
+        Some(vec!["cargo".to_string()])
+    );
+    assert_eq!(
+        progs("curl a ; curl b ; python3 x.py"),
+        Some(vec!["curl".to_string(), "python3".to_string()])
+    );
+    assert_eq!(progs("TZ=UTC touch probe"), Some(vec!["touch".to_string()]));
+    // Write-capable syntax or an unparseable head never broadens — exact only.
+    assert_eq!(progs("curl a > out.txt"), None);
+    assert_eq!(progs("curl \"$(cat secret)\""), None);
+    assert_eq!(progs("PATH=/tmp date"), None);
+    // All-readonly commands have nothing to grant.
+    assert_eq!(progs("ls && git status"), None);
     // PowerShell inspection cmdlets (the Windows shell) and their aliases.
     assert!(bash_is_readonly("Get-Content Cargo.toml"));
     assert!(bash_is_readonly("Select-String -Pattern main src\\main.rs"));

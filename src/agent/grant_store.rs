@@ -25,6 +25,9 @@ enum GrantScope {
     /// A remote-mutation family (`az repos pr update`); matched only by
     /// [`GrantStore::covers_remote`], never the generic walk.
     RemoteCmd(String),
+    /// An ask-mode bash program (`curl`); matched only by
+    /// [`GrantStore::covers_ask_programs`], so it can't widen the confirm gates.
+    AskCmd(String),
     /// Any write whose target resolves under this directory.
     Dir(PathBuf),
     /// Any call to this tool by name (e.g. a trusted MCP tool `mcp__server__x`).
@@ -93,6 +96,24 @@ impl GrantStore {
         for p in prefixes {
             if !self.covers_remote(std::slice::from_ref(p)) {
                 self.session.push(GrantScope::RemoteCmd(p.clone()));
+            }
+        }
+    }
+
+    /// True when every listed program already has an ask grant; empty never covers.
+    pub(crate) fn covers_ask_programs(&self, programs: &[String]) -> bool {
+        !programs.is_empty()
+            && programs.iter().all(|p| {
+                self.all()
+                    .any(|g| matches!(g, GrantScope::AskCmd(k) if k == p))
+            })
+    }
+
+    /// "Always allow" for ask-mode bash programs. Session-only.
+    pub(crate) fn remember_ask_programs(&mut self, programs: &[String]) {
+        for p in programs {
+            if !self.covers_ask_programs(std::slice::from_ref(p)) {
+                self.session.push(GrantScope::AskCmd(p.clone()));
             }
         }
     }
@@ -196,6 +217,8 @@ fn scope_matches(scope: &GrantScope, name: &str, args: &Value, cwd: &Path, exact
         GrantScope::Tool(t) => t == name,
         // covers_remote only — all-families semantics, not any-match.
         GrantScope::RemoteCmd(_) => false,
+        // covers_ask_programs only — ask grants never widen other gates.
+        GrantScope::AskCmd(_) => false,
         GrantScope::CommandPrefix(p) => {
             name == "run_bash"
                 && command_prefix(

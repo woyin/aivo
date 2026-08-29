@@ -1,6 +1,7 @@
 mod helpers;
 
 mod approvals;
+mod ask_mode;
 mod compaction_budget;
 mod compaction_pinning;
 mod context_usage;
@@ -11,7 +12,6 @@ mod jobs;
 mod permission_table;
 mod plan_mode;
 mod plan_tracking;
-mod review_gate;
 mod rewind;
 mod secrets_sandbox;
 mod selfcorrect;

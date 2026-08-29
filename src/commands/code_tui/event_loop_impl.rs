@@ -292,21 +292,6 @@ impl CodeTuiApp {
                     reply,
                 });
             }
-            RuntimeEvent::AgentReviewEdits { items, reply } => {
-                // Precompute the diff body now (has the live cwd) so rendering stays pure.
-                let cwd = if self.real_cwd.is_empty() {
-                    self.cwd.clone()
-                } else {
-                    self.real_cwd.clone()
-                };
-                let body = super::render::review_body_lines(&items, std::path::Path::new(&cwd));
-                self.cards.set_review(PendingReview {
-                    count: items.len(),
-                    body,
-                    scroll: 0,
-                    reply,
-                });
-            }
             RuntimeEvent::AgentPlanApproval { plan, reply } => {
                 // Precompute the rendered plan so the frame render stays pure.
                 let width = self.transcript_width.saturating_sub(6).max(40);
@@ -1156,12 +1141,17 @@ impl CodeTuiApp {
         // so the model sees the new skills. Runs while not sending, so the engine
         // reset stays lossless.
         self.refresh_skill_commands().await;
-        // The turn is over — apply a deferred plan-discard tool restore.
         if self.plan_exit_pending {
             if let Some(session) = self.agent_engine.as_ref() {
                 session.engine.lock().await.set_plan_mode(false);
             }
             self.plan_exit_pending = false;
+        }
+        if self.ask_exit_pending {
+            if let Some(session) = self.agent_engine.as_ref() {
+                session.engine.lock().await.set_ask_mode(false);
+            }
+            self.ask_exit_pending = false;
         }
         self.reclaim_unsent_steering();
         // Commands queued mid-turn run first (a queued `/plan go` needs the plan

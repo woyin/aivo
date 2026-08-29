@@ -363,8 +363,8 @@ impl AgentEngine {
 
     /// Cloned per step; strips the leading system prompt in plain-chat mode, so the
     /// single-system-message invariant `restore_conversation` relies on stays intact.
-    /// In plan mode the read-only reminder rides the copy's latest user message —
-    /// ephemeral (never in `self.messages`), so it vanishes on plan exit.
+    /// In plan/ask mode the read-only reminder rides the copy's latest user message —
+    /// ephemeral (never in `self.messages`), so it vanishes on mode exit.
     pub(super) fn outgoing_messages(&self) -> Vec<Value> {
         let mut out: Vec<Value> = if self.agent_tools_enabled {
             self.messages.clone()
@@ -386,7 +386,14 @@ impl AgentEngine {
         // prefix diverges there and re-bills every tool result uncached.
         let mut reminders: Vec<String> = Vec::new();
         if self.read_only {
-            reminders.push(plan_mode::PLAN_TURN_REMINDER.to_string());
+            reminders.push(
+                if self.ask_mode_on() {
+                    crate::agent::ask_mode::ASK_TURN_REMINDER
+                } else {
+                    plan_mode::PLAN_TURN_REMINDER
+                }
+                .to_string(),
+            );
         }
         if let Some(jobs) = &self.jobs {
             let running = jobs.running_snapshot();

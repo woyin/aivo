@@ -118,7 +118,7 @@ impl CodeTuiApp {
         // defaults off (safe); thinking_enabled defaults on (high-signal).
         let crate::services::session_store::ChatToggles {
             auto_approve,
-            review_edits,
+            ask_mode,
             thinking_enabled,
             web_search_enabled,
             agent_tools_enabled,
@@ -234,14 +234,30 @@ impl CodeTuiApp {
         app.scroll_speed = chat_scroll_speed();
         app.swipe_scroll = chat_swipe_scroll_enabled();
         app.reduce_motion = reduce_motion_requested();
-        // Modes are exclusive; stale prefs with both on → review wins.
-        // `--auto-approve` pre-sets the toggle (session-only, outranks review).
-        let auto = params.auto_approve || (auto_approve && !review_edits);
-        let review = review_edits && !params.auto_approve;
+        let auto = params.auto_approve || auto_approve;
         app.agent_auto_approve = auto;
         app.auto_approve_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(auto));
-        app.agent_review_edits = review;
-        app.review_edits_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(review));
+        // A restored ask mode yields to an explicit `--auto-approve`, and non-agent
+        // keys can't hold the read-only floor; the engine enters at the first turn's
+        // mode sync.
+        if ask_mode && !params.auto_approve && app.agent_capable() {
+            app.ask_mode = true;
+            app.ask_prior_mode = if auto {
+                PlanPriorMode::Auto
+            } else {
+                PlanPriorMode::Default
+            };
+            app.agent_auto_approve = false;
+            app.auto_approve_flag
+                .store(false, std::sync::atomic::Ordering::Relaxed);
+            // Never displace a real startup warning.
+            if app.notice.is_none() {
+                app.notice = Some((
+                    MUTED(),
+                    "Ask mode restored — ask anything (/ask exit to leave)".to_string(),
+                ));
+            }
+        }
         app.thinking_enabled = thinking_enabled;
         app.web_search_enabled = web_search_enabled;
         app.agent_tools_enabled = agent_tools_enabled;
@@ -494,15 +510,14 @@ pub(super) async fn run_chat_tui(params: CodeTuiParams) -> Result<()> {
     // The public link dies with the chat.
     app.stop_live_share();
     app.persist_draft_history();
-    // Remember the auto-approve toggle for next time (best-effort).
+    // Remember the auto-approve toggle for next time (best-effort) — the STANDING
+    // mode, so quitting from inside plan/ask doesn't demote it to default.
     app.session_store
-        .set_chat_auto_approve(app.agent_auto_approve)
+        .set_chat_auto_approve(app.standing_auto_approve())
         .await
         .ok();
-    app.session_store
-        .set_chat_review_edits(app.agent_review_edits)
-        .await
-        .ok();
+    // Ask mode persists across launches; plan mode doesn't (--resume restores it).
+    app.session_store.set_chat_ask_mode(app.ask_mode).await.ok();
     // After a clean exit, point the user back to this exact conversation by id
     // (the terminal is already restored inside `run`, so this lands in normal
     // scrollback). Skipped for an untouched chat — nothing was saved.

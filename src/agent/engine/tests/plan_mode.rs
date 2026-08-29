@@ -160,9 +160,10 @@ async fn plan_mode_readonly_bash_skips_prompt() {
         yes: false, // no auto-approve anywhere — the exemption alone applies
         auto_approve_all: false,
         auto_approve: None,
-        review_edits: None,
         plan_exit: None,
         plan_enter: None,
+        ask_exit: None,
+        ask_enter: None,
     };
     run_session(&mut engine, &ctx, Some("inspect".into()), &mut ui).await;
 
@@ -476,9 +477,10 @@ async fn live_plan_exit_drops_floor_mid_turn() {
         yes: true, // confirm tier waived — only the plan floor could prompt
         auto_approve_all: false,
         auto_approve: None,
-        review_edits: None,
         plan_exit: Some(&exit),
         plan_enter: None,
+        ask_exit: None,
+        ask_enter: None,
     };
     run_session(&mut engine, &ctx, Some("go".into()), &mut ui).await;
 
@@ -507,9 +509,10 @@ async fn live_plan_enter_restricts_mid_turn() {
         yes: true,
         auto_approve_all: false,
         auto_approve: None,
-        review_edits: None,
         plan_exit: None,
         plan_enter: Some(&enter),
+        ask_exit: None,
+        ask_enter: None,
     };
     run_session(&mut engine, &ctx, Some("go".into()), &mut ui).await;
 

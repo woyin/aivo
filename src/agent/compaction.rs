@@ -897,9 +897,10 @@ mod tests {
             yes: true,
             auto_approve_all: false,
             auto_approve: None,
-            review_edits: None,
             plan_exit: None,
             plan_enter: None,
+            ask_exit: None,
+            ask_enter: None,
         }
     }
 

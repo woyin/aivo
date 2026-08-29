@@ -381,7 +381,7 @@ pub(super) const EMPTY_STATE_BOTTOM_GAP: u16 = 0;
 /// screen teaches `/help` and mode-switching, not power-user shortcuts.
 pub(super) const WELCOME_STARTER_TIPS: &[&str] = &[
     "/help lists commands and keybindings",
-    "Shift+Tab cycles mode: normal → auto-approve → review",
+    "Shift+Tab cycles mode: default → auto-approve → plan → ask",
     "Ctrl+R reopens a past session",
 ];
 /// After the first message, the intro banner shows one of these instead
@@ -397,6 +397,7 @@ pub(super) const WELCOME_ADVANCED_TIPS: &[&str] = &[
     "ask the agent to create a subagent for a task — a reviewer, an architect …",
     "/compact summarizes older turns to free up context",
     "/plan plans read-only — approve the plan and it builds",
+    "/ask answers questions with sources — nothing gets edited",
     "/model switches models without losing the thread",
     "/config switches theme and toggles thinking / auto-approve",
     "/copy grabs a past reply to your clipboard",
@@ -616,6 +617,12 @@ pub(super) const SLASH_COMMANDS: &[SlashCommandSpec] = &[
         takes_argument: true,
     },
     SlashCommandSpec {
+        name: "ask",
+        help_label: "/ask [question]",
+        description: "research and learn, read-only",
+        takes_argument: true,
+    },
+    SlashCommandSpec {
         name: "rewind",
         help_label: "/rewind",
         description: "undo the agent's file edits",
@@ -693,6 +700,7 @@ pub(super) fn command_usage_hint(name: &str) -> Option<&'static str> {
         "goal" => Some("<objective> | stop"),
         // go/resume/save/stop stay as hidden aliases.
         "plan" => Some("[objective] | list | exit"),
+        "ask" => Some("[question] | exit"),
         "share" => Some("[stop]"),
         "compact" => Some("[fast]"),
         "model" => Some("[name]"),
@@ -1529,8 +1537,7 @@ pub(super) enum ConfigSetting {
     Theme,
     InlineImages,
     Thinking,
-    /// Standing permission mode (`normal` / `auto-approve` / `review`), folding the
-    /// two former checkboxes into one radio.
+    /// Standing permission mode (`default` / `auto-approve`).
     Approval,
     UseWebSearch,
     AgentTools,
@@ -1683,9 +1690,8 @@ pub(super) struct McpConsentPrompt {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(super) enum PlanPriorMode {
     #[default]
-    Normal,
+    Default,
     Auto,
-    Review,
 }
 
 /// Content digest of a repo's project `.mcp.json` stdio servers — the exact
@@ -2647,6 +2653,9 @@ pub(super) enum SlashCommand {
     /// implementation plan; `go` executes it in a fresh context; bare shows
     /// status, `stop` discards the pending plan.
     Plan(Option<String>),
+    /// Ask mode: `<question>` enters read-only research/learning mode (and asks
+    /// the question); bare just enters; `exit` leaves.
+    Ask(Option<String>),
     /// Built-in `create-skill` command: starts the guided create/improve-a-skill
     /// workflow. The optional argument is the initial intent (what the skill
     /// should do); bare just opens the workflow.
@@ -2907,11 +2916,6 @@ pub(super) enum RuntimeEvent {
         record_history: bool,
         reply: tokio::sync::oneshot::Sender<std::result::Result<String, String>>,
     },
-    /// The agent's edit-review gate: show the pending edits, reply with the verdict.
-    AgentReviewEdits {
-        items: Vec<crate::agent::review::ReviewItem>,
-        reply: tokio::sync::oneshot::Sender<crate::agent::review::ReviewDecision>,
-    },
     /// The agent's `exit_plan_mode` tool: show the plan + approval card, reply with
     /// the verdict. Same oneshot pattern as [`AgentPermission`](Self::AgentPermission).
     AgentPlanApproval {
@@ -3073,15 +3077,6 @@ pub(super) struct PendingAskUser {
     pub(super) selected: usize,
     pub(super) record_history: bool,
     pub(super) reply: tokio::sync::oneshot::Sender<std::result::Result<String, String>>,
-}
-
-/// A pending edit-review card: `count` edits as precomputed scrollable `body` diff
-/// lines and `reply` for the verdict. Dropping it unreplied resolves to `Reject`.
-pub(super) struct PendingReview {
-    pub(super) count: usize,
-    pub(super) body: Vec<ratatui::text::Line<'static>>,
-    pub(super) scroll: u16,
-    pub(super) reply: tokio::sync::oneshot::Sender<crate::agent::review::ReviewDecision>,
 }
 
 /// A pending plan-approval card (`exit_plan_mode`): the plan as precomputed
@@ -3425,6 +3420,12 @@ pub(super) struct CodeTuiApp {
     /// them at the next safe async point (turn end / cancel / next dispatch), never
     /// while the model is still running.
     pub(super) plan_exit_pending: bool,
+    /// Read-only research mode, on until `/ask exit`; exclusive with `plan_mode`.
+    pub(super) ask_mode: bool,
+    /// Captured on ask entry; `/ask exit` returns there.
+    pub(super) ask_prior_mode: PlanPriorMode,
+    /// The `plan_exit_pending` analog for a mid-turn ask exit.
+    pub(super) ask_exit_pending: bool,
     /// An Esc-unsent agent turn whose engine-side un-send may not have landed yet
     /// (the aborted turn task can still hold the lock): re-apply at next dispatch.
     pub(super) agent_unsend_pending: bool,
@@ -3477,7 +3478,7 @@ pub(super) struct CodeTuiApp {
         JoinHandle<anyhow::Result<()>>,
         std::sync::Arc<tokio::sync::Notify>,
     )>,
-    /// Agent decision cards (permission/ask/review/plan/MCP consent); the
+    /// Agent decision cards (permission/ask/plan/MCP consent); the
     /// engine blocks on each oneshot, so at most one is visible at a time.
     pub(super) cards: AgentCards,
     /// Session decision on spawning a repo's project `.mcp.json` stdio servers.
@@ -3491,11 +3492,6 @@ pub(super) struct CodeTuiApp {
     /// cursor-agent ACP session reads it on each out-of-process
     /// `request_permission`. Kept in lockstep with `agent_auto_approve`.
     pub(super) auto_approve_flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    /// Session-wide edit review (`/config`): when on, an edit batch pauses for a
-    /// diff-review card before writing. Off by default (opt-in).
-    pub(super) agent_review_edits: bool,
-    /// The same state as a shared atomic, read LIVE per batch by the running turn.
-    pub(super) review_edits_flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// Live mid-turn plan-mode exit signal: set when the user leaves plan mode with
     /// a turn in flight; the running engine reads it per tool-call boundary and
     /// restores its tools (`plan_exit_pending` is the turn-end fallback).
@@ -3504,6 +3500,9 @@ pub(super) struct CodeTuiApp {
     /// flight); the running engine reads it per tool-call boundary and goes
     /// read-only (the `spawn_agent_turn` mode sync is the turn-end fallback).
     pub(super) plan_enter_flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// The plan flag analogs for ask mode: live mid-turn exit/entry signals.
+    pub(super) ask_exit_flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    pub(super) ask_enter_flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// Whether a planState snapshot is (or may be) in the session file — lets
     /// `persist_plan_state` skip its round-trip for the common no-plan session.
     /// `Cell`: flipped from the `&self` persist path.
@@ -3654,8 +3653,6 @@ pub(super) enum AgentCard {
     Permission(PendingPermission),
     /// `ask_user` question card, while the agent waits for the user's pick.
     Ask(PendingAskUser),
-    /// Edit-review card, while the agent waits for approve/reject.
-    Review(PendingReview),
     /// Plan-approval card (`exit_plan_mode`), while the agent waits for the
     /// verdict.
     PlanApproval(PendingPlanApproval),
@@ -3720,14 +3717,6 @@ impl AgentCards {
         PendingPermission
     );
     card_accessors!(ask, ask_mut, take_ask, set_ask, Ask, PendingAskUser);
-    card_accessors!(
-        review,
-        review_mut,
-        take_review,
-        set_review,
-        Review,
-        PendingReview
-    );
     card_accessors!(
         plan_approval,
         plan_approval_mut,
@@ -3964,6 +3953,9 @@ impl CodeTuiApp {
             plan_mode: false,
             plan_prior_mode: PlanPriorMode::default(),
             plan_exit_pending: false,
+            ask_mode: false,
+            ask_prior_mode: PlanPriorMode::default(),
+            ask_exit_pending: false,
             agent_unsend_pending: false,
             pending_plan: None,
             plan_card_idx: None,
@@ -3980,10 +3972,10 @@ impl CodeTuiApp {
             cards: AgentCards::default(),
             agent_auto_approve: false,
             auto_approve_flag: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            agent_review_edits: false,
-            review_edits_flag: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             plan_exit_flag: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             plan_enter_flag: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            ask_exit_flag: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            ask_enter_flag: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             plan_state_written: std::cell::Cell::new(false),
             thinking_enabled: true,
             web_search_enabled: true,

@@ -1,8 +1,8 @@
 //! The one table of built-in tool traits. Every classification the engine used
 //! to hand-keep in scattered `matches!` lists — read-only, parallel-safe,
 //! mutating, file-writing, plan-hidden, path-carrying — is one row here; the
-//! predicates in `safety`/`file_tracker`/`review` query it. Adding a tool
-//! without a row fails the spec/registry contract test.
+//! predicates in `safety`/`file_tracker` query it. Adding a tool without a
+//! row fails the spec/registry contract test.
 
 /// Classification of one built-in tool. Flags default to the SAFE side (an
 /// unknown tool is not read-only, not parallel, not a write), so a missing row
@@ -15,7 +15,7 @@ pub struct ToolTraits {
     pub parallel_safe: bool,
     /// Mutates the workspace via the client (permission-gated before execute).
     pub mutating: bool,
-    /// File-writing tool: write escalation, LSP fold, review gate, read-only refusal.
+    /// File-writing tool: write escalation, LSP fold, read-only refusal.
     pub file_write: bool,
     /// Stripped from the advertised schema in plan mode.
     pub plan_hidden: bool,

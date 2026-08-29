@@ -983,11 +983,9 @@ conversation is preserved."
             (ConfigSetting::Approval, "auto-approve") => {
                 "Tools run unattended. Plan mode is /plan.".to_string()
             }
-            (ConfigSetting::Approval, "review") => {
-                "Approve each edit before it's applied.".to_string()
-            }
             (ConfigSetting::Approval, _) => {
-                "Risky actions ask first. Plan mode is /plan, not a standing setting.".to_string()
+                "Edits apply; risky commands ask first. Plan mode is /plan, not a standing setting."
+                    .to_string()
             }
             (ConfigSetting::UseWebSearch, "on") => {
                 "The agent can search the web through aivo (daily quota).".to_string()
@@ -1132,7 +1130,7 @@ conversation is preserved."
                 }
             }
             ConfigSetting::Approval => {
-                const OPTIONS: &[&str] = &["normal", "auto-approve", "review"];
+                const OPTIONS: &[&str] = &["default", "auto-approve"];
                 let label = self.approval_mode_label();
                 owned(
                     OPTIONS,
@@ -1169,14 +1167,12 @@ conversation is preserved."
         }
     }
 
-    /// The live standing mode as an Approval label; plan mode clears both flags → `normal`.
+    /// The live standing mode as an Approval label; plan mode clears the flag → `default`.
     fn approval_mode_label(&self) -> &'static str {
         if self.agent_auto_approve {
             "auto-approve"
-        } else if self.agent_review_edits {
-            "review"
         } else {
-            "normal"
+            "default"
         }
     }
 
@@ -1278,7 +1274,7 @@ conversation is preserved."
                 }
             }
             ConfigSetting::Approval => {
-                let mode = segs.options.get(target).map_or("normal", String::as_str);
+                let mode = segs.options.get(target).map_or("default", String::as_str);
                 self.set_approval_mode(mode).await;
             }
             ConfigSetting::UseWebSearch => self.set_web_search_enabled(target == 0).await,
@@ -1318,26 +1314,22 @@ conversation is preserved."
         }
     }
 
-    /// Set the standing mode by label (`normal`/`auto-approve`/`review`); leaves plan mode first.
+    /// Set the standing mode by label (`default`/`auto-approve`); leaves plan/ask mode first.
     pub(super) async fn set_approval_mode(&mut self, mode: &str) {
         if self.plan_mode {
             self.leave_plan_mode(false).await;
         }
+        if self.ask_mode {
+            self.leave_ask_mode().await;
+        }
         match mode {
             "auto-approve" => {
-                self.set_review_quiet(false);
                 self.set_auto_quiet(true);
                 self.show_toast("Auto-approve mode — tools run without asking");
             }
-            "review" => {
-                self.set_auto_quiet(false);
-                self.set_review_quiet(true);
-                self.show_toast("Review mode — approve each edit");
-            }
             _ => {
                 self.set_auto_quiet(false);
-                self.set_review_quiet(false);
-                self.show_toast("Normal mode — risky actions ask first");
+                self.show_toast("Default mode — risky actions ask first");
             }
         }
     }
@@ -3439,13 +3431,14 @@ conversation is preserved."
     /// session first persists.
     pub(super) fn current_plan_state(&self) -> Option<crate::services::session_store::PlanState> {
         let steps = self.unfinished_plan_steps();
-        (self.plan_mode || self.pending_plan.is_some() || steps.is_some()).then(|| {
-            crate::services::session_store::PlanState {
+        (self.plan_mode || self.ask_mode || self.pending_plan.is_some() || steps.is_some()).then(
+            || crate::services::session_store::PlanState {
                 mode: self.plan_mode,
+                ask: self.ask_mode,
                 draft: self.pending_plan.clone(),
                 steps,
-            }
-        })
+            },
+        )
     }
 
     pub(super) async fn persist_plan_state(&self) {
@@ -3546,10 +3539,15 @@ conversation is preserved."
         // session's thread (`/new` and key/model switches reset it the same way).
         self.agent_engine = None;
         self.cards.clear_agent_cards();
-        // Plan/goal modes belong to the OLD conversation — a leaked plan card
+        // Plan/ask/goal modes belong to the OLD conversation — a leaked plan card
         // indexes the replaced history and `/plan go` would run the old plan.
+        // The standing mode they quieted comes back first; the resumed session's
+        // own plan/ask state re-applies below, on top of it.
+        self.set_auto_quiet(self.standing_auto_approve());
         self.plan_mode = false;
         self.plan_exit_pending = false;
+        self.ask_mode = false;
+        self.ask_exit_pending = false;
         self.pending_plan = None;
         self.plan_card_idx = None;
         self.goal_mode = None;
@@ -3632,6 +3630,21 @@ conversation is preserved."
         let restored_plan = match session.plan_state.filter(|_| self.agent_capable()) {
             Some(plan) => {
                 self.plan_mode = plan.mode;
+                self.ask_mode = plan.ask && !plan.mode;
+                // Without this a restored read-only mode would leave auto-approve on.
+                if self.plan_mode || self.ask_mode {
+                    let prior = if self.agent_auto_approve {
+                        PlanPriorMode::Auto
+                    } else {
+                        PlanPriorMode::Default
+                    };
+                    if self.plan_mode {
+                        self.plan_prior_mode = prior;
+                    } else {
+                        self.ask_prior_mode = prior;
+                    }
+                    self.set_auto_quiet(false);
+                }
                 self.pending_plan = plan.draft.filter(|d| !d.trim().is_empty());
                 self.plan_card_idx = self.pending_plan.as_deref().and_then(|p| {
                     self.history
@@ -3669,6 +3682,11 @@ conversation is preserved."
                     "Resumed in plan mode — read-only until you approve a plan (/plan exit to leave)"
                 }
                 .to_string(),
+            ));
+        } else if self.ask_mode {
+            self.notice = Some((
+                MUTED(),
+                "Resumed in ask mode — ask anything (/ask exit to leave)".to_string(),
             ));
         } else if let Some(steps) = self.unfinished_plan_steps() {
             // The checklist and engine transcript both came back, so plain

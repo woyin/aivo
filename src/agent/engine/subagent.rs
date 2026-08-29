@@ -277,10 +277,11 @@ Fix the repo state or run it alone."
             yes: ctx.yes,
             auto_approve_all: ctx.auto_approve_all,
             auto_approve: ctx.auto_approve,
-            review_edits: ctx.review_edits,
             // Sub-agents never run in plan mode (plan strips the subagent tool).
             plan_exit: None,
             plan_enter: None,
+            ask_exit: None,
+            ask_enter: None,
         };
         // Box the recursive future (run_turn → subagent → run_turn) so it isn't infinitely-sized.
         Box::pin(sub.run_turn(&sub_ctx, &mut ui, task.to_string())).await;

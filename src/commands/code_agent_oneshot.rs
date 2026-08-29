@@ -435,9 +435,10 @@ async fn run_agent_captured(
         yes: true,
         auto_approve_all: auto_approve,
         auto_approve: None,
-        review_edits: None,
         plan_exit: None,
         plan_enter: None,
+        ask_exit: None,
+        ask_enter: None,
     };
     let mut ui = HeadlessAgentUi::new(format, session_id.clone());
     ui.silent = opts.silent;

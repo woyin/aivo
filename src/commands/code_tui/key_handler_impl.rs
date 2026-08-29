@@ -139,14 +139,6 @@ impl CodeTuiApp {
             return self.handle_editor_key(key).await;
         }
 
-        // Same draft-guard as the permission card so a queued message isn't corrupted.
-        if self.cards.review().is_some() {
-            if self.handle_review_key(key) {
-                return Ok(false);
-            }
-            return self.handle_editor_key(key).await;
-        }
-
         // The `/login` status card consumes Enter/Esc only on an empty composer.
         if self.account.login.is_some() && self.handle_login_card_key(key) {
             return Ok(false);
@@ -197,6 +189,10 @@ impl CodeTuiApp {
                 self.request_plan_exit_live();
                 self.set_auto_quiet(true);
                 self.show_toast("Plan mode off — auto-approve on");
+            } else if self.ask_mode {
+                self.request_ask_exit_live();
+                self.set_auto_quiet(true);
+                self.show_toast("Ask mode off — auto-approve on");
             } else {
                 self.set_auto_approve(true);
             }
@@ -547,7 +543,7 @@ impl CodeTuiApp {
     }
 
     /// Resolve by option index — approval also picks the exit mode: 0 approve +
-    /// auto, 1 approve + review, 2 keep planning. (Discard = Esc then `/plan exit`.)
+    /// auto, 1 approve + default, 2 keep planning. (Discard = Esc then `/plan exit`.)
     pub(super) fn pick_plan_approval_option(&mut self, idx: usize) {
         use crate::agent::protocol::PlanDecision;
         match idx {
@@ -559,7 +555,7 @@ impl CodeTuiApp {
     }
 
     /// Send the verdict to the waiting engine task and flip the TUI mode: approval
-    /// exits plan mode into auto or review mode (per `auto_approve`).
+    /// exits plan mode into auto-approve or default mode (per `auto_approve`).
     pub(super) fn resolve_plan_approval(
         &mut self,
         decision: crate::agent::protocol::PlanDecision,
@@ -575,7 +571,6 @@ impl CodeTuiApp {
                 self.pending_plan = None;
                 self.plan_card_idx = None;
                 self.set_auto_quiet(auto_approve);
-                self.set_review_quiet(!auto_approve);
                 // cursor ends its turn after an accepted plan; arm the go-ahead.
                 if self.key.is_cursor_acp() {
                     self.cursor_plan_go_pending = true;
@@ -583,7 +578,7 @@ impl CodeTuiApp {
                 self.show_toast(if auto_approve {
                     "Plan approved — executing with auto-approve"
                 } else {
-                    "Plan approved — executing; each edit shows a diff to approve"
+                    "Plan approved — executing"
                 });
             }
             PlanDecision::KeepPlanning { feedback } => {
@@ -597,86 +592,30 @@ impl CodeTuiApp {
         let _ = pending.reply.send(Ok(decision));
     }
 
-    /// Resolve a key against the edit-review card: on an empty composer `y`/Enter
-    /// approve, `n` rejects, arrows scroll. Esc always rejects; decision/scroll keys
-    /// fall through while a queued message is being typed. `true` when consumed.
-    fn handle_review_key(&mut self, key: KeyEvent) -> bool {
-        if self.cards.review().is_none() {
-            return false;
-        }
-        // Esc rejects regardless of composer state — Esc is never message text.
-        if matches!(key.code, KeyCode::Esc) {
-            self.resolve_review(crate::agent::review::ReviewDecision::Reject);
-            return true;
-        }
-        if !self.draft.is_empty() {
-            return false;
-        }
-        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-        match key.code {
-            KeyCode::Up | KeyCode::PageUp => {
-                self.scroll_review(-1);
-                true
-            }
-            KeyCode::Char('p') if ctrl => {
-                self.scroll_review(-1);
-                true
-            }
-            KeyCode::Down | KeyCode::PageDown => {
-                self.scroll_review(1);
-                true
-            }
-            KeyCode::Char('n') if ctrl => {
-                self.scroll_review(1);
-                true
-            }
-            KeyCode::Char('y') | KeyCode::Enter => {
-                self.resolve_review(crate::agent::review::ReviewDecision::ApproveAll);
-                true
-            }
-            KeyCode::Char('n') => {
-                self.resolve_review(crate::agent::review::ReviewDecision::Reject);
-                true
-            }
-            // The card owns every other key while the composer is empty.
-            _ => true,
-        }
-    }
-
-    /// Scroll the review body by `delta` rows; render clamps and writes back.
-    fn scroll_review(&mut self, delta: isize) {
-        if let Some(review) = self.cards.review_mut() {
-            let max = (review.body.len().saturating_sub(1)) as isize;
-            review.scroll = (review.scroll as isize + delta).clamp(0, max.max(0)) as u16;
-        }
-    }
-
-    /// Send the review verdict back to the waiting engine task and close the card.
-    fn resolve_review(&mut self, decision: crate::agent::review::ReviewDecision) {
-        if let Some(review) = self.cards.take_review() {
-            let _ = review.reply.send(decision);
-        }
-    }
-
-    /// Shift+Tab: cycle normal → auto-approve → plan → review → normal (Claude
-    /// Code's ring plus review). Keys without the native agent skip the plan stop.
-    /// Mid-turn entry restricts the RUNNING turn at its next tool-call boundary
-    /// (live flag); the drafted plan survives cycling through.
+    /// Shift+Tab: cycle default → auto-approve → plan → ask → default; keys without
+    /// the native agent skip the read-only stops. Mid-turn entry restricts the
+    /// RUNNING turn at its next tool-call boundary (live flag).
     pub(super) async fn cycle_agent_mode(&mut self) {
         if self.plan_mode {
             self.leave_plan_mode(false).await;
-            self.set_review_quiet(true);
-            self.show_toast("Review mode — approve each edit");
-        } else if self.agent_review_edits {
-            self.set_review_quiet(false);
-            self.show_toast("Normal mode — risky actions ask first");
+            if self.enter_ask_mode().await {
+                self.show_toast(if self.ask_web_search_missing() {
+                    "Ask mode — web search is off (/config)"
+                } else {
+                    "Ask mode — ask anything, answers with sources"
+                });
+            } else {
+                self.show_toast("Default mode — risky actions ask first");
+            }
+        } else if self.ask_mode {
+            self.leave_ask_mode().await;
+            self.show_toast("Default mode — risky actions ask first");
         } else if self.agent_auto_approve {
             self.set_auto_quiet(false);
             if self.enter_plan_mode().await {
                 self.show_toast("Plan mode — read-only until you approve");
             } else {
-                self.set_review_quiet(true);
-                self.show_toast("Review mode — approve each edit");
+                self.show_toast("Default mode — risky actions ask first");
             }
         } else {
             self.set_auto_quiet(true);
@@ -691,13 +630,6 @@ impl CodeTuiApp {
             .store(on, std::sync::atomic::Ordering::Relaxed);
     }
 
-    /// Flip edit-review (field + live atomic) without a toast.
-    pub(super) fn set_review_quiet(&mut self, on: bool) {
-        self.agent_review_edits = on;
-        self.review_edits_flag
-            .store(on, std::sync::atomic::Ordering::Relaxed);
-    }
-
     /// Set session auto-approve and mirror it to the shared live flag the running
     /// agent turn reads (native engine + cursor ACP), with a fading toast. A
     /// toast — not a persistent notice — so the confirmation flashes and vanishes
@@ -707,7 +639,7 @@ impl CodeTuiApp {
         self.show_toast(if on {
             "Auto-approve mode — tools run without asking"
         } else {
-            "Normal mode — risky actions ask first"
+            "Default mode — risky actions ask first"
         });
     }
 

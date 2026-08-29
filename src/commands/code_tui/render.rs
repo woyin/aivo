@@ -2399,8 +2399,8 @@ pub(super) struct EditDiff {
 /// The pairs an edit tool applies, in render order (one per `edit_file`, per
 /// `multi_edit` step, per `apply_patch` hunk, whole content for `write_file`) —
 /// so `line_starts` aligns by index. `write_file` defaults to all-additions;
-/// the review card ([`review_edit_diffs`]) and the transcript card (via the
-/// `old_content` snapshot in [`render_edit_diff`]) upgrade it to a real diff.
+/// the transcript card (via the `old_content` snapshot in
+/// [`render_edit_diff`]) upgrades it to a real diff.
 pub(super) fn edit_diffs(name: &str, args: &serde_json::Value) -> Vec<EditDiff> {
     let pick = |v: &serde_json::Value, k: &str| {
         v.get(k).and_then(|x| x.as_str()).unwrap_or("").to_string()
@@ -2462,81 +2462,6 @@ pub(super) fn edit_diffs(name: &str, args: &serde_json::Value) -> Vec<EditDiff> 
             .unwrap_or_default(),
         _ => vec![],
     }
-}
-
-/// Like [`edit_diffs`] but also covers `write_file` by reading the current file
-/// (read-only). Non-UTF8/oversized files fall back to a byte-count summary.
-pub(super) fn review_edit_diffs(
-    name: &str,
-    args: &serde_json::Value,
-    cwd: &std::path::Path,
-) -> Vec<EditDiff> {
-    if name != "write_file" {
-        return edit_diffs(name, args);
-    }
-    let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("");
-    let new = args
-        .get("content")
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_string();
-    const MAX_BYTES: u64 = 512 * 1024;
-    let abs = cwd.join(path);
-    let (old, new) = match std::fs::metadata(&abs) {
-        Ok(meta) if meta.len() > MAX_BYTES => (
-            format!("<existing file: {} bytes>", meta.len()),
-            format!("<new content: {} bytes>", new.len()),
-        ),
-        Ok(_) => match std::fs::read(&abs).map(String::from_utf8) {
-            Ok(Ok(s)) => (s, new),
-            Ok(Err(e)) => (
-                format!("<binary file: {} bytes>", e.into_bytes().len()),
-                format!("<new content: {} bytes>", new.len()),
-            ),
-            Err(_) => (String::new(), new), // unreadable → treat as new
-        },
-        Err(_) => (String::new(), new), // missing file → all additions
-    };
-    if old.is_empty() && new.is_empty() {
-        return vec![];
-    }
-    vec![EditDiff {
-        path: path.to_string(),
-        old,
-        new,
-    }]
-}
-
-/// The scrollable body of the edit-review card: a filename header + numbered diff
-/// per pending edit. Precomputed once when the card opens so the frame render is pure.
-pub(super) fn review_body_lines(
-    items: &[crate::agent::review::ReviewItem],
-    cwd: &std::path::Path,
-) -> Vec<Line<'static>> {
-    const CONTEXT: usize = 3;
-    let mut out: Vec<Line<'static>> = Vec::new();
-    for item in items {
-        let diffs = review_edit_diffs(&item.tool, &item.args, cwd);
-        for d in &diffs {
-            out.push(Line::from(Span::styled(
-                format!("  {}", d.path),
-                Style::default().fg(TEXT()).add_modifier(Modifier::BOLD),
-            )));
-            let rows = build_hunk(&d.old, &d.new, None, CONTEXT);
-            if rows.is_empty() {
-                out.push(Line::from(Span::styled(
-                    "    (no textual change)".to_string(),
-                    Style::default().fg(FAINT()),
-                )));
-                continue;
-            }
-            let numw = diff_num_width(&rows);
-            for row in &rows {
-                out.push(render_diff_row(row, numw).line);
-            }
-        }
-    }
-    out
 }
 
 /// Expand tabs to 4 spaces so a raw `\t` (unicode-width 1) can't desync the

@@ -420,22 +420,15 @@ async fn test_plan_exit_restores_prior_mode() {
     assert!(app.agent_auto_approve, "back to auto-approve");
     assert!(notice_text(&app).contains("back to auto-approve"));
 
-    // Entered from normal: exit lands on normal.
+    // Entered from default: exit lands on default.
     app.set_auto_quiet(false);
     assert!(app.enter_plan_mode().await);
     app.run_plan_command(Some("exit".to_string())).await;
-    assert!(!app.plan_mode && !app.agent_auto_approve && !app.agent_review_edits);
-
-    // Entered from review: restored too.
-    app.set_review_quiet(true);
-    assert!(app.enter_plan_mode().await);
-    assert!(!app.agent_review_edits, "plan quiets review while on");
-    app.run_plan_command(Some("exit".to_string())).await;
-    assert!(app.agent_review_edits, "back to review");
+    assert!(!app.plan_mode && !app.agent_auto_approve);
 }
 
 /// Approval-card verdicts, Claude Code-style: 1 = approve + auto-approve,
-/// 2 = approve + manual approval, 3 = keep planning. (Bare `/plan`'s silent
+/// 2 = approve + default mode, 3 = keep planning. (Bare `/plan`'s silent
 /// entry is covered in `test_plan_bare_enters_silently`.)
 #[tokio::test]
 async fn test_plan_mode_enter_and_approval_verdicts() {
@@ -460,7 +453,6 @@ async fn test_plan_mode_enter_and_approval_verdicts() {
     assert!(!app.plan_mode, "approval exits plan mode");
     assert!(!app.plan_exit_pending);
     assert!(app.agent_auto_approve, "option 1 lands in auto mode");
-    assert!(!app.agent_review_edits, "modes are exclusive");
     assert!(
         app.auto_approve_flag
             .load(std::sync::atomic::Ordering::Relaxed),
@@ -468,7 +460,7 @@ async fn test_plan_mode_enter_and_approval_verdicts() {
     );
     assert_eq!(rx1.try_recv().unwrap(), Ok(PlanDecision::Approve));
 
-    // Approve with per-edit review: mode off, review mode on.
+    // Approve into default mode: mode off, auto-approve stays off.
     app.plan_mode = true;
     let (reply, mut rx2) = tokio::sync::oneshot::channel();
     app.cards
@@ -480,13 +472,7 @@ async fn test_plan_mode_enter_and_approval_verdicts() {
         });
     app.pick_plan_approval_option(1);
     assert!(!app.plan_mode);
-    assert!(!app.agent_auto_approve, "option 2 lands in review mode");
-    assert!(app.agent_review_edits, "each edit will show a diff");
-    assert!(
-        app.review_edits_flag
-            .load(std::sync::atomic::Ordering::Relaxed),
-        "live review flag follows mid-turn"
-    );
+    assert!(!app.agent_auto_approve, "option 2 lands in default mode");
     assert_eq!(rx2.try_recv().unwrap(), Ok(PlanDecision::Approve));
 
     // Keep planning: mode stays on.
@@ -587,19 +573,14 @@ async fn test_cursor_plan_auto_continue_guards() {
     assert!(!app.sending);
 }
 
-/// Shift+Tab: default → auto → plan → review → default, plan included (Claude
-/// Code's ring). Mid-turn entry arms the live flag instead of skipping.
+/// Shift+Tab: default → auto → plan → ask → default (Claude Code's ring plus
+/// ask). Mid-turn entry arms the live flag instead of skipping.
 #[tokio::test]
 async fn test_shift_tab_cycles_agent_modes() {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let mut app = make_test_app(tx, rx);
-    let mode = |app: &super::super::CodeTuiApp| {
-        (
-            app.agent_auto_approve,
-            app.plan_mode,
-            app.agent_review_edits,
-        )
-    };
+    let mode =
+        |app: &super::super::CodeTuiApp| (app.agent_auto_approve, app.plan_mode, app.ask_mode);
     assert_eq!(mode(&app), (false, false, false), "starts in default");
 
     app.cycle_agent_mode().await;
@@ -607,18 +588,13 @@ async fn test_shift_tab_cycles_agent_modes() {
 
     app.cycle_agent_mode().await;
     assert_eq!(mode(&app), (false, true, false), "auto cycles into plan");
-
-    app.cycle_agent_mode().await;
-    assert_eq!(mode(&app), (false, false, true), "plan cycles into review");
-    assert!(
-        app.review_edits_flag
-            .load(std::sync::atomic::Ordering::Relaxed),
-        "live review flag follows"
-    );
     assert!(
         !app.auto_approve_flag
             .load(std::sync::atomic::Ordering::Relaxed)
     );
+
+    app.cycle_agent_mode().await;
+    assert_eq!(mode(&app), (false, false, true), "plan cycles into ask");
 
     app.cycle_agent_mode().await;
     assert_eq!(mode(&app), (false, false, false), "full circle");
@@ -634,13 +610,30 @@ async fn test_shift_tab_cycles_agent_modes() {
             .load(std::sync::atomic::Ordering::Relaxed),
         "the running turn sees the entry"
     );
+
+    app.cycle_agent_mode().await;
+    assert_eq!(mode(&app), (false, false, true), "ask enters mid-turn too");
+    assert!(
+        app.ask_enter_flag
+            .load(std::sync::atomic::Ordering::Relaxed),
+        "the running turn sees the ask entry"
+    );
+
+    app.cycle_agent_mode().await;
+    assert_eq!(mode(&app), (false, false, false), "ask exits mid-turn");
+    assert!(app.ask_exit_pending, "engine restore deferred to turn end");
+    assert!(
+        !app.ask_enter_flag
+            .load(std::sync::atomic::Ordering::Relaxed),
+        "the exit clears a queued live entry"
+    );
     app.sending = false;
 
     app.plan_mode = true;
     app.sending = true;
     app.cycle_agent_mode().await;
     assert!(!app.plan_mode);
-    assert!(app.agent_review_edits, "leaving plan lands on review");
+    assert!(app.ask_mode, "leaving plan mid-turn lands on ask");
     assert!(app.plan_exit_pending, "engine restore deferred to turn end");
     assert!(
         !app.plan_enter_flag
@@ -740,7 +733,7 @@ async fn test_plan_badge_on_composer_rule() {
 
     let off = app.composer_rule_line(80);
     assert!(!plain(&off).contains("plan"));
-    assert!(plain(&off).contains("normal"), "normal mode shown");
+    assert!(plain(&off).contains("default"), "default mode shown");
     // Every mode carries the cycle hint.
     assert!(plain(&off).contains("(Shift+Tab)"));
 
@@ -899,11 +892,17 @@ async fn test_shift_tab_cycles_modes_through_handle_key() {
     app.handle_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::NONE))
         .await
         .unwrap();
-    assert!(app.agent_review_edits, "third press cycles into review");
+    assert!(
+        app.ask_mode && !app.plan_mode && !app.agent_auto_approve,
+        "third press cycles into ask"
+    );
     app.handle_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::NONE))
         .await
         .unwrap();
-    assert!(!app.plan_mode && !app.agent_auto_approve && !app.agent_review_edits);
+    assert!(
+        !app.ask_mode && !app.plan_mode && !app.agent_auto_approve,
+        "fourth press lands back on default"
+    );
     // Ctrl+O is no longer an auto-approve alias (Shift+Tab only).
     app.handle_key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL))
         .await
@@ -952,6 +951,7 @@ async fn test_plan_resume_picker_lists_unfinished_plans() {
             "s-plan",
             Some(&PlanState {
                 mode: true,
+                ask: false,
                 draft: Some("1. fix gate\n2. add tests".to_string()),
                 steps: None,
             }),
@@ -964,6 +964,7 @@ async fn test_plan_resume_picker_lists_unfinished_plans() {
             "s-executing",
             Some(&PlanState {
                 mode: false,
+                ask: false,
                 draft: None,
                 steps: Some(serde_json::json!([
                     {"step": "dedupe server blocks", "status": "completed"},
@@ -980,6 +981,7 @@ async fn test_plan_resume_picker_lists_unfinished_plans() {
             "s-elsewhere",
             Some(&PlanState {
                 mode: true,
+                ask: false,
                 draft: Some("out of scope".to_string()),
                 steps: None,
             }),
@@ -992,6 +994,7 @@ async fn test_plan_resume_picker_lists_unfinished_plans() {
             "s-modeonly",
             Some(&PlanState {
                 mode: true,
+                ask: false,
                 draft: None,
                 steps: None,
             }),
@@ -1141,6 +1144,7 @@ async fn test_plan_resume_single_candidate_carries_directly() {
             "s-only",
             Some(&PlanState {
                 mode: true,
+                ask: false,
                 draft: Some("1. only plan".to_string()),
                 steps: None,
             }),
@@ -1691,6 +1695,7 @@ async fn test_plan_resume_picker_lists_orphan_saved_files() {
             "s-live",
             Some(&PlanState {
                 mode: true,
+                ask: false,
                 draft: Some("1. live plan".to_string()),
                 steps: None,
             }),

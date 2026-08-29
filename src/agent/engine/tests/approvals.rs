@@ -15,9 +15,10 @@ fn auto_approve_enabled_tracks_static_flag_and_live_toggle() {
         yes,
         auto_approve_all: false,
         auto_approve: flag,
-        review_edits: None,
         plan_exit: None,
         plan_enter: None,
+        ask_exit: None,
+        ask_enter: None,
     };
     assert!(ctx(true, None).auto_approve_enabled());
     assert!(!ctx(false, None).auto_approve_enabled());

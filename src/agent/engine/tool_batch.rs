@@ -77,12 +77,17 @@ impl AgentEngine {
         });
 
         for (i, call) in tool_calls.iter().enumerate() {
-            // Live mid-turn plan transitions (Shift+Tab), picked up at this call
-            // boundary: exit unrestricts the rest of the turn, entry restricts it.
-            if self.read_only && ctx.plan_exit_requested() {
+            // Live mid-turn mode transitions (Shift+Tab), picked up at this call
+            // boundary so the rest of the running turn takes the new floor.
+            if self.plan_mode_on() && ctx.plan_exit_requested() {
                 self.set_plan_mode(false);
             } else if !self.read_only && ctx.plan_enter_requested() {
                 self.set_plan_mode(true);
+            }
+            if self.ask_mode_on() && ctx.ask_exit_requested() {
+                self.set_ask_mode(false);
+            } else if !self.read_only && ctx.ask_enter_requested() {
+                self.set_ask_mode(true);
             }
             let n = names[i];
             // The plan tool renders as a checklist card and never needs permission —
@@ -123,11 +128,16 @@ exact action this turn.)"
             // Backstop for a hallucinated state-changing tool (also hidden from the
             // schema); `subagent` has its own refusal below.
             if self.read_only && tools::hidden_in_plan_mode(n) && n != "subagent" {
-                outcomes[i] = Some(Err(
+                outcomes[i] = Some(Err(if self.ask_mode_on() {
+                    "Ask mode is read-only — do not modify files or write artifacts. \
+Answer from investigation; the user must leave ask mode (/ask exit or Shift+Tab) \
+before edits are possible."
+                        .to_string()
+                } else {
                     "Plan mode is read-only — do not modify files or write artifacts. \
 Investigate, or call `exit_plan_mode` with your plan."
-                        .to_string(),
-                ));
+                        .to_string()
+                }));
                 continue;
             }
             // PreToolUse veto runs before the permission tiers — a veto never
@@ -138,6 +148,12 @@ Investigate, or call `exit_plan_mode` with your plan."
                 outcomes[i] = Some(Err(format!("blocked by PreToolUse hook: {reason}")));
                 continue;
             }
+            // Its own tier (`PermissionAction::AskBash`): plan's Once floor would
+            // nag a research session on every variation of the same fetch/inspect
+            // command. Risky/remote calls below still take their stricter gates.
+            let ask_bash = self.ask_mode_on()
+                && n == "run_bash"
+                && !tools::is_readonly_command(&call.arguments);
             // Confirm only genuinely risky actions: destructive command, blind
             // overwrite of an unread file, or an untrusted external tool.
             let needs_confirm = tools::is_dangerous(n, &call.arguments)
@@ -151,8 +167,9 @@ Investigate, or call `exit_plan_mode` with your plan."
             let catastrophic = tools::is_catastrophic(n, &call.arguments);
             // Plan-mode bash confirms per call (allow-once, bypasses -y/auto/grants
             // like `catastrophic`); provably read-only inspection is exempt.
-            let plan_bash =
-                self.read_only && n == "run_bash" && !tools::is_readonly_command(&call.arguments);
+            let plan_bash = self.plan_mode_on()
+                && n == "run_bash"
+                && !tools::is_readonly_command(&call.arguments);
             // Remote mutation: only auto-approve mode waives it; AlwaysAllow
             // remembers the command family so a deploy loop isn't re-prompted.
             let remote_side_effect = !catastrophic
@@ -198,8 +215,7 @@ Investigate, or call `exit_plan_mode` with your plan."
                 match remote {
                     Resolution::Denied => false,
                     Resolution::Approved => true,
-                    Resolution::Covered if !needs_confirm => true,
-                    Resolution::Covered => self
+                    Resolution::Covered if needs_confirm => self
                         .resolve_permission(
                             ctx,
                             ui,
@@ -210,6 +226,19 @@ Investigate, or call `exit_plan_mode` with your plan."
                         )
                         .await
                         .allowed(),
+                    Resolution::Covered if ask_bash => self
+                        .resolve_permission(
+                            ctx,
+                            ui,
+                            PermissionAction::AskBash {
+                                name: n,
+                                args: &call.arguments,
+                                programs: tools::bash_nonreadonly_programs(&call.arguments),
+                            },
+                        )
+                        .await
+                        .allowed(),
+                    Resolution::Covered => true,
                 }
             };
             if !allowed {
@@ -335,32 +364,6 @@ Investigate, or call `exit_plan_mode` with your plan."
             sequential_idx.retain(|i| !subagent_idx.contains(i));
         }
 
-        // Opt-in edit-review gate: pause an edit-bearing batch for approval before
-        // any write. Reject drops the reviewed calls (a sibling `run_bash` still runs).
-        if ctx.review_edits_enabled() {
-            let reviewed: Vec<usize> = sequential_idx
-                .iter()
-                .copied()
-                .filter(|&i| crate::agent::review::is_edit_tool(names[i]))
-                .collect();
-            if !reviewed.is_empty() {
-                let items: Vec<crate::agent::review::ReviewItem> = reviewed
-                    .iter()
-                    .map(|&i| {
-                        crate::agent::review::review_item(i, names[i], &tool_calls[i].arguments)
-                    })
-                    .collect();
-                if ui.review_edits(&items).await == crate::agent::review::ReviewDecision::Reject {
-                    for &i in &reviewed {
-                        outcomes[i] = Some(Err(
-                            crate::agent::review::REVIEW_REJECTED_DIRECTIVE.to_string()
-                        ));
-                    }
-                    sequential_idx.retain(|i| !reviewed.contains(i));
-                }
-            }
-        }
-
         // Run the ordered calls one at a time — they mutate the engine or workspace, so concurrency is unsafe.
         for &i in &sequential_idx {
             let call = &tool_calls[i];
@@ -380,11 +383,14 @@ Investigate, or call `exit_plan_mode` with your plan."
                     .unwrap_or("");
                 skills::load_skill_result(&self.skills, name)
             } else if n == "subagent" && self.read_only {
-                // A sub-engine isn't read-only; refuse delegation in plan mode.
-                Err(
+                // A sub-engine wouldn't inherit the read-only floor.
+                Err(if self.ask_mode_on() {
+                    "Ask mode is read-only — cannot delegate to a subagent; investigate directly."
+                        .to_string()
+                } else {
                     "Plan mode is read-only — cannot delegate to a subagent while planning."
-                        .to_string(),
-                )
+                        .to_string()
+                })
             } else if n == "subagent" {
                 // Fresh sub-engine on the same serve/cwd; tokens fold in even on failure.
                 let base = self.turn_usage.completion_tokens;
@@ -403,7 +409,7 @@ Investigate, or call `exit_plan_mode` with your plan."
                 // Engine-state intrinsics (notes/session controls/schema search).
                 res
             } else if n == "exit_plan_mode" {
-                if !self.read_only {
+                if !self.plan_mode_on() {
                     Err(
                         "exit_plan_mode: not in plan mode (the plan was already approved or \
 planning is off) — continue with the task."

@@ -30,6 +30,15 @@ pub(crate) enum PermissionAction<'a> {
     /// Risky call (destructive / blind overwrite / secret read / untrusted tool):
     /// `-y`/auto-approve bypass, tool-call grant, AlwaysAllow remembers.
     Confirm { name: &'a str, args: &'a Value },
+    /// Ask-mode bash that isn't provably read-only (and isn't risky): prompts,
+    /// and AlwaysAllow remembers the command's PROGRAMS for the session — a
+    /// research session repeats the same fetch/inspect commands. `programs:
+    /// None` (unparseable) stays exact.
+    AskBash {
+        name: &'a str,
+        args: &'a Value,
+        programs: Option<Vec<String>>,
+    },
     /// Bespoke escalation (sandbox / out-of-workspace write): `-y`/auto-approve
     /// bypass, exact-key grant. `add_write_root` keys persist across sessions;
     /// the rest are session-scoped.
@@ -101,6 +110,31 @@ impl AgentEngine {
                     Decision::Allow => Resolution::Approved,
                     Decision::AlwaysAllow => {
                         self.grants.remember(name, args, ctx.cwd);
+                        Resolution::Approved
+                    }
+                    Decision::Deny => Resolution::Denied,
+                }
+            }
+            PermissionAction::AskBash {
+                name,
+                args,
+                programs,
+            } => {
+                let covered = match &programs {
+                    Some(p) => self.grants.covers_ask_programs(p),
+                    None => self.grants.covers(name, args, ctx.cwd),
+                };
+                if ctx.auto_approve_enabled() || covered {
+                    return Resolution::Covered;
+                }
+                let preview = tools::preview(name, args);
+                match ui.ask_permission(name, preview.as_deref(), false).await {
+                    Decision::Allow => Resolution::Approved,
+                    Decision::AlwaysAllow => {
+                        match &programs {
+                            Some(p) => self.grants.remember_ask_programs(p),
+                            None => self.grants.remember(name, args, ctx.cwd),
+                        }
                         Resolution::Approved
                     }
                     Decision::Deny => Resolution::Denied,

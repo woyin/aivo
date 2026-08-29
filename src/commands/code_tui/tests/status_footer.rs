@@ -1422,12 +1422,8 @@ fn test_footer_is_single_status_row() {
         "auto badge on composer rule"
     );
     assert!(
-        full_screen(|a| a.agent_auto_approve = false).contains("normal (Shift+Tab)"),
-        "normal mode shown on composer rule (discoverable)"
-    );
-    assert!(
-        full_screen(|a| a.agent_review_edits = true).contains('✎'),
-        "review badge on composer rule"
+        full_screen(|a| a.agent_auto_approve = false).contains("default (Shift+Tab)"),
+        "default mode shown on composer rule (discoverable)"
     );
     assert!(
         !footer_text(|a| a.agent_auto_approve = true).contains('↯'),

@@ -365,14 +365,6 @@ pub trait AgentUi: Send {
             Err("Plan approval is only available in interactive `aivo code`.".to_string())
         })
     }
-    /// Show the pending edits and return the user's verdict. Only reached with the
-    /// live toggle on; the default fails closed to `Reject` like `ask_permission`.
-    fn review_edits<'a>(
-        &'a mut self,
-        _items: &'a [crate::agent::review::ReviewItem],
-    ) -> BoxFuture<'a, crate::agent::review::ReviewDecision> {
-        Box::pin(async { crate::agent::review::ReviewDecision::Reject })
-    }
 }
 
 /// Marks an engine-synthesized message (value = kind); stripped pre-request in
@@ -443,15 +435,16 @@ pub struct TurnCtx<'a> {
     /// tool call so flipping it mid-turn takes effect on the *running* turn,
     /// unlike the `yes` snapshot. `None` outside the chat TUI.
     pub auto_approve: Option<&'a std::sync::atomic::AtomicBool>,
-    /// Live edit-review toggle (chat `/config`), read fresh per batch. `None`
-    /// outside the chat TUI — headless / `-y` / sub-agents never gate.
-    pub review_edits: Option<&'a std::sync::atomic::AtomicBool>,
     /// Live mid-turn plan-mode exit (chat TUI Shift+Tab), read per tool-call
     /// boundary so the running turn drops the plan floor. `None` outside the TUI.
     pub plan_exit: Option<&'a std::sync::atomic::AtomicBool>,
     /// Live mid-turn plan-mode entry (the reverse ring direction), read per
     /// tool-call boundary so the running turn goes read-only. `None` outside the TUI.
     pub plan_enter: Option<&'a std::sync::atomic::AtomicBool>,
+    /// Live mid-turn ask-mode exit, the ask-mode analog of `plan_exit`.
+    pub ask_exit: Option<&'a std::sync::atomic::AtomicBool>,
+    /// Live mid-turn ask-mode entry, the ask-mode analog of `plan_enter`.
+    pub ask_enter: Option<&'a std::sync::atomic::AtomicBool>,
 }
 
 impl TurnCtx<'_> {
@@ -469,12 +462,6 @@ impl TurnCtx<'_> {
         self.yes || self.auto_approve_mode()
     }
 
-    /// True when edits should pause for review — the live toggle only (no `-y`).
-    pub fn review_edits_enabled(&self) -> bool {
-        self.review_edits
-            .is_some_and(|f| f.load(std::sync::atomic::Ordering::Relaxed))
-    }
-
     pub fn plan_exit_requested(&self) -> bool {
         self.plan_exit
             .is_some_and(|f| f.load(std::sync::atomic::Ordering::Relaxed))
@@ -482,6 +469,16 @@ impl TurnCtx<'_> {
 
     pub fn plan_enter_requested(&self) -> bool {
         self.plan_enter
+            .is_some_and(|f| f.load(std::sync::atomic::Ordering::Relaxed))
+    }
+
+    pub fn ask_exit_requested(&self) -> bool {
+        self.ask_exit
+            .is_some_and(|f| f.load(std::sync::atomic::Ordering::Relaxed))
+    }
+
+    pub fn ask_enter_requested(&self) -> bool {
+        self.ask_enter
             .is_some_and(|f| f.load(std::sync::atomic::Ordering::Relaxed))
     }
 }
@@ -627,10 +624,13 @@ pub struct AgentEngine {
     /// Whether this model can reason at all (snapshot). Cached at construction so the
     /// disable path doesn't send an effort field that would 400.
     reasoning_capable: bool,
-    /// Plan mode: mutating tools refused so planning can't modify the workspace.
-    /// Reversible — see `set_plan_mode`.
+    /// Read-only bit shared by plan and ask mode: mutating tools refused.
+    /// Reversible — see `set_plan_mode` / `set_ask_mode`.
     read_only: bool,
-    /// Tool specs stripped by `set_plan_mode(true)`, restored verbatim on exit.
+    /// Which read-only mode owns `read_only`: `true` = ask mode, else plan mode.
+    ask_mode: bool,
+    /// Tool specs stripped on read-only entry, restored verbatim on exit; plan
+    /// and ask mode share it because they're mutually exclusive.
     plan_mode_stash: Vec<Value>,
     /// Unattended `-e` only: reject a text turn that admits it isn't done (or trails
     /// off mid-step) and nudge to continue, rather than accept it as the final answer.

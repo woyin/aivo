@@ -6,6 +6,7 @@
 
 pub mod apply_patch;
 pub mod ask;
+pub mod ask_mode;
 pub mod checkpoint;
 pub mod compaction;
 pub mod engine;
@@ -26,7 +27,6 @@ pub mod plan_mode;
 pub mod protocol;
 pub mod request;
 pub mod retry;
-pub mod review;
 pub mod sandbox;
 pub mod secrets_guard;
 pub mod serve_client;

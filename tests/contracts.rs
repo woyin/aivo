@@ -81,7 +81,15 @@ fn removed_features_stay_removed() {
         ),
         (
             "\"/review\"",
-            "/review command removed; review MODE + evaluate.md stay",
+            "/review command and review mode both removed; evaluate.md stays",
+        ),
+        (
+            "ReviewDecision",
+            "review mode (the edit-review gate) removed 2026-08; ask mode took its ring slot",
+        ),
+        (
+            "review_edits_flag",
+            "review mode (the edit-review gate) removed 2026-08; no per-edit diff approval",
         ),
         (
             "\"/detach\"",

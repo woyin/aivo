@@ -27,7 +27,7 @@ async fn test_help_overlay_groups_lists_every_command_and_scrolls() {
         "Model & key",
         "Context",
         "Skills & tools",
-        "Autonomous",
+        "Modes",
     ] {
         assert!(top.contains(group), "missing command group {group}:\n{top}");
     }
@@ -550,29 +550,21 @@ async fn test_config_overlay_toggles_agent_tools() {
 async fn test_config_approval_radio_is_mutually_exclusive() {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let mut app = make_test_app(tx, rx);
-    // Three standing modes; plan is a transient state, not a segment here.
+    // Two standing modes; plan is a transient state, not a segment here.
     assert_eq!(
         app.config_segments(ConfigSetting::Approval).options,
-        &["normal", "auto-approve", "review"]
+        &["default", "auto-approve"]
     );
 
-    // Fresh session: normal mode — segment 0 is live.
-    assert!(!app.agent_auto_approve && !app.agent_review_edits && !app.plan_mode);
+    assert!(!app.agent_auto_approve && !app.plan_mode);
     assert_eq!(app.config_segments(ConfigSetting::Approval).active, 0);
 
-    // Auto-approve sets exactly one flag.
     app.set_approval_mode("auto-approve").await;
-    assert!(app.agent_auto_approve && !app.agent_review_edits);
+    assert!(app.agent_auto_approve);
     assert_eq!(app.config_segments(ConfigSetting::Approval).active, 1);
 
-    // Switching to Review clears auto-approve — the fold's whole point.
-    app.set_approval_mode("review").await;
-    assert!(app.agent_review_edits && !app.agent_auto_approve);
-    assert_eq!(app.config_segments(ConfigSetting::Approval).active, 2);
-
-    // Back to Normal leaves every mode off.
-    app.set_approval_mode("normal").await;
-    assert!(!app.agent_auto_approve && !app.agent_review_edits && !app.plan_mode);
+    app.set_approval_mode("default").await;
+    assert!(!app.agent_auto_approve && !app.plan_mode);
     assert_eq!(app.config_segments(ConfigSetting::Approval).active, 0);
 }
 
@@ -601,10 +593,10 @@ async fn config_overlay_renders_live_values_and_focused_options() {
 
     // Theme focused: live values everywhere, alternatives only on that row.
     let text = render(&mut app);
-    for label in ["Theme", "Mode", "dark", "light", "normal", "aivo"] {
+    for label in ["Theme", "Mode", "dark", "light", "default", "aivo"] {
         assert!(text.contains(label), "{label:?} missing:\n{text}");
     }
-    for hidden in ["review", "auto-approve", "gateway"] {
+    for hidden in ["auto-approve", "gateway"] {
         assert!(!text.contains(hidden), "{hidden:?} leaked:\n{text}");
     }
     assert!(
@@ -623,11 +615,11 @@ async fn config_overlay_renders_live_values_and_focused_options() {
         state.select_next();
     }
     let text = render(&mut app);
-    for label in ["normal", "auto-approve", "review"] {
+    for label in ["default", "auto-approve"] {
         assert!(text.contains(label), "option {label:?} missing:\n{text}");
     }
     assert!(
-        text.contains("Risky actions"),
+        text.contains("risky commands ask first"),
         "active-value copy missing:\n{text}"
     );
 }

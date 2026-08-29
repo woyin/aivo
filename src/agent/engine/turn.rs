@@ -455,7 +455,7 @@ impl AgentEngine {
                     continue;
                 }
                 // A plan set this turn but never started isn't done — nudge once.
-                // Plan mode is exempt: proposing without executing is the point.
+                // Read-only modes are exempt: proposing without executing is the point.
                 if !self.read_only
                     && plan_set_this_turn
                     && plan_nudges < MAX_PLAN_NUDGES

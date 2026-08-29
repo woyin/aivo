@@ -800,9 +800,8 @@ impl MessageAttachment {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChatToggles {
     pub auto_approve: bool,
-    /// Whether an edit-bearing batch pauses for a diff-review card before writing
-    /// (`/config`). Defaults off (opt-in).
-    pub review_edits: bool,
+    /// Whether the last chat quit in ask mode (read-only research). Defaults off.
+    pub ask_mode: bool,
     /// Whether the model is asked to think (and its reasoning shown, folded) — the
     /// single thinking on/off concept. Defaults on.
     pub thinking_enabled: bool,
@@ -996,13 +995,15 @@ pub struct CodeSessionState {
     pub created_at: String,
 }
 
-/// Unfinished plan-mode snapshot saved with a code session: `mode` restores
-/// read-only planning; `draft` re-arms the approval card / `/plan go`; `steps` is
-/// the mid-execution `update_plan` checklist another session's `/plan resume` continues.
+/// Transient session-mode snapshot saved with a code session: `mode`/`ask` restore
+/// the read-only modes; `draft` re-arms the approval card / `/plan go`; `steps` is
+/// the `update_plan` checklist another session's `/plan resume` continues.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PlanState {
     #[serde(default)]
     pub mode: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub ask: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub draft: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2095,15 +2096,10 @@ impl SessionStore {
         self.write_code_prefs(&prefs).await
     }
 
-    /// The persisted edit-review toggle (code-prefs.json). Missing → off (opt-in).
-    pub async fn get_chat_review_edits(&self) -> bool {
-        self.get_chat_pref_bool("reviewEdits", false).await
-    }
-
-    /// Persist the global edit-review toggle, preserving sibling prefs. Best-effort.
-    pub async fn set_chat_review_edits(&self, on: bool) -> Result<()> {
+    /// Persist whether the chat quit in ask mode, preserving sibling prefs.
+    pub async fn set_chat_ask_mode(&self, on: bool) -> Result<()> {
         let mut prefs = self.read_code_prefs().await;
-        prefs.insert("reviewEdits".into(), serde_json::Value::Bool(on));
+        prefs.insert("askMode".into(), serde_json::Value::Bool(on));
         self.write_code_prefs(&prefs).await
     }
 
@@ -2262,7 +2258,7 @@ impl SessionStore {
             .unwrap_or(true);
         ChatToggles {
             auto_approve: bool_or("autoApprove", false),
-            review_edits: bool_or("reviewEdits", false),
+            ask_mode: bool_or("askMode", false),
             thinking_enabled,
             web_search_enabled: bool_or("useWebSearch", false),
             agent_tools_enabled: bool_or("agentTools", true),
@@ -3105,33 +3101,37 @@ mod tests {
         assert_eq!(resolved.name, "my-key");
     }
 
-    /// The edit-review toggle defaults off, round-trips, and coexists with the
-    /// auto-approve pref (each read-merge-writes without clobbering the other).
+    /// The ask-mode pref round-trips beside auto-approve without clobbering it.
     #[tokio::test]
-    async fn test_review_edits_pref_persists_beside_auto_approve() {
+    async fn test_ask_mode_pref_persists_beside_auto_approve() {
         let temp_dir = TempDir::new().unwrap();
         let store = SessionStore::with_path(temp_dir.path().join("config.json"));
 
-        // Default off, and absent from the toggles snapshot's default.
-        assert!(!store.get_chat_review_edits().await);
-        assert!(!store.get_chat_toggles().await.review_edits);
-
-        // Set a sibling pref first, then flip review-edits; neither clobbers the other.
+        assert!(!store.get_chat_toggles().await.ask_mode, "defaults off");
         store.set_chat_auto_approve(true).await.unwrap();
-        store.set_chat_review_edits(true).await.unwrap();
-
-        assert!(store.get_chat_review_edits().await);
+        store.set_chat_ask_mode(true).await.unwrap();
         let toggles = store.get_chat_toggles().await;
-        assert!(toggles.review_edits);
-        assert!(
-            toggles.auto_approve,
-            "sibling autoApprove survived the write"
-        );
+        assert!(toggles.ask_mode);
+        assert!(toggles.auto_approve, "sibling autoApprove survived");
 
-        // And it can be turned back off.
-        store.set_chat_review_edits(false).await.unwrap();
-        assert!(!store.get_chat_review_edits().await);
-        assert!(store.get_chat_auto_approve().await);
+        store.set_chat_ask_mode(false).await.unwrap();
+        assert!(!store.get_chat_toggles().await.ask_mode);
+    }
+
+    /// A stale `reviewEdits` key (the removed review mode) doesn't disturb the
+    /// prefs beside it.
+    #[tokio::test]
+    async fn test_stale_review_edits_pref_is_ignored() {
+        let temp_dir = TempDir::new().unwrap();
+        let store = SessionStore::with_path(temp_dir.path().join("config.json"));
+
+        store.set_chat_auto_approve(true).await.unwrap();
+        let mut prefs = store.read_code_prefs().await;
+        prefs.insert("reviewEdits".into(), serde_json::Value::Bool(true));
+        store.write_code_prefs(&prefs).await.unwrap();
+
+        let toggles = store.get_chat_toggles().await;
+        assert!(toggles.auto_approve, "autoApprove survives the stale key");
     }
 
     #[tokio::test]

@@ -627,7 +627,7 @@ fn test_composer_rule_shows_goal_step_indicator() {
 
     let off = plain_text_from_spans(&app.composer_rule_line(80).spans);
     assert!(!off.contains("goal"), "no goal badge when off: {off:?}");
-    assert!(off.contains("normal"), "mode badge shows: {off:?}");
+    assert!(off.contains("default"), "mode badge shows: {off:?}");
 
     app.goal_mode = Some(GoalState {
         objective: "ship it".to_string(),
@@ -637,7 +637,7 @@ fn test_composer_rule_shows_goal_step_indicator() {
     });
     let on = plain_text_from_spans(&app.composer_rule_line(80).spans);
     assert!(on.contains("goal 2/20"), "goal step indicator: {on:?}");
-    assert!(on.contains("normal"), "mode badge stays: {on:?}");
+    assert!(on.contains("default"), "mode badge stays: {on:?}");
     assert!(
         display_width(&on) <= 80,
         "rule fits width: {}",

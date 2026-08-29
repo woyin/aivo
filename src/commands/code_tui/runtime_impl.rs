@@ -866,13 +866,19 @@ impl CodeTuiApp {
                 engine.unsend_last_user_turn();
             }
             engine.set_plan_mode(self.plan_mode);
+            engine.set_ask_mode(self.ask_mode);
             engine.set_self_correct(self_correct);
         }
         self.plan_exit_pending = false;
+        self.ask_exit_pending = false;
         // Clear any stale live transition requests; the mode sync above is authoritative.
         self.plan_exit_flag
             .store(false, std::sync::atomic::Ordering::Relaxed);
         self.plan_enter_flag
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        self.ask_exit_flag
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        self.ask_enter_flag
             .store(false, std::sync::atomic::Ordering::Relaxed);
         // The agent works in the real launch directory — NOT chat's sandbox
         // (`self.cwd`). It reads/edits the user's actual project.
@@ -1013,10 +1019,13 @@ impl CodeTuiApp {
                 self.connect_mcp_with_consent(real_cwd.clone(), disabled)
                     .await;
             }
-            // Re-enter plan mode on a rebuilt engine, last — so it strips from the
-            // fully assembled tool list (`set_subagents`/MCP add tools above).
+            // Re-enter plan/ask mode on a rebuilt engine, last — so it strips from
+            // the fully assembled tool list (`set_subagents`/MCP add tools above).
             if self.plan_mode {
                 engine.set_plan_mode(true);
+            }
+            if self.ask_mode {
+                engine.set_ask_mode(true);
             }
             self.agent_engine = Some(AgentSession {
                 key_id: self.key.id.clone(),
@@ -1058,9 +1067,10 @@ impl CodeTuiApp {
         // Clone the shared LIVE flags (not snapshots) so a mid-turn Shift+Tab
         // toggle takes effect on this running turn's permission gate.
         let auto_approve = self.auto_approve_flag.clone();
-        let review_edits = self.review_edits_flag.clone();
         let plan_exit = self.plan_exit_flag.clone();
         let plan_enter = self.plan_enter_flag.clone();
+        let ask_exit = self.ask_exit_flag.clone();
+        let ask_enter = self.ask_enter_flag.clone();
         let steering = self.steering_queue.clone();
         // The context window may have resolved AFTER the engine was built (a model
         // only known via the background catalog warm). Carry the latest value in
@@ -1131,9 +1141,10 @@ impl CodeTuiApp {
                 yes: false,
                 auto_approve_all: false, // the live toggle carries the mode
                 auto_approve: Some(&auto_approve),
-                review_edits: Some(&review_edits),
                 plan_exit: Some(&plan_exit),
                 plan_enter: Some(&plan_enter),
+                ask_exit: Some(&ask_exit),
+                ask_enter: Some(&ask_enter),
             };
             let mut ui = ChatAgentUi {
                 tx,
@@ -1366,9 +1377,10 @@ impl CodeTuiApp {
                 yes: false,
                 auto_approve_all: false, // compaction runs no tools
                 auto_approve: None,
-                review_edits: None,
                 plan_exit: None,
                 plan_enter: None,
+                ask_exit: None,
+                ask_enter: None,
             };
             let mut ui = ChatAgentUi {
                 tx,
@@ -1848,6 +1860,10 @@ impl CodeTuiApp {
             }
             SlashCommand::Plan(arg) => {
                 self.run_plan_command(arg).await;
+                Ok(false)
+            }
+            SlashCommand::Ask(arg) => {
+                self.run_ask_command(arg).await;
                 Ok(false)
             }
             SlashCommand::CreateSkill(arg) => {
@@ -2472,6 +2488,13 @@ impl CodeTuiApp {
                     ));
                     return;
                 }
+                if self.ask_mode {
+                    self.notice = Some((
+                        ERROR(),
+                        "Ask mode is for research — /ask exit before /goal".to_string(),
+                    ));
+                    return;
+                }
                 if !self.agent_capable() {
                     self.notice = Some((
                         ERROR(),
@@ -2661,15 +2684,17 @@ and keep each turn's work small"
         if !self.agent_capable() {
             return false;
         }
-        self.plan_prior_mode = if self.agent_auto_approve {
+        // Capture BEFORE leaving ask, mirroring `enter_ask_mode`.
+        let prior_auto = self.standing_auto_approve();
+        if self.ask_mode {
+            self.leave_ask_mode().await;
+        }
+        self.plan_prior_mode = if prior_auto {
             PlanPriorMode::Auto
-        } else if self.agent_review_edits {
-            PlanPriorMode::Review
         } else {
-            PlanPriorMode::Normal
+            PlanPriorMode::Default
         };
         self.set_auto_quiet(false);
-        self.set_review_quiet(false);
         // A goal would auto-continue into the read-only engine; mirror /goal's gate.
         self.goal_mode = None;
         self.plan_mode = true;
@@ -2721,6 +2746,182 @@ and keep each turn's work small"
         // A queued live entry must not re-restrict the turn being released.
         self.plan_enter_flag
             .store(false, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// What auto-approve returns to once plan/ask is peeled away — entering a
+    /// read-only mode quiets the live flag, so `/new`, resume and exit-persist must
+    /// read this, not `agent_auto_approve`.
+    pub(super) fn standing_auto_approve(&self) -> bool {
+        if self.plan_mode {
+            self.plan_prior_mode == PlanPriorMode::Auto
+        } else if self.ask_mode {
+            self.ask_prior_mode == PlanPriorMode::Auto
+        } else {
+            self.agent_auto_approve
+        }
+    }
+
+    /// Enter ask mode (read-only research): exclusive with plan and `/goal`, and a
+    /// live engine is restricted in place (a not-yet-built one enters at build
+    /// time). `false` when the key can't drive the native agent; no toast.
+    pub(super) async fn enter_ask_mode(&mut self) -> bool {
+        if !self.agent_capable() {
+            return false;
+        }
+        // Capture the standing mode BEFORE leaving plan — a plan→ask swap must
+        // carry the original prior, not plan's quieted (false) auto flag.
+        let prior_auto = self.standing_auto_approve();
+        if self.plan_mode {
+            self.leave_plan_mode(false).await;
+        }
+        self.ask_prior_mode = if prior_auto {
+            PlanPriorMode::Auto
+        } else {
+            PlanPriorMode::Default
+        };
+        self.set_auto_quiet(false);
+        // A goal would auto-continue into the read-only engine; mirror /plan's gate.
+        self.goal_mode = None;
+        self.ask_mode = true;
+        self.ask_exit_pending = false;
+        // A stale live exit request must not cancel the fresh ask mode.
+        self.ask_exit_flag
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        if self.sending {
+            // The running turn picks this up at its next tool-call boundary; the
+            // next `spawn_agent_turn` mode sync is the fallback.
+            self.ask_enter_flag
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+        } else if let Some(session) = self.agent_engine.as_ref() {
+            session.engine.lock().await.set_ask_mode(true);
+        }
+        self.persist_plan_state().await;
+        true
+    }
+
+    /// Leave ask mode, restoring the engine's tools in place (no rebuild). Mid-turn
+    /// the turn task holds the lock, so the exit rides the live flag instead.
+    pub(super) async fn leave_ask_mode(&mut self) {
+        self.ask_mode = false;
+        if self.sending {
+            self.request_ask_exit_live();
+        } else {
+            if let Some(session) = self.agent_engine.as_ref() {
+                session.engine.lock().await.set_ask_mode(false);
+            }
+            self.ask_exit_pending = false;
+        }
+        self.persist_plan_state().await;
+    }
+
+    /// Mid-turn ask exit: the `request_plan_exit_live` analog.
+    pub(super) fn request_ask_exit_live(&mut self) {
+        self.ask_mode = false;
+        self.ask_exit_pending = true;
+        self.ask_exit_flag
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        // A queued live entry must not re-restrict the turn being released.
+        self.ask_enter_flag
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// True when ask mode has NO web retrieval (toggle off, no native search) —
+    /// a research mode that silently can't reach the web misleads, so entry hints.
+    pub(super) fn ask_web_search_missing(&self) -> bool {
+        !self.web_search_enabled && !crate::agent::tools::native_web_search_enabled(&self.model)
+    }
+
+    /// `/ask` — enter read-only research/learning mode; with a question, ask it
+    /// in the same breath; `exit` leaves and restores the prior standing mode.
+    pub(super) async fn run_ask_command(&mut self, arg: Option<String>) {
+        let arg = arg.unwrap_or_default();
+        let arg = arg.trim();
+        if self.key.is_cursor_acp() {
+            self.notice = Some((
+                ERROR(),
+                "Ask mode needs the native agent (an API key or Copilot — not cursor)".to_string(),
+            ));
+            return;
+        }
+        match arg {
+            "exit" | "stop" | "off" => {
+                if self.sending {
+                    self.queue_command(SlashCommand::Ask(Some("exit".to_string())), "/ask exit");
+                    return;
+                }
+                let was_on = self.ask_mode;
+                self.leave_ask_mode().await;
+                let restored = match self.ask_prior_mode {
+                    _ if !was_on => "",
+                    PlanPriorMode::Auto => {
+                        self.set_auto_quiet(true);
+                        " — back to auto-approve"
+                    }
+                    PlanPriorMode::Default => "",
+                };
+                self.notice = Some((
+                    MUTED(),
+                    if was_on {
+                        format!("Ask mode off{restored}")
+                    } else {
+                        "Ask mode isn't on".to_string()
+                    },
+                ));
+            }
+            "" => {
+                if self.ask_mode {
+                    self.notice = Some((
+                        MUTED(),
+                        "Ask mode is on — just type your question (/ask exit to leave)".to_string(),
+                    ));
+                    return;
+                }
+                if self.sending {
+                    self.queue_command(SlashCommand::Ask(None), "/ask");
+                    return;
+                }
+                if !self.enter_ask_mode().await {
+                    self.notice = Some((
+                        ERROR(),
+                        "Ask mode needs the native agent (an API key or Copilot — not OAuth or cursor)"
+                            .to_string(),
+                    ));
+                    return;
+                }
+                self.notice = Some((
+                    MUTED(),
+                    if self.ask_web_search_missing() {
+                        "Ask mode — web search is off (/config to enable); repo and knowledge questions still work"
+                    } else {
+                        "Ask mode — I'll read code and search the web to answer with sources (/ask exit to leave)"
+                    }
+                    .to_string(),
+                ));
+            }
+            question => {
+                if self.sending {
+                    self.queue_command(SlashCommand::Ask(Some(question.to_string())), "/ask");
+                    return;
+                }
+                if !self.ask_mode && !self.enter_ask_mode().await {
+                    self.notice = Some((
+                        ERROR(),
+                        "Ask mode needs the native agent (an API key or Copilot — not OAuth or cursor)"
+                            .to_string(),
+                    ));
+                    return;
+                }
+                // record: None keeps the question out of ↑/↓ recall (mirrors /plan).
+                if let Err(e) = self.dispatch_user_message(question.to_string(), None).await {
+                    self.notice = Some((ERROR(), e.to_string()));
+                } else if self.ask_web_search_missing() {
+                    self.notice = Some((
+                        MUTED(),
+                        "Ask mode — note: web search is off (/config to enable)".to_string(),
+                    ));
+                }
+            }
+        }
     }
 
     /// Other sessions' unfinished plans in this cwd, newest first:
@@ -2907,9 +3108,12 @@ and keep each turn's work small"
             ));
             return;
         }
-        // The continuation must not run against the read-only plan tools.
+        // The continuation must not run against the read-only plan/ask tools.
         if self.plan_mode && !matches!(carry, PlanCarry::Draft(_)) {
             self.leave_plan_mode(true).await;
+        }
+        if self.ask_mode && !matches!(carry, PlanCarry::Draft(_)) {
+            self.leave_ask_mode().await;
         }
         match carry {
             PlanCarry::Continue(steps) => {
@@ -3031,13 +3235,15 @@ and keep each turn's work small"
                     ));
                     return;
                 }
-                // Mirrors the approval card: `-y` = auto-approve, default = review.
+                // Mirrors the approval card's verdicts: `-y` = auto-approve.
                 let auto = rest == "-y" || rest.starts_with("-y ");
                 let guidance = rest.strip_prefix("-y").map(str::trim).unwrap_or(rest);
                 // Same session — the plan is already in the engine's history.
                 self.leave_plan_mode(true).await;
+                if self.ask_mode {
+                    self.leave_ask_mode().await;
+                }
                 self.set_auto_quiet(auto);
-                self.set_review_quiet(!auto);
                 if let Err(e) = self
                     .dispatch_preserving_composer(plan_go_message(guidance), None)
                     .await
@@ -3050,8 +3256,7 @@ and keep each turn's work small"
                     if auto {
                         "Executing the approved plan with auto-approve".to_string()
                     } else {
-                        "Executing the approved plan — each edit shows a diff to approve"
-                            .to_string()
+                        "Executing the approved plan".to_string()
                     },
                 ));
             }
@@ -3118,11 +3323,7 @@ and keep each turn's work small"
                         self.set_auto_quiet(true);
                         " — back to auto-approve"
                     }
-                    PlanPriorMode::Review => {
-                        self.set_review_quiet(true);
-                        " — back to review"
-                    }
-                    PlanPriorMode::Normal => "",
+                    PlanPriorMode::Default => "",
                 };
                 let msg = match (was_on, had_plan) {
                     (true, true) => format!("Plan mode off{restored} · plan discarded"),
@@ -3534,8 +3735,13 @@ and keep each turn's work small"
         self.session_cost_usd = 0.0;
         self.context_is_estimate = true;
         self.follow_output = true;
+        // The read-only mode dies with the conversation, but the standing mode it
+        // quieted comes back — /new must not demote auto-approve.
+        self.set_auto_quiet(self.standing_auto_approve());
         self.plan_mode = false;
         self.plan_exit_pending = false;
+        self.ask_mode = false;
+        self.ask_exit_pending = false;
         self.pending_plan = None;
         self.plan_card_idx = None;
         self.notice = if handoff_steps.is_some() {
@@ -3588,6 +3794,13 @@ and keep each turn's work small"
         {
             engine.set_plan_mode(false);
             self.plan_exit_pending = false;
+        }
+        if self.ask_exit_pending
+            && let Some(session) = self.agent_engine.as_ref()
+            && let Ok(mut engine) = session.engine.try_lock()
+        {
+            engine.set_ask_mode(false);
+            self.ask_exit_pending = false;
         }
         // An in-process agent turn is in flight when its per-turn serve is up. The
         // engine has ALREADY consumed this turn (and may have run side-effecting
@@ -4420,26 +4633,6 @@ impl crate::agent::engine::AgentUi for ChatAgentUi {
             rx.await.unwrap_or_else(|_| {
                 Err(crate::agent::plan_mode::PLAN_APPROVAL_DISMISSED.to_string())
             })
-        })
-    }
-
-    fn review_edits<'a>(
-        &'a mut self,
-        items: &'a [crate::agent::review::ReviewItem],
-    ) -> futures::future::BoxFuture<'a, crate::agent::review::ReviewDecision> {
-        let tx = self.tx.clone();
-        let items = items.to_vec();
-        Box::pin(async move {
-            let (reply, rx) = tokio::sync::oneshot::channel();
-            if tx
-                .send(RuntimeEvent::AgentReviewEdits { items, reply })
-                .is_err()
-            {
-                return crate::agent::review::ReviewDecision::Reject;
-            }
-            // A dropped card (interrupt / session end) reads as a rejection (fail-closed).
-            rx.await
-                .unwrap_or(crate::agent::review::ReviewDecision::Reject)
         })
     }
 }

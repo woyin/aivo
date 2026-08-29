@@ -2979,7 +2979,7 @@ const HELP_COMMAND_GROUPS: &[(&str, &[&str])] = &[
         "Skills & tools",
         &["skills", "create-skill", "agents", "mcp"],
     ),
-    ("Autonomous", &["plan", "goal"]),
+    ("Modes", &["plan", "ask", "goal"]),
     // Shown only on the aivo provider (hidden by `slash_command_visible`).
     ("aivo account", &["login", "usage", "logout"]),
 ];
@@ -3044,7 +3044,7 @@ const HELP_KEYBINDINGS: &[(&str, &[(&str, &str)])] = &[
         "Session",
         &[
             ("Ctrl+R", "resume a saved session"),
-            ("Shift+Tab", "cycle mode (normal/auto-approve/review)"),
+            ("Shift+Tab", "cycle mode (default/auto-approve/plan/ask)"),
             ("Ctrl+T", "cycle thinking (off + effort levels)"),
             ("Esc", "cancel / close overlay"),
             ("Ctrl+C", "exit (press twice to confirm)"),

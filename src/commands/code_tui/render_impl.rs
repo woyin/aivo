@@ -1051,9 +1051,6 @@ impl CodeTuiApp {
         if self.cards.ask().is_some() {
             return "waiting for your answer".to_string();
         }
-        if self.cards.review().is_some() {
-            return "waiting for your review".to_string();
-        }
         if self.cards.plan_approval().is_some() {
             return "waiting for plan approval".to_string();
         }
@@ -1900,8 +1897,6 @@ impl CodeTuiApp {
             self.build_ask_user_card(max_width, max_total)
         } else if self.cards.plan_approval().is_some() {
             self.build_plan_approval_card(max_width, max_total)
-        } else if self.cards.review().is_some() {
-            self.build_review_card(max_width, max_total)
         } else if self.account.login.is_some() {
             // Last: passive status — decision cards win the slot.
             self.build_login_card(max_width)
@@ -2326,64 +2321,9 @@ impl CodeTuiApp {
         })
     }
 
-    /// The edit-review card: heading, the scrollable precomputed diff, and y/n keys.
-    /// Carries the clamped scroll for write-back.
-    fn build_review_card(&self, max_width: u16, max_total: u16) -> Option<SlotCard> {
-        let review = self.cards.review()?;
-        let max_width = max_width.max(1);
-        let inner_width = usize::from(max_width.saturating_sub(4)).max(1);
-
-        let heading = format!(
-            "review {} edit{} before writing",
-            review.count,
-            if review.count == 1 { "" } else { "s" }
-        );
-        let keys = review_keys_line();
-
-        // heading + 2 blanks + keys + 2 borders + reserved overflow-marker row.
-        let chrome = 7u16;
-        let body_budget = usize::from(max_total.saturating_sub(chrome)).max(1);
-        let overflow = review.body.len() > body_budget;
-        // Last-full-page clamp: keeps the card height stable at the bottom.
-        let scroll = usize::from(review.scroll).min(review.body.len().saturating_sub(body_budget));
-        let visible = review.body.len().saturating_sub(scroll).min(body_budget);
-
-        let mut lines: Vec<Line<'static>> = Vec::new();
-        lines.push(Line::from(Span::styled(
-            truncate_for_display_width(&heading, inner_width),
-            Style::default().fg(TEXT()).add_modifier(Modifier::BOLD),
-        )));
-        lines.push(Line::from(""));
-        for line in review.body.iter().skip(scroll).take(visible) {
-            lines.push(line.clone());
-        }
-        let remaining = review.body.len().saturating_sub(scroll + visible);
-        if remaining > 0 {
-            lines.push(Line::from(Span::styled(
-                format!("  … +{remaining} more (↑↓ scroll)"),
-                Style::default().fg(FAINT()),
-            )));
-        } else if overflow {
-            lines.push(Line::from(Span::styled(
-                "  … end of diff",
-                Style::default().fg(FAINT()),
-            )));
-        }
-        lines.push(Line::from(""));
-        lines.push(keys);
-
-        Some(SlotCard {
-            title: " review edits ",
-            border: ACCENT(),
-            width: max_width,
-            lines,
-            scroll: Some(u16::try_from(scroll).unwrap_or(u16::MAX)),
-        })
-    }
-
     /// The plan-approval card (`exit_plan_mode`): heading, the scrollable rendered
-    /// plan, and the three verdicts. Sits above the composer like the review card;
-    /// carries the clamped scroll for write-back.
+    /// plan, and the three verdicts. Sits above the composer; carries the clamped
+    /// scroll for write-back.
     fn build_plan_approval_card(&self, max_width: u16, max_total: u16) -> Option<SlotCard> {
         let pending = self.cards.plan_approval()?;
         let max_width = max_width.max(1);
@@ -2508,12 +2448,10 @@ impl CodeTuiApp {
             .max(1);
         let card_max_width = area.width.saturating_sub(2).max(1);
         let slot_card = self.build_slot_card(card_max_width, card_cap);
-        if let Some(clamped) = slot_card.as_ref().and_then(|card| card.scroll) {
-            if let Some(p) = self.cards.plan_approval_mut() {
-                p.scroll = clamped;
-            } else if let Some(r) = self.cards.review_mut() {
-                r.scroll = clamped;
-            }
+        if let Some(clamped) = slot_card.as_ref().and_then(|card| card.scroll)
+            && let Some(p) = self.cards.plan_approval_mut()
+        {
+            p.scroll = clamped;
         }
         let card_slot_height = slot_card
             .as_ref()
@@ -2832,13 +2770,15 @@ impl CodeTuiApp {
         composer_area
     }
 
-    /// Hue shared by the composer's rounded border: shell gets functional amber,
-    /// plan gets brand lime, and the ordinary input stays quiet.
+    /// Hue shared by the composer's rounded border: amber shell, lime plan, blue
+    /// ask, and a quiet ordinary input.
     pub(super) fn composer_rule_style(&self) -> Style {
         if self.draft_is_shell_command() {
             Style::default().fg(SHELL())
         } else if self.plan_mode || self.cursor_plan_mode {
             Style::default().fg(ACCENT())
+        } else if self.ask_mode {
+            Style::default().fg(INFO())
         } else {
             Style::default().fg(FAINT())
         }
@@ -2851,18 +2791,21 @@ impl CodeTuiApp {
         let width = usize::from(width);
         let plan_mode = self.plan_mode || self.cursor_plan_mode;
         let rule_style = self.composer_rule_style();
-        // The mode badge — one slot, since the four modes are exclusive.
+        // The mode badge — one slot, since the modes are exclusive.
         let (badge, badge_style) = if plan_mode {
             (
                 "◇ plan",
                 Style::default().fg(ACCENT()).add_modifier(Modifier::BOLD),
             )
+        } else if self.ask_mode {
+            (
+                "◆ ask",
+                Style::default().fg(INFO()).add_modifier(Modifier::BOLD),
+            )
         } else if self.agent_auto_approve {
             ("↯ auto-approve", Style::default().fg(WARNING()))
-        } else if self.agent_review_edits {
-            ("✎ review", Style::default().fg(MUTED()))
         } else {
-            ("normal", Style::default().fg(MUTED()))
+            ("default", Style::default().fg(MUTED()))
         };
         const CYCLE_HINT: &str = " (Shift+Tab)";
         // Left title: `History {pos}/{total}` while recalling input (counts down
@@ -3432,6 +3375,16 @@ impl CodeTuiApp {
             } else if self.sending {
                 Span::styled(
                     "Type to queue your next message…",
+                    Style::default().fg(FAINT()),
+                )
+            } else if self.plan_mode || self.cursor_plan_mode {
+                Span::styled(
+                    "Describe what to plan · read-only until approved",
+                    Style::default().fg(FAINT()),
+                )
+            } else if self.ask_mode {
+                Span::styled(
+                    "Ask anything · concepts, docs, code, the web",
                     Style::default().fg(FAINT()),
                 )
             } else {
@@ -4199,31 +4152,6 @@ fn plan_approval_keys_line() -> Line<'static> {
         gap(),
         keycap("Esc"),
         label(" dismiss"),
-    ])
-}
-
-/// The edit-review card's key-hint row.
-fn review_keys_line() -> Line<'static> {
-    let keycap = |key: &str| {
-        Span::styled(
-            key.to_string(),
-            Style::default().fg(ACCENT()).add_modifier(Modifier::BOLD),
-        )
-    };
-    let label = |text: &str| Span::styled(text.to_string(), Style::default().fg(MUTED()));
-    let gap = || Span::styled("    ".to_string(), Style::default().fg(FAINT()));
-    Line::from(vec![
-        keycap("y"),
-        label(" approve"),
-        gap(),
-        keycap("n"),
-        label(" reject"),
-        gap(),
-        keycap("↑↓"),
-        label(" scroll"),
-        gap(),
-        keycap("Esc"),
-        label(" reject"),
     ])
 }
 
