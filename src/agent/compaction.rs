@@ -152,18 +152,27 @@ impl AgentEngine {
     /// round-trip could itself overflow mid-recovery). Clears stale tool output, then hard-trims.
     pub(crate) fn force_fit_budget(&mut self) {
         let budget = self.compaction_budget_estimate();
-        let mut cut = find_cut(&self.messages, self.keep_recent_budget());
-        // Single long turn (resume) has no interior user boundary → fall back so `enforce_budget` doesn't drop it to `[system, user]`.
-        if cut <= 1 {
-            cut = find_cut(&self.messages, 0);
-        }
+        let cut = self.choose_cut();
         self.clear_stale_tool_results(cut);
-        // No summary round-trip is safe mid-overflow; fold a model-free marker.
-        if cut > 1 && self.messages.get(cut).map(role) == Some("user") {
+        // No summary round-trip is safe mid-overflow; `cut == len` would fold the whole tail.
+        if cut > 1 && cut < self.messages.len() {
             let note = self.mechanical_summary();
             self.apply_compaction(cut, &note);
         }
         self.enforce_budget(budget);
+    }
+
+    /// Fold boundary: a user turn near the keep-recent budget, else the latest user
+    /// turn, else an assistant group boundary. `<= 1` = nothing to fold.
+    fn choose_cut(&self) -> usize {
+        let mut cut = find_cut(&self.messages, self.keep_recent_budget());
+        if cut <= 1 {
+            cut = find_cut(&self.messages, 0);
+        }
+        if cut <= 1 {
+            cut = find_group_cut(&self.messages, self.keep_recent_budget());
+        }
+        cut
     }
 
     /// If the history would overflow, summarize the older messages (quiet `complete`)
@@ -178,11 +187,7 @@ impl AgentEngine {
         if total <= budget {
             return 0;
         }
-        let mut cut = find_cut(&self.messages, self.keep_recent_budget());
-        // Single long turn (resume) has no interior user boundary → summarize into the latest user turn.
-        if cut <= 1 {
-            cut = find_cut(&self.messages, 0);
-        }
+        let cut = self.choose_cut();
 
         // Cheap pass first: if clearing OLD tool output alone brings us under budget,
         // do that and skip the LLM summary. Only when it alone suffices, so the summary path still sees full content.
@@ -279,7 +284,7 @@ impl AgentEngine {
 
     /// Whether a compaction could fold/clear anything — lets `/compact` skip a pointless round-trip.
     pub fn has_compactable_history(&self) -> bool {
-        let cut = find_cut(&self.messages, self.keep_recent_budget());
+        let cut = self.choose_cut();
         cut > 1 || self.stale_tool_result_savings(cut) > 0
     }
 
@@ -291,7 +296,7 @@ impl AgentEngine {
         elapsed_secs: u64,
     ) {
         let before = self.estimated_context_tokens();
-        let cut = find_cut(&self.messages, self.keep_recent_budget());
+        let cut = self.choose_cut();
         let tokens = if cut > 1 {
             self.summarize_range(ctx, ui, cut).await
         } else {
@@ -305,7 +310,7 @@ impl AgentEngine {
     /// `/compact fast`: clear stale tool output, no model call. Returns `(before, after)` calibrated estimate.
     pub fn compact_now_local(&mut self) -> (u64, u64) {
         let before = self.estimated_context_tokens();
-        let cut = find_cut(&self.messages, self.keep_recent_budget());
+        let cut = self.choose_cut();
         self.clear_stale_tool_results(cut);
         (before, self.estimated_context_tokens())
     }
@@ -658,6 +663,39 @@ impl AgentEngine {
             };
             self.messages.drain(1..cut);
             self.rebase_checkpoints(cut, cut - 1); // drain removes cut-1 messages
+        } else if cut >= 2
+            && self.messages.get(1).is_some_and(|m| {
+                role(m) == "user" && m.get(super::engine::SYNTHETIC_MARKER_KEY).is_none()
+            })
+        {
+            // Group cut: keep the task prompt verbatim (a failed summary would erase
+            // it); the fold rides behind it, replacing last round's.
+            let original = self.messages[1].get("content").cloned();
+            self.messages[1]["content"] = match original {
+                Some(Value::Array(mut parts)) => {
+                    if parts.last().is_some_and(is_fold_part) {
+                        parts.pop();
+                    }
+                    parts.push(json!({ "type": "text", "text": summary }));
+                    Value::Array(parts)
+                }
+                Some(Value::String(s)) => match strip_trailing_fold(&s) {
+                    "" => json!(summary),
+                    kept => json!(format!("{kept}\n\n{summary}")),
+                },
+                _ => json!(summary),
+            };
+            self.messages.drain(2..cut);
+            let removed = cut - 2;
+            // Like `rebase_checkpoints`, but the kept prompt's checkpoint survives.
+            self.checkpoints.retain_mut(|cp| {
+                if cp.msg_index >= cut {
+                    cp.msg_index -= removed;
+                    true
+                } else {
+                    cp.msg_index < 2
+                }
+            });
         } else {
             // Defensive (find_cut should land on a user turn): keep a standalone summary rather than drop it.
             self.messages.splice(
@@ -837,26 +875,66 @@ pub(crate) fn compose_pinned(
     out
 }
 
-/// Index `cut` such that `messages[cut..]` is kept — chosen at a user-turn
-/// boundary nearest to `keep_recent_tokens` of recent history.
-pub(crate) fn find_cut(messages: &[Value], keep_recent_tokens: usize) -> usize {
+/// Strip a group fold: first line-leading marker past the start (line-exact =
+/// engine-made; a marker AT the start is a prior merge, left alone).
+fn strip_trailing_fold(s: &str) -> &str {
+    let mut from = 0;
+    while let Some(i) = s
+        .get(from..)
+        .and_then(|t| t.find(SUMMARY_FOLD_PREFIX))
+        .map(|o| o + from)
+    {
+        if i > 0 && s.as_bytes()[i - 1] == b'\n' {
+            return s[..i].trim_end();
+        }
+        from = i + SUMMARY_FOLD_PREFIX.len();
+    }
+    s
+}
+
+fn is_fold_part(p: &Value) -> bool {
+    p.get("type").and_then(Value::as_str) == Some("text")
+        && p.get("text")
+            .and_then(Value::as_str)
+            .is_some_and(|t| t.starts_with(SUMMARY_FOLD_PREFIX))
+}
+
+/// Newest boundary index that still leaves `keep_recent_tokens` behind it.
+fn find_cut_by(
+    messages: &[Value],
+    keep_recent_tokens: usize,
+    boundary: fn(&Value) -> bool,
+) -> Option<usize> {
     let mut acc = 0usize;
-    let mut cut = messages.len();
+    let mut cut = None;
     for i in (1..messages.len()).rev() {
         acc += estimate_tokens(&messages[i..=i]);
-        // A cut at a synthesized user turn would clobber its content array.
-        if role(&messages[i]) == "user"
-            && messages[i]
-                .get(super::engine::SYNTHETIC_MARKER_KEY)
-                .is_none()
-        {
-            cut = i;
+        if boundary(&messages[i]) {
+            cut = Some(i);
             if acc >= keep_recent_tokens {
                 break;
             }
         }
     }
     cut
+}
+
+/// [`find_cut`] fallback when no interior user turn exists: an assistant boundary
+/// (never orphans a `tool` result); 0 = don't fold.
+fn find_group_cut(messages: &[Value], keep_recent_tokens: usize) -> usize {
+    find_cut_by(messages, keep_recent_tokens, |m| role(m) == "assistant")
+        .filter(|&cut| cut > 2)
+        .unwrap_or(0)
+}
+
+/// Index `cut` such that `messages[cut..]` is kept — chosen at a user-turn
+/// boundary nearest to `keep_recent_tokens` of recent history.
+pub(crate) fn find_cut(messages: &[Value], keep_recent_tokens: usize) -> usize {
+    // A cut at a synthesized user turn would clobber its content array.
+    find_cut_by(messages, keep_recent_tokens, |m| {
+        role(m) == "user" && m.get(super::engine::SYNTHETIC_MARKER_KEY).is_none()
+    })
+    .unwrap_or(messages.len())
 }
 
 #[cfg(test)]
@@ -869,6 +947,10 @@ mod tests {
 
     fn engine() -> AgentEngine {
         AgentEngine::new("/tmp", "m", "", &[], &[], 0, 0)
+    }
+
+    fn msg(role: &str, content: String) -> Value {
+        json!({"role": role, "content": content})
     }
 
     struct NoopUi;
@@ -1282,7 +1364,7 @@ mod tests {
     }
 
     #[test]
-    fn apply_compaction_nonuser_cut_splices_standalone_summary() {
+    fn apply_compaction_group_cut_keeps_prompt_and_appends_fold() {
         let mut e = engine();
         e.messages = vec![
             json!({"role":"system","content":"sys"}),
@@ -1303,6 +1385,62 @@ mod tests {
 
         let roles: Vec<&str> = e.messages.iter().map(role).collect();
         assert_eq!(roles, vec!["system", "user", "assistant"]);
+        let merged = e.messages[1]["content"].as_str().unwrap();
+        assert!(
+            merged.starts_with("u1\n\n[Summary of earlier conversation]")
+                && merged.contains("early work"),
+            "{merged}"
+        );
+        assert_eq!(e.messages[2]["content"], "a2", "kept turn intact");
+        // prompt cp survives at 1; survivor 3 → 2
+        assert_eq!(
+            e.checkpoints
+                .iter()
+                .map(|c| c.msg_index)
+                .collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+    }
+
+    #[test]
+    fn apply_compaction_group_cut_replaces_stale_fold() {
+        let mut e = engine();
+        e.messages = vec![msg("system", "sys".into()), msg("user", "修复 bug".into())];
+        for i in 0..4 {
+            e.messages.push(msg("assistant", format!("a{i}")));
+            e.messages.push(msg("tool", "t".repeat(4_000)));
+        }
+        let cut = find_group_cut(&e.messages, 1_500);
+        assert!(cut > 2);
+        e.apply_compaction(cut, "round one");
+
+        let cut = find_group_cut(&e.messages, 0);
+        assert!(cut > 2);
+        e.apply_compaction(cut, "round two");
+        let merged = e.messages[1]["content"].as_str().unwrap();
+        assert!(
+            merged.starts_with("修复 bug\n\n[Summary of earlier conversation]\nround two"),
+            "{merged}"
+        );
+        assert!(
+            !merged.contains("round one"),
+            "stale fold stacked: {merged}"
+        );
+    }
+
+    #[test]
+    fn apply_compaction_splices_when_no_real_user_to_keep() {
+        let mut e = engine();
+        e.messages = vec![
+            json!({"role":"system","content":"sys"}),
+            json!({"role":"user", "aivo": "tool_images", "content":[{"type":"text","text":"img"}]}),
+            json!({"role":"assistant","content":"a1"}),
+            json!({"role":"assistant","content":"a2"}),
+        ];
+        e.apply_compaction(3, "early work");
+
+        let roles: Vec<&str> = e.messages.iter().map(role).collect();
+        assert_eq!(roles, vec!["system", "user", "assistant"]);
         let summary = e.messages[1]["content"].as_str().unwrap();
         assert!(
             summary.starts_with("[Summary of earlier conversation]")
@@ -1310,14 +1448,6 @@ mod tests {
             "{summary}"
         );
         assert_eq!(e.messages[2]["content"], "a2", "kept turn intact");
-        // splice nets −(cut−2): survivor 3 → 2; folded cp dropped
-        assert_eq!(
-            e.checkpoints
-                .iter()
-                .map(|c| c.msg_index)
-                .collect::<Vec<_>>(),
-            vec![2]
-        );
     }
 
     #[test]
@@ -1339,13 +1469,12 @@ mod tests {
 
     #[test]
     fn find_cut_honors_keep_recent_and_no_user_boundary() {
-        let m = |role: &str, content: String| json!({"role": role, "content": content});
         let messages = vec![
-            m("system", "sys".into()),
-            m("user", "u1".into()),
-            m("assistant", "a".repeat(4_000)),
-            m("user", "u2".into()),
-            m("assistant", "a2".into()),
+            msg("system", "sys".into()),
+            msg("user", "u1".into()),
+            msg("assistant", "a".repeat(4_000)),
+            msg("user", "u2".into()),
+            msg("assistant", "a2".into()),
         ];
         assert_eq!(find_cut(&messages, 0), 3, "keep=0 cuts at the last user");
         assert_eq!(
@@ -1354,11 +1483,96 @@ mod tests {
             "a large keep window walks back to an earlier user boundary"
         );
         let no_user = vec![
-            m("system", "sys".into()),
-            m("assistant", "a1".into()),
-            m("tool", "t1".into()),
+            msg("system", "sys".into()),
+            msg("assistant", "a1".into()),
+            msg("tool", "t1".into()),
         ];
         assert_eq!(find_cut(&no_user, 0), no_user.len());
+    }
+
+    #[test]
+    fn group_cut_folds_a_single_user_turn_transcript() {
+        let mut messages = vec![
+            msg("system", "sys".into()),
+            msg("user", "do the thing".into()),
+        ];
+        for _ in 0..4 {
+            messages.push(msg("assistant", "calling".into()));
+            messages.push(msg("tool", "t".repeat(4_000)));
+        }
+        assert_eq!(find_cut(&messages, 8_000), 1);
+        assert_eq!(find_cut(&messages, 0), 1);
+
+        let cut = find_group_cut(&messages, 1_500);
+        assert!(cut > 2, "cut={cut} must fold more than the lone user turn");
+        assert_eq!(
+            role(&messages[cut]),
+            "assistant",
+            "a cut at a `tool` message would orphan it from its call"
+        );
+        assert_eq!(
+            find_group_cut(&messages, 100_000),
+            0,
+            "keep window covering everything → nothing worth folding"
+        );
+    }
+
+    #[test]
+    fn group_cut_declines_when_folding_would_reclaim_nothing() {
+        let messages = vec![
+            msg("system", "sys".into()),
+            msg("user", "u".into()),
+            msg("assistant", "a".into()),
+        ];
+        assert_eq!(find_group_cut(&messages, 0), 0);
+        assert_eq!(find_group_cut(&[], 0), 0);
+        let with_tools = vec![
+            msg("system", "sys".into()),
+            msg("user", "u".into()),
+            msg("assistant", "a".into()),
+            msg("tool", "t".into()),
+        ];
+        assert_eq!(
+            find_group_cut(&with_tools, 0),
+            0,
+            "cut=2 would fold only the lone user turn — must decline"
+        );
+    }
+
+    #[test]
+    fn force_fit_group_folds_and_keeps_the_prompt() {
+        let mut e = engine();
+        e.context_window = 20_000;
+        e.messages = vec![msg("system", "sys".into()), msg("user", "keep me".into())];
+        for i in 0..4 {
+            e.messages.push(msg("assistant", format!("a{i}")));
+            e.messages.push(msg("tool", "t".repeat(200_000)));
+        }
+        e.force_fit_budget();
+        assert!(estimate_tokens(&e.messages) <= e.compaction_budget_estimate());
+        let prompt = e.messages[1]["content"].as_str().unwrap();
+        assert!(prompt.starts_with("keep me"), "prompt lost: {prompt}");
+        assert!(
+            prompt.contains("omitted"),
+            "mechanical note missing: {prompt}"
+        );
+    }
+
+    #[test]
+    fn manual_compact_reaches_single_user_transcripts() {
+        let mut e = engine();
+        e.context_window = 20_000;
+        e.messages = vec![msg("system", "sys".into()), msg("user", "u".into())];
+        for i in 0..4 {
+            e.messages.push(msg("assistant", format!("a{i}")));
+            e.messages.push(msg("tool", "t".repeat(40_000)));
+        }
+        assert!(e.has_compactable_history());
+        let (before, after) = e.compact_now_local();
+        assert!(
+            after < before,
+            "stale tool output not cleared: {before} → {after}"
+        );
     }
 
     #[test]

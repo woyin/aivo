@@ -329,16 +329,15 @@ fn has_compactable_history_false_for_short_conversation() {
     );
 }
 
-/// Tiny window + zero keep-recent: with only stale OLD tool output overflowing,
-/// `maybe_compact` takes the no-model cheap path (clears them, returns 0).
+/// Tiny window: with only stale OLD tool output overflowing, `maybe_compact`
+/// takes the no-model cheap path (clears them, returns 0).
 #[tokio::test]
 async fn forced_tiny_window_compacts_at_boundary_without_a_model_call() {
-    // SAFETY: scoped mutation of an env var no other test reads.
-    unsafe { std::env::set_var("AIVO_AGENT_KEEP_RECENT", "0") };
-
     let mut engine = AgentEngine::new("/tmp", "m", "", &[], &[], 0, 0);
     engine.context_window = 20_000; // reserve caps at 30% → budget = 14_000
     let huge = "x".repeat(200_000);
+    // Oversize the last user turn so the cut pins to it, keeping both stale results in range.
+    let last_user = "n".repeat(16 * engine.keep_recent_budget());
     engine.messages = vec![
         json!({"role": "system", "content": "sys"}),
         json!({"role": "user", "content": "q1"}),
@@ -349,12 +348,17 @@ async fn forced_tiny_window_compacts_at_boundary_without_a_model_call() {
         json!({"role": "assistant", "content": "", "tool_calls": [
             {"id": "b", "type": "function", "function": {"name": "read_file", "arguments": "{}"}}]}),
         json!({"role": "tool", "tool_call_id": "b", "content": huge}),
-        json!({"role": "user", "content": "now"}),
+        json!({"role": "user", "content": last_user}),
     ];
     let budget = engine.compaction_window() - engine.compact_reserve();
     assert!(
         estimate_tokens(&engine.messages) > budget,
         "transcript must start over budget so the boundary is actually crossed"
+    );
+    assert!(
+        estimate_tokens(std::slice::from_ref(engine.messages.last().unwrap()))
+            >= engine.keep_recent_budget(),
+        "last user turn must outweigh keep-recent or the cut moves off it"
     );
 
     let client = reqwest::Client::new();
@@ -362,8 +366,6 @@ async fn forced_tiny_window_compacts_at_boundary_without_a_model_call() {
     let ctx = turn_ctx(&client, "", cwd);
     let mut ui = CapturingUi::default();
     let tokens = engine.maybe_compact(&ctx, &mut ui).await;
-
-    unsafe { std::env::remove_var("AIVO_AGENT_KEEP_RECENT") };
 
     assert_eq!(tokens, 0, "cheap path must not call the model");
     assert!(

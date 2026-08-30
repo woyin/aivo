@@ -99,9 +99,9 @@ impl AgentEngine {
                         Some(Derived::Call(name.to_string(), args))
                     })
                     .collect::<Vec<_>>(),
-                // Typed copies of the fold prefix were defanged — only real folds match.
+                // Line-exact = engine fold (typed copies defanged); group folds sit at the tail.
                 "user" => user_text(m)
-                    .filter(|t| t.starts_with(compaction::SUMMARY_FOLD_PREFIX))
+                    .filter(|t| t.lines().any(|l| l == compaction::SUMMARY_FOLD_PREFIX))
                     .and_then(|t| compaction::parse_pinned_block(&t))
                     .map(Derived::Pinned)
                     .into_iter()
