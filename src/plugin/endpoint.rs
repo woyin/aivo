@@ -99,6 +99,20 @@ pub(crate) async fn dispatch(name: &str, bin: &Path, args: &[String], store: &Se
             (flags.key.filter(|s| !s.is_empty()), None, args.to_vec())
         };
 
+    let (key_flag, model_flag) = if manages_km {
+        apply_key_model_spec(
+            store,
+            key_flag,
+            model_flag,
+            &mut plugin_args,
+            plan.is_coding_agent,
+            name,
+        )
+        .await
+    } else {
+        (key_flag, model_flag)
+    };
+
     // HF/local-gguf takeover: an `hf:`/gguf model is served by a local
     // llama-server, not the active key. Spawn it, synthesize the loopback key,
     // and serve the model over the endpoint (the wrapped tool can't read `hf:`).
@@ -628,6 +642,82 @@ fn plugin_model_request(model_flag: Option<String>, key_was_explicit: bool) -> O
         (None, true) => Some(String::new()),
         (other, _) => other,
     }
+}
+
+/// `<key>::<model>` for key-managed plugins, mirroring native `aivo run`: lift a
+/// leading positional spec into `-m` when its key half names a stored key
+/// (coding-agent only — a generic plugin's positionals are real args), then split.
+async fn apply_key_model_spec(
+    store: &SessionStore,
+    key_flag: Option<String>,
+    model_flag: Option<String>,
+    plugin_args: &mut Vec<String>,
+    allow_positional: bool,
+    name: &str,
+) -> (Option<String>, Option<String>) {
+    let mut model_flag = model_flag;
+    if allow_positional
+        && model_flag.is_none()
+        && plugin_args
+            .first()
+            .is_some_and(|a| crate::cli_args::looks_like_key_model_spec(a))
+    {
+        let (key_ref, _) = crate::cli_args::split_tier_spec(&plugin_args[0]);
+        let key_is_real = match &key_ref {
+            Some(kr) => store
+                .find_keys_by_id_or_name_info(kr)
+                .await
+                .map(|m| !m.is_empty())
+                .unwrap_or(false),
+            None => false,
+        };
+        if key_is_real {
+            model_flag = Some(plugin_args.remove(0));
+        } else if let Some(kr) = key_ref {
+            eprintln!(
+                "{} '{kr}' isn't a known key — forwarding {:?} to {name} as a plain argument.",
+                style::yellow("Note:"),
+                plugin_args[0],
+            );
+            eprintln!(
+                "  {}",
+                style::dim(
+                    "For a <key>::<model> spec use a real key; run `aivo keys` to list them."
+                )
+            );
+        }
+    }
+    let Some(value) = model_flag else {
+        return (key_flag, None);
+    };
+    let aliases = store.get_aliases().await.unwrap_or_default();
+    match split_model_spec(key_flag, value, &aliases) {
+        Ok(pair) => pair,
+        Err(msg) => {
+            eprintln!("{} {msg}", style::red("Error:"));
+            std::process::exit(crate::errors::ExitCode::UserError.code());
+        }
+    }
+}
+
+/// Split a `-m` value (or an alias expanding to `key::model`) into key + model.
+/// A conflicting explicit `-k` is an error, not a silent drop.
+fn split_model_spec(
+    key_flag: Option<String>,
+    value: String,
+    aliases: &HashMap<String, String>,
+) -> Result<(Option<String>, Option<String>), String> {
+    let (spec_key, model) = crate::cli_args::split_tier_spec(&value);
+    let (spec_key, model) = crate::cli_args::resolve_alias_with_tier(aliases, spec_key, model);
+    if let (Some(k), Some(kr)) = (key_flag.as_deref(), spec_key.as_deref())
+        && !k.is_empty()
+        && k != kr
+    {
+        return Err(format!(
+            "-k '{k}' conflicts with the provider in -m '{kr}::…' — pick one."
+        ));
+    }
+    Ok((key_flag.or(spec_key), Some(model)))
 }
 
 /// A stood-up hf/local-gguf takeover: the synthetic loopback key bound to the
@@ -1571,6 +1661,91 @@ mod tests {
 
     fn args(items: &[&str]) -> Vec<String> {
         items.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn split_model_spec_handles_specs_aliases_and_conflicts() {
+        use super::split_model_spec;
+        use std::collections::HashMap;
+
+        let no_aliases = HashMap::new();
+        assert_eq!(
+            split_model_spec(None, "gpt-4o".into(), &no_aliases),
+            Ok((None, Some("gpt-4o".to_string())))
+        );
+        assert_eq!(
+            split_model_spec(None, "work::opus".into(), &no_aliases),
+            Ok((Some("work".to_string()), Some("opus".to_string())))
+        );
+        // Empty model half stays empty (picker trigger).
+        assert_eq!(
+            split_model_spec(None, "work::".into(), &no_aliases),
+            Ok((Some("work".to_string()), Some(String::new())))
+        );
+        let aliases = HashMap::from([("fast".to_string(), "groq::llama".to_string())]);
+        assert_eq!(
+            split_model_spec(None, "fast".into(), &aliases),
+            Ok((Some("groq".to_string()), Some("llama".to_string())))
+        );
+        assert_eq!(
+            split_model_spec(Some("work".into()), "work::opus".into(), &no_aliases),
+            Ok((Some("work".to_string()), Some("opus".to_string())))
+        );
+        assert!(split_model_spec(Some("other".into()), "work::opus".into(), &no_aliases).is_err());
+        // Bare `-k` (picker request) wins over the spec's key.
+        assert_eq!(
+            split_model_spec(Some(String::new()), "work::opus".into(), &no_aliases),
+            Ok((Some(String::new()), Some("opus".to_string())))
+        );
+    }
+
+    #[tokio::test]
+    async fn positional_key_model_spec_lifts_like_native_run() {
+        use crate::services::session_store::SessionStore;
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        let store = SessionStore::with_path(tmp.path().join("config.json"));
+        store
+            .add_key_with_protocol("work", "https://api.openai.com/v1", None, "sk-test")
+            .await
+            .unwrap();
+
+        // Known key → the leading spec acts like `-m` and leaves the argv.
+        let mut rest = args(&["work::opus", "-p", "hi"]);
+        let (k, m) = super::apply_key_model_spec(&store, None, None, &mut rest, true, "amp").await;
+        assert_eq!(k.as_deref(), Some("work"));
+        assert_eq!(m.as_deref(), Some("opus"));
+        assert_eq!(rest, args(&["-p", "hi"]));
+
+        // Unknown key → forwarded untouched.
+        let mut rest = args(&["nope::opus"]);
+        let (k, m) = super::apply_key_model_spec(&store, None, None, &mut rest, true, "amp").await;
+        assert!(k.is_none());
+        assert!(m.is_none());
+        assert_eq!(rest, args(&["nope::opus"]));
+
+        // Generic plugins never lift positionals.
+        let mut rest = args(&["work::opus"]);
+        let (k, m) = super::apply_key_model_spec(&store, None, None, &mut rest, false, "x").await;
+        assert!(k.is_none());
+        assert!(m.is_none());
+        assert_eq!(rest, args(&["work::opus"]));
+
+        // Explicit `-m` suppresses the lift; its own spec still splits.
+        let mut rest = args(&["work::ignored"]);
+        let (k, m) = super::apply_key_model_spec(
+            &store,
+            None,
+            Some("work::opus".to_string()),
+            &mut rest,
+            true,
+            "amp",
+        )
+        .await;
+        assert_eq!(k.as_deref(), Some("work"));
+        assert_eq!(m.as_deref(), Some("opus"));
+        assert_eq!(rest, args(&["work::ignored"]));
     }
 
     #[test]
