@@ -623,6 +623,12 @@ pub(super) const SLASH_COMMANDS: &[SlashCommandSpec] = &[
         takes_argument: true,
     },
     SlashCommandSpec {
+        name: "btw",
+        help_label: "/btw [question]",
+        description: "side question, answered outside the conversation",
+        takes_argument: true,
+    },
+    SlashCommandSpec {
         name: "rewind",
         help_label: "/rewind",
         description: "undo the agent's file edits",
@@ -701,6 +707,7 @@ pub(super) fn command_usage_hint(name: &str) -> Option<&'static str> {
         // go/resume/save/stop stay as hidden aliases.
         "plan" => Some("[objective] | list | exit"),
         "ask" => Some("[question] | exit"),
+        "btw" => Some("[question]"),
         "share" => Some("[stop]"),
         "compact" => Some("[fast]"),
         "model" => Some("[name]"),
@@ -1734,6 +1741,10 @@ pub(super) enum Overlay {
     Share {
         scroll: u16,
     },
+    /// `/btw` — the side-question answer panel, over `self.btw`.
+    Btw {
+        scroll: u16,
+    },
     Picker(Box<PickerState>),
 }
 
@@ -1741,6 +1752,14 @@ impl Overlay {
     pub(super) fn blocks_input(&self) -> bool {
         !matches!(self, Self::None)
     }
+}
+
+/// One `/btw` exchange.
+pub(super) struct BtwExchange {
+    pub(super) question: String,
+    pub(super) answer: String,
+    /// A partial answer that streamed before the failure is kept.
+    pub(super) error: Option<String>,
 }
 
 pub(super) use crate::services::image_generate::GeneratorSource;
@@ -2656,6 +2675,9 @@ pub(super) enum SlashCommand {
     /// Ask mode: `<question>` enters read-only research/learning mode (and asks
     /// the question); bare just enters; `exit` leaves.
     Ask(Option<String>),
+    /// `/btw <question>` answers a side question in an isolated one-off call —
+    /// the exchange never enters the conversation. Bare reopens the last answer.
+    Btw(Option<String>),
     /// Built-in `create-skill` command: starts the guided create/improve-a-skill
     /// workflow. The optional argument is the initial intent (what the skill
     /// should do); bare just opens the workflow.
@@ -2709,6 +2731,12 @@ pub(super) enum DeferredFinish {
 
 /// Composer→engine steering handoff; `std::sync` mutex — never held across an await.
 pub(super) type SteeringQueue = std::sync::Arc<std::sync::Mutex<Vec<String>>>;
+
+/// A loopback serve's (accept-loop handle, shutdown notify).
+pub(super) type ServeHandle = (
+    JoinHandle<anyhow::Result<()>>,
+    std::sync::Arc<tokio::sync::Notify>,
+);
 
 /// Owning queue of a unified queue row; variants in delivery order.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2879,6 +2907,17 @@ pub(super) enum RuntimeEvent {
     AgentPlan(serde_json::Value),
     /// Engine status line (compaction, step limit, …) — shown as a notice.
     AgentNotice(String),
+    /// A `/btw` side call streamed answer text.
+    BtwDelta {
+        seq: u64,
+        text: String,
+    },
+    /// The `/btw` side call finished: `Ok` = the assembled final answer
+    /// (authoritative over accumulated deltas — covers buffered upstreams).
+    BtwFinished {
+        seq: u64,
+        result: std::result::Result<String, String>,
+    },
     /// The engine ended the turn early (guard stop / step limit) — typed, for /goal steering.
     AgentTurnStop(crate::agent::engine::TurnStop),
     /// A mutating tool needs approval. The event loop shows a permission card
@@ -3472,12 +3511,16 @@ pub(super) struct CodeTuiApp {
     /// their connect reports a 401 — so adding an OAuth server is one step, not a
     /// separate Ctrl+O. Drained when that connect resolves.
     pub(super) pending_mcp_auth: std::collections::HashMap<String, String>,
-    /// Per-turn loopback serve backing the agent engine: (accept-loop handle,
-    /// shutdown notify). Torn down when the turn finishes or is cancelled.
-    pub(super) agent_serve: Option<(
-        JoinHandle<anyhow::Result<()>>,
-        std::sync::Arc<tokio::sync::Notify>,
-    )>,
+    /// Per-turn loopback serve backing the agent engine. Torn down when the
+    /// turn finishes or is cancelled.
+    pub(super) agent_serve: Option<ServeHandle>,
+    /// The last `/btw` side exchange; dies with the conversation.
+    pub(super) btw: Option<BtwExchange>,
+    /// Stale-stream guard: a new `/btw` bumps it, so a superseded call's deltas drop.
+    pub(super) btw_seq: u64,
+    /// The `/btw` call's own loopback serve — separate from `agent_serve` so a
+    /// main turn can start/finish while a side answer streams.
+    pub(super) btw_serve: Option<ServeHandle>,
     /// Agent decision cards (permission/ask/plan/MCP consent); the
     /// engine blocks on each oneshot, so at most one is visible at a time.
     pub(super) cards: AgentCards,
@@ -3969,6 +4012,9 @@ impl CodeTuiApp {
             engine_stale: false,
             pending_mcp_auth: std::collections::HashMap::new(),
             agent_serve: None,
+            btw: None,
+            btw_seq: 0,
+            btw_serve: None,
             cards: AgentCards::default(),
             agent_auto_approve: false,
             auto_approve_flag: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),

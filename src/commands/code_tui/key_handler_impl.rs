@@ -786,6 +786,7 @@ impl CodeTuiApp {
             | Overlay::Context { .. }
             | Overlay::Session { .. }
             | Overlay::Share { .. }
+            | Overlay::Btw { .. }
             | Overlay::Config(_)
             | Overlay::None => false,
         }
@@ -804,10 +805,13 @@ impl CodeTuiApp {
                 }
                 OverlayKeyAction::Handled
             }
-            Overlay::Context { .. } => {
+            // Closing Btw doesn't cancel its in-flight answer.
+            Overlay::Context { .. } | Overlay::Btw { .. } => {
                 if matches!(key.code, KeyCode::Esc | KeyCode::Enter) {
                     self.overlay = Overlay::None;
-                } else if let Overlay::Context { scroll, .. } = &mut self.overlay {
+                } else if let Overlay::Context { scroll, .. } | Overlay::Btw { scroll } =
+                    &mut self.overlay
+                {
                     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
                     apply_detail_scroll(scroll, key, ctrl);
                 }

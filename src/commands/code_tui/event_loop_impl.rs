@@ -239,6 +239,31 @@ impl CodeTuiApp {
                 self.retrying = text.contains("retrying");
                 self.notice = Some((MUTED(), text));
             }
+            RuntimeEvent::BtwDelta { seq, text } => {
+                if seq == self.btw_seq
+                    && let Some(exchange) = &mut self.btw
+                {
+                    exchange.answer.push_str(&text);
+                }
+            }
+            RuntimeEvent::BtwFinished { seq, result } => {
+                if seq == self.btw_seq {
+                    if let Some(exchange) = &mut self.btw {
+                        match result {
+                            Ok(full) => {
+                                if !full.is_empty() {
+                                    exchange.answer = full;
+                                }
+                            }
+                            Err(e) => exchange.error = Some(e),
+                        }
+                        if exchange.answer.is_empty() && exchange.error.is_none() {
+                            exchange.error = Some("the model returned no text".to_string());
+                        }
+                    }
+                    self.stop_btw_serve();
+                }
+            }
             // Typed early-stop (guard stop / step limit) — remembered for /goal steering.
             RuntimeEvent::AgentTurnStop(stop) => {
                 self.goal_guard_stop = Some(stop);
@@ -3273,6 +3298,14 @@ impl CodeTuiApp {
                 Ok(Some(false))
             }
             (Overlay::Session { .. }, _) => Ok(Some(false)),
+            (Overlay::Btw { .. }, MouseEventKind::ScrollUp | MouseEventKind::ScrollDown) => {
+                let up = matches!(mouse.kind, MouseEventKind::ScrollUp);
+                if let Overlay::Btw { scroll } = &mut self.overlay {
+                    *scroll = wheel_scroll(*scroll, up);
+                }
+                Ok(Some(false))
+            }
+            (Overlay::Btw { .. }, _) => Ok(Some(false)),
             (Overlay::Share { .. }, MouseEventKind::ScrollUp | MouseEventKind::ScrollDown) => {
                 let up = matches!(mouse.kind, MouseEventKind::ScrollUp);
                 if let Overlay::Share { scroll } = &mut self.overlay {
@@ -3430,7 +3463,8 @@ impl CodeTuiApp {
             Overlay::Help { scroll }
             | Overlay::Context { scroll, .. }
             | Overlay::Session { scroll }
-            | Overlay::Share { scroll } => *scroll = start.min(usize::from(u16::MAX)) as u16,
+            | Overlay::Share { scroll }
+            | Overlay::Btw { scroll } => *scroll = start.min(usize::from(u16::MAX)) as u16,
             _ => {}
         }
     }

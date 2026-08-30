@@ -3552,6 +3552,7 @@ conversation is preserved."
         self.plan_card_idx = None;
         self.goal_mode = None;
         self.stop_agent_serve();
+        self.discard_btw();
         self.session_id = session.session_id;
         // Re-root NEW background-job logs under the resumed session's artifacts dir.
         self.jobs.set_logs_root(

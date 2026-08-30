@@ -1631,6 +1631,15 @@ impl CodeTuiApp {
                     *scroll = clamped;
                 }
             }
+            Overlay::Btw { scroll } => {
+                let area = centered_rect(72, 88, body);
+                self.set_overlay_regions(area);
+                let (clamped, bar) = self.render_btw_overlay(frame, area, scroll);
+                self.scrollbar_hit = bar;
+                if let Overlay::Btw { scroll } = &mut self.overlay {
+                    *scroll = clamped;
+                }
+            }
             Overlay::Share { scroll } => {
                 let area = centered_rect_fixed(64, 9, body);
                 self.set_overlay_regions(area);

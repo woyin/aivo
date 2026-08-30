@@ -607,18 +607,7 @@ impl CodeTuiApp {
                 Style::default().fg(FAINT()),
             )));
             lines.push(Line::from(""));
-            for raw in text.split('\n') {
-                if raw.trim().is_empty() {
-                    lines.push(Line::from(""));
-                    continue;
-                }
-                for wrapped in wrap_chars(raw, width) {
-                    lines.push(Line::from(Span::styled(
-                        wrapped,
-                        Style::default().fg(TEXT()),
-                    )));
-                }
-            }
+            push_wrapped_text(&mut lines, text, width, Style::default().fg(TEXT()));
         }
 
         render_detail_lines(frame, inner, lines, scroll)
@@ -693,6 +682,56 @@ impl CodeTuiApp {
             )));
         }
 
+        render_detail_lines(frame, inner, lines, scroll)
+    }
+
+    /// `/btw` panel: the side question and its (possibly still-streaming) answer.
+    pub(super) fn render_btw_overlay(
+        &self,
+        frame: &mut Frame<'_>,
+        area: Rect,
+        scroll: u16,
+    ) -> (u16, Option<ScrollbarHit>) {
+        let inner = overlay_shell(frame, area, "Btw", Some(("Esc".to_string(), MUTED())));
+        let width = usize::from(inner.width).max(1);
+        let mut lines: Vec<Line> = Vec::new();
+        let Some(exchange) = &self.btw else {
+            lines.push(Line::from(Span::styled(
+                "no side question yet — /btw <question>",
+                Style::default().fg(MUTED()),
+            )));
+            return render_detail_lines(frame, inner, lines, scroll);
+        };
+        push_wrapped_text(
+            &mut lines,
+            &exchange.question,
+            width,
+            Style::default().fg(TEXT()).add_modifier(Modifier::BOLD),
+        );
+        push_wrapped_text(
+            &mut lines,
+            "answered outside the conversation — nothing here reaches the model's context",
+            width,
+            Style::default().fg(FAINT()),
+        );
+        lines.push(Line::from(""));
+        if exchange.answer.is_empty() && exchange.error.is_none() {
+            lines.push(Line::from(Span::styled(
+                "thinking…",
+                Style::default().fg(MUTED()),
+            )));
+        } else if !exchange.answer.is_empty() {
+            push_wrapped_text(
+                &mut lines,
+                &exchange.answer,
+                width,
+                Style::default().fg(TEXT()),
+            );
+        }
+        if let Some(err) = &exchange.error {
+            lines.push(Line::from(""));
+            push_wrapped_text(&mut lines, err, width, Style::default().fg(ERROR()));
+        }
         render_detail_lines(frame, inner, lines, scroll)
     }
 
@@ -2961,6 +3000,19 @@ fn footer_hints(hints: &[(&str, &str)]) -> Line<'static> {
     Line::from(spans)
 }
 
+/// Char-wrap `text` (multi-line; blank lines preserved) into styled lines.
+fn push_wrapped_text(lines: &mut Vec<Line<'static>>, text: &str, width: usize, style: Style) {
+    for raw in text.split('\n') {
+        if raw.trim().is_empty() {
+            lines.push(Line::from(""));
+            continue;
+        }
+        for wrapped in wrap_chars(raw, width) {
+            lines.push(Line::from(Span::styled(wrapped, style)));
+        }
+    }
+}
+
 /// Slash commands grouped by purpose for the `/help` overlay. Each entry is a
 /// section label and the command names (matched against [`SLASH_COMMANDS`])
 /// shown under it. Any command not listed here is swept into a trailing "More"
@@ -2974,7 +3026,10 @@ const HELP_COMMAND_GROUPS: &[(&str, &[&str])] = &[
         ],
     ),
     ("Model & key", &["model", "key"]),
-    ("Context", &["attach", "preview", "compact", "context"]),
+    (
+        "Context",
+        &["attach", "preview", "compact", "context", "btw"],
+    ),
     (
         "Skills & tools",
         &["skills", "create-skill", "agents", "mcp"],

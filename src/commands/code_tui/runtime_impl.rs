@@ -1235,10 +1235,102 @@ impl CodeTuiApp {
 
     /// Tear down the per-turn agent serve (shutdown notify + abort accept loop).
     pub(super) fn stop_agent_serve(&mut self) {
-        if let Some((handle, shutdown)) = self.agent_serve.take() {
-            shutdown.notify_one();
-            handle.abort();
+        stop_serve(&mut self.agent_serve);
+    }
+
+    pub(super) fn stop_btw_serve(&mut self) {
+        stop_serve(&mut self.btw_serve);
+    }
+
+    /// A side exchange belongs to the conversation it was asked about — call on
+    /// every conversation swap (`/new`, `/resume`). The seq bump drops a
+    /// still-streaming call's late deltas.
+    pub(super) fn discard_btw(&mut self) {
+        self.btw = None;
+        self.btw_seq = self.btw_seq.wrapping_add(1);
+        self.stop_btw_serve();
+    }
+
+    /// `/btw <question>`: answer a side question in an isolated one-off
+    /// completion. Runs mid-turn too — its own serve, and it touches neither the
+    /// engine nor the transcript.
+    pub(super) async fn run_btw_command(&mut self, question: Option<String>) {
+        let question = question
+            .map(|q| q.trim().to_string())
+            .filter(|q| !q.is_empty());
+        let Some(question) = question else {
+            if self.btw.is_some() {
+                self.overlay = Overlay::Btw { scroll: 0 };
+            } else {
+                self.notice = Some((
+                    MUTED(),
+                    "/btw <question> — a side answer that never enters the conversation"
+                        .to_string(),
+                ));
+            }
+            return;
+        };
+        if !self.agent_capable() {
+            self.notice = Some((MUTED(), "/btw isn't available on this key".to_string()));
+            return;
         }
+        self.btw_seq = self.btw_seq.wrapping_add(1);
+        let seq = self.btw_seq;
+        self.stop_btw_serve();
+
+        let (base, auth) = match self.start_serve(Vec::new()).await {
+            Ok((handle, base, auth)) => {
+                self.btw_serve = Some(handle);
+                (base, auth)
+            }
+            Err(e) => {
+                self.notice = Some((ERROR(), format!("btw serve failed to start: {e}")));
+                return;
+            }
+        };
+
+        let request = crate::agent::protocol::ChatRequest {
+            model: self.model.clone(),
+            messages: btw_request_messages(&self.history, &self.vision_descriptions, &question),
+            tools: vec![],
+            extra: serde_json::Map::new(),
+        };
+        self.btw = Some(BtwExchange {
+            question,
+            answer: String::new(),
+            error: None,
+        });
+        self.overlay = Overlay::Btw { scroll: 0 };
+
+        let tx = self.tx.clone();
+        tokio::spawn(async move {
+            let client = crate::services::http_utils::router_http_client();
+            let tx_delta = tx.clone();
+            let mut sink = move |d: crate::agent::serve_client::StreamDelta| {
+                if let crate::agent::serve_client::StreamDelta::Text(t) = d {
+                    let _ = tx_delta.send(RuntimeEvent::BtwDelta {
+                        seq,
+                        text: t.to_string(),
+                    });
+                }
+            };
+            let call = crate::agent::serve_client::complete(
+                &client,
+                &base,
+                Some(&auth),
+                &request,
+                &mut sink,
+            );
+            let result =
+                match tokio::time::timeout(std::time::Duration::from_secs(BTW_TIMEOUT_SECS), call)
+                    .await
+                {
+                    Err(_) => Err("btw answer timed out".to_string()),
+                    Ok(Err(e)) => Err(e.to_string()),
+                    Ok(Ok(msg)) => Ok(msg.content.unwrap_or_default()),
+                };
+            let _ = tx.send(RuntimeEvent::BtwFinished { seq, result });
+        });
     }
 
     /// Loopback serve router + auth token (sole egress, usage under "code").
@@ -1276,17 +1368,27 @@ impl CodeTuiApp {
         (router, auth)
     }
 
+    /// Start a loopback serve for the active key; the caller stores the handle
+    /// in its own slot (`agent_serve` for turns, `btw_serve` for side calls).
+    async fn start_serve(
+        &mut self,
+        model_upstreams: Vec<(String, ApiKey)>,
+    ) -> Result<(ServeHandle, String, String)> {
+        let (router, auth) =
+            Self::build_agent_serve_router(&self.key, &self.session_store, model_upstreams).await;
+        let router = router.with_route_cache(self.agent_route_cache());
+        let (handle, shutdown, port) = router.start_background_with_addr("127.0.0.1", 0).await?;
+        Ok(((handle, shutdown), format!("http://127.0.0.1:{port}"), auth))
+    }
+
     /// Start this turn's loopback serve; sets `self.agent_serve`, returns `(base, auth)`.
     async fn start_agent_serve(
         &mut self,
         model_upstreams: Vec<(String, ApiKey)>,
     ) -> Result<(String, String)> {
-        let (router, auth) =
-            Self::build_agent_serve_router(&self.key, &self.session_store, model_upstreams).await;
-        let router = router.with_route_cache(self.agent_route_cache());
-        let (handle, shutdown, port) = router.start_background_with_addr("127.0.0.1", 0).await?;
-        self.agent_serve = Some((handle, shutdown));
-        Ok((format!("http://127.0.0.1:{port}"), auth))
+        let (handle, base, auth) = self.start_serve(model_upstreams).await?;
+        self.agent_serve = Some(handle);
+        Ok((base, auth))
     }
 
     /// `/compact` folds older turns via the LLM; `/compact fast` clears stale output.
@@ -1864,6 +1966,10 @@ impl CodeTuiApp {
             }
             SlashCommand::Ask(arg) => {
                 self.run_ask_command(arg).await;
+                Ok(false)
+            }
+            SlashCommand::Btw(arg) => {
+                self.run_btw_command(arg).await;
                 Ok(false)
             }
             SlashCommand::CreateSkill(arg) => {
@@ -3691,6 +3797,7 @@ and keep each turn's work small"
             let _ = self.persist_history().await;
         }
         self.overlay = Overlay::None;
+        self.discard_btw();
         self.pristine_import_len = None;
         self.import_fidelity = None;
         self.history.clear();
@@ -4118,6 +4225,64 @@ pub(super) fn agent_seed_turns(
         i += 1;
     }
     out
+}
+
+/// Tear down a loopback serve (shutdown notify + abort accept loop).
+fn stop_serve(slot: &mut Option<ServeHandle>) {
+    if let Some((handle, shutdown)) = slot.take() {
+        shutdown.notify_one();
+        handle.abort();
+    }
+}
+
+const BTW_TIMEOUT_SECS: u64 = 120;
+
+/// Transcript budget (~15k tokens at chars/4), trimmed oldest-first.
+const BTW_CONTEXT_MAX_CHARS: usize = 60_000;
+
+const BTW_SYSTEM: &str = "You are answering a quick side question from the user of a coding \
+session. The conversation transcript is provided as context only. Answer the question directly \
+and concisely; do not continue the conversation's work, and do not address anything but the \
+question.";
+
+/// The `/btw` request: system prompt + ONE user message holding the labeled
+/// transcript and the question. A single user turn keeps every wire bridge's
+/// role-alternation rules satisfied regardless of what the history ends with.
+pub(super) fn btw_request_messages(
+    history: &[ChatMessage],
+    descriptions: &std::collections::HashMap<String, String>,
+    question: &str,
+) -> Vec<serde_json::Value> {
+    use std::fmt::Write;
+    // Cut BEFORE seeding so a long session doesn't materialize megabytes of
+    // transcript to keep 60k; always keeps at least the newest message.
+    let mut total = 0usize;
+    let mut cut = history.len();
+    for (i, m) in history.iter().enumerate().rev() {
+        total += m.content.len();
+        if total > BTW_CONTEXT_MAX_CHARS && cut < history.len() {
+            break;
+        }
+        cut = i;
+    }
+    let mut transcript = String::new();
+    if cut > 0 {
+        transcript.push_str("(earlier turns omitted)\n");
+    }
+    for (role, content) in agent_seed_turns(&history[cut..], descriptions) {
+        let _ = writeln!(transcript, "{role}: {content}\n");
+    }
+    let user = if transcript.trim().is_empty() {
+        format!("Side question: {question}")
+    } else {
+        format!(
+            "<conversation transcript (context only)>\n{transcript}</conversation>\n\nSide question: {question}"
+        )
+    };
+    vec![
+        serde_json::json!({"role": "system", "content": BTW_SYSTEM}),
+        serde_json::json!({"role": "user", "content": user}),
+    ]
 }
 
 /// One-line, length-capped excerpt of a turn's prompt for the `/rewind` picker.

@@ -181,6 +181,7 @@ pub(super) fn command_recall_text(command: &SlashCommand) -> String {
         SlashCommand::Goal(arg) => with_arg("goal", arg),
         SlashCommand::Plan(arg) => with_arg("plan", arg),
         SlashCommand::Ask(arg) => with_arg("ask", arg),
+        SlashCommand::Btw(arg) => with_arg("btw", arg),
         SlashCommand::CreateSkill(arg) => with_arg("create-skill", arg),
         SlashCommand::Skill { name, argument } => with_arg(name, argument),
         SlashCommand::Rewind => "/rewind".to_string(),
