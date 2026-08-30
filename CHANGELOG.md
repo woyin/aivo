@@ -1,5 +1,24 @@
 # Changelog
 
+## v0.49.0
+
+Review mode is replaced by ask mode — a read-only session mode for understanding things (concepts, docs, this codebase, the web) instead of changing code. `/btw` answers side questions outside the conversation, the agent tools gain `switch_key`, and session resume preserves the explicit model and key. Model listing authentication errors propagate instead of being silently swallowed.
+
+- feat(code): ask mode — learn/research/search replaces review mode (1a20acf0)
+- feat(code): /btw side questions, answered outside the conversation (7b27106f)
+- feat(code): add a switch_key agent tool alongside switch_model (4d000d6b)
+- improve(code): ask for full findings, not a recap, on answer-shaped turns (561f9521)
+- fix: preserve explicit key when resuming code sessions (#39) (728e754d)
+- fix(code): preserve explicit model on session resume (#38) (26ebbaa9)
+- fix: preserve model listing authentication errors (#40) (27ae1e4c)
+- fix(models): soften the listing-error propagation from #40 (#41) (7392d671)
+- fix(plugins): recognize `<key>::<model>` specs for key-managed plugins (7bb9a9ce)
+- fix(code): compact single-user-turn transcripts at assistant boundaries (dc2c1a55)
+- fix(code): stop claiming auto-approve gates remote mutations in the system prompt (b7bd3a07)
+- fix(code): hide the error notice while it duplicates the transcript's last error entry (16959548)
+- fix(code): /help keybindings keep the body's neutral ink (e68c75af)
+- fix(code): avoid truecolor parsing in diff rows (#37) (06e0dc8a)
+
 ## v0.48.1
 
 The code TUI makes short-lived thinking changes visible with a fading center toast, while sandbox denial handling identifies masked or protected-path failures without futile escalation. Custom key setup accepts the base URL and API key in either order, and shared goal sessions are more reliable.
