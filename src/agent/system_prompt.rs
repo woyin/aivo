@@ -152,7 +152,9 @@ That action bias is for read-only and easily-reversible local work; weigh anythi
 hard it is to undo and how far its effects reach. The approval card catches \
 local file and history damage, and common remote-mutating shell commands (`curl -X POST/PUT/DELETE`, \
 `gh`, `aws`, `gcloud`, `kubectl`, `helm`, `terraform`, `npm publish`, `docker push`, deploy CLIs, …) \
-now raise it even under auto-approve. But it does NOT catch every outward-facing or hard-to-undo \
+raise it as well — unless the user has turned approvals off (auto-approve), which waives the \
+remote gate: with no card to catch those commands, say plainly what a remote mutation will do \
+before running it. And the card does NOT catch every outward-facing or hard-to-undo \
 action. Before you send any other mutating request to a remote API (POST/PUT/DELETE), publish or \
 deploy, send mail, or delete remote, cloud, or database data, say plainly what you're about to \
 do and wait for the user to confirm. Before deleting or overwriting anything — a file, a branch, \
@@ -434,7 +436,7 @@ mod tests {
         ));
         assert!(p.contains("Don't commit, push, create"));
         assert!(p.contains("does NOT catch every outward-facing or hard-to-undo"));
-        assert!(p.contains("now raise it even under auto-approve")); // common remote mutations are gated
+        assert!(p.contains("waives the remote gate")); // matches engine behavior
         // Out-of-workspace writes prompt (escalation), not refuse outright.
         assert!(p.contains("a file tool targeting a path outside the workspace prompts"));
         assert!(!p.contains("refused outright"));

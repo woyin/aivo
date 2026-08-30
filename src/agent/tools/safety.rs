@@ -281,7 +281,7 @@ pub fn is_catastrophic(name: &str, args: &Value) -> bool {
 }
 
 /// A `run_bash` command that mutates remote/cloud/API state (see
-/// [`bash_mutates_remote`]); the engine confirms it even under auto-approve.
+/// [`bash_mutates_remote`]); confirmed unless auto-approve mode waives it.
 pub fn is_remote_side_effect(name: &str, args: &Value) -> bool {
     name == "run_bash"
         && args
