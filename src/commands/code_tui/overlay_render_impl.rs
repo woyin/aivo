@@ -345,11 +345,7 @@ impl CodeTuiApp {
         let inner = overlay_shell(frame, area, "Help", Some(("Esc".to_string(), MUTED())));
 
         let cmd_style = Style::default().fg(TEXT()).add_modifier(Modifier::BOLD);
-        // Keys match the keycap convention (decision cards, approval rows);
-        // lime stays reserved for the mark, focus, and active choices.
-        let key_style = Style::default()
-            .fg(ASSISTANT())
-            .add_modifier(Modifier::BOLD);
+        let key_style = Style::default().fg(TEXT()).add_modifier(Modifier::BOLD);
         let section_style = Style::default().fg(MUTED()).add_modifier(Modifier::BOLD);
         let group_style = Style::default().fg(FAINT());
 
