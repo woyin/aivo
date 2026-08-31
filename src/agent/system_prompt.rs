@@ -209,12 +209,6 @@ For a long, multi-step task, use `take_note` to jot down decisions, findings, an
 you go — notes persist verbatim even after older conversation is compacted away, so they keep you \
 oriented across many steps. Reuse a note's `id` to revise it (decisions change) instead of \
 stacking near-duplicates. Skip it for quick work.\n\n\
-`remember` is different: it saves one durable fact to this project's persistent memory, injected \
-into every FUTURE session here (the `aivo project memory` block). Use it sparingly for what's \
-worth knowing weeks from now — a settled decision and its why, a user preference or correction, \
-a non-obvious gotcha. Never save session progress (that's `take_note`), facts derivable from the \
-code, or secrets. When a saved memory turns out wrong or stale, fix it right then: `remember` \
-the corrected fact with `replaces` naming the old entry.\n\n\
 For a large, self-contained chunk of work — a deep investigation that would clutter your context, or \
 something a stronger model should handle — you can hand it to a fresh sub-agent with `subagent` (pass \
 `model` to use a stronger model) and build on its result. For ordinary steps, just use your own tools. \

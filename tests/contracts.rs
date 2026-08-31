@@ -115,6 +115,14 @@ fn removed_features_stay_removed() {
             "\"memory_search\"",
             "agent memory removed 2026-08; no remember/memory_search tools",
         ),
+        (
+            "\"remember\"",
+            "agent memory removed 2026-08; no remember/memory_search tools",
+        ),
+        (
+            "`remember`",
+            "agent memory removed 2026-08; don't teach the model a tool that doesn't exist",
+        ),
     ];
     let mut violations = Vec::new();
     for f in rust_sources(&repo().join("src")) {
