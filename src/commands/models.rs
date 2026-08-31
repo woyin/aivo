@@ -597,28 +597,28 @@ mod tests {
     fn merge_models_spec_folds_positional_into_flags() {
         let s = |v: &str| Some(v.to_string());
         assert_eq!(
-            merge_models_spec(None, s("gapnet"), s("glm")),
-            Ok((s("gapnet"), s("glm")))
+            merge_models_spec(None, s("acme"), s("glm")),
+            Ok((s("acme"), s("glm")))
         );
         assert_eq!(
-            merge_models_spec(s("gapnet::"), None, None),
-            Ok((s("gapnet"), None))
+            merge_models_spec(s("acme::"), None, None),
+            Ok((s("acme"), None))
         );
         assert_eq!(
-            merge_models_spec(s("gapnet::glm"), None, None),
-            Ok((s("gapnet"), s("glm")))
+            merge_models_spec(s("acme::glm"), None, None),
+            Ok((s("acme"), s("glm")))
         );
         assert_eq!(
             merge_models_spec(s("sonnet"), None, None),
             Ok((None, s("sonnet")))
         );
         assert_eq!(
-            merge_models_spec(s("gapnet::"), None, s("glm")),
-            Ok((s("gapnet"), s("glm")))
+            merge_models_spec(s("acme::"), None, s("glm")),
+            Ok((s("acme"), s("glm")))
         );
         assert_eq!(
-            merge_models_spec(s("glm"), s("gapnet"), None),
-            Ok((s("gapnet"), s("glm")))
+            merge_models_spec(s("glm"), s("acme"), None),
+            Ok((s("acme"), s("glm")))
         );
         assert_eq!(merge_models_spec(s("::"), None, None), Ok((None, None)));
     }
@@ -628,17 +628,17 @@ mod tests {
         let s = |v: &str| Some(v.to_string());
         // Agreeing values collapse (run-path policy for -k vs -m key::…).
         assert_eq!(
-            merge_models_spec(s("gapnet::"), s("gapnet"), None),
-            Ok((s("gapnet"), None))
+            merge_models_spec(s("acme::"), s("acme"), None),
+            Ok((s("acme"), None))
         );
         assert_eq!(
             merge_models_spec(s("glm"), None, s("glm")),
             Ok((None, s("glm")))
         );
-        assert!(merge_models_spec(s("gapnet::"), s("other"), None).is_err());
+        assert!(merge_models_spec(s("acme::"), s("other"), None).is_err());
         // Bare `-k` ("" = picker request) is a differing value, not absence.
-        assert!(merge_models_spec(s("gapnet::"), s(""), None).is_err());
-        assert!(merge_models_spec(s("gapnet::glm"), None, s("kimi")).is_err());
+        assert!(merge_models_spec(s("acme::"), s(""), None).is_err());
+        assert!(merge_models_spec(s("acme::glm"), None, s("kimi")).is_err());
         assert!(merge_models_spec(s("glm"), None, s("kimi")).is_err());
     }
 

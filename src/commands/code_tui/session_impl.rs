@@ -15,6 +15,8 @@ impl CodeTuiApp {
             ModelSelectionTarget::ImageGenerator(_) => "Generator model (makes images)",
             _ => "Select model",
         };
+        // Generators may live outside the chat catalog (Images-API models).
+        let chat_only = !matches!(target, ModelSelectionTarget::ImageGenerator(_));
         self.overlay = Overlay::Picker(Box::new(PickerState::loading(
             title,
             query,
@@ -32,7 +34,7 @@ impl CodeTuiApp {
         let cache = self.cache.clone();
 
         tokio::spawn(async move {
-            let choices = load_model_choices(&client, &key, &cache).await;
+            let choices = load_model_choices(&client, &key, &cache, chat_only).await;
             if choices.is_empty() {
                 tx.send(RuntimeEvent::ModelsLoaded(Err(
                     "No models available for this provider".to_string(),
@@ -325,7 +327,7 @@ impl CodeTuiApp {
         if self.raw_model.eq_ignore_ascii_case(&requested) {
             return Ok(format!("Already using {}.", self.raw_model));
         }
-        let choices = load_model_choices(&self.client, &self.key, &self.cache).await;
+        let choices = load_model_choices(&self.client, &self.key, &self.cache, true).await;
         let resolved = resolve_model_request(&requested, &choices)?;
         self.apply_model(resolved.clone())
             .await
@@ -358,13 +360,13 @@ is preserved."
 
         let raw_model = match model.as_deref().map(str::trim).filter(|m| !m.is_empty()) {
             Some(m) => {
-                let choices = load_model_choices(&self.client, &key, &self.cache).await;
+                let choices = load_model_choices(&self.client, &key, &self.cache, true).await;
                 resolve_model_request(m, &choices)?
             }
             None => match self.session_store.get_code_model(&key.id).await {
                 Ok(Some(m)) => m,
                 _ => {
-                    let choices = load_model_choices(&self.client, &key, &self.cache).await;
+                    let choices = load_model_choices(&self.client, &key, &self.cache, true).await;
                     return Err(pick_a_model_error(&key, &choices));
                 }
             },
@@ -1490,7 +1492,11 @@ conversation is preserved."
 
     pub(super) async fn apply_image_generator(&mut self, key: ApiKey, model: String) {
         use crate::services::session_store::ImageGenMode;
-        if let Err(message) = super::validate_generator_model(&model, &self.model) {
+        if let Err(message) = super::validate_generator_model(
+            &model,
+            &self.model,
+            crate::services::image_generate::key_serves_images_api(&key),
+        ) {
             self.set_config_error(ConfigSetting::ImageGen, message);
             return;
         }
@@ -4144,18 +4150,22 @@ pub(super) fn same_wire_provider(a: &str, b: &str) -> bool {
 }
 
 /// Fetch model metadata for the picker, falling back to cached IDs on error.
-/// On a successful detailed fetch we also seed the IDs cache so other commands
-/// stay warm.
+/// Chat-filtered fetches also seed the IDs cache so other commands stay warm.
 async fn load_model_choices(
     client: &reqwest::Client,
     key: &ApiKey,
     cache: &crate::services::ModelsCache,
+    chat_only: bool,
 ) -> Vec<ModelChoice> {
-    match crate::services::model_catalog::fetch_models_detailed(client, key).await {
+    match crate::services::model_catalog::fetch_models_detailed_filtered(client, key, chat_only)
+        .await
+    {
         Ok(infos) => {
-            let ids: Vec<String> = infos.iter().map(|m| m.id.clone()).collect();
-            let cache_key = crate::services::model_catalog::model_cache_key_for_key(key);
-            cache.set(&cache_key, ids).await;
+            if chat_only {
+                let ids: Vec<String> = infos.iter().map(|m| m.id.clone()).collect();
+                let cache_key = crate::services::model_catalog::model_cache_key_for_key(key);
+                cache.set(&cache_key, ids).await;
+            }
             infos
                 .into_iter()
                 .map(|m| ModelChoice {

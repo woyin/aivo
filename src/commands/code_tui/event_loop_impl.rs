@@ -1697,7 +1697,7 @@ impl CodeTuiApp {
                 PickerKind::Model {
                     target: ModelSelectionTarget::ImageGenerator(key),
                     ..
-                } => (None, Some(key.id.clone())),
+                } => (None, Some(key.clone())),
                 PickerKind::Model { .. } => (None, None),
                 _ => return None,
             },
@@ -1705,8 +1705,11 @@ impl CodeTuiApp {
         };
         let models = if describer_key.is_some() {
             filter_vision_choices(models)
-        } else if generator_key.is_some() {
-            filter_generator_choices(models)
+        } else if let Some(key) = &generator_key {
+            filter_generator_choices(
+                models,
+                crate::services::image_generate::key_serves_images_api(key),
+            )
         } else {
             filter_main_chat_choices(models)
         };
@@ -1743,7 +1746,10 @@ impl CodeTuiApp {
                 } else {
                     &self.image_gen_custom
                 };
-                match (describer_key.as_ref().or(generator_key.as_ref()), pair) {
+                let picked = describer_key
+                    .as_deref()
+                    .or_else(|| generator_key.as_ref().map(|k| k.id.as_str()));
+                match (picked, pair) {
                     (Some(key_id), Some((id, model))) if key_id == id => {
                         models.iter().position(|m| &m.id == model)
                     }
@@ -3777,18 +3783,27 @@ pub(super) fn filter_main_chat_choices(models: Vec<ModelChoice>) -> Vec<ModelCho
     models
         .into_iter()
         .filter(|m| {
-            !crate::services::model_metadata::model_generates_images(&m.id)
-                || crate::services::model_metadata::model_calls_tools(&m.id)
+            !crate::services::model_metadata::model_images_api_only(&m.id)
+                && (!crate::services::model_metadata::model_generates_images(&m.id)
+                    || crate::services::model_metadata::model_calls_tools(&m.id))
         })
         .collect()
 }
 
 /// Snapshot `g` flag only — no permissive fallback; the caller handles empty.
-pub(super) fn filter_generator_choices(models: Vec<ModelChoice>) -> Vec<ModelChoice> {
+/// `images_api_ok` also admits `n`-flagged Images-API generators.
+pub(super) fn filter_generator_choices(
+    models: Vec<ModelChoice>,
+    images_api_ok: bool,
+) -> Vec<ModelChoice> {
     sort_cheapest_first(
         models
             .into_iter()
-            .filter(|m| crate::services::model_metadata::model_generates_images(&m.id))
+            .filter(|m| {
+                crate::services::model_metadata::model_generates_images(&m.id)
+                    || (images_api_ok
+                        && crate::services::model_metadata::model_images_api_only(&m.id))
+            })
             .collect(),
     )
 }

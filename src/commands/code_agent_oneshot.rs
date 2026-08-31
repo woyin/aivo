@@ -52,15 +52,25 @@ async fn resolve_image_generator(
     if gen_model == model {
         return None;
     }
-    if !crate::services::model_metadata::model_generates_images(&gen_model) {
+    let chat_wire = crate::services::model_metadata::model_generates_images(&gen_model);
+    if !chat_wire && !crate::services::model_metadata::model_images_api_only(&gen_model) {
         return None;
     }
     let mut key = session_store.get_key_by_id(&key_id).await.ok().flatten()?;
     SessionStore::decrypt_key_secret(&mut key).ok()?;
-    Some(GeneratorSource::OwnKey {
-        model: gen_model,
-        key: Box::new(key),
-    })
+    if chat_wire {
+        Some(GeneratorSource::OwnKey {
+            model: gen_model,
+            key: Box::new(key),
+        })
+    } else if crate::services::image_generate::key_serves_images_api(&key) {
+        Some(GeneratorSource::ImagesApi {
+            model: gen_model,
+            key: Box::new(key),
+        })
+    } else {
+        None
+    }
 }
 
 /// Unattended `-e` backstops (env-overridable, 0 disables) — the TUI relies on esc instead.
@@ -370,10 +380,18 @@ async fn run_agent_captured(
                 .await
                 .map_err(|e| anyhow::anyhow!(e))?;
             SessionStore::decrypt_key_secret(&mut gen_key)?;
-            Some(GeneratorSource::OwnKey {
-                model: gen_model,
-                key: Box::new(gen_key),
-            })
+            // Validated above: not chat-wire → Images-API model.
+            if crate::services::model_metadata::model_generates_images(&gen_model) {
+                Some(GeneratorSource::OwnKey {
+                    model: gen_model,
+                    key: Box::new(gen_key),
+                })
+            } else {
+                Some(GeneratorSource::ImagesApi {
+                    model: gen_model,
+                    key: Box::new(gen_key),
+                })
+            }
         }
         None => resolve_image_generator(session_store, model).await,
     };

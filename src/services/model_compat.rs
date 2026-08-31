@@ -16,6 +16,10 @@
 /// (chat, claude, codex, gemini, pi, opencode), or `None` when it's usable.
 /// The string renders as a dim suffix on the disabled picker row.
 pub fn text_chat_incompat_reason(model_id: &str) -> Option<&'static str> {
+    // `n`-flagged models have no text mode, whatever the name looks like.
+    if crate::services::model_metadata::model_images_api_only(model_id) {
+        return Some("image generation");
+    }
     let lower = model_id.to_ascii_lowercase();
     if lower.contains("embed") {
         return Some("embeddings");
@@ -71,6 +75,14 @@ mod tests {
         // Catalog-confirmed image-output chat models are exempt from the `-image` name rule.
         assert!(text_chat_incompat_reason("gemini-2.5-flash-image").is_none());
         assert!(text_chat_incompat_reason("google/gemini-2.5-flash-image").is_none());
+        assert_eq!(
+            text_chat_incompat_reason("imagen-4"),
+            Some("image generation")
+        );
+        assert_eq!(
+            text_chat_incompat_reason("flux-2-pro"),
+            Some("image generation")
+        );
         assert_eq!(text_chat_incompat_reason("tts-1"), Some("text-to-speech"));
         assert_eq!(
             text_chat_incompat_reason("whisper-1"),

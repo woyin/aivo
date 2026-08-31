@@ -348,22 +348,31 @@ pub(super) fn validate_describer_model(
 }
 
 /// Strict (unknown → reject), unlike the describer: a non-generator fails only
-/// at tool time with a confusing text-only answer. Chat-incompatible generators
-/// (gpt-image-1) aren't in the snapshot, so they're rejected too.
+/// at tool time with a confusing text-only answer.
 pub(super) fn validate_generator_model(
     model: &str,
     active_model: &str,
+    images_api_ok: bool,
 ) -> std::result::Result<(), String> {
     if model == active_model {
         return Err("the generator can't be the active model — pick a different one".to_string());
     }
-    if !crate::services::model_metadata::model_generates_images(model) {
+    if crate::services::model_metadata::model_generates_images(model) {
+        return Ok(());
+    }
+    if crate::services::model_metadata::model_images_api_only(model) {
+        if images_api_ok {
+            return Ok(());
+        }
         return Err(format!(
-            "{model} isn't known to generate images — pick an image-output chat model \
-(e.g. gemini-2.5-flash-image)"
+            "{model} only serves the Images API, which this key's provider type can't — \
+pick an OpenAI-compatible key"
         ));
     }
-    Ok(())
+    Err(format!(
+        "{model} isn't known to generate images — pick an image-output model \
+(e.g. gemini-2.5-flash-image)"
+    ))
 }
 
 /// An empty model half means "open a picker", handled after startup.
@@ -433,7 +442,12 @@ pub(crate) async fn resolve_image_model_override(
         None => require_describer_key(active_key.clone())?,
         Some(query) => resolve_describer_key(store, &query).await?,
     };
-    validate_generator_model(&model, active_model).map_err(|e| format!("--image-model: {e}"))?;
+    validate_generator_model(
+        &model,
+        active_model,
+        crate::services::image_generate::key_serves_images_api(&key),
+    )
+    .map_err(|e| format!("--image-model: {e}"))?;
     Ok((key, model))
 }
 

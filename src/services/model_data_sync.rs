@@ -4,7 +4,7 @@
 //!
 //! Row per normalized id: `[context|null, output|null, "flags", "efforts"]`.
 //! flags: `t`=tool_call, `r`=reasoning, `a`=attachment, `i`=image input,
-//! `g`=image output,
+//! `g`=image output, `n`=no text output (Images-API-only generator),
 //! `f`=rejects temperature, `d`=deprecated.
 //!
 //! Keep the winner/normalization rules in lockstep with the Python generator —
@@ -179,15 +179,26 @@ fn collect(data: &BTreeMap<String, ApiProvider>) -> BTreeMap<String, Vec<Obs>> {
     let mut observations: BTreeMap<String, Vec<Obs>> = BTreeMap::new();
     for (provider_id, provider) in data {
         for (model_id, entry) in &provider.models {
+            // Image-only output stays (Images-API, flag `n`); other non-text
+            // output (embeddings / audio / video gen) is pruned.
+            let mut image_only = false;
             if let Some(out) = &entry.modalities.output
                 && !out.iter().any(|m| m == "text")
             {
-                continue; // non-text output (embeddings / image / audio gen)
+                if out.iter().any(|m| m == "image") {
+                    image_only = true;
+                } else {
+                    continue;
+                }
             }
             let ctx = entry.limit.context.and_then(pos_u64);
             let out = entry.limit.output.and_then(pos_u64);
             if ctx.is_none() && out.is_none() {
                 continue; // nothing to record
+            }
+            let mut flags = flags_for(entry);
+            if image_only {
+                flags.push('n');
             }
             observations
                 .entry(normalize(model_id))
@@ -196,7 +207,7 @@ fn collect(data: &BTreeMap<String, ApiProvider>) -> BTreeMap<String, Vec<Obs>> {
                     provider: provider_id.clone(),
                     ctx,
                     out,
-                    flags: flags_for(entry),
+                    flags,
                     temp: entry.temperature,
                     deprecated: entry.status.as_deref() == Some("deprecated"),
                     efforts: effort_values(entry),
@@ -379,7 +390,8 @@ fn pick_winner(rows: &[Obs]) -> Row {
     // `g` drives the generate_image picker/tool, so a lone noisy aggregator
     // (neon branded the whole gpt-5 family image-emitting) must not set it —
     // vendor-verdict-else-majority, like `r/f/d`.
-    if vendor_verdict(rows, |r| Some(r.flags.contains('g'))) == Some(true) {
+    let generates = vendor_verdict(rows, |r| Some(r.flags.contains('g'))) == Some(true);
+    if generates {
         flags.push('g');
     }
     if vendor_verdict(rows, |r| r.temp) == Some(false) {
@@ -387,6 +399,10 @@ fn pick_winner(rows: &[Obs]) -> Row {
     }
     if vendor_verdict(rows, |r| Some(r.deprecated)) == Some(true) {
         flags.push('d');
+    }
+    // `n` flips the tool's wire — vendor-verdict like `g`.
+    if generates && vendor_verdict(rows, |r| Some(r.flags.contains('n'))) == Some(true) {
+        flags.push('n');
     }
     let efforts = vendor_verdict(rows, |r| r.efforts.clone()).unwrap_or_default();
     (ctx, out, flags, efforts.join(","))
@@ -525,6 +541,25 @@ mod tests {
         let (json, _) = transform(api).unwrap();
         assert_eq!(rows_of(&json)["m"][2], "", "lone aggregator can't set g");
         assert_eq!(rows_of(&json)["pic"][2], "g", "vendor-confirmed g sticks");
+    }
+
+    #[test]
+    fn image_only_models_survive_with_n_flag() {
+        let api = r#"{
+          "kenari": {"models": {"gpt-image-2": {"limit": {"context": 272000},
+                                 "modalities": {"output": ["image"]}}}},
+          "fastrouter": {"models": {"gpt-image-2": {"limit": {"context": 128000},
+                                 "modalities": {"output": ["image"]}}}},
+          "bytedance": {"models": {"seedance": {"limit": {"context": 32768},
+                                 "modalities": {"output": ["video"]}}}},
+          "google": {"models": {"pic": {"limit": {"context": 32768},
+                                 "modalities": {"output": ["image", "text"]}}}}
+        }"#;
+        let (json, _) = transform(api).unwrap();
+        let rows = rows_of(&json);
+        assert_eq!(rows["gpt-image-2"][2], "gn", "image-only → g + n");
+        assert!(rows.get("seedance").is_none(), "video output still pruned");
+        assert_eq!(rows["pic"][2], "g", "text+image chats — no n");
     }
 
     #[test]

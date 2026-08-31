@@ -743,7 +743,7 @@ mod tests {
         assert_eq!(
             select_model_for_provider_attempt(
                 None,
-                "https://api.gapnet.ai/endpoint",
+                "https://api.acme.example/endpoint",
                 Some("anthropic/claude-sonnet-4.5"),
                 None,
                 ProviderProtocol::Google

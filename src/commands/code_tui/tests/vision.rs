@@ -511,13 +511,16 @@ fn generator_picker_filters_strictly_to_image_output_models() {
         id: id.to_string(),
         image_input: None,
     };
-    let filtered = filter_generator_choices(vec![
-        choice("gemini-3-pro-image"),     // generates, pricier
-        choice("gemini-2.5-flash"),       // vision-in only, no image output
-        choice("deepseek-chat"),          // text-only
-        choice("gemini-2.5-flash-image"), // generates, cheapest
-        choice("my-local-mystery"),       // unknown → excluded (strict)
-    ]);
+    let filtered = filter_generator_choices(
+        vec![
+            choice("gemini-3-pro-image"),     // generates, pricier
+            choice("gemini-2.5-flash"),       // vision-in only, no image output
+            choice("deepseek-chat"),          // text-only
+            choice("gemini-2.5-flash-image"), // generates, cheapest
+            choice("my-local-mystery"),       // unknown → excluded (strict)
+        ],
+        false,
+    );
     let ids: Vec<&str> = filtered.iter().map(|m| m.id.as_str()).collect();
     assert_eq!(
         ids,
@@ -525,7 +528,38 @@ fn generator_picker_filters_strictly_to_image_output_models() {
         "image-output models only, price-ascending"
     );
 
-    assert!(filter_generator_choices(vec![choice("mystery"), choice("deepseek-chat")]).is_empty());
+    assert!(
+        filter_generator_choices(vec![choice("mystery"), choice("deepseek-chat")], false)
+            .is_empty()
+    );
+}
+
+#[test]
+fn generator_picker_admits_images_api_models_only_when_key_qualifies() {
+    use super::super::event_loop_impl::filter_generator_choices;
+    let choice = |id: &str| ModelChoice {
+        label: id.to_string(),
+        id: id.to_string(),
+        image_input: None,
+    };
+    let models = || {
+        vec![
+            choice("openai/gpt-image-2"),     // Images-API only (`n`)
+            choice("gemini-2.5-flash-image"), // chat-wire generator
+        ]
+    };
+    let with = filter_generator_choices(models(), true);
+    assert_eq!(
+        with.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
+        ["openai/gpt-image-2", "gemini-2.5-flash-image"],
+        "images-api model admitted, sorted by price"
+    );
+    let without = filter_generator_choices(models(), false);
+    assert_eq!(
+        without.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
+        ["gemini-2.5-flash-image"],
+        "non-openai-wire key never sees images-api models"
+    );
 }
 
 #[test]
@@ -913,15 +947,18 @@ fn resume_load_keeps_small_history_images_verbatim() {
 
 #[test]
 fn generator_model_validation_is_strict() {
-    validate_generator_model("gemini-2.5-flash-image", "deepseek-chat").unwrap();
+    validate_generator_model("gemini-2.5-flash-image", "deepseek-chat", false).unwrap();
     // Active-model collision would hijack the main upstream route.
-    let err =
-        validate_generator_model("gemini-2.5-flash-image", "gemini-2.5-flash-image").unwrap_err();
+    let err = validate_generator_model("gemini-2.5-flash-image", "gemini-2.5-flash-image", true)
+        .unwrap_err();
     assert!(err.contains("active model"), "got: {err}");
-    let err = validate_generator_model("deepseek-chat", "gpt-5.4").unwrap_err();
+    let err = validate_generator_model("deepseek-chat", "gpt-5.4", true).unwrap_err();
     assert!(err.contains("isn't known to generate"), "got: {err}");
-    let err = validate_generator_model("totally-unknown-xyz", "gpt-5.4").unwrap_err();
+    let err = validate_generator_model("totally-unknown-xyz", "gpt-5.4", true).unwrap_err();
     assert!(err.contains("isn't known to generate"), "got: {err}");
+    validate_generator_model("openai/gpt-image-2", "gpt-5.4", true).unwrap();
+    let err = validate_generator_model("openai/gpt-image-2", "gpt-5.4", false).unwrap_err();
+    assert!(err.contains("Images API"), "got: {err}");
 }
 
 #[tokio::test]

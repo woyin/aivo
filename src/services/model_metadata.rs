@@ -22,6 +22,8 @@ pub struct ModelLimits {
     pub image_input: bool,
     /// Model emits images in its output (`g` snapshot flag).
     pub image_output: bool,
+    /// No text output (`n` snapshot flag): Images-API-only generator.
+    pub image_only: bool,
     /// False when the model rejects the `temperature` param (o-series,
     /// forced-reasoning claude variants).
     pub temperature: bool,
@@ -73,10 +75,14 @@ pub fn model_pricing(model: &str) -> Option<Pricing> {
     snapshot_limits(model)?.pricing
 }
 
-/// Snapshot `g` flag. Unknown models → false: the image-gen picker offers only
-/// models known to generate.
+/// Chat-wire image generator (`g` without `n`); unknown models → false.
 pub fn model_generates_images(model: &str) -> bool {
-    snapshot_limits(model).is_some_and(|l| l.image_output)
+    snapshot_limits(model).is_some_and(|l| l.image_output && !l.image_only)
+}
+
+/// `/v1/images/generations`-only generator (`g` + `n`); unknown models → false.
+pub fn model_images_api_only(model: &str) -> bool {
+    snapshot_limits(model).is_some_and(|l| l.image_output && l.image_only)
 }
 
 /// Snapshot `t` flag. Unknown models → false; callers pair this with a
@@ -160,10 +166,11 @@ fn overlay_override(
     for (k, mut limits) in fold_rows(over) {
         if let Some(prev) = map.get(&k) {
             merge_pricing(&mut limits, prev.pricing);
-            // The `g` flag postdates deployed override caches (2026-08): a row
-            // written by an older binary would otherwise mask a capability the
-            // embedded snapshot knows — until the user happens to resync.
+            // The `g`/`n` flags postdate deployed override caches (2026-08): a
+            // row written by an older binary would otherwise mask a capability
+            // the embedded snapshot knows — until the user happens to resync.
             limits.image_output |= prev.image_output;
+            limits.image_only |= prev.image_only;
         }
         map.insert(k, limits);
     }
@@ -240,6 +247,7 @@ fn parse_row(row: &[serde_json::Value]) -> Option<ModelLimits> {
         attachment: flags.contains('a'),
         image_input: flags.contains('i'),
         image_output: flags.contains('g'),
+        image_only: flags.contains('n'),
         temperature: !flags.contains('f'),
         deprecated: flags.contains('d'),
         reasoning_efforts: efforts
@@ -461,6 +469,7 @@ fn hf_local_caps(image_input: bool) -> ModelLimits {
         attachment: false,
         image_input,
         image_output: false,
+        image_only: false,
         temperature: true,
         deprecated: false,
         reasoning_efforts: Vec::new(),
@@ -753,6 +762,15 @@ mod tests {
         assert!(model_generates_images("gemini-2.5-flash-image"));
         assert!(!model_generates_images("deepseek-chat"));
         assert!(!model_generates_images("totally-unknown-model-xyz"));
+        assert!(
+            parse_row(&row(None, Some(16384), "aign".into()))
+                .unwrap()
+                .image_only
+        );
+        assert!(!model_generates_images("gpt-image-2"));
+        assert!(model_images_api_only("openai/gpt-image-2"));
+        assert!(!model_images_api_only("gemini-2.5-flash-image"));
+        assert!(!model_images_api_only("totally-unknown-model-xyz"));
     }
 
     #[test]

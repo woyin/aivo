@@ -703,7 +703,8 @@ impl CodeTuiApp {
         }
         // Re-check the catalog at dispatch: a pair stored while the snapshot
         // was wrong (or before a capability was revoked) must not arm the tool.
-        if !crate::services::model_metadata::model_generates_images(model) {
+        let chat_wire = crate::services::model_metadata::model_generates_images(model);
+        if !chat_wire && !crate::services::model_metadata::model_images_api_only(model) {
             return None;
         }
         let mut key = self
@@ -713,10 +714,19 @@ impl CodeTuiApp {
             .ok()
             .flatten()?;
         crate::services::session_store::SessionStore::decrypt_key_secret(&mut key).ok()?;
-        Some(GeneratorSource::OwnKey {
-            model: model.clone(),
-            key: Box::new(key),
-        })
+        if chat_wire {
+            Some(GeneratorSource::OwnKey {
+                model: model.clone(),
+                key: Box::new(key),
+            })
+        } else if crate::services::image_generate::key_serves_images_api(&key) {
+            Some(GeneratorSource::ImagesApi {
+                model: model.clone(),
+                key: Box::new(key),
+            })
+        } else {
+            None
+        }
     }
 
     fn image_refusal_base(&self) -> String {
