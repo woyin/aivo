@@ -1052,7 +1052,9 @@ or finish with status \"blocked\".",
             }
             if self.verify_state == verify::VerifyState::Dirty && self.self_correct {
                 let vplan = verify::detect_plan(ctx.cwd);
-                if !vplan.is_empty() {
+                if vplan.is_empty() {
+                    self.record_no_verify_entrypoint(ui);
+                } else {
                     match self.run_verify_plan(ctx.cwd, ui, &vplan).await {
                         VerifyRun::Fail {
                             label,

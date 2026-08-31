@@ -236,6 +236,47 @@ async fn selfcorrect_plan_stops_at_first_failing_check() {
     assert_eq!(ui.verify_records.len(), 3);
 }
 
+/// Edits with no recognizable entrypoint leave an explicit Unverified record.
+#[tokio::test]
+async fn selfcorrect_records_missing_entrypoint_as_unverified() {
+    use crate::agent::verify;
+    let dir = tmp(); // nothing for detect_plan to find
+    let write = tool_call_sse("write_file", json!({"path": "f", "content": "x"}));
+    let port = spawn_sse_sequence(vec![write, FINAL_TEXT_SSE.to_string()]);
+    let client = reqwest::Client::builder().no_proxy().build().unwrap();
+    let base = format!("http://127.0.0.1:{port}");
+    let mut engine = AgentEngine::new(&dir.display().to_string(), "m", "", &[], &[], 0, 0);
+    engine.set_self_correct(true);
+    let mut ui = CapturingUi::default();
+    run_session(
+        &mut engine,
+        &turn_ctx(&client, &base, &dir),
+        Some("edit something".into()),
+        &mut ui,
+    )
+    .await;
+
+    assert_eq!(engine.verify_state, verify::VerifyState::Unverified);
+    assert_eq!(
+        engine.evidence,
+        vec![verify::EvidenceRecord {
+            command: verify::NO_ENTRYPOINT_COMMAND.into(),
+            status: verify::EvidenceStatus::Inconclusive,
+            detail: verify::NO_ENTRYPOINT_DETAIL.into(),
+        }]
+    );
+    assert!(
+        ui.notices
+            .iter()
+            .any(|n| n.contains(verify::NO_ENTRYPOINT_DETAIL)),
+        "{:?}",
+        ui.notices
+    );
+    let mut resumed = AgentEngine::new(&dir.display().to_string(), "m", "", &[], &[], 0, 0);
+    resumed.restore_conversation(engine.export_conversation());
+    assert_eq!(resumed.evidence, engine.evidence, "resume parity");
+}
+
 /// An inconclusive check taints the run `Unverified` — never `Clean` — while
 /// the remaining checks still run.
 #[tokio::test]

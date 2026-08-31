@@ -467,6 +467,13 @@ impl AgentEngine {
                     self.push_text_turn("user", PLAN_NUDGE.to_string());
                     continue;
                 }
+                if self.self_correct
+                    && vplan.is_empty()
+                    && self.verify_state == verify::VerifyState::Dirty
+                {
+                    let line = self.record_no_verify_entrypoint(ui);
+                    self.push_text_turn("user", line);
+                }
                 // A declared-done turn isn't accepted while a check fails — feed
                 // the failure back (bounded) so the model fixes the cause. Every run
                 // leaves `[self-verify]` marker lines for the log-derived digest.
@@ -715,6 +722,23 @@ you were working. If the outcome matters to the task, inspect the log; otherwise
         let line = verify::evidence_line(&record);
         ui.verify_evidence(&record);
         verify::merge_evidence(&mut self.evidence, record, MAX_EVIDENCE);
+        line
+    }
+
+    /// Record the no-entrypoint miss as Inconclusive and taint the run
+    /// `Unverified` — absence must not read as verified. Returns the marker line.
+    pub(super) fn record_no_verify_entrypoint(&mut self, ui: &mut dyn AgentUi) -> String {
+        ui.notify(&format!(
+            "{} — result not verified",
+            verify::NO_ENTRYPOINT_DETAIL
+        ));
+        let line = self.record_verify_evidence(
+            ui,
+            verify::NO_ENTRYPOINT_COMMAND,
+            verify::EvidenceStatus::Inconclusive,
+            verify::NO_ENTRYPOINT_DETAIL.to_string(),
+        );
+        self.verify_state = verify::VerifyState::Unverified;
         line
     }
 

@@ -99,6 +99,9 @@ const EVIDENCE_DETAIL_MAX: usize = 160;
 const EVIDENCE_COMMAND_MAX: usize = 80;
 /// Detail on a pinned pass record once the tree changed after the run.
 pub const STALE_DETAIL: &str = "stale";
+/// Digest entry for "edits landed but [`detect_plan`] found nothing".
+pub const NO_ENTRYPOINT_COMMAND: &str = "(none)";
+pub const NO_ENTRYPOINT_DETAIL: &str = "no verification entrypoint detected";
 
 /// `` [self-verify] `cargo test` → fail — 2 tests failed ``.
 pub fn evidence_line(r: &EvidenceRecord) -> String {
@@ -212,6 +215,17 @@ fn sanitize_detail(s: &str) -> String {
     out
 }
 
+/// Alternate spellings of the project's check entrypoint, in priority order —
+/// first match wins. Run via `sh <path>`, so each must be POSIX.
+const ENTRYPOINT_SCRIPTS: &[&str] = &[
+    "run_tests.sh",
+    "test.sh",
+    "check.sh",
+    "scripts/run_tests.sh",
+    "scripts/test.sh",
+    "scripts/check.sh",
+];
+
 /// The project's verification plan, cheapest first; empty when unrecognized.
 /// A project-declared driver (entrypoint script, Makefile) replaces language
 /// defaults it conventionally wraps; otherwise checks union across the
@@ -220,8 +234,12 @@ fn sanitize_detail(s: &str) -> String {
 pub fn detect_plan(cwd: &Path) -> Vec<Validator> {
     // Without Git-Bash/MSYS there is no `sh` on Windows — fall through to the
     // language validators instead of an always-Inconclusive one.
-    if cwd.join("run_tests.sh").is_file() && (cfg!(unix) || resolve_program("sh").is_some()) {
-        return vec![Validator::new("run_tests.sh", &["sh", "run_tests.sh"])];
+    if cfg!(unix) || resolve_program("sh").is_some() {
+        for rel in ENTRYPOINT_SCRIPTS {
+            if cwd.join(rel).is_file() {
+                return vec![Validator::new(rel, &["sh", rel])];
+            }
+        }
     }
     let mut plan = Vec::new();
     if makefile_has_target(cwd, "check") {
@@ -409,9 +427,25 @@ mod tests {
         std::fs::write(d.join("Makefile"), "test:\n\techo t\ncheck:\n\techo c\n").unwrap();
         assert_eq!(labels(&d), ["make check", "make test"]);
 
-        // run_tests.sh wins over everything, alone.
+        // Any entrypoint-script spelling wins over everything, alone.
+        std::fs::write(d.join("test.sh"), "exit 0").unwrap();
+        assert_eq!(labels(&d), ["test.sh"]);
         std::fs::write(d.join("run_tests.sh"), "exit 0").unwrap();
         assert_eq!(labels(&d), ["run_tests.sh"]);
+    }
+
+    #[test]
+    fn detect_plan_finds_entrypoint_scripts_under_scripts_dir() {
+        let d = tmp();
+        std::fs::create_dir_all(d.join("scripts")).unwrap();
+        std::fs::write(d.join("scripts/check.sh"), "exit 0").unwrap();
+        assert_eq!(labels(&d), ["scripts/check.sh"]);
+
+        // A root-level spelling outranks the scripts/ one.
+        std::fs::write(d.join("scripts/test.sh"), "exit 0").unwrap();
+        assert_eq!(labels(&d), ["scripts/test.sh"]);
+        std::fs::write(d.join("check.sh"), "exit 0").unwrap();
+        assert_eq!(labels(&d), ["check.sh"]);
     }
 
     #[test]
