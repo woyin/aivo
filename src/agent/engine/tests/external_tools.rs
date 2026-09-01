@@ -405,6 +405,89 @@ async fn external_tool_images_are_surfaced_only_for_vision_models() {
     }
 }
 
+/// Oversized tool images are shrunk before entering the transcript; the
+/// keep-raw case is pinned by the vision test above.
+#[tokio::test]
+async fn oversized_external_tool_images_are_optimized() {
+    use base64::Engine as _;
+    let png = crate::services::image_optimize::test_png(3000, 1500, |x, _| {
+        [(x % 256) as u8, 120, 60, 255]
+    });
+    let png_b64 = base64::engine::general_purpose::STANDARD.encode(&png);
+
+    struct BigImgExt(String);
+    impl crate::agent::engine::ExternalTools for BigImgExt {
+        fn specs(&self) -> Vec<Value> {
+            vec![json!({
+                "type": "function",
+                "function": {"name": "mcp__img__gen", "description": "d", "parameters": {"type": "object"}}
+            })]
+        }
+        fn handles(&self, name: &str) -> bool {
+            name == "mcp__img__gen"
+        }
+        fn call<'a>(
+            &'a self,
+            _name: &'a str,
+            _args: &'a Value,
+        ) -> BoxFuture<'a, Result<crate::agent::engine::ToolOutput, String>> {
+            let data = self.0.clone();
+            Box::pin(async move {
+                Ok(crate::agent::engine::ToolOutput {
+                    text: "[image saved: /tmp/big.png (image/png)]".to_string(),
+                    images: vec![crate::agent::engine::ToolImage {
+                        path: "/tmp/big.png".into(),
+                        mime: "image/png".to_string(),
+                        data_b64: data,
+                    }],
+                })
+            })
+        }
+    }
+
+    let dir = tmp();
+    let call = tool_call_sse("mcp__img__gen", json!({}));
+    let port = spawn_sse_sequence(vec![call, FINAL_TEXT_SSE.to_string()]);
+    let client = reqwest::Client::builder().no_proxy().build().unwrap();
+    let base = format!("http://127.0.0.1:{port}");
+    let mut engine = AgentEngine::new(&dir.display().to_string(), "m", "", &[], &[], 0, 0);
+    engine.set_external_tools(std::sync::Arc::new(BigImgExt(png_b64)));
+    engine.set_model_reads_images(true);
+
+    let mut ui = CapturingUi::default();
+    run_session(
+        &mut engine,
+        &turn_ctx(&client, &base, &dir),
+        Some("draw".into()),
+        &mut ui,
+    )
+    .await;
+
+    let injected: Vec<&Value> = engine
+        .messages
+        .iter()
+        .filter(|m| m.get("aivo").and_then(|v| v.as_str()) == Some("tool_images"))
+        .collect();
+    assert_eq!(injected.len(), 1, "one image turn expected");
+    let url = injected[0]["content"][1]["image_url"]["url"]
+        .as_str()
+        .unwrap();
+    assert!(
+        url.starts_with("data:image/jpeg;base64,"),
+        "oversized png must be re-encoded, got prefix {:?}",
+        &url[..30.min(url.len())]
+    );
+    let sent = base64::engine::general_purpose::STANDARD
+        .decode(&url["data:image/jpeg;base64,".len()..])
+        .unwrap();
+    assert!(
+        sent.len() < png.len(),
+        "optimized image ({}) must be smaller than the original ({})",
+        sent.len(),
+        png.len()
+    );
+}
+
 /// Plan mode is read-only, and an MCP server's tools can write anything — so
 /// they leave the advertised set with the built-in mutators and a call is refused.
 #[tokio::test]
