@@ -68,7 +68,9 @@ fn assert_stream_matches(reply: &str, width: u16, step: usize) {
         attachments: vec![],
     });
     app.sending = true;
-    app.request_started_at = Some(Instant::now());
+    // No turn clock on purpose: the spinner re-reads `elapsed()` per render, so
+    // a second ticking over between the composed frame and the reference build
+    // would diverge on "(0s)" vs "(1s)" with every row identical.
     let mut terminal = Terminal::new(TestBackend::new(width, 30)).unwrap();
 
     let boundaries: Vec<usize> = reply
@@ -116,7 +118,7 @@ fn streamed_reply_with_reasoning_and_notice_matches() {
         attachments: vec![],
     });
     app.sending = true;
-    app.request_started_at = Some(Instant::now());
+    // No turn clock — see `assert_stream_matches`.
     app.thinking_enabled = true;
     let mut terminal = Terminal::new(TestBackend::new(60, 30)).unwrap();
 
@@ -157,7 +159,7 @@ fn shrunken_reply_resets_settled_sections() {
         attachments: vec![],
     });
     app.sending = true;
-    app.request_started_at = Some(Instant::now());
+    // No turn clock — see `assert_stream_matches`.
     let mut terminal = Terminal::new(TestBackend::new(60, 30)).unwrap();
 
     let long = corpus()[0];

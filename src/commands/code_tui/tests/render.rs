@@ -615,9 +615,11 @@ fn test_streaming_composed_render_matches_full_transcript() {
         reasoning_content: None,
         attachments: vec![],
     });
-    // Mid-stream: a partial reply (the volatile tail) + a notice, plus the spinner.
+    // Mid-stream: a partial reply (the volatile tail) + a notice, plus the
+    // spinner. No turn clock: the spinner re-reads `elapsed()` per render, so a
+    // second ticking over between the composed frame and the single-pass build
+    // would diverge on "(0s)" vs "(1s)" with every row identical.
     app.sending = true;
-    app.request_started_at = Some(Instant::now());
     app.pending_response =
         "Streaming this answer now, with another long line that should wrap across the pane."
             .to_string();
@@ -666,7 +668,7 @@ fn streaming_reply_cache_invalidates_on_change() {
         attachments: vec![],
     });
     app.sending = true;
-    app.request_started_at = Some(Instant::now());
+    // No turn clock — see `test_streaming_composed_render_matches_full_transcript`.
 
     let long = "Short reply that has now grown a good deal longer and wraps across the pane.";
     let states: [(&str, Option<&str>); 4] = [
