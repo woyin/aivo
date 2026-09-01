@@ -94,7 +94,7 @@ impl CopilotRouter {
             token_manager: Arc::new(CopilotTokenManager::new(self.config.github_token.clone())),
             expected_token: self.expected_token.clone(),
             usage: self.usage.clone(),
-            client: http_utils::router_http_client(),
+            client: http_utils::router_http_model_client(),
         };
         let handle = tokio::spawn(async move {
             http_utils::run_text_router(listener, Arc::new(state), handle_copilot_request).await

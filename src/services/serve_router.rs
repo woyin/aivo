@@ -15,7 +15,7 @@ use crate::services::anthropic_chat_request::{
 };
 use crate::services::anthropic_chat_response::{OpenAIToAnthropicConfig, UsageValueMode};
 use crate::services::copilot_auth::CopilotTokenManager;
-use crate::services::http_utils::{self, router_http_client_with_timeout};
+use crate::services::http_utils::{self, router_http_streaming_client};
 use crate::services::log_store::{LogEvent, LogStore};
 use crate::services::model_catalog::fetch_models;
 use crate::services::model_list_response;
@@ -426,7 +426,7 @@ impl ServeRouter {
 
         let state = Arc::new(ServeState {
             config: Arc::new(self.config),
-            client: router_http_client_with_timeout(timeout),
+            client: router_http_streaming_client(timeout),
             key: self.key,
             copilot_tokens,
             grok_tokens,

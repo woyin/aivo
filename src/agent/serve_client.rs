@@ -1,25 +1,19 @@
-//! Client → loopback serve: the `Complete` handler. Streams an OpenAI chat
-//! completion and assembles the assistant message (content + tool_calls). This
-//! is the client's sole provider I/O — serve translates to the real upstream,
-//! so this only ever speaks OpenAI chat. `on_delta` fires per content/reasoning
-//! delta for live rendering.
+//! The client's sole provider I/O: streams an OpenAI chat completion from the
+//! loopback serve and assembles the assistant message.
 
 use crate::agent::protocol::{AssistantMessage, ChatRequest, ToolCall};
 use crate::services::tool_call_accumulator::{StreamedToolCall, accumulate_tool_call_deltas};
 use futures::StreamExt;
 use serde_json::{Value, json};
 
-/// A streamed delta handed to the caller's render callback: the visible answer
-/// text, or the model's reasoning/thinking (DeepSeek `reasoning_content`, the
-/// generic `reasoning`, or an Anthropic-style `thinking` field). One callback so
-/// the caller can keep a single "anything streamed yet?" flag.
+/// One render callback for both kinds so the caller can keep a single
+/// "anything streamed yet?" flag.
 pub enum StreamDelta<'a> {
     Text(&'a str),
     Reasoning(&'a str),
 }
 
-/// A failed provider call. The status and `Retry-After` let the engine decide
-/// retryability from the code (not prose) and honor the server's backoff.
+/// A failed provider call; status + `Retry-After` drive the engine's retry decisions.
 #[derive(Debug)]
 pub struct ServeError {
     pub message: String,
@@ -51,8 +45,7 @@ pub async fn complete(
     base_url: &str,
     auth_token: Option<&str>,
     request: &ChatRequest,
-    // `+ Send` so the chat TUI can run the engine (and this call) on a spawned task.
-    // Fires per content/reasoning delta for live rendering.
+    // `+ Send` so the chat TUI can run this on a spawned task.
     on_delta: &mut (dyn FnMut(StreamDelta) + Send),
 ) -> Result<AssistantMessage, ServeError> {
     let url = format!("{}/v1/chat/completions", base_url.trim_end_matches('/'));
@@ -65,8 +58,7 @@ pub async fn complete(
         body["tools"] = Value::Array(request.tools.clone());
     }
     if let Value::Object(map) = &mut body {
-        // Pass-through extras (temperature, tool_choice, …) without clobbering
-        // the fields we set above.
+        // Extras must not clobber the fields set above.
         for (k, v) in &request.extra {
             map.entry(k.clone()).or_insert_with(|| v.clone());
         }
@@ -102,23 +94,20 @@ pub async fn complete(
     let mut usage: Option<Value> = None;
     let mut model: Option<String> = None;
     let mut images: Vec<String> = Vec::new();
-    // Accumulate raw BYTES, not lossily-decoded chunks: a multi-byte char (CJK,
-    // emoji) can straddle a chunk boundary, and decoding each chunk separately
-    // would turn each half into a replacement char. A `\n`-terminated line never
-    // splits a char, so we decode only complete lines.
+    // Decode only complete `\n`-terminated lines: a multi-byte char split
+    // across chunks must not become replacement chars.
     let mut buf: Vec<u8> = Vec::new();
     let mut done = false;
+    let mut saw_finish = false;
     let mut truncated = false;
     let mut stream = resp.bytes_stream();
 
     while let Some(chunk) = stream.next().await {
         let bytes = match chunk {
             Ok(b) => b,
-            // A mid-stream drop AFTER a text-only partial reply: keep what
-            // already streamed (the user saw it), flagged as truncated —
-            // matching the plain-chat sender. But if a tool call was
-            // mid-assembly its arguments may be truncated, so bail rather than
-            // risk executing a malformed call.
+            // Keep a text-only partial (the user saw it) flagged truncated,
+            // but bail if a tool call was mid-assembly — its arguments could
+            // be malformed.
             Err(_) if !content.is_empty() && tools.is_empty() => {
                 truncated = true;
                 break;
@@ -152,17 +141,19 @@ pub async fn complete(
             {
                 model = Some(m.to_string());
             }
-            // A `stream: true` request answered with one final non-delta chunk
-            // still carries its images under `message`.
+            // A buffered reply converted to one non-delta chunk keeps images under `message`.
             if let Some(imgs) = v.pointer("/choices/0/message/images") {
                 collect_image_urls(imgs, &mut images);
+            }
+            if v.pointer("/choices/0/finish_reason")
+                .is_some_and(|f| !f.is_null())
+            {
+                saw_finish = true;
             }
             let Some(delta) = v.pointer("/choices/0/delta") else {
                 continue;
             };
-            // Reasoning/thinking arrives on its own delta fields (no `content`).
-            // Stream it for live rendering but DON'T fold it into `content`: it's
-            // not part of the assistant's reply sent back on the next turn.
+            // Stream reasoning for display only — it's not part of the reply.
             if let Some(r) = delta
                 .get("reasoning_content")
                 .and_then(|x| x.as_str())
@@ -187,6 +178,18 @@ pub async fn complete(
         }
         if done {
             break;
+        }
+    }
+
+    // A clean EOF without `[DONE]`/finish_reason is an interrupted stream (an
+    // upstream drop forwarded by serve's pass-through) — mirror the Err arm.
+    if !done && !saw_finish {
+        if !content.is_empty() && tools.is_empty() {
+            truncated = true;
+        } else {
+            return Err(ServeError::transport(
+                "stream ended without [DONE] or finish_reason",
+            ));
         }
     }
 
@@ -218,9 +221,8 @@ pub async fn complete(
     })
 }
 
-/// OpenRouter-convention image outputs: entries are either `{image_url:{url}}`
-/// objects or bare data-URL strings. Deduped — a converted buffered response can
-/// carry the same image on both `delta.images` and `message.images`.
+/// OpenRouter-convention image outputs: `{image_url:{url}}` objects or bare
+/// data-URL strings; deduped across `delta.images` and `message.images`.
 fn collect_image_urls(node: &Value, out: &mut Vec<String>) {
     let Some(imgs) = node.as_array() else {
         return;
@@ -238,8 +240,8 @@ fn collect_image_urls(node: &Value, out: &mut Vec<String>) {
     }
 }
 
-/// Parse tool-call args; repair a truncated/malformed JSON string before falling
-/// back to `{}`. Read-only only — a repaired mutating call could run a wrong command.
+/// Repair truncated args for read-only tools only — a repaired mutating call
+/// could run a wrong command. Falls back to `{}`.
 fn repair_tool_arguments(name: &str, raw: &str) -> Value {
     if let Ok(v) = serde_json::from_str::<Value>(raw) {
         return v;
@@ -297,9 +299,8 @@ fn close_truncated_json(raw: &str) -> Option<String> {
     Some(out)
 }
 
-/// Fold a streamed `usage` object into the running one by field-wise max, so a
-/// later partial chunk (e.g. an Anthropic-bridged final delta carrying only
-/// `output_tokens`) can't wipe an input count and collapse the footer's fill.
+/// Field-wise max fold: a partial final chunk (e.g. `output_tokens` only)
+/// can't wipe an input count.
 fn merge_usage(acc: &mut Option<Value>, incoming: &Value) {
     match acc {
         Some(existing) => merge_numeric_max(existing, incoming),
@@ -333,8 +334,7 @@ fn merge_numeric_max(acc: &mut Value, incoming: &Value) {
     }
 }
 
-/// Floor `total_tokens` to the input+output component sum (mirrors `usage_tokens`);
-/// never lowers a larger provider total, so its total-first shortcut can't understate.
+/// Floor `total_tokens` to the component sum; never lowers a larger provider total.
 fn floor_total_tokens(usage: &mut Value) {
     let Some(obj) = usage.as_object_mut() else {
         return;
@@ -452,8 +452,7 @@ data: [DONE]\n\n";
         );
     }
 
-    /// A chunk carrying `message` instead of `delta` — and the same image on
-    /// both, which must dedup to one.
+    /// The same image on both `message` and `delta` must dedup to one.
     #[tokio::test]
     async fn collects_message_images_from_a_non_delta_chunk() {
         let body = "data: {\"choices\":[{\"message\":{\"role\":\"assistant\",\"images\":[{\"image_url\":{\"url\":\"data:image/png;base64,aGk=\"}}]}}]}\n\n\
@@ -577,8 +576,7 @@ data: [DONE]\n\n";
         assert_eq!(usage["total_tokens"], 50_200);
     }
 
-    /// A multi-byte char split across two network chunks must be reassembled, not
-    /// turned into replacement chars (the bug when each chunk was decoded alone).
+    /// A multi-byte char split across chunks must not become replacement chars.
     #[tokio::test]
     async fn reassembles_multibyte_char_split_across_chunks() {
         let body = "data: {\"choices\":[{\"delta\":{\"content\":\"中文\"}}]}\n\ndata: [DONE]\n\n";
@@ -694,10 +692,8 @@ data: [DONE]\n\n";
         assert_eq!(err.status, Some(401));
     }
 
-    /// A mid-stream drop after a text-only partial reply keeps what streamed
-    /// (matching the plain-chat sender) instead of discarding it as an error.
-    /// The server claims a larger Content-Length than it sends, then closes —
-    /// so reqwest reports an incomplete body (a stream error), not a clean EOF.
+    /// A mid-stream drop keeps a text-only partial. Content-Length overshoot
+    /// makes reqwest report a stream error, not a clean EOF.
     #[tokio::test]
     async fn keeps_partial_text_on_midstream_error() {
         use std::io::{Read, Write};
@@ -744,5 +740,66 @@ data: [DONE]\n\n";
             msg.truncated,
             "a kept partial must be flagged so it can't pass for a complete answer"
         );
+    }
+
+    /// Clean EOF without `[DONE]`/finish_reason must flag the partial text.
+    #[tokio::test]
+    async fn clean_eof_without_done_flags_text_truncated() {
+        let body = "data: {\"choices\":[{\"delta\":{\"content\":\"half an ans\"}}]}\n\n";
+        let port = spawn_sse(body);
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let msg = complete(
+            &client,
+            &format!("http://127.0.0.1:{port}"),
+            None,
+            &req(),
+            &mut |_| {},
+        )
+        .await
+        .unwrap();
+        assert_eq!(msg.content.as_deref(), Some("half an ans"));
+        assert!(
+            msg.truncated,
+            "clean EOF without [DONE] must not pass for a complete answer"
+        );
+    }
+
+    /// Upstreams that end after `finish_reason` without `[DONE]` are complete.
+    #[tokio::test]
+    async fn clean_eof_with_finish_reason_is_complete() {
+        let body = "data: {\"choices\":[{\"delta\":{\"content\":\"full answer\"},\"finish_reason\":null}]}\n\n\
+data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n";
+        let port = spawn_sse(body);
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let msg = complete(
+            &client,
+            &format!("http://127.0.0.1:{port}"),
+            None,
+            &req(),
+            &mut |_| {},
+        )
+        .await
+        .unwrap();
+        assert_eq!(msg.content.as_deref(), Some("full answer"));
+        assert!(!msg.truncated, "finish_reason proves completion");
+    }
+
+    /// Clean EOF mid tool-call assembly must error, never execute.
+    #[tokio::test]
+    async fn clean_eof_without_done_mid_tool_call_errors() {
+        let body = "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"function\":{\"name\":\"run_bash\",\"arguments\":\"{\\\"command\\\":\\\"rm\"}}]}}]}\n\n";
+        let port = spawn_sse(body);
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let err = complete(
+            &client,
+            &format!("http://127.0.0.1:{port}"),
+            None,
+            &req(),
+            &mut |_| {},
+        )
+        .await
+        .unwrap_err();
+        assert!(err.status.is_none(), "a protocol drop is a transport error");
+        assert!(err.message.contains("without [DONE]"));
     }
 }

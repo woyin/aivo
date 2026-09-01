@@ -13,7 +13,7 @@ use crate::services::anthropic_chat_request::hoist_anthropic_system_messages;
 use crate::services::anthropic_route_pipeline::{RequestContext, RouterPipeline};
 use crate::services::device_fingerprint;
 use crate::services::http_debug::LoggedSend;
-use crate::services::http_utils::{self, router_http_client};
+use crate::services::http_utils::{self, router_http_model_client};
 use crate::services::token_usage::{
     StreamUsageSniffer, TokenUsage, UsageAccounting, parse_token_usage,
 };
@@ -115,7 +115,7 @@ impl AnthropicRouter {
             config: Arc::new(self.config.clone()),
             expected_token: self.expected_token.clone(),
             usage: self.usage.clone(),
-            client: router_http_client(),
+            client: router_http_model_client(),
             beta_header_rejected: Arc::new(AtomicBool::new(false)),
         };
         let handle = tokio::spawn(async move {

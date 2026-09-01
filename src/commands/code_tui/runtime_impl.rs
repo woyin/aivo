@@ -1142,7 +1142,7 @@ impl CodeTuiApp {
         };
         let model_reads_images = self.model_image_input == Some(true);
         self.response_task = Some(tokio::spawn(async move {
-            let client = crate::services::http_utils::router_http_client();
+            let client = crate::services::http_utils::router_http_model_client_loopback();
             let ctx = TurnCtx {
                 client: &client,
                 serve_base: &base,
@@ -1314,7 +1314,7 @@ impl CodeTuiApp {
 
         let tx = self.tx.clone();
         tokio::spawn(async move {
-            let client = crate::services::http_utils::router_http_client();
+            let client = crate::services::http_utils::router_http_model_client_loopback();
             let tx_delta = tx.clone();
             let mut sink = move |d: crate::agent::serve_client::StreamDelta| {
                 if let crate::agent::serve_client::StreamDelta::Text(t) = d {
@@ -1480,7 +1480,7 @@ impl CodeTuiApp {
         self.subagent_token_base = 0;
         self.compact_before = Some(before);
         self.response_task = Some(tokio::spawn(async move {
-            let client = crate::services::http_utils::router_http_client();
+            let client = crate::services::http_utils::router_http_model_client_loopback();
             let ctx = TurnCtx {
                 client: &client,
                 serve_base: &base,

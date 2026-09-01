@@ -159,7 +159,7 @@ impl GeminiRouter {
             config: Arc::new(self.config.clone()),
             expected_token: self.expected_token.clone(),
             usage: self.usage.clone(),
-            client: Arc::new(http_utils::router_http_client()),
+            client: Arc::new(http_utils::router_http_model_client()),
             route_cache: route_cache.clone(),
             learned_requires_reasoning: learned_requires_reasoning.clone(),
         };

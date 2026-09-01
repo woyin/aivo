@@ -294,7 +294,7 @@ impl ServeCommand {
         print_opt("--cors", "Enable CORS headers for browser-based clients");
         print_opt(
             "--timeout <SECS>",
-            "Upstream timeout in seconds (default: 300)",
+            "Upstream inactivity timeout in seconds (default: 300)",
         );
         print_opt(
             "--auth-token [TOKEN]",

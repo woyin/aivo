@@ -251,7 +251,7 @@ impl ResponsesToChatRouter {
         let learned_requires_reasoning = Arc::new(AtomicBool::new(false));
         let state = ResponsesToChatRouterState {
             config: Arc::new(self.config.clone()),
-            client: Arc::new(http_utils::router_http_client()),
+            client: Arc::new(http_utils::router_http_model_client()),
             route_cache: route_cache.clone(),
             learned_requires_reasoning: learned_requires_reasoning.clone(),
             usage: self.usage.clone(),

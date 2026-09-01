@@ -27,7 +27,7 @@ use crate::services::anthropic_route_pipeline::{
     inject_chat_completions_cache_control,
 };
 use crate::services::http_debug::LoggedSend;
-use crate::services::http_utils::{self, router_http_client};
+use crate::services::http_utils::{self, router_http_model_client};
 use crate::services::model_names::{
     infer_provider_name_from_model, is_gateway_style_endpoint, select_model_for_provider_attempt,
     strip_context_suffix,
@@ -296,7 +296,7 @@ impl AnthropicToOpenAIRouter {
             config: Arc::new(self.config.clone()),
             expected_token: self.expected_token.clone(),
             usage: self.usage.clone(),
-            client: router_http_client(),
+            client: router_http_model_client(),
             route_cache: route_cache.clone(),
             probe: ProbeState::new(),
             learned_requires_reasoning: learned_requires_reasoning.clone(),

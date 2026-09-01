@@ -443,8 +443,7 @@ async fn run_agent_captured(
         )
     };
 
-    // Loopback-only: bypass any env proxy, which can't reach the serve port (hangs).
-    let client = crate::services::http_utils::router_http_client_loopback();
+    let client = crate::services::http_utils::router_http_model_client_loopback();
     let ctx = TurnCtx {
         client: &client,
         serve_base: &base,

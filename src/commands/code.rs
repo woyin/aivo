@@ -583,7 +583,7 @@ impl CodeCommand {
             return Ok(ExitCode::AuthError);
         }
 
-        let client = crate::services::http_utils::router_http_client();
+        let client = crate::services::http_utils::router_http_model_client();
         // `aivo code` always runs in an isolated sandbox dir so backends
         // that accept a `cwd` (cursor ACP today) can't auto-pull
         // surrounding project files into the conversation. Chat is a

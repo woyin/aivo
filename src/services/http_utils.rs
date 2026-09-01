@@ -960,8 +960,7 @@ fn force_ipv4_with(env: Option<&str>) -> bool {
     matches!(env.map(str::trim), Some("1" | "true" | "yes" | "on"))
 }
 
-/// Creates a `reqwest::Client` with a configurable overall timeout.
-/// If `secs` is 0, no overall timeout is applied.
+/// Overall-timeout client (0 = none) — for bounded request/response calls.
 pub fn router_http_client_with_timeout(secs: u64) -> reqwest::Client {
     let mut builder = aivo_http_client_builder()
         .connect_timeout(std::time::Duration::from_secs(30))
@@ -973,15 +972,13 @@ pub fn router_http_client_with_timeout(secs: u64) -> reqwest::Client {
     builder.build().unwrap_or_else(|_| reqwest::Client::new())
 }
 
-/// Creates a `reqwest::Client` with connection pooling for router use.
-/// Enables keep-alive for connection reuse across requests.
+/// Pooled keep-alive client with a 300 s overall timeout.
 pub fn router_http_client() -> reqwest::Client {
     router_http_client_with_timeout(300)
 }
 
-/// The HTTP proxy env vars (both casings) that child processes honor. Callers
-/// clear or unset these when the child must talk to an aivo loopback and its
-/// HTTP stack ignores `NO_PROXY` (Node grok client, gemini's undici agent).
+/// Cleared/unset when a child must reach an aivo loopback but its HTTP stack
+/// ignores `NO_PROXY` (Node grok client, gemini's undici agent).
 pub(crate) const PROXY_ENV_VARS: &[&str; 6] = &[
     "HTTP_PROXY",
     "http_proxy",
@@ -991,9 +988,8 @@ pub(crate) const PROXY_ENV_VARS: &[&str; 6] = &[
     "all_proxy",
 ];
 
-/// Like [`router_http_client`] but never routes through an env proxy — for the
-/// in-process loopback serve (`127.0.0.1`), which an `http_proxy`/`ALL_PROXY` set
-/// for external traffic can't reach (the request would hang).
+/// [`router_http_client`] minus env proxies, which can't reach the in-process
+/// loopback serve (the request would hang).
 pub fn router_http_client_loopback() -> reqwest::Client {
     aivo_http_client_builder()
         .no_proxy()
@@ -1005,21 +1001,38 @@ pub fn router_http_client_loopback() -> reqwest::Client {
         .unwrap_or_else(|_| reqwest::Client::new())
 }
 
-/// Per-read inactivity timeout, no overall budget — for multi-GB body streams.
+/// Per-read inactivity timeout (0 = none), no overall budget — for multi-GB body streams.
 pub fn router_http_streaming_client(read_timeout_secs: u64) -> reqwest::Client {
     streaming_client_builder(read_timeout_secs)
         .build()
         .unwrap_or_else(|_| reqwest::Client::new())
 }
 
-/// Timeout config shared with the regression test: per-read timeout, NO
-/// overall `.timeout()`.
+const MODEL_STREAM_READ_TIMEOUT_SECS: u64 = 300;
+
+/// Model-call client: bounds silence between reads, never total duration.
+pub fn router_http_model_client() -> reqwest::Client {
+    router_http_streaming_client(MODEL_STREAM_READ_TIMEOUT_SECS)
+}
+
+/// [`router_http_model_client`] minus env proxies, for the in-process loopback serve.
+pub fn router_http_model_client_loopback() -> reqwest::Client {
+    streaming_client_builder(MODEL_STREAM_READ_TIMEOUT_SECS)
+        .no_proxy()
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new())
+}
+
+/// Shared with the regression test: per-read timeout (0 = none), NO overall `.timeout()`.
 fn streaming_client_builder(read_timeout_secs: u64) -> reqwest::ClientBuilder {
-    aivo_http_client_builder()
+    let mut builder = aivo_http_client_builder()
         .connect_timeout(std::time::Duration::from_secs(30))
-        .read_timeout(std::time::Duration::from_secs(read_timeout_secs))
         .pool_max_idle_per_host(10)
-        .tcp_keepalive(std::time::Duration::from_secs(60))
+        .tcp_keepalive(std::time::Duration::from_secs(60));
+    if read_timeout_secs > 0 {
+        builder = builder.read_timeout(std::time::Duration::from_secs(read_timeout_secs));
+    }
+    builder
 }
 
 /// Detects `X-Initiator` value from an Anthropic Messages API body.
