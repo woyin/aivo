@@ -8,8 +8,8 @@ use crate::agent::engine::{AgentEngine, AgentUi, DEFAULT_CONTEXT_WINDOW, TurnCtx
 use crate::agent::notes::Note;
 use crate::agent::plan;
 use crate::agent::protocol::ChatRequest;
-use crate::agent::request::{role, serialize_transcript, truncate_str};
-use crate::agent::retry::parse_overflow_actual;
+use crate::agent::request::{role, serialize_transcript_bounded, truncate_str};
+use crate::agent::retry::{is_context_overflow_error, parse_overflow_actual};
 use crate::agent::serve_client;
 use crate::agent::tokens::{
     CALIBRATION_MIN_SAMPLE, MAX_CALIBRATION, calibration_ratio, estimate_str_tokens,
@@ -66,6 +66,18 @@ const SNIP_MIN_RECLAIM: usize = 5_000;
 const MIN_SUMMARY_CHARS: usize = 120;
 /// The degeneracy floor applies only above this transcript size.
 const DEGENERATE_TRANSCRIPT_FLOOR: usize = 2_000;
+/// Summary output cap; also its input-budget reserve (window-capped).
+const SUMMARY_MAX_TOKENS: usize = 8_000;
+/// Transcript ceiling (est tokens) — near-window requests on 1M windows are all cost.
+const SUMMARY_INPUT_MAX_TOKENS: usize = 128_000;
+/// Past this (est tokens), the update prompt demands no growth — updated
+/// summaries otherwise append monotonically until compaction reclaims nothing.
+const SUMMARY_SOFT_CAP_TOKENS: usize = 2_000;
+/// Backstop for providers that ignore `max_tokens`.
+const SUMMARY_MAX_CHARS: usize = 40_000;
+const SUMMARY_LENGTH_GUIDANCE: &str = "\n\nIMPORTANT: The current summary is at its length limit. \
+Keep the updated summary NO LONGER than the current one: condense or drop the least important \
+details while preserving goals, decisions, file paths, unresolved work, and the latest state.";
 
 impl AgentEngine {
     /// The window `maybe_compact` budgets against: the real one, or [`DEFAULT_CONTEXT_WINDOW`] if unknown (0).
@@ -216,12 +228,13 @@ impl AgentEngine {
         if cut <= 1 {
             return 0;
         }
-        let transcript = self.summary_transcript(cut);
-        let transcript_len = transcript.len();
-        let request = self.build_summary_request(&transcript);
         ui.notify("compacting context…");
+        let mut transcript_budget = self.summary_transcript_budget();
         let mut usage = 0;
         for attempt in 0..2 {
+            let transcript = self.summary_transcript(cut, transcript_budget);
+            let transcript_len = transcript.len();
+            let request = self.build_summary_request(&transcript);
             let m = match serve_client::complete(
                 ctx.client,
                 ctx.serve_base,
@@ -232,8 +245,16 @@ impl AgentEngine {
             .await
             {
                 Ok(m) => m,
-                Err(_) => {
-                    // Don't re-send an overflowed request (not retryable → bricks the turn); drop mechanically.
+                Err(e) => {
+                    // An overflowed request must shrink before a retry; other errors
+                    // get one identical shot before history degrades to the fold.
+                    if attempt == 0 {
+                        if is_context_overflow_error(&e.message) {
+                            transcript_budget /= 4;
+                        }
+                        ui.notify("compaction summary failed — retrying");
+                        continue;
+                    }
                     ui.notify("compaction summary unavailable — trimming older context");
                     self.fold_mechanical(cut);
                     return usage;
@@ -249,7 +270,7 @@ impl AgentEngine {
                 self.fold_mechanical(cut);
             } else {
                 // Carry forward so the next compaction updates it in place (anti-drift).
-                let summary = neutralize_summary(&summary);
+                let summary = truncate_str(&neutralize_summary(&summary), SUMMARY_MAX_CHARS);
                 self.apply_compaction(cut, &summary);
                 self.last_summary = Some(summary);
             }
@@ -258,12 +279,32 @@ impl AgentEngine {
         usage
     }
 
+    /// Window-capped like [`Self::compact_reserve`] — a flat 8k eats small local windows.
+    fn summary_response_reserve(&self) -> usize {
+        SUMMARY_MAX_TOKENS.min(self.compaction_window() * RESERVE_MAX_WINDOW_PCT / 100)
+    }
+
+    /// Transcript budget: (window − reserve) / calibration − prompt scaffolding, capped.
+    fn summary_transcript_budget(&self) -> usize {
+        let scaffold = match &self.last_summary {
+            Some(prev) => {
+                estimate_str_tokens(SUMMARY_UPDATE_SYSTEM_PROMPT) + estimate_str_tokens(prev)
+            }
+            None => estimate_str_tokens(SUMMARY_SYSTEM_PROMPT),
+        };
+        let real = self
+            .compaction_window()
+            .saturating_sub(self.summary_response_reserve());
+        let est = ((real as f64) / self.token_calibration).floor() as usize;
+        est.saturating_sub(scaffold).min(SUMMARY_INPUT_MAX_TOKENS)
+    }
+
     /// Snip-restored + description-substituted — a description beats a bare
     /// `[image]` even on a vision model (cache hits only).
-    fn summary_transcript(&self, cut: usize) -> String {
+    fn summary_transcript(&self, cut: usize, max_tokens: usize) -> String {
         let mut range = self.restore_snipped_range(cut);
         super::engine::substitute_image_parts(&mut range, &self.image_descriptions);
-        serialize_transcript(&range)
+        serialize_transcript_bounded(&range, max_tokens)
     }
 
     /// Shared degenerate/error fallback.
@@ -583,14 +624,24 @@ impl AgentEngine {
     /// Never folded into `self.messages`, so it can't affect role alternation.
     pub(crate) fn build_summary_request(&self, transcript: &str) -> ChatRequest {
         let (system, user) = match &self.last_summary {
-            Some(prev) => (
-                SUMMARY_UPDATE_SYSTEM_PROMPT,
-                format!(
-                    "## Current running summary\n{prev}\n\n## New events since then\n{transcript}"
-                ),
-            ),
-            None => (SUMMARY_SYSTEM_PROMPT, transcript.to_string()),
+            Some(prev) => {
+                let cap = if estimate_str_tokens(prev) > SUMMARY_SOFT_CAP_TOKENS {
+                    SUMMARY_LENGTH_GUIDANCE
+                } else {
+                    ""
+                };
+                (
+                    format!("{SUMMARY_UPDATE_SYSTEM_PROMPT}{cap}"),
+                    format!(
+                        "## Current running summary\n{prev}\n\n## New events since then\n{transcript}"
+                    ),
+                )
+            }
+            None => (SUMMARY_SYSTEM_PROMPT.to_string(), transcript.to_string()),
         };
+        // serve renames to `max_completion_tokens` where models require it
+        let mut extra = Map::new();
+        extra.insert("max_tokens".into(), json!(self.summary_response_reserve()));
         ChatRequest {
             model: self.model.clone(),
             messages: vec![
@@ -598,7 +649,7 @@ impl AgentEngine {
                 json!({"role": "user", "content": user}),
             ],
             tools: vec![],
-            extra: Map::new(),
+            extra,
         }
     }
 
@@ -1340,6 +1391,54 @@ mod tests {
         assert!(s.contains("summarization unavailable"), "{s}");
     }
 
+    fn summary_system(e: &AgentEngine) -> String {
+        e.build_summary_request("t").messages[0]["content"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    }
+
+    #[test]
+    fn summary_request_caps_output_and_soft_caps_the_carry_forward() {
+        let mut e = engine();
+        assert_eq!(
+            e.build_summary_request("t").extra["max_tokens"],
+            json!(SUMMARY_MAX_TOKENS)
+        );
+        assert!(!summary_system(&e).contains("NO LONGER"));
+        e.last_summary = Some("short".into());
+        assert!(!summary_system(&e).contains("NO LONGER"));
+        e.last_summary = Some("word ".repeat(4 * SUMMARY_SOFT_CAP_TOKENS));
+        assert!(summary_system(&e).contains("NO LONGER"));
+    }
+
+    #[test]
+    fn summary_transcript_budget_reserves_response_scaffold_and_caps() {
+        let mut e = engine();
+        e.context_window = 20_000;
+        let base = e.summary_transcript_budget();
+        // 20k − 30%-capped reserve (6k) − small system prompt estimate
+        assert!(base > 13_000 && base < 14_000, "{base}");
+
+        e.last_summary = Some("word ".repeat(6_000)); // ≈6k est tokens
+        let with_prev = e.summary_transcript_budget();
+        assert!(with_prev < base - 5_000, "{with_prev} vs {base}");
+
+        e.context_window = 2_000_000;
+        assert_eq!(e.summary_transcript_budget(), SUMMARY_INPUT_MAX_TOKENS);
+    }
+
+    #[test]
+    fn summary_budget_survives_small_local_windows() {
+        let mut e = engine();
+        e.context_window = 8_000;
+        assert_eq!(
+            e.build_summary_request("t").extra["max_tokens"],
+            json!(2_400)
+        );
+        assert!(e.summary_transcript_budget() > 4_000);
+    }
+
     #[test]
     fn force_fit_fold_carries_running_summary_forward() {
         let mut e = engine();
@@ -1699,14 +1798,14 @@ mod tests {
             json!({"role":"assistant","content":"a button"}),
             json!({"role":"user","content":"recent"}),
         ];
-        let bare = e.summary_transcript(3);
+        let bare = e.summary_transcript(3, usize::MAX);
         assert!(bare.contains("[image]"), "miss stays a marker: {bare}");
 
         e.insert_image_description(
             crate::services::vision_describe::image_hash("aGVsbG8="),
             "[Image] a red Submit button".to_string(),
         );
-        let described = e.summary_transcript(3);
+        let described = e.summary_transcript(3, usize::MAX);
         assert!(
             described.contains("a red Submit button") && !described.contains("[image]"),
             "cached description must ride the summary transcript: {described}"
