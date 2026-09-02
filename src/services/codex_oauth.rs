@@ -507,6 +507,14 @@ pub fn generate_session_id() -> String {
     )
 }
 
+/// One id per process for the `session_id` header and `prompt_cache_key`: the
+/// backend routes by them for cache affinity, so a fresh id per request scatters
+/// one conversation across shards (Codex CLI keeps one per thread).
+pub fn process_session_id() -> &'static str {
+    static ID: std::sync::LazyLock<String> = std::sync::LazyLock::new(generate_session_id);
+    &ID
+}
+
 /// Model ids for a ChatGPT-account Codex credential. The backend has no
 /// `/v1/models` catalog, so read codex's own discovered cache, else fall back.
 pub fn known_model_ids() -> Vec<String> {
@@ -748,6 +756,14 @@ mod tests {
         assert_eq!(parts[2].as_bytes()[0], b'4');
         assert!(matches!(parts[3].as_bytes()[0], b'8' | b'9' | b'a' | b'b'));
         assert_ne!(generate_session_id(), generate_session_id());
+    }
+
+    #[test]
+    fn process_session_id_is_stable_and_uuid_shaped() {
+        let id = process_session_id();
+        assert_eq!(id, process_session_id());
+        assert_eq!(id.split('-').count(), 5);
+        assert!(id.chars().all(|c| c.is_ascii_hexdigit() || c == '-'));
     }
 
     #[test]

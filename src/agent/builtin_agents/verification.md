@@ -2,6 +2,7 @@
 name: verification
 description: Adversarially verify a change actually works — run the real commands, observe the output, and return a PASS or FAIL verdict backed by evidence.
 tools: [read_file, grep, glob, list_dir, run_bash]
+effort: medium
 ---
 
 # Verification

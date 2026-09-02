@@ -93,8 +93,10 @@ impl AgentEngine {
     /// `subagent`, same cwd + serve, optionally a stronger model), run to convergence,
     /// return its answer. Capturing UI (only the result surfaces). Dangerous ops inherit
     /// the parent's auto-approve, else fail closed (no nested prompt).
-    /// Run one sub-agent to completion and hand back `(result, tokens)` — tokens
-    /// even on `Err`, they were spent. `parent_ui` `Some` streams its activity to
+    /// Run one sub-agent to completion and hand back `(result, tokens, usage)` —
+    /// `tokens` is the prompt+completion total the status feed shows, `usage` the
+    /// measured split the caller folds in; both even on `Err`, they were spent.
+    /// `parent_ui` `Some` streams its activity to
     /// the parent (the lone-sub-agent path); `None` buffers silently, so several
     /// can run concurrently without sharing the UI. `require_isolation` (parallel
     /// batches): a delegate that asked for a worktree fails instead of falling
@@ -109,7 +111,7 @@ impl AgentEngine {
         args: &Value,
         require_isolation: bool,
         budget_share: usize,
-    ) -> (Result<String, String>, u64) {
+    ) -> (Result<String, String>, u64, SessionTokens) {
         // Fallback keys are Claude Code's names, so a Task-vocabulary call still delegates.
         let str_arg = |keys: &[&str]| {
             keys.iter().find_map(|k| {
@@ -124,7 +126,7 @@ impl AgentEngine {
             if let Some((s, slot)) = &sink {
                 s.done(*slot, false, 0, 0);
             }
-            (Err(e), 0u64)
+            (Err(e), 0u64, SessionTokens::default())
         };
         let Some(task) = str_arg(&["task", "prompt"]) else {
             return fail_early("subagent: missing `task`".to_string());
@@ -144,12 +146,32 @@ impl AgentEngine {
             .unwrap_or(&self.model);
 
         // Isolation: explicit arg wins, else the profile's flag; unavailable falls
-        // back to the shared workspace with a note.
-        let isolate = args.get("isolation").and_then(|v| v.as_str()) == Some("worktree")
+        // back to the shared workspace with a note. An edit-less profile never gets
+        // one — a worktree snapshots HEAD, hiding the uncommitted work a review reads.
+        let wants_worktree = args.get("isolation").and_then(|v| v.as_str()) == Some("worktree")
             || profile.as_ref().is_some_and(|p| p.isolation_worktree);
+        let edit_less = profile
+            .as_ref()
+            .and_then(|p| p.resolved_tools())
+            .is_some_and(|allowed| {
+                !allowed.iter().any(|t| {
+                    matches!(
+                        *t,
+                        "edit_file" | "multi_edit" | "apply_patch" | "write_file"
+                    )
+                })
+            });
+        let isolate = wants_worktree && !edit_less;
         let mut guard: Option<subagents::WorktreeGuard> = None;
         let mut sub_cwd: PathBuf = ctx.cwd.to_path_buf();
         let mut isolation_note: Option<String> = None;
+        if wants_worktree && edit_less {
+            isolation_note = Some(
+                "\n\n[worktree isolation] not applied: this profile has no file-editing tools, and a \
+worktree would hide the workspace's uncommitted changes; ran in the shared workspace."
+                    .to_string(),
+            );
+        }
         if isolate {
             match subagents::create_worktree(ctx.cwd) {
                 Ok(wt) => {
@@ -283,8 +305,11 @@ Fix the repo state or run it alone."
             ask_exit: None,
             ask_enter: None,
         };
+        let started = Instant::now();
         // Box the recursive future (run_turn → subagent → run_turn) so it isn't infinitely-sized.
         Box::pin(sub.run_turn(&sub_ctx, &mut ui, task.to_string())).await;
+        ui.elapsed_secs = started.elapsed().as_secs();
+        let split = sub.take_turn_usage();
         // An early stop fails the run even with text — the report may be partial.
         // So does a self-reported blocked/needs_user finish (there's no user here).
         let finish_not_done = ui
@@ -338,14 +363,22 @@ it to inherit yours."
         }
         // No answer = failed delegation — Err, never a green success.
         if failed {
-            return (Err(msg), ui.tokens);
+            return (Err(msg), ui.tokens, split);
         }
         // Gate on the STORED length (not the bare answer) so the tail can't push it over
         // the clear threshold and get cleared without a pointer.
         if let Some(dir) = &self.artifacts_dir
             && msg.len() > crate::agent::compaction::TOOL_RESULT_CLEAR_MIN
             && let Some(path) = self
-                .save_subagent_report(dir, task, &ui.agent_name, model, ui.steps, ui.answer())
+                .save_subagent_report(
+                    dir,
+                    task,
+                    &ui.agent_name,
+                    model,
+                    ui.steps,
+                    ui.elapsed_secs,
+                    ui.answer(),
+                )
                 .await
         {
             msg.push_str(&format!(
@@ -353,10 +386,11 @@ it to inherit yours."
                 path.display()
             ));
         }
-        (Ok(msg), ui.tokens)
+        (Ok(msg), ui.tokens, split)
     }
 
     /// Write a sub-agent report (`sub-<seq>-<slug>.md`); `None` on IO failure (never fails the turn).
+    #[allow(clippy::too_many_arguments)]
     pub(super) async fn save_subagent_report(
         &self,
         dir: &Path,
@@ -364,6 +398,7 @@ it to inherit yours."
         agent: &str,
         model: &str,
         steps: usize,
+        elapsed_secs: u64,
         answer: &str,
     ) -> Option<PathBuf> {
         tokio::fs::create_dir_all(dir).await.ok()?;
@@ -382,7 +417,8 @@ it to inherit yours."
             .take(200)
             .collect();
         let content = format!(
-            "# Sub-agent report\n- task: {task_line}\n- agent: {agent} · model: {model} · steps: {steps} · date: {}\n---\n{answer}\n",
+            "# Sub-agent report\n- task: {task_line}\n- agent: {agent} · model: {model} · steps: {steps} · took: {} · date: {}\n---\n{answer}\n",
+            format_elapsed(elapsed_secs),
             self.date
         );
         tokio::fs::write(&path, content).await.ok()?;
@@ -437,7 +473,7 @@ pub(super) fn subagent_tool_spec(subagents: &[Subagent]) -> ToolSpec {
         "task": {"type": "string", "description": "A complete, standalone instruction for the sub-agent."},
         "label": {"type": "string", "description": "Short name for this delegate (3–6 words), shown in the live progress UI — e.g. \"audit auth flow\"."},
         "model": {"type": "string", "description": "Optional model id to run the sub-agent on (default: the agent's configured model, else same as you)."},
-        "isolation": {"type": "string", "enum": ["worktree"], "description": "Optional: run the sub-agent in a disposable git worktree — an isolated snapshot of the last commit (uncommitted changes not included). Its edits stay there and the result tells you how to review/apply them. Use when a delegate will edit files, especially several delegates in parallel."}
+        "isolation": {"type": "string", "enum": ["worktree"], "description": "Optional: run the sub-agent in a disposable git worktree — an isolated snapshot of the last commit (uncommitted changes not included). Its edits stay there and the result tells you how to review/apply them. Use when a delegate will edit files, especially several delegates in parallel. Ignored for a specialist without file-editing tools (a review of uncommitted work needs the real workspace)."}
     });
     let mut description = "Delegate a self-contained subtask to a fresh sub-agent that has the same \
 file/shell tools and runs its own loop, then hands back its result. Use it to keep your own context \
@@ -510,6 +546,17 @@ pub(super) struct SubagentUi<'a> {
     pub(super) stop: Option<TurnStop>,
     /// The sub-run's accepted `finish_turn` report, if it ended with one.
     pub(super) finish: Option<crate::agent::finish::FinishReport>,
+    /// Wall time — in the result tail so the parent can weigh a re-run.
+    pub(super) elapsed_secs: u64,
+}
+
+/// `45s` / `18m 02s` / `1h 02m`.
+pub(super) fn format_elapsed(secs: u64) -> String {
+    match secs {
+        s if s < 60 => format!("{s}s"),
+        s if s < 3600 => format!("{}m {:02}s", s / 60, s % 60),
+        s => format!("{}h {:02}m", s / 3600, (s % 3600) / 60),
+    }
 }
 
 /// Streamed growth must move the estimate this much before it forwards again,
@@ -531,7 +578,12 @@ impl SubagentUi<'_> {
     pub(super) fn result_message(&self) -> String {
         let answer = self.answer();
         if !answer.is_empty() {
-            format!("{answer}\n\n[sub-agent: {} step(s)]", self.steps)
+            let took = if self.elapsed_secs > 0 {
+                format!(" in {}", format_elapsed(self.elapsed_secs))
+            } else {
+                String::new()
+            };
+            format!("{answer}\n\n[sub-agent: {} step(s){took}]", self.steps)
         } else if !self.last_notice.trim().is_empty() {
             format!(
                 "(sub-agent produced no answer — {})",

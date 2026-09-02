@@ -227,6 +227,108 @@ async fn subagent_worktree_isolation_keeps_parent_tree_clean() {
         .output();
 }
 
+/// A read-only specialist never gets a worktree even when the call asks: a worktree
+/// snapshots HEAD, so a review of uncommitted work would see nothing.
+#[tokio::test]
+async fn subagent_worktree_ignored_for_edit_less_profile() {
+    let dir = tmp();
+    let git = |args: &[&str]| {
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&dir)
+            .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "git {args:?} failed");
+    };
+    git(&["init", "-q"]);
+    std::fs::write(dir.join("a.txt"), "committed").unwrap();
+    git(&["add", "-A"]);
+    git(&["commit", "-qm", "init"]);
+    // What a HEAD snapshot would hide.
+    std::fs::write(dir.join("pending.txt"), "uncommitted").unwrap();
+
+    let parent_call = tool_call_sse(
+        "subagent",
+        json!({"task": "review it", "agent": "reviewer", "isolation": "worktree"}),
+    );
+    let sub_read = tool_call_sse("read_file", json!({"path": "pending.txt"}));
+    let port = spawn_sse_sequence(vec![
+        parent_call,
+        sub_read,
+        FINAL_TEXT_SSE.to_string(), // sub declares done
+        FINAL_TEXT_SSE.to_string(), // parent declares done
+    ]);
+    let client = reqwest::Client::builder().no_proxy().build().unwrap();
+    let base = format!("http://127.0.0.1:{port}");
+    let mut engine = AgentEngine::new(&dir.display().to_string(), "m", "", &[], &[], 0, 0);
+    engine.set_subagents(&[subagent(
+        "reviewer",
+        None,
+        Some(vec!["read_file", "grep", "glob", "list_dir"]),
+    )]);
+    let mut ui = CapturingUi::default();
+    run_session(
+        &mut engine,
+        &turn_ctx(&client, &base, &dir),
+        Some("review the pending change".into()),
+        &mut ui,
+    )
+    .await;
+
+    let results = tool_result_texts(&engine);
+    let note = results
+        .iter()
+        .find(|s| s.contains("[worktree isolation]"))
+        .expect("result must explain the suppression");
+    assert!(note.contains("no file-editing tools"), "{note}");
+    assert!(
+        results.iter().any(|s| s.contains("uncommitted")),
+        "delegate must see the working tree: {results:?}"
+    );
+    let worktrees = std::process::Command::new("git")
+        .arg("-C")
+        .arg(&dir)
+        .args(["worktree", "list"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        String::from_utf8_lossy(&worktrees.stdout).lines().count(),
+        1,
+        "no worktree should have been created"
+    );
+}
+
+#[test]
+fn format_elapsed_scales_by_magnitude() {
+    assert_eq!(format_elapsed(0), "0s");
+    assert_eq!(format_elapsed(45), "45s");
+    assert_eq!(format_elapsed(62), "1m 02s");
+    assert_eq!(format_elapsed(1082), "18m 02s");
+    assert_eq!(format_elapsed(3720), "1h 02m");
+}
+
+#[test]
+fn result_message_reports_elapsed_time() {
+    let mut ui = SubagentUi {
+        elapsed_secs: 1082,
+        steps: 14,
+        ..Default::default()
+    };
+    ui.assistant_text("VERDICT: APPROVE");
+    assert!(
+        ui.result_message()
+            .contains("[sub-agent: 14 step(s) in 18m 02s]"),
+        "got: {}",
+        ui.result_message()
+    );
+    // Unmeasured keeps the classic tail rather than printing "in 0s".
+    let mut fast = SubagentUi::default();
+    fast.assistant_text("done");
+    assert!(fast.result_message().ends_with("[sub-agent: 0 step(s)]"));
+}
+
 /// A delegate that converges with no answer surfaces as a FAILED tool result
 /// (red in the UI), not a green success wrapping "(no answer)".
 #[tokio::test]

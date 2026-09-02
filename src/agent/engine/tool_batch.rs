@@ -317,7 +317,7 @@ Investigate, or call `exit_plan_mode` with your plan."
             // worker set avoids buffer_unordered's Send bound on the sub-engine future.
             let cursor = std::sync::atomic::AtomicUsize::new(0);
             // Mutex (not RefCell): the turn future must stay Send; locked only between awaits.
-            type DelegateOutcome = (usize, Result<String, String>, u64);
+            type DelegateOutcome = (usize, Result<String, String>, u64, SessionTokens);
             let done: std::sync::Mutex<Vec<DelegateOutcome>> =
                 std::sync::Mutex::new(Vec::with_capacity(subagent_idx.len()));
             let workers = (0..SUBAGENT_PARALLEL_CAP.min(subagent_idx.len())).map(|_| {
@@ -330,7 +330,7 @@ Investigate, or call `exit_plan_mode` with your plan."
                             break;
                         };
                         let s = sink.clone().map(|s| (s, slot));
-                        let (res, toks) = this
+                        let (res, toks, split) = this
                             .run_subagent(
                                 ctx,
                                 None,
@@ -341,24 +341,25 @@ Investigate, or call `exit_plan_mode` with your plan."
                                 subagent_idx.len(),
                             )
                             .await;
-                        done.lock().unwrap().push((i, res, toks));
+                        done.lock().unwrap().push((i, res, toks, split));
                     }
                 }
             });
             futures::future::join_all(workers).await;
             let mut sub_tokens_total = 0u64;
-            for (i, res, toks) in done.into_inner().unwrap() {
+            let mut sub_usage = SessionTokens::default();
+            for (i, res, toks, split) in done.into_inner().unwrap() {
                 sub_tokens_total = sub_tokens_total.saturating_add(toks);
+                sub_usage = sub_usage.merge(split);
                 outcomes[i] = Some(res);
             }
             if let Some(s) = &sink {
                 s.finish();
             }
             extra_tokens = extra_tokens.saturating_add(sub_tokens_total);
-            self.turn_usage.completion_tokens = self
-                .turn_usage
-                .completion_tokens
-                .saturating_add(sub_tokens_total);
+            // The measured split, not the prompt+completion total: budgets, cost, and
+            // `aivo stats` all read `completion_tokens` as the turn's output.
+            self.turn_usage = self.turn_usage.merge(sub_usage);
             // Keep the status counter at the folded total after sink rows clear.
             ui.turn_tokens(self.turn_usage.completion_tokens);
             sequential_idx.retain(|i| !subagent_idx.contains(i));
@@ -394,12 +395,11 @@ Investigate, or call `exit_plan_mode` with your plan."
             } else if n == "subagent" {
                 // Fresh sub-engine on the same serve/cwd; tokens fold in even on failure.
                 let base = self.turn_usage.completion_tokens;
-                let (res, sub_tokens) = self
+                let (res, sub_tokens, split) = self
                     .run_subagent(ctx, Some(&mut *ui), None, base, &call.arguments, false, 1)
                     .await;
                 extra_tokens += sub_tokens;
-                self.turn_usage.completion_tokens =
-                    self.turn_usage.completion_tokens.saturating_add(sub_tokens);
+                self.turn_usage = self.turn_usage.merge(split);
                 res
             } else if n == "list_sessions" {
                 self.list_sessions_result()

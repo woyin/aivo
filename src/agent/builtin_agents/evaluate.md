@@ -2,6 +2,7 @@
 name: evaluate
 description: Code review of a change for correctness and quality, citing file:line and ending with a clear verdict, whenever a diff should be reviewed before it lands.
 tools: [read_file, grep, glob, list_dir, run_bash]
+effort: medium
 ---
 
 # Evaluate

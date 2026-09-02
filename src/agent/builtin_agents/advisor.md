@@ -2,6 +2,7 @@
 name: advisor
 description: Read-only analysis of a hard problem or design choice, returning a reasoned recommendation and the tradeoffs, when you want a second opinion before committing.
 tools: [read_file, grep, glob, list_dir]
+effort: medium
 ---
 
 # Advisor

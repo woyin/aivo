@@ -796,6 +796,12 @@ mod tests {
             vec!["read_file", "grep", "glob", "list_dir"]
         );
         assert_eq!(explorer.effort.as_deref(), Some("low"));
+        // Unpinned, a delegate inherits the parent's effort — xhigh reviews measured
+        // 15+ min each on a 27 tok/s backend.
+        for name in ["verification", "advisor", "evaluate"] {
+            let sa = builtins.iter().find(|s| s.name == name).unwrap();
+            assert_eq!(sa.effort.as_deref(), Some("medium"), "{name}");
+        }
 
         // A user file named `explorer` shadows the built-in outright.
         let dir = tempfile::tempdir().unwrap();
