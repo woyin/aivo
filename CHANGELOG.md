@@ -1,5 +1,20 @@
 # Changelog
 
+## v0.49.1
+
+Image-only models such as `gpt-image-2` and `imagen` are driven through the Images API, and oversized tool-produced images are shrunk before they enter the transcript. Model streams are no longer cut at 300 seconds, and a clean EOF that never sent `[DONE]` is reported as truncation instead of passing a half answer off as the final one. The compaction summary request is bounded on both sides, and the musl builds ship smaller.
+
+- feat(code): drive image-only models (gpt-image-2, imagen) via the Images API (8fea66b8)
+- improve(code): shrink oversized tool-produced images before they enter the transcript (4a627932)
+- improve(code): bound the compaction summary request on both sides (5345f879)
+- improve(code): widen self-verify entrypoint detection and surface the miss (c6b9c32e)
+- improve(build): drop dead unwind tables from the musl builds (#42) (7f6f78dd)
+- fix(code): stop cutting model streams at 300 s and catch clean-EOF truncation (bf095350)
+- fix(code): drop the removed remember tool from the system prompt (747a0189)
+- fix(test): stop the turn clock flaking the differential render tests (2efe022c)
+- refactor(run): split the code/run/models/serve arms of run() into dispatch fns (31f36c11)
+- chore(data): re-sync model limits from models.dev (2ada549b)
+
 ## v0.49.0
 
 Review mode is replaced by ask mode — a read-only session mode for understanding things (concepts, docs, this codebase, the web) instead of changing code. `/btw` answers side questions outside the conversation, the agent tools gain `switch_key`, and session resume preserves the explicit model and key. Model listing authentication errors propagate instead of being silently swallowed.
