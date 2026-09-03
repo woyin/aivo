@@ -1,5 +1,12 @@
 # Changelog
 
+## v0.49.2
+
+The streaming `/btw` panel is easier to read, and delegated agents now receive the correct thinking effort while their token usage is tracked accurately.
+
+- improve(code): make the /btw panel readable while it streams (c577f6ae)
+- fix(code): stop delegates inheriting xhigh, and count their tokens right (a663e361)
+
 ## v0.49.1
 
 Image-only models such as `gpt-image-2` and `imagen` are driven through the Images API, and oversized tool-produced images are shrunk before they enter the transcript. Model streams are no longer cut at 300 seconds, and a clean EOF that never sent `[DONE]` is reported as truncation instead of passing a half answer off as the final one. The compaction summary request is bounded on both sides, and the musl builds ship smaller.
