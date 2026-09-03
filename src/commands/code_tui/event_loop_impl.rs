@@ -260,6 +260,7 @@ impl CodeTuiApp {
                         if exchange.answer.is_empty() && exchange.error.is_none() {
                             exchange.error = Some("the model returned no text".to_string());
                         }
+                        exchange.streaming = false;
                     }
                     self.stop_btw_serve();
                 }
@@ -3306,8 +3307,9 @@ impl CodeTuiApp {
             (Overlay::Session { .. }, _) => Ok(Some(false)),
             (Overlay::Btw { .. }, MouseEventKind::ScrollUp | MouseEventKind::ScrollDown) => {
                 let up = matches!(mouse.kind, MouseEventKind::ScrollUp);
-                if let Overlay::Btw { scroll } = &mut self.overlay {
+                if let Overlay::Btw { scroll, follow } = &mut self.overlay {
                     *scroll = wheel_scroll(*scroll, up);
+                    *follow &= !up;
                 }
                 Ok(Some(false))
             }
@@ -3466,11 +3468,14 @@ impl CodeTuiApp {
             Overlay::McpTools(s) => s.list_scroll = start,
             Overlay::McpPaste(s) => s.list_scroll = start,
             Overlay::Config(s) => s.list_scroll = start,
+            Overlay::Btw { scroll, follow } => {
+                *scroll = start.min(usize::from(u16::MAX)) as u16;
+                *follow = false;
+            }
             Overlay::Help { scroll }
             | Overlay::Context { scroll, .. }
             | Overlay::Session { scroll }
-            | Overlay::Share { scroll }
-            | Overlay::Btw { scroll } => *scroll = start.min(usize::from(u16::MAX)) as u16,
+            | Overlay::Share { scroll } => *scroll = start.min(usize::from(u16::MAX)) as u16,
             _ => {}
         }
     }

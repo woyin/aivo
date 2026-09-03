@@ -1261,6 +1261,23 @@ impl CodeTuiApp {
         self.stop_btw_serve();
     }
 
+    /// `c` in the `/btw` panel — `/copy` can't reach an off-transcript answer.
+    pub(super) fn copy_btw_answer(&mut self) {
+        let answer = self
+            .btw
+            .as_ref()
+            .map(|exchange| exchange.answer.trim().to_string())
+            .filter(|answer| !answer.is_empty());
+        let Some(answer) = answer else { return };
+        #[cfg(not(test))]
+        let copied = write_system_clipboard(&answer).is_ok();
+        #[cfg(test)]
+        let copied = !answer.is_empty();
+        if copied {
+            self.show_toast("Side answer copied to clipboard");
+        }
+    }
+
     /// `/btw <question>`: answer a side question in an isolated one-off
     /// completion. Runs mid-turn too — its own serve, and it touches neither the
     /// engine nor the transcript.
@@ -1270,7 +1287,10 @@ impl CodeTuiApp {
             .filter(|q| !q.is_empty());
         let Some(question) = question else {
             if self.btw.is_some() {
-                self.overlay = Overlay::Btw { scroll: 0 };
+                self.overlay = Overlay::Btw {
+                    scroll: 0,
+                    follow: true,
+                };
             } else {
                 self.notice = Some((
                     MUTED(),
@@ -1308,9 +1328,13 @@ impl CodeTuiApp {
         self.btw = Some(BtwExchange {
             question,
             answer: String::new(),
+            streaming: true,
             error: None,
         });
-        self.overlay = Overlay::Btw { scroll: 0 };
+        self.overlay = Overlay::Btw {
+            scroll: 0,
+            follow: true,
+        };
 
         let tx = self.tx.clone();
         tokio::spawn(async move {

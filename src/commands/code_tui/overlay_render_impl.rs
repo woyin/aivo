@@ -681,22 +681,15 @@ impl CodeTuiApp {
         render_detail_lines(frame, inner, lines, scroll)
     }
 
-    /// `/btw` panel: the side question and its (possibly still-streaming) answer.
-    pub(super) fn render_btw_overlay(
-        &self,
-        frame: &mut Frame<'_>,
-        area: Rect,
-        scroll: u16,
-    ) -> (u16, Option<ScrollbarHit>) {
-        let inner = overlay_shell(frame, area, "Btw", Some(("Esc".to_string(), MUTED())));
-        let width = usize::from(inner.width).max(1);
+    /// The `/btw` panel's body — built before the box so the box can size to it.
+    fn btw_lines(&self, width: usize) -> Vec<Line<'static>> {
         let mut lines: Vec<Line> = Vec::new();
         let Some(exchange) = &self.btw else {
             lines.push(Line::from(Span::styled(
                 "no side question yet — /btw <question>",
                 Style::default().fg(MUTED()),
             )));
-            return render_detail_lines(frame, inner, lines, scroll);
+            return lines;
         };
         push_wrapped_text(
             &mut lines,
@@ -717,17 +710,62 @@ impl CodeTuiApp {
                 Style::default().fg(MUTED()),
             )));
         } else if !exchange.answer.is_empty() {
-            push_wrapped_text(
-                &mut lines,
-                &exchange.answer,
-                width,
-                Style::default().fg(TEXT()),
-            );
+            push_markdown_body(&mut lines, &exchange.answer, width);
         }
         if let Some(err) = &exchange.error {
             lines.push(Line::from(""));
             push_wrapped_text(&mut lines, err, width, Style::default().fg(ERROR()));
         }
+        lines
+    }
+
+    /// Size the box to the answer — a few lines in a full-height box are adrift
+    /// in void — returning the measured lines so the frame builds them once. The
+    /// top edge stays put: re-centering would slide a streaming answer up under
+    /// the reader's eye.
+    pub(super) fn btw_overlay_layout(&self, body: Rect) -> (Rect, Vec<Line<'static>>) {
+        let full = centered_rect(72, 88, body);
+        let width = full.width.min(BTW_MAX_WIDTH);
+        let text_width = usize::from(width.saturating_sub(OVERLAY_SHELL_CHROME_H)).max(1);
+        let lines = self.btw_lines(text_width);
+        let height = u16::try_from(lines.len())
+            .unwrap_or(u16::MAX)
+            .saturating_add(OVERLAY_SHELL_CHROME_V)
+            .min(full.height);
+        let area = Rect {
+            x: body.x + body.width.saturating_sub(width) / 2,
+            y: full.y,
+            width,
+            height,
+        };
+        (area, lines)
+    }
+
+    /// `/btw` panel: the side question and its (possibly still-streaming) answer.
+    pub(super) fn render_btw_overlay(
+        &self,
+        frame: &mut Frame<'_>,
+        area: Rect,
+        lines: Vec<Line<'static>>,
+        scroll: u16,
+        follow: bool,
+    ) -> (u16, Option<ScrollbarHit>) {
+        let badge = match &self.btw {
+            Some(exchange) if exchange.streaming => format!(
+                "{} answering · Esc",
+                spinner_frame_indexed(self.frame_tick, self.reduce_motion)
+            ),
+            Some(exchange) if !exchange.answer.trim().is_empty() => "c copy · Esc".to_string(),
+            _ => "Esc".to_string(),
+        };
+        let inner = overlay_shell(frame, area, "Btw", Some((badge, MUTED())));
+        // `u16::MAX` = the tail; `render_detail_lines` clamps it and writes it back.
+        let streaming = self.btw.as_ref().is_some_and(|e| e.streaming);
+        let scroll = if streaming && follow {
+            u16::MAX
+        } else {
+            scroll
+        };
         render_detail_lines(frame, inner, lines, scroll)
     }
 
@@ -2444,20 +2482,8 @@ impl CodeTuiApp {
                 Style::default().fg(FAINT()),
             )));
         } else {
-            // The body IS markdown — render it like the transcript, not dim raw lines.
             lines.push(Line::from(""));
-            let mut body_lines = render_markdown_lines(body, width as u16);
-            while body_lines
-                .first()
-                .is_some_and(|l| l.plain.trim().is_empty())
-            {
-                body_lines.remove(0);
-            }
-            for styled in body_lines {
-                for row in wrap_styled_line(&styled.line.spans, width) {
-                    lines.push(row.line);
-                }
-            }
+            push_markdown_body(&mut lines, body, width);
         }
         render_detail_lines(frame, area, lines, scroll).0
     }
@@ -2496,6 +2522,13 @@ struct ToggleListView<'a> {
     /// `(key, label)` hints rendered along the footer.
     footer: Vec<(&'a str, &'a str)>,
 }
+
+/// What [`overlay_shell`] spends on border + inner margin, both edges.
+const OVERLAY_SHELL_CHROME_V: u16 = 4;
+const OVERLAY_SHELL_CHROME_H: u16 = 6;
+
+/// Past ~90 text columns prose gets hard to track back to the next line.
+const BTW_MAX_WIDTH: u16 = 96;
 
 /// Draw the rounded modal frame with a bold title (left) and an optional
 /// status badge (right) on the top border, returning the padded inner rect.
@@ -2994,6 +3027,22 @@ fn footer_hints(hints: &[(&str, &str)]) -> Line<'static> {
         ));
     }
     Line::from(spans)
+}
+
+/// Push a markdown body in the transcript's styling, not dim raw lines.
+fn push_markdown_body(lines: &mut Vec<Line<'static>>, body: &str, width: usize) {
+    let mut body_lines = render_markdown_lines(body, width as u16);
+    while body_lines
+        .first()
+        .is_some_and(|l| l.plain.trim().is_empty())
+    {
+        body_lines.remove(0);
+    }
+    for styled in body_lines {
+        for row in wrap_styled_line(&styled.line.spans, width) {
+            lines.push(row.line);
+        }
+    }
 }
 
 /// Char-wrap `text` (multi-line; blank lines preserved) into styled lines.

@@ -25,6 +25,8 @@ impl CodeTuiApp {
             || self.drag_autoscroll.is_some()
             || self.selection_flash_until.is_some()
             || self.preview_pane_loading()
+            // The `/btw` call runs outside the turn, so `sending` misses it.
+            || self.btw.as_ref().is_some_and(|exchange| exchange.streaming)
     }
 
     /// Advance the welcome-screen tip once its interval elapses; returns `true`

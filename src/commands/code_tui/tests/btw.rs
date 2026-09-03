@@ -81,10 +81,17 @@ async fn test_bare_btw_reopens_last_exchange_or_hints() {
     app.btw = Some(BtwExchange {
         question: "q".to_string(),
         answer: "a".to_string(),
+        streaming: false,
         error: None,
     });
     app.run_btw_command(None).await;
-    assert!(matches!(app.overlay, Overlay::Btw { scroll: 0 }));
+    assert!(matches!(
+        app.overlay,
+        Overlay::Btw {
+            scroll: 0,
+            follow: true
+        }
+    ));
 }
 
 #[tokio::test]
@@ -96,6 +103,7 @@ async fn test_btw_stream_events_respect_seq_and_finish() {
     app.btw = Some(BtwExchange {
         question: "q".to_string(),
         answer: String::new(),
+        streaming: true,
         error: None,
     });
 
@@ -128,11 +136,13 @@ async fn test_btw_stream_events_respect_seq_and_finish() {
     let exchange = app.btw.as_ref().unwrap();
     assert_eq!(exchange.answer, "Hello there");
     assert!(exchange.error.is_none());
+    assert!(!exchange.streaming, "finish clears the streaming state");
 
     // A failed call with nothing streamed reads as an error, not a blank panel.
     app.btw = Some(BtwExchange {
         question: "q".to_string(),
         answer: String::new(),
+        streaming: true,
         error: None,
     });
     tx2.send(RuntimeEvent::BtwFinished {
@@ -154,13 +164,18 @@ fn test_btw_overlay_renders_question_answer_and_streaming_state() {
     app.btw = Some(BtwExchange {
         question: "what is a monad?".to_string(),
         answer: String::new(),
+        streaming: true,
         error: None,
     });
-    app.overlay = Overlay::Btw { scroll: 0 };
+    app.overlay = Overlay::Btw {
+        scroll: 0,
+        follow: true,
+    };
     let (screen, _) = render_full_screen(&mut app, 90, 30);
     assert!(screen.contains("Btw"), "title:\n{screen}");
     assert!(screen.contains("what is a monad?"), "{screen}");
     assert!(screen.contains("thinking…"), "pre-answer state:\n{screen}");
+    assert!(screen.contains("answering"), "stream badge:\n{screen}");
 
     app.btw.as_mut().unwrap().answer = "a monoid in the category of endofunctors".to_string();
     let (screen, _) = render_full_screen(&mut app, 90, 30);
@@ -169,5 +184,131 @@ fn test_btw_overlay_renders_question_answer_and_streaming_state() {
     assert!(
         screen.contains("answered outside the conversation"),
         "off-transcript note:\n{screen}"
+    );
+    assert!(screen.contains("answering"), "still streaming:\n{screen}");
+
+    app.btw.as_mut().unwrap().streaming = false;
+    let (screen, _) = render_full_screen(&mut app, 90, 30);
+    assert!(!screen.contains("answering"), "{screen}");
+    assert!(screen.contains("c copy"), "copy hint:\n{screen}");
+}
+
+#[test]
+fn test_btw_answer_renders_as_markdown() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.btw = Some(BtwExchange {
+        question: "how?".to_string(),
+        answer: "## Pointers\n\n- first item\n- second item".to_string(),
+        streaming: false,
+        error: None,
+    });
+    app.overlay = Overlay::Btw {
+        scroll: 0,
+        follow: true,
+    };
+    let (screen, _) = render_full_screen(&mut app, 90, 30);
+    assert!(screen.contains("Pointers"), "{screen}");
+    assert!(screen.contains("first item"), "{screen}");
+    assert!(!screen.contains("##"), "heading markup consumed:\n{screen}");
+}
+
+#[tokio::test]
+async fn test_btw_follows_the_tail_until_a_manual_scroll() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    let answer: String = (0..60)
+        .map(|i| format!("line-{i:02}\n"))
+        .collect::<Vec<_>>()
+        .join("");
+    app.btw = Some(BtwExchange {
+        question: "q".to_string(),
+        answer,
+        streaming: true,
+        error: None,
+    });
+    app.overlay = Overlay::Btw {
+        scroll: 0,
+        follow: true,
+    };
+
+    let (screen, _) = render_full_screen(&mut app, 90, 30);
+    assert!(screen.contains("line-59"), "tail visible:\n{screen}");
+    assert!(!screen.contains("line-00"), "head scrolled off:\n{screen}");
+
+    app.handle_key(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE))
+        .await
+        .unwrap();
+    assert!(matches!(app.overlay, Overlay::Btw { follow: false, .. }));
+    let (screen, _) = render_full_screen(&mut app, 90, 30);
+    assert!(screen.contains("line-00"), "parked at the top:\n{screen}");
+
+    // End re-joins the tail.
+
+    app.handle_key(KeyEvent::new(KeyCode::End, KeyModifiers::NONE))
+        .await
+        .unwrap();
+    assert!(matches!(app.overlay, Overlay::Btw { follow: true, .. }));
+}
+
+#[tokio::test]
+async fn test_btw_c_copies_the_answer() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.btw = Some(BtwExchange {
+        question: "q".to_string(),
+        answer: "the answer".to_string(),
+        streaming: false,
+        error: None,
+    });
+    app.overlay = Overlay::Btw {
+        scroll: 0,
+        follow: true,
+    };
+    app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE))
+        .await
+        .unwrap();
+    assert!(
+        app.toast
+            .as_ref()
+            .is_some_and(|t| t.text.contains("copied")),
+        "copy toast: {:?}",
+        app.toast.as_ref().map(|t| &t.text)
+    );
+    assert!(matches!(app.overlay, Overlay::Btw { .. }));
+
+    app.toast = None;
+    app.btw.as_mut().unwrap().answer.clear();
+    app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE))
+        .await
+        .unwrap();
+    assert!(app.toast.is_none());
+}
+
+#[test]
+fn test_btw_box_hugs_its_content_and_caps_its_width() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.btw = Some(BtwExchange {
+        question: "does PBKDF2 slow down brute force?".to_string(),
+        answer: "Yes — it iterates a PRF.".to_string(),
+        streaming: false,
+        error: None,
+    });
+
+    let body = Rect::new(0, 0, 160, 48);
+    let (small, lines) = app.btw_overlay_layout(body);
+    assert_eq!(small.width, 96, "width capped");
+    assert_eq!(usize::from(small.height), lines.len() + 4, "chrome only");
+    assert!(small.height < 12, "hugs the answer: {small:?}");
+
+    let tall_answer = (0..200).map(|i| format!("line {i}\n")).collect::<String>();
+    app.btw.as_mut().unwrap().answer = tall_answer;
+    let (tall, _) = app.btw_overlay_layout(body);
+    assert_eq!(tall.height, centered_rect(72, 88, body).height);
+    assert_eq!(
+        (tall.x, tall.y),
+        (small.x, small.y),
+        "anchored, not recentered"
     );
 }

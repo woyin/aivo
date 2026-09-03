@@ -1631,12 +1631,12 @@ impl CodeTuiApp {
                     *scroll = clamped;
                 }
             }
-            Overlay::Btw { scroll } => {
-                let area = centered_rect(72, 88, body);
+            Overlay::Btw { scroll, follow } => {
+                let (area, lines) = self.btw_overlay_layout(body);
                 self.set_overlay_regions(area);
-                let (clamped, bar) = self.render_btw_overlay(frame, area, scroll);
+                let (clamped, bar) = self.render_btw_overlay(frame, area, lines, scroll, follow);
                 self.scrollbar_hit = bar;
-                if let Overlay::Btw { scroll } = &mut self.overlay {
+                if let Overlay::Btw { scroll, .. } = &mut self.overlay {
                     *scroll = clamped;
                 }
             }

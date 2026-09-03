@@ -805,15 +805,31 @@ impl CodeTuiApp {
                 }
                 OverlayKeyAction::Handled
             }
-            // Closing Btw doesn't cancel its in-flight answer.
-            Overlay::Context { .. } | Overlay::Btw { .. } => {
+            Overlay::Context { .. } => {
                 if matches!(key.code, KeyCode::Esc | KeyCode::Enter) {
                     self.overlay = Overlay::None;
-                } else if let Overlay::Context { scroll, .. } | Overlay::Btw { scroll } =
-                    &mut self.overlay
-                {
+                } else if let Overlay::Context { scroll, .. } = &mut self.overlay {
                     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
                     apply_detail_scroll(scroll, key, ctrl);
+                }
+                OverlayKeyAction::Handled
+            }
+            // Closing Btw doesn't cancel its in-flight answer.
+            Overlay::Btw { .. } => {
+                match key.code {
+                    KeyCode::Esc | KeyCode::Enter => self.overlay = Overlay::None,
+                    KeyCode::Char('c') => self.copy_btw_answer(),
+                    _ => {
+                        if let Overlay::Btw { scroll, follow } = &mut self.overlay {
+                            let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+                            let before = *scroll;
+                            apply_detail_scroll(scroll, key, ctrl);
+                            // End is the tail; anything else that moved parks it.
+                            if *scroll != before {
+                                *follow = matches!(key.code, KeyCode::End);
+                            }
+                        }
+                    }
                 }
                 OverlayKeyAction::Handled
             }

@@ -1744,6 +1744,8 @@ pub(super) enum Overlay {
     /// `/btw` — the side-question answer panel, over `self.btw`.
     Btw {
         scroll: u16,
+        /// Ride the tail while the answer streams; a manual scroll away drops it.
+        follow: bool,
     },
     Picker(Box<PickerState>),
 }
@@ -1758,6 +1760,9 @@ impl Overlay {
 pub(super) struct BtwExchange {
     pub(super) question: String,
     pub(super) answer: String,
+    /// Still arriving — past the first delta a partial answer is otherwise
+    /// indistinguishable from a finished one.
+    pub(super) streaming: bool,
     /// A partial answer that streamed before the failure is kept.
     pub(super) error: Option<String>,
 }
