@@ -2366,6 +2366,7 @@ impl CodeTuiApp {
         self.turn_durations.clear();
         // The plan reply may be truncated away; the in-memory plan stays usable.
         self.plan_card_idx = None;
+        self.last_turn_interrupted = false;
         self.draft = removed.content;
         self.cursor = self.draft.len();
         self.draft_attachments = removed.attachments;
@@ -3885,6 +3886,7 @@ and keep each turn's work small"
         self.ask_exit_pending = false;
         self.pending_plan = None;
         self.plan_card_idx = None;
+        self.last_turn_interrupted = false;
         self.notice = if handoff_steps.is_some() {
             Some((
                 MUTED(),
@@ -4039,6 +4041,7 @@ and keep each turn's work small"
                     .history
                     .last()
                     .is_some_and(|message| message.role == "user");
+            self.last_turn_interrupted = !nothing_produced;
             self.cancel_inflight_request(if nothing_produced {
                 CancelKind::Unsend
             } else {
@@ -4054,6 +4057,7 @@ and keep each turn's work small"
         if let Some(task) = self.response_task.take() {
             task.abort();
         }
+        self.last_turn_interrupted = true;
         if was_agent_turn {
             self.finalize_interrupted_checkpoint();
         }

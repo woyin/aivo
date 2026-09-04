@@ -61,6 +61,7 @@ impl AgentEngine {
             mcp_defer_tokens: tool_search::defer_threshold(),
             last_summary: None,
             plan: Vec::new(),
+            plan_interrupted: false,
             touched_files: Vec::new(),
             notes: Vec::new(),
             evidence: Vec::new(),

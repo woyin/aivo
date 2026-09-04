@@ -62,15 +62,18 @@ impl CodeTuiApp {
         tips[self.welcome_tip_index % tips.len()]
     }
 
-    /// At the next user turn, drop a plan card that's fully completed (done marker)
-    /// or unstarted (an abandoned proposal). A mid-execution plan is left alone.
+    /// At the next user turn, drop a plan card that's fully completed, unstarted,
+    /// or cut short by Esc. One the model paused on its own is left alone.
     pub(super) fn clear_stale_plan(&mut self) {
+        let interrupted = std::mem::take(&mut self.last_turn_interrupted);
         let stale = self
             .history
             .iter()
             .rev()
             .find(|m| m.role == "plan")
-            .is_some_and(|m| plan_all_completed(&m.content) || plan_unstarted(&m.content));
+            .is_some_and(|m| {
+                interrupted || plan_all_completed(&m.content) || plan_unstarted(&m.content)
+            });
         if stale {
             self.drop_plan_entries();
         }
@@ -207,6 +210,7 @@ impl CodeTuiApp {
         self.transcript_scroll = 0;
         self.request_started_at = None;
         self.sending = false;
+        self.last_turn_interrupted = false;
         self.notice = None;
     }
 }

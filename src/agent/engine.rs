@@ -270,7 +270,7 @@ pub trait AgentUi: Send {
     /// Drop the just-streamed segment before the step retries (leaked tool-call
     /// markup, or a small partial before a retryable failure). Default no-op.
     fn discard_streamed_segment(&mut self) {}
-    /// The agent set/updated its plan via `update_plan`; rendered as a checklist card. Default no-op.
+    /// Rendered as a checklist card; empty clears it. Default no-op.
     fn plan_updated(&mut self, _items: &[PlanItem]) {}
     fn tool_start(&mut self, name: &str, args: &Value);
     /// Live output chunk from an in-flight `run_bash` (local display only,
@@ -572,6 +572,8 @@ pub struct AgentEngine {
     pub(crate) last_summary: Option<String>,
     /// Latest `update_plan` plan. Pinned into every compaction fold, verbatim.
     pub(crate) plan: Vec<PlanItem>,
+    /// An unfinished `plan` was dropped at this turn's entry; reminds once.
+    pub(crate) plan_interrupted: bool,
     /// Files touched this session (insertion order, deduped, capped). Maintained
     /// incrementally so it survives summarization; pinned into every compaction.
     pub(crate) touched_files: Vec<String>,

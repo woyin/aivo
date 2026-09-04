@@ -1732,3 +1732,47 @@ async fn test_plan_resume_picker_lists_orphan_saved_files() {
         "{labels:?}"
     );
 }
+
+#[test]
+fn test_interrupted_plan_clears_on_next_user_message() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    let plan_count = |a: &CodeTuiApp| a.history.iter().filter(|m| m.role == "plan").count();
+    let mid_execution = serde_json::json!([
+        {"step": "a", "status": "completed"},
+        {"step": "b", "status": "in_progress"},
+    ]);
+
+    app.apply_agent_plan(mid_execution.clone());
+    app.last_turn_interrupted = true;
+    app.clear_stale_plan();
+    assert_eq!(
+        plan_count(&app),
+        0,
+        "interrupted plan cleared on next message"
+    );
+    assert!(!app.last_turn_interrupted, "consumed by the dispatch");
+
+    // The same card, this time not interrupted.
+    app.apply_agent_plan(mid_execution);
+    app.clear_stale_plan();
+    assert_eq!(plan_count(&app), 1, "a paused plan must not be cleared");
+}
+
+#[test]
+fn test_apply_agent_plan_empty_drops_card() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    let plan_count = |a: &CodeTuiApp| a.history.iter().filter(|m| m.role == "plan").count();
+    app.apply_agent_plan(serde_json::json!([
+        {"step": "a", "status": "completed"},
+        {"step": "b", "status": "pending"},
+    ]));
+    assert_eq!(plan_count(&app), 1);
+    let revision = app.transcript_revision;
+
+    app.apply_agent_plan(serde_json::json!([]));
+    assert_eq!(plan_count(&app), 0, "empty plan clears the card");
+    assert!(app.unfinished_plan_steps().is_none());
+    assert_ne!(app.transcript_revision, revision, "panel re-renders");
+}

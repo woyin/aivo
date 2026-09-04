@@ -1010,16 +1010,18 @@ impl CodeTuiApp {
     /// of stacking a near-identical copy after every batch of tool calls.
     pub(super) fn apply_agent_plan(&mut self, items: serde_json::Value) {
         self.flush_pending_assistant();
-        let content = items.to_string();
         // Drop the prior card (with index-map fixup), re-append the latest below.
         self.drop_plan_entries();
-        self.history.push(ChatMessage {
-            model: None,
-            role: "plan".to_string(),
-            content,
-            reasoning_content: None,
-            attachments: vec![],
-        });
+        // Empty = the engine dropped the plan: nothing replaces the card.
+        if items.as_array().is_some_and(|a| !a.is_empty()) {
+            self.history.push(ChatMessage {
+                model: None,
+                role: "plan".to_string(),
+                content: items.to_string(),
+                reasoning_content: None,
+                attachments: vec![],
+            });
+        }
         // Removing the prior card can leave history length and the last entry
         // unchanged (e.g. a status-only edit), so bump the revision unconditionally
         // to invalidate the transcript render cache.

@@ -14,6 +14,7 @@ impl AgentEngine {
         self.messages.truncate(1);
         self.last_summary = None;
         self.plan.clear();
+        self.plan_interrupted = false;
         self.touched_files.clear();
         self.notes.clear();
         self.evidence.clear();
@@ -361,6 +362,20 @@ impl AgentEngine {
         self.prefix_fp = Some(fp);
     }
 
+    /// A turn the model ended itself always closes on a plain assistant message.
+    pub(super) fn last_turn_interrupted(&self) -> bool {
+        self.messages
+            .iter()
+            .rev()
+            .find(|m| role(m) != "user")
+            .is_some_and(|m| {
+                role(m) == "tool"
+                    || m.get("tool_calls")
+                        .and_then(|t| t.as_array())
+                        .is_some_and(|a| !a.is_empty())
+            })
+    }
+
     /// Cloned per step; strips the leading system prompt in plain-chat mode, so the
     /// single-system-message invariant `restore_conversation` relies on stays intact.
     /// In plan/ask mode the read-only reminder rides the copy's latest user message —
@@ -394,6 +409,9 @@ impl AgentEngine {
                 }
                 .to_string(),
             );
+        }
+        if self.plan_interrupted {
+            reminders.push(PLAN_INTERRUPTED_REMINDER.to_string());
         }
         if let Some(jobs) = &self.jobs {
             let running = jobs.running_snapshot();
@@ -600,6 +618,12 @@ fn user_text(m: &Value) -> Option<String> {
         _ => None,
     }
 }
+
+pub(crate) const PLAN_INTERRUPTED_REMINDER: &str = "<system-reminder>The previous turn was \
+interrupted by the user before its plan finished, so that checklist has been cleared. If this \
+request continues that work, first call `update_plan` with the full checklist again (re-verify \
+which steps are really done — the interrupted step may be partial). If it's a different request, \
+ignore the old plan.</system-reminder>";
 
 fn running_jobs_reminder(running: &[String]) -> String {
     format!(

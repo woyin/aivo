@@ -30,6 +30,8 @@ impl AgentEngine {
     pub(crate) fn begin_user_turn(&mut self, user_content: Value, checkpoint_prompt: String) {
         // User text must not be able to forge `[self-verify]` evidence lines.
         let user_content = super::conversation::neutralize_evidence_markers(user_content);
+        // Before the repair below erases the interrupted tail.
+        self.drop_interrupted_plan();
         self.repair_interrupted_tail();
         self.check_prefix_drift();
         // `/rewind` checkpoint at this turn's opening user message. The push below
@@ -65,7 +67,22 @@ impl AgentEngine {
         self.push_user_content(user_content);
     }
 
+    /// An Esc leaves step statuses unverified and the user usually redirecting.
+    fn drop_interrupted_plan(&mut self) {
+        let unfinished = self
+            .plan
+            .iter()
+            .any(|i| i.status != plan::PlanStatus::Completed);
+        if unfinished && self.last_turn_interrupted() {
+            self.plan.clear();
+            self.plan_interrupted = true;
+        }
+    }
+
     pub(super) async fn run_loop(&mut self, ctx: &TurnCtx<'_>, ui: &mut dyn AgentUi) {
+        if self.plan_interrupted {
+            ui.plan_updated(&[]);
+        }
         let mut steps = 0usize;
         let mut leaked_nudges = 0usize;
         let mut completion_nudges = 0usize;
@@ -248,6 +265,8 @@ impl AgentEngine {
                     }
                 }
             };
+            // One request only.
+            self.plan_interrupted = false;
             // End the turn without recording — an "[error: …]" assistant turn
             // would replay the failure to the model every later step and on resume.
             if terminal_error {

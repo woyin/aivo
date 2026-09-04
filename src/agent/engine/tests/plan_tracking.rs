@@ -215,3 +215,130 @@ async fn stale_plan_from_prior_turn_does_not_nudge() {
     assert_eq!(nudges, 1, "the stale plan must not nudge a later turn");
     assert_eq!(engine.messages.last().unwrap()["content"], "done");
 }
+
+/// The transcript as an Esc left it: a tool batch cut off before its results.
+fn engine_with_interrupted_plan(dir: &std::path::Path) -> AgentEngine {
+    use crate::agent::plan::PlanItem;
+    let mut engine = AgentEngine::new(&dir.display().to_string(), "m", "", &[], &[], 0, 0);
+    engine
+        .messages
+        .push(json!({"role":"user","content":"migrate the meter view"}));
+    engine.messages.push(json!({
+        "role":"assistant",
+        "tool_calls":[{"id":"p1","type":"function","function":{"name":"update_plan","arguments":"{}"}}]
+    }));
+    engine
+        .messages
+        .push(json!({"role":"tool","tool_call_id":"p1","content":"Plan updated (1/2 done)"}));
+    engine.messages.push(json!({
+        "role":"assistant",
+        "tool_calls":[{"id":"b1","type":"function","function":{"name":"run_bash","arguments":"{}"}}]
+    }));
+    engine.plan = vec![
+        PlanItem {
+            step: "edit".into(),
+            status: PlanStatus::Completed,
+        },
+        PlanItem {
+            step: "verify".into(),
+            status: PlanStatus::InProgress,
+        },
+    ];
+    engine
+}
+
+#[test]
+fn interrupted_turn_drops_unfinished_plan_and_reminds() {
+    use super::super::conversation::PLAN_INTERRUPTED_REMINDER;
+    let dir = tmp();
+    let mut engine = engine_with_interrupted_plan(&dir);
+
+    engine.begin_user_turn(json!("unrelated question"), "unrelated question".into());
+
+    assert!(engine.plan.is_empty(), "interrupted plan must be dropped");
+    assert!(engine.plan_interrupted);
+    let out = engine.outgoing_messages();
+    assert!(
+        content_str(out.last().unwrap()).contains(PLAN_INTERRUPTED_REMINDER),
+        "reminder must ride the request tail: {:?}",
+        out.last()
+    );
+    assert!(
+        !engine
+            .messages
+            .iter()
+            .any(|m| content_str(m).contains("<system-reminder>")),
+        "reminder must not persist in history"
+    );
+}
+
+#[test]
+fn normally_ended_turn_keeps_unfinished_plan() {
+    let dir = tmp();
+    let mut engine = engine_with_interrupted_plan(&dir);
+    engine
+        .messages
+        .push(json!({"role":"tool","tool_call_id":"b1","content":"ok"}));
+    engine.messages.push(json!({
+        "role":"assistant",
+        "content":"Which channel should the migration use?"
+    }));
+
+    engine.begin_user_turn(json!("use dev"), "use dev".into());
+
+    assert_eq!(engine.plan.len(), 2, "a paused plan is kept");
+    assert!(!engine.plan_interrupted);
+    assert!(!content_str(engine.outgoing_messages().last().unwrap()).contains("<system-reminder>"));
+}
+
+#[tokio::test]
+async fn interrupted_plan_card_clears_then_returns_when_resent() {
+    let dir = tmp();
+    let client = reqwest::Client::builder().no_proxy().build().unwrap();
+    let mut ui = CapturingUi::default();
+
+    // Turn A: unrelated request, the model never touches the plan.
+    let port = spawn_sse_sequence(vec![FINAL_TEXT_SSE.to_string()]);
+    let base = format!("http://127.0.0.1:{port}");
+    let mut engine = engine_with_interrupted_plan(&dir);
+    run_session(
+        &mut engine,
+        &turn_ctx(&client, &base, &dir),
+        Some("unrelated question".into()),
+        &mut ui,
+    )
+    .await;
+    assert_eq!(ui.plans, vec![0], "card cleared once at turn entry");
+    assert!(engine.plan.is_empty());
+    assert!(!engine.plan_interrupted, "reminder is one-request only");
+
+    // Turn B: fresh interrupted state, the model continues and re-sends.
+    let resend = tool_call_sse(
+        "update_plan",
+        json!({"plan": [
+            {"step": "edit", "status": "completed"},
+            {"step": "verify", "status": "in_progress"}
+        ]}),
+    );
+    let port = spawn_sse_sequence(vec![resend, FINAL_TEXT_SSE.to_string()]);
+    let base = format!("http://127.0.0.1:{port}");
+    let mut engine = engine_with_interrupted_plan(&dir);
+    let mut ui = CapturingUi::default();
+    run_session(
+        &mut engine,
+        &turn_ctx(&client, &base, &dir),
+        Some("continue".into()),
+        &mut ui,
+    )
+    .await;
+    assert_eq!(
+        ui.plans,
+        vec![0, 2],
+        "cleared, then restored by the re-send"
+    );
+    assert_eq!(
+        ui.last_plan,
+        vec![PlanStatus::Completed, PlanStatus::InProgress]
+    );
+    assert_eq!(engine.plan.len(), 2);
+}

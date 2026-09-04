@@ -3473,6 +3473,9 @@ pub(super) struct CodeTuiApp {
     /// An Esc-unsent agent turn whose engine-side un-send may not have landed yet
     /// (the aborted turn task can still hold the lock): re-apply at next dispatch.
     pub(super) agent_unsend_pending: bool,
+    /// Esc cut the last turn short after it had produced something; consumed at
+    /// the next dispatch to drop its plan card. Engine twin: `drop_interrupted_plan`.
+    pub(super) last_turn_interrupted: bool,
     /// A drafted plan (a plan-mode reply that ended without `exit_plan_mode`),
     /// awaiting `/plan go`. Cleared on execute, `/plan exit`, or `/new`.
     pub(super) pending_plan: Option<String>,
@@ -4005,6 +4008,7 @@ impl CodeTuiApp {
             ask_prior_mode: PlanPriorMode::default(),
             ask_exit_pending: false,
             agent_unsend_pending: false,
+            last_turn_interrupted: false,
             pending_plan: None,
             plan_card_idx: None,
             agent_engine: None,
