@@ -1,5 +1,15 @@
 # Changelog
 
+## v0.49.3
+
+`@path` in the composer attaches files and `@agent-<name>` addresses a sub-agent, replacing `/attach`. Requests to OpenCode's backend now carry a stable session id, and a plan the user interrupted no longer lingers as an unfinishable task card.
+
+- feat(code): @path attaches files; sub-agents become @agent-<name>; drop /attach (7f6e7f4a)
+- fix(code): drop a plan the user interrupted instead of letting it linger (9b5bb874)
+- fix(opencode): send x-opencode-session on requests to their backend (#43) (b5c1c079)
+- fix(code): @a.b. attached the same file twice on Windows (00aa52a1)
+- chore(data): re-sync model limits from models.dev (f8e438fc)
+
 ## v0.49.2
 
 The streaming `/btw` panel is easier to read, and delegated agents now receive the correct thinking effort while their token usage is tracked accurately.
