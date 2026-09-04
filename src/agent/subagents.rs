@@ -242,8 +242,8 @@ pub fn subagents_prompt_section(subagents: &[Subagent]) -> String {
         "\n\nYou have specialist sub-agents — pre-configured roles you can delegate to. To use one, \
 call the `subagent` tool with its name in the `agent` field (plus a complete, standalone `task`). \
 Each runs its own loop with its own instructions and only the `task` you pass — it never sees this \
-conversation — and hands back a result. Omit `agent` for a generic sub-agent. `@name` in a user \
-message names one of these profiles — treat it as an explicit request to delegate to that sub-agent.",
+conversation — and hands back a result. Omit `agent` for a generic sub-agent. `@agent-<name>` in a \
+user message names one of these profiles — treat it as an explicit request to delegate to that sub-agent.",
     );
     if !trusted.is_empty() {
         let list: String = trusted.iter().map(|s| advert(s, false)).collect();

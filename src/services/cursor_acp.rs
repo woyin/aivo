@@ -1263,7 +1263,7 @@ pub fn build_prompt_blocks(text: &str, attachments: &[MessageAttachment]) -> Res
 /// Combine pre-shaped ACP image content blocks with the user text into one
 /// `session/prompt` block list. Image blocks come first; the trailing text
 /// block is omitted when the text is empty and at least one image block is
-/// present, so an `/attach foo.png` + Enter with no draft text sends just
+/// present, so an image-only submit (no prose beside it) sends just
 /// the image. A fully-empty submit still yields one empty text block so the
 /// wire shape stays valid.
 ///
@@ -2597,7 +2597,7 @@ mod tests {
 
     #[test]
     fn build_prompt_blocks_image_only_send_omits_empty_text_block() {
-        // /attach foo.png + Enter with no draft text: send the image alone,
+        // Image-only submit (no prose beside it): send the image alone,
         // no trailing empty text block. If cursor-agent turns out to require
         // a text peer for image blocks, flip this in `build_prompt_blocks`.
         let img = inline_attachment("a.png", "image/png", "AAA=");

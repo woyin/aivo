@@ -42,7 +42,7 @@ impl CodeTuiApp {
 
         let footer_text = if menu.entries.is_empty() {
             "Esc close · Enter submit"
-        } else if menu.kind == MenuKind::Path {
+        } else if matches!(menu.kind, MenuKind::Path | MenuKind::Mention) {
             "Esc close · Enter/Tab insert · ↑/↓ navigate"
         } else {
             "Esc close · Enter run · Tab insert · ↑/↓ navigate"
@@ -430,6 +430,7 @@ impl CodeTuiApp {
         lines.push(Line::from(Span::styled("Text entry", section_style)));
         lines.push(Line::from(""));
         for note in [
+            "@path attaches a file or image · @agent-<name> delegates to that sub-agent",
             "!cmd runs a shell command locally (output not sent to the model)",
             "//text sends a literal leading slash · !!text a literal !",
         ] {
@@ -3071,10 +3072,7 @@ const HELP_COMMAND_GROUPS: &[(&str, &[&str])] = &[
         ],
     ),
     ("Model & key", &["model", "key"]),
-    (
-        "Context",
-        &["attach", "preview", "compact", "context", "btw"],
-    ),
+    ("Context", &["preview", "compact", "context", "btw"]),
     (
         "Skills & tools",
         &["skills", "create-skill", "agents", "mcp"],
@@ -3092,7 +3090,7 @@ const HELP_KEYBINDINGS: &[(&str, &[(&str, &str)])] = &[
         &[
             ("Enter", "send message / run command"),
             ("Ctrl+J", "insert newline"),
-            ("Tab", "complete command or path"),
+            ("Tab", "complete command, @path, or @agent"),
             ("Ctrl+V", "paste clipboard text/image"),
             ("Ctrl+X Ctrl+E", "edit draft in $EDITOR"),
         ],

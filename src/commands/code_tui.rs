@@ -39,6 +39,8 @@ use super::code_tui_format::{
 };
 use super::*;
 
+#[path = "code_tui/mentions.rs"]
+mod mentions;
 #[path = "code_tui/menu.rs"]
 mod menu;
 #[path = "code_tui/overlay_render_impl.rs"]
@@ -79,6 +81,7 @@ mod runtime_impl;
 mod session_impl;
 
 use self::inline_images::*;
+use self::mentions::*;
 use self::menu::*;
 use self::preview_pane::*;
 use self::render::*;
@@ -218,8 +221,10 @@ impl CodeTuiApp {
         app.model = params.model;
         app.format = initial_format;
         app.history = params.initial_history;
-        app.draft_attachments = params.initial_draft_attachments;
-        app.append_missing_attachment_tags();
+        if params.initial_prompt.is_none() {
+            app.draft = mention_draft_for_paths(&params.initial_attachment_paths);
+            app.cursor = app.draft.len();
+        }
         app.mcp_configured_count = mcp_configured_count;
         app.welcome_tip_index = welcome_tip_index;
         app.draft_history = draft_history;
@@ -465,7 +470,14 @@ pub(super) async fn run_chat_tui(params: CodeTuiParams) -> Result<()> {
         original_hook(info);
     }));
     let initial_resume = params.initial_resume.clone();
-    let initial_prompt = params.initial_prompt.clone();
+    let initial_prompt = params.initial_prompt.clone().map(|prompt| {
+        let mentions = mention_draft_for_paths(&params.initial_attachment_paths);
+        if mentions.is_empty() {
+            prompt
+        } else {
+            format!("{prompt} {}", mentions.trim_end())
+        }
+    });
     let share = params.share;
     let vision_picker_at_start = match params.vision_model.as_deref().map(parse_vision_flag) {
         Some(VisionFlag::KeyPicker(query)) => Some(Some(query)),

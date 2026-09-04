@@ -99,25 +99,6 @@ impl CodeTuiApp {
         self.cursor += text.len();
     }
 
-    /// Seed tags for attachments the draft doesn't show (`/attach`, CLI `-a`).
-    pub(super) fn append_missing_attachment_tags(&mut self) {
-        for i in 0..self.draft_attachments.len() {
-            let tag = attachment_tag(&self.draft_attachments[i], i + 1);
-            if self.draft.contains(&tag) {
-                continue;
-            }
-            let cursor_at_end = self.cursor == self.draft.len();
-            if !self.draft.is_empty() && !self.draft.ends_with(char::is_whitespace) {
-                self.draft.push(' ');
-            }
-            self.draft.push_str(&tag);
-            self.draft.push(' ');
-            if cursor_at_end {
-                self.cursor = self.draft.len();
-            }
-        }
-    }
-
     pub(super) fn cursor_left(&mut self) {
         if self.cursor == 0 {
             return;
@@ -378,65 +359,65 @@ impl CodeTuiApp {
         command_usage_hint(self.draft[1..].trim_end())
     }
 
-    /// The (command, partial path) of a path-completing command being typed.
-    pub(super) fn active_path_query(&self) -> Option<(&'static str, &str)> {
+    pub(super) fn active_path_query(&self) -> Option<&str> {
         if self.overlay.blocks_input() || self.draft.starts_with("//") || self.draft.contains('\n')
         {
             return None;
         }
-        [("attach", "/attach "), ("preview", "/preview ")]
-            .into_iter()
-            .find_map(|(command, prefix)| {
-                self.draft.strip_prefix(prefix).map(|rest| (command, rest))
-            })
+        self.draft.strip_prefix("/preview ")
     }
 
-    /// An `@name` sub-agent mention being typed at the cursor: the byte offset
-    /// of the `@` and the partial name after it. Only at a word boundary (start
-    /// of draft or after whitespace) so emails and paths don't trigger it, and
-    /// only when discovered profiles exist to suggest. Command/attach modes win.
     pub(super) fn active_mention_query(&self) -> Option<(usize, String)> {
         if self.overlay.blocks_input()
-            || self.last_subagents.is_empty()
             || self.active_command_query().is_some()
             || self.active_path_query().is_some()
         {
             return None;
         }
-        let head = self.draft.get(..self.cursor)?;
-        let at = head.rfind('@')?;
-        if !head[..at]
-            .chars()
-            .next_back()
-            .is_none_or(char::is_whitespace)
-        {
-            return None;
-        }
-        let query = &head[at + 1..];
-        if query.chars().any(char::is_whitespace) {
-            return None;
-        }
-        Some((at, query.to_string()))
+        mention_query_at(self.draft.get(..self.cursor)?)
     }
 
-    /// The `@` menu entries: discovered sub-agent profiles matching the partial
-    /// name, prefix matches first (same ranking as the skill-command filter).
+    /// Paths first, then profiles matched by name or `agent-<name>` handle.
     pub(super) fn matching_mention_entries(&self, query: &str) -> Vec<ComposerMenuEntry> {
+        // The real launch dir, NOT chat's empty sandbox (`self.cwd`).
+        let mut entries: Vec<ComposerMenuEntry> =
+            collect_path_suggestions(self.persist_cwd(), query)
+                .into_iter()
+                .map(ComposerMenuEntry::Path)
+                .collect();
         let mut prefix = Vec::new();
         let mut fuzzy = Vec::new();
         for sa in &self.last_subagents {
+            let handle = format!("{AGENT_MENTION_PREFIX}{}", sa.name);
             let entry = ComposerMenuEntry::Agent(AgentMention {
                 name: sa.name.clone(),
-                description: crate::agent::skills::advert_description(&sa.description),
+                description: format!(
+                    "agent · {}",
+                    crate::agent::skills::advert_description(&sa.description)
+                ),
             });
-            if sa.name.starts_with(query) {
+            if sa.name.starts_with(query) || handle.starts_with(query) {
                 prefix.push(entry);
-            } else if matches_fuzzy(query, &sa.name) {
+            } else if matches_fuzzy(query, &handle) {
                 fuzzy.push(entry);
             }
         }
-        prefix.extend(fuzzy);
-        prefix
+        entries.extend(prefix);
+        entries.extend(fuzzy);
+        entries
+    }
+
+    pub(super) fn is_agent_mention(&self, text: &str) -> bool {
+        text.strip_prefix(AGENT_MENTION_PREFIX)
+            .is_some_and(|name| self.last_subagents.iter().any(|sa| sa.name == name))
+    }
+
+    /// Validated now, so a missing or oversized file keeps the draft.
+    pub(super) fn mention_attachments(&self, text: &str) -> Result<Vec<MessageAttachment>> {
+        resolve_file_mentions(text, self.persist_cwd(), |t| self.is_agent_mention(t))
+            .iter()
+            .map(|m| build_pending_attachment(&m.path))
+            .collect()
     }
 
     /// Whether the draft is a `!cmd` local shell command — a single line whose
@@ -469,21 +450,6 @@ impl CodeTuiApp {
         entries
     }
 
-    fn slash_command_opens_inline_menu(&self, command: &SlashCommandSpec) -> bool {
-        command.name == "attach"
-    }
-
-    fn complete_inline_arg_command(&mut self, command: &SlashCommandSpec) -> bool {
-        if !self.slash_command_opens_inline_menu(command) {
-            return false;
-        }
-        self.draft = command.insertion_text();
-        self.cursor = self.draft.len();
-        self.command_menu.reset();
-        self.sync_command_menu_state();
-        true
-    }
-
     pub(super) fn visible_command_menu(&self) -> Option<VisibleCommandMenu> {
         // While recalling input history (↑/↓), keep arrows driving history
         // navigation — don't pop the dropdown for a recalled `/command` and let
@@ -499,12 +465,12 @@ impl CodeTuiApp {
             return None;
         } else if let Some(query) = self.active_command_query() {
             (MenuKind::Commands, self.matching_command_entries(query))
-        } else if let Some((command, query)) = self.active_path_query() {
+        } else if let Some(query) = self.active_path_query() {
             (
                 MenuKind::Path,
                 // Suggest from the real launch dir (where relative paths actually
-                // resolve at queue time), NOT chat's empty sandbox (`self.cwd`).
-                collect_path_suggestions(self.persist_cwd(), command, query)
+                // resolve), NOT chat's empty sandbox (`self.cwd`).
+                collect_path_suggestions(self.persist_cwd(), query)
                     .into_iter()
                     .map(ComposerMenuEntry::Path)
                     .collect::<Vec<_>>(),
@@ -533,7 +499,7 @@ impl CodeTuiApp {
     pub(super) fn sync_command_menu_state(&mut self) {
         let (kind, query) = if let Some(query) = self.active_command_query() {
             (MenuKind::Commands, query.to_string())
-        } else if let Some((_, query)) = self.active_path_query() {
+        } else if let Some(query) = self.active_path_query() {
             (MenuKind::Path, query.to_string())
         } else if let Some((_, query)) = self.active_mention_query() {
             (MenuKind::Mention, query)
@@ -554,8 +520,8 @@ impl CodeTuiApp {
 
         let matches = if self.active_command_query().is_some() {
             self.matching_command_entries(&query).len()
-        } else if let Some((command, _)) = self.active_path_query() {
-            collect_path_suggestions(self.persist_cwd(), command, &query).len()
+        } else if self.active_path_query().is_some() {
+            collect_path_suggestions(self.persist_cwd(), &query).len()
         } else {
             self.matching_mention_entries(&query).len()
         };
@@ -620,12 +586,10 @@ impl CodeTuiApp {
         self.command_menu.selected = 0;
         match entry {
             ComposerMenuEntry::Command(command) => {
-                if !self.complete_inline_arg_command(command) {
-                    self.draft = command.insertion_text();
-                    self.cursor = self.draft.len();
-                    self.command_menu.dismissed = true;
-                    self.command_menu.placement = None;
-                }
+                self.draft = command.insertion_text();
+                self.cursor = self.draft.len();
+                self.command_menu.dismissed = true;
+                self.command_menu.placement = None;
             }
             ComposerMenuEntry::Skill(skill) => {
                 self.draft = skill.insertion_text();
@@ -633,8 +597,8 @@ impl CodeTuiApp {
                 self.command_menu.dismissed = true;
                 self.command_menu.placement = None;
             }
-            ComposerMenuEntry::Path(path) => {
-                self.draft = path.insertion_text;
+            ComposerMenuEntry::Path(path) if self.active_path_query().is_some() => {
+                self.draft = format!("/preview {}", path.path);
                 self.cursor = self.draft.len();
                 // Keep the menu open for directories so the user can continue
                 // navigating into the selected directory with subsequent Tab presses.
@@ -644,23 +608,38 @@ impl CodeTuiApp {
                     self.command_menu.placement = None;
                 }
             }
+            ComposerMenuEntry::Path(path) => self.insert_mention_path(&path),
             ComposerMenuEntry::Agent(agent) => {
-                self.insert_mention(&agent.name);
+                self.insert_mention(&format!("{AGENT_MENTION_PREFIX}{} ", agent.name));
+                self.command_menu.dismissed = true;
+                self.command_menu.placement = None;
             }
         }
         true
     }
 
-    /// Replace the `@partial` at the cursor with `@name ` — the mention is part
-    /// of a message still being composed, so the draft is never submitted here.
-    fn insert_mention(&mut self, name: &str) {
+    fn insert_mention(&mut self, text: &str) {
         if let Some((at, _)) = self.active_mention_query() {
-            let mention = format!("@{name} ");
+            let mention = format!("@{text}");
             self.draft.replace_range(at..self.cursor, &mention);
             self.cursor = at + mention.len();
         }
-        self.command_menu.dismissed = true;
-        self.command_menu.placement = None;
+    }
+
+    /// A directory keeps the menu open so Tab descends into it.
+    fn insert_mention_path(&mut self, path: &PathMenuEntry) {
+        if let Some((at, _)) = self.active_mention_query() {
+            let mut mention = mention_text_for_path(&path.path, path.is_dir);
+            if !path.is_dir {
+                mention.push(' ');
+            }
+            self.draft.replace_range(at..self.cursor, &mention);
+            self.cursor = at + mention.len();
+        }
+        self.command_menu.dismissed = !path.is_dir;
+        if !path.is_dir {
+            self.command_menu.placement = None;
+        }
     }
 
     pub(super) async fn execute_selected_command(&mut self) -> Result<bool> {
@@ -669,9 +648,6 @@ impl CodeTuiApp {
         };
         match entry {
             ComposerMenuEntry::Command(command) => {
-                if self.complete_inline_arg_command(command) {
-                    return Ok(false);
-                }
                 self.draft = command.command_label();
                 self.cursor = self.draft.len();
                 self.command_menu.reset();
@@ -683,8 +659,8 @@ impl CodeTuiApp {
                 self.command_menu.reset();
                 self.submit_draft().await
             }
-            ComposerMenuEntry::Path(path) => {
-                self.draft = path.insertion_text;
+            ComposerMenuEntry::Path(path) if self.active_path_query().is_some() => {
+                self.draft = format!("/preview {}", path.path);
                 self.cursor = self.draft.len();
                 self.command_menu.reset();
                 if path.is_dir {
@@ -693,10 +669,10 @@ impl CodeTuiApp {
                     self.submit_draft().await
                 }
             }
-            // Enter completes the mention like Tab — the user still has the
+            // Enter completes a mention like Tab — the user still has the
             // actual request to type around it.
-            ComposerMenuEntry::Agent(agent) => {
-                self.insert_mention(&agent.name);
+            ComposerMenuEntry::Path(_) | ComposerMenuEntry::Agent(_) => {
+                self.insert_selected_command();
                 Ok(false)
             }
         }

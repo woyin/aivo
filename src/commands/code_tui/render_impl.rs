@@ -3416,9 +3416,14 @@ impl CodeTuiApp {
         // hanging indent so text aligns under the first character.
         let rows = composer_visual_rows(&self.draft, self.composer_text_width());
         let last = rows.len().saturating_sub(1);
-        // Attachment tags render accented so they read as removable objects.
+        // Tags and mentions render accented so they read as objects.
         let mut tag_spans: Vec<(usize, usize)> =
             self.attachment_tag_spans().into_iter().flatten().collect();
+        tag_spans.extend(
+            mention_tokens(&self.draft)
+                .into_iter()
+                .map(|t| (t.start, t.end)),
+        );
         tag_spans.sort_unstable();
         for (index, &(start, end)) in rows.iter().enumerate().skip(self.composer_scroll) {
             let prefix = if index == 0 {

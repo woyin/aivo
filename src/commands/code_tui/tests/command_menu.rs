@@ -149,29 +149,29 @@ async fn test_esc_keeps_partially_typed_command_draft() {
 }
 
 #[tokio::test]
-async fn test_selecting_attach_command_transitions_to_path_menu() {
+async fn test_at_opens_file_menu_and_enter_completes_in_place() {
     let temp_dir = TempDir::new().unwrap();
     std::fs::write(temp_dir.path().join("alpha.txt"), "hi").unwrap();
 
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let mut app = make_test_app(tx, rx);
     app.cwd = temp_dir.path().to_string_lossy().into_owned();
-    app.draft = "/att".to_string();
+    app.draft = "explain @al".to_string();
     app.cursor = app.draft.len();
     app.sync_command_menu_state();
+
+    let menu = app.visible_command_menu().expect("mention menu");
+    assert_eq!(menu.kind, MenuKind::Mention);
+    assert_eq!(menu.entries[0].label(), "alpha.txt");
 
     app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
         .await
         .unwrap();
 
-    assert_eq!(app.draft, "/attach ");
-    let menu = app.visible_command_menu().expect("attach path menu");
-    assert_eq!(menu.kind, MenuKind::Path);
-    assert!(
-        menu.entries
-            .iter()
-            .any(|entry| entry.label() == "alpha.txt")
-    );
+    assert_eq!(app.draft, "explain @alpha.txt ");
+    assert_eq!(app.cursor, app.draft.len());
+    assert!(app.history.is_empty(), "completing a mention must not send");
+    assert!(app.visible_command_menu().is_none());
 }
 
 #[tokio::test]
@@ -372,34 +372,54 @@ fn test_collect_path_suggestions_lists_matching_entries() {
     std::fs::write(temp_dir.path().join("alpha.txt"), "hi").unwrap();
     std::fs::create_dir(temp_dir.path().join("assets")).unwrap();
 
-    let entries = collect_path_suggestions(temp_dir.path().to_str().unwrap(), "attach", "a");
+    let entries = collect_path_suggestions(temp_dir.path().to_str().unwrap(), "a");
 
     assert!(entries.iter().any(|entry| entry.label == "assets/"));
     assert!(entries.iter().any(|entry| entry.label == "alpha.txt"));
 }
 
 #[test]
-fn test_attach_query_uses_path_menu_and_tab_inserts_selected_path() {
+fn test_at_mention_tab_descends_into_directories() {
     let temp_dir = TempDir::new().unwrap();
     std::fs::create_dir(temp_dir.path().join("assets")).unwrap();
+    std::fs::write(temp_dir.path().join("assets").join("logo.png"), "x").unwrap();
+    std::fs::create_dir(temp_dir.path().join("my docs")).unwrap();
+    std::fs::write(temp_dir.path().join("my docs").join("a b.md"), "x").unwrap();
 
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let mut app = make_test_app(tx, rx);
     app.cwd = temp_dir.path().to_string_lossy().into_owned();
-    app.draft = "/attach a".to_string();
+    app.draft = "see @as".to_string();
     app.cursor = app.draft.len();
     app.sync_command_menu_state();
 
-    let menu = app.visible_command_menu().unwrap();
-    assert_eq!(menu.kind, MenuKind::Path);
+    assert_eq!(app.visible_command_menu().unwrap().kind, MenuKind::Mention);
     assert!(app.insert_selected_command());
-    assert_eq!(app.draft, "/attach assets/");
+    assert_eq!(app.draft, "see @assets/");
     // Menu stays open after tab on a directory so the user can continue navigating.
-    assert!(app.visible_command_menu().is_some());
+    let menu = app
+        .visible_command_menu()
+        .expect("menu open inside the dir");
+    assert_eq!(menu.entries[0].label(), "logo.png");
+    assert!(app.insert_selected_command());
+    assert_eq!(app.draft, "see @assets/logo.png ");
+    assert!(app.visible_command_menu().is_none());
+
+    app.draft = "see @my".to_string();
+    app.cursor = app.draft.len();
+    app.sync_command_menu_state();
+    assert!(app.insert_selected_command());
+    assert_eq!(app.draft, "see @\"my docs/");
+    let menu = app
+        .visible_command_menu()
+        .expect("quoted partial still completes");
+    assert_eq!(menu.entries[0].label(), "a b.md");
+    assert!(app.insert_selected_command());
+    assert_eq!(app.draft, "see @\"my docs/a b.md\" ");
 }
 
 #[test]
-fn test_preview_query_completes_paths_like_attach() {
+fn test_preview_query_completes_paths() {
     let temp_dir = TempDir::new().unwrap();
     std::fs::write(temp_dir.path().join("chart.svg"), "<svg/>").unwrap();
 
@@ -416,13 +436,13 @@ fn test_preview_query_completes_paths_like_attach() {
     assert_eq!(app.draft, "/preview chart.svg");
 }
 
-/// The `@` mention menu: word-boundary trigger (mid-message ok, emails no),
-/// prefix-first filtering over discovered profiles, and completion that inserts
-/// `@name ` at the token without submitting the draft.
 #[test]
 fn test_at_mention_menu_completes_subagent_names() {
+    let temp_dir = TempDir::new().unwrap();
+    std::fs::write(temp_dir.path().join("codec.rs"), "x").unwrap();
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let mut app = make_test_app(tx, rx);
+    app.cwd = temp_dir.path().to_string_lossy().into_owned();
     let profile = |name: &str| crate::agent::subagents::Subagent {
         name: name.to_string(),
         description: format!("{name} does things. Extra sentence."),
@@ -435,45 +455,46 @@ fn test_at_mention_menu_completes_subagent_names() {
         source: std::path::PathBuf::new(),
     };
 
-    // No discovered profiles → no menu, even on a bare `@`.
-    app.draft = "@".to_string();
-    app.cursor = 1;
-    assert!(app.active_mention_query().is_none());
-
     app.last_subagents = vec![profile("code-reviewer"), profile("architect")];
 
-    // Mid-message mention at a word boundary; query is the partial after `@`.
     app.draft = "use @co on the diff".to_string();
     app.cursor = 7; // after "use @co"
     let (at, query) = app.active_mention_query().expect("mention active");
     assert_eq!((at, query.as_str()), (4, "co"));
     let menu = app.visible_command_menu().expect("menu visible");
     assert!(matches!(menu.kind, MenuKind::Mention));
-    assert_eq!(menu.entries.len(), 1);
-    assert_eq!(menu.entries[0].label(), "@code-reviewer");
+    let labels: Vec<String> = menu.entries.iter().map(ComposerMenuEntry::label).collect();
+    assert_eq!(labels, ["codec.rs", "@agent-code-reviewer"]);
+    assert!(menu.entries[1].description().starts_with("agent · "));
 
     // Tab completion replaces just the token and keeps composing (no submit).
+    app.command_menu.selected = 1;
     assert!(app.insert_selected_command());
-    assert_eq!(app.draft, "use @code-reviewer  on the diff");
-    assert_eq!(app.cursor, "use @code-reviewer ".len());
+    assert_eq!(app.draft, "use @agent-code-reviewer  on the diff");
+    assert_eq!(app.cursor, "use @agent-code-reviewer ".len());
 
-    // A bare `@` lists every profile.
+    app.draft = "@agent-".to_string();
+    app.cursor = app.draft.len();
+    app.command_menu.reset();
+    let menu = app.visible_command_menu().expect("menu visible");
+    let labels: Vec<String> = menu.entries.iter().map(ComposerMenuEntry::label).collect();
+    assert_eq!(labels, ["@agent-code-reviewer", "@agent-architect"]);
     app.draft = "@".to_string();
     app.cursor = 1;
     app.command_menu.reset();
     let menu = app.visible_command_menu().expect("menu visible");
-    assert_eq!(menu.entries.len(), 2);
+    assert_eq!(menu.entries.len(), 3);
 
     // No word boundary (email-style) → no menu; ditto once the token has a space.
     app.draft = "mail me a@b".to_string();
     app.cursor = app.draft.len();
     assert!(app.active_mention_query().is_none());
-    app.draft = "@code-reviewer go".to_string();
+    app.draft = "@agent-code-reviewer go".to_string();
     app.cursor = app.draft.len();
     assert!(app.active_mention_query().is_none());
 
-    // `/attach` path mode wins over mention parsing…
-    app.draft = "/attach @x".to_string();
+    // `/preview` path mode wins over mention parsing…
+    app.draft = "/preview @x".to_string();
     app.cursor = app.draft.len();
     assert!(app.active_mention_query().is_none());
     // …but a mention inside an ordinary command ARGUMENT works (`/goal`, `/plan`
@@ -534,12 +555,12 @@ fn test_composer_command_hint() {
         "/skills should ghost the add/rm syntax"
     );
 
-    // `/attach` is deliberately hint-less: typing `/attach ` opens path
+    // `/preview` is deliberately hint-less: typing `/preview ` opens path
     // completion, and a ghost would suppress that menu.
-    set(&mut app, "/attach");
+    set(&mut app, "/preview");
     assert!(
         app.composer_command_hint().is_none(),
-        "attach must not ghost (path menu owns it)"
+        "preview must not ghost (path menu owns it)"
     );
     // A no-argument command has no hint either.
     set(&mut app, "/new");

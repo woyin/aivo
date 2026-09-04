@@ -586,7 +586,7 @@ fn main_picker_excludes_no_tool_image_generators() {
     );
 }
 
-/// The working fallback is invisible: no describer announcement at attach time.
+/// The working fallback is invisible at attach time.
 #[tokio::test]
 async fn attaching_an_image_stays_silent_about_the_describer() {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
@@ -596,15 +596,15 @@ async fn attaching_an_image_stays_silent_about_the_describer() {
     app.vision_fallback_custom = Some(("k1".to_string(), "gemini-2.5-flash-lite".to_string()));
 
     let dir = crate::test_sandbox::tmp("aivo-attach");
-    let path = dir.join("shot.png");
-    std::fs::write(&path, b"fakepng").unwrap();
-    app.queue_attachment(path.to_string_lossy().into_owned())
-        .unwrap();
-    let msg = notice_text(&app);
-    assert!(msg.starts_with("Queued"), "attach notice shown: {msg}");
+    std::fs::write(dir.join("shot.png"), b"fakepng").unwrap();
+    app.cwd = dir.to_string_lossy().into_owned();
+    let attachments = app.mention_attachments("look at @shot.png").unwrap();
+    assert_eq!(attachments.len(), 1);
+    assert!(attachments[0].is_image());
     assert!(
-        !msg.contains("described via"),
-        "attach notice must not mention the describer: {msg}"
+        app.notice.is_none(),
+        "attaching must not mention the describer: {}",
+        notice_text(&app)
     );
 }
 

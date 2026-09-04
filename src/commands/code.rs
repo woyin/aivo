@@ -1011,7 +1011,7 @@ impl CodeCommand {
         let initial_session = new_code_session_id();
         let initial_history = Vec::new();
 
-        let startup_notice = attachment_notice(&pending_attachments);
+        let startup_notice = attachment_notice(&pending_attachments, initial_prompt.is_some());
 
         self.session_store
             .record_selection(&key.id, "code", Some(&raw_model))
@@ -1028,7 +1028,7 @@ impl CodeCommand {
             model,
             initial_session,
             initial_history,
-            initial_draft_attachments: pending_attachments,
+            initial_attachment_paths: attachments,
             startup_notice,
             initial_resume: resume,
             model_explicit: model_flag.is_some(),
@@ -1478,12 +1478,12 @@ fn ensure_picker_terminal(kind: &str, explicit_flag: &str) -> Result<()> {
     );
 }
 
-fn attachment_notice(attachments: &[MessageAttachment]) -> Option<String> {
-    if attachments.is_empty() {
+fn attachment_notice(attachments: &[MessageAttachment], prompt_sent: bool) -> Option<String> {
+    if attachments.is_empty() || prompt_sent {
         None
     } else {
         Some(format!(
-            "{} attachment{} queued. Press Enter to send or use /attach to add more.",
+            "{} file{} referenced as @path in the draft — add your message and press Enter",
             attachments.len(),
             if attachments.len() == 1 { "" } else { "s" }
         ))
@@ -1497,11 +1497,14 @@ fn build_pending_attachments(paths: &[String]) -> Result<Vec<MessageAttachment>>
         .collect()
 }
 
-fn build_pending_attachment(path: &str) -> Result<MessageAttachment> {
+/// Bigger text files are for the read tool — one stray log would swallow the window.
+const MAX_TEXT_ATTACHMENT_BYTES: u64 = 256 * 1024;
+
+pub(crate) fn build_pending_attachment(path: &str) -> Result<MessageAttachment> {
     let expanded = crate::services::system_env::expand_tilde(path);
     let file_path = expanded.as_path();
-    ensure_attachment_exists(file_path)?;
     let mime_type = guess_attachment_mime_type(file_path)?;
+    ensure_attachable(file_path, &mime_type)?;
     Ok(MessageAttachment {
         name: attachment_name(file_path),
         mime_type,
@@ -1511,11 +1514,21 @@ fn build_pending_attachment(path: &str) -> Result<MessageAttachment> {
     })
 }
 
-fn ensure_attachment_exists(path: &Path) -> Result<()> {
+fn ensure_attachable(path: &Path, mime_type: &str) -> Result<()> {
     let metadata = std::fs::metadata(path)
         .map_err(|err| anyhow::anyhow!("Failed to read attachment '{}': {err}", path.display()))?;
     if !metadata.is_file() {
         anyhow::bail!("Attachment '{}' is not a file", path.display());
+    }
+    // Images are re-encoded; PDFs go to the provider whole.
+    let inlined_as_text = !mime_type.starts_with("image/") && !is_document_mime(mime_type);
+    if inlined_as_text && metadata.len() > MAX_TEXT_ATTACHMENT_BYTES {
+        anyhow::bail!(
+            "'{}' is {} KiB — too large to attach (limit {} KiB); ask the agent to read the parts you need",
+            attachment_name(path),
+            metadata.len() / 1024,
+            MAX_TEXT_ATTACHMENT_BYTES / 1024
+        );
     }
     Ok(())
 }

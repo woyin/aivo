@@ -93,7 +93,11 @@ fn removed_features_stay_removed() {
         ),
         (
             "\"/detach\"",
-            "/detach removed; [image #n] draft tags are the only attachment surface",
+            "/detach removed; deleting the [image #n] tag or the @path text detaches",
+        ),
+        (
+            "\"/attach\"",
+            "/attach removed 2026-09; @path in the message attaches (Claude Code's @ menu)",
         ),
         (
             "\"/effort\"",

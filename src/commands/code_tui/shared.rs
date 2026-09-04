@@ -395,6 +395,7 @@ pub(super) const WELCOME_ADVANCED_TIPS: &[&str] = &[
     "Ctrl+T changes how hard the model thinks",
     "/skills and /mcp manage the agent's extra tools",
     "ask the agent to create a subagent for a task — a reviewer, an architect …",
+    "@path attaches a file or image to your message — Tab completes the path",
     "/compact summarizes older turns to free up context",
     "/plan plans read-only — approve the plan and it builds",
     "/ask answers questions with sources — nothing gets edited",
@@ -563,12 +564,6 @@ pub(super) const SLASH_COMMANDS: &[SlashCommandSpec] = &[
         takes_argument: true,
     },
     SlashCommandSpec {
-        name: "attach",
-        help_label: "/attach <path>",
-        description: "attach a file or image",
-        takes_argument: true,
-    },
-    SlashCommandSpec {
         name: "copy",
         help_label: "/copy [n]",
         description: "copy a past reply to the clipboard",
@@ -714,8 +709,8 @@ pub(super) fn command_usage_hint(name: &str) -> Option<&'static str> {
         "key" => Some("[id|name]"),
         "resume" => Some("[query]"),
         "copy" => Some("[n]"),
-        // `attach`/`preview` deliberately omitted: a `<path>` ghost would
-        // suppress the path-completion menu (see `visible_command_menu`).
+        // `preview` deliberately omitted: a `<path>` ghost would suppress the
+        // path-completion menu (see `visible_command_menu`).
         _ => None,
     }
 }
@@ -755,7 +750,7 @@ pub(crate) struct CodeTuiParams {
     pub model: String,
     pub initial_session: String,
     pub initial_history: Vec<ChatMessage>,
-    pub initial_draft_attachments: Vec<MessageAttachment>,
+    pub initial_attachment_paths: Vec<String>,
     pub startup_notice: Option<String>,
     /// `--resume` request: `Some("")` opens the session picker at startup,
     /// `Some(id)` jumps straight to that session, `None` starts fresh.
@@ -2083,15 +2078,15 @@ pub(super) struct PathMenuEntry {
     pub(super) label: String,
     pub(super) is_dir: bool,
     pub(super) description: String,
-    pub(super) insertion_text: String,
+    pub(super) path: String,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum MenuKind {
     Commands,
-    /// Path completion for a command's file argument (`/attach`, `/preview`).
+    /// Path completion for `/preview`'s file argument.
     Path,
-    /// `@name` sub-agent mentions in the composer.
+    /// `@path` file / `@agent-<name>` sub-agent mentions in the composer.
     Mention,
 }
 
@@ -2117,9 +2112,7 @@ impl SkillCommand {
     }
 }
 
-/// A discovered sub-agent offered by the `@` mention menu: name + one-line
-/// advert. Selecting it inserts `@name ` into the draft (it does not submit —
-/// a mention is part of a message still being composed).
+/// A sub-agent row in the `@` menu; selecting inserts `@agent-<name> ` without submitting.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct AgentMention {
     pub(super) name: String,
@@ -2141,7 +2134,7 @@ impl ComposerMenuEntry {
             Self::Command(command) => command.help_label.to_string(),
             Self::Skill(skill) => skill.command_label(),
             Self::Path(path) => path.label.clone(),
-            Self::Agent(agent) => format!("@{}", agent.name),
+            Self::Agent(agent) => format!("@{AGENT_MENTION_PREFIX}{}", agent.name),
         }
     }
 
@@ -2659,7 +2652,6 @@ pub(super) enum SlashCommand {
     Resume(Option<String>),
     Model(Option<String>),
     Key(Option<String>),
-    Attach(String),
     /// Copy the Nth-latest assistant reply (default 1 = most recent) to the clipboard.
     Copy(Option<usize>),
     /// Side preview pane: `<path|url>` pins, `off` closes, bare toggles off.

@@ -700,20 +700,43 @@ async fn test_draft_history_capped_at_max() {
 }
 
 #[tokio::test]
-async fn test_submit_draft_keeps_failed_attach_command_and_shows_notice() {
+async fn test_submit_draft_keeps_oversized_mention_and_shows_notice() {
+    let dir = crate::test_sandbox::tmp("aivo-mention-big");
+    std::fs::write(dir.join("big.log"), vec![b'x'; 300 * 1024]).unwrap();
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let mut app = make_test_app(tx, rx);
-    app.draft = "/attach ./definitely-missing-file.txt".to_string();
+    app.cwd = dir.to_string_lossy().into_owned();
+    app.draft = "why does @big.log grow?".to_string();
     app.cursor = app.draft.len();
 
     let should_exit = app.submit_draft().await.unwrap();
 
     assert!(!should_exit);
-    assert_eq!(app.draft, "/attach ./definitely-missing-file.txt");
-    assert!(app.draft_attachments.is_empty());
-    assert!(app.notice.as_ref().is_some_and(
-        |(color, text)| *color == ERROR() && text.contains("Failed to read attachment")
-    ));
+    assert_eq!(app.draft, "why does @big.log grow?");
+    assert!(app.history.is_empty(), "nothing sent");
+    assert!(
+        app.notice
+            .as_ref()
+            .is_some_and(|(color, text)| *color == ERROR() && text.contains("too large to attach"))
+    );
+}
+
+#[test]
+fn test_mention_attachments_resolve_from_draft_text() {
+    let dir = crate::test_sandbox::tmp("aivo-mention-resolve");
+    std::fs::write(dir.join("notes.md"), "hi").unwrap();
+    std::fs::write(dir.join("explorer"), "a file named like a profile").unwrap();
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.cwd = dir.to_string_lossy().into_owned();
+    app.last_subagents = crate::agent::subagents::builtin_subagents();
+
+    let attachments = app
+        .mention_attachments("read @notes.md and @notes.md, ask @agent-explorer, @explorer, @nope")
+        .unwrap();
+    let names: Vec<&str> = attachments.iter().map(|a| a.name.as_str()).collect();
+    assert_eq!(names, ["notes.md", "explorer"]);
+    assert_eq!(attachments[0].mime_type, "text/markdown");
 }
 
 #[test]
@@ -838,18 +861,4 @@ fn test_cursor_left_hops_over_tag() {
     app.cursor = "a [image #1]".len();
     app.cursor_left();
     assert_eq!(app.cursor, "a ".len());
-}
-
-#[test]
-fn test_append_missing_attachment_tags_seeds_draft() {
-    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-    let mut app = make_test_app(tx, rx);
-    app.draft_attachments.push(image_attachment("one.png"));
-    app.draft_attachments.push(image_attachment("two.png"));
-    app.append_missing_attachment_tags();
-    assert_eq!(app.draft, "[image #1] [image #2] ");
-    assert_eq!(app.cursor, app.draft.len());
-    // Idempotent.
-    app.append_missing_attachment_tags();
-    assert_eq!(app.draft, "[image #1] [image #2] ");
 }

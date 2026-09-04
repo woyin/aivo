@@ -195,7 +195,6 @@ impl CodeTuiApp {
                     command,
                     SlashCommand::Skill { .. } | SlashCommand::CreateSkill(_)
                 );
-                let was_attach = matches!(command, SlashCommand::Attach(_));
                 let typed = self.draft.trim().to_string();
                 match self.execute_slash_command(command).await {
                     Ok(should_exit) => {
@@ -206,9 +205,6 @@ impl CodeTuiApp {
                         }
                         self.draft.clear();
                         self.cursor = 0;
-                        if was_attach {
-                            self.append_missing_attachment_tags();
-                        }
                         self.command_menu.reset();
                         Ok(should_exit)
                     }
@@ -310,30 +306,37 @@ impl CodeTuiApp {
 
     /// Send a skill invocation: the model receives `content` (the expanded skill
     /// body), but the draft history records `typed` (`/name args`) so up-arrow
-    /// recalls the re-runnable command, not the expanded body.
+    /// recalls the re-runnable command, not the expanded body. Not user prose,
+    /// so its `@` tokens are never file mentions.
     pub(super) async fn send_skill_message(
         &mut self,
         content: String,
         typed: String,
     ) -> Result<()> {
-        self.dispatch_user_message(content, Some(typed)).await
+        self.dispatch_user_message_shown(content, Some(typed), None, Vec::new())
+            .await
     }
 
+    /// User-authored text: `@path` mentions resolve here, before anything is sent.
     pub(super) async fn dispatch_user_message(
         &mut self,
         input: String,
         record: Option<String>,
     ) -> Result<()> {
-        self.dispatch_user_message_shown(input, record, None).await
+        let mentioned = self.mention_attachments(&input)?;
+        self.dispatch_user_message_shown(input, record, None, mentioned)
+            .await
     }
 
-    /// Like [`dispatch_user_message`], but the transcript shows `display`
-    /// (e.g. `/goal — continue`) while the model receives the full `input`.
+    /// Like [`dispatch_user_message`] minus mention resolution (machine-framed
+    /// text); the transcript shows `display` (e.g. `/goal — continue`) while the
+    /// model receives the full `input`.
     pub(super) async fn dispatch_user_message_shown(
         &mut self,
         input: String,
         record: Option<String>,
         display: Option<String>,
+        mentioned: Vec<MessageAttachment>,
     ) -> Result<()> {
         // Images never change the route: describer → described text; known
         // text-only without one → placeholder notes, except a fresh image
@@ -342,7 +345,11 @@ impl CodeTuiApp {
         let mut vision_shim: Option<DescriberSource> = None;
         let mut placeholder_images = false;
         if self.model_image_input != Some(true) {
-            let has_image_draft = self.draft_attachments.iter().any(|a| a.is_image());
+            let has_image_draft = self
+                .draft_attachments
+                .iter()
+                .chain(&mentioned)
+                .any(|a| a.is_image());
             let known_text_only = self.model_image_input == Some(false);
             if has_image_draft
                 || self.history_has_image()
@@ -359,7 +366,9 @@ impl CodeTuiApp {
                 }
             }
         }
-        let attachments = materialize_attachments(&self.draft_attachments).await?;
+        let mut staged = self.draft_attachments.clone();
+        staged.extend(mentioned);
+        let attachments = materialize_attachments(&staged).await?;
         if self.key.is_cursor_acp()
             && let Some(session) = self.cursor_acp_session.as_ref()
         {
@@ -375,7 +384,8 @@ impl CodeTuiApp {
             self.record_draft_history(&record);
         }
         self.draft.clear();
-        self.draft_attachments.clear();
+        // Mentions re-resolve on resend, so restoring them too would double up.
+        let pasted = std::mem::take(&mut self.draft_attachments);
         self.cursor = 0;
         self.command_menu.reset();
         self.overlay = Overlay::None;
@@ -400,7 +410,7 @@ impl CodeTuiApp {
         self.wait_tick = None;
         self.pending_submit = Some(PendingSubmission {
             content: input.clone(),
-            attachments: attachments.clone(),
+            attachments: pasted,
         });
         self.request_started_at = Some(Instant::now());
         // A new message starts (possibly) new work — drop a stale plan card so it
@@ -465,6 +475,11 @@ impl CodeTuiApp {
         if input.trim().is_empty() {
             return;
         }
+        // Validate while the draft is still editable.
+        if let Err(err) = self.mention_attachments(&input) {
+            self.notice = Some((ERROR(), err.to_string()));
+            return;
+        }
         self.record_draft_history(&input);
         // Serve up + not `/compact` (which runs no batches) = a steerable run.
         if self.agent_serve.is_some() && self.compact_before.is_none() {
@@ -520,11 +535,25 @@ impl CodeTuiApp {
     /// Records nothing — queue sites already recorded the recallable form, and a
     /// queued skill's expanded body must not land in ↑/↓ recall.
     pub(super) async fn drain_queued_message(&mut self) -> Result<()> {
-        if !self.sending && !self.queued_messages.is_empty() {
-            let queued = self.queued_messages.remove(0);
-            self.dispatch_user_message(queued, None).await?;
+        if self.sending || self.queued_messages.is_empty() {
+            return Ok(());
         }
-        Ok(())
+        let queued = self.queued_messages.remove(0);
+        // The dispatch would wipe a mid-turn draft and send its pasted images.
+        let draft = std::mem::take(&mut self.draft);
+        let cursor = self.cursor;
+        let attachments = std::mem::take(&mut self.draft_attachments);
+        let sent = if skill_invocation_label(&queued).is_some() {
+            self.dispatch_user_message_shown(queued, None, None, Vec::new())
+                .await
+        } else {
+            self.dispatch_user_message(queued, None).await
+        };
+        self.draft = draft;
+        self.cursor = cursor;
+        self.draft_attachments = attachments;
+        self.sync_command_menu_state();
+        sent
     }
 
     /// Poll the open-session mailbox (~700ms). Mail is claimed only when idle,
@@ -577,8 +606,13 @@ impl CodeTuiApp {
             msg_id: msg.id.clone(),
             blocking: msg.awaiting_reply,
         });
-        self.dispatch_user_message_shown(msg.agent_frame(), None, Some(msg.transcript_display()))
-            .await?;
+        self.dispatch_user_message_shown(
+            msg.agent_frame(),
+            None,
+            Some(msg.transcript_display()),
+            Vec::new(),
+        )
+        .await?;
         Ok(true)
     }
 
@@ -1929,15 +1963,6 @@ impl CodeTuiApp {
         }));
     }
 
-    pub(super) fn queue_attachment(&mut self, path: String) -> Result<()> {
-        let attachment = build_pending_attachment(&path)?;
-        let name = attachment.name.clone();
-        let kind = attachment_kind_label(&attachment);
-        self.draft_attachments.push(attachment);
-        self.notice = Some((MUTED(), format!("Queued {kind}: {name}")));
-        Ok(())
-    }
-
     pub(super) async fn execute_slash_command(&mut self, command: SlashCommand) -> Result<bool> {
         match command {
             SlashCommand::New => {
@@ -1964,10 +1989,6 @@ impl CodeTuiApp {
             }
             SlashCommand::Key(query) => {
                 self.open_or_switch_key(query).await?;
-                Ok(false)
-            }
-            SlashCommand::Attach(path) => {
-                self.queue_attachment(path)?;
                 Ok(false)
             }
             SlashCommand::Copy(n) => {
@@ -2655,7 +2676,7 @@ impl CodeTuiApp {
                 let first = format!("{GOAL_PREAMBLE}\n\nObjective: {objective}");
                 let typed = format!("/goal {objective}");
                 if let Err(e) = self
-                    .dispatch_user_message_shown(first, None, Some(typed))
+                    .dispatch_user_message_shown(first, None, Some(typed), Vec::new())
                     .await
                 {
                     self.goal_mode = None;
@@ -2796,7 +2817,12 @@ and keep each turn's work small"
         let cursor = self.cursor;
         let attachments = std::mem::take(&mut self.draft_attachments);
         let sent = self
-            .dispatch_user_message_shown(continuation, None, Some("/goal — continue".to_string()))
+            .dispatch_user_message_shown(
+                continuation,
+                None,
+                Some("/goal — continue".to_string()),
+                Vec::new(),
+            )
             .await;
         self.draft = draft;
         self.cursor = cursor;
@@ -3335,7 +3361,9 @@ and keep each turn's work small"
         let stash = std::mem::take(&mut self.draft);
         let cursor = self.cursor;
         let attachments = std::mem::take(&mut self.draft_attachments);
-        let sent = self.dispatch_user_message_shown(message, None, shown).await;
+        let sent = self
+            .dispatch_user_message_shown(message, None, shown, Vec::new())
+            .await;
         self.draft = stash;
         self.cursor = cursor;
         self.draft_attachments = attachments;
@@ -3774,6 +3802,7 @@ and keep each turn's work small"
                 "The plan is approved — implement it now.".to_string(),
                 None,
                 Some("/plan go".to_string()),
+                Vec::new(),
             )
             .await;
         self.draft = draft;

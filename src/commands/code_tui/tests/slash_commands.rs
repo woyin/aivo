@@ -7,9 +7,9 @@ fn test_parse_slash_command_with_argument() {
         parse_slash_command("model claude-sonnet-4").unwrap(),
         SlashCommand::Model(Some("claude-sonnet-4".to_string()))
     );
-    assert_eq!(
-        parse_slash_command("attach ./README.md").unwrap(),
-        SlashCommand::Attach("./README.md".to_string())
+    assert!(
+        parse_slash_command("attach ./README.md").is_err(),
+        "/attach was removed — @path in the message attaches instead"
     );
     assert_eq!(
         parse_slash_command("resume").unwrap(),

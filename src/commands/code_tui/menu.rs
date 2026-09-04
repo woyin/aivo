@@ -52,11 +52,7 @@ pub(super) fn filter_skill_commands(commands: &[SkillCommand], query: &str) -> V
     prefix_matches
 }
 
-pub(super) fn collect_path_suggestions(
-    cwd: &str,
-    command: &str,
-    query: &str,
-) -> Vec<PathMenuEntry> {
+pub(super) fn collect_path_suggestions(cwd: &str, query: &str) -> Vec<PathMenuEntry> {
     let trimmed = query.trim_start();
     let (dir_part, prefix) = match trimmed.rfind('/') {
         Some(index) => (&trimmed[..=index], &trimmed[index + 1..]),
@@ -91,7 +87,7 @@ pub(super) fn collect_path_suggestions(
                 label: display_name.clone(),
                 is_dir,
                 description: if is_dir { "directory" } else { "file" }.to_string(),
-                insertion_text: format!("/{command} {dir_part}{display_name}"),
+                path: format!("{dir_part}{display_name}"),
             })
         })
         .collect::<Vec<_>>();
@@ -233,7 +229,7 @@ pub(super) fn render_command_menu_rows(
             match menu.kind {
                 MenuKind::Commands => "No matching command — keep typing or Esc",
                 MenuKind::Path => "No matching path — keep typing or Esc",
-                MenuKind::Mention => "No matching sub-agent — keep typing or Esc",
+                MenuKind::Mention => "No matching file or sub-agent — keep typing or Esc",
             },
             Style::default().fg(MUTED()),
         ))];

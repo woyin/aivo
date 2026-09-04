@@ -200,11 +200,13 @@ Type `/help` for the full list. Slash commands:
 
 - Session: `/new`, `/resume [query]`, `/rewind` (undo edits), `/copy [n]`, `/config`, `/share [stop]`, `/help`, `/exit`
 - Model & key: `/model [name]`, `/key [id|name]`
-- Context: `/attach <path>`, `/compact [fast]`, `/context`, `/memory`
+- Context: `/compact [fast]`, `/context`, `/memory`
 - Skills & tools: `/skills`, `/create-skill`, `/mcp` (CLI twins: `aivo code skills`, `aivo code mcp`)
 - Autonomous: `/plan <objective>`, `/goal <objective>`
 
-Other input: `!cmd` runs a local shell command; `//` / `!!` escape to literal text.
+Other input: `@path` attaches a file or image to the message (Tab completes; quote paths with
+spaces: `@"my notes.md"`); `@agent-<name>` delegates to that sub-agent; `!cmd` runs a local shell
+command; `//` / `!!` escape to literal text.
 
 Keys: `Enter` send · `Ctrl+J` newline · `Tab` complete · `Ctrl+V` paste text/image ·
 `Ctrl+X Ctrl+E` edit draft in $EDITOR · `Shift+Tab` cycle mode (default/auto-approve/plan/ask) · `Ctrl+R` resume ·

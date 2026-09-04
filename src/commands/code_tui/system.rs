@@ -641,9 +641,6 @@ pub(super) fn parse_slash_command(input: &str) -> Result<SlashCommand> {
         "resume" => Ok(SlashCommand::Resume(argument)),
         "model" => Ok(SlashCommand::Model(argument)),
         "key" => Ok(SlashCommand::Key(argument)),
-        "attach" => Ok(SlashCommand::Attach(
-            argument.ok_or_else(|| anyhow::anyhow!("Usage: /attach <path>"))?,
-        )),
         "copy" => Ok(SlashCommand::Copy(match argument {
             None => None,
             Some(value) => Some(
