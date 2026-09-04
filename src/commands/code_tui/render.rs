@@ -726,7 +726,7 @@ fn thinking_marker(has_more: bool, expanded: bool) -> &'static str {
 }
 
 /// A clickable thinking header. Must reject every other `✻`/`▸`/`▾`-leading row
-/// (`✻ Done in`, `✻ Tip`, output fold markers) — false positives shift the
+/// (`✻ Done in`, `✻ Paused after`, `✻ Tip`, output fold markers) — false positives shift the
 /// click ordinal and toggle the wrong block.
 pub(super) fn is_thinking_header(row: &str) -> bool {
     let row = row.trim_start();
@@ -740,6 +740,7 @@ pub(super) fn is_thinking_header(row: &str) -> bool {
     rest.starts_with(' ')
         && !is_output_expander(row)
         && !rest.starts_with(" Done in ")
+        && !rest.starts_with(" Paused after ")
         && !rest.starts_with(" Tip ")
 }
 
@@ -2967,6 +2968,19 @@ pub(super) fn plan_all_completed(content: &str) -> bool {
                     .iter()
                     .all(|i| i.get("status").and_then(|s| s.as_str()) == Some("completed"))
         })
+}
+
+pub(super) fn plan_steps_left(content: &str) -> usize {
+    serde_json::from_str::<serde_json::Value>(content)
+        .ok()
+        .and_then(|v| v.as_array().cloned())
+        .map(|items| {
+            items
+                .iter()
+                .filter(|i| i.get("status").and_then(|s| s.as_str()) != Some("completed"))
+                .count()
+        })
+        .unwrap_or(0)
 }
 
 /// True when no step is past `pending` — a proposed plan not yet executed. Dropped

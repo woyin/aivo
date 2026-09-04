@@ -95,6 +95,7 @@ impl CodeTuiApp {
             self.history.remove(idx);
             shift_index_map_after_removal(&mut self.turn_durations, idx);
             shift_index_map_after_removal(&mut self.turn_notes, idx);
+            shift_index_map_after_removal(&mut self.turn_pauses, idx);
             shift_index_map_after_removal(&mut self.reasoning_durations, idx);
             shift_index_map_after_removal(&mut self.local_outputs, idx);
             shift_index_set_after_removal(&mut self.expanded_thinking, idx);
@@ -192,6 +193,7 @@ impl CodeTuiApp {
         self.reasoning_durations.clear();
         self.turn_durations.clear();
         self.turn_notes.clear();
+        self.turn_pauses.clear();
         self.clear_transcript_selection();
         self.reset_composer();
         self.pending_response.clear();

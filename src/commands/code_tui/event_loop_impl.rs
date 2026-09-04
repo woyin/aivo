@@ -1087,6 +1087,22 @@ impl CodeTuiApp {
                 }
             }
         }
+        if let Some(idx) = done_idx
+            && !self.plan_mode
+            && !self.ask_mode
+            && self.goal_mode.is_none()
+        {
+            let left = self
+                .history
+                .iter()
+                .rev()
+                .find(|m| m.role == "plan")
+                .map(|m| plan_steps_left(&m.content))
+                .unwrap_or(0);
+            if left > 0 {
+                self.turn_pauses.insert(idx, left);
+            }
+        }
         self.retrying = false;
         // A retry that recovered on the final step has no later chunk to clear it.
         self.clear_retry_notice();

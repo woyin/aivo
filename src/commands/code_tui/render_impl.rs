@@ -702,12 +702,19 @@ impl CodeTuiApp {
                     .get(&i)
                     .map(|n| format!(" · {n}"))
                     .unwrap_or_default();
+                let elapsed = format_request_elapsed(std::time::Duration::from_millis(ms));
+                let marker = match self.turn_pauses.get(&i) {
+                    Some(&left) => {
+                        let s = if left == 1 { "" } else { "s" };
+                        format!(
+                            "  ✻ Paused after {elapsed}{note} · {left} step{s} left — reply to continue"
+                        )
+                    }
+                    None => format!("  ✻ Done in {elapsed}{note}"),
+                };
                 push_styled_line(
                     &mut lines,
-                    format!(
-                        "  ✻ Done in {}{note}",
-                        format_request_elapsed(std::time::Duration::from_millis(ms))
-                    ),
+                    marker,
                     Style::default().fg(MUTED()).add_modifier(Modifier::ITALIC),
                 );
                 bars.push(None);

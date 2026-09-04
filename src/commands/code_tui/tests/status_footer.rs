@@ -1825,3 +1825,104 @@ fn test_footer_stats_render_width_gated() {
     assert!(!narrow.contains("tok/s"), "{narrow}");
     assert!(!narrow.contains("cache:"), "{narrow}");
 }
+
+fn plan_row(content: &str) -> ChatMessage {
+    ChatMessage {
+        model: None,
+        role: "plan".to_string(),
+        content: content.to_string(),
+        reasoning_content: None,
+        attachments: vec![],
+    }
+}
+
+#[test]
+fn test_paused_marker_over_unfinished_plan() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.history.push(ChatMessage {
+        model: None,
+        role: "assistant".to_string(),
+        content: "I'll rewrite it after approval.".to_string(),
+        reasoning_content: None,
+        attachments: vec![],
+    });
+    let idx = app.history.len() - 1;
+    app.turn_durations.insert(idx, 277_000);
+    app.turn_notes.insert(idx, "9.6k tokens".to_string());
+    app.turn_pauses.insert(idx, 3);
+    let plain = app.build_transcript().plain_lines.join("\n");
+    assert!(
+        plain.contains("✻ Paused after 4m 37s · 9.6k tokens · 3 steps left — reply to continue"),
+        "{plain}"
+    );
+    assert!(!plain.contains("Done in"), "{plain}");
+    let row = plain.lines().find(|l| l.contains("Paused after")).unwrap();
+    assert!(!is_thinking_header(row), "{row}");
+
+    app.turn_pauses.insert(idx, 1);
+    app.transcript_revision = app.transcript_revision.wrapping_add(1);
+    let plain = app.build_transcript().plain_lines.join("\n");
+    assert!(
+        plain.contains("· 1 step left — reply to continue"),
+        "{plain}"
+    );
+}
+
+async fn finish_over_plan(app: &mut CodeTuiApp, plan: &str) -> Option<usize> {
+    app.history.push(ChatMessage {
+        model: None,
+        role: "assistant".to_string(),
+        content: "proposal".to_string(),
+        reasoning_content: None,
+        attachments: vec![],
+    });
+    let idx = app.history.len() - 1;
+    app.history.push(plan_row(plan));
+    app.sending = true;
+    app.request_started_at =
+        std::time::Instant::now().checked_sub(std::time::Duration::from_secs(3));
+    app.tx
+        .send(RuntimeEvent::AgentFinished {
+            steps: 1,
+            tokens: 0,
+            context_tokens: 0,
+        })
+        .unwrap();
+    app.handle_runtime_events().await.unwrap();
+    assert!(
+        app.turn_durations.contains_key(&idx),
+        "marker stamped on the reply"
+    );
+    app.turn_pauses.get(&idx).copied()
+}
+
+const UNFINISHED_PLAN: &str = r#"[{"step":"inspect","status":"completed"},{"step":"propose","status":"in_progress"},{"step":"rewrite","status":"pending"}]"#;
+
+#[tokio::test]
+async fn test_finish_over_unfinished_plan_records_steps_left() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    assert_eq!(finish_over_plan(&mut app, UNFINISHED_PLAN).await, Some(2));
+}
+
+#[tokio::test]
+async fn test_finish_over_completed_plan_is_done() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    let done =
+        r#"[{"step":"inspect","status":"completed"},{"step":"rewrite","status":"completed"}]"#;
+    assert_eq!(finish_over_plan(&mut app, done).await, None);
+}
+
+#[tokio::test]
+async fn test_finish_in_read_only_modes_is_done() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.plan_mode = true;
+    assert_eq!(finish_over_plan(&mut app, UNFINISHED_PLAN).await, None);
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.ask_mode = true;
+    assert_eq!(finish_over_plan(&mut app, UNFINISHED_PLAN).await, None);
+}

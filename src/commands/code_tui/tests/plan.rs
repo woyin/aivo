@@ -77,12 +77,14 @@ fn test_clear_completed_plan_shifts_index_maps() {
     });
     // Markers keyed to the entry AFTER the plan (idx 2) must slide to idx 1.
     app.turn_durations.insert(2, 5_000);
+    app.turn_pauses.insert(2, 3);
     app.expanded_thinking.insert(2);
 
     app.clear_stale_plan();
 
     assert_eq!(app.turn_durations.get(&2), None, "stale key dropped");
     assert_eq!(app.turn_durations.get(&1), Some(&5_000), "shifted down one");
+    assert_eq!(app.turn_pauses.get(&1), Some(&3), "pause key shifted too");
     assert!(app.expanded_thinking.contains(&1), "set key shifted too");
 }
 

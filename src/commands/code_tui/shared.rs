@@ -3665,6 +3665,8 @@ pub(super) struct CodeTuiApp {
     /// Completion note appended to the `✻ Done in …` marker (this turn's tokens
     /// and estimated cost), keyed and cleared like `turn_durations`.
     pub(super) turn_notes: std::collections::HashMap<usize, String>,
+    /// Open plan steps at turn end; keyed like `turn_durations`.
+    pub(super) turn_pauses: std::collections::HashMap<usize, usize>,
     /// When the current segment's reasoning started streaming (first reasoning
     /// chunk), for the live `▸ thought for Ns` timer. `None` between segments.
     pub(super) reasoning_started_at: Option<Instant>,
@@ -4064,6 +4066,7 @@ impl CodeTuiApp {
             reasoning_durations: std::collections::HashMap::new(),
             turn_durations: std::collections::HashMap::new(),
             turn_notes: std::collections::HashMap::new(),
+            turn_pauses: std::collections::HashMap::new(),
             reasoning_started_at: None,
             reasoning_elapsed_ms: None,
             installing_skill: None,
