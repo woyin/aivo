@@ -134,6 +134,9 @@ pub(super) fn resolve_file_mentions(
 }
 
 fn regular_file(cwd: &str, path: &str) -> Option<String> {
+    if cfg!(windows) && path.ends_with(['.', ' ']) {
+        return None;
+    }
     let expanded = crate::services::system_env::expand_tilde(path);
     let full = if expanded.is_absolute() {
         expanded
