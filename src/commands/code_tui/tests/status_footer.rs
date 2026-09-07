@@ -1850,7 +1850,7 @@ fn test_paused_marker_over_unfinished_plan() {
     let idx = app.history.len() - 1;
     app.turn_durations.insert(idx, 277_000);
     app.turn_notes.insert(idx, "9.6k tokens".to_string());
-    app.turn_pauses.insert(idx, 3);
+    app.turn_pauses.insert(idx, TurnPause::Steps(3));
     let plain = app.build_transcript().plain_lines.join("\n");
     assert!(
         plain.contains("✻ Paused after 4m 37s · 9.6k tokens · 3 steps left — reply to continue"),
@@ -1860,7 +1860,7 @@ fn test_paused_marker_over_unfinished_plan() {
     let row = plain.lines().find(|l| l.contains("Paused after")).unwrap();
     assert!(!is_thinking_header(row), "{row}");
 
-    app.turn_pauses.insert(idx, 1);
+    app.turn_pauses.insert(idx, TurnPause::Steps(1));
     app.transcript_revision = app.transcript_revision.wrapping_add(1);
     let plain = app.build_transcript().plain_lines.join("\n");
     assert!(
@@ -1869,7 +1869,7 @@ fn test_paused_marker_over_unfinished_plan() {
     );
 }
 
-async fn finish_over_plan(app: &mut CodeTuiApp, plan: &str) -> Option<usize> {
+async fn finish_over_plan(app: &mut CodeTuiApp, plan: &str) -> Option<TurnPause> {
     app.history.push(ChatMessage {
         model: None,
         role: "assistant".to_string(),
@@ -1903,7 +1903,10 @@ const UNFINISHED_PLAN: &str = r#"[{"step":"inspect","status":"completed"},{"step
 async fn test_finish_over_unfinished_plan_records_steps_left() {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let mut app = make_test_app(tx, rx);
-    assert_eq!(finish_over_plan(&mut app, UNFINISHED_PLAN).await, Some(2));
+    assert_eq!(
+        finish_over_plan(&mut app, UNFINISHED_PLAN).await,
+        Some(TurnPause::Steps(2))
+    );
 }
 
 #[tokio::test]
@@ -1925,4 +1928,113 @@ async fn test_finish_in_read_only_modes_is_done() {
     let mut app = make_test_app(tx, rx);
     app.ask_mode = true;
     assert_eq!(finish_over_plan(&mut app, UNFINISHED_PLAN).await, None);
+}
+
+fn row(role: &str, content: String) -> ChatMessage {
+    ChatMessage {
+        model: None,
+        role: role.to_string(),
+        content,
+        reasoning_content: None,
+        attachments: vec![],
+    }
+}
+
+fn call_row(name: &str, args: serde_json::Value) -> ChatMessage {
+    row(
+        "tool_call",
+        serde_json::json!({"name": name, "args": args}).to_string(),
+    )
+}
+
+async fn finish_over_calls(app: &mut CodeTuiApp, calls: Vec<ChatMessage>) -> Option<TurnPause> {
+    app.history
+        .push(row("user", "improve the docs page".into()));
+    app.history.extend(calls);
+    app.history
+        .push(row("assistant", "### Proposed approach".into()));
+    let idx = app.history.len() - 1;
+    app.sending = true;
+    app.request_started_at =
+        std::time::Instant::now().checked_sub(std::time::Duration::from_secs(3));
+    app.tx
+        .send(RuntimeEvent::AgentFinished {
+            steps: 1,
+            tokens: 0,
+            context_tokens: 0,
+        })
+        .unwrap();
+    app.handle_runtime_events().await.unwrap();
+    app.turn_pauses.get(&idx).copied()
+}
+
+#[tokio::test]
+async fn test_finish_after_ask_without_changes_pauses() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    let calls = vec![
+        call_row("read_file", serde_json::json!({"path": "docs.astro"})),
+        call_row(
+            "run_bash",
+            serde_json::json!({"command": "git status --short && git log -5 --oneline"}),
+        ),
+        call_row(
+            "ask_user",
+            serde_json::json!({"question": "Which direction?"}),
+        ),
+    ];
+    assert_eq!(
+        finish_over_calls(&mut app, calls).await,
+        Some(TurnPause::AskedThenIdle)
+    );
+}
+
+#[tokio::test]
+async fn test_finish_after_ask_with_changes_is_done() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    let calls = vec![
+        call_row(
+            "ask_user",
+            serde_json::json!({"question": "Which direction?"}),
+        ),
+        call_row("write_file", serde_json::json!({"path": "docs.astro"})),
+    ];
+    assert_eq!(finish_over_calls(&mut app, calls).await, None);
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    let calls = vec![
+        call_row(
+            "ask_user",
+            serde_json::json!({"question": "Which direction?"}),
+        ),
+        call_row("run_bash", serde_json::json!({"command": "npm run build"})),
+    ];
+    assert_eq!(finish_over_calls(&mut app, calls).await, None);
+}
+
+#[tokio::test]
+async fn test_finish_read_only_turn_without_ask_is_done() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    let calls = vec![call_row("grep", serde_json::json!({"pattern": "fn main"}))];
+    assert_eq!(finish_over_calls(&mut app, calls).await, None);
+}
+
+#[test]
+fn test_asked_then_idle_marker_text() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.history
+        .push(row("assistant", "### Proposed approach".into()));
+    let idx = app.history.len() - 1;
+    app.turn_durations.insert(idx, 154_000);
+    app.turn_notes.insert(idx, "2.6k tokens".to_string());
+    app.turn_pauses.insert(idx, TurnPause::AskedThenIdle);
+    let plain = app.build_transcript().plain_lines.join("\n");
+    assert!(
+        plain.contains("✻ Paused after 2m 34s · 2.6k tokens · nothing changed — reply to continue"),
+        "{plain}"
+    );
+    assert!(!plain.contains("Done in"), "{plain}");
 }

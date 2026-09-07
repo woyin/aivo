@@ -1836,6 +1836,13 @@ pub(super) enum PlanCarry {
     Interrupted(serde_json::Value),
 }
 
+/// Why a finished turn is a hand-back — the `✻ Paused after …` reason.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum TurnPause {
+    Steps(usize),
+    AskedThenIdle,
+}
+
 #[derive(Clone)]
 #[allow(clippy::large_enum_variant)]
 pub(super) enum ModelSelectionTarget {
@@ -3665,8 +3672,8 @@ pub(super) struct CodeTuiApp {
     /// Completion note appended to the `✻ Done in …` marker (this turn's tokens
     /// and estimated cost), keyed and cleared like `turn_durations`.
     pub(super) turn_notes: std::collections::HashMap<usize, String>,
-    /// Open plan steps at turn end; keyed like `turn_durations`.
-    pub(super) turn_pauses: std::collections::HashMap<usize, usize>,
+    /// Why a finished turn handed back; keyed like `turn_durations`, absent = done.
+    pub(super) turn_pauses: std::collections::HashMap<usize, TurnPause>,
     /// When the current segment's reasoning started streaming (first reasoning
     /// chunk), for the live `▸ thought for Ns` timer. `None` between segments.
     pub(super) reasoning_started_at: Option<Instant>,

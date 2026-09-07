@@ -704,12 +704,15 @@ impl CodeTuiApp {
                     .unwrap_or_default();
                 let elapsed = format_request_elapsed(std::time::Duration::from_millis(ms));
                 let marker = match self.turn_pauses.get(&i) {
-                    Some(&left) => {
-                        let s = if left == 1 { "" } else { "s" };
+                    Some(TurnPause::Steps(left)) => {
+                        let s = if *left == 1 { "" } else { "s" };
                         format!(
                             "  ✻ Paused after {elapsed}{note} · {left} step{s} left — reply to continue"
                         )
                     }
+                    Some(TurnPause::AskedThenIdle) => format!(
+                        "  ✻ Paused after {elapsed}{note} · nothing changed — reply to continue"
+                    ),
                     None => format!("  ✻ Done in {elapsed}{note}"),
                 };
                 push_styled_line(

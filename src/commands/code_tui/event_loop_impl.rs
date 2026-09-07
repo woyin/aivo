@@ -1100,7 +1100,9 @@ impl CodeTuiApp {
                 .map(|m| plan_steps_left(&m.content))
                 .unwrap_or(0);
             if left > 0 {
-                self.turn_pauses.insert(idx, left);
+                self.turn_pauses.insert(idx, TurnPause::Steps(left));
+            } else if self.turn_asked_then_idled() {
+                self.turn_pauses.insert(idx, TurnPause::AskedThenIdle);
             }
         }
         self.retrying = false;
@@ -1206,6 +1208,31 @@ impl CodeTuiApp {
         // start the next turn), continue toward the goal or stop on completion/cap.
         self.maybe_continue_goal().await?;
         Ok(())
+    }
+
+    /// Asked the user to decide, then changed nothing — the answer went nowhere.
+    /// Never asking = an ordinary read-only deliverable; unflagged tools = changed.
+    fn turn_asked_then_idled(&self) -> bool {
+        let start = self
+            .history
+            .iter()
+            .rposition(|m| m.role == "user")
+            .unwrap_or(0);
+        let mut asked = false;
+        for m in &self.history[start..] {
+            if m.role != "tool_call" {
+                continue;
+            }
+            let (name, args) = decode_tool_call(&m.content);
+            if name == "ask_user" {
+                asked = true;
+            } else if !crate::agent::tools::is_read_only(&name)
+                && !(name == "run_bash" && crate::agent::tools::is_readonly_command(&args))
+            {
+                return false;
+            }
+        }
+        asked
     }
 
     /// Record the agent turn in `aivo logs`. The per-turn loopback serve only
