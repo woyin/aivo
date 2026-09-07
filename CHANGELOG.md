@@ -1,5 +1,10 @@
 # Changelog
 
+## v0.49.4
+
+- improve(code): mark a turn that asked or left open tasks as paused, not done (018bcf96, eb083b4f)
+- improve(agent): carry-on hint in ask_user results, resume offsets, key redaction, codex custom-tool imports (4605bd88, 53f7ff1d)
+
 ## v0.49.3
 
 `@path` in the composer attaches files and `@agent-<name>` addresses a sub-agent, replacing `/attach`. Requests to OpenCode's backend now carry a stable session id, and a plan the user interrupted no longer lingers as an unfinishable task card.
