@@ -128,13 +128,27 @@ pub fn parse_ask(args: &Value) -> Result<(String, Vec<AskOption>, bool, bool), S
 
 const ANSWER_PREFIX: &str = "The user answered: ";
 
+/// The system prompt's "carry on in the same turn" rule, restated where the model reads it.
+pub const CONTINUE_CUE: &str = "Carry on in this turn using this answer. If you want the approach \
+approved before building, ask with ask_user (e.g. Approve / Adjust) — don't end the turn with a \
+written proposal unless the user asked only for a plan.";
+
 /// The tool result echoing the user's answer back to the model.
 pub fn confirmation(answer: &str) -> String {
     format!("{ANSWER_PREFIX}{answer}")
 }
 
+pub fn with_continue_cue(echo: &str) -> String {
+    format!("{echo}\n{CONTINUE_CUE}")
+}
+
 pub fn answer_from_result(output: &str) -> Option<&str> {
-    let answer = output.trim().strip_prefix(ANSWER_PREFIX)?.trim();
+    let answer = output
+        .trim()
+        .strip_prefix(ANSWER_PREFIX)?
+        .lines()
+        .next()?
+        .trim();
     (!answer.is_empty()).then_some(answer)
 }
 
@@ -222,6 +236,20 @@ mod tests {
         .unwrap();
         assert!(multi);
         assert!(!free); // forced off despite the explicit true
+    }
+
+    #[test]
+    fn cue_rides_on_its_own_line_and_stays_out_of_the_parsed_answer() {
+        let with = with_continue_cue(&confirmation("Approve"));
+        assert!(with.starts_with("The user answered: Approve\n"));
+        assert!(with.ends_with(CONTINUE_CUE));
+        assert_eq!(answer_from_result(&with), Some("Approve"));
+        assert_eq!(
+            answer_from_result(&confirmation("Approve")),
+            Some("Approve")
+        );
+        assert_eq!(answer_from_result(&confirmation("  ")), None);
+        assert_eq!(answer_from_result("unrelated"), None);
     }
 
     #[test]

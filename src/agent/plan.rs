@@ -59,7 +59,9 @@ COMPLETE ordered list (not a delta). Mark the step you're working on `in_progres
 step to `completed` the moment its work is actually done (not merely intended). Call this when you \
 begin a multi-step task and again \
 every time a step's status changes — and ALWAYS send a final call marking every step `completed` \
-once the task is done, so the plan doesn't linger as unfinished. Skip it for trivial one-step work."
+once the task is done, so the plan doesn't linger as unfinished. Skip it for trivial one-step work. \
+Steps are work you do this turn: a decision only the user can make is an `ask_user` call inside a \
+step, never a step that waits for approval."
             .to_string(),
         parameters: json!({
             "type": "object",
@@ -168,6 +170,30 @@ pub fn pinned_block(items: &[PlanItem]) -> String {
     out.trim_end().to_string()
 }
 
+/// Every session whose plan had an open "approved"/"for approval" step ended in a
+/// proposal hand-back unless the model asked via `ask_user`.
+pub const APPROVAL_GATE_NOTE: &str = "A step that waits for the user's approval must not end the \
+turn: get the decision with ask_user (e.g. Approve / Adjust) and carry on in this turn — don't hand \
+back a written proposal.";
+
+fn awaits_approval(items: &[PlanItem]) -> bool {
+    const CUES: [&str; 6] = [
+        "approv",
+        "sign-off",
+        "sign off",
+        "go-ahead",
+        "go ahead",
+        "confirm with",
+    ];
+    items
+        .iter()
+        .filter(|i| i.status != PlanStatus::Completed)
+        .any(|i| {
+            let step = i.step.to_ascii_lowercase();
+            CUES.iter().any(|c| step.contains(c))
+        })
+}
+
 /// The confirmation echoed back to the model as the tool result, so it knows the
 /// plan it just set (and how many steps remain).
 pub fn confirmation(items: &[PlanItem]) -> String {
@@ -178,6 +204,9 @@ pub fn confirmation(items: &[PlanItem]) -> String {
     let mut out = format!("Plan updated ({done}/{} done):\n", items.len());
     for item in items {
         out.push_str(&format!("{} {}\n", item.status.checkbox(), item.step));
+    }
+    if awaits_approval(items) {
+        out.push_str(APPROVAL_GATE_NOTE);
     }
     out.trim_end().to_string()
 }
@@ -267,6 +296,26 @@ mod tests {
         assert!(!started(&plan(&["pending", "pending"])));
         assert!(started(&plan(&["pending", "in_progress"])));
         assert!(started(&plan(&["completed"])));
+    }
+
+    #[test]
+    fn open_approval_step_carries_the_note_until_done() {
+        let gated = parse_plan(&json!({"plan": [
+            {"step": "Propose a redesign for approval", "status": "in_progress"},
+            {"step": "Implement the approved changes", "status": "pending"}
+        ]}))
+        .unwrap();
+        assert!(confirmation(&gated).ends_with(APPROVAL_GATE_NOTE));
+
+        let done = parse_plan(&json!({"plan": [
+            {"step": "Implement the approved changes", "status": "completed"}
+        ]}))
+        .unwrap();
+        assert!(!confirmation(&done).contains(APPROVAL_GATE_NOTE));
+
+        let plain =
+            parse_plan(&json!({"plan": [{"step": "Run tests", "status": "pending"}]})).unwrap();
+        assert!(!confirmation(&plain).contains(APPROVAL_GATE_NOTE));
     }
 
     #[test]

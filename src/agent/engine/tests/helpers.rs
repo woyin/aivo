@@ -47,6 +47,8 @@ pub(super) struct CapturingUi {
     pub(super) mail_rows: Vec<String>,
     /// Each `set_chat_effort` level, in order (the default declines instead).
     pub(super) efforts: Vec<String>,
+    /// Successful `tool_result` texts as the UI saw them.
+    pub(super) tool_outputs: Vec<String>,
 }
 
 impl AgentUi for CapturingUi {
@@ -68,8 +70,9 @@ impl AgentUi for CapturingUi {
         self.tools.push(name.to_string());
     }
     fn tool_result(&mut self, name: &str, r: &Result<String, String>) {
-        if r.is_err() {
-            self.tool_errors.push(name.to_string());
+        match r {
+            Ok(s) => self.tool_outputs.push(s.clone()),
+            Err(_) => self.tool_errors.push(name.to_string()),
         }
     }
     fn notify(&mut self, t: &str) {

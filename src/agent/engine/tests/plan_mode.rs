@@ -394,6 +394,44 @@ async fn dismissed_question_does_not_suppress_plan_approval() {
     assert!(ui.stops.is_empty(), "an approved plan resets the ladder");
 }
 
+/// No cue in plan mode — the turn should end on the plan card.
+#[tokio::test]
+async fn plan_mode_answer_has_no_continue_cue() {
+    let dir = tmp();
+    let ask = tool_call_sse(
+        "ask_user",
+        json!({ "question": "Which one?", "options": ["a", "b"] }),
+    );
+    let exit = tool_call_sse("exit_plan_mode", json!({"plan": "1. do X"}));
+    let port = spawn_sse_sequence(vec![ask, exit, FINAL_TEXT_SSE.to_string()]);
+    let client = reqwest::Client::builder().no_proxy().build().unwrap();
+    let base = format!("http://127.0.0.1:{port}");
+    let mut engine = AgentEngine::new(&dir.display().to_string(), "m", "", &[], &[], 0, 0);
+    engine.set_plan_mode(true);
+    let mut ui = CapturingUi {
+        plan_decision: Some(PlanDecision::Approve),
+        ..Default::default()
+    };
+    run_session(
+        &mut engine,
+        &turn_ctx(&client, &base, &dir),
+        Some("plan it".into()),
+        &mut ui,
+    )
+    .await;
+
+    let texts = tool_result_texts(&engine);
+    let result = texts
+        .iter()
+        .find(|t| t.starts_with("The user answered: a"))
+        .expect("the answer is echoed");
+    assert_eq!(
+        result.as_str(),
+        "The user answered: a",
+        "no cue in plan mode"
+    );
+}
+
 /// An empty `plan` argument is a steering error, not a card.
 #[tokio::test]
 async fn exit_plan_mode_empty_plan_errors() {

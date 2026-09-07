@@ -614,11 +614,18 @@ command in the foreground (drop `background`)."
                 }
             };
             // Redact secrets before going upstream; the local `tool_result` already showed the real output.
-            let (content, redacted) = secrets_guard::redact_for_model(&raw);
+            let (mut content, redacted) = secrets_guard::redact_for_model(&raw);
             if redacted > 0 {
                 ui.notify(&format!(
                     "redacted {redacted} secret-shaped value(s) from `{n}` output before sending upstream"
                 ));
+            }
+            // Model-only (the UI already got the bare echo); plan mode ends on the plan card instead.
+            if n == "ask_user"
+                && !self.plan_mode_on()
+                && ask::answer_from_result(&content).is_some()
+            {
+                content = ask::with_continue_cue(&content);
             }
             self.messages.push(json!({
                 "role": "tool",

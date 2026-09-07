@@ -479,6 +479,43 @@ async fn dismissed_question_is_a_result_not_a_failure() {
     );
 }
 
+/// The model gets the continue cue; the UI's copy stays the bare echo.
+#[tokio::test]
+async fn answered_question_result_carries_continue_cue() {
+    let dir = tmp();
+    let ask = tool_call_sse(
+        "ask_user",
+        json!({ "question": "Which one?", "options": ["a", "b"] }),
+    );
+    let port = spawn_sse_sequence(vec![ask, FINAL_TEXT_SSE.to_string()]);
+    let client = reqwest::Client::builder().no_proxy().build().unwrap();
+    let base = format!("http://127.0.0.1:{port}");
+    let mut engine = AgentEngine::new(&dir.display().to_string(), "m", "", &[], &[], 0, 0);
+    let mut ui = CapturingUi::default();
+    run_session(
+        &mut engine,
+        &turn_ctx(&client, &base, &dir),
+        Some("pick".into()),
+        &mut ui,
+    )
+    .await;
+
+    let texts = tool_result_texts(&engine);
+    let result = texts
+        .iter()
+        .find(|t| t.starts_with("The user answered: a"))
+        .expect("the answer is echoed");
+    assert!(
+        result.contains(crate::agent::ask::CONTINUE_CUE),
+        "answer carries the cue: {result}"
+    );
+    assert!(
+        ui.tool_outputs.iter().any(|t| t == "The user answered: a"),
+        "the transcript row is the bare echo: {:?}",
+        ui.tool_outputs
+    );
+}
+
 /// A re-ask after a dismissal never shows a second card: the engine
 /// auto-dismisses it and ends the turn instead of hinting a retry.
 #[tokio::test]
