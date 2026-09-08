@@ -232,6 +232,64 @@ async fn denial_named_protected_root_skips_escalated_rerun() {
     assert!(existed, "approved protected write did not run unconfined");
 }
 
+/// A second block with NO protected evidence is a misread, not the floor.
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn double_flagged_block_without_protected_evidence_skips_the_floor_prompt() {
+    if !crate::agent::sandbox::active() {
+        return;
+    }
+    let dir = tmp();
+    let home = crate::services::system_env::home_dir().unwrap();
+    // Quoted path = output, not a token; `| tail` masks the exit; the write makes it attributable.
+    let cmd = format!(
+        "touch probe.txt; echo 'touch: {}/aivo_misread: Operation not permitted' 2>&1 | tail -1",
+        home.display()
+    );
+    let bash = tool_call_sse("run_bash", json!({ "command": cmd }));
+    let port = spawn_sse_sequence(vec![bash, FINAL_TEXT_SSE.to_string()]);
+    let client = reqwest::Client::builder().no_proxy().build().unwrap();
+    let base = format!("http://127.0.0.1:{port}");
+    let mut engine = AgentEngine::new(&dir.display().to_string(), "m", "", &[], &[], 0, 0);
+    let mut ui = CapturingUi {
+        always_allow: true,
+        ..Default::default()
+    };
+    run_session(
+        &mut engine,
+        &turn_ctx(&client, &base, &dir),
+        Some("read the log".into()),
+        &mut ui,
+    )
+    .await;
+
+    // Auto-approve waives the escalated ask, so any ask here is the floor prompt.
+    assert!(
+        ui.ask_tools.is_empty(),
+        "a second block with no protected evidence must not raise the floor prompt: {:?}",
+        ui.ask_tools
+    );
+    assert_eq!(
+        ui.notices
+            .iter()
+            .filter(|n| n.contains("outside the workspace sandbox"))
+            .count(),
+        1,
+        "expected no unconfined third run: {:?}",
+        ui.notices
+    );
+    let tool_content: String = engine
+        .messages
+        .iter()
+        .filter(|m| m["role"] == "tool")
+        .filter_map(|m| m["content"].as_str())
+        .collect();
+    assert!(
+        tool_content.contains("aivo_misread"),
+        "the escalated output must reach the model: {tool_content}"
+    );
+}
+
 /// Approving the escalation re-runs outside the sandbox, so the blocked out-of-workspace write now succeeds.
 #[cfg(target_os = "macos")]
 #[tokio::test]

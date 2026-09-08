@@ -489,33 +489,35 @@ pub(super) async fn run_bash_inner(
     if code != 0 {
         out.push_str(&format!("\n[exit {code}]"));
     }
-    // Seatbelt denies with EPERM, Landlock with EACCES/EPERM. Harnesses like
-    // `cargo test` re-emit captured denials on stdout, so match both streams; on
-    // macOS "Permission denied" is an ordinary unreadable file, not a block.
+    // Node/Go lowercase the errno; macOS says "Permission denied" for a merely
+    // unreadable file.
     let denial_in = |s: &str| {
-        s.contains("Operation not permitted")
-            || (!cfg!(target_os = "macos") && s.contains("Permission denied"))
+        let s = s.to_ascii_lowercase();
+        s.contains("operation not permitted")
+            || (!cfg!(target_os = "macos") && s.contains("permission denied"))
     };
-    let denial = denial_in(&stderr) || denial_in(&stdout);
-    // `… | tail` / `; echo $?` masks the failing step's status, so exit 0 alone
-    // can't clear a denial — an escaping path stands in as the evidence. The
-    // command's own paths cover a denial line that names a relative one.
-    let masked_corroborated = || {
+    // Unmerged exit-0 stdout is the command's own output, not the shell's stderr.
+    let stdout_counts =
+        code != 0 || command.contains("2>&1") || command.contains("&>") || command.contains("|&");
+    let denial_lines = || {
         stderr
             .lines()
-            .chain(stdout.lines())
+            .chain(stdout_counts.then(|| stdout.lines()).into_iter().flatten())
             .filter(|l| denial_in(l))
-            .any(|l| denial_line_names_escaping_path(l, cwd))
+    };
+    let denial = denial_in(&stderr) || (stdout_counts && denial_in(&stdout));
+    // We deny writes and the protected read floor, nothing else.
+    let attributable = || !bash_is_readonly(command) || command_mentions_protected_path(command);
+    // A masked exit (`… | tail`) can't clear a denial, so exit 0 needs an
+    // escaping path instead; a failing exit stands alone (`cd ..` names none).
+    let corroborated = || {
+        denial_lines().any(|l| denial_line_names_escaping_path(l, cwd))
             || !command_escaping_paths(command, cwd).is_empty()
     };
     let mut blocked_protected = false;
-    if sandbox_enforced && denial && (code != 0 || masked_corroborated()) {
+    if sandbox_enforced && denial && attributable() && (code != 0 || corroborated()) {
         sandbox_blocked = true;
-        blocked_protected = stderr
-            .lines()
-            .chain(stdout.lines())
-            .filter(|l| denial_in(l))
-            .any(|l| denial_line_names_protected_path(l, cwd));
+        blocked_protected = denial_lines().any(|l| denial_line_names_protected_path(l, cwd));
         // The workspace note's remedies can't open a protected root.
         out.push_str(
             if blocked_protected || confinement != BashConfinement::Workspace {

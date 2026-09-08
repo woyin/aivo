@@ -874,7 +874,11 @@ Re-run the full command without write confinement?",
         if !escalated.sandbox_blocked {
             return escalated.result;
         }
-        // Blocked again = a protected root — confirm per call, even under auto-approve.
+        // No protected evidence = a misread of the command's own output, not the floor.
+        if !escalated.blocked_protected && !tools::command_mentions_protected_path(command) {
+            return escalated.result;
+        }
+        // The floor — confirm per call, even under auto-approve.
         let action = PermissionAction::Once {
             ask_name: "run_bash_unsandboxed",
             preview: Some(format!(

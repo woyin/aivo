@@ -173,8 +173,7 @@ async fn confined_block_on_protected_root_sets_blocked_protected() {
     assert!(outcome.result.unwrap().contains("protected path"));
 }
 
-/// Stdout denials flag too (harnesses like `cargo test` re-emit captured
-/// denials there); a spurious flag only costs a declinable escalation prompt.
+/// Stdout denials flag too (`cargo test` re-emits them there) when the exit fails.
 #[cfg(unix)]
 #[tokio::test]
 async fn denial_phrase_on_stdout_flags_sandbox_block() {
@@ -182,12 +181,96 @@ async fn denial_phrase_on_stdout_flags_sandbox_block() {
         return;
     }
     let dir = tmp();
-    let cmd =
-        json!({"command": "echo 'grep: Permission denied / Operation not permitted'; exit 1"});
+    let cmd = json!({"command": "echo 'grep: /etc/aivo-probe: Operation not permitted'; exit 1"});
     let outcome = run_bash_confined(&cmd, &dir, None).await;
     assert!(
         outcome.sandbox_blocked,
         "a captured denial re-emitted on stdout must flag for escalation"
+    );
+}
+
+/// We deny writes, so a denial in a read-only pipeline is someone else's.
+#[cfg(unix)]
+#[tokio::test]
+async fn denial_in_a_read_only_pipeline_does_not_flag() {
+    if !crate::agent::sandbox::active() {
+        return;
+    }
+    let dir = tmp();
+    let log = dir.join("deploy.log");
+    std::fs::write(&log, "cp: /etc/aivo-probe: Operation not permitted\n").unwrap();
+    // `grep -q` misses: the denial prints, the exit stays nonzero.
+    let cmd = json!({"command": format!(
+        "cat '{log}'; grep -q zzzz '{log}'",
+        log = log.display()
+    )});
+    let outcome = run_bash_confined(&cmd, &dir, None).await;
+    assert!(
+        !outcome.sandbox_blocked,
+        "a read-only pipeline can't have been blocked by a write sandbox"
+    );
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn read_only_command_on_a_protected_path_still_flags() {
+    if !crate::agent::sandbox::active() {
+        return;
+    }
+    let dir = tmp();
+    let ssh = crate::services::system_env::home_dir()
+        .unwrap()
+        .join(".ssh");
+    std::fs::create_dir_all(&ssh).unwrap();
+    let key = ssh.join(format!("aivo_read_probe_{}", std::process::id()));
+    std::fs::write(&key, "secret\n").unwrap();
+    let cmd = json!({"command": format!("cat '{}'", key.display())});
+    let outcome = run_bash_confined(&cmd, &dir, None).await;
+    let _ = std::fs::remove_file(&key);
+    assert!(outcome.sandbox_blocked, "a protected read must still flag");
+    assert!(outcome.blocked_protected);
+}
+
+/// A block after `cd ..` names no path anywhere: the failing exit is the only evidence.
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn relative_escape_with_failing_exit_flags() {
+    if !crate::agent::sandbox::active() {
+        return;
+    }
+    // TMPDIR is writable under the seatbelt, so the workspace goes under $HOME.
+    let home = crate::services::system_env::home_dir().unwrap();
+    let ws = home.join(format!("aivo_ws_{}", std::process::id()));
+    std::fs::create_dir_all(&ws).unwrap();
+    let name = format!("aivo_rel_probe_{}", std::process::id());
+    let target = home.join(&name);
+    let _ = std::fs::remove_file(&target);
+    let cmd = json!({"command": format!("cd .. && touch '{name}'")});
+    let outcome = run_bash_confined(&cmd, &ws, None).await;
+    let existed = target.exists();
+    let _ = std::fs::remove_file(&target);
+    let _ = std::fs::remove_dir_all(&ws);
+    assert!(!existed, "relative escape landed");
+    assert!(
+        outcome.sandbox_blocked,
+        "a real block after `cd ..` must flag"
+    );
+    assert!(!outcome.blocked_protected);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn lowercase_denial_phrase_flags() {
+    if !crate::agent::sandbox::active() {
+        return;
+    }
+    let dir = tmp();
+    let cmd = json!({"command": "touch inside.txt; \
+printf \"Error: EPERM: operation not permitted, mkdir '/etc/aivo-probe'\\n\" 1>&2; exit 1"});
+    let outcome = run_bash_confined(&cmd, &dir, None).await;
+    assert!(
+        outcome.sandbox_blocked,
+        "a lowercase errno spelling must still read as a denial"
     );
 }
 
@@ -277,6 +360,30 @@ async fn masked_exit_denial_without_path_evidence_does_not_flag() {
         !outcome.sandbox_blocked,
         "an exit-0 denial phrase with no path evidence must not flag"
     );
+}
+
+/// A log whose CONTENTS quote a denial isn't a block — stdout is the file's text.
+#[cfg(unix)]
+#[tokio::test]
+async fn denial_phrase_quoted_by_a_read_file_does_not_flag() {
+    if !crate::agent::sandbox::active() {
+        return;
+    }
+    let dir = tmp();
+    let log = dir.join("chrome.log");
+    std::fs::write(
+        &log,
+        "[ERROR:file_io_posix.cc:208] open /Users/x/Library/Application Support/Google/Chrome/\
+Crashpad/settings.dat: Operation not permitted (1)\n",
+    )
+    .unwrap();
+    let cmd = json!({"command": format!("cat '{}' 2>/dev/null | tail -40", log.display())});
+    let outcome = run_bash_confined(&cmd, &dir, None).await;
+    assert!(
+        !outcome.sandbox_blocked,
+        "a denial quoted by a file's contents must not read as a block against the reader"
+    );
+    assert!(outcome.result.unwrap().contains("settings.dat"));
 }
 
 /// macOS: a read denial ("Permission denied", EACCES on stderr) is not a
