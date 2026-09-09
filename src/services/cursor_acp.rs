@@ -1574,6 +1574,7 @@ impl CursorAcpSession {
             requested_model,
             workspace_cwd,
             None,
+            Vec::new(),
             ModelPickPreference::Default,
             model_only,
             None,
@@ -1599,6 +1600,7 @@ impl CursorAcpSession {
             requested_model,
             workspace_cwd,
             mcp_url,
+            Vec::new(),
             ModelPickPreference::Default,
             model_only,
             None,
@@ -1608,7 +1610,7 @@ impl CursorAcpSession {
         .await
     }
 
-    /// Most general open: lets callers register an MCP server and pick a model
+    /// Most general open: lets callers register MCP servers and pick a model
     /// preference. Tool permissions follow [`resolve_cursor_permission`].
     #[allow(clippy::too_many_arguments)]
     pub async fn open_with_options(
@@ -1616,6 +1618,7 @@ impl CursorAcpSession {
         requested_model: Option<&str>,
         workspace_cwd: &str,
         mcp_url: Option<&str>,
+        mcp_servers: Vec<Value>,
         model_pick_preference: ModelPickPreference,
         model_only: bool,
         auto_approve: Option<Arc<AtomicBool>>,
@@ -1683,16 +1686,18 @@ impl CursorAcpSession {
 
         let prompt_capabilities = PromptCapabilities::from_init_response(&init);
 
-        let mcp_servers: Vec<Value> = mcp_url
-            .map(|url| {
-                vec![json!({
+        let mut mcp_servers = mcp_servers;
+        if let Some(url) = mcp_url {
+            mcp_servers.insert(
+                0,
+                json!({
                     "type": "http",
                     "name": MCP_BRIDGE_SERVER_NAME,
                     "url": url,
                     "headers": [],
-                })]
-            })
-            .unwrap_or_default();
+                }),
+            );
+        }
         let new_session = client
             .request(
                 "session/new",
@@ -1849,11 +1854,18 @@ where
     // conversation-only (always-off toggle) so `-p` is fail-closed like the
     // native agent. `AIVO_CURSOR_ALLOW_TOOLS=1` still opts in (checked first).
     let one_shot_tools_off = Arc::new(AtomicBool::new(false));
+    let mcp_servers = crate::agent::mcp::acp_session_servers(
+        std::path::Path::new(workspace_cwd),
+        &std::collections::HashSet::new(),
+        true,
+    )
+    .await;
     let session = CursorAcpSession::open_with_options(
         key,
         requested_model,
         workspace_cwd,
         None,
+        mcp_servers,
         ModelPickPreference::PreferNoThinking,
         false,
         Some(one_shot_tools_off),

@@ -1821,6 +1821,30 @@ impl CodeTuiApp {
         }
     }
 
+    pub(super) fn drop_cursor_acp_child(&mut self) {
+        self.cursor_acp_session = None;
+        if let Some(handle) = self.cursor_prewarm.take() {
+            handle.abort();
+        }
+    }
+
+    pub(super) fn restart_cursor_session_for_mcp(&mut self) {
+        if !self.key.is_cursor_acp() {
+            return;
+        }
+        self.drop_cursor_acp_child();
+        self.prewarm_cursor_session();
+    }
+
+    pub(super) async fn prepare_and_prewarm_cursor_session(&mut self) {
+        let cwd = self.cursor_workspace_cwd();
+        self.seed_project_mcp_consent(&cwd).await;
+        if self.key.is_cursor_acp() {
+            self.prompt_project_mcp_if_needed(&cwd).await;
+        }
+        self.prewarm_cursor_session();
+    }
+
     /// Start opening the cursor ACP session in the background so its connect
     /// overlaps the user typing. The first turn consumes this in-flight open
     /// (see [`Self::spawn_cursor_turn`]) rather than starting its own, so
@@ -1839,11 +1863,15 @@ impl CodeTuiApp {
         let auto_approve = self.auto_approve_flag.clone();
         let permission_prompt = self.cursor_permission_prompt();
         let hooks = self.cursor_interaction_hooks();
+        let session_store = self.session_store.clone();
+        let hold_project = self.project_mcp_consent != ProjectMcpConsent::Allowed;
         self.cursor_prewarm = Some(tokio::spawn(async move {
+            let mcp_servers = collect_cursor_mcp_servers(&session_store, &cwd, hold_project).await;
             open_cursor_session(
                 key,
                 requested_model,
                 cwd,
+                mcp_servers,
                 auto_approve,
                 permission_prompt,
                 hooks,
@@ -1895,8 +1923,7 @@ impl CodeTuiApp {
         let key = self.key.clone();
         let key_id = key.id.clone();
         let requested_model = (!self.raw_model.is_empty()).then(|| self.raw_model.clone());
-        // A fresh open (prewarm/`/new`) comes up in `agent`; re-apply plan below.
-        let want_plan_mode = self.cursor_plan_mode;
+        let want_mode = self.cursor_acp_mode;
         let cwd = self.cursor_workspace_cwd();
         let tx = self.tx.clone();
         let format = self.format.clone();
@@ -1906,6 +1933,8 @@ impl CodeTuiApp {
         // Consume the startup prewarm so we reuse its open, not a second one.
         let prewarm = self.cursor_prewarm.take();
         let acp_store = self.acp_checkpoint_store.clone();
+        let session_store = self.session_store.clone();
+        let hold_project = self.project_mcp_consent != ProjectMcpConsent::Allowed;
 
         // Open + prompt happen inside the spawned task so the TUI event loop
         // keeps polling input. The Node.js startup + 3 RPC roundtrips on a
@@ -1941,6 +1970,8 @@ impl CodeTuiApp {
                                 key,
                                 requested_model.clone(),
                                 cwd,
+                                session_store.clone(),
+                                hold_project,
                                 cursor_auto_approve,
                                 permission_prompt,
                                 hooks,
@@ -1956,8 +1987,8 @@ impl CodeTuiApp {
                             if let Some(m) = &requested_model {
                                 let _ = session.set_model(m).await;
                             }
-                            if want_plan_mode {
-                                let _ = session.set_mode("plan").await;
+                            if want_mode != CursorAcpMode::Agent {
+                                let _ = session.set_mode(want_mode.acp_id()).await;
                             }
                             let handles = (
                                 session.client_handle(),
@@ -2450,7 +2481,7 @@ impl CodeTuiApp {
         self.cursor = self.draft.len();
         self.draft_attachments = removed.attachments;
         self.clear_transcript_selection();
-        self.cursor_acp_session = None;
+        self.drop_cursor_acp_child();
         self.follow_output = true;
 
         let notice = match ordinal {
@@ -2977,13 +3008,21 @@ and keep each turn's work small"
     /// read-only mode quiets the live flag, so `/new`, resume and exit-persist must
     /// read this, not `agent_auto_approve`.
     pub(super) fn standing_auto_approve(&self) -> bool {
-        if self.plan_mode {
+        if self.in_plan_mode() {
             self.plan_prior_mode == PlanPriorMode::Auto
-        } else if self.ask_mode {
+        } else if self.in_ask_mode() {
             self.ask_prior_mode == PlanPriorMode::Auto
         } else {
             self.agent_auto_approve
         }
+    }
+
+    pub(super) fn in_plan_mode(&self) -> bool {
+        self.plan_mode || self.cursor_acp_mode == CursorAcpMode::Plan
+    }
+
+    pub(super) fn in_ask_mode(&self) -> bool {
+        self.ask_mode || self.cursor_acp_mode == CursorAcpMode::Ask
     }
 
     /// Enter ask mode (read-only research): exclusive with plan and `/goal`, and a
@@ -3062,10 +3101,7 @@ and keep each turn's work small"
         let arg = arg.unwrap_or_default();
         let arg = arg.trim();
         if self.key.is_cursor_acp() {
-            self.notice = Some((
-                ERROR(),
-                "Ask mode needs the native agent (an API key or Copilot — not cursor)".to_string(),
-            ));
+            self.run_cursor_ask_command(arg).await;
             return;
         }
         match arg {
@@ -3744,14 +3780,14 @@ and keep each turn's work small"
                     self.queue_command(SlashCommand::Plan(Some("exit".to_string())), "/plan exit");
                     return;
                 }
-                if !self.cursor_plan_mode {
+                if self.cursor_acp_mode != CursorAcpMode::Plan {
                     self.notice = Some((MUTED(), "Plan mode isn't on".to_string()));
                     return;
                 }
-                self.set_cursor_mode(false).await;
+                let restored = self.leave_cursor_readonly().await;
                 self.notice = Some((
                     MUTED(),
-                    "Plan mode off — cursor is back in agent mode".to_string(),
+                    format!("Plan mode off — cursor is back in agent mode{restored}"),
                 ));
             }
             "go" | "run" | "execute" => {
@@ -3759,7 +3795,7 @@ and keep each turn's work small"
                     self.queue_command(SlashCommand::Plan(Some(full.to_string())), "/plan go");
                     return;
                 }
-                self.set_cursor_mode(false).await;
+                let _ = self.set_cursor_acp_mode(CursorAcpMode::Agent).await;
                 if rest.is_empty() {
                     self.notice = Some((
                         MUTED(),
@@ -3770,7 +3806,7 @@ and keep each turn's work small"
                 }
             }
             "" | "on" => {
-                if self.cursor_plan_mode {
+                if self.cursor_acp_mode == CursorAcpMode::Plan {
                     self.notice = Some((
                         MUTED(),
                         "Plan mode is on — describe what to plan, or /plan exit to leave"
@@ -3782,7 +3818,7 @@ and keep each turn's work small"
                     self.queue_command(SlashCommand::Plan(None), "/plan");
                     return;
                 }
-                if self.set_cursor_mode(true).await {
+                if self.enter_cursor_mode(CursorAcpMode::Plan).await {
                     self.notice = Some((
                         MUTED(),
                         "Plan mode — cursor plans read-only and asks you to approve".to_string(),
@@ -3794,7 +3830,9 @@ and keep each turn's work small"
                     self.queue_command(SlashCommand::Plan(Some(full.to_string())), "/plan");
                     return;
                 }
-                if !self.cursor_plan_mode && !self.set_cursor_mode(true).await {
+                if self.cursor_acp_mode != CursorAcpMode::Plan
+                    && !self.enter_cursor_mode(CursorAcpMode::Plan).await
+                {
                     return;
                 }
                 if let Err(e) = self.dispatch_user_message(full.to_string(), None).await {
@@ -3804,22 +3842,127 @@ and keep each turn's work small"
         }
     }
 
-    /// Switch the cursor session to `plan`/`agent`. Records the desired mode (a
-    /// later prewarm/`/new` open re-applies it) and applies it now if a session is
-    /// live. `false` only when a live session reports the mode unavailable.
-    async fn set_cursor_mode(&mut self, plan: bool) -> bool {
-        self.cursor_plan_mode = plan;
-        let mode = if plan { "plan" } else { "agent" };
+    async fn run_cursor_ask_command(&mut self, arg: &str) {
+        match arg {
+            "exit" | "stop" | "off" => {
+                if self.sending {
+                    self.queue_command(SlashCommand::Ask(Some("exit".to_string())), "/ask exit");
+                    return;
+                }
+                if self.cursor_acp_mode != CursorAcpMode::Ask {
+                    self.notice = Some((MUTED(), "Ask mode isn't on".to_string()));
+                    return;
+                }
+                let restored = self.leave_cursor_readonly().await;
+                self.notice = Some((MUTED(), format!("Ask mode off{restored}")));
+            }
+            "" => {
+                if self.cursor_acp_mode == CursorAcpMode::Ask {
+                    self.notice = Some((
+                        MUTED(),
+                        "Ask mode is on — just type your question (/ask exit to leave)".to_string(),
+                    ));
+                    return;
+                }
+                if self.sending {
+                    self.queue_command(SlashCommand::Ask(None), "/ask");
+                    return;
+                }
+                if self.enter_cursor_mode(CursorAcpMode::Ask).await {
+                    self.notice = Some((
+                        MUTED(),
+                        "Ask mode — cursor answers read-only (/ask exit to leave)".to_string(),
+                    ));
+                }
+            }
+            question => {
+                if self.sending {
+                    self.queue_command(SlashCommand::Ask(Some(question.to_string())), "/ask");
+                    return;
+                }
+                if self.cursor_acp_mode != CursorAcpMode::Ask
+                    && !self.enter_cursor_mode(CursorAcpMode::Ask).await
+                {
+                    return;
+                }
+                if let Err(e) = self.dispatch_user_message(question.to_string(), None).await {
+                    self.notice = Some((ERROR(), e.to_string()));
+                }
+            }
+        }
+    }
+
+    async fn enter_cursor_mode(&mut self, mode: CursorAcpMode) -> bool {
+        debug_assert!(matches!(mode, CursorAcpMode::Plan | CursorAcpMode::Ask));
+        let prior_auto = self.standing_auto_approve();
+        let prior = if prior_auto {
+            PlanPriorMode::Auto
+        } else {
+            PlanPriorMode::Default
+        };
+        match mode {
+            CursorAcpMode::Plan => self.plan_prior_mode = prior,
+            CursorAcpMode::Ask => self.ask_prior_mode = prior,
+            CursorAcpMode::Agent => {}
+        }
+        self.set_auto_quiet(false);
+        self.set_cursor_acp_mode(mode).await
+    }
+
+    async fn leave_cursor_readonly(&mut self) -> &'static str {
+        let restore_auto = match self.cursor_acp_mode {
+            CursorAcpMode::Plan => self.plan_prior_mode == PlanPriorMode::Auto,
+            CursorAcpMode::Ask => self.ask_prior_mode == PlanPriorMode::Auto,
+            CursorAcpMode::Agent => false,
+        };
+        let _ = self.set_cursor_acp_mode(CursorAcpMode::Agent).await;
+        if restore_auto {
+            self.set_auto_quiet(true);
+            " — back to auto-approve"
+        } else {
+            ""
+        }
+    }
+
+    pub(super) async fn cycle_cursor_acp_mode(&mut self) {
+        match self.cursor_acp_mode {
+            CursorAcpMode::Ask => {
+                let _ = self.set_cursor_acp_mode(CursorAcpMode::Agent).await;
+                self.show_toast("Default mode — risky actions ask first");
+            }
+            CursorAcpMode::Plan => {
+                if self.enter_cursor_mode(CursorAcpMode::Ask).await {
+                    self.show_toast("Ask mode — cursor answers read-only");
+                }
+            }
+            CursorAcpMode::Agent if self.agent_auto_approve => {
+                if self.enter_cursor_mode(CursorAcpMode::Plan).await {
+                    self.show_toast("Plan mode — read-only until you approve");
+                }
+            }
+            CursorAcpMode::Agent => {
+                self.set_auto_quiet(true);
+                self.show_toast("Auto-approve mode — tools run without asking");
+            }
+        }
+    }
+
+    pub(super) async fn set_cursor_acp_mode(&mut self, mode: CursorAcpMode) -> bool {
+        let previous = self.cursor_acp_mode;
+        self.cursor_acp_mode = mode;
         let Some(session) = self.cursor_acp_session.as_mut() else {
             return true;
         };
-        match session.set_mode(mode).await {
+        match session.set_mode(mode.acp_id()).await {
             Ok(true) => true,
             Ok(false) => {
-                self.cursor_plan_mode = false;
+                self.cursor_acp_mode = previous;
                 self.notice = Some((
                     ERROR(),
-                    format!("cursor didn't offer a '{mode}' mode for this session"),
+                    format!(
+                        "cursor didn't offer a '{}' mode for this session",
+                        mode.acp_id()
+                    ),
                 ));
                 false
             }
@@ -3847,8 +3990,8 @@ and keep each turn's work small"
         if self.sending || errored {
             return Ok(());
         }
-        if self.cursor_plan_mode {
-            self.set_cursor_mode(false).await;
+        if self.cursor_acp_mode == CursorAcpMode::Plan {
+            self.set_cursor_acp_mode(CursorAcpMode::Agent).await;
         }
         // Stash the composer so the dispatch can't wipe a mid-turn draft or
         // attach the user's staged files.
@@ -3990,8 +4133,8 @@ and keep each turn's work small"
         };
         // Drop the cursor session (no context bleed across /new), then
         // re-prewarm so the next message's connect overlaps typing.
-        self.cursor_acp_session = None;
-        self.cursor_plan_mode = false; // fresh session opens in `agent`
+        self.drop_cursor_acp_child();
+        self.cursor_acp_mode = CursorAcpMode::Agent;
         self.cursor_plan_go_pending = false;
         self.prewarm_cursor_session();
         // Drop the agent engine + serve so a fresh chat starts with no context.
@@ -4926,12 +5069,27 @@ impl crate::agent::engine::AgentUi for ChatAgentUi {
     }
 }
 
+async fn collect_cursor_mcp_servers(
+    session_store: &crate::services::session_store::SessionStore,
+    cwd: &str,
+    hold_project: bool,
+) -> Vec<serde_json::Value> {
+    let disabled: std::collections::HashSet<String> = session_store
+        .get_disabled_mcp_servers()
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .collect();
+    crate::agent::mcp::acp_session_servers(std::path::Path::new(cwd), &disabled, hold_project).await
+}
+
 /// Open a cursor ACP session with the TUI's standard options. Shared by
 /// `spawn_cursor_turn`'s cold-open and `prewarm_cursor_session`.
 async fn open_cursor_session(
     key: ApiKey,
     requested_model: Option<String>,
     cwd: String,
+    mcp_servers: Vec<serde_json::Value>,
     auto_approve: std::sync::Arc<std::sync::atomic::AtomicBool>,
     permission_prompt: cursor_acp::CursorPermissionPrompt,
     hooks: cursor_acp::CursorInteractionHooks,
@@ -4941,6 +5099,7 @@ async fn open_cursor_session(
         requested_model.as_deref(),
         &cwd,
         None,
+        mcp_servers,
         cursor_acp::ModelPickPreference::PreferNoThinking,
         false,
         Some(auto_approve),
@@ -4959,10 +5118,13 @@ async fn open_cursor_session(
 /// emitting a `retrying` notice through `tx` when present so the reconnect is
 /// visible (matching the native engine's retry UX). Permanent failures — missing
 /// binary, legacy key — return immediately; retrying them can't help.
+#[allow(clippy::too_many_arguments)]
 async fn open_cursor_session_with_retry(
     key: ApiKey,
     requested_model: Option<String>,
     cwd: String,
+    session_store: crate::services::session_store::SessionStore,
+    hold_project: bool,
     auto_approve: std::sync::Arc<std::sync::atomic::AtomicBool>,
     permission_prompt: cursor_acp::CursorPermissionPrompt,
     hooks: cursor_acp::CursorInteractionHooks,
@@ -4971,10 +5133,12 @@ async fn open_cursor_session_with_retry(
     const MAX_ATTEMPTS: u32 = 3;
     let mut attempt = 1;
     loop {
+        let mcp_servers = collect_cursor_mcp_servers(&session_store, &cwd, hold_project).await;
         let result = open_cursor_session(
             key.clone(),
             requested_model.clone(),
             cwd.clone(),
+            mcp_servers,
             auto_approve.clone(),
             permission_prompt.clone(),
             hooks.clone(),

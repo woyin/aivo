@@ -87,6 +87,16 @@ pub(super) fn seed_two_exchanges(app: &mut CodeTuiApp) {
     }
 }
 
+pub(super) fn pin_cursor_key(app: &mut CodeTuiApp) {
+    app.key.base_url = crate::services::cursor_acp::CURSOR_ACP_SENTINEL.to_string();
+}
+
+pub(super) fn abort_cursor_prewarm(app: &mut CodeTuiApp) {
+    if let Some(handle) = app.cursor_prewarm.take() {
+        handle.abort();
+    }
+}
+
 pub(super) fn left_click(column: u16, row: u16) -> MouseEvent {
     MouseEvent {
         kind: MouseEventKind::Down(MouseButton::Left),

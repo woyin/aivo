@@ -2790,9 +2790,9 @@ impl CodeTuiApp {
     pub(super) fn composer_rule_style(&self) -> Style {
         if self.draft_is_shell_command() {
             Style::default().fg(SHELL())
-        } else if self.plan_mode || self.cursor_plan_mode {
+        } else if self.in_plan_mode() {
             Style::default().fg(ACCENT())
-        } else if self.ask_mode {
+        } else if self.in_ask_mode() {
             Style::default().fg(INFO())
         } else {
             Style::default().fg(FAINT())
@@ -2804,7 +2804,7 @@ impl CodeTuiApp {
     /// discoverable (the hint bar drops right-hand items when narrow).
     pub(super) fn composer_rule_line(&self, width: u16) -> Line<'static> {
         let width = usize::from(width);
-        let plan_mode = self.plan_mode || self.cursor_plan_mode;
+        let plan_mode = self.in_plan_mode();
         let rule_style = self.composer_rule_style();
         // The mode badge — one slot, since the modes are exclusive.
         let (badge, badge_style) = if plan_mode {
@@ -2812,7 +2812,7 @@ impl CodeTuiApp {
                 "◇ plan",
                 Style::default().fg(ACCENT()).add_modifier(Modifier::BOLD),
             )
-        } else if self.ask_mode {
+        } else if self.in_ask_mode() {
             (
                 "◆ ask",
                 Style::default().fg(INFO()).add_modifier(Modifier::BOLD),
@@ -3371,12 +3371,12 @@ impl CodeTuiApp {
                     "Type to queue your next message…",
                     Style::default().fg(FAINT()),
                 )
-            } else if self.plan_mode || self.cursor_plan_mode {
+            } else if self.in_plan_mode() {
                 Span::styled(
                     "Describe what to plan · read-only until approved",
                     Style::default().fg(FAINT()),
                 )
-            } else if self.ask_mode {
+            } else if self.in_ask_mode() {
                 Span::styled(
                     "Ask anything · concepts, docs, code, the web",
                     Style::default().fg(FAINT()),

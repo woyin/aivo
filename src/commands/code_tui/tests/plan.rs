@@ -648,6 +648,116 @@ async fn test_shift_tab_cycles_agent_modes() {
     );
 }
 
+#[tokio::test]
+async fn test_shift_tab_cycles_cursor_acp_modes() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    pin_cursor_key(&mut app);
+    let mode = |app: &super::super::CodeTuiApp| {
+        (
+            app.agent_auto_approve,
+            app.cursor_acp_mode,
+            app.plan_mode,
+            app.ask_mode,
+        )
+    };
+    assert_eq!(
+        mode(&app),
+        (false, CursorAcpMode::Agent, false, false),
+        "starts in default"
+    );
+
+    app.cycle_agent_mode().await;
+    assert_eq!(mode(&app), (true, CursorAcpMode::Agent, false, false));
+
+    app.cycle_agent_mode().await;
+    assert_eq!(
+        mode(&app),
+        (false, CursorAcpMode::Plan, false, false),
+        "auto cycles into cursor plan; native flags stay off"
+    );
+    assert!(app.in_plan_mode());
+    assert!(!app.in_ask_mode());
+
+    app.cycle_agent_mode().await;
+    assert_eq!(
+        mode(&app),
+        (false, CursorAcpMode::Ask, false, false),
+        "plan cycles into cursor ask"
+    );
+    assert!(app.in_ask_mode());
+
+    app.cycle_agent_mode().await;
+    assert_eq!(
+        mode(&app),
+        (false, CursorAcpMode::Agent, false, false),
+        "ask exits to default, not auto"
+    );
+}
+
+#[tokio::test]
+async fn test_cursor_plan_command_enters_and_exits() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    pin_cursor_key(&mut app);
+    app.set_auto_quiet(true);
+
+    app.run_plan_command(None).await;
+    assert_eq!(app.cursor_acp_mode, CursorAcpMode::Plan);
+    assert!(!app.plan_mode, "native plan_mode stays off");
+    assert!(!app.agent_auto_approve, "plan quiets auto");
+    assert!(notice_text(&app).contains("read-only"));
+
+    app.run_plan_command(Some("exit".to_string())).await;
+    assert_eq!(app.cursor_acp_mode, CursorAcpMode::Agent);
+    assert!(app.agent_auto_approve, "exit restores auto");
+    assert!(notice_text(&app).contains("back to auto-approve"));
+}
+
+#[tokio::test]
+async fn test_cursor_plan_badge_on_composer_rule() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    pin_cursor_key(&mut app);
+    let plain = |line: &ratatui::text::Line<'_>| -> String {
+        line.spans.iter().map(|s| s.content.as_ref()).collect()
+    };
+    app.cursor_acp_mode = CursorAcpMode::Plan;
+    let on = app.composer_rule_line(80);
+    assert!(plain(&on).contains("◇ plan"));
+    let placeholder: String = app.render_composer_text().lines[0]
+        .spans
+        .iter()
+        .map(|s| s.content.as_ref())
+        .collect();
+    assert!(placeholder.contains("what to plan"), "{placeholder}");
+}
+
+#[tokio::test]
+async fn test_permission_card_shift_tab_in_cursor_plan_exits_into_auto() {
+    use crate::agent::protocol::Decision;
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    pin_cursor_key(&mut app);
+    app.cursor_acp_mode = CursorAcpMode::Plan;
+    app.sending = true;
+    let (reply, mut rx1) = tokio::sync::oneshot::channel();
+    app.cards.set_permission(super::super::PendingPermission {
+        tool: "cursor".to_string(),
+        preview: Some("edit".to_string()),
+        once_only: true,
+        reply,
+    });
+    let consumed = app
+        .handle_permission_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT))
+        .await;
+    assert!(consumed);
+    assert_eq!(rx1.try_recv().unwrap(), Decision::Allow);
+    assert_eq!(app.cursor_acp_mode, CursorAcpMode::Agent);
+    assert!(!app.plan_mode);
+    assert!(app.agent_auto_approve, "auto-approve enabled");
+}
+
 /// Shift+Tab on a permission card during plan mode exits plan mode (live), enables
 /// auto-approve, and allows this call — the only reachable exit while back-to-back
 /// plan cards keep coming.
@@ -665,7 +775,9 @@ async fn test_permission_card_shift_tab_in_plan_mode_exits_plan_into_auto() {
         once_only: true,
         reply,
     });
-    let consumed = app.handle_permission_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT));
+    let consumed = app
+        .handle_permission_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT))
+        .await;
     assert!(consumed);
     assert_eq!(rx1.try_recv().unwrap(), Decision::Allow);
     assert!(!app.plan_mode, "plan mode exited");
@@ -692,7 +804,9 @@ async fn test_once_only_permission_card_maps_always_to_allow() {
         once_only: true,
         reply,
     });
-    let consumed = app.handle_permission_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE));
+    let consumed = app
+        .handle_permission_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE))
+        .await;
     assert!(consumed);
     assert_eq!(rx1.try_recv().unwrap(), Decision::Allow);
 }

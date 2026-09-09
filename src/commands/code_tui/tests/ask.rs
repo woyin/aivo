@@ -31,6 +31,84 @@ async fn test_ask_command_enters_and_exits_with_prior_mode() {
 }
 
 #[tokio::test]
+async fn test_cursor_ask_command_enters_and_exits_with_prior_mode() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    pin_cursor_key(&mut app);
+
+    app.set_auto_quiet(true);
+    app.run_ask_command(None).await;
+    assert_eq!(app.cursor_acp_mode, CursorAcpMode::Ask);
+    assert!(!app.ask_mode, "native ask_mode stays off");
+    assert!(!app.plan_mode);
+    assert!(!app.agent_auto_approve, "ask quiets auto");
+    assert!(notice_text(&app).contains("read-only"));
+
+    app.run_ask_command(Some("exit".to_string())).await;
+    assert_eq!(app.cursor_acp_mode, CursorAcpMode::Agent);
+    assert!(app.agent_auto_approve, "back to auto-approve");
+    assert!(notice_text(&app).contains("back to auto-approve"));
+
+    app.set_auto_quiet(false);
+    app.run_ask_command(None).await;
+    app.run_ask_command(Some("exit".to_string())).await;
+    assert_eq!(app.cursor_acp_mode, CursorAcpMode::Agent);
+    assert!(!app.agent_auto_approve);
+
+    app.run_ask_command(Some("exit".to_string())).await;
+    assert!(notice_text(&app).contains("isn't on"));
+}
+
+#[tokio::test]
+async fn test_cursor_ask_badge_on_composer_rule() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    pin_cursor_key(&mut app);
+    let plain = |line: &ratatui::text::Line<'_>| -> String {
+        line.spans.iter().map(|s| s.content.as_ref()).collect()
+    };
+    app.cursor_acp_mode = CursorAcpMode::Ask;
+    let on = app.composer_rule_line(80);
+    assert!(plain(&on).contains("◆ ask"));
+    let placeholder: String = app.render_composer_text().lines[0]
+        .spans
+        .iter()
+        .map(|s| s.content.as_ref())
+        .collect();
+    assert!(
+        placeholder.contains("concepts, docs, code"),
+        "{placeholder}"
+    );
+}
+
+#[tokio::test]
+async fn test_set_approval_mode_leaves_cursor_ask_mode() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    pin_cursor_key(&mut app);
+    app.run_ask_command(None).await;
+    assert_eq!(app.cursor_acp_mode, CursorAcpMode::Ask);
+    app.set_approval_mode("auto-approve").await;
+    assert_eq!(app.cursor_acp_mode, CursorAcpMode::Agent);
+    assert!(app.agent_auto_approve);
+}
+
+#[tokio::test]
+async fn test_new_chat_restores_standing_mode_from_cursor_ask() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    pin_cursor_key(&mut app);
+    app.set_auto_quiet(true);
+    app.run_ask_command(None).await;
+    assert_eq!(app.cursor_acp_mode, CursorAcpMode::Ask);
+    assert!(!app.agent_auto_approve);
+    app.start_new_chat().await;
+    abort_cursor_prewarm(&mut app);
+    assert_eq!(app.cursor_acp_mode, CursorAcpMode::Agent);
+    assert!(app.agent_auto_approve, "auto-approve comes back after /new");
+}
+
+#[tokio::test]
 async fn test_ask_command_leaves_plan_mode() {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let mut app = make_test_app(tx, rx);
@@ -202,7 +280,9 @@ async fn test_permission_card_shift_tab_in_ask_mode_exits_ask_into_auto() {
         once_only: true,
         reply,
     });
-    let consumed = app.handle_permission_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT));
+    let consumed = app
+        .handle_permission_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT))
+        .await;
     assert!(consumed);
     assert_eq!(rx1.try_recv().unwrap(), Decision::Allow);
     assert!(!app.ask_mode, "ask mode exited");

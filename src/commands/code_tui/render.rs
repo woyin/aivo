@@ -2258,9 +2258,7 @@ enum DiffRow {
     Gap,
 }
 
-/// Line-level LCS of `old` vs `new`. Common prefix/suffix stay Equal even past
-/// the size cap — Cursor ACP sends the whole file, and without this a one-line
-/// edit in a 4k-line file is remove-all/add-all (the card shows only red).
+/// Prefix/suffix stay Equal past the LCS cap (Cursor ACP sends the whole file).
 fn diff_lines<'a>(old: &'a str, new: &'a str) -> Vec<(DiffTag, &'a str)> {
     let a: Vec<&str> = old.lines().collect();
     let b: Vec<&str> = new.lines().collect();
@@ -2798,8 +2796,6 @@ fn render_edit_diff(
     }
 }
 
-/// Cap to `cap` rows. A remove-all/add-all rewrite would otherwise fill the
-/// card with red minuses; keep some of each side.
 fn preview_diff_rows(rows: Vec<DiffRow>, cap: usize) -> (Vec<DiffRow>, usize) {
     if rows.len() <= cap {
         return (rows, 0);

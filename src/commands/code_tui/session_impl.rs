@@ -386,7 +386,9 @@ is preserved."
         self.copilot_tm = copilot_token_manager_for_key(&self.key);
         self.format = seeded_chat_format(&self.key, &raw_model);
         // Auth changed — a live cursor session can't carry across it.
-        self.cursor_acp_session = None;
+        self.drop_cursor_acp_child();
+        self.cursor_acp_mode = CursorAcpMode::Agent;
+        self.prepare_and_prewarm_cursor_session().await;
         self.persist_model_selection(&raw_model)
             .await
             .map_err(|e| format!("couldn't save the key switch: {e}"))?;
@@ -453,7 +455,9 @@ conversation is preserved."
         // cursor session (auth changed).
         self.format = seeded_chat_format(&self.key, &raw_model);
         self.reset_engine_preserving_conversation();
-        self.cursor_acp_session = None;
+        self.drop_cursor_acp_child();
+        self.cursor_acp_mode = CursorAcpMode::Agent;
+        self.prepare_and_prewarm_cursor_session().await;
         self.persist_history().await?;
         self.notice = Some((
             MUTED(),
@@ -1323,6 +1327,12 @@ conversation is preserved."
         }
         if self.ask_mode {
             self.leave_ask_mode().await;
+        }
+        if matches!(
+            self.cursor_acp_mode,
+            CursorAcpMode::Plan | CursorAcpMode::Ask
+        ) {
+            let _ = self.set_cursor_acp_mode(CursorAcpMode::Agent).await;
         }
         match mode {
             "auto-approve" => {
@@ -2209,6 +2219,42 @@ conversation is preserved."
             .collect()
     }
 
+    pub(super) async fn seed_project_mcp_consent(&mut self, cwd: &str) {
+        if self.project_mcp_consent != ProjectMcpConsent::Unknown {
+            return;
+        }
+        let gated = crate::agent::mcp::project_gated_servers(std::path::Path::new(cwd));
+        if gated.is_empty() {
+            return;
+        }
+        let dir_key = canonical_dir_key(cwd);
+        let digest = project_mcp_digest(&gated);
+        if self
+            .session_store
+            .get_project_mcp_approved(&dir_key, &digest)
+            .await
+        {
+            self.project_mcp_consent = ProjectMcpConsent::Allowed;
+        }
+    }
+
+    pub(super) async fn prompt_project_mcp_if_needed(&mut self, cwd: &str) {
+        if self.project_mcp_consent != ProjectMcpConsent::Unknown
+            || self.cards.mcp_consent.is_some()
+        {
+            return;
+        }
+        let gated = crate::agent::mcp::project_gated_servers(std::path::Path::new(cwd));
+        if gated.is_empty() {
+            return;
+        }
+        self.cards.mcp_consent = Some(McpConsentPrompt {
+            servers: gated,
+            cwd: cwd.to_string(),
+            base_disabled: self.effective_disabled_mcp_servers().await,
+        });
+    }
+
     /// Connect MCP, gating a repo's project `.mcp.json` servers behind a one-time
     /// consent — stdio spawns local commands, `url` hands the conversation to a
     /// repo-picked endpoint. User-scope servers connect freely. Until the user
@@ -2223,19 +2269,10 @@ conversation is preserved."
             self.start_mcp_connect(cwd, base_disabled);
             return;
         }
-        // Seed the session decision from the persistent per-repo allow-list once —
-        // but only if the stored approval matches the CURRENT server set (digest),
-        // so a changed `.mcp.json` re-prompts instead of silently reusing consent.
-        if self.project_mcp_consent == ProjectMcpConsent::Unknown {
-            let dir_key = canonical_dir_key(&cwd);
-            let digest = project_mcp_digest(&gated);
-            if self
-                .session_store
-                .get_project_mcp_approved(&dir_key, &digest)
-                .await
-            {
-                self.project_mcp_consent = ProjectMcpConsent::Allowed;
-            }
+        let was_unknown = self.project_mcp_consent == ProjectMcpConsent::Unknown;
+        self.seed_project_mcp_consent(&cwd).await;
+        if was_unknown && self.project_mcp_consent == ProjectMcpConsent::Allowed {
+            self.restart_cursor_session_for_mcp();
         }
         if self.project_mcp_consent == ProjectMcpConsent::Allowed {
             self.start_mcp_connect(cwd, base_disabled);
@@ -2753,6 +2790,7 @@ conversation is preserved."
         self.mcp_connecting = false;
         self.mcp_connect_progress.clear();
         self.request_engine_rebuild();
+        self.restart_cursor_session_for_mcp();
     }
 
     /// Status + health for one server, read from the current client snapshot.
@@ -3045,6 +3083,7 @@ conversation is preserved."
         self.request_engine_rebuild();
         self.spawn_mcp_connect(cwd, disabled, self.mcp_connect_gen, self.mcp_client.clone());
         self.refresh_mcp_overlay_status();
+        self.restart_cursor_session_for_mcp();
     }
 
     /// Spawn the background connect task: report each server's status as its
@@ -3496,7 +3535,8 @@ conversation is preserved."
         self.clear_for_resume_loading();
         // The new session id will come from storage; drop any live cursor ACP
         // session since cursor doesn't know about the resumed session.
-        self.cursor_acp_session = None;
+        self.drop_cursor_acp_child();
+        self.cursor_acp_mode = CursorAcpMode::Agent;
         self.resume_request_id = self.resume_request_id.wrapping_add(1);
         let request_id = self.resume_request_id;
         self.loading_resume = Some(LoadingResume {
@@ -3554,6 +3594,7 @@ conversation is preserved."
         self.plan_exit_pending = false;
         self.ask_mode = false;
         self.ask_exit_pending = false;
+        self.cursor_acp_mode = CursorAcpMode::Agent;
         self.pending_plan = None;
         self.plan_card_idx = None;
         self.goal_mode = None;
@@ -3709,6 +3750,7 @@ conversation is preserved."
         }
         // Session-local: no persist, so viewing an old chat can't reset the key's
         // default model. Only explicit `/model` and `/key` persist.
+        self.prepare_and_prewarm_cursor_session().await;
         Ok(())
     }
 

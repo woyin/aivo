@@ -1144,3 +1144,137 @@ async fn project_mcp_http_only_still_gated() {
     assert!(app.cards.mcp_consent.is_none());
     let _ = std::fs::remove_dir_all(&bare);
 }
+
+#[tokio::test]
+async fn test_mcp_config_change_restarts_cursor_prewarm() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+
+    let hang = || {
+        tokio::spawn(async {
+            std::future::pending::<()>().await;
+            Err::<crate::services::cursor_acp::CursorAcpSession, _>("old".to_string())
+        })
+    };
+
+    app.cursor_prewarm = Some(hang());
+    app.reset_mcp_after_config_change();
+    assert!(
+        app.cursor_prewarm.is_some() && !app.cursor_prewarm.as_ref().unwrap().is_finished(),
+        "non-cursor MCP change must not abort a prewarm"
+    );
+    abort_cursor_prewarm(&mut app);
+
+    pin_cursor_key(&mut app);
+    let stale = hang();
+    let stale_id = stale.id();
+    app.cursor_prewarm = Some(stale);
+    app.reset_mcp_after_config_change();
+    let fresh = app
+        .cursor_prewarm
+        .as_ref()
+        .expect("a replacement prewarm is started");
+    assert_ne!(fresh.id(), stale_id, "the stale prewarm must be replaced");
+    abort_cursor_prewarm(&mut app);
+}
+
+#[tokio::test]
+async fn cursor_prepare_uses_persisted_project_mcp_without_card() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    pin_cursor_key(&mut app);
+    let repo = std::env::temp_dir().join(format!("aivo-cursor-mcp-pre-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&repo);
+    std::fs::create_dir_all(&repo).unwrap();
+    std::fs::write(
+        repo.join(".mcp.json"),
+        r#"{"mcpServers":{"x":{"command":"aivo_no_such_binary_zzz"}}}"#,
+    )
+    .unwrap();
+    let cwd = repo.to_str().unwrap().to_string();
+    let dir_key = std::fs::canonicalize(&repo)
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+    let servers = crate::agent::mcp::project_gated_servers(std::path::Path::new(&cwd));
+    app.session_store
+        .set_project_mcp_approved(&dir_key, &project_mcp_digest(&servers))
+        .await
+        .unwrap();
+    app.cwd = cwd;
+
+    app.prepare_and_prewarm_cursor_session().await;
+    assert_eq!(app.project_mcp_consent, ProjectMcpConsent::Allowed);
+    assert!(
+        app.cards.mcp_consent.is_none(),
+        "pre-approved repo skips the card"
+    );
+    assert!(app.cursor_prewarm.is_some());
+    abort_cursor_prewarm(&mut app);
+    let _ = std::fs::remove_dir_all(&repo);
+}
+
+#[tokio::test]
+async fn cursor_prepare_prompts_project_mcp_without_native_engine() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    pin_cursor_key(&mut app);
+    let repo = std::env::temp_dir().join(format!("aivo-cursor-mcp-card-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&repo);
+    std::fs::create_dir_all(&repo).unwrap();
+    std::fs::write(
+        repo.join(".mcp.json"),
+        r#"{"mcpServers":{"x":{"command":"sh","args":["-c","echo hi"]}}}"#,
+    )
+    .unwrap();
+    app.cwd = repo.to_str().unwrap().to_string();
+
+    app.prepare_and_prewarm_cursor_session().await;
+    assert_eq!(app.project_mcp_consent, ProjectMcpConsent::Unknown);
+    let prompt = app.cards.mcp_consent.as_ref().expect("consent card");
+    assert_eq!(prompt.servers[0].0, "x");
+    abort_cursor_prewarm(&mut app);
+    let _ = std::fs::remove_dir_all(&repo);
+}
+
+#[tokio::test]
+async fn project_mcp_preapproved_restarts_held_cursor_prewarm() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    pin_cursor_key(&mut app);
+    let repo = std::env::temp_dir().join(format!("aivo-cursor-mcp-restart-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&repo);
+    std::fs::create_dir_all(&repo).unwrap();
+    std::fs::write(
+        repo.join(".mcp.json"),
+        r#"{"mcpServers":{"x":{"command":"aivo_no_such_binary_zzz"}}}"#,
+    )
+    .unwrap();
+    let cwd = repo.to_str().unwrap().to_string();
+    let dir_key = std::fs::canonicalize(&repo)
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+    let servers = crate::agent::mcp::project_gated_servers(std::path::Path::new(&cwd));
+    app.session_store
+        .set_project_mcp_approved(&dir_key, &project_mcp_digest(&servers))
+        .await
+        .unwrap();
+
+    let stale = tokio::spawn(async {
+        std::future::pending::<()>().await;
+        Err::<crate::services::cursor_acp::CursorAcpSession, _>("old".to_string())
+    });
+    let stale_id = stale.id();
+    app.cursor_prewarm = Some(stale);
+
+    app.connect_mcp_with_consent(cwd, Default::default()).await;
+    assert_eq!(app.project_mcp_consent, ProjectMcpConsent::Allowed);
+    let fresh = app
+        .cursor_prewarm
+        .as_ref()
+        .expect("prewarm replaced after persisted approval");
+    assert_ne!(fresh.id(), stale_id);
+    abort_cursor_prewarm(&mut app);
+    let _ = std::fs::remove_dir_all(&repo);
+}

@@ -72,10 +72,10 @@ impl CodeTuiApp {
                 }
             }
             RuntimeEvent::CursorSessionOpened(session) => {
-                // Defensive: a /new or /key switch could land between the task
-                // starting `open()` and this event arriving. Only adopt the
-                // session if we still need one for the current cursor key.
-                if self.key.is_cursor_acp() && self.cursor_acp_session.is_none() {
+                if self.key.is_cursor_acp()
+                    && self.cursor_acp_session.is_none()
+                    && self.cursor_prewarm.is_none()
+                {
                     self.cursor_acp_session = Some(session);
                 }
             }
@@ -1990,7 +1990,7 @@ impl CodeTuiApp {
         }
         // Open the cursor session now (no-op for other keys) so its connect
         // overlaps the user typing their first message.
-        self.prewarm_cursor_session();
+        self.prepare_and_prewarm_cursor_session().await;
         // Repaint only on change; an idle chat draws nothing.
         let mut needs_redraw = true;
         let mut was_streaming = false;

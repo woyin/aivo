@@ -324,6 +324,84 @@ pub fn project_gated_servers(cwd: &Path) -> Vec<(String, String)> {
     out
 }
 
+pub async fn acp_session_servers(
+    cwd: &Path,
+    disabled: &HashSet<String>,
+    hold_project: bool,
+) -> Vec<Value> {
+    acp_session_servers_from(user_config_path().as_deref(), cwd, disabled, hold_project).await
+}
+
+async fn acp_session_servers_from(
+    user_path: Option<&Path>,
+    cwd: &Path,
+    disabled: &HashSet<String>,
+    hold_project: bool,
+) -> Vec<Value> {
+    let mut combined: std::collections::BTreeMap<String, (ServerConfig, ServerScope)> =
+        std::collections::BTreeMap::new();
+    if let Some(path) = user_path {
+        for (name, cfg) in read_file_servers(path) {
+            combined.insert(name, (cfg, ServerScope::User));
+        }
+    }
+    for (name, cfg) in read_file_servers(&cwd.join(".mcp.json")) {
+        combined.insert(name, (cfg, ServerScope::Project));
+    }
+    let mut out = Vec::new();
+    for (name, (cfg, scope)) in combined {
+        if disabled.contains(&name) {
+            continue;
+        }
+        if hold_project && scope == ServerScope::Project {
+            continue;
+        }
+        if let Some(entry) = server_to_acp_entry(&name, &cfg).await {
+            out.push(entry);
+        }
+    }
+    out
+}
+
+async fn server_to_acp_entry(name: &str, cfg: &ServerConfig) -> Option<Value> {
+    let cfg = expand_config(cfg).ok()?;
+    Some(match cfg.transport {
+        Transport::Stdio { command, args, env } => {
+            let mut env_pairs: Vec<_> = env.into_iter().collect();
+            env_pairs.sort_by(|a, b| a.0.cmp(&b.0));
+            let env: Vec<Value> = env_pairs
+                .into_iter()
+                .map(|(n, v)| json!({"name": n, "value": v}))
+                .collect();
+            json!({
+                "name": name,
+                "command": command,
+                "args": args,
+                "env": env,
+            })
+        }
+        Transport::Http { url, mut headers } => {
+            if !headers
+                .iter()
+                .any(|(k, _)| k.eq_ignore_ascii_case("authorization"))
+                && let Some(bearer) = resolve_http_bearer(name, &url).await
+            {
+                headers.push(("Authorization".to_string(), bearer));
+            }
+            let headers: Vec<Value> = headers
+                .into_iter()
+                .map(|(n, v)| json!({"name": n, "value": v}))
+                .collect();
+            json!({
+                "type": "http",
+                "name": name,
+                "url": url,
+                "headers": headers,
+            })
+        }
+    })
+}
+
 /// Stable key for the per-repo project-MCP allow-list: the canonicalized cwd
 /// (symlinks resolved, so the same repo reached two ways shares one decision),
 /// falling back to the raw path when it can't be canonicalized.
@@ -3226,6 +3304,73 @@ mod tests {
         assert!(servers[1].trust, "default trust");
         assert_eq!(servers[0].scope, ServerScope::Project);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn acp_session_servers_stdio_and_http_shape() {
+        let user_dir =
+            std::env::temp_dir().join(format!("aivo-mcp-acp-user-{}", std::process::id()));
+        let cwd = std::env::temp_dir().join(format!("aivo-mcp-acp-cwd-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&user_dir);
+        let _ = std::fs::remove_dir_all(&cwd);
+        std::fs::create_dir_all(&user_dir).unwrap();
+        std::fs::create_dir_all(&cwd).unwrap();
+        let user_path = user_dir.join("mcp.json");
+        std::fs::write(
+            &user_path,
+            json!({"mcpServers":{
+                "fs":{"command":"npx","args":["-y","srv"],"env":{"B":"2","A":"1"}},
+                "remote":{"url":"https://mcp.example.com/mcp","headers":{"Authorization":"Bearer t"}},
+                "bad":{"command":"x","env":{"K":"${AIVO_TEST_SURELY_UNSET_ACP_VAR}"}}
+            }})
+            .to_string(),
+        )
+        .unwrap();
+        std::fs::write(
+            cwd.join(".mcp.json"),
+            json!({"mcpServers":{"proj":{"command":"echo","args":["hi"]}}}).to_string(),
+        )
+        .unwrap();
+
+        fn names(entries: &[Value]) -> Vec<String> {
+            entries
+                .iter()
+                .filter_map(|e| e["name"].as_str().map(str::to_string))
+                .collect()
+        }
+
+        let all = acp_session_servers_from(Some(&user_path), &cwd, &HashSet::new(), false).await;
+        assert_eq!(names(&all), ["fs", "proj", "remote"]);
+        let fs = all.iter().find(|e| e["name"] == "fs").unwrap();
+        assert_eq!(fs["command"], "npx");
+        assert_eq!(fs["args"], json!(["-y", "srv"]));
+        assert_eq!(
+            fs["env"],
+            json!([{"name":"A","value":"1"},{"name":"B","value":"2"}]),
+            "env pairs are sorted by name"
+        );
+        assert!(fs.get("type").is_none(), "stdio has no type field");
+        let remote = all.iter().find(|e| e["name"] == "remote").unwrap();
+        assert_eq!(remote["type"], "http");
+        assert_eq!(remote["url"], "https://mcp.example.com/mcp");
+        assert_eq!(
+            remote["headers"],
+            json!([{"name":"Authorization","value":"Bearer t"}])
+        );
+
+        let held = acp_session_servers_from(Some(&user_path), &cwd, &HashSet::new(), true).await;
+        assert_eq!(
+            names(&held),
+            ["fs", "remote"],
+            "hold_project skips project .mcp.json"
+        );
+
+        let disabled = HashSet::from(["fs".to_string()]);
+        let skipped = acp_session_servers_from(Some(&user_path), &cwd, &disabled, false).await;
+        assert_eq!(names(&skipped), ["proj", "remote"]);
+
+        let _ = std::fs::remove_dir_all(&user_dir);
+        let _ = std::fs::remove_dir_all(&cwd);
     }
 
     /// `project_gated_servers` lists every project-file server (stdio with

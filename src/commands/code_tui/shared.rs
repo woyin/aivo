@@ -1697,6 +1697,24 @@ pub(super) enum PlanPriorMode {
     Auto,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) enum CursorAcpMode {
+    #[default]
+    Agent,
+    Plan,
+    Ask,
+}
+
+impl CursorAcpMode {
+    pub(super) fn acp_id(self) -> &'static str {
+        match self {
+            Self::Agent => "agent",
+            Self::Plan => "plan",
+            Self::Ask => "ask",
+        }
+    }
+}
+
 /// Content digest of a repo's project `.mcp.json` stdio servers — the exact
 pub(super) use crate::agent::mcp::project_mcp_digest;
 
@@ -3434,10 +3452,7 @@ pub(super) struct CodeTuiApp {
     /// snapshot/diff it off the event loop (a cold snapshot hashes the tree).
     pub(super) acp_checkpoint_store:
         Option<std::sync::Arc<tokio::sync::Mutex<crate::agent::checkpoint::CheckpointStore>>>,
-    /// Desired cursor ACP mode: `true` = `plan` (emits `cursor/create_plan`),
-    /// `false` = `agent`. Applied via `session/set_mode`, re-applied on re-open.
-    /// Cursor keys only.
-    pub(super) cursor_plan_mode: bool,
+    pub(super) cursor_acp_mode: CursorAcpMode,
     /// Armed on plan approval: cursor ends its turn after an accepted
     /// `cursor/create_plan`, so turn-end auto-sends the build go-ahead.
     pub(super) cursor_plan_go_pending: bool,
@@ -4001,7 +4016,7 @@ impl CodeTuiApp {
             cursor_prewarm: None,
             acp_checkpoints: Vec::new(),
             acp_checkpoint_store: None,
-            cursor_plan_mode: false,
+            cursor_acp_mode: CursorAcpMode::Agent,
             cursor_plan_go_pending: false,
             cursor_turn_seq: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             pending_agent_messages: None,

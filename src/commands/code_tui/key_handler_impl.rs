@@ -122,7 +122,7 @@ impl CodeTuiApp {
         // would corrupt the draft and risk an accidental approval. Unconsumed keys
         // fall through to the editor so composing continues with the card still up.
         if self.cards.permission().is_some() {
-            if self.handle_permission_key(key) {
+            if self.handle_permission_key(key).await {
                 return Ok(false);
             }
             return self.handle_editor_key(key).await;
@@ -186,7 +186,7 @@ impl CodeTuiApp {
     /// waiting engine task. Returns `true` if the key was consumed as a decision
     /// or card chord, `false` if it should fall through to the composer (so the
     /// user can keep typing a queued message while the card stays up).
-    pub(super) fn handle_permission_key(&mut self, key: KeyEvent) -> bool {
+    pub(super) async fn handle_permission_key(&mut self, key: KeyEvent) -> bool {
         use crate::agent::protocol::Decision;
         // Shift+Tab: allow this request and turn on auto-approve. In plan mode it
         // also exits plan mode (cards arrive back-to-back, so this is the only
@@ -200,11 +200,26 @@ impl CodeTuiApp {
                 self.request_ask_exit_live();
                 self.set_auto_quiet(true);
                 self.show_toast("Ask mode off — auto-approve on");
+            } else if matches!(
+                self.cursor_acp_mode,
+                CursorAcpMode::Plan | CursorAcpMode::Ask
+            ) {
+                self.set_auto_quiet(true);
+                self.show_toast("Back in agent mode — auto-approve on");
             } else {
                 self.set_auto_approve(true);
             }
             if let Some(pending) = self.cards.take_permission() {
                 let _ = pending.reply.send(Decision::Allow);
+            }
+            if !self.plan_mode
+                && !self.ask_mode
+                && matches!(
+                    self.cursor_acp_mode,
+                    CursorAcpMode::Plan | CursorAcpMode::Ask
+                )
+            {
+                let _ = self.set_cursor_acp_mode(CursorAcpMode::Agent).await;
             }
             return true;
         }
@@ -603,6 +618,10 @@ impl CodeTuiApp {
     /// the native agent skip the read-only stops. Mid-turn entry restricts the
     /// RUNNING turn at its next tool-call boundary (live flag).
     pub(super) async fn cycle_agent_mode(&mut self) {
+        if self.key.is_cursor_acp() {
+            self.cycle_cursor_acp_mode().await;
+            return;
+        }
         if self.plan_mode {
             self.leave_plan_mode(false).await;
             if self.enter_ask_mode().await {
