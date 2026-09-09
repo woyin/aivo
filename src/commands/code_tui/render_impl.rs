@@ -1178,16 +1178,16 @@ impl CodeTuiApp {
         } else {
             self.real_cwd.as_str()
         };
-        self.history[start..]
+        let calls: Vec<_> = self.history[start..]
             .iter()
             .map(|m| {
                 let (name, args) = decode_tool_call(&m.content);
-                let outcome = decode_tool_outcome(&m.content);
-                line_plain(
-                    super::render::parallel_call_row_text(&name, &args, outcome, cwd),
-                    style,
-                )
+                (name, args, decode_tool_outcome(&m.content))
             })
+            .collect();
+        super::render::parallel_live_row_texts(&calls, cwd)
+            .into_iter()
+            .map(|text| line_plain(text, style))
             .collect()
     }
 

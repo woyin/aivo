@@ -99,6 +99,55 @@ fn test_parallel_bridged_batch_mixed_tools_noun() {
     );
 }
 
+#[test]
+fn test_parallel_live_rows_coalesce_cursor_style_edits() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.sending = true;
+    let batch = [
+        ("runtime_impl.rs", 7),
+        ("session_impl.rs", 4),
+        ("render.rs", 2),
+        ("mcp.rs", 2),
+        ("shared.rs", 1),
+    ];
+    let mut n = 0usize;
+    for (file, count) in batch {
+        for _ in 0..count {
+            n += 1;
+            app.apply_agent_tool_call(
+                Some(n.to_string()),
+                "edit_file".to_string(),
+                serde_json::json!({ "path": format!("src/{file}") }),
+                vec![],
+                None,
+            );
+        }
+    }
+    assert_eq!(
+        app.desired_status(),
+        format!("running {n} parallel steps (0/{n} done)")
+    );
+    let plain = app.build_transcript().plain_lines.join("\n");
+    let live: Vec<&str> = plain
+        .lines()
+        .filter(|l| l.contains("↳ editing") || l.contains("editing runtime_impl"))
+        .collect();
+    assert_eq!(
+        live.len(),
+        1,
+        "duplicate file edits must collapse to one row:\n{plain}"
+    );
+    assert!(
+        live[0].contains("runtime_impl.rs ×7") && live[0].contains("session_impl.rs ×4"),
+        "counts should name the busiest files:\n{plain}"
+    );
+    assert!(
+        !plain.contains("↳ editing runtime_impl.rs\n"),
+        "un-counted duplicate rows leaked:\n{plain}"
+    );
+}
+
 /// Clicking a folded `!cmd` block's `▸ +N more lines` expander reveals the full
 /// output inline (the in-process successor to the ctrl+o pager); clicking the
 /// `▾ collapse` toggle folds it back to the preview. Drives the real render +

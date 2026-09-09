@@ -1130,6 +1130,157 @@ pub(super) fn subagent_row_text(row: &super::shared::SubagentRow) -> String {
     line
 }
 
+/// Cursor ACP often fires 20+ edits at once; listing each hides the transcript.
+pub(super) const PARALLEL_LIVE_MAX_ROWS: usize = 6;
+
+type ParallelLiveCall = (String, serde_json::Value, (Option<String>, bool));
+
+pub(super) fn parallel_live_row_texts(calls: &[ParallelLiveCall], cwd: &str) -> Vec<String> {
+    if calls.is_empty() {
+        return Vec::new();
+    }
+    let mut groups: Vec<(bool, Vec<usize>)> = Vec::new();
+    for (i, (name, _, _)) in calls.iter().enumerate() {
+        if canonical_tool_name(name) == "subagent" {
+            groups.push((true, vec![i]));
+            continue;
+        }
+        let key = tool_group_key(canonical_tool_name(name));
+        if let Some((_, idxs)) = groups.iter_mut().find(|(solo, idxs)| {
+            !solo && tool_group_key(canonical_tool_name(&calls[idxs[0]].0)) == key
+        }) {
+            idxs.push(i);
+        } else {
+            groups.push((false, vec![i]));
+        }
+    }
+    let mut rows: Vec<String> = groups
+        .into_iter()
+        .map(|(solo, idxs)| {
+            if solo || idxs.len() == 1 {
+                let (name, args, outcome) = &calls[idxs[0]];
+                parallel_call_row_text(name, args, outcome.clone(), cwd)
+            } else {
+                live_verb_group_row(&calls[idxs[0]].0, &idxs, calls, cwd)
+            }
+        })
+        .collect();
+    if rows.len() > PARALLEL_LIVE_MAX_ROWS {
+        let rest = rows.len() - (PARALLEL_LIVE_MAX_ROWS - 1);
+        rows.truncate(PARALLEL_LIVE_MAX_ROWS - 1);
+        rows.push(format!("  ↳ +{rest} more"));
+    }
+    rows
+}
+
+fn live_group_head(name: &str, count: usize, unique: usize) -> String {
+    match canonical_tool_name(name) {
+        "read_file" => format!("reading {unique} files"),
+        "edit_file" | "multi_edit" => format!("editing {unique} files"),
+        "write_file" => format!("writing {unique} files"),
+        "delete_file" => format!("deleting {unique} files"),
+        "grep" | "glob" => format!("searching ×{count}"),
+        "run_bash" => format!("running {count} commands"),
+        "web_fetch" => format!("fetching {count} URLs"),
+        "web_search" => format!("searching the web ×{count}"),
+        other => format!("{} ×{count}", tool_display_name(other)),
+    }
+}
+
+fn live_verb_group_row(
+    name: &str,
+    idxs: &[usize],
+    calls: &[ParallelLiveCall],
+    cwd: &str,
+) -> String {
+    let n = idxs.len();
+    let pending = idxs
+        .iter()
+        .filter(|&&i| {
+            let (result, failed) = &calls[i].2;
+            result.is_none() && !*failed
+        })
+        .count();
+    let failed = idxs
+        .iter()
+        .filter(|&&i| {
+            let (_, failed) = &calls[i].2;
+            *failed
+        })
+        .count();
+    let done = n - pending;
+
+    let targets: Vec<String> = idxs
+        .iter()
+        .map(|&i| {
+            let target = tool_call_target_display(name, &calls[i].1, cwd);
+            if target.is_empty() {
+                let (result, _) = &calls[i].2;
+                result.clone().unwrap_or_default()
+            } else {
+                target
+            }
+        })
+        .collect();
+    let counted = counted_target_labels(&targets);
+    let unique = counted.len();
+
+    let mark = if pending > 0 {
+        "↳"
+    } else if failed > 0 {
+        "✗"
+    } else {
+        "✓"
+    };
+
+    let head = if unique <= 1 {
+        let sample = idxs
+            .iter()
+            .copied()
+            .find(|&i| !tool_call_target_display(name, &calls[i].1, cwd).is_empty())
+            .unwrap_or(idxs[0]);
+        let label = tool_action_label(name, &calls[sample].1, cwd);
+        format!("{label} ×{n}")
+    } else {
+        let head = live_group_head(name, n, unique);
+        let list = join_targets(&counted, 56);
+        if list.is_empty() {
+            head
+        } else {
+            format!("{head}: {list}")
+        }
+    };
+
+    let mut line = format!("  {mark} {head}");
+    if pending > 0 && done > 0 {
+        line.push_str(&format!(" ({done}/{n})"));
+    } else if pending == 0 && failed > 0 {
+        if unique <= 1 {
+            let detail = idxs
+                .iter()
+                .find(|&&i| {
+                    let (_, failed) = &calls[i].2;
+                    *failed
+                })
+                .and_then(|&i| {
+                    let (result, _) = &calls[i].2;
+                    result.as_deref()
+                })
+                .unwrap_or("failed");
+            line.push_str(&format!(
+                " — {}",
+                truncate_label(
+                    detail.lines().next().unwrap_or_default().trim(),
+                    ACTION_TARGET_MAX_COLS,
+                )
+            ));
+        } else {
+            line.push_str(&format!(" · {failed} failed"));
+        }
+    }
+    line
+}
+
 /// One row for a call in a trailing parallel batch: `↳ Audit the auth flow`,
 /// flipping to `✓ Audit the auth flow — 34 lines` / `✗ … — <error>`. No
 /// per-row clock — history entries carry no start time.
@@ -1659,6 +1810,30 @@ fn truncate_label(s: &str, max: usize) -> String {
     }
     out.push('…');
     out
+}
+
+fn counted_target_labels(targets: &[String]) -> Vec<String> {
+    let mut items: Vec<(String, usize)> = Vec::new();
+    for target in targets {
+        if target.is_empty() {
+            continue;
+        }
+        match items.iter_mut().find(|(name, _)| name == target) {
+            Some((_, count)) => *count += 1,
+            None => items.push((target.clone(), 1)),
+        }
+    }
+    items.sort_by_key(|item| std::cmp::Reverse(item.1));
+    items
+        .into_iter()
+        .map(|(name, count)| {
+            if count > 1 {
+                format!("{name} ×{count}")
+            } else {
+                name
+            }
+        })
+        .collect()
 }
 
 /// Join target labels into one line, dropping empties, capped at `max` display
@@ -4221,8 +4396,9 @@ pub(super) fn compact_lines_and_bars(lines: &mut Vec<StyledLine>, bars: &mut Vec
 #[cfg(test)]
 mod render_tests {
     use super::{
-        condense_subagent_task, parallel_call_row_text, render_edit_diff, strip_ansi_and_controls,
-        subagent_row_text, tool_action_label, tool_arg_summary, tool_result_summary,
+        PARALLEL_LIVE_MAX_ROWS, condense_subagent_task, parallel_call_row_text,
+        parallel_live_row_texts, render_edit_diff, strip_ansi_and_controls, subagent_row_text,
+        tool_action_label, tool_arg_summary, tool_result_summary,
     };
 
     #[test]
@@ -4632,6 +4808,129 @@ mod render_tests {
                 ""
             ),
             "  ↳ searching hover"
+        );
+    }
+
+    #[test]
+    fn parallel_live_rows_coalesce_duplicate_file_edits() {
+        let mut calls = Vec::new();
+        for (path, n) in [("src/a.rs", 7), ("src/b.rs", 4), ("src/c.rs", 2)] {
+            for _ in 0..n {
+                calls.push((
+                    "edit_file".to_string(),
+                    serde_json::json!({ "path": path }),
+                    (None, false),
+                ));
+            }
+        }
+        assert_eq!(
+            parallel_live_row_texts(&calls, ""),
+            vec!["  ↳ editing 3 files: a.rs ×7, b.rs ×4, c.rs ×2"]
+        );
+    }
+
+    #[test]
+    fn parallel_live_rows_same_file_uses_times_count() {
+        let calls: Vec<_> = (0..5)
+            .map(|_| {
+                (
+                    "edit_file".to_string(),
+                    serde_json::json!({ "path": "src/a.rs" }),
+                    (None, false),
+                )
+            })
+            .collect();
+        assert_eq!(
+            parallel_live_row_texts(&calls, ""),
+            vec!["  ↳ editing a.rs ×5"]
+        );
+    }
+
+    #[test]
+    fn parallel_live_rows_keep_subagents_split() {
+        let calls = vec![
+            (
+                "subagent".to_string(),
+                serde_json::json!({ "label": "Audit auth" }),
+                (None, false),
+            ),
+            (
+                "subagent".to_string(),
+                serde_json::json!({ "label": "Map engine" }),
+                (None, false),
+            ),
+        ];
+        assert_eq!(
+            parallel_live_row_texts(&calls, ""),
+            vec!["  ↳ Audit auth", "  ↳ Map engine"]
+        );
+    }
+
+    #[test]
+    fn parallel_live_rows_cap_long_subagent_list() {
+        let calls: Vec<_> = (1..=8)
+            .map(|i| {
+                (
+                    "subagent".to_string(),
+                    serde_json::json!({ "label": format!("Task {i}") }),
+                    (None, false),
+                )
+            })
+            .collect();
+        let rows = parallel_live_row_texts(&calls, "");
+        assert_eq!(rows.len(), PARALLEL_LIVE_MAX_ROWS);
+        assert_eq!(rows.last().unwrap(), "  ↳ +3 more");
+        assert!(rows[0].contains("Task 1"), "{rows:?}");
+        assert!(rows.iter().all(|r| !r.contains("Task 8")), "{rows:?}");
+    }
+
+    #[test]
+    fn parallel_live_rows_mixed_verbs_stay_separate() {
+        let calls = vec![
+            (
+                "grep".to_string(),
+                serde_json::json!({ "pattern": "hover" }),
+                (None, false),
+            ),
+            (
+                "edit_file".to_string(),
+                serde_json::json!({ "path": "a.rs" }),
+                (None, false),
+            ),
+            (
+                "edit_file".to_string(),
+                serde_json::json!({ "path": "b.rs" }),
+                (None, false),
+            ),
+        ];
+        assert_eq!(
+            parallel_live_row_texts(&calls, ""),
+            vec!["  ↳ searching hover", "  ↳ editing 2 files: a.rs, b.rs",]
+        );
+    }
+
+    #[test]
+    fn parallel_live_rows_progress_on_partial_group() {
+        let calls = vec![
+            (
+                "edit_file".to_string(),
+                serde_json::json!({ "path": "a.rs" }),
+                (Some("ok".into()), false),
+            ),
+            (
+                "edit_file".to_string(),
+                serde_json::json!({ "path": "a.rs" }),
+                (None, false),
+            ),
+            (
+                "edit_file".to_string(),
+                serde_json::json!({ "path": "a.rs" }),
+                (None, false),
+            ),
+        ];
+        assert_eq!(
+            parallel_live_row_texts(&calls, ""),
+            vec!["  ↳ editing a.rs ×3 (1/3)"]
         );
     }
 
