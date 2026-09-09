@@ -2438,14 +2438,7 @@ impl CodeTuiApp {
         let plan_lines = self.plan_panel_lines();
         let plan_panel_height =
             self.plan_panel_height(&plan_lines, area, composer_height, footer_height);
-        // Clamp queue focus each frame — the engine or a turn-end drain may
-        // have emptied the rows it selects since the last event.
         let queue_rows = self.queued_rows();
-        match (&mut self.queue_focus, queue_rows.len()) {
-            (focus @ Some(_), 0) => *focus = None,
-            (Some(sel), n) => *sel = (*sel).min(n - 1),
-            (None, _) => {}
-        }
         let queue_lines = self.queued_panel_lines(&queue_rows, area.width);
         let queue_panel_height = self.queued_panel_height(
             &queue_lines,
@@ -2991,59 +2984,38 @@ impl CodeTuiApp {
         frame.render_widget(Paragraph::new(wrapped.text).scroll((scroll, 0)), body);
     }
 
-    /// Queued-input panel lines: a blank spacer, one line per item (windowed
-    /// around the selection with `… +k` indicators), a hint line while focused.
+    /// Blank spacer, the oldest `QUEUE_PANEL_MAX_ROWS` rows, overflow, hint.
     fn queued_panel_lines(&self, rows: &[QueuedRow], width: u16) -> Vec<Line<'static>> {
         if rows.is_empty() {
             return Vec::new();
         }
-        let selected = self.queue_focus;
-        let start = selected
-            .map(|sel| sel.saturating_sub(QUEUE_PANEL_MAX_ROWS - 1))
-            .unwrap_or(0)
-            .min(rows.len().saturating_sub(QUEUE_PANEL_MAX_ROWS));
-        let end = (start + QUEUE_PANEL_MAX_ROWS).min(rows.len());
+        let shown = rows.len().min(QUEUE_PANEL_MAX_ROWS);
         let mut lines = vec![Line::default()];
-        if start > 0 {
-            lines.push(Line::from(Span::styled(
-                format!("  … +{start} earlier"),
-                Style::default().fg(FAINT()),
-            )));
-        }
-        for (i, row) in rows.iter().enumerate().take(end).skip(start) {
-            let is_selected = selected == Some(i);
-            let marker = if is_selected { "▸ " } else { "  " };
+        for row in &rows[..shown] {
             let prefix = match row.segment {
                 QueueSegment::Steering => "» ",
                 QueueSegment::Command => "",
                 QueueSegment::Message => "· ",
             };
             let room = usize::from(width).saturating_sub(3 + prefix.chars().count());
-            let (marker_style, text_style) = if is_selected {
-                (Style::default().fg(ACCENT()), Style::default().fg(TEXT()))
-            } else {
-                (Style::default().fg(MUTED()), Style::default().fg(MUTED()))
-            };
-            lines.push(Line::from(vec![
-                Span::styled(marker.to_string(), marker_style),
-                Span::styled(
-                    format!("{prefix}{}", truncate_for_display_width(&row.display, room)),
-                    text_style,
+            lines.push(Line::from(Span::styled(
+                format!(
+                    "  {prefix}{}",
+                    truncate_for_display_width(&row.display, room)
                 ),
-            ]));
+                Style::default().fg(MUTED()),
+            )));
         }
-        if end < rows.len() {
+        if shown < rows.len() {
             lines.push(Line::from(Span::styled(
-                format!("  … +{} more", rows.len() - end),
+                format!("  … +{} more", rows.len() - shown),
                 Style::default().fg(FAINT()),
             )));
         }
-        if selected.is_some() {
-            lines.push(Line::from(Span::styled(
-                "  Enter edit · Ctrl+D remove · Alt+↑↓ move · Esc back",
-                Style::default().fg(FAINT()),
-            )));
-        }
+        lines.push(Line::from(Span::styled(
+            QUEUE_RECALL_HINT.to_string(),
+            Style::default().fg(FAINT()),
+        )));
         lines
     }
 

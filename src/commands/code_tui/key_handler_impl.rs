@@ -34,7 +34,14 @@ fn cycle(row: usize, dir: CycleDir) -> OverlayKeyAction {
 }
 
 const GOAL_STOP_CONFIRM_NOTICE: &str = "Press Esc again to stop goal mode";
-const QUEUE_ROW_GONE_NOTICE: &str = "That message was already picked up by the agent";
+
+fn is_composer_prev_key(key: KeyEvent) -> bool {
+    match key.code {
+        KeyCode::Up => key.modifiers.is_empty(),
+        KeyCode::Char('p') => key.modifiers.contains(KeyModifiers::CONTROL),
+        _ => false,
+    }
+}
 
 impl CodeTuiApp {
     pub(super) async fn handle_key(&mut self, key: KeyEvent) -> Result<bool> {
@@ -148,8 +155,8 @@ impl CodeTuiApp {
             return Ok(should_exit);
         }
 
-        if let Some(should_exit) = self.handle_queue_focus_key(key) {
-            return Ok(should_exit);
+        if self.handle_queue_recall_key(key) {
+            return Ok(false);
         }
 
         // Close the dropdown without interrupting a live turn.
@@ -1365,117 +1372,26 @@ impl CodeTuiApp {
         }
     }
 
-    /// Queue-focus mode over the queued-input panel (↑ on an empty composer
-    /// enters it). Sits between the overlay and global handlers: pre-empts the
-    /// sending-scroll ↑/↓ and Esc-interrupt branches, yields to modal cards.
-    /// `None` = fall through, exiting focus first so typing resumes composing.
-    fn handle_queue_focus_key(&mut self, key: KeyEvent) -> Option<bool> {
-        let Some(selected) = self.queue_focus else {
-            if matches!(key.code, KeyCode::Up)
-                && key.modifiers.is_empty()
-                && self.draft.is_empty()
-                && self.loading_resume.is_none()
-            {
-                let rows = self.queued_rows();
-                if !rows.is_empty() {
-                    self.queue_focus = Some(rows.len() - 1);
-                    return Some(false);
-                }
-            }
-            return None;
-        };
-
-        let rows = self.queued_rows();
-        if rows.is_empty() {
-            self.queue_focus = None;
-            return None;
+    /// Runs above the global handlers so it pre-empts the sending-scroll ↑
+    /// branch; falls through once the queue is empty, so the next press reaches
+    /// draft history.
+    fn handle_queue_recall_key(&mut self, key: KeyEvent) -> bool {
+        if !is_composer_prev_key(key)
+            || self.loading_resume.is_some()
+            || self.visible_command_menu().is_some()
+            || !self.composer_cursor_on_top_row()
+            || !self.recall_queued_into_draft()
+        {
+            return false;
         }
-        let selected = selected.min(rows.len() - 1);
-        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-        let reorder = key
-            .modifiers
-            .intersects(KeyModifiers::ALT | KeyModifiers::SHIFT)
-            && !ctrl;
-        match key.code {
-            KeyCode::Up if reorder => {
-                if self.queue_row_move(&rows[selected], -1) {
-                    self.queue_focus = Some(selected.saturating_sub(1));
-                }
-            }
-            KeyCode::Down if reorder => {
-                if self.queue_row_move(&rows[selected], 1) {
-                    self.queue_focus = Some(selected + 1);
-                }
-            }
-            KeyCode::Up if key.modifiers.is_empty() => {
-                self.queue_focus = Some(selected.saturating_sub(1));
-            }
-            KeyCode::Char('p') if ctrl => {
-                self.queue_focus = Some(selected.saturating_sub(1));
-            }
-            KeyCode::Down if key.modifiers.is_empty() => {
-                if selected + 1 < rows.len() {
-                    self.queue_focus = Some(selected + 1);
-                } else {
-                    self.queue_focus = None;
-                }
-            }
-            KeyCode::Char('n') if ctrl => {
-                if selected + 1 < rows.len() {
-                    self.queue_focus = Some(selected + 1);
-                } else {
-                    self.queue_focus = None;
-                }
-            }
-            KeyCode::Enter => match self.queue_row_recall(&rows[selected]) {
-                Some(text) => {
-                    self.clear_queue_notice();
-                    self.queue_focus = None;
-                    self.draft = text;
-                    self.cursor = self.draft.len();
-                    self.sync_command_menu_state();
-                }
-                None => {
-                    self.notice = Some((MUTED(), QUEUE_ROW_GONE_NOTICE.to_string()));
-                }
-            },
-            KeyCode::Backspace | KeyCode::Delete => {
-                if self.queue_row_remove(&rows[selected]) {
-                    self.clear_queue_notice();
-                } else {
-                    self.notice = Some((MUTED(), QUEUE_ROW_GONE_NOTICE.to_string()));
-                }
-                match self.queued_rows().len() {
-                    0 => self.queue_focus = None,
-                    n => self.queue_focus = Some(selected.min(n - 1)),
-                }
-            }
-            KeyCode::Char('d') if ctrl => {
-                if self.queue_row_remove(&rows[selected]) {
-                    self.clear_queue_notice();
-                } else {
-                    self.notice = Some((MUTED(), QUEUE_ROW_GONE_NOTICE.to_string()));
-                }
-                match self.queued_rows().len() {
-                    0 => self.queue_focus = None,
-                    n => self.queue_focus = Some(selected.min(n - 1)),
-                }
-            }
-            KeyCode::Esc => {
-                self.queue_focus = None;
-            }
-            _ => {
-                self.queue_focus = None;
-                return None;
-            }
-        }
-        Some(false)
+        self.clear_queue_notice();
+        self.sync_command_menu_state();
+        true
     }
 
     fn clear_queue_notice(&mut self) {
         let stale = matches!(&self.notice, Some((_, text)) if text.starts_with("Queued")
-            || text.contains(" queued — ")
-            || text == QUEUE_ROW_GONE_NOTICE);
+            || text.contains(" queued — "));
         if stale {
             self.notice = None;
         }

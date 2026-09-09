@@ -3131,11 +3131,9 @@ const HELP_KEYBINDINGS: &[(&str, &[(&str, &str)])] = &[
     (
         "Queued messages",
         &[
-            ("↑ (empty prompt)", "select a queued message"),
-            ("Enter", "recall it into the prompt to edit"),
-            ("Del/Ctrl+D", "remove it"),
-            ("Alt/Shift+↑/↓", "move it in the queue"),
-            ("Esc", "back to the prompt"),
+            ("Enter (mid-turn)", "queue the message for the next turn"),
+            ("↑ (top of prompt)", "pull them all back into the prompt"),
+            ("Ctrl+L", "then clear the prompt to drop them"),
         ],
     ),
     (

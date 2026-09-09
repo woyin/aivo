@@ -169,6 +169,11 @@ impl CodeTuiApp {
         }
     }
 
+    pub(super) fn composer_cursor_on_top_row(&self) -> bool {
+        let rows = composer_visual_rows(&self.draft, self.composer_text_width());
+        composer_cursor_rowcol(&self.draft, self.cursor, &rows).0 == 0
+    }
+
     /// Move the cursor up one *visual* (wrapped) row, keeping its display column
     /// where possible. Returns false when already on the top row, so the caller
     /// can fall back to history recall (Claude-Code style: history at the edge).

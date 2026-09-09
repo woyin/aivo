@@ -373,6 +373,7 @@ pub(super) const PLAIN_CODE_BADGE: &str = "plain chat";
 pub(super) const EMPTY_STATE_TOP_GAP: u16 = 1;
 /// Max visible rows in the queued-input panel.
 pub(super) const QUEUE_PANEL_MAX_ROWS: usize = 5;
+pub(super) const QUEUE_RECALL_HINT: &str = "  ↑ to edit";
 // No bottom padding: the composer already reserves its own blank spacing row
 // above the divider, so the welcome screen's last line keeps the same single
 // blank gap above the prompt as a live conversation does (not a doubled gap).
@@ -2750,12 +2751,10 @@ pub(super) enum QueueSegment {
     Message,
 }
 
-/// One row of the unified queued-input view, snapshotted per key event/frame;
-/// ops revalidate `offset`+`recall` against the owning queue before mutating.
+/// One row of the unified queued-input view.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct QueuedRow {
     pub(super) segment: QueueSegment,
-    pub(super) offset: usize,
     /// Single-line label; width truncation happens at render time.
     pub(super) display: String,
     /// Text a recall puts back into the composer.
@@ -3621,9 +3620,6 @@ pub(super) struct CodeTuiApp {
     /// turn finishes, before any queued message. Cleared with `queued_messages` on
     /// interrupt/cancel.
     pub(super) queued_commands: Vec<SlashCommand>,
-    /// Selected row in the queued-input panel (`queued_rows` order); `None` =
-    /// composer focused. Entered by ↑ on an empty composer.
-    pub(super) queue_focus: Option<usize>,
     /// An in-flight `!cmd` local shell run streaming output into the transcript,
     /// or `None`. Separate from `sending` (model turns) so the two don't entangle.
     pub(super) local_command: Option<LocalCommandRun>,
@@ -4057,7 +4053,6 @@ impl CodeTuiApp {
             pending_reply_obligation: None,
             steering_queue: SteeringQueue::default(),
             queued_commands: Vec::new(),
-            queue_focus: None,
             project_mcp_consent: ProjectMcpConsent::default(),
             local_command: None,
             jobs: crate::agent::jobs::JobTable::new(None),

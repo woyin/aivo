@@ -12,99 +12,48 @@ impl CodeTuiApp {
         let mut rows = Vec::with_capacity(
             steering.len() + self.queued_commands.len() + self.queued_messages.len(),
         );
-        for (offset, text) in steering.iter().enumerate() {
+        for text in &steering {
             rows.push(queued_row(
                 QueueSegment::Steering,
-                offset,
                 message_recall_text(text),
             ));
         }
-        for (offset, command) in self.queued_commands.iter().enumerate() {
+        for command in &self.queued_commands {
             rows.push(queued_row(
                 QueueSegment::Command,
-                offset,
                 command_recall_text(command),
             ));
         }
-        for (offset, text) in self.queued_messages.iter().enumerate() {
-            rows.push(queued_row(
-                QueueSegment::Message,
-                offset,
-                message_recall_text(text),
-            ));
+        for text in &self.queued_messages {
+            rows.push(queued_row(QueueSegment::Message, message_recall_text(text)));
         }
         rows
     }
 
-    /// Remove the row from its owning queue; `false` = the engine drained it.
-    pub(super) fn queue_row_remove(&mut self, row: &QueuedRow) -> bool {
-        match row.segment {
-            QueueSegment::Steering => {
-                let mut queue = self
-                    .steering_queue
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                match validated_position(&queue, row, |s| message_recall_text(s)) {
-                    Some(pos) => {
-                        queue.remove(pos);
-                        true
-                    }
-                    None => false,
-                }
-            }
-            QueueSegment::Command => {
-                match validated_position(&self.queued_commands, row, command_recall_text) {
-                    Some(pos) => {
-                        self.queued_commands.remove(pos);
-                        true
-                    }
-                    None => false,
-                }
-            }
-            QueueSegment::Message => {
-                match validated_position(&self.queued_messages, row, |s| message_recall_text(s)) {
-                    Some(pos) => {
-                        self.queued_messages.remove(pos);
-                        true
-                    }
-                    None => false,
-                }
-            }
+    /// Drain every pending row into the composer as one newline-joined draft,
+    /// keeping typed text on its own line below. `false` = nothing was queued.
+    pub(super) fn recall_queued_into_draft(&mut self) -> bool {
+        let rows = self.queued_rows();
+        if rows.is_empty() {
+            return false;
         }
-    }
-
-    /// Remove the row and hand back the text to re-edit in the composer.
-    pub(super) fn queue_row_recall(&mut self, row: &QueuedRow) -> Option<String> {
-        self.queue_row_remove(row).then(|| row.recall.clone())
-    }
-
-    /// Swap the row with its neighbor toward `dir` (−1 earlier, +1 later);
-    /// within its own segment only — delivery semantics differ across segments.
-    pub(super) fn queue_row_move(&mut self, row: &QueuedRow, dir: i8) -> bool {
-        match row.segment {
-            QueueSegment::Steering => {
-                let mut queue = self
-                    .steering_queue
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                match validated_position(&queue, row, |s| message_recall_text(s)) {
-                    Some(pos) => swap_neighbor(&mut queue, pos, dir),
-                    None => false,
-                }
-            }
-            QueueSegment::Command => {
-                match validated_position(&self.queued_commands, row, command_recall_text) {
-                    Some(pos) => swap_neighbor(&mut self.queued_commands, pos, dir),
-                    None => false,
-                }
-            }
-            QueueSegment::Message => {
-                match validated_position(&self.queued_messages, row, |s| message_recall_text(s)) {
-                    Some(pos) => swap_neighbor(&mut self.queued_messages, pos, dir),
-                    None => false,
-                }
-            }
+        let recalled = rows
+            .iter()
+            .map(|row| row.recall.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        self.queued_messages.clear();
+        self.queued_commands.clear();
+        self.clear_steering_queue();
+        self.leave_history_navigation();
+        if self.draft.is_empty() {
+            self.cursor = recalled.len();
+            self.draft = recalled;
+        } else {
+            self.cursor += recalled.len() + 1;
+            self.draft = format!("{recalled}\n{}", self.draft);
         }
+        true
     }
 }
 
@@ -114,44 +63,12 @@ fn message_recall_text(text: &str) -> String {
     skill_invocation_label(text).unwrap_or_else(|| text.to_string())
 }
 
-fn queued_row(segment: QueueSegment, offset: usize, recall: String) -> QueuedRow {
+fn queued_row(segment: QueueSegment, recall: String) -> QueuedRow {
     let display = recall.replace('\n', " ⏎ ");
     QueuedRow {
         segment,
-        offset,
         display,
         recall,
-    }
-}
-
-/// The row's current position: the snapshotted offset when it still matches,
-/// else by recall text; `None` = the engine consumed it.
-fn validated_position<T>(
-    items: &[T],
-    row: &QueuedRow,
-    recall_of: impl Fn(&T) -> String,
-) -> Option<usize> {
-    if items
-        .get(row.offset)
-        .is_some_and(|item| recall_of(item) == row.recall)
-    {
-        return Some(row.offset);
-    }
-    items.iter().position(|item| recall_of(item) == row.recall)
-}
-
-fn swap_neighbor<T>(items: &mut [T], pos: usize, dir: i8) -> bool {
-    let target = if dir < 0 {
-        pos.checked_sub(1)
-    } else {
-        Some(pos + 1)
-    };
-    match target {
-        Some(target) if target < items.len() => {
-            items.swap(pos, target);
-            true
-        }
-        _ => false,
     }
 }
 

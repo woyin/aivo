@@ -4144,7 +4144,6 @@ and keep each turn's work small"
         self.queued_messages.clear();
         self.clear_steering_queue();
         self.queued_commands.clear();
-        self.queue_focus = None;
         count
     }
 
