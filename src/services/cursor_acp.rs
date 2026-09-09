@@ -794,6 +794,35 @@ pub fn looks_like_cursor_auth_failure(msg: &str) -> bool {
     lower.contains("unauthorized") && !lower.contains("rejectunauthorized")
 }
 
+pub(crate) const CURSOR_PROMPT_ATTEMPTS: u32 = 3;
+
+pub(crate) fn cursor_reconnect_backoff(attempt: u32) -> std::time::Duration {
+    std::time::Duration::from_millis(800u64 << (attempt.saturating_sub(1)).min(3))
+}
+
+/// In-band transport death: cursor-agent appends this to the assistant message
+/// and still returns `end_turn`. Prefix + `[code]` so ordinary replies don't match.
+pub(crate) fn cursor_transport_failure(text: &str) -> Option<&str> {
+    let report = text
+        .trim_start()
+        .strip_prefix("Error: ")
+        .or_else(|| text.trim_start().strip_prefix("Cursor Error: "))?;
+    let has_connect_code = report
+        .split_once('[')
+        .is_some_and(|(_, rest)| rest.contains(']'));
+    (report.starts_with("RetriableError:") && has_connect_code).then_some(report.trim_end())
+}
+
+pub(crate) fn cursor_transport_error(report: &str) -> anyhow::Error {
+    crate::errors::CLIError::new(
+        format!("cursor-agent lost its connection to Cursor's backend: {report}"),
+        crate::errors::ErrorCategory::Network,
+        None::<String>,
+        Some("If this repeats, a proxy is usually in the path — add `cursor.sh` to NO_PROXY."),
+    )
+    .into()
+}
+
 pub fn map_cursor_auth_error(err: anyhow::Error, key_id_or_name: &str) -> anyhow::Error {
     let msg = format!("{err:#}");
     if !looks_like_cursor_auth_failure(&msg) || msg.contains("login expired or signed out") {
@@ -1317,6 +1346,7 @@ pub struct CursorTurnResult {
     pub model: Option<String>,
     /// `None` → callers fall back to their chars/4 estimate.
     pub usage: Option<CursorUsage>,
+    pub transport_failure: Option<String>,
 }
 
 /// Token usage from an ACP `session/prompt` result. Schema-defined but not
@@ -1760,39 +1790,50 @@ where
     .map_err(|e| map_cursor_auth_error(e, &key.id))?;
     ensure_image_attachments_supported(session.prompt_capabilities(), attachments)?;
     let blocks = build_prompt_blocks(prompt_text, attachments)?;
-    let mut stream = session
-        .prompt_with_blocks(blocks)
-        .await
-        .map_err(|e| map_cursor_auth_error(e, &key.id))?;
+    let mut attempt = 1;
+    loop {
+        let mut stream = session
+            .prompt_with_blocks(blocks.clone())
+            .await
+            .map_err(|e| map_cursor_auth_error(e, &key.id))?;
 
-    let mut out = CursorTurnResult {
-        model: session.model_id().map(str::to_string),
-        ..Default::default()
-    };
-    let mut reasoning_buf = String::new();
-    while let Some(event) = stream.next().await {
-        match event {
-            PromptEvent::Update(value) => {
-                consume_session_update(&value, &mut out, &mut reasoning_buf, on_chunk)?;
-            }
-            PromptEvent::Done(result) => {
-                let value = result
-                    .map_err(|e| anyhow!(e))
-                    .context("cursor-agent ACP session/prompt failed")
-                    .map_err(|e| map_cursor_auth_error(e, &key.id))?;
-                out.stop_reason = value
-                    .get("stopReason")
-                    .and_then(Value::as_str)
-                    .map(str::to_string);
-                out.usage = parse_result_usage(&value);
-                break;
+        let mut out = CursorTurnResult {
+            model: session.model_id().map(str::to_string),
+            ..Default::default()
+        };
+        let mut reasoning_buf = String::new();
+        while let Some(event) = stream.next().await {
+            match event {
+                PromptEvent::Update(value) => {
+                    consume_session_update(&value, &mut out, &mut reasoning_buf, on_chunk)?;
+                }
+                PromptEvent::Done(result) => {
+                    let value = result
+                        .map_err(|e| anyhow!(e))
+                        .context("cursor-agent ACP session/prompt failed")
+                        .map_err(|e| map_cursor_auth_error(e, &key.id))?;
+                    out.stop_reason = value
+                        .get("stopReason")
+                        .and_then(Value::as_str)
+                        .map(str::to_string);
+                    out.usage = parse_result_usage(&value);
+                    break;
+                }
             }
         }
+        if let Some(report) = out.transport_failure.take() {
+            if out.content.is_empty() && attempt < CURSOR_PROMPT_ATTEMPTS {
+                tokio::time::sleep(cursor_reconnect_backoff(attempt)).await;
+                attempt += 1;
+                continue;
+            }
+            return Err(cursor_transport_error(&report));
+        }
+        if !reasoning_buf.is_empty() {
+            out.reasoning_content = Some(reasoning_buf);
+        }
+        return Ok(out);
     }
-    if !reasoning_buf.is_empty() {
-        out.reasoning_content = Some(reasoning_buf);
-    }
-    Ok(out)
 }
 
 /// Folds one `session/update` value into the running turn result and emits a
@@ -1820,6 +1861,10 @@ where
     match kind {
         Some("agent_message_chunk") => {
             if let Some(t) = text() {
+                if let Some(report) = cursor_transport_failure(t) {
+                    out.transport_failure = Some(report.to_string());
+                    return Ok(());
+                }
                 out.content.push_str(t);
                 on_chunk(CursorChunk::Content(t))?;
             }
@@ -3225,6 +3270,53 @@ mod tests {
                 ("content".to_string(), "Hello".to_string()),
             ]
         );
+    }
+
+    #[test]
+    fn cursor_transport_failure_matches_measured_reports_only() {
+        assert_eq!(
+            cursor_transport_failure(
+                "\n\nError: RetriableError: [canceled] http/2 stream closed with error code CANCEL (0x8)"
+            ),
+            Some("RetriableError: [canceled] http/2 stream closed with error code CANCEL (0x8)")
+        );
+        assert!(
+            cursor_transport_failure(
+                "Cursor Error: RetriableError: [internal] HTTP/2 keepalive ping timed out after 5000ms"
+            )
+            .is_some()
+        );
+        assert!(
+            cursor_transport_failure(
+                "You hit `Error: RetriableError: [internal] ...` because a proxy sits in front of cursor.sh."
+            )
+            .is_none()
+        );
+        assert!(cursor_transport_failure("\n\nError: TypeError: x is not a function").is_none());
+        assert!(cursor_transport_failure("\n\nError: RetriableError: no code here").is_none());
+    }
+
+    #[test]
+    fn consume_session_update_holds_back_transport_failure_text() {
+        let mut out = CursorTurnResult::default();
+        let mut reasoning = String::new();
+        let mut chunks: Vec<String> = Vec::new();
+        let mut on_chunk = |chunk: CursorChunk<'_>| -> Result<()> {
+            if let CursorChunk::Content(t) = chunk {
+                chunks.push(t.to_string());
+            }
+            Ok(())
+        };
+
+        let msg = serde_json::json!({
+            "sessionId": "s1",
+            "update": {"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": "\n\nError: RetriableError: [canceled] http/2 stream closed with error code CANCEL (0x8)"}},
+        });
+        consume_session_update(&msg, &mut out, &mut reasoning, &mut on_chunk).unwrap();
+
+        assert!(out.content.is_empty());
+        assert!(chunks.is_empty());
+        assert!(out.transport_failure.is_some());
     }
 
     #[test]

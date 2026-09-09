@@ -5065,10 +5065,6 @@ async fn drive_cursor_turn(
     tx: &UnboundedSender<RuntimeEvent>,
 ) -> Result<ChatTurnResult> {
     let blocks = cursor_acp::build_prompt_blocks(&user_input, &attachments)?;
-    let mut stream = client.start_prompt(&session_id, blocks).await?;
-
-    let mut turn_result = CursorTurnResult::default();
-    let mut reasoning_buf = String::new();
     let mut forward = |chunk: CursorChunk<'_>| -> Result<()> {
         // Tool calls reuse the in-process agent's tool-call card (the renderer
         // coalesces runs); text/reasoning stream as deltas.
@@ -5116,31 +5112,52 @@ async fn drive_cursor_turn(
         Ok(())
     };
 
-    while let Some(event) = stream.next().await {
-        match event {
-            PromptEvent::Update(value) => {
-                cursor_acp::consume_session_update(
-                    &value,
-                    &mut turn_result,
-                    &mut reasoning_buf,
-                    &mut forward,
-                )?;
-            }
-            PromptEvent::Done(result) => {
-                let value = result
-                    .map_err(|e| anyhow::anyhow!(e))
-                    .context("cursor-agent ACP session/prompt failed")?;
-                turn_result.usage = cursor_acp::parse_result_usage(&value);
-                break;
+    let mut attempt = 1;
+    let turn_result = loop {
+        let mut stream = client.start_prompt(&session_id, blocks.clone()).await?;
+        let mut turn_result = CursorTurnResult::default();
+        let mut reasoning_buf = String::new();
+        while let Some(event) = stream.next().await {
+            match event {
+                PromptEvent::Update(value) => {
+                    cursor_acp::consume_session_update(
+                        &value,
+                        &mut turn_result,
+                        &mut reasoning_buf,
+                        &mut forward,
+                    )?;
+                }
+                PromptEvent::Done(result) => {
+                    let value = result
+                        .map_err(|e| anyhow::anyhow!(e))
+                        .context("cursor-agent ACP session/prompt failed")?;
+                    turn_result.usage = cursor_acp::parse_result_usage(&value);
+                    break;
+                }
             }
         }
-    }
-    // `reasoning_buf` is required by `consume_session_update`'s signature, but the
-    // chat TUI doesn't read it: cursor reasoning reaches the UI live via
-    // `CursorChunk::Reasoning` → `pending_reasoning` (committed at turn finish like
-    // every other provider), so there's no `reasoning_content` on `ChatTurnResult`
-    // to populate here.
-    let _ = &reasoning_buf;
+        // `reasoning_buf` is required by `consume_session_update`'s signature, but the
+        // chat TUI doesn't read it: cursor reasoning reaches the UI live via
+        // `CursorChunk::Reasoning` → `pending_reasoning` (committed at turn finish like
+        // every other provider), so there's no `reasoning_content` on `ChatTurnResult`
+        // to populate here.
+        let _ = &reasoning_buf;
+
+        let Some(report) = turn_result.transport_failure.take() else {
+            break turn_result;
+        };
+        if !turn_result.content.is_empty() || attempt >= cursor_acp::CURSOR_PROMPT_ATTEMPTS {
+            return Err(cursor_acp::cursor_transport_error(&report));
+        }
+        tx.send(RuntimeEvent::AgentNotice(format!(
+            "Cursor connection lost — retrying ({}/{})…",
+            attempt + 1,
+            cursor_acp::CURSOR_PROMPT_ATTEMPTS
+        )))
+        .ok();
+        tokio::time::sleep(cursor_acp::cursor_reconnect_backoff(attempt)).await;
+        attempt += 1;
+    };
 
     Ok(ChatTurnResult {
         content: turn_result.content,
