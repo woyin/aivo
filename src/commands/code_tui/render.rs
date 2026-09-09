@@ -2250,6 +2250,7 @@ type Seg = (bool, String);
 /// A grouped-diff row. `num` is the gutter line number (old-file for `Del`,
 /// new-file for `Context`/`Ins`), `None` when the offset is unknown. Changed
 /// lines carry per-token segments so the word diff brightens only what moved.
+#[derive(Clone)]
 enum DiffRow {
     Context { num: Option<usize>, text: String },
     Del { num: Option<usize>, segs: Vec<Seg> },
@@ -2257,20 +2258,34 @@ enum DiffRow {
     Gap,
 }
 
-/// Line-level LCS diff of `old` vs `new`, so only changed lines are flagged and
-/// the rest stays context. Falls back to remove-all/add-all past a size cap so a
-/// giant rewrite can't trigger the O(n·m) table.
+/// Line-level LCS of `old` vs `new`. Common prefix/suffix stay Equal even past
+/// the size cap — Cursor ACP sends the whole file, and without this a one-line
+/// edit in a 4k-line file is remove-all/add-all (the card shows only red).
 fn diff_lines<'a>(old: &'a str, new: &'a str) -> Vec<(DiffTag, &'a str)> {
     let a: Vec<&str> = old.lines().collect();
     let b: Vec<&str> = new.lines().collect();
     let (n, m) = (a.len(), b.len());
-    if n > 600 || m > 600 {
-        let mut ops = Vec::with_capacity(n + m);
-        ops.extend(a.iter().map(|l| (DiffTag::Del, *l)));
-        ops.extend(b.iter().map(|l| (DiffTag::Ins, *l)));
-        return ops;
+    let mut pre = 0;
+    while pre < n && pre < m && a[pre] == b[pre] {
+        pre += 1;
     }
-    lcs_diff(&a, &b)
+    let mut a_end = n;
+    let mut b_end = m;
+    while a_end > pre && b_end > pre && a[a_end - 1] == b[b_end - 1] {
+        a_end -= 1;
+        b_end -= 1;
+    }
+    let mut ops = Vec::with_capacity(n + m);
+    ops.extend(a[..pre].iter().copied().map(|l| (DiffTag::Equal, l)));
+    let (mid_n, mid_m) = (a_end - pre, b_end - pre);
+    if mid_n > 600 || mid_m > 600 {
+        ops.extend(a[pre..a_end].iter().copied().map(|l| (DiffTag::Del, l)));
+        ops.extend(b[pre..b_end].iter().copied().map(|l| (DiffTag::Ins, l)));
+    } else if mid_n > 0 || mid_m > 0 {
+        ops.extend(lcs_diff(&a[pre..a_end], &b[pre..b_end]));
+    }
+    ops.extend(a[a_end..].iter().copied().map(|l| (DiffTag::Equal, l)));
+    ops
 }
 
 /// Split a line into word-diff tokens: identifier runs and whitespace runs each
@@ -2770,16 +2785,42 @@ fn render_edit_diff(
     }
 
     // Indent two under the `→ verb` call so the diff nests with the tool.
-    let numw = diff_num_width(&rows);
-    for row in rows.iter().take(MAX_DIFF_LINES) {
+    let (preview, hidden) = preview_diff_rows(rows, MAX_DIFF_LINES);
+    let numw = diff_num_width(&preview);
+    for row in &preview {
         lines.push(indent_tool_detail(render_diff_row(row, numw)));
     }
-    if rows.len() > MAX_DIFF_LINES {
+    if hidden > 0 {
         lines.push(line_with_plain(vec![Span::styled(
-            format!("    … (+{} more)", rows.len() - MAX_DIFF_LINES),
+            format!("    … (+{hidden} more)"),
             Style::default().fg(FAINT()),
         )]));
     }
+}
+
+/// Cap to `cap` rows. A remove-all/add-all rewrite would otherwise fill the
+/// card with red minuses; keep some of each side.
+fn preview_diff_rows(rows: Vec<DiffRow>, cap: usize) -> (Vec<DiffRow>, usize) {
+    if rows.len() <= cap {
+        return (rows, 0);
+    }
+    let head_has_ins = rows[..cap].iter().any(|r| matches!(r, DiffRow::Ins { .. }));
+    let later_ins = rows[cap..].iter().any(|r| matches!(r, DiffRow::Ins { .. }));
+    if head_has_ins || !later_ins {
+        let hidden = rows.len() - cap;
+        return (rows.into_iter().take(cap).collect(), hidden);
+    }
+    let first_ins = rows
+        .iter()
+        .position(|r| matches!(r, DiffRow::Ins { .. }))
+        .expect("later_ins");
+    let ins_take = (cap / 2).max(1).min(rows.len() - first_ins);
+    let del_take = cap.saturating_sub(ins_take + 1);
+    let hidden = rows.len() - del_take - ins_take;
+    let mut out: Vec<DiffRow> = rows.iter().take(del_take).cloned().collect();
+    out.push(DiffRow::Gap);
+    out.extend(rows[first_ins..first_ins + ins_take].iter().cloned());
+    (out, hidden)
 }
 
 /// Render an `apply_patch` call as a per-file diff: a filename header over the
@@ -4252,6 +4293,76 @@ mod render_tests {
         let mut lines = Vec::new();
         render_edit_diff(&mut lines, "write_file", &args, &[None], None);
         assert!(lines.is_empty(), "empty write should emit no diff rows");
+    }
+
+    fn diff_plain(lines: &[super::StyledLine]) -> Vec<String> {
+        lines
+            .iter()
+            .map(|l| {
+                l.line
+                    .spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn edit_diff_large_file_small_change_shows_both_sides() {
+        let mut old: Vec<String> = (0..800).map(|i| format!("line {i}")).collect();
+        let mut new = old.clone();
+        old[400] = "old middle".into();
+        new[400] = "new middle".into();
+        let args = serde_json::json!({
+            "path": "big.rs",
+            "old_string": old.join("\n"),
+            "new_string": new.join("\n"),
+        });
+        let mut lines = Vec::new();
+        render_edit_diff(&mut lines, "edit_file", &args, &[None], None);
+        let texts = diff_plain(&lines);
+        let blob = texts.join("\n");
+        assert!(
+            blob.contains("old middle") && blob.contains("new middle"),
+            "changed lines missing:\n{blob}"
+        );
+        assert!(
+            blob.contains(" - ") && blob.contains(" + "),
+            "expected both del and ins:\n{blob}"
+        );
+        assert!(
+            !blob.contains("more)"),
+            "small middle change should not truncate:\n{blob}"
+        );
+        assert!(
+            texts.len() < 20,
+            "should be a compact hunk, got {} rows:\n{blob}",
+            texts.len()
+        );
+    }
+
+    #[test]
+    fn edit_diff_large_rewrite_still_shows_additions() {
+        let old: String = (0..700).map(|i| format!("old {i}\n")).collect();
+        let new: String = (0..700).map(|i| format!("new {i}\n")).collect();
+        let args = serde_json::json!({
+            "path": "rewrite.rs",
+            "old_string": old,
+            "new_string": new,
+        });
+        let mut lines = Vec::new();
+        render_edit_diff(&mut lines, "edit_file", &args, &[None], None);
+        let blob = diff_plain(&lines).join("\n");
+        assert!(
+            blob.contains(" - ") && blob.contains("old "),
+            "dels:\n{blob}"
+        );
+        assert!(
+            blob.contains(" + ") && blob.contains("new "),
+            "ins:\n{blob}"
+        );
+        assert!(blob.contains("more)"), "rewrite should still cap:\n{blob}");
     }
 
     #[test]
