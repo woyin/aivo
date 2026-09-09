@@ -1,5 +1,18 @@
 # Changelog
 
+## v0.49.5
+
+Cursor ACP sessions surface advertised slash commands, image generation, and edit diffs instead of opaque cards; MCP and ask mode are wired through session/new and session/set_mode. Parallel live tool rows collapse so a Cursor batch does not bury the transcript, in-band transport deaths retry instead of ending the turn, and ↑ recalls the whole queued-message list. Large-file edit diffs show both sides, a denial quoted in a command's own output no longer fakes a sandbox block, and a long turn no longer freezes the TUI on token estimates, markdown, glob, and disk I/O.
+
+- improve(cursor): show advertised slash commands, image gen, and edit diffs (ae777fe3)
+- improve(cursor): wire /mcp into session/new and add ACP ask mode (ae2387de)
+- improve(code): keep a long turn from freezing the TUI on token estimates, markdown, glob, and disk I/O (7b53da83)
+- improve(code): collapse parallel live tool rows so a Cursor ACP batch doesn't bury the transcript (889c5645)
+- improve(code): recall the whole queued-message list with ↑, not one row at a time (4a0c6231)
+- fix(cursor): retry in-band transport deaths instead of treating them as a finished turn (d3ad5992)
+- fix(code): show both sides of large-file edit diffs (9721c12f)
+- fix(agent): a denial quoted in a command's own output faked a sandbox block (f013575f)
+
 ## v0.49.4
 
 - improve(code): mark a turn that asked or left open tasks as paused, not done (018bcf96, eb083b4f)
