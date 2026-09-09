@@ -587,6 +587,75 @@ fn test_streaming_tokens_do_not_invalidate_history_body_cache() {
     );
 }
 
+#[test]
+fn test_in_flight_tool_call_does_not_invalidate_history_body_cache() {
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.history.push(ChatMessage {
+        model: None,
+        role: "user".to_string(),
+        content: "please inspect src/main.rs".to_string(),
+        reasoning_content: None,
+        attachments: vec![],
+    });
+    app.history.push(ChatMessage {
+        model: None,
+        role: "assistant".to_string(),
+        content: "I'll read the file.".to_string(),
+        reasoning_content: None,
+        attachments: vec![],
+    });
+    app.sending = true;
+    app.request_started_at = Some(std::time::Instant::now());
+
+    let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+    terminal
+        .draw(|frame| {
+            app.render_main(frame, frame.area());
+        })
+        .unwrap();
+    let body_ptr = app
+        .render_cache
+        .transcript
+        .as_ref()
+        .unwrap()
+        .body
+        .lines
+        .as_ptr();
+    let prefix_end = app.render_cache.transcript.as_ref().unwrap().prefix_end;
+
+    app.apply_agent_tool_call(
+        Some("c1".to_string()),
+        "read_file".to_string(),
+        serde_json::json!({"path": "src/main.rs"}),
+        vec![],
+        None,
+    );
+    terminal
+        .draw(|frame| {
+            app.render_main(frame, frame.area());
+        })
+        .unwrap();
+    assert_eq!(
+        app.render_cache
+            .transcript
+            .as_ref()
+            .unwrap()
+            .body
+            .lines
+            .as_ptr(),
+        body_ptr,
+        "hidden in-flight tool_call must reuse the cached history body"
+    );
+    assert_eq!(
+        app.render_cache.transcript.as_ref().unwrap().prefix_end,
+        prefix_end
+    );
+}
+
 /// The split render (cached history body + volatile tail + spinner) must
 /// reproduce the single-pass `build_transcript` row-for-row at the same width —
 /// scroll math goes through `max_scroll` → `build_transcript`, so any divergence

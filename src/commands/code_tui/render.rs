@@ -893,7 +893,7 @@ fn mark_block(
 
 /// [`mark_block`] with an explicit starting `marked` state, returned updated —
 /// settled/live reply parts place exactly one marker across the sequence.
-fn mark_block_from(
+pub(super) fn mark_block_from(
     block: Vec<StyledLine>,
     body_width: u16,
     marker: &'static str,
@@ -934,6 +934,54 @@ fn mark_block_from(
         }
     }
     (out, marked)
+}
+
+/// Fence-body lines matching [`MarkdownRenderer::emit_code_block`], without a markdown re-parse.
+pub(super) fn render_fence_chunk(
+    chunk: &str,
+    mut fence: Option<(char, usize, String)>,
+) -> (Vec<StyledLine>, Option<(char, usize, String)>) {
+    let mut lines = Vec::new();
+    for line in chunk.split_inclusive('\n') {
+        let content = line.trim_end_matches(['\n', '\r']);
+        let trimmed = content.trim();
+        let fence_len = trimmed
+            .chars()
+            .take_while(|&c| c == '`' || c == '~')
+            .count();
+        if let Some((ch, len, _)) = fence.as_ref() {
+            let closing = fence_len >= *len && trimmed.chars().all(|c| c == *ch);
+            if closing {
+                fence = None;
+                // Match `emit_code_block`'s trailing `"  "` + `TagEnd::CodeBlock` blank.
+                lines.push(line_plain("  ".to_string(), Style::default().fg(TEXT())));
+                lines.push(blank_line());
+                continue;
+            }
+            lines.push(line_plain(
+                format!("  {content}"),
+                Style::default().fg(TEXT()),
+            ));
+            continue;
+        }
+        if fence_len >= 3 {
+            let ch = trimmed.chars().next().unwrap();
+            if trimmed[..fence_len].chars().all(|c| c == ch) {
+                let lang = trimmed[fence_len..].trim().to_string();
+                let label = if lang.is_empty() {
+                    "code".to_string()
+                } else {
+                    lang.clone()
+                };
+                lines.push(line_plain(
+                    format!("  {label}"),
+                    Style::default().fg(MUTED()),
+                ));
+                fence = Some((ch, fence_len, lang));
+            }
+        }
+    }
+    (lines, fence)
 }
 
 /// Renders one part of a streamed reply (settled chunk or live suffix) so the

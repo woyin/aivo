@@ -3,6 +3,8 @@
 //! base64 length), `usage`-object parsing, and the measured/estimate calibration
 //! ratio. Pure functions with no engine state — compaction and the loop call in.
 
+use std::sync::Mutex;
+
 use serde_json::{Value, json};
 
 /// Flat per-image token cost — counting the base64 verbatim would blow the budget.
@@ -91,6 +93,63 @@ pub(crate) fn is_image_part(part: &Value) -> bool {
 /// Conservative token estimate over serialized messages (see [`estimate_str_tokens`]).
 pub(crate) fn estimate_tokens(messages: &[Value]) -> usize {
     messages.iter().map(estimate_message_tokens).sum()
+}
+
+/// Count + content/argument bytes — cheaper than re-serializing for a cache key.
+fn messages_est_fp(messages: &[Value]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    messages.len().hash(&mut hasher);
+    let mut bytes = 0u64;
+    for m in messages {
+        bytes = bytes.wrapping_add(message_content_bytes(m));
+    }
+    bytes.hash(&mut hasher);
+    hasher.finish()
+}
+
+fn message_content_bytes(m: &Value) -> u64 {
+    let mut n = 0u64;
+    match m.get("content") {
+        Some(Value::String(s)) => n += s.len() as u64,
+        Some(Value::Array(parts)) => {
+            n += parts.len() as u64;
+            for p in parts {
+                if let Some(s) = p.get("text").and_then(|t| t.as_str()) {
+                    n += s.len() as u64;
+                }
+            }
+        }
+        _ => {}
+    }
+    if let Some(tcs) = m.get("tool_calls").and_then(|v| v.as_array()) {
+        n += tcs.len() as u64;
+        for tc in tcs {
+            if let Some(a) = tc.pointer("/function/arguments").and_then(|v| v.as_str()) {
+                n += a.len() as u64;
+            }
+        }
+    }
+    n
+}
+
+/// [`estimate_tokens`] with a fingerprint cache for unchanged conversations.
+pub(crate) fn estimate_tokens_memo(
+    messages: &[Value],
+    cache: &Mutex<Option<(u64, usize)>>,
+) -> usize {
+    let fp = messages_est_fp(messages);
+    if let Ok(guard) = cache.lock()
+        && let Some((cfp, est)) = *guard
+        && cfp == fp
+    {
+        return est;
+    }
+    let est = estimate_tokens(messages);
+    if let Ok(mut guard) = cache.lock() {
+        *guard = Some((fp, est));
+    }
+    est
 }
 
 /// Message estimate, but each image part counts as a flat [`IMAGE_TOKEN_ESTIMATE`] — its
@@ -242,6 +301,24 @@ mod tests {
             "run classing ({est}) must undercut chars/4 ({flat})"
         );
         assert!(est > flat / 3, "and not collapse toward zero: {est}");
+    }
+
+    #[test]
+    fn estimate_tokens_memo_hits_on_unchanged_messages() {
+        use std::sync::Mutex;
+        let msgs = vec![
+            json!({"role": "system", "content": "you are a coding agent"}),
+            json!({"role": "user", "content": "hello ".repeat(200)}),
+        ];
+        let cache = Mutex::new(None);
+        let a = estimate_tokens_memo(&msgs, &cache);
+        let b = estimate_tokens_memo(&msgs, &cache);
+        assert_eq!(a, b);
+        assert_eq!(a, estimate_tokens(&msgs));
+        let mut grown = msgs.clone();
+        grown.push(json!({"role": "assistant", "content": "ok"}));
+        let c = estimate_tokens_memo(&grown, &cache);
+        assert!(c > a);
     }
 
     #[test]

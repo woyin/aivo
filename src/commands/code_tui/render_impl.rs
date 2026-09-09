@@ -7,6 +7,13 @@ const FOLD_KEEP_TAIL: usize = 8;
 /// marker costs more indirection than it saves.
 const FOLD_MIN: usize = 12;
 
+struct HistorySpan {
+    lines: Vec<StyledLine>,
+    bars: Vec<Option<Color>>,
+    deferred: Option<usize>,
+    previewed: std::collections::HashSet<u64>,
+}
+
 /// Width the transcript body is built to fit (tables, pre-wrapped turn blocks):
 /// full column minus left gutter and right margin. Must equal the paint-time text
 /// area's width, or pre-wrapped rows get re-broken flush at the gutter.
@@ -37,19 +44,18 @@ fn is_safe_block_start(line: &str) -> bool {
     true
 }
 
-/// Largest markdown-safe settle boundary in `src` at or after `from` (itself a
-/// boundary): the start of a non-blank [`is_safe_block_start`] line after a
-/// blank line, outside code fences and blank-spanning raw-HTML blocks. The
-/// candidate line itself stays live, so the suffix always has content.
-fn settled_reply_boundary(src: &str, from: usize) -> usize {
+/// Largest markdown-safe settle boundary at or after `from`. Complete fence
+/// lines settle immediately so a long streamed code block isn't re-parsed every frame.
+fn settled_reply_boundary(
+    src: &str,
+    from: usize,
+    mut fence: Option<(char, usize, String)>,
+) -> (usize, Option<(char, usize, String)>) {
     let mut best = from;
-    let mut fence: Option<(char, usize)> = None;
     let mut html_close: Option<&'static str> = None;
     let mut prev_blank = false;
     let mut pos = from;
     for line in src[from..].split_inclusive('\n') {
-        // Never judge the unterminated live edge: "2" may grow into "2. item"
-        // and continue a loose list, invalidating a latched boundary.
         if !line.ends_with('\n') {
             break;
         }
@@ -67,42 +73,64 @@ fn settled_reply_boundary(src: &str, from: usize) -> usize {
             .chars()
             .take_while(|&c| c == '`' || c == '~')
             .count();
-        match fence {
-            Some((ch, len)) => {
-                // Closing fence: same char, at least as long, nothing after.
-                if fence_len >= len && trimmed.chars().all(|c| c == ch) {
-                    fence = None;
-                }
+        if let Some((ch, len, _)) = fence.as_ref() {
+            let closing = fence_len >= *len && trimmed.chars().all(|c| c == *ch);
+            if closing {
+                best = pos + line.len();
+                fence = None;
+                break;
             }
-            None => {
-                if prev_blank && !trimmed.is_empty() && is_safe_block_start(content) {
+            pos += line.len();
+            // Blank fence lines stay live: `push_block` trims trailing ones.
+            if !trimmed.is_empty() {
+                best = pos;
+            }
+            continue;
+        }
+        if fence_len >= 3 {
+            let ch = trimmed.chars().next().unwrap();
+            if trimmed[..fence_len].chars().all(|c| c == ch) {
+                if pos > from {
                     best = pos;
+                    break;
                 }
-                if fence_len >= 3 {
-                    let ch = trimmed.chars().next().unwrap();
-                    if trimmed[..fence_len].chars().all(|c| c == ch) {
-                        fence = Some((ch, fence_len));
-                    }
-                } else {
-                    let lower = trimmed.to_ascii_lowercase();
-                    for (open, close) in [
-                        ("<pre", "</pre>"),
-                        ("<script", "</script>"),
-                        ("<style", "</style>"),
-                        ("<!--", "-->"),
-                    ] {
-                        if lower.starts_with(open) && !lower.contains(close) {
-                            html_close = Some(close);
-                            break;
-                        }
-                    }
-                }
+                let lang = trimmed[fence_len..].trim().to_string();
+                fence = Some((ch, fence_len, lang));
+                best = pos + line.len();
+                pos += line.len();
+                continue;
+            }
+        }
+        if prev_blank && !trimmed.is_empty() && is_safe_block_start(content) {
+            best = pos;
+        }
+        let lower = trimmed.to_ascii_lowercase();
+        for (open, close) in [
+            ("<pre", "</pre>"),
+            ("<script", "</script>"),
+            ("<style", "</style>"),
+            ("<!--", "-->"),
+        ] {
+            if lower.starts_with(open) && !lower.contains(close) {
+                html_close = Some(close);
+                break;
             }
         }
         prev_blank = trimmed.is_empty();
         pos += line.len();
     }
-    best
+    (best, fence)
+}
+
+fn fence_open_at(chunk: &str) -> bool {
+    chunk.lines().next().is_some_and(|line| {
+        let trimmed = line.trim();
+        let n = trimmed
+            .chars()
+            .take_while(|&c| c == '`' || c == '~')
+            .count();
+        n >= 3
+    })
 }
 
 /// Replace every control-char cell (tab, ESC, …) with a space, keeping its
@@ -293,42 +321,153 @@ impl CodeTuiApp {
         (steps, counts, failed)
     }
 
+    /// Start of the trailing tool-card run — the prefix before this is stable across appends.
+    pub(super) fn trailing_foldable_start(&self, render_len: usize) -> usize {
+        let foldable = |m: &ChatMessage| match m.role.as_str() {
+            "tool_result" => true,
+            "tool_call" => decode_tool_name(&m.content) != "exit_plan_mode",
+            _ => false,
+        };
+        let mut i = render_len;
+        while i > 0 && foldable(&self.history[i - 1]) {
+            i -= 1;
+        }
+        i
+    }
+
+    fn role_before(&self, start: usize) -> Option<&str> {
+        (0..start).rev().find_map(|i| {
+            let r = self.history[i].role.as_str();
+            (r != "plan").then_some(r)
+        })
+    }
+
+    fn model_before(&self, start: usize) -> Option<&str> {
+        (0..start).rev().find_map(|i| {
+            (self.history[i].role == "assistant")
+                .then_some(self.history[i].model.as_deref())
+                .flatten()
+        })
+    }
+
+    fn deferred_mention_before(&self, start: usize) -> Option<usize> {
+        let mut deferred = None;
+        for i in 0..start {
+            match self.history[i].role.as_str() {
+                "user" => deferred = Some(i),
+                "assistant" => deferred = None,
+                _ => {}
+            }
+        }
+        deferred
+    }
+
+    /// Identity of the prefix render so a trailing tool-run can reuse it.
+    fn history_prefix_fp(&self, prefix_end: usize) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        self.is_transcript_empty().hash(&mut hasher);
+        self.transcript_revision.hash(&mut hasher);
+        self.thinking_enabled.hash(&mut hasher);
+        self.sending.hash(&mut hasher);
+        prefix_end.hash(&mut hasher);
+        if let Some(first) = self.history.first() {
+            first.role.hash(&mut hasher);
+            first.content.len().hash(&mut hasher);
+            first.attachments.len().hash(&mut hasher);
+        }
+        if prefix_end > 0
+            && let Some(last) = self.history.get(prefix_end - 1)
+        {
+            last.role.hash(&mut hasher);
+            last.content.len().hash(&mut hasher);
+            last.attachments.len().hash(&mut hasher);
+        }
+        hasher.finish()
+    }
+
     /// The memoizable transcript prefix: intro + committed history, with no
     /// dependence on the live stream or notice. This is the expensive part
     /// (markdown parsing, tool decoding) and what
     /// [`ensure_transcript_cache`](Self::ensure_transcript_cache) caches — so it
     /// is rebuilt at most once per *history* change, never per streamed token.
     pub(super) fn build_transcript_history_body(&self, text_width: u16) -> RenderedTranscript {
+        let render_len = self.committed_render_len();
+        let prefix_end = self.trailing_foldable_start(render_len);
+        let prefix = self.build_history_span(0, prefix_end, text_width, true);
+        self.assemble_history_body(prefix, prefix_end, render_len, text_width)
+    }
+
+    fn assemble_history_body(
+        &self,
+        mut prefix: HistorySpan,
+        prefix_end: usize,
+        render_len: usize,
+        text_width: u16,
+    ) -> RenderedTranscript {
+        if prefix_end < render_len {
+            let tail = self.build_history_span(prefix_end, render_len, text_width, false);
+            prefix.lines.extend(tail.lines);
+            prefix.bars.extend(tail.bars);
+            prefix.previewed.extend(tail.previewed);
+            prefix.deferred = tail.deferred;
+        }
+        if let Some(d_idx) = prefix.deferred.take() {
+            self.push_deferred_mention(
+                &mut prefix.lines,
+                &mut prefix.bars,
+                &mut prefix.previewed,
+                d_idx,
+                text_width,
+            );
+        }
+        compact_lines_and_bars(&mut prefix.lines, &mut prefix.bars);
+        RenderedTranscript::new(prefix.lines, prefix.bars)
+    }
+
+    fn build_history_span(
+        &self,
+        start: usize,
+        end: usize,
+        text_width: u16,
+        include_intro: bool,
+    ) -> HistorySpan {
         let mut lines = Vec::new();
-        // Bar color per logical line, kept in lockstep with `lines`. Chrome
-        // (intro, spacing) is `None`; each message block paints its role color.
         let mut bars: Vec<Option<Color>> = Vec::new();
-        let mut previous_role: Option<&str> = None;
-        // Last stamped assistant model; unstamped (pre-feature) turns don't reset it.
-        let mut previous_model: Option<&str> = None;
+        let mut previous_role: Option<&str> = self.role_before(start);
+        let mut previous_model: Option<&str> = self.model_before(start);
 
         if self.is_transcript_empty() {
-            push_styled_line(&mut lines, "", Style::default());
-            bars.push(None);
-            return RenderedTranscript::new(lines, bars);
+            if include_intro {
+                push_styled_line(&mut lines, "", Style::default());
+                bars.push(None);
+            }
+            return HistorySpan {
+                lines,
+                bars,
+                deferred: None,
+                previewed: std::collections::HashSet::new(),
+            };
         }
 
-        // The welcome header (banner + tip) sits one column right of the messages:
-        // build it apart, indent it, then append.
-        let mut header = Vec::new();
-        push_transcript_intro(&mut header, text_width.saturating_sub(HEADER_LEFT_INSET));
-        // Tip stays pinned above the conversation; frozen once non-empty, so safe
-        // to memoize.
-        header.extend(self.welcome_status_lines());
-        lines.extend(header.into_iter().map(|line| {
-            if line.plain.is_empty() {
-                line
-            } else {
-                indent_styled_line(line, usize::from(HEADER_LEFT_INSET))
-            }
-        }));
-        push_message_spacing(&mut lines);
-        bars.resize(lines.len(), None);
+        if include_intro {
+            // The welcome header (banner + tip) sits one column right of the messages:
+            // build it apart, indent it, then append.
+            let mut header = Vec::new();
+            push_transcript_intro(&mut header, text_width.saturating_sub(HEADER_LEFT_INSET));
+            // Tip stays pinned above the conversation; frozen once non-empty, so safe
+            // to memoize.
+            header.extend(self.welcome_status_lines());
+            lines.extend(header.into_iter().map(|line| {
+                if line.plain.is_empty() {
+                    line
+                } else {
+                    indent_styled_line(line, usize::from(HEADER_LEFT_INSET))
+                }
+            }));
+            push_message_spacing(&mut lines);
+            bars.resize(lines.len(), None);
+        }
 
         // The agent's working dir — tool paths render relative to it (the footer
         // already shows the cwd, so absolute paths are just noise that hides the
@@ -362,9 +501,9 @@ impl CodeTuiApp {
         let mut merge_anchor: Option<usize> = None;
         // A path the USER named previews under the ANSWER: anchored to the request
         // it lands above the reasoning still looking for it.
-        let mut deferred_mention: Option<usize> = None;
-        let mut idx = 0;
-        while idx < render_len {
+        let mut deferred_mention: Option<usize> = self.deferred_mention_before(start);
+        let mut idx = start;
+        while idx < end {
             let message = &self.history[idx];
             // The plan/task list is pinned in its own panel above the composer
             // (see `render_plan_panel`), not rendered inline — so it stays visible
@@ -525,7 +664,7 @@ impl CodeTuiApp {
                         self.tool_call_run_len(idx, &name)
                     };
                     // Don't coalesce into the hidden in-flight tail.
-                    let run = run.min(render_len - idx);
+                    let run = run.min(end - idx);
                     // Nor across a fold start — every fold must render its own
                     // marker row, or the click ordinal → fold mapping shifts.
                     let run = match folds.iter().map(|&(s, _)| s).find(|&s| s > idx) {
@@ -728,15 +867,13 @@ impl CodeTuiApp {
             previous_role = Some(message.role.as_str());
             idx += advance;
         }
-        // Reply not in yet (mid-turn, or an in-flight tool run hidden by
-        // `committed_render_len`): render at the tail, else naming a path shows
-        // nothing for the whole turn.
-        if let Some(d_idx) = deferred_mention.take() {
-            self.push_deferred_mention(&mut lines, &mut bars, &mut previewed, d_idx, text_width);
-        }
 
-        compact_lines_and_bars(&mut lines, &mut bars);
-        RenderedTranscript::new(lines, bars)
+        HistorySpan {
+            lines,
+            bars,
+            deferred: deferred_mention,
+            previewed,
+        }
     }
 
     /// The volatile blocks that follow the committed history — the live streamed
@@ -1216,34 +1353,25 @@ impl CodeTuiApp {
             .collect()
     }
 
-    /// A cheap O(1) fingerprint of everything the cached *history body* depends
-    /// on: intro + committed history (length + the immutable first/last entries).
-    /// History entries are *mostly* append-only, so length plus the endpoints
-    /// identifies the body without hashing all of it every frame; the one
-    /// exception — in-place enrichment of a cursor tool-call entry — bumps
-    /// `transcript_revision`, which is mixed in here so those edits still
-    /// invalidate. The streamed reply, notice, and spinner are deliberately
-    /// EXCLUDED: they live in the volatile tail (composed fresh each frame), so a
-    /// growing stream must not bust this cache and force a full-history re-render.
-    /// `is_transcript_empty` (which reads the stream/sending) flips at most once
-    /// per turn — when streaming starts/ends — so it stays stable mid-stream.
+    /// O(1) fingerprint of the cached history body. Uses [`Self::committed_render_len`]
+    /// so a hidden in-flight `tool_call` does not bust the cache.
     fn transcript_body_fp(&self) -> u64 {
         use std::hash::{Hash, Hasher};
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         self.is_transcript_empty().hash(&mut hasher);
         self.transcript_revision.hash(&mut hasher);
-        // The committed history renders the folded reasoning summary only while
-        // this is on, so a toggle must invalidate the memoized body.
         self.thinking_enabled.hash(&mut hasher);
-        // The in-flight card hide depends on `sending`, so a flip must rebuild.
         self.sending.hash(&mut hasher);
-        self.history.len().hash(&mut hasher);
+        let render_len = self.committed_render_len();
+        render_len.hash(&mut hasher);
         if let Some(first) = self.history.first() {
             first.role.hash(&mut hasher);
             first.content.len().hash(&mut hasher);
             first.attachments.len().hash(&mut hasher);
         }
-        if let Some(last) = self.history.last() {
+        if render_len > 0
+            && let Some(last) = self.history.get(render_len - 1)
+        {
             last.role.hash(&mut hasher);
             last.content.len().hash(&mut hasher);
             last.attachments.len().hash(&mut hasher);
@@ -1269,13 +1397,37 @@ impl CodeTuiApp {
         // New images referenced by this rebuild start their (async) preview
         // prep here; completion bumps `transcript_revision`, re-entering once.
         self.queue_missing_previews();
-        let body = self.build_transcript_history_body(table_layout_width(area_width));
-        let plain_width = table_layout_width(area_width).max(1);
+        let text_width = table_layout_width(area_width);
+        let render_len = self.committed_render_len();
+        let prefix_end = self.trailing_foldable_start(render_len);
+        let prefix_fp = self.history_prefix_fp(prefix_end);
+        let prefix = if let Some(cache) = self.render_cache.transcript.as_ref()
+            && cache.prefix_fp == prefix_fp
+            && cache.prefix_end == prefix_end
+            && cache.area_width == area_width
+        {
+            HistorySpan {
+                lines: cache.prefix_lines.clone(),
+                bars: cache.prefix_bars.clone(),
+                deferred: self.deferred_mention_before(prefix_end),
+                previewed: std::collections::HashSet::new(),
+            }
+        } else {
+            self.build_history_span(0, prefix_end, text_width, true)
+        };
+        let prefix_lines = prefix.lines.clone();
+        let prefix_bars = prefix.bars.clone();
+        let body = self.assemble_history_body(prefix, prefix_end, render_len, text_width);
+        let plain_width = text_width.max(1);
         let plain_prepass = wrap_plain_lines(&body.plain_lines, plain_width).len();
         self.render_cache.transcript = Some(TranscriptCache {
             fp,
             area_width,
             body,
+            prefix_fp,
+            prefix_end,
+            prefix_lines,
+            prefix_bars,
             plain_prepass,
             styled_width: 0,
             wrapped: None,
@@ -1364,6 +1516,7 @@ impl CodeTuiApp {
         settled_src: usize,
         settled_marked: bool,
         prev_ends_blank: bool,
+        settled_fence: Option<&(char, usize, String)>,
     ) -> TailSection {
         let mut lines: Vec<StyledLine> = Vec::new();
         let mut bars: Vec<Option<Color>> = Vec::new();
@@ -1371,16 +1524,29 @@ impl CodeTuiApp {
             return TailSection::empty();
         }
         if !self.pending_response.is_empty() {
-            let (part, _) = render_reply_part(
-                &self.pending_response[settled_src..],
-                width,
-                settled_marked,
-                settled_src == 0,
-                false,
-                prev_ends_blank,
-            );
-            // `push_block`'s trailing-blank trim is correct here — this is the
-            // reply's true end; settled chunks keep theirs (interior).
+            let suffix = &self.pending_response[settled_src..];
+            let body_width = width.saturating_sub(TURN_MARKER_W);
+            let part = if let Some(fence) = settled_fence {
+                let (block, _) = render_fence_chunk(suffix, Some(fence.clone()));
+                mark_block_from(
+                    block,
+                    body_width,
+                    crate::style::AGENT_MARKER,
+                    Style::default().fg(ACCENT()),
+                    settled_marked,
+                )
+                .0
+            } else {
+                render_reply_part(
+                    suffix,
+                    width,
+                    settled_marked,
+                    settled_src == 0,
+                    false,
+                    prev_ends_blank,
+                )
+                .0
+            };
             push_block(&mut lines, &mut bars, part, Some(ACCENT()));
         }
         self.push_live_command_block(&mut lines, &mut bars);
@@ -1410,6 +1576,7 @@ impl CodeTuiApp {
                 reply_len: 0,
                 settled_src: 0,
                 settled_marked: false,
+                settled_fence: None,
                 head,
                 settled: Vec::new(),
                 live: TailSection::empty(),
@@ -1423,39 +1590,65 @@ impl CodeTuiApp {
                 .last()
                 .is_some_and(|l| l.plain.trim().is_empty())
         };
-        let (settled_src, settled_marked, prev_ends_blank) = {
+        let (settled_src, settled_marked, prev_ends_blank, settled_fence) = {
             let cache = self.render_cache.volatile_tail.as_ref().unwrap();
             (
                 cache.settled_src,
                 cache.settled_marked,
                 cache.settled.last().is_some_and(&ends_blank),
+                cache.settled_fence.clone(),
             )
         };
-        let boundary = settled_reply_boundary(&self.pending_response, settled_src);
+        let (boundary, new_fence) =
+            settled_reply_boundary(&self.pending_response, settled_src, settled_fence.clone());
         let advanced = (boundary > settled_src).then(|| {
-            let (chunk, marked) = render_reply_part(
-                &self.pending_response[settled_src..boundary],
-                render_width,
-                settled_marked,
-                settled_src == 0,
-                true,
-                prev_ends_blank,
-            );
-            // No trailing trim: the chunk's separator blank is interior.
-            let chunk_bars = vec![Some(ACCENT()); chunk.len()];
-            (TailSection::new(chunk, chunk_bars), marked)
+            let chunk = &self.pending_response[settled_src..boundary];
+            let body_width = render_width.saturating_sub(TURN_MARKER_W);
+            let (block, marked) = if settled_fence.is_some() || fence_open_at(chunk) {
+                let in_fence = settled_fence.is_some();
+                let (mut block, _) = render_fence_chunk(chunk, settled_fence.clone());
+                // `flush_line` inserts a paragraph-break blank before `Start(CodeBlock)`.
+                if !in_fence && !prev_ends_blank && settled_src > 0 {
+                    block.insert(0, blank_line());
+                }
+                mark_block_from(
+                    block,
+                    body_width,
+                    crate::style::AGENT_MARKER,
+                    Style::default().fg(ACCENT()),
+                    settled_marked,
+                )
+            } else {
+                render_reply_part(
+                    chunk,
+                    render_width,
+                    settled_marked,
+                    settled_src == 0,
+                    true,
+                    prev_ends_blank,
+                )
+            };
+            let chunk_bars = vec![Some(ACCENT()); block.len()];
+            (TailSection::new(block, chunk_bars), marked)
         });
         let (new_marked, live_prev_blank) = match &advanced {
             Some((section, marked)) => (*marked, ends_blank(section)),
             None => (settled_marked, prev_ends_blank),
         };
-        let live = self.build_tail_live(render_width, boundary, new_marked, live_prev_blank);
+        let live = self.build_tail_live(
+            render_width,
+            boundary,
+            new_marked,
+            live_prev_blank,
+            new_fence.as_ref(),
+        );
         let cache = self.render_cache.volatile_tail.as_mut().unwrap();
         if let Some((section, marked)) = advanced {
             cache.settled.push(section);
             cache.settled_src = boundary;
             cache.settled_marked = marked;
         }
+        cache.settled_fence = new_fence;
         cache.live = live;
         cache.reply_len = reply_len;
     }
@@ -3826,13 +4019,33 @@ impl CodeTuiApp {
                 / 4;
             let baseline = self
                 .context_tokens
-                .max(estimate_context_tokens(&self.history));
+                .max(self.cached_history_context_tokens());
             return (baseline + streamed, true);
         }
         match self.last_usage {
             Some(usage) => (usage.total_tokens(), false),
             None => (self.context_tokens, self.context_is_estimate),
         }
+    }
+
+    fn cached_history_context_tokens(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        self.history.len().hash(&mut hasher);
+        if let Some(last) = self.history.last() {
+            last.content.len().hash(&mut hasher);
+            last.attachments.len().hash(&mut hasher);
+        }
+        self.transcript_revision.hash(&mut hasher);
+        let fp = hasher.finish();
+        if let Some((cfp, est)) = self.render_cache.history_token_est.get()
+            && cfp == fp
+        {
+            return est;
+        }
+        let est = estimate_context_tokens(&self.history);
+        self.render_cache.history_token_est.set(Some((fp, est)));
+        est
     }
 
     pub(super) fn footer_status_label(&self) -> (String, Color) {

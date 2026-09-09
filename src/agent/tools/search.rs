@@ -89,11 +89,29 @@ pub(super) fn glob_match(pattern: &str, text: &str) -> bool {
 }
 
 pub(super) fn seg_match(pat: &[&str], txt: &[&str]) -> bool {
-    match pat.first() {
-        None => txt.is_empty(),
-        Some(&"**") => (0..=txt.len()).any(|i| seg_match(&pat[1..], &txt[i..])),
-        Some(seg) => !txt.is_empty() && wildcard(seg, txt[0]) && seg_match(&pat[1..], &txt[1..]),
+    // Recursive `**`/`*` split was exponential on `**/*a*b*c*` over a large tree.
+    let n = txt.len();
+    let mut dp = vec![false; n + 1];
+    dp[0] = true;
+    let mut next = vec![false; n + 1];
+    for &seg in pat {
+        next.fill(false);
+        if seg == "**" {
+            let mut any = false;
+            for j in 0..=n {
+                any |= dp[j];
+                next[j] = any;
+            }
+        } else {
+            for j in 0..n {
+                if dp[j] && wildcard(seg, txt[j]) {
+                    next[j + 1] = true;
+                }
+            }
+        }
+        dp.copy_from_slice(&next);
     }
+    dp[n]
 }
 
 pub(super) fn wildcard(pat: &str, text: &str) -> bool {
@@ -103,12 +121,28 @@ pub(super) fn wildcard(pat: &str, text: &str) -> bool {
 }
 
 pub(super) fn wm(p: &[char], t: &[char]) -> bool {
-    match p.first() {
-        None => t.is_empty(),
-        Some('*') => (0..=t.len()).any(|i| wm(&p[1..], &t[i..])),
-        Some('?') => !t.is_empty() && wm(&p[1..], &t[1..]),
-        Some(&c) => !t.is_empty() && t[0] == c && wm(&p[1..], &t[1..]),
+    let n = t.len();
+    let mut dp = vec![false; n + 1];
+    dp[0] = true;
+    let mut next = vec![false; n + 1];
+    for &pc in p {
+        next.fill(false);
+        if pc == '*' {
+            let mut any = false;
+            for j in 0..=n {
+                any |= dp[j];
+                next[j] = any;
+            }
+        } else {
+            for j in 0..n {
+                if dp[j] && (pc == '?' || pc == t[j]) {
+                    next[j + 1] = true;
+                }
+            }
+        }
+        dp.copy_from_slice(&next);
     }
+    dp[n]
 }
 
 pub(super) async fn grep(args: &Value, cwd: &Path) -> Result<String, String> {

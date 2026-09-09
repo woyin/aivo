@@ -2,6 +2,7 @@
 //! hooks, jobs, external tools, effort/thinking, and session context.
 
 use super::*;
+use std::sync::Mutex;
 
 impl AgentEngine {
     /// Seed an engine with the identity system prompt. `guides` = names of project
@@ -43,6 +44,8 @@ impl AgentEngine {
             model: model.to_string(),
             tools_openai,
             messages,
+            msg_est_cache: Mutex::new(None),
+            tools_est_cache: Mutex::new(None),
             context_window,
             token_calibration: 1.0,
             max_steps,

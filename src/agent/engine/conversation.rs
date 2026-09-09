@@ -292,11 +292,19 @@ impl AgentEngine {
         }
     }
 
+    pub(crate) fn estimate_messages(&self) -> usize {
+        crate::agent::tokens::estimate_tokens_memo(&self.messages, &self.msg_est_cache)
+    }
+
+    pub(crate) fn estimate_tools(&self) -> usize {
+        crate::agent::tokens::estimate_tokens_memo(&self.tools_openai, &self.tools_est_cache)
+    }
+
     /// Estimate of the next request's prompt (system + tools + conversation), on the
     /// same [`estimate_tokens`] ruler as `context_report` so footer and `/context`
     /// agree. Seeds the live context-fill before real usage.
     pub(crate) fn estimated_prompt_tokens(&self) -> u64 {
-        (estimate_tokens(&self.messages) + estimate_tokens(&self.tools_openai)) as u64
+        (self.estimate_messages() + self.estimate_tools()) as u64
     }
 
     /// Calibrated composition snapshot for the `/context` viewer.
@@ -323,8 +331,7 @@ impl AgentEngine {
                 )
             },
         );
-        let tools_full = estimate_tokens(&self.tools_openai);
-        let transcript = &self.messages[self.messages.len().min(1)..];
+        let tools_full = self.estimate_tools();
 
         ContextReport {
             context_window: self.context_window,
@@ -335,8 +342,8 @@ impl AgentEngine {
             mcp_tools: calib(mcp_tok),
             mcp_tool_count,
             mcp_deferred_count: self.deferred_tools.len(),
-            messages: calib(estimate_tokens(transcript)),
-            message_count: transcript.len(),
+            messages: calib(self.estimate_messages().saturating_sub(sys_full)),
+            message_count: self.messages.len().saturating_sub(1),
             calibration: cal,
         }
     }

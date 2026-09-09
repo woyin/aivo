@@ -5,6 +5,7 @@
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
@@ -526,6 +527,9 @@ pub struct AgentEngine {
     pub(crate) model: String,
     pub(crate) tools_openai: Vec<Value>,
     pub(crate) messages: Vec<Value>,
+    /// Fingerprint cache for [`estimate_tokens`] (`Mutex` so `&self` can fill it).
+    pub(crate) msg_est_cache: Mutex<Option<(u64, usize)>>,
+    pub(crate) tools_est_cache: Mutex<Option<(u64, usize)>>,
     pub(crate) context_window: u32,
     /// Multiplier (>= 1.0) correcting the chars/4 [`estimate_tokens`] undershoot toward
     /// the real tokenizer, learned from measured usage; starts at 1.0.

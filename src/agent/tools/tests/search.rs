@@ -104,6 +104,14 @@ fn glob_match_semantics() {
     assert!(!glob_match("?.txt", "ab.txt"));
 }
 
+#[test]
+fn glob_match_is_not_exponential() {
+    let pat = "*a*a*a*a*a*a*a*a*a*a*a*a";
+    let text = "b".repeat(40);
+    assert!(!glob_match(pat, &text));
+    assert!(glob_match("**/*a*b*", "src/fooaXb.rs"));
+}
+
 #[tokio::test]
 async fn grep_finds_match() {
     let dir = tmp();

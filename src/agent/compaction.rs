@@ -92,11 +92,7 @@ impl AgentEngine {
     /// Tokens held back from the window for the response + the tool schemas being
     /// sent; the schema estimate is calibrated onto the window's real-token ruler.
     pub(crate) fn compact_reserve(&self) -> usize {
-        let schemas: usize = self
-            .tools_openai
-            .iter()
-            .map(|t| estimate_str_tokens(&t.to_string()))
-            .sum();
+        let schemas = self.estimate_tools();
         let schemas_real = (schemas as f64 * self.token_calibration) as usize;
         (RESPONSE_RESERVE + schemas_real)
             .min(self.compaction_window() * RESERVE_MAX_WINDOW_PCT / 100)
@@ -148,7 +144,7 @@ impl AgentEngine {
     /// Raise the calibration from an overflow rejection: use the cited token count if present, else nudge up.
     pub(crate) fn recalibrate_from_overflow(&mut self, err: &str) {
         // Cited counts cover the whole request, schemas included.
-        let estimate = estimate_tokens(&self.messages) + estimate_tokens(&self.tools_openai);
+        let estimate = self.estimate_messages() + self.estimate_tools();
         match parse_overflow_actual(err) {
             Some(actual) if estimate >= CALIBRATION_MIN_SAMPLE => {
                 // rise-only on overflow, unlike update_calibration's EMA
@@ -192,9 +188,9 @@ impl AgentEngine {
     /// intact. Returns tokens the summarization consumed (counted toward the turn, not a step).
     pub(crate) async fn maybe_compact(&mut self, ctx: &TurnCtx<'_>, ui: &mut dyn AgentUi) -> u64 {
         let budget = self.compaction_budget_estimate();
-        let mut total = estimate_tokens(&self.messages);
+        let mut total = self.estimate_messages();
         if self.maybe_preventive_snip(budget, total, ui) {
-            total = estimate_tokens(&self.messages);
+            total = self.estimate_messages();
         }
         if total <= budget {
             return 0;
@@ -567,17 +563,24 @@ impl AgentEngine {
     /// boundaries, then shorten the biggest string left (a `content` or a tool-call
     /// `arguments` blob). Always terminates; keeps the system prompt and call↔result pairing.
     pub(crate) fn enforce_budget(&mut self, budget: usize) {
-        while estimate_tokens(&self.messages) > budget {
+        let mut total = self.estimate_messages();
+        while total > budget {
             let cut = find_cut(&self.messages, 0);
             if cut <= 1 {
                 break; // only [system, last user turn] left — no boundary to drop
             }
+            let drained: usize = self.messages[1..cut]
+                .iter()
+                .map(crate::agent::tokens::estimate_message_tokens)
+                .sum();
             self.messages.drain(1..cut);
+            *self.msg_est_cache.lock().unwrap() = None;
             self.rebase_checkpoints(cut, cut - 1);
+            total = total.saturating_sub(drained);
         }
         // Shrink the largest string left, incl. tool-call `arguments`: a big call with
         // empty `content` in the irreducible recent turn is otherwise unreducible; truncated args stay paired with their id.
-        while estimate_tokens(&self.messages) > budget {
+        while self.estimate_messages() > budget {
             // loc: None = content; Some(j) = tool_calls[j] arguments.
             let pick = self
                 .messages

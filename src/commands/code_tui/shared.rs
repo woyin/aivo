@@ -2555,6 +2555,11 @@ pub(super) struct TranscriptCache {
     pub(super) styled_width: u16,
     /// `body` word-wrapped to `styled_width`.
     pub(super) wrapped: Option<WrappedTranscript>,
+    /// Uncompacted `history[0..prefix_end]` so a trailing tool-run doesn't re-markdown it.
+    pub(super) prefix_fp: u64,
+    pub(super) prefix_end: usize,
+    pub(super) prefix_lines: Vec<StyledLine>,
+    pub(super) prefix_bars: Vec<Option<Color>>,
 }
 
 /// Cross-frame memo of the VOLATILE tail (the streamed reply, a running `!cmd`'s
@@ -2607,6 +2612,8 @@ pub(super) struct VolatileTailCache {
     pub(super) settled_src: usize,
     /// Whether a settled chunk already placed the `◆ ` reply marker.
     pub(super) settled_marked: bool,
+    /// Open fence at `settled_src` (further fence lines settle without a markdown re-parse).
+    pub(super) settled_fence: Option<(char, usize, String)>,
     pub(super) head: TailSection,
     pub(super) settled: Vec<TailSection>,
     pub(super) live: TailSection,
@@ -3830,6 +3837,8 @@ pub(super) struct RenderCache {
     /// Non-picker overlay's full box (borders included) from the last render;
     /// a left press outside it dismisses the overlay like Esc.
     pub(super) overlay_hitbox: Option<Rect>,
+    /// Memo of [`estimate_context_tokens`] so a spinner tick does not re-walk history.
+    pub(super) history_token_est: std::cell::Cell<Option<(u64, u64)>>,
     /// Region the screen selection is confined to — a modal's inner content rect
     /// while one is open, so a drag selects inside the modal, not the whole line.
     /// `None` = the full screen.

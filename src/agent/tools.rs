@@ -146,14 +146,18 @@ pub async fn execute(name: &str, args: &Value, cwd: &Path) -> Result<String, Str
     // The OS sandbox confines only the shell; refuse in-process edits here too.
     refuse_writes_in_read_only(name)?;
     match name {
-        "read_file" => read_file(args, cwd),
-        "list_dir" => list_dir(args, cwd),
+        "read_file" => blocking_tool(args, cwd, read_file).await,
+        "list_dir" => blocking_tool(args, cwd, list_dir).await,
         "glob" => glob(args, cwd).await,
         "grep" => grep(args, cwd).await,
-        "write_file" => write_file(args, cwd),
-        "edit_file" => edit_file(args, cwd),
-        "multi_edit" => multi_edit(args, cwd),
-        "apply_patch" => crate::agent::apply_patch::apply(arg_str(args, "input")?, cwd),
+        "write_file" => blocking_tool(args, cwd, write_file).await,
+        "edit_file" => blocking_tool(args, cwd, edit_file).await,
+        "multi_edit" => blocking_tool(args, cwd, multi_edit).await,
+        "apply_patch" => {
+            let patch = arg_str(args, "input")?.to_string();
+            let cwd = cwd.to_path_buf();
+            spawn_blocking_tool(move || crate::agent::apply_patch::apply(&patch, &cwd)).await
+        }
         "web_fetch" => web_fetch(args).await,
         "web_search" => web_search(args).await,
         "run_bash" => run_bash(args, cwd).await,
@@ -174,14 +178,37 @@ pub async fn execute_write_unconfined(
     let name = subagents::normalize_tool_name(name).unwrap_or(name);
     refuse_writes_in_read_only(name)?;
     match name {
-        "write_file" => write_file_confined(args, cwd, false),
-        "edit_file" => edit_file_confined(args, cwd, false),
-        "multi_edit" => multi_edit_confined(args, cwd, false),
+        "write_file" => blocking_tool(args, cwd, |a, c| write_file_confined(a, c, false)).await,
+        "edit_file" => blocking_tool(args, cwd, |a, c| edit_file_confined(a, c, false)).await,
+        "multi_edit" => blocking_tool(args, cwd, |a, c| multi_edit_confined(a, c, false)).await,
         "apply_patch" => {
-            crate::agent::apply_patch::apply_confined(arg_str(args, "input")?, cwd, false)
+            let patch = arg_str(args, "input")?.to_string();
+            let cwd = cwd.to_path_buf();
+            spawn_blocking_tool(move || {
+                crate::agent::apply_patch::apply_confined(&patch, &cwd, false)
+            })
+            .await
         }
         other => Err(format!("`{other}` is not a write tool")),
     }
+}
+
+/// Offload a sync tool so it can't freeze the current-thread TUI runtime.
+async fn blocking_tool<F>(args: &Value, cwd: &Path, f: F) -> Result<String, String>
+where
+    F: FnOnce(&Value, &Path) -> Result<String, String> + Send + 'static,
+{
+    let args = args.clone();
+    let cwd = cwd.to_path_buf();
+    spawn_blocking_tool(move || f(&args, &cwd)).await
+}
+
+async fn spawn_blocking_tool(
+    f: impl FnOnce() -> Result<String, String> + Send + 'static,
+) -> Result<String, String> {
+    tokio::task::spawn_blocking(f)
+        .await
+        .unwrap_or_else(|e| Err(format!("tool: {e}")))
 }
 
 fn refuse_writes_in_read_only(name: &str) -> Result<(), String> {
