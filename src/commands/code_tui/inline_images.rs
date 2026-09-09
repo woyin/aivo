@@ -146,13 +146,17 @@ pub(super) fn file_key(path: &Path) -> Option<u64> {
     }))
 }
 
-/// The image path a write/edit tool call touches (unresolved). Callers must
-/// wait for evidence the call executed, or the pre-write state gets pinned.
-/// `read_file` deliberately previews nothing — that's the preview pane's job.
+/// The image path a write/edit/generate_image tool call touches (unresolved).
+/// Callers must wait for evidence the call executed, or the pre-write state
+/// gets pinned. `read_file` deliberately previews nothing — that's the preview
+/// pane's job.
 pub(super) fn file_tool_image_target(content: &str) -> Option<String> {
     let (name, args) = decode_tool_call(content);
     let name = canonical_tool_name(&name);
-    if !matches!(name, "write_file" | "edit_file" | "multi_edit") {
+    if !matches!(
+        name,
+        "write_file" | "edit_file" | "multi_edit" | "generate_image"
+    ) {
         return None;
     }
     let path = args.get("path").and_then(|v| v.as_str())?;
@@ -1490,6 +1494,15 @@ mod tests {
         assert!(file_tool_image_target(&rs).is_none());
         let grep = serde_json::json!({"name": "grep", "args": {"pattern": "x.svg"}}).to_string();
         assert!(file_tool_image_target(&grep).is_none());
+        let generated = serde_json::json!({
+            "name": "generate_image",
+            "args": {"path": "icon.png", "prompt": "app icon"}
+        })
+        .to_string();
+        assert_eq!(
+            file_tool_image_target(&generated),
+            Some("icon.png".to_string())
+        );
     }
 
     /// Whitespace tokenization alone yields `rain](assets/cat.png)` — an

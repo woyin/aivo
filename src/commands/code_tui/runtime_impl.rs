@@ -252,6 +252,9 @@ impl CodeTuiApp {
             return Ok(Some(SubmitAction::Send(format!("/{escaped}"))));
         }
         if let Some(command) = trimmed.strip_prefix('/') {
+            if self.is_cursor_prompt(command) {
+                return Ok(Some(SubmitAction::Send(trimmed.to_string())));
+            }
             return Ok(Some(SubmitAction::Command(
                 self.resolve_slash_command(command)?,
             )));
@@ -277,11 +280,8 @@ impl CodeTuiApp {
         Ok(Some(SubmitAction::Send(trimmed.to_string())))
     }
 
-    /// Parse `input` (the text after the leading `/`) into a [`SlashCommand`]. A
-    /// name that isn't a built-in but matches a discovered skill resolves to
-    /// [`SlashCommand::Skill`] (the `/repo-study` case); everything else falls back
-    /// to [`parse_slash_command`], so a built-in always wins over a same-named skill
-    /// and a true typo still errors with "Unknown command".
+    /// Parse the text after `/`. Built-ins win name collisions; then skills.
+    /// Cursor-advertised names are sent as prompts in [`prepare_submit_action`].
     pub(super) fn resolve_slash_command(&self, input: &str) -> Result<SlashCommand> {
         let name = input.split_whitespace().next().unwrap_or("");
         let is_builtin = SLASH_COMMANDS.iter().any(|c| c.name == name);
@@ -297,6 +297,19 @@ impl CodeTuiApp {
             });
         }
         parse_slash_command(input)
+    }
+
+    pub(super) fn slash_name_taken(&self, name: &str) -> bool {
+        SLASH_COMMANDS.iter().any(|c| c.name == name)
+            || self.skill_commands.iter().any(|s| s.name == name)
+    }
+
+    /// Advertised by cursor-ACP and not shadowed by a built-in or skill.
+    fn is_cursor_prompt(&self, input: &str) -> bool {
+        let name = input.split_whitespace().next().unwrap_or("");
+        !name.is_empty()
+            && !self.slash_name_taken(name)
+            && self.cursor_slash_commands.iter().any(|c| c.name == name)
     }
 
     pub(super) async fn send_user_message(&mut self, input: String) -> Result<()> {
@@ -1656,6 +1669,8 @@ impl CodeTuiApp {
             update_todos: Some(self.cursor_todos_sink()),
             create_plan: Some(self.cursor_plan_prompt()),
             task: Some(self.cursor_task_sink()),
+            generate_image: Some(self.cursor_generate_image_sink()),
+            commands: Some(self.cursor_commands_sink()),
         }
     }
 
@@ -1664,8 +1679,14 @@ impl CodeTuiApp {
     fn cursor_task_sink(&self) -> cursor_acp::CursorTaskSink {
         let tx = self.tx.clone();
         std::sync::Arc::new(move |notice: cursor_acp::CursorTaskNotice| {
-            if notice.tool_call_id.is_empty()
-                || (notice.description.is_empty() && notice.prompt.is_empty())
+            if notice.tool_call_id.is_empty() {
+                return;
+            }
+            // Completion notices may only have durationMs/model.
+            if notice.description.is_empty()
+                && notice.prompt.is_empty()
+                && notice.model.is_empty()
+                && notice.duration_ms.is_none()
             {
                 return;
             }
@@ -1683,12 +1704,49 @@ impl CodeTuiApp {
             ) {
                 args.insert("agent".into(), notice.subagent_type.into());
             }
+            if !notice.model.is_empty() {
+                args.insert("model".into(), notice.model.into());
+            }
+            if let Some(ms) = notice.duration_ms {
+                args.insert("duration_ms".into(), serde_json::json!(ms));
+            }
             let _ = tx.send(RuntimeEvent::AgentToolUpdate {
                 id: notice.tool_call_id,
                 args: Some(serde_json::Value::Object(args)),
                 result: None,
                 failed: false,
             });
+        })
+    }
+
+    fn cursor_generate_image_sink(&self) -> cursor_acp::CursorGenerateImageSink {
+        let tx = self.tx.clone();
+        std::sync::Arc::new(move |notice: cursor_acp::CursorGenerateImageNotice| {
+            if notice.tool_call_id.is_empty() {
+                return;
+            }
+            let mut args = serde_json::Map::new();
+            if !notice.description.is_empty() {
+                args.insert("prompt".into(), notice.description.clone().into());
+            }
+            if !notice.file_path.is_empty() {
+                args.insert("path".into(), notice.file_path.clone().into());
+            }
+            let result =
+                (!notice.file_path.is_empty()).then(|| format!("saved to {}", notice.file_path));
+            let _ = tx.send(RuntimeEvent::AgentToolUpdate {
+                id: notice.tool_call_id,
+                args: (!args.is_empty()).then_some(serde_json::Value::Object(args)),
+                result,
+                failed: false,
+            });
+        })
+    }
+
+    fn cursor_commands_sink(&self) -> cursor_acp::CursorCommandsSink {
+        let tx = self.tx.clone();
+        std::sync::Arc::new(move |commands: Vec<cursor_acp::CursorSlashCommand>| {
+            let _ = tx.send(RuntimeEvent::CursorCommands(commands));
         })
     }
 

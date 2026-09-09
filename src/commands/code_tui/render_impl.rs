@@ -514,9 +514,12 @@ impl CodeTuiApp {
                         continue;
                     }
                     // Coalesce adjacent same-verb calls into one line. Exceptions stay
-                    // split: subagents (never an opaque `subagent ×N`) and mixed-batch
-                    // calls, whose result inlines under them (`split_calls`).
-                    let run = if name == "subagent" || split_calls.contains(&idx) {
+                    // split: subagents, mixed-batch calls (`split_calls`), and edits
+                    // that already have a textual diff (else `edited N files` hides it).
+                    let run = if name == "subagent"
+                        || split_calls.contains(&idx)
+                        || tool_has_inline_diff(&message.content)
+                    {
                         1
                     } else {
                         self.tool_call_run_len(idx, &name)

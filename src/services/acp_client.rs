@@ -69,6 +69,11 @@ pub type PermissionFn =
 pub type ExtMethodFn =
     Arc<dyn Fn(String, Value) -> futures::future::BoxFuture<'static, Option<Value>> + Send + Sync>;
 
+/// Idle `session/update` listener, installed at spawn so notifications that
+/// arrive before any `session/prompt` (e.g. `available_commands_update`) are
+/// not dropped. Invoked for every `session/update`, including during a turn.
+pub type SessionUpdateFn = Arc<dyn Fn(Value) + Send + Sync>;
+
 /// One of the two `outcome.outcome` shapes the ACP spec defines for
 /// `session/request_permission` replies. The encoder picks a matching
 /// `optionId` from the `options` array carried in the request — preferring
@@ -162,9 +167,19 @@ impl AcpClient {
     /// Like [`spawn_with_permission_policy`] but also installs an
     /// [`ExtMethodFn`] for cursor's server-initiated `cursor/*` methods.
     pub async fn spawn_with_handlers(
+        cmd: Command,
+        permission_fn: PermissionFn,
+        ext_method_fn: Option<ExtMethodFn>,
+    ) -> Result<Self> {
+        Self::spawn_with_session_hook(cmd, permission_fn, ext_method_fn, None).await
+    }
+
+    /// Like [`spawn_with_handlers`] plus an idle [`SessionUpdateFn`].
+    pub(crate) async fn spawn_with_session_hook(
         mut cmd: Command,
         permission_fn: PermissionFn,
         ext_method_fn: Option<ExtMethodFn>,
+        session_update_fn: Option<SessionUpdateFn>,
     ) -> Result<Self> {
         cmd.stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -198,6 +213,7 @@ impl AcpClient {
             request_timings.clone(),
             permission_fn,
             ext_method_fn,
+            session_update_fn,
         );
         let stderr_drain = spawn_stderr_drain(BufReader::new(stderr), stderr_tail.clone());
 
@@ -373,6 +389,7 @@ fn spawn_stderr_drain(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn spawn_reader(
     mut stdout: BufReader<tokio::process::ChildStdout>,
     pending: PendingMap,
@@ -381,6 +398,7 @@ fn spawn_reader(
     request_timings: RequestTimings,
     permission_fn: PermissionFn,
     ext_method_fn: Option<ExtMethodFn>,
+    session_update_fn: Option<SessionUpdateFn>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         let mut line = String::new();
@@ -411,6 +429,7 @@ fn spawn_reader(
                 &writer,
                 &permission_fn,
                 &ext_method_fn,
+                &session_update_fn,
             )
             .await;
         }
@@ -453,6 +472,7 @@ async fn dispatch_inbound(
     writer: &Writer,
     permission_fn: &PermissionFn,
     ext_method_fn: &Option<ExtMethodFn>,
+    session_update_fn: &Option<SessionUpdateFn>,
 ) {
     // Keep the id as a raw `Value`: server-initiated requests may carry a
     // string/negative id (JSON-RPC-legal) that must be echoed verbatim —
@@ -471,7 +491,7 @@ async fn dispatch_inbound(
         }
         (None, Some(method)) => {
             // Notification.
-            handle_notification(method, value.get("params"), sessions).await;
+            handle_notification(method, value.get("params"), sessions, session_update_fn).await;
         }
         (Some(id), Some("session/request_permission")) => {
             let params = value.get("params").cloned().unwrap_or(Value::Null);
@@ -540,11 +560,21 @@ fn build_permission_response(id: Value, params: &Value, decision: PermissionDeci
     })
 }
 
-async fn handle_notification(method: &str, params: Option<&Value>, sessions: &SessionMap) {
+async fn handle_notification(
+    method: &str,
+    params: Option<&Value>,
+    sessions: &SessionMap,
+    session_update_fn: &Option<SessionUpdateFn>,
+) {
     if method != "session/update" {
         return;
     }
-    let Some(params) = params else { return };
+    let Some(params) = params else {
+        return;
+    };
+    if let Some(cb) = session_update_fn {
+        cb(params.clone());
+    }
     let Some(session_id) = params.get("sessionId").and_then(Value::as_str) else {
         return;
     };
@@ -917,10 +947,39 @@ printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"stopReason":"end_turn"}}'"#,
 read line; printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"ok":true}}'"#,
         );
         let client = AcpClient::spawn(cmd).await.unwrap();
-        // The notification for "ghost" should be silently dropped because no
-        // handler is registered. Following request still succeeds.
         let r = client.request("ping", json!({})).await.unwrap();
         assert_eq!(r["ok"], json!(true));
+    }
+
+    #[tokio::test]
+    async fn session_update_hook_sees_updates_without_a_prompt() {
+        let cmd = fake_acp_script(
+            r#"printf '%s\n' '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s1","update":{"sessionUpdate":"available_commands_update","availableCommands":[{"name":"copy-request-id","description":"Copy the last request ID to clipboard"}]}}}'
+read line; printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"ok":true}}'"#,
+        );
+        let seen: Arc<std::sync::Mutex<Option<Value>>> = Arc::new(std::sync::Mutex::new(None));
+        let seen_in = seen.clone();
+        let hook: SessionUpdateFn = Arc::new(move |params| {
+            *seen_in.lock().unwrap() = Some(params);
+        });
+        let permission: PermissionFn = Arc::new(|_| Box::pin(async { PermissionDecision::Reject }));
+        let client = AcpClient::spawn_with_session_hook(cmd, permission, None, Some(hook))
+            .await
+            .unwrap();
+        let r = tokio::time::timeout(Duration::from_secs(3), client.request("ping", json!({})))
+            .await
+            .expect("request timed out")
+            .expect("request failed");
+        assert_eq!(r["ok"], json!(true));
+        let v = seen
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("session update hook was not called");
+        assert_eq!(
+            v["update"]["availableCommands"][0]["name"],
+            "copy-request-id"
+        );
     }
 
     #[test]

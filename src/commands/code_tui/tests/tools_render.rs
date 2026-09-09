@@ -1123,6 +1123,117 @@ fn write_file_snapshot_rides_tool_call_entry() {
 }
 
 #[test]
+fn cursor_edit_update_shows_diff_card() {
+    // Start event has path only; `tool_call_update` supplies old/new.
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.apply_agent_tool_call(
+        Some("edit-1".to_string()),
+        "edit_file".to_string(),
+        serde_json::json!({"path": "src/a.rs"}),
+        vec![],
+        None,
+    );
+    app.apply_agent_tool_update(
+        "edit-1".to_string(),
+        Some(serde_json::json!({
+            "path": "src/a.rs",
+            "old_string": "let x = 1;",
+            "new_string": "let x = 2;",
+        })),
+        Some("ok".to_string()),
+        false,
+    );
+    let plain = app.build_transcript().plain_lines.join("\n");
+    assert!(plain.contains("let x = 1;"), "old side missing: {plain}");
+    assert!(plain.contains("let x = 2;"), "new side missing: {plain}");
+    assert!(
+        plain.contains(" - ") && plain.contains(" + "),
+        "expected del/ins rows: {plain}"
+    );
+}
+
+#[test]
+fn consecutive_edits_with_diffs_do_not_coalesce() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    for (path, old, new) in [
+        ("src/a.rs", "let x = 1;", "let x = 2;"),
+        ("src/b.rs", "fn a() {}", "fn b() {}"),
+    ] {
+        app.history.push(ChatMessage {
+            model: None,
+            role: "tool_call".to_string(),
+            content: serde_json::json!({
+                "name": "edit_file",
+                "args": {"path": path, "old_string": old, "new_string": new},
+            })
+            .to_string(),
+            reasoning_content: None,
+            attachments: vec![],
+        });
+    }
+    let plain = app.build_transcript().plain_lines.join("\n");
+    assert!(
+        !plain.contains("edited 2 files"),
+        "diffs must not hide behind a coalesced header: {plain}"
+    );
+    assert!(plain.contains("let x = 1;"), "first old missing: {plain}");
+    assert!(plain.contains("fn b() {}"), "second new missing: {plain}");
+}
+
+#[test]
+fn consecutive_path_only_edits_still_coalesce() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    for path in ["src/a.rs", "src/b.rs", "src/c.rs"] {
+        app.history.push(ChatMessage {
+            model: None,
+            role: "tool_call".to_string(),
+            content: format!(r#"{{"name":"edit_file","args":{{"path":"{path}"}}}}"#),
+            reasoning_content: None,
+            attachments: vec![],
+        });
+    }
+    let plain = app.build_transcript().plain_lines.join("\n");
+    assert!(
+        plain.contains("→ edited 3 files"),
+        "path-only edits should still coalesce: {plain}"
+    );
+}
+
+#[test]
+fn cursor_generate_image_update_names_prompt_and_path() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.apply_agent_tool_call(
+        Some("img-1".to_string()),
+        "generate_image".to_string(),
+        serde_json::json!({"prompt": "Minimal app icon"}),
+        vec![],
+        None,
+    );
+    app.apply_agent_tool_update(
+        "img-1".to_string(),
+        Some(serde_json::json!({
+            "prompt": "Minimal app icon",
+            "path": "/tmp/icon.png",
+        })),
+        Some("saved to /tmp/icon.png".to_string()),
+        false,
+    );
+    let plain = app.build_transcript().plain_lines.join("\n");
+    assert!(
+        plain.contains("generate_image(Minimal app icon)"),
+        "prompt missing from card: {plain}"
+    );
+    assert!(
+        plain.contains("saved to /tmp/icon.png"),
+        "saved path missing: {plain}"
+    );
+}
+
+#[test]
 fn test_run_bash_label_drops_redirection_noise() {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let mut app = make_test_app(tx, rx);

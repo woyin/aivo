@@ -142,6 +142,13 @@ pub(super) fn skill_command(name: &str, description: &str) -> SkillCommand {
     }
 }
 
+pub(super) fn cursor_command(name: &str, description: &str) -> CursorCommand {
+    CursorCommand {
+        name: name.to_string(),
+        description: description.to_string(),
+    }
+}
+
 pub(super) fn skills_overlay_fixture() -> SkillsOverlay {
     use crate::agent::skills::SkillScope;
     SkillsOverlay {

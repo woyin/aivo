@@ -168,6 +168,9 @@ impl CodeTuiApp {
                 result,
                 failed,
             } => self.apply_agent_tool_update(id, args, result, failed),
+            RuntimeEvent::CursorCommands(commands) => {
+                self.cursor_slash_commands = commands;
+            }
             RuntimeEvent::AgentToolOutput { chunk } => self.push_tool_output(&chunk),
             RuntimeEvent::AgentToolResult { content } => self.apply_agent_tool_result(content),
             RuntimeEvent::AgentSteered(text) => self.apply_agent_steered(text),
@@ -817,7 +820,14 @@ impl CodeTuiApp {
             .unwrap_or_else(|_| serde_json::json!({}));
         let args_updated = args.is_some();
         if let Some(args) = args {
-            obj["args"] = args;
+            match (obj.get_mut("args"), args) {
+                (Some(serde_json::Value::Object(dst)), serde_json::Value::Object(src)) => {
+                    for (k, v) in src {
+                        dst.insert(k, v);
+                    }
+                }
+                (_, args) => obj["args"] = args,
+            }
         }
         if let Some(result) = result {
             obj["result"] = serde_json::Value::String(result);

@@ -36,16 +36,27 @@ fn is_alias_target(query: &str, command_name: &str) -> bool {
 /// matches ranked before fuzzy ones — the same ranking as `filter_slash_commands`.
 /// Returns clones so the result can outlive the borrow of `commands`.
 pub(super) fn filter_skill_commands(commands: &[SkillCommand], query: &str) -> Vec<SkillCommand> {
+    filter_named(commands, query, |c| c.name.as_str())
+}
+
+pub(super) fn filter_cursor_commands(
+    commands: &[CursorCommand],
+    query: &str,
+) -> Vec<CursorCommand> {
+    filter_named(commands, query, |c| c.name.as_str())
+}
+
+fn filter_named<T: Clone>(items: &[T], query: &str, name: impl Fn(&T) -> &str) -> Vec<T> {
     if query.is_empty() {
-        return commands.to_vec();
+        return items.to_vec();
     }
     let mut prefix_matches = Vec::new();
     let mut fuzzy_matches = Vec::new();
-    for command in commands {
-        if command.name.starts_with(query) {
-            prefix_matches.push(command.clone());
-        } else if matches_fuzzy(query, &command.name) {
-            fuzzy_matches.push(command.clone());
+    for item in items {
+        if name(item).starts_with(query) {
+            prefix_matches.push(item.clone());
+        } else if matches_fuzzy(query, name(item)) {
+            fuzzy_matches.push(item.clone());
         }
     }
     prefix_matches.extend(fuzzy_matches);

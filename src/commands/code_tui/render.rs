@@ -1292,9 +1292,7 @@ pub(super) fn render_tool_call(
     }
     lines.push(line_with_plain(spans));
     let call_row = lines.len() - 1;
-    // For edit/write tools, show a compact diff of what changed so the user can
-    // review the agent's edit without opening the file (no-op for tools without
-    // a textual old/new, e.g. cursor edits).
+    // Compact edit/write diff (no-op without a textual old/new).
     render_edit_diff(lines, name, args, line_starts, old_content);
     // Cursor stores its compact result on the call entry — ride the call row.
     let outcome_color = if failed { ERROR() } else { FAINT() };
@@ -1445,6 +1443,14 @@ pub(super) fn tool_call_target(name: &str, args: &serde_json::Value) -> String {
         "run_bash" => pick("command").to_string(),
         "web_fetch" => pick("url").to_string(),
         "web_search" => pick("query").to_string(),
+        "generate_image" => {
+            let prompt = pick("prompt");
+            if prompt.is_empty() {
+                basename(pick("path"))
+            } else {
+                prompt.to_string()
+            }
+        }
         "send_session" => pick("target").to_string(),
         _ => String::new(),
     }
@@ -1552,6 +1558,7 @@ pub(super) fn tool_action_label(name: &str, args: &serde_json::Value, cwd: &str)
         "run_bash" => "running",
         "web_fetch" => "fetching",
         "web_search" => "searching the web for",
+        "generate_image" => "generating",
         // MCP and any other external tool: name it, no target to show.
         _ => return format!("running {}", tool_display_name(name)),
     };
@@ -2465,6 +2472,15 @@ pub(super) fn edit_diffs(name: &str, args: &serde_json::Value) -> Vec<EditDiff> 
     }
 }
 
+/// True when this call has a textual old/new the compact diff card can draw.
+/// Path-only cursor start events still coalesce; once `tool_call_update`
+/// supplies the diff, the card must stay split or `edited N files` hides it.
+pub(super) fn tool_has_inline_diff(content: &str) -> bool {
+    let (name, args) = decode_tool_call(content);
+    !edit_diffs(canonical_tool_name(&name), &args).is_empty()
+        || decode_old_content(content).is_some()
+}
+
 /// Expand tabs to 4 spaces so a raw `\t` (unicode-width 1) can't desync the
 /// terminal's cell grid and leave stale ghost cells.
 pub(super) fn expand_tabs(s: &str) -> Cow<'_, str> {
@@ -3207,6 +3223,14 @@ fn tool_arg_summary(name: &str, args: &serde_json::Value, cwd: &str) -> String {
         "run_bash" => elide_middle(&condense_command(pick("command"), cwd), 60),
         "web_fetch" => display_url(pick("url"), 60),
         "web_search" => truncate_chars(pick("query"), 60),
+        "generate_image" => {
+            let prompt = pick("prompt");
+            if prompt.is_empty() {
+                display_path(pick("path"), cwd)
+            } else {
+                truncate_chars(prompt, 60)
+            }
+        }
         "skill" => truncate_chars(pick("name"), 60),
         // The question is the salient detail; the answer lands on the `⎿` result line.
         "ask_user" => truncate_chars(pick("question"), 72),
@@ -3241,16 +3265,53 @@ fn tool_arg_summary(name: &str, args: &serde_json::Value, cwd: &str) -> String {
                     truncate_chars(&condense_subagent_task(task), 72)
                 }
             };
-            match [pick("agent"), pick("subagent_type")]
+            let model = pick("model").trim();
+            let mut out = match [pick("agent"), pick("subagent_type")]
                 .into_iter()
                 .find(|s| !s.trim().is_empty())
             {
-                Some(agent) if !body.is_empty() => format!("{} — {}", agent.trim(), body),
-                Some(agent) => agent.trim().to_string(),
+                Some(agent) => {
+                    let agent = agent.trim();
+                    let named = if model.is_empty() {
+                        agent.to_string()
+                    } else {
+                        format!("{agent} ({model})")
+                    };
+                    if body.is_empty() {
+                        named
+                    } else {
+                        format!("{named} — {body}")
+                    }
+                }
+                None if !model.is_empty() && !body.is_empty() => {
+                    format!("{body} · {model}")
+                }
+                None if !model.is_empty() => model.to_string(),
                 None => body,
+            };
+            if let Some(ms) = args.get("duration_ms").and_then(|v| v.as_u64())
+                && ms > 0
+            {
+                let dur = format_duration_ms(ms);
+                out = if out.is_empty() {
+                    dur
+                } else {
+                    format!("{out} · {dur}")
+                };
             }
+            out
         }
         _ => String::new(),
+    }
+}
+
+fn format_duration_ms(ms: u64) -> String {
+    if ms < 1000 {
+        format!("{ms}ms")
+    } else if ms < 10_000 {
+        format!("{:.1}s", ms as f64 / 1000.0)
+    } else {
+        format!("{:.0}s", ms as f64 / 1000.0)
     }
 }
 
@@ -4124,7 +4185,7 @@ pub(super) fn compact_lines_and_bars(lines: &mut Vec<StyledLine>, bars: &mut Vec
 mod render_tests {
     use super::{
         condense_subagent_task, parallel_call_row_text, render_edit_diff, strip_ansi_and_controls,
-        subagent_row_text, tool_arg_summary, tool_result_summary,
+        subagent_row_text, tool_action_label, tool_arg_summary, tool_result_summary,
     };
 
     #[test]
@@ -4357,6 +4418,43 @@ mod render_tests {
                 ""
             ),
             "audit auth flow"
+        );
+    }
+
+    #[test]
+    fn tool_arg_summary_subagent_shows_model_and_duration() {
+        assert_eq!(
+            tool_arg_summary(
+                "subagent",
+                &serde_json::json!({
+                    "agent": "explore",
+                    "label": "map the engine",
+                    "model": "composer-2.5",
+                    "duration_ms": 2410
+                }),
+                ""
+            ),
+            "explore (composer-2.5) — map the engine · 2.4s"
+        );
+    }
+
+    #[test]
+    fn tool_arg_summary_generate_image_prefers_prompt() {
+        assert_eq!(
+            tool_arg_summary(
+                "generate_image",
+                &serde_json::json!({"prompt": "Minimal app icon", "path": "/tmp/icon.png"}),
+                ""
+            ),
+            "Minimal app icon"
+        );
+        assert_eq!(
+            tool_action_label(
+                "generate_image",
+                &serde_json::json!({"prompt": "Minimal app icon"}),
+                ""
+            ),
+            "generating Minimal app icon"
         );
     }
 

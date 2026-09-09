@@ -100,6 +100,97 @@ fn test_matching_command_entries_includes_skills_after_builtins() {
     );
 }
 
+#[test]
+fn test_matching_command_entries_includes_cursor_commands() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.cursor_slash_commands = vec![
+        cursor_command("copy-request-id", "Copy the last request ID"),
+        cursor_command("copy", "must not shadow the built-in"),
+    ];
+    app.skill_commands = vec![skill_command("copy-request-id", "skill wins")];
+
+    let entries = app.matching_command_entries("copy-request");
+    let labels: Vec<String> = entries.iter().map(ComposerMenuEntry::label).collect();
+    assert_eq!(labels, vec!["/copy-request-id".to_string()]);
+    assert!(matches!(entries[0], ComposerMenuEntry::Skill(_)));
+
+    app.skill_commands.clear();
+    let entries = app.matching_command_entries("copy-request");
+    assert!(matches!(
+        &entries[..],
+        [ComposerMenuEntry::Cursor(c)] if c.name == "copy-request-id"
+    ));
+
+    let copy_entries = app.matching_command_entries("copy");
+    assert!(
+        copy_entries
+            .iter()
+            .any(|e| matches!(e, ComposerMenuEntry::Command(c) if c.name == "copy")),
+        "built-in /copy still appears"
+    );
+    assert!(
+        !copy_entries
+            .iter()
+            .any(|e| matches!(e, ComposerMenuEntry::Cursor(c) if c.name == "copy")),
+        "cursor must not shadow /copy"
+    );
+}
+
+#[test]
+fn test_cursor_slash_command_sends_as_prompt() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.cursor_slash_commands = vec![cursor_command(
+        "copy-request-id",
+        "Copy the last request ID",
+    )];
+    app.draft = "/copy-request-id".to_string();
+    assert!(matches!(
+        app.prepare_submit_action().unwrap(),
+        Some(SubmitAction::Send(text)) if text == "/copy-request-id"
+    ));
+    app.draft = "/copy-request-id extra".to_string();
+    assert!(matches!(
+        app.prepare_submit_action().unwrap(),
+        Some(SubmitAction::Send(text)) if text == "/copy-request-id extra"
+    ));
+    app.draft = "/copy".to_string();
+    assert!(matches!(
+        app.prepare_submit_action().unwrap(),
+        Some(SubmitAction::Command(SlashCommand::Copy(None)))
+    ));
+}
+
+#[tokio::test]
+async fn test_cursor_commands_event_keeps_catalog_menu_hides_collisions() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx.clone(), rx);
+    tx.send(RuntimeEvent::CursorCommands(vec![
+        cursor_command("copy-request-id", "Copy the last request ID"),
+        cursor_command("help", "must not shadow /help"),
+    ]))
+    .unwrap();
+    app.handle_runtime_events().await.unwrap();
+    assert_eq!(
+        app.cursor_slash_commands
+            .iter()
+            .map(|c| c.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["copy-request-id", "help"]
+    );
+    let help = app.matching_command_entries("help");
+    assert!(
+        help.iter()
+            .any(|e| matches!(e, ComposerMenuEntry::Command(c) if c.name == "help"))
+    );
+    assert!(
+        !help
+            .iter()
+            .any(|e| matches!(e, ComposerMenuEntry::Cursor(c) if c.name == "help"))
+    );
+}
+
 #[tokio::test]
 async fn test_refresh_skill_commands_discovers_and_respects_disabled() {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();

@@ -2120,6 +2120,10 @@ impl SkillCommand {
     }
 }
 
+/// Slash command advertised by `cursor-agent acp`. Submitting sends `/{name}`
+/// so cursor's own handler runs.
+pub(super) type CursorCommand = crate::services::cursor_acp::CursorSlashCommand;
+
 /// A sub-agent row in the `@` menu; selecting inserts `@agent-<name> ` without submitting.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct AgentMention {
@@ -2131,6 +2135,7 @@ pub(super) struct AgentMention {
 pub(super) enum ComposerMenuEntry {
     Command(&'static SlashCommandSpec),
     Skill(SkillCommand),
+    Cursor(CursorCommand),
     Path(PathMenuEntry),
     Agent(AgentMention),
 }
@@ -2141,6 +2146,7 @@ impl ComposerMenuEntry {
             // Help label, not the bare name, so arg-taking commands show their argument.
             Self::Command(command) => command.help_label.to_string(),
             Self::Skill(skill) => skill.command_label(),
+            Self::Cursor(command) => format!("/{}", command.name),
             Self::Path(path) => path.label.clone(),
             Self::Agent(agent) => format!("@{AGENT_MENTION_PREFIX}{}", agent.name),
         }
@@ -2150,6 +2156,7 @@ impl ComposerMenuEntry {
         match self {
             Self::Command(command) => command.description,
             Self::Skill(skill) => &skill.description,
+            Self::Cursor(command) => &command.description,
             Self::Path(path) => &path.description,
             Self::Agent(agent) => &agent.description,
         }
@@ -2861,6 +2868,8 @@ pub(super) enum RuntimeEvent {
         result: Option<String>,
         failed: bool,
     },
+    /// Slash commands advertised by the live cursor ACP session.
+    CursorCommands(Vec<CursorCommand>),
     /// Live `run_bash` output chunk — feeds the streaming tail, not the transcript.
     AgentToolOutput {
         chunk: String,
@@ -3199,6 +3208,7 @@ pub(super) struct CodeTuiApp {
     /// startup and after any skill mutation; read by the `/` menu and command
     /// resolver. Empty when none; its length feeds the welcome chip.
     pub(super) skill_commands: Vec<SkillCommand>,
+    pub(super) cursor_slash_commands: Vec<CursorCommand>,
     /// Subagent profiles discovered for the working dir, last time the set was
     /// checked (startup + after each turn). Compared post-turn — full structs,
     /// since the engine snapshots profiles at build and never re-reads them — so
@@ -3891,6 +3901,7 @@ impl CodeTuiApp {
             cursor: 0,
             command_menu: CommandMenuState::default(),
             skill_commands: Vec::new(),
+            cursor_slash_commands: Vec::new(),
             last_subagents: Vec::new(),
             mcp_configured_count: 0,
             welcome_tip_index: 0,

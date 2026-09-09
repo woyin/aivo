@@ -15,6 +15,7 @@ use tokio::process::Command;
 use crate::agent::protocol::Decision;
 use crate::services::acp_client::{
     AcpClient, ExtMethodFn, PermissionDecision, PermissionFn, PromptEvent, PromptStream,
+    SessionUpdateFn,
 };
 use crate::services::cursor_home_shadow::CursorShadow;
 use crate::services::session_store::{ApiKey, AttachmentStorage, MessageAttachment};
@@ -236,10 +237,28 @@ pub struct CursorTaskNotice {
     pub description: String,
     pub prompt: String,
     pub subagent_type: String,
+    pub model: String,
+    pub duration_ms: Option<u64>,
 }
 
 /// Non-blocking sink for `cursor/task` (returns immediately).
 pub type CursorTaskSink = Arc<dyn Fn(CursorTaskNotice) + Send + Sync>;
+
+pub struct CursorGenerateImageNotice {
+    pub tool_call_id: String,
+    pub description: String,
+    pub file_path: String,
+}
+
+pub type CursorGenerateImageSink = Arc<dyn Fn(CursorGenerateImageNotice) + Send + Sync>;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CursorSlashCommand {
+    pub name: String,
+    pub description: String,
+}
+
+pub type CursorCommandsSink = Arc<dyn Fn(Vec<CursorSlashCommand>) + Send + Sync>;
 
 pub struct CursorPlanPhase {
     pub name: String,
@@ -275,6 +294,8 @@ pub struct CursorInteractionHooks {
     pub update_todos: Option<CursorTodosSink>,
     pub create_plan: Option<CursorPlanPrompt>,
     pub task: Option<CursorTaskSink>,
+    pub generate_image: Option<CursorGenerateImageSink>,
+    pub commands: Option<CursorCommandsSink>,
 }
 
 impl CursorInteractionHooks {
@@ -283,6 +304,8 @@ impl CursorInteractionHooks {
             && self.update_todos.is_none()
             && self.create_plan.is_none()
             && self.task.is_none()
+            && self.generate_image.is_none()
+            && self.commands.is_none()
     }
 }
 
@@ -315,28 +338,77 @@ fn build_ext_method_fn(hooks: CursorInteractionHooks) -> Option<ExtMethodFn> {
                     sink(parse_cursor_task_notice(&params));
                     Some(json!({}))
                 }
+                "cursor/generate_image" => {
+                    let sink = hooks.generate_image.as_ref()?;
+                    sink(parse_cursor_generate_image(&params));
+                    Some(json!({}))
+                }
                 _ => None,
             }
         })
     }))
 }
 
+fn json_str(params: &Value, key: &str) -> String {
+    params
+        .get(key)
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim()
+        .to_string()
+}
+
 /// Parse a `cursor/task` notice (`{toolCallId, description, prompt, subagentType, …}`).
 fn parse_cursor_task_notice(params: &Value) -> CursorTaskNotice {
-    let s = |k: &str| {
-        params
-            .get(k)
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .trim()
-            .to_string()
-    };
     CursorTaskNotice {
-        tool_call_id: s("toolCallId"),
-        description: s("description"),
-        prompt: s("prompt"),
-        subagent_type: s("subagentType"),
+        tool_call_id: json_str(params, "toolCallId"),
+        description: json_str(params, "description"),
+        prompt: json_str(params, "prompt"),
+        subagent_type: json_str(params, "subagentType"),
+        model: json_str(params, "model"),
+        duration_ms: params
+            .get("durationMs")
+            .and_then(|v| v.as_u64().or_else(|| v.as_f64().map(|f| f as u64))),
     }
+}
+
+fn parse_cursor_generate_image(params: &Value) -> CursorGenerateImageNotice {
+    CursorGenerateImageNotice {
+        tool_call_id: json_str(params, "toolCallId"),
+        description: json_str(params, "description"),
+        file_path: json_str(params, "filePath"),
+    }
+}
+
+/// Empty / missing list is `None` so callers don't clobber a previously received catalog.
+fn parse_available_commands(value: &Value) -> Option<Vec<CursorSlashCommand>> {
+    let update = value.get("update")?;
+    if update.get("sessionUpdate").and_then(Value::as_str) != Some("available_commands_update") {
+        return None;
+    }
+    let arr = update
+        .get("availableCommands")
+        .or_else(|| update.get("commands"))
+        .and_then(Value::as_array)?;
+    let commands: Vec<CursorSlashCommand> = arr
+        .iter()
+        .filter_map(|c| {
+            let name = c.get("name").and_then(Value::as_str)?.trim();
+            if name.is_empty() {
+                return None;
+            }
+            Some(CursorSlashCommand {
+                name: name.to_string(),
+                description: c
+                    .get("description")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .trim()
+                    .to_string(),
+            })
+        })
+        .collect();
+    (!commands.is_empty()).then_some(commands)
 }
 
 /// Parse a `[{id, content, status}]` array, dropping items missing id/content.
@@ -1224,17 +1296,8 @@ fn status_value_authenticated(value: &Value) -> Option<bool> {
     }
 }
 
-/// Reject image attachments before they reach `cursor-agent acp`.
-///
-/// Why: ACP defines an `image` content block, but as of writing
-/// `cursor-agent`'s ACP server does not advertise the `image` prompt
-/// capability — confirmed both by the spec
-/// ([agentclientprotocol.com/protocol/content](https://agentclientprotocol.com/protocol/content),
-/// which gates image blocks on `promptCapabilities.image`) and by the
-/// `raphaelluethy/cursor-acp` adapter, which flattens images to text to
-/// work around it. Bail with a clear message; once a session reports
-/// `image: true` via [`PromptCapabilities`], callers can switch to
-/// [`ensure_image_attachments_supported`] for the conditional path.
+/// Reject image attachments. cursor-agent 2026.09+ advertises
+/// `promptCapabilities.image`; older builds did not.
 pub fn ensure_no_image_attachments(attachments: &[MessageAttachment]) -> Result<()> {
     if let Some(att) = first_image_attachment(attachments) {
         anyhow::bail!(
@@ -1468,12 +1531,8 @@ pub struct CursorAcpSession {
     model_pick_preference: ModelPickPreference,
 }
 
-/// Parsed `agentCapabilities.promptCapabilities` from the ACP `initialize`
-/// response. Per spec ([agentclientprotocol.com/protocol/content](https://agentclientprotocol.com/protocol/content)),
-/// these flags gate which content-block types the agent will accept in
-/// `session/prompt`. cursor-agent's current ACP server appears to advertise
-/// text-only — capturing the raw flags lets us flip image/audio guards from
-/// blanket bails to capability-conditional once that changes.
+/// `agentCapabilities.promptCapabilities` from ACP `initialize`.
+/// cursor-agent 2026.09+ advertises `image: true`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PromptCapabilities {
     pub image: bool,
@@ -1586,9 +1645,24 @@ impl CursorAcpSession {
                     .await
             })
         });
+        let session_update_fn = hooks.commands.clone().map(|sink| {
+            let hook: SessionUpdateFn = Arc::new(move |params| {
+                if let Some(commands) = parse_available_commands(&params) {
+                    sink(commands);
+                }
+            });
+            hook
+        });
         let ext_method_fn = build_ext_method_fn(hooks);
-        let client =
-            Arc::new(AcpClient::spawn_with_handlers(cmd, permission_fn, ext_method_fn).await?);
+        let client = Arc::new(
+            AcpClient::spawn_with_session_hook(
+                cmd,
+                permission_fn,
+                ext_method_fn,
+                session_update_fn,
+            )
+            .await?,
+        );
 
         let init = client
             .request(
@@ -1936,15 +2010,24 @@ fn normalize_tool_call(update: &Value) -> (String, Value) {
         "read" => ("read_file".into(), serde_json::json!({ "path": path })),
         "edit" => ("edit_file".into(), serde_json::json!({ "path": path })),
         "delete" => ("delete_file".into(), serde_json::json!({ "path": path })),
-        "search" => {
-            let pattern = raw_input_str(update, PATTERN_KEYS).unwrap_or("");
-            ("grep".into(), serde_json::json!({ "pattern": pattern }))
+        "fetch" => {
+            let url = raw_input_str(update, URL_KEYS).unwrap_or("");
+            ("web_fetch".into(), serde_json::json!({ "url": url }))
         }
+        "search" => normalize_search_tool(update, title, path),
         "execute" => {
             let command = raw_input_str(update, COMMAND_KEYS).unwrap_or(title);
             ("run_bash".into(), serde_json::json!({ "command": command }))
         }
         _ => {
+            if is_generate_image_call(update, title) {
+                let prompt = raw_input_str(update, &["description", "prompt"]).unwrap_or("");
+                let file = raw_input_str(update, PATH_KEYS).unwrap_or(path);
+                return (
+                    "generate_image".into(),
+                    serde_json::json!({ "prompt": prompt, "path": file }),
+                );
+            }
             // A delegation (`Task: <desc>` title / "task" kind) renders as a
             // delegation, not raw-title jargon like `running Task: Subagent task`.
             let task_desc = title
@@ -1963,6 +2046,29 @@ fn normalize_tool_call(update: &Value) -> (String, Value) {
     }
 }
 
+fn normalize_search_tool(update: &Value, title: &str, path: &str) -> (String, Value) {
+    if let Some(q) = raw_input_str(update, &["searchTerm"]) {
+        return ("web_search".into(), serde_json::json!({ "query": q }));
+    }
+    if let Some(p) = raw_input_str(update, &["globPattern"]) {
+        return ("glob".into(), serde_json::json!({ "pattern": p }));
+    }
+    let pattern = raw_input_str(update, PATTERN_KEYS).unwrap_or("");
+    if pattern.is_empty() && !path.is_empty() {
+        return ("list_dir".into(), serde_json::json!({ "path": path }));
+    }
+    // Glob titles are `Find …`; grep titles are `Grep` / the pattern.
+    if title.starts_with("Find") && !pattern.is_empty() {
+        return ("glob".into(), serde_json::json!({ "pattern": pattern }));
+    }
+    ("grep".into(), serde_json::json!({ "pattern": pattern }))
+}
+
+fn is_generate_image_call(update: &Value, title: &str) -> bool {
+    raw_input_str(update, &["_toolName"]) == Some("generateImage")
+        || title.starts_with("Generate Image")
+}
+
 /// cursor's `rawInput` parameter names aren't stable across tools (a read's path
 /// may be `path`, `target_file`, `file_path`, …), so each salient field is keyed
 /// off a candidate list rather than a single name.
@@ -1977,6 +2083,7 @@ const PATH_KEYS: &[&str] = &[
 const PATTERN_KEYS: &[&str] = &["pattern", "query", "regex", "search"];
 const COMMAND_KEYS: &[&str] = &["command", "cmd"];
 const TASK_LABEL_KEYS: &[&str] = &["description", "label", "task"];
+const URL_KEYS: &[&str] = &["url", "uri"];
 
 /// First string value among `keys` in the event's `rawInput`.
 fn raw_input_str<'a>(update: &'a Value, keys: &[&str]) -> Option<&'a str> {
@@ -2004,11 +2111,34 @@ fn update_target_args(update: &Value) -> Option<Value> {
     if let Some(p) = location_path(update).or_else(|| raw_input_str(update, PATH_KEYS)) {
         map.insert("path".into(), Value::String(p.to_string()));
     }
-    if let Some(p) = raw_input_str(update, PATTERN_KEYS) {
+    if let Some(q) = raw_input_str(update, &["searchTerm"]) {
+        map.insert("query".into(), Value::String(q.to_string()));
+    }
+    if let Some(p) = raw_input_str(update, &["globPattern"]) {
+        map.insert("pattern".into(), Value::String(p.to_string()));
+    } else if let Some(p) = raw_input_str(update, PATTERN_KEYS) {
         map.insert("pattern".into(), Value::String(p.to_string()));
     }
     if let Some(c) = raw_input_str(update, COMMAND_KEYS) {
         map.insert("command".into(), Value::String(c.to_string()));
+    }
+    if let Some(u) = raw_input_str(update, URL_KEYS) {
+        map.insert("url".into(), Value::String(u.to_string()));
+    }
+    if let Some(prompt) = raw_input_str(update, &["description", "prompt"])
+        && is_generate_image_call(
+            update,
+            update.get("title").and_then(Value::as_str).unwrap_or(""),
+        )
+    {
+        map.insert("prompt".into(), Value::String(prompt.to_string()));
+    }
+    if let Some((path, old, new)) = first_diff(update) {
+        if !map.contains_key("path") && !path.is_empty() {
+            map.insert("path".into(), Value::String(path.to_string()));
+        }
+        map.insert("old_string".into(), Value::String(old.to_string()));
+        map.insert("new_string".into(), Value::String(new.to_string()));
     }
     (!map.is_empty()).then_some(Value::Object(map))
 }
@@ -2034,6 +2164,21 @@ fn summarize_tool_outcome(update: &Value) -> (Option<String>, bool) {
             result = Some(format!("{n} result{}", if n == 1 { "" } else { "s" }));
         } else if let Some(content) = out.get("content").and_then(Value::as_str) {
             result = Some(compact_result(content));
+        } else if out.get("exitCode").is_some() {
+            let code = out.get("exitCode").and_then(Value::as_i64).unwrap_or(0);
+            failed = failed || code != 0;
+            let stdout = out.get("stdout").and_then(Value::as_str).unwrap_or("");
+            let stderr = out.get("stderr").and_then(Value::as_str).unwrap_or("");
+            let body = if !stdout.trim().is_empty() {
+                stdout
+            } else {
+                stderr
+            };
+            if !body.trim().is_empty() {
+                result = Some(compact_result(body));
+            } else if code != 0 {
+                result = Some(format!("exit {code}"));
+            }
         }
     }
     if result.is_none() {
@@ -2066,6 +2211,23 @@ fn collect_content_text(update: &Value) -> String {
         }
     }
     text
+}
+
+fn first_diff(update: &Value) -> Option<(&str, &str, &str)> {
+    let blocks = update.get("content").and_then(Value::as_array)?;
+    for block in blocks {
+        if block.get("type").and_then(Value::as_str) != Some("diff") {
+            continue;
+        }
+        let path = block.get("path").and_then(Value::as_str).unwrap_or("");
+        let old = block.get("oldText").and_then(Value::as_str).unwrap_or("");
+        let new = block.get("newText").and_then(Value::as_str).unwrap_or("");
+        if path.is_empty() && old.is_empty() && new.is_empty() {
+            continue;
+        }
+        return Some((path, old, new));
+    }
+    None
 }
 
 /// One-line digest of tool output: the line itself when short, else `N lines`.
@@ -2393,11 +2555,14 @@ mod tests {
             "prompt": "You are auditing…",
             "subagentType": "explore",
             "model": "composer-2.5",
+            "durationMs": 2410,
         }));
         assert_eq!(notice.tool_call_id, "tool_60759ef1");
         assert_eq!(notice.description, "Audit the auth flow");
         assert_eq!(notice.prompt, "You are auditing…");
         assert_eq!(notice.subagent_type, "explore");
+        assert_eq!(notice.model, "composer-2.5");
+        assert_eq!(notice.duration_ms, Some(2410));
         // A failed spawn sends empty strings — parsed, not panicked.
         let empty =
             parse_cursor_task_notice(&json!({"toolCallId": "t", "subagentType": "unspecified"}));
@@ -3254,12 +3419,6 @@ mod tests {
             "update": {"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": "Hello"}},
         });
         consume_session_update(&msg, &mut out, &mut reasoning, &mut on_chunk).unwrap();
-        // Unknown update kinds (plan, available_commands_update) are dropped.
-        let msg = serde_json::json!({
-            "sessionId": "s1",
-            "update": {"sessionUpdate": "available_commands_update", "commands": []},
-        });
-        consume_session_update(&msg, &mut out, &mut reasoning, &mut on_chunk).unwrap();
 
         assert_eq!(out.content, "Hello");
         assert_eq!(reasoning, "hmm ");
@@ -3514,11 +3673,59 @@ mod tests {
             )
         );
 
-        // Unknown kind keeps the human title.
-        let other = serde_json::json!({"kind": "fetch", "title": "Fetch URL"});
+        let other = serde_json::json!({
+            "kind": "fetch", "title": "Web Fetch: https://ex.test",
+            "rawInput": {"url": "https://ex.test"},
+        });
         assert_eq!(
             normalize_tool_call(&other),
-            ("Fetch URL".to_string(), Value::Null)
+            (
+                "web_fetch".to_string(),
+                serde_json::json!({"url": "https://ex.test"})
+            )
+        );
+
+        let web = serde_json::json!({
+            "kind": "search", "title": "Web Search",
+            "rawInput": {"searchTerm": "acp protocol"},
+        });
+        assert_eq!(
+            normalize_tool_call(&web),
+            (
+                "web_search".to_string(),
+                serde_json::json!({"query": "acp protocol"})
+            )
+        );
+
+        let glob = serde_json::json!({
+            "kind": "search", "title": "Find `src` `*.rs`",
+            "rawInput": {"pattern": "*.rs", "path": "src"},
+        });
+        assert_eq!(
+            normalize_tool_call(&glob),
+            ("glob".to_string(), serde_json::json!({"pattern": "*.rs"}))
+        );
+
+        let ls = serde_json::json!({
+            "kind": "search", "title": "List the `src` directory's contents",
+            "rawInput": {"path": "src"},
+        });
+        assert_eq!(
+            normalize_tool_call(&ls),
+            ("list_dir".to_string(), serde_json::json!({"path": "src"}))
+        );
+
+        let image = serde_json::json!({
+            "kind": "other",
+            "title": "Generate Image: a red dot",
+            "rawInput": {"_toolName": "generateImage", "description": "a red dot", "filename": "dot.png"},
+        });
+        assert_eq!(
+            normalize_tool_call(&image),
+            (
+                "generate_image".to_string(),
+                serde_json::json!({"prompt": "a red dot", "path": "dot.png"})
+            )
         );
 
         // Delegation titles map onto the `subagent` vocabulary.
@@ -3590,5 +3797,89 @@ mod tests {
         let (result, failed) = summarize_tool_outcome(&err);
         assert!(failed);
         assert!(result.unwrap().starts_with("Glob pattern"));
+    }
+
+    #[test]
+    fn summarize_tool_outcome_reads_shell_raw_output() {
+        let ok = serde_json::json!({
+            "status": "completed",
+            "rawOutput": {"exitCode": 0, "stdout": "hello\n", "stderr": ""},
+        });
+        assert_eq!(
+            summarize_tool_outcome(&ok),
+            (Some("hello".to_string()), false)
+        );
+
+        let fail = serde_json::json!({
+            "status": "completed",
+            "rawOutput": {"exitCode": 2, "stdout": "", "stderr": ""},
+        });
+        assert_eq!(
+            summarize_tool_outcome(&fail),
+            (Some("exit 2".to_string()), true)
+        );
+    }
+
+    #[test]
+    fn update_target_args_reads_diff_content_blocks() {
+        let update = serde_json::json!({
+            "sessionUpdate": "tool_call_update",
+            "toolCallId": "c1",
+            "content": [{
+                "type": "diff",
+                "path": "src/main.rs",
+                "oldText": "fn a() {}",
+                "newText": "fn b() {}",
+            }],
+        });
+        assert_eq!(
+            update_target_args(&update),
+            Some(serde_json::json!({
+                "path": "src/main.rs",
+                "old_string": "fn a() {}",
+                "new_string": "fn b() {}",
+            }))
+        );
+    }
+
+    #[test]
+    fn parse_available_commands_reads_advertised_slash_commands() {
+        let value = json!({
+            "sessionId": "s1",
+            "update": {
+                "sessionUpdate": "available_commands_update",
+                "availableCommands": [
+                    {"name": "copy-request-id", "description": "Copy the last request ID to clipboard"},
+                    {"name": "  ", "description": "blank names drop"},
+                ],
+            },
+        });
+        let cmds = parse_available_commands(&value).expect("commands");
+        assert_eq!(cmds.len(), 1);
+        assert_eq!(cmds[0].name, "copy-request-id");
+        assert!(
+            parse_available_commands(&json!({
+                "update": {"sessionUpdate": "available_commands_update", "availableCommands": []}
+            }))
+            .is_none()
+        );
+        assert!(
+            parse_available_commands(&json!({
+                "update": {"sessionUpdate": "agent_message_chunk"}
+            }))
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn parse_cursor_generate_image_reads_path_and_description() {
+        let notice = parse_cursor_generate_image(&json!({
+            "toolCallId": "img1",
+            "description": "Minimal app icon",
+            "filePath": "/tmp/icon.png",
+        }));
+        assert_eq!(notice.tool_call_id, "img1");
+        assert_eq!(notice.description, "Minimal app icon");
+        assert_eq!(notice.file_path, "/tmp/icon.png");
     }
 }

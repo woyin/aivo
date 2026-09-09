@@ -437,9 +437,8 @@ impl CodeTuiApp {
         trimmed.starts_with('!') && !trimmed.starts_with("!!")
     }
 
-    /// The `/` menu entries for `query`: built-in commands first, then discovered
-    /// skill commands (`/repo-study`). A skill whose name collides with a built-in
-    /// is dropped — the built-in wins — so a stray skill can't shadow `/model` etc.
+    /// `/` menu: builtins, then skills, then cursor-ACP commands. Built-ins win
+    /// name collisions; skills win over cursor commands at submit.
     pub(super) fn matching_command_entries(&self, query: &str) -> Vec<ComposerMenuEntry> {
         let mut entries: Vec<ComposerMenuEntry> = filter_slash_commands(query)
             .into_iter()
@@ -451,6 +450,12 @@ impl CodeTuiApp {
             if !SLASH_COMMANDS.iter().any(|c| c.name == skill.name) {
                 entries.push(ComposerMenuEntry::Skill(skill));
             }
+        }
+        for command in filter_cursor_commands(&self.cursor_slash_commands, query) {
+            if self.slash_name_taken(&command.name) {
+                continue;
+            }
+            entries.push(ComposerMenuEntry::Cursor(command));
         }
         entries
     }
@@ -591,16 +596,13 @@ impl CodeTuiApp {
         self.command_menu.selected = 0;
         match entry {
             ComposerMenuEntry::Command(command) => {
-                self.draft = command.insertion_text();
-                self.cursor = self.draft.len();
-                self.command_menu.dismissed = true;
-                self.command_menu.placement = None;
+                self.replace_draft_and_dismiss_menu(command.insertion_text());
             }
             ComposerMenuEntry::Skill(skill) => {
-                self.draft = skill.insertion_text();
-                self.cursor = self.draft.len();
-                self.command_menu.dismissed = true;
-                self.command_menu.placement = None;
+                self.replace_draft_and_dismiss_menu(skill.insertion_text());
+            }
+            ComposerMenuEntry::Cursor(command) => {
+                self.replace_draft_and_dismiss_menu(format!("/{} ", command.name));
             }
             ComposerMenuEntry::Path(path) if self.active_path_query().is_some() => {
                 self.draft = format!("/preview {}", path.path);
@@ -621,6 +623,13 @@ impl CodeTuiApp {
             }
         }
         true
+    }
+
+    fn replace_draft_and_dismiss_menu(&mut self, text: String) {
+        self.draft = text;
+        self.cursor = self.draft.len();
+        self.command_menu.dismissed = true;
+        self.command_menu.placement = None;
     }
 
     fn insert_mention(&mut self, text: &str) {
@@ -653,16 +662,11 @@ impl CodeTuiApp {
         };
         match entry {
             ComposerMenuEntry::Command(command) => {
-                self.draft = command.command_label();
-                self.cursor = self.draft.len();
-                self.command_menu.reset();
-                self.submit_draft().await
+                self.submit_slash_label(command.command_label()).await
             }
-            ComposerMenuEntry::Skill(skill) => {
-                self.draft = skill.command_label();
-                self.cursor = self.draft.len();
-                self.command_menu.reset();
-                self.submit_draft().await
+            ComposerMenuEntry::Skill(skill) => self.submit_slash_label(skill.command_label()).await,
+            ComposerMenuEntry::Cursor(command) => {
+                self.submit_slash_label(format!("/{}", command.name)).await
             }
             ComposerMenuEntry::Path(path) if self.active_path_query().is_some() => {
                 self.draft = format!("/preview {}", path.path);
@@ -681,6 +685,13 @@ impl CodeTuiApp {
                 Ok(false)
             }
         }
+    }
+
+    async fn submit_slash_label(&mut self, label: String) -> Result<bool> {
+        self.draft = label;
+        self.cursor = self.draft.len();
+        self.command_menu.reset();
+        self.submit_draft().await
     }
 
     pub(super) fn paste_system_clipboard(&mut self) -> Result<()> {
