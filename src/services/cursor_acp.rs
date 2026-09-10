@@ -1410,6 +1410,14 @@ pub struct CursorTurnResult {
     /// `None` → callers fall back to their chars/4 estimate.
     pub usage: Option<CursorUsage>,
     pub transport_failure: Option<String>,
+    pub tool_dispatched: bool,
+}
+
+impl CursorTurnResult {
+    /// A resend replays tools cursor already ran, and `tool_call` precedes text.
+    pub(crate) fn is_retry_safe(&self) -> bool {
+        self.content.is_empty() && !self.tool_dispatched
+    }
 }
 
 /// Token usage from an ACP `session/prompt` result. Schema-defined but not
@@ -1908,7 +1916,7 @@ where
             }
         }
         if let Some(report) = out.transport_failure.take() {
-            if out.content.is_empty() && attempt < CURSOR_PROMPT_ATTEMPTS {
+            if out.is_retry_safe() && attempt < CURSOR_PROMPT_ATTEMPTS {
                 tokio::time::sleep(cursor_reconnect_backoff(attempt)).await;
                 attempt += 1;
                 continue;
@@ -1964,6 +1972,7 @@ where
         // A tool starting: surface a normalized call card. The resolved target
         // and result land later in a `tool_call_update` (below), correlated by id.
         Some("tool_call") => {
+            out.tool_dispatched = true;
             let (name, args) = normalize_tool_call(update);
             let id = update
                 .get("toolCallId")
@@ -1975,6 +1984,7 @@ where
         // pattern, which the start event usually omits) and the result. Emitted
         // only when it adds something — an enrichment for the call line.
         Some("tool_call_update") => {
+            out.tool_dispatched = true;
             if let Some(id) = update.get("toolCallId").and_then(Value::as_str) {
                 let args = update_target_args(update);
                 let (result, failed) = summarize_tool_outcome(update);
@@ -3488,6 +3498,29 @@ mod tests {
         assert!(out.content.is_empty());
         assert!(chunks.is_empty());
         assert!(out.transport_failure.is_some());
+    }
+
+    /// Cursor streams reasoning, then `tool_call`, and text only at the end — so
+    /// a drop after the tool ran still leaves `content` empty.
+    #[test]
+    fn retry_is_safe_only_while_the_attempt_left_nothing_behind() {
+        let safe_after = |kinds: &[&str]| {
+            let mut out = CursorTurnResult::default();
+            let mut reasoning = String::new();
+            let mut on_chunk = |_: CursorChunk<'_>| -> Result<()> { Ok(()) };
+            for kind in kinds {
+                let update = serde_json::json!({
+                    "update": {"sessionUpdate": kind, "toolCallId": "t1", "content": {"type": "text", "text": "hi"}},
+                });
+                consume_session_update(&update, &mut out, &mut reasoning, &mut on_chunk).unwrap();
+            }
+            out.is_retry_safe()
+        };
+
+        assert!(safe_after(&["agent_thought_chunk"]));
+        assert!(!safe_after(&["agent_thought_chunk", "tool_call"]));
+        assert!(!safe_after(&["tool_call_update"]));
+        assert!(!safe_after(&["agent_message_chunk"]));
     }
 
     #[test]

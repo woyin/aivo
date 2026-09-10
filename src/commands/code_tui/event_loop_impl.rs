@@ -176,6 +176,10 @@ impl CodeTuiApp {
             RuntimeEvent::AgentSteered(text) => self.apply_agent_steered(text),
             RuntimeEvent::AgentSessionMail(display) => self.apply_agent_session_mail(display),
             RuntimeEvent::AgentDiscardSegment => self.discard_streamed_segment(),
+            RuntimeEvent::AgentDiscardReasoning => {
+                self.pending_reasoning.clear();
+                self.reasoning_started_at = None;
+            }
             RuntimeEvent::McpConnected { client, generation } => {
                 // Drop a connect that started before a `/mcp` toggle changed the
                 // server set; only the current generation's result is applied.

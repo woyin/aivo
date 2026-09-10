@@ -5368,9 +5368,10 @@ async fn drive_cursor_turn(
         let Some(report) = turn_result.transport_failure.take() else {
             break turn_result;
         };
-        if !turn_result.content.is_empty() || attempt >= cursor_acp::CURSOR_PROMPT_ATTEMPTS {
+        if !turn_result.is_retry_safe() || attempt >= cursor_acp::CURSOR_PROMPT_ATTEMPTS {
             return Err(cursor_acp::cursor_transport_error(&report));
         }
+        tx.send(RuntimeEvent::AgentDiscardReasoning).ok();
         tx.send(RuntimeEvent::AgentNotice(format!(
             "Cursor connection lost — retrying ({}/{})…",
             attempt + 1,

@@ -2906,6 +2906,8 @@ pub(super) enum RuntimeEvent {
     /// The agent's just-streamed output was a tool call written as text: drop the
     /// uncommitted segment so the markup never reaches the scrollback.
     AgentDiscardSegment,
+    /// Drop an abandoned attempt's reasoning so a retried turn commits one.
+    AgentDiscardReasoning,
     /// The engine consumed a mid-turn interjection — commit it at the injection point.
     AgentSteered(String),
     /// Peer mail surfaced mid-turn, in `transcript_display` form; committed as a ✉ row.
