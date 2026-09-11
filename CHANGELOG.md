@@ -1,5 +1,11 @@
 # Changelog
 
+## v0.49.6
+
+Cursor transport drops are retried only before the turn has begun using tools, preventing a duplicate or unsafe retry after tool execution.
+
+- fix(cursor): don't retry a transport drop after the turn already ran tools (28188fd5)
+
 ## v0.49.5
 
 Cursor ACP sessions surface advertised slash commands, image generation, and edit diffs instead of opaque cards; MCP and ask mode are wired through session/new and session/set_mode. Parallel live tool rows collapse so a Cursor batch does not bury the transcript, in-band transport deaths retry instead of ending the turn, and ↑ recalls the whole queued-message list. Large-file edit diffs show both sides, a denial quoted in a command's own output no longer fakes a sandbox block, and a long turn no longer freezes the TUI on token estimates, markdown, glob, and disk I/O.
