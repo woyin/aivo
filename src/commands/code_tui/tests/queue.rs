@@ -71,6 +71,7 @@ async fn test_mid_turn_message_steers_then_reclaims_or_commits() {
             .last()
             .is_some_and(|m| m.role == "user" && m.content == "also add a test")
     );
+    assert!(app.notice.is_none(), "notice: {:?}", app.notice);
 }
 
 /// Messages submitted while a turn is in flight queue in order — a second one

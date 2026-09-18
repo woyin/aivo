@@ -1042,7 +1042,7 @@ impl CodeTuiApp {
         self.flush_pending_assistant();
         self.history
             .push(ChatMessage::new("user", text).with_identity());
-        self.notice = Some((MUTED(), "Interjection delivered".to_string()));
+        self.clear_queue_notice();
     }
 
     /// Commit mid-turn peer mail as a ✉ row (otherwise only a folded tool result).

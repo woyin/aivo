@@ -1406,7 +1406,7 @@ impl CodeTuiApp {
         true
     }
 
-    fn clear_queue_notice(&mut self) {
+    pub(super) fn clear_queue_notice(&mut self) {
         let stale = matches!(&self.notice, Some((_, text)) if text.starts_with("Queued")
             || text.contains(" queued — "));
         if stale {
