@@ -1,5 +1,16 @@
 # Changelog
 
+## v0.49.9
+
+Sixel image previews in the code TUI are now sized in the terminal's logical
+pixels rather than tmux's device pixels, so a HiDPI cell no longer lands a
+double-size raster outside its reserved cell band (`AIVO_CELL_PX` pins the size
+when the halving heuristic is wrong). The redundant "Interjection delivered"
+notice is gone — the interjection itself is the feedback.
+
+- fix(code): size sixel previews in the terminal's logical pixels (e0f0580c)
+- fix(code): drop the redundant "Interjection delivered" notice (c15f6bef)
+
 ## v0.49.8
 
 The code TUI keeps the composer docked on a full transcript, lays out image previews cleanly, preserves turn timing and identity, and treats a bare `exit` draft as `/exit`. Provider catalog support now reads live ChatGPT OAuth models and Copilot's current id/name listings; Gemini API-key sessions are pinned to their isolated CLI home. The key/model shorthand accepts `-k`, Cursor idle timeouts surface instead of failing silently, and Ctrl+X Ctrl+E continues to open `$EDITOR` after typing an attachment.
