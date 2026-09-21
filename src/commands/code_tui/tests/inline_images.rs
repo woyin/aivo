@@ -26,6 +26,54 @@ fn placement(y: u16) -> PlacedImage {
     }
 }
 
+fn ready_preview(app: &mut super::super::CodeTuiApp, key: u64, w: u32, h: u32) {
+    app.inline_images.previews.insert(
+        key,
+        PreviewSlot::Ready(Arc::new(EncodedPreview {
+            format: PixelFormat::Rgb,
+            px_w: w,
+            px_h: h,
+            payload_b64: String::new(),
+            thumb: Some(crate::services::terminal_graphics::Thumb {
+                rgb: vec![0x40; (w * h * 3) as usize],
+                w,
+                h,
+            }),
+            content_hash: key,
+        })),
+    );
+}
+
+/// The raster must be the placement's cell grid in LOGICAL pixels.
+#[tokio::test]
+async fn sixel_raster_matches_the_placement_cell_grid() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.inline_images.caps = sixel_caps();
+    let want = PlacedImage {
+        key: 5,
+        x: 1,
+        y: 1,
+        cols: 20,
+        rows: 8,
+    };
+    ready_preview(&mut app, want.key, 400, 400);
+    app.inline_images.desired = vec![want];
+
+    let mut out = Vec::new();
+    assert!(!app.flush_inline_images(&mut out), "no extra frame");
+    let seq = String::from_utf8(out).expect("escapes are ascii");
+    let start = seq.find("\"1;1;").expect("sixel raster attributes") + 5;
+    // `"1;1;W;H#color…` — the palette entry follows H directly.
+    let dims: Vec<&str> = seq[start..]
+        .split(';')
+        .take(2)
+        .map(|part| part.split('#').next().unwrap_or(part))
+        .collect();
+    assert_eq!(dims, ["160", "128"], "20x8 cells at 8x16 logical px");
+    assert_eq!(app.inline_images.placed, vec![want]);
+}
+
 #[tokio::test]
 async fn sixel_scroll_movement_holds_placements_until_settled() {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
