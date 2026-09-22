@@ -1,3 +1,5 @@
+#[cfg(unix)]
+use super::super::event_loop_impl::ExternalEdit;
 use super::super::*;
 use super::helpers::*;
 
@@ -596,6 +598,91 @@ async fn test_ctrl_x_chord_cancelled_by_other_key() {
         .await
         .unwrap();
     assert!(!app.pending_external_edit);
+}
+
+/// Stub `$EDITOR`: a shell script that runs `body` with the draft file as `$1`.
+#[cfg(unix)]
+fn editor_script(body: &str) -> (tempfile::TempDir, Vec<String>) {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("editor.sh");
+    std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    (dir, vec![path.to_string_lossy().into_owned()])
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn test_external_edit_clean_exit_loads_the_text() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.draft = "old draft".to_string();
+    app.cursor = app.draft.len();
+    let (_dir, editor) = editor_script("printf 'typed in vi\\n' > \"$1\"");
+
+    let outcome = app.run_editor_on_draft(&editor).await.unwrap();
+
+    assert!(matches!(outcome, ExternalEdit::Adopted));
+    assert_eq!(app.draft, "typed in vi");
+    assert_eq!(app.cursor, app.draft.len());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn test_external_edit_failure_loads_saved_edits_anyway() {
+    // A non-zero exit says nothing about whether the editor saved.
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.draft = "old draft".to_string();
+    app.cursor = app.draft.len();
+    let (_dir, editor) = editor_script("printf 'typed in vi\\n' > \"$1\"; exit 1");
+
+    let outcome = app.run_editor_on_draft(&editor).await.unwrap();
+
+    let ExternalEdit::AdoptedDespite(warning) = outcome else {
+        panic!("saved edits must be adopted despite the failing exit");
+    };
+    assert!(warning.contains("exit status: 1"), "got {warning}");
+    assert_eq!(app.draft, "typed in vi");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn test_external_edit_abort_keeps_the_draft_file() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.draft = "old draft".to_string();
+    app.cursor = app.draft.len();
+    let (_dir, editor) = editor_script("exit 1");
+
+    let outcome = app.run_editor_on_draft(&editor).await.unwrap();
+
+    let ExternalEdit::DraftPreserved(path) = outcome else {
+        panic!("an editor that wrote nothing must preserve the draft file");
+    };
+    assert_eq!(app.draft, "old draft");
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "old draft");
+    std::fs::remove_file(&path).unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn test_external_edit_truncated_file_is_not_adopted() {
+    // Died mid-write: an emptied file must not wipe the composer.
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.draft = "old draft".to_string();
+    app.cursor = app.draft.len();
+    let (_dir, editor) = editor_script(": > \"$1\"; exit 1");
+
+    let outcome = app.run_editor_on_draft(&editor).await.unwrap();
+
+    let ExternalEdit::DraftPreserved(path) = outcome else {
+        panic!("an emptied file must not be adopted as the draft");
+    };
+    assert_eq!(app.draft, "old draft");
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "old draft");
+    std::fs::remove_file(&path).unwrap();
 }
 
 #[test]

@@ -2347,7 +2347,8 @@ impl CodeTuiApp {
     }
 
     /// Ctrl+X Ctrl+E: suspend the TUI, edit the draft in `$VISUAL`/`$EDITOR`, load it back.
-    /// The terminal is restored even on failure; errors become a notice, the draft is kept.
+    /// The terminal is restored even on failure, and a failed edit never discards the user's
+    /// text (see [`ExternalEdit`]).
     async fn edit_draft_in_external_editor(
         &mut self,
         terminal: &mut Terminal<CrosstermBackend<Stdout>>,
@@ -2376,19 +2377,33 @@ impl CodeTuiApp {
         }
         let _ = terminal.clear(); // contract-ok: re-entering alt screen after $EDITOR needs a clean slate
 
-        if let Err(err) = result {
-            self.notice = Some((ERROR(), format!("External edit failed: {err:#}")));
+        match result {
+            Ok(ExternalEdit::Adopted) => {}
+            Ok(ExternalEdit::AdoptedDespite(warning)) => {
+                self.notice = Some((WARNING(), warning));
+            }
+            Ok(ExternalEdit::DraftPreserved(path)) => {
+                self.notice = Some((
+                    ERROR(),
+                    format!(
+                        "External edit aborted — draft file kept at {}",
+                        path.display()
+                    ),
+                ));
+            }
+            Err(err) => self.notice = Some((ERROR(), format!("External edit failed: {err:#}"))),
         }
     }
 
-    async fn run_editor_on_draft(&mut self, editor: &[String]) -> Result<()> {
+    pub(super) async fn run_editor_on_draft(&mut self, editor: &[String]) -> Result<ExternalEdit> {
         use anyhow::Context as _;
         let file = tempfile::Builder::new()
             .prefix("aivo-draft-")
             .suffix(".md")
             .tempfile()
             .context("create temp file")?;
-        std::fs::write(file.path(), &self.draft).context("write draft")?;
+        let original = self.draft.clone();
+        std::fs::write(file.path(), &original).context("write draft")?;
         let status = tokio::process::Command::new(&editor[0])
             .args(&editor[1..])
             .arg(file.path())
@@ -2398,20 +2413,39 @@ impl CodeTuiApp {
             .status()
             .await
             .with_context(|| format!("launch `{}` (set $VISUAL or $EDITOR)", editor[0]))?;
-        if !status.success() {
-            anyhow::bail!("`{}` exited with {status}; draft kept", editor[0]);
-        }
-        let text = std::fs::read_to_string(file.path()).context("read edited draft")?;
+
+        // Read back before judging the exit status: dropping `file` deletes saved text.
+        let edited = std::fs::read_to_string(file.path()).context("read edited draft")?;
         // Editors append a final newline and may save CRLF; neither belongs in the composer.
-        let text = text.replace("\r\n", "\n");
-        let text = text.trim_end_matches('\n');
+        let text = edited.replace("\r\n", "\n");
+        let text = text.trim_end_matches('\n').to_string();
+
+        if !status.success() && (text == original || text.is_empty()) {
+            // Wrote nothing (`:cq`), or died mid-write and emptied the file.
+            if text.is_empty() {
+                std::fs::write(file.path(), &original).context("restore draft")?;
+            }
+            let (_file, path) = file
+                .keep()
+                .map_err(|err| err.error)
+                .context("keep draft file")?;
+            return Ok(ExternalEdit::DraftPreserved(path));
+        }
+
         self.leave_history_navigation();
         let before = self.attachment_tag_spans();
-        self.draft = text.to_string();
+        self.draft = text;
         self.cursor = self.draft.len();
         self.reconcile_attachment_tags(&before);
         self.sync_command_menu_state();
-        Ok(())
+
+        if status.success() {
+            return Ok(ExternalEdit::Adopted);
+        }
+        Ok(ExternalEdit::AdoptedDespite(format!(
+            "`{}` exited with {status} — loaded its edits anyway",
+            editor[0]
+        )))
     }
 
     /// Feeds one freshly-read event through the [`EscReassembly`] state machine.
@@ -3662,6 +3696,16 @@ impl CodeTuiApp {
 
         Ok(Some(false))
     }
+}
+
+/// How a Ctrl+X Ctrl+E round trip ended, so the caller can word its notice.
+pub(super) enum ExternalEdit {
+    /// Clean exit; its text is in the composer.
+    Adopted,
+    /// Exited non-zero but had saved edits; adopted anyway, with the warning to show.
+    AdoptedDespite(String),
+    /// Wrote nothing, so the composer draft stands and the file at this path keeps the text.
+    DraftPreserved(PathBuf),
 }
 
 /// State for stitching a mouse report that crossterm split at its leading ESC
