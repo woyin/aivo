@@ -18,10 +18,6 @@ const PNG_PASSTHROUGH_MAX_EDGE: u32 = 1024;
 /// `WxH` override for the cell size sixel rasters are sized in.
 const CELL_PX_ENV: &str = "AIVO_CELL_PX";
 
-/// Pixel-doubled cell — see `logical_cell_px`.
-const HIDPI_CELL_WIDTH: u16 = 12;
-const HIDPI_CELL_HEIGHT: u16 = 24;
-
 /// How previews reach the screen.
 ///
 /// `KittyVirtual` (Unicode placeholders, U+10EEEE cells): the image composites
@@ -72,8 +68,7 @@ pub struct GraphicsCaps {
     /// Inside tmux every APC must ride a DCS passthrough wrapper (sixel is
     /// exempt: tmux parses it natively).
     pub tmux: bool,
-    /// Terminal cell size in its own (logical) pixel space, for sizing sixel
-    /// output. From the tmux server when available, else a conservative 8×16.
+    /// Cell size sixel rasters are sized in: tmux's own figure, else 8×16.
     pub cell_px: (u16, u16),
 }
 
@@ -160,21 +155,6 @@ pub fn detect() -> GraphicsCaps {
     )
 }
 
-/// tmux reports DEVICE pixels on a HiDPI display, but the terminal composites
-/// sixel in LOGICAL ones — a device-sized raster lands at twice the cell band
-/// it was reserved for. `AIVO_CELL_PX` pins the size when halving is wrong.
-fn logical_cell_px(reported: (u16, u16), override_value: Option<&str>) -> (u16, u16) {
-    if let Some(px) = override_value.and_then(parse_cell_px) {
-        return px;
-    }
-    let (w, h) = reported;
-    if w >= HIDPI_CELL_WIDTH && h >= HIDPI_CELL_HEIGHT {
-        ((w / 2).max(1), (h / 2).max(1))
-    } else {
-        reported
-    }
-}
-
 fn parse_cell_px(value: &str) -> Option<(u16, u16)> {
     let (w, h) = value.trim().split_once(['x', 'X'])?;
     let w = w.trim().parse::<u16>().ok()?;
@@ -189,8 +169,12 @@ fn detect_from(
 ) -> GraphicsCaps {
     let tmux = var("TMUX").is_some_and(|v| !v.is_empty())
         || var("TERM").is_some_and(|t| t.starts_with("tmux"));
-    let reported_cell = tmux_info.and_then(|i| i.cell_px).unwrap_or((8, 16));
-    let cell_px = logical_cell_px(reported_cell, var(CELL_PX_ENV).as_deref());
+    // tmux sizes the image's cell footprint with this figure — never rescale it.
+    let cell_px = var(CELL_PX_ENV)
+        .as_deref()
+        .and_then(parse_cell_px)
+        .or_else(|| tmux_info.and_then(|i| i.cell_px))
+        .unwrap_or((8, 16));
     let caps = |protocol: Protocol| GraphicsCaps {
         protocol,
         tmux,
@@ -405,6 +389,7 @@ pub fn place(
     y: u16,
     cols: u16,
     rows: u16,
+    src_h: Option<u32>,
     tmux: bool,
 ) {
     // CUP is plain CSI — tmux translates it natively, no wrapper.
@@ -413,9 +398,10 @@ pub fn place(
         y.saturating_add(1),
         x.saturating_add(1)
     ));
+    let crop = src_h.map(|h| format!(",y=0,h={h}")).unwrap_or_default();
     push_apc(
         out,
-        &format!("a=p,q=2,i={id},p={pid},c={cols},r={rows},C=1"),
+        &format!("a=p,q=2,i={id},p={pid},c={cols},r={rows}{crop},C=1"),
         "",
         tmux,
     );
@@ -766,8 +752,11 @@ mod tests {
     #[test]
     fn place_moves_cursor_then_places() {
         let mut out = String::new();
-        place(&mut out, 3, 21, 4, 20, 40, 12, false);
+        place(&mut out, 3, 21, 4, 20, 40, 12, None, false);
         assert_eq!(out, "\x1b[21;5H\x1b_Ga=p,q=2,i=3,p=21,c=40,r=12,C=1\x1b\\");
+        let mut out = String::new();
+        place(&mut out, 3, 21, 4, 20, 40, 5, Some(200), false);
+        assert!(out.contains("c=40,r=5,y=0,h=200,C=1"), "{out:?}");
     }
 
     #[test]
@@ -797,7 +786,7 @@ mod tests {
     }
 
     #[test]
-    fn hidpi_tmux_cell_is_halved_for_sixel_raster() {
+    fn hidpi_tmux_cell_is_used_as_reported() {
         let hidpi = TmuxClientInfo {
             features: "RGB,sixel".into(),
             termtype: "WezTerm 20240203-110809-5046fc22".into(),
@@ -805,20 +794,8 @@ mod tests {
         };
         let caps = caps_with_tmux(&[("TMUX", "x")], Some(&hidpi));
         assert_eq!(caps.protocol, Protocol::Sixel);
-        assert_eq!(caps.cell_px, (8, 16));
+        assert_eq!(caps.cell_px, (17, 32));
 
-        // Already-logical metrics are left alone.
-        let plain = TmuxClientInfo {
-            features: "RGB,sixel".into(),
-            cell_px: Some((9, 18)),
-            ..Default::default()
-        };
-        assert_eq!(
-            caps_with_tmux(&[("TMUX", "x")], Some(&plain)).cell_px,
-            (9, 18)
-        );
-
-        // …and so is the default when tmux says nothing.
         let silent = TmuxClientInfo {
             features: "RGB,sixel".into(),
             ..Default::default()
@@ -830,7 +807,7 @@ mod tests {
     }
 
     #[test]
-    fn cell_px_override_beats_tmux_and_the_heuristic() {
+    fn cell_px_override_beats_tmux() {
         let hidpi = TmuxClientInfo {
             features: "RGB,sixel".into(),
             cell_px: Some((17, 32)),
@@ -838,11 +815,11 @@ mod tests {
         };
         let pinned = caps_with_tmux(&[("TMUX", "x"), ("AIVO_CELL_PX", "10x20")], Some(&hidpi));
         assert_eq!(pinned.cell_px, (10, 20));
-        // Junk and zeroes fall through to the heuristic.
+        // Junk and zeroes fall through.
         let junk = caps_with_tmux(&[("TMUX", "x"), ("AIVO_CELL_PX", "10")], Some(&hidpi));
-        assert_eq!(junk.cell_px, (8, 16));
+        assert_eq!(junk.cell_px, (17, 32));
         let zero = caps_with_tmux(&[("TMUX", "x"), ("AIVO_CELL_PX", "0x0")], Some(&hidpi));
-        assert_eq!(zero.cell_px, (8, 16));
+        assert_eq!(zero.cell_px, (17, 32));
         // Applies without tmux info too (AIVO_PREVIEW=sixel outside tmux).
         let forced = caps_with(&[("AIVO_PREVIEW", "sixel"), ("AIVO_CELL_PX", "6x12")]);
         assert_eq!(forced.cell_px, (6, 12));

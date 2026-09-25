@@ -1473,6 +1473,7 @@ fn test_inline_image_flush_diffs_placements() {
         y: 5,
         cols: 10,
         rows: 4,
+        grid_rows: 4,
     };
 
     // First flush transmits then places.
@@ -1659,6 +1660,7 @@ fn test_inline_image_flush_virtual_mode_is_scroll_free() {
         y: 0,
         cols: 20,
         rows: 8,
+        grid_rows: 8,
     };
 
     // First sight: transmit + virtual placement, tmux-passthrough-wrapped.
@@ -1684,6 +1686,7 @@ fn test_inline_image_flush_virtual_mode_is_scroll_free() {
     app.inline_images.desired = vec![PlacedImage {
         cols: 12,
         rows: 5,
+        grid_rows: 5,
         ..want
     }];
     let mut out = Vec::new();

@@ -491,6 +491,7 @@ impl CodeTuiApp {
             },
             cols,
             rows,
+            grid_rows: rows,
         });
     }
 }

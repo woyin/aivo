@@ -65,6 +65,7 @@ pub(super) struct PlacedImage {
     pub(super) y: u16,
     pub(super) cols: u16,
     pub(super) rows: u16,
+    pub(super) grid_rows: u16,
 }
 
 #[derive(Default)]
@@ -81,9 +82,9 @@ pub(super) struct InlineImageState {
     /// grid sent with them (so a size change re-creates the placement).
     pub(super) transmitted: HashMap<u64, (u16, u16)>,
     pub(super) transmit_order: VecDeque<u64>,
-    /// Sixel mode: encoded image per (key, cols, rows) — re-emitted on every
-    /// placement change, so encoding once matters.
-    pub(super) sixel_cache: HashMap<(u64, u16, u16), Arc<String>>,
+    /// Sixel mode: encoded per (key, cols, grid_rows, shown rows), re-emitted
+    /// on every placement change.
+    pub(super) sixel_cache: HashMap<(u64, u16, u16, u16), Arc<String>>,
     /// Classic mode only: placements live on the terminal after the last flush.
     pub(super) placed: Vec<PlacedImage>,
     /// What this frame's render wants on screen; virtual mode uses it purely
@@ -110,6 +111,15 @@ impl PlacedImage {
 /// (or after a scroll) gets distinct, reproducible placements.
 fn placement_id(p: &PlacedImage) -> u32 {
     u32::from(p.y) + 1
+}
+
+fn write_restoring_cursor(out: &mut impl std::io::Write, seq: &str) {
+    if seq.is_empty() {
+        return;
+    }
+    let _ = out.write_all(b"\x1b7");
+    let _ = out.write_all(seq.as_bytes());
+    let _ = out.write_all(b"\x1b8");
 }
 
 /// `DefaultHasher` over a domain tag plus caller-fed fields.
@@ -1241,23 +1251,33 @@ impl CodeTuiApp {
         true
     }
 
-    /// Sixel bytes for `key` at the given cell grid, encoded once and cached.
-    fn sixel_for(&mut self, key: u64, cols: u16, rows: u16) -> Option<Arc<String>> {
-        if let Some(data) = self.inline_images.sixel_cache.get(&(key, cols, rows)) {
+    fn sixel_for(
+        &mut self,
+        key: u64,
+        cols: u16,
+        grid_rows: u16,
+        shown: u16,
+    ) -> Option<Arc<String>> {
+        let cache_key = (key, cols, grid_rows, shown);
+        if let Some(data) = self.inline_images.sixel_cache.get(&cache_key) {
             return Some(Arc::clone(data));
         }
         let preview = self.ready_preview(key)?;
         let thumb = preview.thumb.as_ref()?;
         let (cell_w, cell_h) = self.inline_images.caps.cell_px;
         let px_w = u32::from(cols) * u32::from(cell_w);
-        let px_h = u32::from(rows) * u32::from(cell_h);
-        let rgb = crate::services::image_optimize::resample_rgb_exact(
+        let px_h = u32::from(grid_rows) * u32::from(cell_h);
+        let mut rgb = crate::services::image_optimize::resample_rgb_exact(
             &thumb.rgb, thumb.w, thumb.h, px_w, px_h,
         );
-        let data = Arc::new(terminal_graphics::sixel_encode(&rgb, px_w, px_h));
+        // tmux rounds a sixel's height up to 6-px bands — unaligned rasters spill a row.
+        let shown_h = u32::from(shown.min(grid_rows)) * u32::from(cell_h);
+        let shown_h = (shown_h / 6 * 6).max(shown_h.min(6));
+        rgb.truncate((px_w * shown_h * 3) as usize);
+        let data = Arc::new(terminal_graphics::sixel_encode(&rgb, px_w, shown_h));
         self.inline_images
             .sixel_cache
-            .insert((key, cols, rows), Arc::clone(&data));
+            .insert(cache_key, Arc::clone(&data));
         Some(data)
     }
 
@@ -1285,13 +1305,13 @@ impl CodeTuiApp {
                 if !self.ensure_transmitted(&mut seq, want.key, &desired, tmux) {
                     continue;
                 }
-                let grid = (want.cols, want.rows);
+                let grid = (want.cols, want.grid_rows);
                 if self.inline_images.transmitted.get(&want.key) != Some(&grid) {
                     terminal_graphics::create_virtual_placement(
                         &mut seq,
                         image_id(want.key),
                         want.cols,
-                        want.rows,
+                        want.grid_rows,
                         tmux,
                     );
                     self.inline_images.transmitted.insert(want.key, grid);
@@ -1318,6 +1338,10 @@ impl CodeTuiApp {
                 if !self.ensure_transmitted(&mut seq, want.key, &desired, tmux) {
                     continue;
                 }
+                let src_h = (want.rows < want.grid_rows)
+                    .then(|| self.ready_preview(want.key))
+                    .flatten()
+                    .map(|p| (p.px_h * u32::from(want.rows) / u32::from(want.grid_rows)).max(1));
                 terminal_graphics::place(
                     &mut seq,
                     image_id(want.key),
@@ -1326,14 +1350,19 @@ impl CodeTuiApp {
                     want.y,
                     want.cols,
                     want.rows,
+                    src_h,
                     tmux,
                 );
                 new_placed.push(*want);
             }
             self.inline_images.placed = new_placed;
         }
-        if !seq.is_empty() {
-            let _ = out.write_all(seq.as_bytes());
+        if self.inline_images.caps.virtual_placement() {
+            if !seq.is_empty() {
+                let _ = out.write_all(seq.as_bytes());
+            }
+        } else {
+            write_restoring_cursor(out, &seq);
         }
         false
     }
@@ -1369,16 +1398,14 @@ impl CodeTuiApp {
                 new_placed.push(*want);
                 continue;
             }
-            let Some(data) = self.sixel_for(want.key, want.cols, want.rows) else {
+            let Some(data) = self.sixel_for(want.key, want.cols, want.grid_rows, want.rows) else {
                 continue;
             };
             terminal_graphics::sixel_place(&mut seq, want.x, want.y, &data);
             new_placed.push(*want);
         }
         self.inline_images.placed = new_placed;
-        if !seq.is_empty() {
-            let _ = out.write_all(seq.as_bytes());
-        }
+        write_restoring_cursor(out, &seq);
         false
     }
 
@@ -1541,6 +1568,7 @@ impl CodeTuiApp {
                     y,
                     cols,
                     rows,
+                    grid_rows: anchor.rows,
                 });
             }
         }
