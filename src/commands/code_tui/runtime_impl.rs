@@ -486,7 +486,7 @@ impl CodeTuiApp {
     /// Stash a message typed mid-turn: an engine run steers it, anything else
     /// queues for turn end.
     fn queue_message(&mut self, input: String) {
-        if input.trim().is_empty() {
+        if input.trim().is_empty() && self.draft_attachments.is_empty() {
             return;
         }
         // Validate while the draft is still editable.
@@ -496,17 +496,17 @@ impl CodeTuiApp {
         }
         self.record_draft_history(&input);
         // Serve up + not `/compact` (which runs no batches) = a steerable run.
-        if self.agent_serve.is_some() && self.compact_before.is_none() {
+        if self.agent_serve.is_some() && self.compact_before.is_none() && !input.trim().is_empty() {
             self.steering_queue
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .push(input);
-            self.notice = Some((
-                MUTED(),
-                "Queued — the agent picks it up after the current tool step".to_string(),
-            ));
+            self.notice = Some((MUTED(), self.steered_notice()));
         } else {
-            self.queued_messages.push(input);
+            self.queued_messages.push(QueuedMessage {
+                text: input,
+                attachments: std::mem::take(&mut self.draft_attachments),
+            });
             self.notice = Some((MUTED(), self.queued_notice()));
         }
         self.draft.clear();
@@ -522,6 +522,16 @@ impl CodeTuiApp {
             0 | 1 => "Queued — sends when the current turn finishes".to_string(),
             n => format!("Queued ({n} waiting) — sent one per turn, in order"),
         }
+    }
+
+    fn steered_notice(&self) -> String {
+        const BASE: &str = "Queued — the agent picks it up after the current tool step";
+        let held = self.draft_attachments.len();
+        if held == 0 {
+            return BASE.to_string();
+        }
+        let plural = if held == 1 { "" } else { "s" };
+        format!("{BASE}; {held} staged attachment{plural} not sent")
     }
 
     pub(super) fn clear_steering_queue(&mut self) {
@@ -540,7 +550,8 @@ impl CodeTuiApp {
             .drain(..)
             .collect();
         for (i, message) in drained.into_iter().enumerate() {
-            self.queued_messages.insert(i, message);
+            self.queued_messages
+                .insert(i, QueuedMessage::text_only(message));
         }
     }
 
@@ -556,16 +567,29 @@ impl CodeTuiApp {
         // The dispatch would wipe a mid-turn draft and send its pasted images.
         let draft = std::mem::take(&mut self.draft);
         let cursor = self.cursor;
-        let attachments = std::mem::take(&mut self.draft_attachments);
-        let sent = if skill_invocation_label(&queued).is_some() {
-            self.dispatch_user_message_shown(queued, None, None, Vec::new())
+        let staged = std::mem::replace(&mut self.draft_attachments, queued.attachments);
+        let turns = self.history.len();
+        let text = queued.text.clone();
+        let sent = if skill_invocation_label(&queued.text).is_some() {
+            self.dispatch_user_message_shown(queued.text, None, None, Vec::new())
                 .await
         } else {
-            self.dispatch_user_message(queued, None).await
+            self.dispatch_user_message(queued.text, None).await
         };
+        let unsent = std::mem::replace(&mut self.draft_attachments, staged);
         self.draft = draft;
         self.cursor = cursor;
-        self.draft_attachments = attachments;
+        // Refused before reaching the transcript: recall it rather than drop it.
+        if self.history.len() == turns {
+            self.queued_messages.insert(
+                0,
+                QueuedMessage {
+                    text,
+                    attachments: unsent,
+                },
+            );
+            self.recall_queued_into_draft();
+        }
         self.sync_command_menu_state();
         sent
     }
@@ -2247,7 +2271,10 @@ impl CodeTuiApp {
             // A turn is in flight — queue the expanded prompt; record the typed
             // form so up-arrow recalls the command.
             self.record_draft_history(&typed);
-            self.queued_messages.push(content);
+            self.queued_messages.push(QueuedMessage {
+                text: content,
+                attachments: std::mem::take(&mut self.draft_attachments),
+            });
             self.notice = Some((MUTED(), self.queued_notice()));
         } else {
             self.send_skill_message(content, typed).await?;
@@ -2284,7 +2311,10 @@ impl CodeTuiApp {
         };
         if self.sending {
             self.record_draft_history(&typed);
-            self.queued_messages.push(content);
+            self.queued_messages.push(QueuedMessage {
+                text: content,
+                attachments: std::mem::take(&mut self.draft_attachments),
+            });
             self.notice = Some((MUTED(), self.queued_notice()));
         } else {
             self.send_skill_message(content, typed).await?;

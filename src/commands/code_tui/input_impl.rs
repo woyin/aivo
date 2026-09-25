@@ -63,7 +63,7 @@ impl CodeTuiApp {
         self.draft_attachments = keep.into_iter().map(|(_, att)| att).collect();
     }
 
-    fn replace_in_draft(&mut self, old: &str, new: &str) {
+    pub(super) fn replace_in_draft(&mut self, old: &str, new: &str) {
         let Some(start) = self.draft.find(old) else {
             return;
         };

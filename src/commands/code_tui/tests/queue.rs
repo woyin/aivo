@@ -5,8 +5,8 @@ use super::helpers::*;
 fn test_discard_queued_input_counts_and_clears() {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let mut app = make_test_app(tx, rx);
-    app.queued_messages.push("a".to_string());
-    app.queued_messages.push("b".to_string());
+    app.queued_messages.push(queued("a"));
+    app.queued_messages.push(queued("b"));
     app.steering_queue.lock().unwrap().push("steer".to_string());
     assert_eq!(app.discard_queued_input(), 3);
     assert!(app.queued_messages.is_empty());
@@ -23,8 +23,9 @@ async fn test_drained_queued_message_not_recorded_in_draft_history() {
     // Non-agent key (OAuth) keeps the send on the lightweight plain-chat path.
     app.key.base_url = "claude-oauth".to_string();
 
-    app.queued_messages
-        .push("Use the \"x\" skill. Follow these instructions:\n\n…pages…".to_string());
+    app.queued_messages.push(queued(
+        "Use the \"x\" skill. Follow these instructions:\n\n…pages…",
+    ));
     app.drain_queued_message().await.unwrap();
 
     assert!(
@@ -62,7 +63,7 @@ async fn test_mid_turn_message_steers_then_reclaims_or_commits() {
     }
 
     app.reclaim_unsent_steering();
-    assert_eq!(app.queued_messages, vec!["actually use tabs".to_string()]);
+    assert_eq!(queued_texts(&app), vec!["actually use tabs"]);
     assert!(app.steering_queue.lock().unwrap().is_empty());
 
     app.apply_agent_steered("also add a test".to_string());
@@ -91,8 +92,8 @@ async fn test_queued_messages_fifo_no_clobber() {
     app.submit_draft().await.unwrap();
 
     assert_eq!(
-        app.queued_messages,
-        vec!["first".to_string(), "second".to_string()],
+        queued_texts(&app),
+        vec!["first", "second"],
         "both messages are queued in submit order"
     );
     let (_lvl, notice) = app.notice.clone().expect("a queued notice");
@@ -195,7 +196,7 @@ async fn test_interrupt_drains_queued_messages() {
     });
     app.pending_response = "partial".to_string();
     app.sending = true;
-    app.queued_messages = vec!["fix login".to_string(), "run tests".to_string()];
+    app.queued_messages = vec![queued("fix login"), queued("run tests")];
 
     app.interrupt_inflight_request().await.unwrap();
 
@@ -209,7 +210,7 @@ async fn test_interrupt_drains_queued_messages() {
             .last()
             .is_some_and(|m| m.role == "user" && m.content == "fix login")
     );
-    assert_eq!(app.queued_messages, vec!["run tests".to_string()]);
+    assert_eq!(queued_texts(&app), vec!["run tests"]);
     assert!(app.sending);
 }
 
@@ -264,7 +265,7 @@ async fn test_interrupt_empty_unsends_then_drains_queue() {
         attachments: Vec::new(),
     });
     app.sending = true;
-    app.queued_messages = vec!["do this instead".to_string()];
+    app.queued_messages = vec![queued("do this instead")];
 
     app.interrupt_inflight_request().await.unwrap();
 
@@ -283,7 +284,7 @@ async fn test_up_recalls_whole_queue_into_composer() {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let mut app = make_test_app(tx, rx);
     app.sending = true;
-    app.queued_messages = vec!["fix login".to_string(), "run tests".to_string()];
+    app.queued_messages = vec![queued("fix login"), queued("run tests")];
 
     app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE))
         .await
@@ -298,7 +299,7 @@ async fn test_ctrl_p_recalls_the_queue_like_up() {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let mut app = make_test_app(tx, rx);
     app.sending = true;
-    app.queued_messages = vec!["fix login".to_string(), "run tests".to_string()];
+    app.queued_messages = vec![queued("fix login"), queued("run tests")];
 
     app.handle_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL))
         .await
@@ -326,7 +327,7 @@ async fn test_up_recalls_all_three_queues_in_delivery_order() {
         .unwrap()
         .extend(["steer it".to_string()]);
     app.queued_commands.push(SlashCommand::Rewind);
-    app.queued_messages = vec!["m1".to_string(), "m2".to_string()];
+    app.queued_messages = vec![queued("m1"), queued("m2")];
 
     app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE))
         .await
@@ -342,7 +343,7 @@ async fn test_up_keeps_the_typed_draft_below_the_recall() {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let mut app = make_test_app(tx, rx);
     app.sending = true;
-    app.queued_messages = vec!["fix login".to_string()];
+    app.queued_messages = vec![queued("fix login")];
     app.draft = "typing".to_string();
     app.cursor = 3;
 
@@ -357,7 +358,7 @@ async fn test_up_keeps_the_typed_draft_below_the_recall() {
 async fn test_up_below_the_top_row_leaves_the_queue_alone() {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let mut app = make_test_app(tx, rx);
-    app.queued_messages = vec!["queued".to_string()];
+    app.queued_messages = vec![queued("queued")];
     app.draft = "one\ntwo".to_string();
     app.cursor = app.draft.len();
 
@@ -365,7 +366,7 @@ async fn test_up_below_the_top_row_leaves_the_queue_alone() {
         .await
         .unwrap();
     assert_eq!(app.draft, "one\ntwo", "the draft is untouched");
-    assert_eq!(app.queued_messages, vec!["queued".to_string()]);
+    assert_eq!(queued_texts(&app), vec!["queued"]);
     assert_eq!(app.cursor, 3, "the cursor moved to the first line");
 
     // Same guard mid-turn, where bare ↑ belongs to the transcript scroller.
@@ -375,7 +376,7 @@ async fn test_up_below_the_top_row_leaves_the_queue_alone() {
         .await
         .unwrap();
     assert_eq!(app.draft, "one\ntwo");
-    assert_eq!(app.queued_messages, vec!["queued".to_string()]);
+    assert_eq!(queued_texts(&app), vec!["queued"]);
 }
 
 #[tokio::test]
@@ -383,7 +384,7 @@ async fn test_up_falls_through_to_history_once_the_queue_is_empty() {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let mut app = make_test_app(tx, rx);
     app.draft_history = vec!["an older draft".to_string()];
-    app.queued_messages = vec!["queued".to_string()];
+    app.queued_messages = vec![queued("queued")];
 
     app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE))
         .await
@@ -402,7 +403,7 @@ async fn test_recall_clears_the_queue_tip_but_not_other_notices() {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let mut app = make_test_app(tx, rx);
     app.sending = true;
-    app.queued_messages = vec!["fix login".to_string()];
+    app.queued_messages = vec![queued("fix login")];
     app.notice = Some((
         MUTED(),
         "Queued — sends when the current turn finishes".to_string(),
@@ -413,7 +414,7 @@ async fn test_recall_clears_the_queue_tip_but_not_other_notices() {
         .unwrap();
     assert_eq!(app.notice, None, "queue tip clears with the recall");
 
-    app.queued_messages = vec!["fix login".to_string()];
+    app.queued_messages = vec![queued("fix login")];
     app.draft.clear();
     app.cursor = 0;
     app.notice = Some((ERROR(), "Copy failed: nope".to_string()));
@@ -431,7 +432,7 @@ async fn test_up_navigates_the_command_menu_over_the_queue() {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let mut app = make_test_app(tx, rx);
     app.sending = true;
-    app.queued_messages = vec!["queued".to_string()];
+    app.queued_messages = vec![queued("queued")];
     app.draft = "/".to_string();
     app.cursor = app.draft.len();
     app.sync_command_menu_state();
@@ -446,7 +447,7 @@ async fn test_up_navigates_the_command_menu_over_the_queue() {
         app.handle_key(prev).await.unwrap();
         assert_eq!(app.command_menu.selected, 0);
         assert_eq!(app.draft, "/", "the queue stayed out of it");
-        assert_eq!(app.queued_messages, vec!["queued".to_string()]);
+        assert_eq!(queued_texts(&app), vec!["queued"]);
     }
 }
 
@@ -483,17 +484,16 @@ fn test_queued_panel_rows_render_with_cap_and_more() {
         .unwrap()
         .push("steer msg".to_string());
     app.queued_commands.push(SlashCommand::Rewind);
-    app.queued_messages.push("plain msg".to_string());
+    app.queued_messages.push(queued("plain msg"));
     let (screen, _rows) = render_full_screen(&mut app, 70, 20);
     assert!(screen.contains("» steer msg"), "steering row:\n{screen}");
     assert!(screen.contains("/rewind"), "command row:\n{screen}");
     assert!(screen.contains("· plain msg"), "message row:\n{screen}");
 
     // An expanded skill body renders as its compact /name form.
-    app.queued_messages.push(
-        "Use the \"my-skill\" skill. Follow these instructions:\n\nLong body.\n\nInput: hello"
-            .to_string(),
-    );
+    app.queued_messages.push(queued(
+        "Use the \"my-skill\" skill. Follow these instructions:\n\nLong body.\n\nInput: hello",
+    ));
     let (screen, _rows) = render_full_screen(&mut app, 70, 20);
     assert!(screen.contains("/my-skill hello"), "{screen}");
     assert!(!screen.contains("Follow these instructions"), "{screen}");
@@ -501,7 +501,7 @@ fn test_queued_panel_rows_render_with_cap_and_more() {
     // Overflow: 7 messages cap at QUEUE_PANEL_MAX_ROWS + an indicator.
     app.steering_queue.lock().unwrap().clear();
     app.queued_commands.clear();
-    app.queued_messages = (1..=7).map(|i| format!("q{i}")).collect();
+    app.queued_messages = (1..=7).map(|i| queued(&format!("q{i}"))).collect();
     let (screen, _rows) = render_full_screen(&mut app, 70, 20);
     assert!(
         screen.contains("· q1") && screen.contains("· q5"),
@@ -511,4 +511,272 @@ fn test_queued_panel_rows_render_with_cap_and_more() {
     assert!(screen.contains("… +2 more"), "{screen}");
     assert!(screen.contains(QUEUE_RECALL_HINT.trim()), "{screen}");
     assert!(!screen.contains("▸ ·"), "no selection marker:\n{screen}");
+}
+
+fn staged_image() -> MessageAttachment {
+    named_image("shot.png")
+}
+
+fn named_image(name: &str) -> MessageAttachment {
+    MessageAttachment {
+        name: name.to_string(),
+        mime_type: "image/png".to_string(),
+        storage: AttachmentStorage::Inline {
+            data: "iVBOR".to_string(),
+        },
+    }
+}
+
+#[tokio::test]
+async fn test_queued_message_carries_its_staged_image() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    pin_to_plain_chat(&mut app);
+    app.model_image_input = Some(true);
+    app.sending = true;
+
+    app.draft_attachments.push(staged_image());
+    app.draft = "[image #1] what is this".to_string();
+    app.cursor = app.draft.len();
+    app.submit_draft().await.unwrap();
+
+    assert_eq!(queued_texts(&app), vec!["[image #1] what is this"]);
+    assert_eq!(
+        app.queued_messages[0].attachments.len(),
+        1,
+        "the image is queued with its own message"
+    );
+    assert!(
+        app.draft_attachments.is_empty(),
+        "the image moved into the queue"
+    );
+
+    app.sending = false;
+    app.drain_queued_message().await.unwrap();
+
+    let last = app.history.last().expect("a user turn");
+    assert_eq!(last.content, "[image #1] what is this");
+    assert_eq!(
+        last.attachments
+            .iter()
+            .map(|a| a.name.as_str())
+            .collect::<Vec<_>>(),
+        ["shot.png"],
+        "the queued turn carries the screenshot"
+    );
+}
+
+#[tokio::test]
+async fn test_drain_leaves_the_composing_draft_attachments_alone() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    pin_to_plain_chat(&mut app);
+    app.model_image_input = Some(true);
+    app.sending = true;
+
+    app.draft = "first".to_string();
+    app.cursor = app.draft.len();
+    app.submit_draft().await.unwrap();
+    assert_eq!(queued_texts(&app), vec!["first"]);
+
+    app.draft_attachments.push(staged_image());
+    app.sending = false;
+    app.drain_queued_message().await.unwrap();
+
+    let last = app.history.last().expect("a user turn");
+    assert_eq!(last.content, "first");
+    assert!(
+        last.attachments.is_empty(),
+        "the queued text-only message must not pick up a later staged image"
+    );
+    assert_eq!(
+        app.draft_attachments.len(),
+        1,
+        "the composer's own staged image is untouched"
+    );
+}
+
+#[tokio::test]
+async fn test_steered_message_keeps_its_image_and_says_so() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.sending = true;
+    app.agent_serve = Some((
+        tokio::spawn(async { Ok(()) }),
+        std::sync::Arc::new(tokio::sync::Notify::new()),
+    ));
+
+    app.draft_attachments.push(staged_image());
+    app.draft = "[image #1] use tabs".to_string();
+    app.cursor = app.draft.len();
+    app.submit_draft().await.unwrap();
+
+    {
+        let steering = app.steering_queue.lock().unwrap();
+        assert_eq!(steering.as_slice(), ["[image #1] use tabs".to_string()]);
+    }
+    assert!(
+        app.queued_messages.is_empty(),
+        "an engine turn steers, it doesn't queue"
+    );
+    assert_eq!(app.draft_attachments.len(), 1, "the image stays staged");
+    assert!(
+        notice_text(&app).contains("1 staged attachment not sent"),
+        "notice: {}",
+        notice_text(&app)
+    );
+}
+
+#[tokio::test]
+async fn test_attachment_only_follow_up_queues_mid_turn() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.sending = true;
+    app.draft_attachments.push(staged_image());
+
+    app.submit_draft().await.unwrap();
+
+    assert_eq!(queued_texts(&app), vec![""]);
+    assert_eq!(app.queued_messages[0].attachments.len(), 1);
+    assert!(app.draft_attachments.is_empty(), "the image is queued");
+
+    let (tx2, rx2) = tokio::sync::mpsc::unbounded_channel();
+    let mut steered = make_test_app(tx2, rx2);
+    steered.sending = true;
+    steered.agent_serve = Some((
+        tokio::spawn(async { Ok(()) }),
+        std::sync::Arc::new(tokio::sync::Notify::new()),
+    ));
+    steered.draft_attachments.push(staged_image());
+    steered.submit_draft().await.unwrap();
+    assert!(steered.steering_queue.lock().unwrap().is_empty());
+    assert_eq!(steered.queued_messages[0].attachments.len(), 1);
+
+    let (screen, _rows) = render_full_screen(&mut steered, 70, 20);
+    assert!(screen.contains("[image] shot.png"), "{screen}");
+
+    steered
+        .handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE))
+        .await
+        .unwrap();
+    assert!(steered.draft.is_empty());
+    assert_eq!(steered.draft_attachments.len(), 1, "the image is recalled");
+}
+
+#[tokio::test]
+async fn test_recall_restores_queued_images() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.sending = true;
+    app.draft_attachments.push(staged_image());
+    app.draft = "[image #1] what is this".to_string();
+    app.cursor = app.draft.len();
+    app.submit_draft().await.unwrap();
+    assert_eq!(app.draft_attachments.len(), 0);
+
+    app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE))
+        .await
+        .unwrap();
+
+    assert_eq!(app.draft, "[image #1] what is this");
+    assert_eq!(
+        app.draft_attachments
+            .iter()
+            .map(|a| a.name.as_str())
+            .collect::<Vec<_>>(),
+        ["shot.png"],
+        "the recalled image is staged again"
+    );
+    assert_eq!(
+        app.attachment_tag_spans(),
+        vec![Some((0, "[image #1]".len()))],
+        "the tag binds to the restored image"
+    );
+}
+
+fn staged_names(app: &CodeTuiApp) -> Vec<&str> {
+    app.draft_attachments
+        .iter()
+        .map(|a| a.name.as_str())
+        .collect()
+}
+
+#[tokio::test]
+async fn test_recall_renumbers_tags_across_queued_messages() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.sending = true;
+    app.queued_messages = vec![
+        QueuedMessage {
+            text: "[image #1] a".to_string(),
+            attachments: vec![named_image("a.png")],
+        },
+        QueuedMessage {
+            text: "[image #1] b [image #2]".to_string(),
+            attachments: vec![named_image("b.png"), named_image("c.png")],
+        },
+    ];
+
+    assert!(app.recall_queued_into_draft());
+
+    assert_eq!(app.draft, "[image #1] a\n[image #2] b [image #3]");
+    assert_eq!(staged_names(&app), ["a.png", "b.png", "c.png"]);
+    assert!(app.attachment_tag_spans().iter().all(Option::is_some));
+}
+
+#[tokio::test]
+async fn test_recall_shifts_the_drafts_own_tags() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.sending = true;
+    app.queued_messages = vec![QueuedMessage {
+        text: "[image #1] queued".to_string(),
+        attachments: vec![named_image("queued.png")],
+    }];
+    app.draft_attachments.push(named_image("mine.png"));
+    app.draft = "[image #1] mine".to_string();
+    app.cursor = app.draft.len();
+
+    assert!(app.recall_queued_into_draft());
+
+    assert_eq!(app.draft, "[image #1] queued\n[image #2] mine");
+    assert_eq!(
+        app.cursor,
+        app.draft.len(),
+        "the cursor stays at the draft's end"
+    );
+    assert_eq!(staged_names(&app), ["queued.png", "mine.png"]);
+    assert_eq!(
+        app.attachment_tag_spans(),
+        vec![Some((0, 10)), Some((18, 28))]
+    );
+}
+
+#[tokio::test]
+async fn test_refused_queued_message_returns_to_the_composer() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    pin_dispatch_refusal(&mut app);
+    let image = app.draft_attachments.remove(0);
+    app.queued_messages = vec![
+        QueuedMessage {
+            text: "[image #1] what is this".to_string(),
+            attachments: vec![image],
+        },
+        queued("then this"),
+    ];
+    app.draft = "typing".to_string();
+    app.cursor = app.draft.len();
+
+    app.drain_queued_message().await.unwrap();
+
+    assert!(!app.sending, "nothing went out");
+    assert!(app.queued_messages.is_empty());
+    assert_eq!(app.draft, "[image #1] what is this\nthen this\ntyping");
+    assert_eq!(staged_names(&app), ["shot.png"]);
+    assert!(
+        notice_text(&app).contains("can't read images"),
+        "{}",
+        notice_text(&app)
+    );
 }

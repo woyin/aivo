@@ -24,8 +24,17 @@ impl CodeTuiApp {
                 command_recall_text(command),
             ));
         }
-        for text in &self.queued_messages {
-            rows.push(queued_row(QueueSegment::Message, message_recall_text(text)));
+        for message in &self.queued_messages {
+            let recall = message_recall_text(&message.text);
+            rows.push(if recall.trim().is_empty() {
+                QueuedRow {
+                    segment: QueueSegment::Message,
+                    display: attachment_summary(&message.attachments),
+                    recall,
+                }
+            } else {
+                queued_row(QueueSegment::Message, recall)
+            });
         }
         rows
     }
@@ -37,15 +46,40 @@ impl CodeTuiApp {
         if rows.is_empty() {
             return false;
         }
-        let recalled = rows
+        let mut recalls: Vec<String> = rows.into_iter().map(|row| row.recall).collect();
+        // One tag sequence over recalled messages first, the draft below after.
+        let messages = std::mem::take(&mut self.queued_messages);
+        let first_message = recalls.len() - messages.len();
+        let mut attachments = Vec::new();
+        for (recall, message) in recalls[first_message..].iter_mut().zip(messages) {
+            *recall = shift_attachment_tags(recall, &message.attachments, attachments.len());
+            attachments.extend(message.attachments);
+        }
+        let shift = attachments.len();
+        if shift > 0 {
+            let draft_attachments = std::mem::take(&mut self.draft_attachments);
+            // Descending, or a rewritten tag collides with the next one.
+            for (i, att) in draft_attachments.iter().enumerate().rev() {
+                self.replace_in_draft(
+                    &attachment_tag(att, i + 1),
+                    &attachment_tag(att, shift + i + 1),
+                );
+            }
+            attachments.extend(draft_attachments);
+            self.draft_attachments = attachments;
+        }
+        let recalled = recalls
             .iter()
-            .map(|row| row.recall.as_str())
+            .map(String::as_str)
+            .filter(|recall| !recall.trim().is_empty())
             .collect::<Vec<_>>()
             .join("\n");
-        self.queued_messages.clear();
         self.queued_commands.clear();
         self.clear_steering_queue();
         self.leave_history_navigation();
+        if recalled.is_empty() {
+            return true;
+        }
         if self.draft.is_empty() {
             self.cursor = recalled.len();
             self.draft = recalled;
@@ -61,6 +95,31 @@ impl CodeTuiApp {
 /// else the raw text.
 fn message_recall_text(text: &str) -> String {
     skill_invocation_label(text).unwrap_or_else(|| text.to_string())
+}
+
+fn shift_attachment_tags(text: &str, attachments: &[MessageAttachment], offset: usize) -> String {
+    let mut text = text.to_string();
+    if offset == 0 {
+        return text;
+    }
+    for (i, att) in attachments.iter().enumerate().rev() {
+        let old = attachment_tag(att, i + 1);
+        if let Some(start) = text.find(&old) {
+            text.replace_range(
+                start..start + old.len(),
+                &attachment_tag(att, offset + i + 1),
+            );
+        }
+    }
+    text
+}
+
+fn attachment_summary(attachments: &[MessageAttachment]) -> String {
+    attachments
+        .iter()
+        .map(|a| format!("[{}] {}", attachment_kind_label(a), a.name))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn queued_row(segment: QueueSegment, recall: String) -> QueuedRow {

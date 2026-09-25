@@ -52,6 +52,14 @@ pub(super) fn theme_lock() -> std::sync::MutexGuard<'static, ()> {
     LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
+pub(super) fn queued(text: &str) -> QueuedMessage {
+    QueuedMessage::text_only(text)
+}
+
+pub(super) fn queued_texts(app: &CodeTuiApp) -> Vec<String> {
+    app.queued_messages.iter().map(|m| m.text.clone()).collect()
+}
+
 /// Make dispatch decline before any spawn, keeping tests off the agent engine.
 pub(super) fn pin_dispatch_refusal(app: &mut CodeTuiApp) {
     app.draft_attachments.push(MessageAttachment {

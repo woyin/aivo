@@ -2087,6 +2087,21 @@ pub(super) struct PendingSubmission {
     pub(super) attachments: Vec<MessageAttachment>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct QueuedMessage {
+    pub(super) text: String,
+    pub(super) attachments: Vec<MessageAttachment>,
+}
+
+impl QueuedMessage {
+    pub(super) fn text_only(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            attachments: Vec::new(),
+        }
+    }
+}
+
 #[derive(Clone, Default)]
 pub(super) struct CommandMenuState {
     pub(super) kind: Option<MenuKind>,
@@ -3650,7 +3665,7 @@ pub(super) struct CodeTuiApp {
     /// refreshed on model/key change. Empty = the model exposes none.
     pub(super) model_reasoning_efforts: Vec<String>,
     /// Mid-turn follow-ups; sent one per turn when the current turn ends.
-    pub(super) queued_messages: Vec<String>,
+    pub(super) queued_messages: Vec<QueuedMessage>,
     /// Session-mail messages seen waiting while a turn ran; the "arrives when
     /// this turn ends" notice fires only when this count grows.
     pub(super) mail_waiting_seen: usize,

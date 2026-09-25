@@ -852,8 +852,8 @@ fn test_status_tail_counts_queued_input() {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let mut app = make_test_app(tx, rx);
     app.sending = true;
-    app.queued_messages.push("follow-up one".to_string());
-    app.queued_messages.push("follow-up two".to_string());
+    app.queued_messages.push(queued("follow-up one"));
+    app.queued_messages.push(queued("follow-up two"));
     let plain = app.build_transcript().plain_lines().join("\n");
     assert!(plain.contains("2 queued"), "queued chip missing: {plain:?}");
 }
