@@ -1,5 +1,17 @@
 # Changelog
 
+## v0.49.10
+
+Codex launches stay isolated from the shared app-server daemon. The code TUI
+also sizes sixel previews correctly across tmux and scaled terminals, preserves
+images attached to queued follow-ups, and keeps a draft when the external
+editor fails.
+
+- fix(codex): keep launches off codex's shared app-server daemon (2761963c)
+- fix(code): size sixel previews in tmux and scaling issues (f1330e63)
+- fix(code): send a queued follow-up with the images staged for it (9424a845)
+- fix(code): keep the draft when the external editor fails (e4a07c45)
+
 ## v0.49.9
 
 Sixel image previews in the code TUI are now sized in the terminal's logical
