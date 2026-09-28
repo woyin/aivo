@@ -76,6 +76,7 @@ pub(crate) fn preview_args(
     } else {
         args
     };
+    let args = inject_codex_no_daemon(tool, &args);
     preview_codex_provider_config_args(env, args)
 }
 
@@ -281,6 +282,7 @@ pub(crate) async fn build_runtime_args(
     let args = inject_codex_slot_models(codex_slots, &args, raw_model_upstream);
     let args = inject_codex_model_catalog(codex_model_catalog_path.as_deref(), &args);
     let args = inject_codex_cursor_tui_reasoning(use_responses_router, &args);
+    let args = inject_codex_no_daemon(tool, &args);
 
     Ok(RuntimeArgs {
         args,
@@ -733,6 +735,21 @@ fn inject_codex_reasoning_effort(effort: Option<&str>, args: &[String]) -> Vec<S
     new_args
 }
 
+/// Keeps codex (0.156+) off its shared background server: that server would
+/// outlive this launch, serve other launches with this launch's env/auth, and
+/// under a temp `CODEX_HOME` on macOS its socket path overflows `SUN_LEN`.
+fn inject_codex_no_daemon(tool: AIToolType, args: &[String]) -> Vec<String> {
+    if tool != AIToolType::Codex || args.iter().any(|a| a.contains("daemon_auto_start")) {
+        return args.to_vec();
+    }
+    let mut new_args = vec![
+        "--config".to_string(),
+        "features.daemon_auto_start=false".to_string(),
+    ];
+    new_args.extend_from_slice(args);
+    new_args
+}
+
 /// Prepended so a user-supplied `-c <key>=...` parses later and wins; for
 /// codex-app the pairs ride the global prefix into the wrapper.
 fn inject_codex_slot_models(
@@ -1099,6 +1116,48 @@ mod tests {
         let args = vec!["prompt".to_string()];
         assert_eq!(inject_codex_reasoning_effort(None, &args), args);
         assert_eq!(inject_codex_reasoning_effort(Some(""), &args), args);
+    }
+
+    #[test]
+    fn inject_codex_no_daemon_prepends_feature_off() {
+        let args = vec!["resume".to_string(), "--last".to_string()];
+        assert_eq!(
+            inject_codex_no_daemon(AIToolType::Codex, &args),
+            vec![
+                "--config",
+                "features.daemon_auto_start=false",
+                "resume",
+                "--last"
+            ]
+        );
+    }
+
+    #[test]
+    fn inject_codex_no_daemon_defers_to_user_config() {
+        let args = vec![
+            "-c".to_string(),
+            "features.daemon_auto_start=true".to_string(),
+        ];
+        assert_eq!(inject_codex_no_daemon(AIToolType::Codex, &args), args);
+    }
+
+    #[test]
+    fn inject_codex_no_daemon_skips_codex_app() {
+        let args = vec!["prompt".to_string()];
+        assert_eq!(inject_codex_no_daemon(AIToolType::CodexApp, &args), args);
+    }
+
+    #[test]
+    fn preview_args_disable_codex_daemon() {
+        let args = preview_args(
+            AIToolType::Codex,
+            &[],
+            None,
+            &HashMap::new(),
+            None,
+            &CodexSlotModels::default(),
+        );
+        assert_eq!(args, vec!["--config", "features.daemon_auto_start=false"]);
     }
 
     #[test]
