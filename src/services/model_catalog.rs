@@ -72,10 +72,26 @@ impl ModelInfo {
 }
 
 /// `{"data":[{"id":…}]}`, or `{"models":[{"name":…}]}` (TypeSafe).
-#[derive(Deserialize)]
 struct OpenAIModelsResponse {
-    #[serde(alias = "models")]
     data: Vec<OpenAIModel>,
+}
+
+impl<'de> Deserialize<'de> for OpenAIModelsResponse {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        struct Envelope {
+            #[serde(default)]
+            data: Option<Vec<OpenAIModel>>,
+            #[serde(default)]
+            models: Option<Vec<OpenAIModel>>,
+        }
+        let envelope = Envelope::deserialize(deserializer)?;
+        let data = envelope
+            .data
+            .or(envelope.models)
+            .ok_or_else(|| serde::de::Error::missing_field("data"))?;
+        Ok(Self { data })
+    }
 }
 
 /// Loosely-parsed model entry, adapted to any provider's response shape: every
@@ -1252,6 +1268,39 @@ mod tests {
         let resp: OpenAIModelsResponse =
             serde_json::from_str(r#"{"models":[{"name":"jev-latest"}]}"#).unwrap();
         assert_eq!(resp.data[0].name.as_deref(), Some("jev-latest"));
+    }
+
+    #[test]
+    fn models_response_prefers_data_when_both_envelopes_present() {
+        // Issue #49: `aivo serve` answers with `data` (OpenAI rows) plus
+        // `models` (codex rows without an `id`); the alias form rejected it.
+        let resp: OpenAIModelsResponse = serde_json::from_str(
+            r#"{"object":"list","data":[{"id":"gpt-4o"}],"models":[{"slug":"gpt-4o"}]}"#,
+        )
+        .unwrap();
+        let ids: Vec<String> = resp
+            .data
+            .into_iter()
+            .filter_map(|m| m.into_model_info(1.0))
+            .map(|m| m.id)
+            .collect();
+        assert_eq!(ids, vec!["gpt-4o"]);
+    }
+
+    #[test]
+    fn models_response_round_trips_serve_listing() {
+        let body = crate::services::model_list_response::build_models_response_body_for_owner(
+            &["mock-alpha".to_string(), "mock-beta".to_string()],
+            "aivo",
+        );
+        let resp: OpenAIModelsResponse = serde_json::from_value(body).unwrap();
+        let ids: Vec<String> = resp
+            .data
+            .into_iter()
+            .filter_map(|m| m.into_model_info(1.0))
+            .map(|m| m.id)
+            .collect();
+        assert_eq!(ids, vec!["mock-alpha", "mock-beta"]);
     }
 
     #[test]
