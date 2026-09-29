@@ -6,6 +6,7 @@ use std::collections::{HashMap, VecDeque};
 
 use serde_json::{Value, json};
 
+use crate::services::anthropic_route_pipeline::normalize_for_model;
 use crate::services::bridge_defaults::BRIDGE_DEFAULT_ANTHROPIC_MAX_TOKENS;
 use crate::services::effort::{
     CanonicalEffort, extract_anthropic_effort, gemini_thinking_config, gemini_uses_thinking_level,
@@ -516,6 +517,7 @@ pub fn convert_gemini_to_anthropic_request(body: &Value, model: &str) -> Value {
         }
     }
 
+    normalize_for_model(&mut request);
     request
 }
 

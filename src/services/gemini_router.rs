@@ -38,6 +38,7 @@ pub struct GeminiRouterConfig {
     /// When set, overrides the model name extracted from the URL path (used for Copilot mode
     /// since Gemini model names like `gemini-2.0-flash` are not available on Copilot).
     pub forced_model: Option<String>,
+    pub launch_model: Option<String>,
     /// When Some, use Copilot token auth instead of api_key
     pub copilot_token_manager: Option<Arc<CopilotTokenManager>>,
     /// Whether the provider requires `reasoning_content` on assistant tool-call turns
@@ -203,6 +204,24 @@ async fn handle_router_request(request: String, state: Arc<GeminiRouterState>) -
     response
 }
 
+/// Gemini CLI 0.61+ promotes flash ids to the newest flash on API-key auth;
+/// map a same-tier flash id back to the launch model.
+fn undo_flash_promotion(requested: String, launch: Option<&str>) -> String {
+    let Some(launch) = launch else {
+        return requested;
+    };
+    let tier = |m: &str| {
+        let m = m.rsplit('/').next().unwrap_or(m);
+        m.starts_with("gemini-")
+            .then(|| m.contains("flash-lite"))
+            .filter(|_| m.contains("flash"))
+    };
+    match (tier(&requested), tier(launch)) {
+        (Some(a), Some(b)) if a == b && requested != launch => launch.to_string(),
+        _ => requested,
+    }
+}
+
 async fn handle_request(
     request: &str,
     config: &std::sync::Arc<GeminiRouterConfig>,
@@ -214,7 +233,9 @@ async fn handle_request(
 
     match parse_gemini_path(&path) {
         Some((extracted_model, is_streaming)) => {
-            let model = config.forced_model.clone().unwrap_or(extracted_model);
+            let model = config.forced_model.clone().unwrap_or_else(|| {
+                undo_flash_promotion(extracted_model, config.launch_model.as_deref())
+            });
             let slot = route_cache.resolve(&model);
             let body: Value = serde_json::from_str(http_utils::extract_request_body(request)?)?;
             let tool_schemas = extract_tool_schemas(&body);
@@ -741,6 +762,36 @@ mod tests {
     use super::*;
 
     #[test]
+    fn undo_flash_promotion_restores_same_tier_launch_model() {
+        let undo = |req: &str, launch: Option<&str>| undo_flash_promotion(req.into(), launch);
+        assert_eq!(
+            undo("gemini-3.8-flash", Some("gemini-3.5-flash")),
+            "gemini-3.5-flash"
+        );
+        assert_eq!(
+            undo("gemini-3.8-flash", Some("google/gemini-3-flash")),
+            "google/gemini-3-flash"
+        );
+        assert_eq!(
+            undo("gemini-3.5-flash-lite", Some("gemini-3.1-flash-lite")),
+            "gemini-3.1-flash-lite"
+        );
+        assert_eq!(
+            undo("gemini-3.5-flash-lite", Some("gemini-3.5-flash")),
+            "gemini-3.5-flash-lite"
+        );
+        assert_eq!(
+            undo("gemini-3.8-flash", Some("gpt-5.5")),
+            "gemini-3.8-flash"
+        );
+        assert_eq!(
+            undo("gemini-3-pro-preview", Some("gemini-3.5-flash")),
+            "gemini-3-pro-preview"
+        );
+        assert_eq!(undo("gemini-3.8-flash", None), "gemini-3.8-flash");
+    }
+
+    #[test]
     fn wrap_upstream_error_wraps_plaintext_body() {
         let out = wrap_upstream_error_as_json(401, "Authentication Fails (governor)");
         let v: Value = serde_json::from_str(&out).expect("must be valid JSON");
@@ -807,6 +858,7 @@ mod tests {
             api_key: String::new(),
             upstream_protocol: ProviderProtocol::Openai,
             forced_model: Some("gpt-4o".to_string()),
+            launch_model: None,
             copilot_token_manager: None,
             requires_reasoning_content: false,
             max_tokens_cap: None,
@@ -823,6 +875,7 @@ mod tests {
             api_key: "sk-test".to_string(),
             upstream_protocol: ProviderProtocol::Openai,
             forced_model: None,
+            launch_model: None,
             copilot_token_manager: None,
             requires_reasoning_content: false,
             max_tokens_cap: None,

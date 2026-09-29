@@ -793,17 +793,24 @@ fn prune_empty_json_object(value: &mut serde_json::Value, path: &[&str]) {
 
 fn gemini_internal_model_config_override(model: &str) -> serde_json::Value {
     let aliases = [
-        // Gemini CLI 0.40.x uses these helper aliases for routing,
-        // completion, edit correction and summarization. Several default to
-        // gemini-2.5-flash-lite, which may be unavailable or irrelevant when
-        // aivo is routing the CLI to a non-Google provider.
+        // Gemini CLI helper aliases (as of 0.61), each pinned to a fixed Google
+        // model a non-Google provider may not serve.
         "gemini-2.5-flash-lite",
         "classifier",
         "prompt-completion",
         "edit-corrector",
         "summarizer-default",
         "summarizer-shell",
+        "fast-ack-helper",
+        "agent-history-provider-summarizer",
+        "loop-detection-double-check",
+        "chat-compression-default",
         "chat-compression-2.5-flash-lite",
+        "chat-compression-2.5-flash",
+        "chat-compression-2.5-pro",
+        "chat-compression-3-flash",
+        "chat-compression-3-pro",
+        "chat-compression-3.1-flash-lite",
     ];
     let custom_aliases = aliases
         .into_iter()
@@ -1641,6 +1648,7 @@ async fn start_gemini_router(
         api_key,
         upstream_protocol,
         forced_model: None,
+        launch_model: env.get("GEMINI_MODEL").cloned(),
         copilot_token_manager: None,
         requires_reasoning_content,
         max_tokens_cap,
@@ -1697,6 +1705,7 @@ async fn start_gemini_copilot_router(
         api_key: String::new(),
         upstream_protocol: ProviderProtocol::ResponsesApi,
         forced_model,
+        launch_model: None,
         copilot_token_manager: Some(Arc::new(CopilotTokenManager::new(github_token))),
         requires_reasoning_content: false,
         max_tokens_cap: None,

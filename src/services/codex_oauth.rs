@@ -43,8 +43,7 @@ pub const ORIGINATOR_HEADER: &str = "originator";
 pub const ORIGINATOR_VALUE: &str = "codex_cli_rs";
 pub const SESSION_ID_HEADER: &str = "session_id";
 /// ChatGPT hides newer slugs from older clients — keep near current native Codex.
-pub const CODEX_CLIENT_VERSION: &str = "0.153.4";
-pub const CODEX_USER_AGENT: &str = "codex_cli_rs/0.153.4";
+pub const CODEX_CLIENT_VERSION: &str = "0.158.0";
 
 /// Fallback when a client asks for a non-Codex model; plain `gpt-5` is rejected.
 pub const DEFAULT_CODEX_MODEL: &str = "gpt-5.5";
@@ -639,6 +638,10 @@ async fn fetch_model_ids_from(
         anyhow::bail!("chatgpt /codex/models returned no usable models");
     }
     Ok(ids)
+}
+
+pub fn codex_user_agent() -> String {
+    format!("{ORIGINATOR_VALUE}/{}", listing_client_version())
 }
 
 fn listing_client_version() -> String {

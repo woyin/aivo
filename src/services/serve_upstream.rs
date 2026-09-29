@@ -554,7 +554,7 @@ pub(crate) async fn send_codex_responses(
             codex_oauth::ORIGINATOR_VALUE,
         )
         .header(codex_oauth::SESSION_ID_HEADER, session_id)
-        .header("User-Agent", codex_oauth::CODEX_USER_AGENT);
+        .header("User-Agent", codex_oauth::codex_user_agent());
     if let Some(account_id) = auth.account_id.as_deref() {
         req = req.header(codex_oauth::ACCOUNT_ID_HEADER, account_id);
     }

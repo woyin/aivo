@@ -1,5 +1,6 @@
 use serde_json::{Value, json};
 
+use crate::services::anthropic_route_pipeline::normalize_for_model;
 use crate::services::bridge_defaults::{
     BRIDGE_DEFAULT_ANTHROPIC_MAX_TOKENS, BRIDGE_FALLBACK_OPENAI_RESPONSE_ID,
 };
@@ -250,9 +251,7 @@ pub fn convert_openai_chat_to_anthropic_request(
         // thinking; older models take the numeric budget.
         let adaptive = anthropic_thinking_uses_adaptive(model);
         if effort == CanonicalEffort::None {
-            // Explicit "off": emit the disable form — but Fable/adaptive-only models
-            // 400 on `{type:"disabled"}`, so omit `thinking` for them instead.
-            if !has_thinking && !adaptive {
+            if !has_thinking {
                 req["thinking"] = json!({ "type": "disabled" });
             }
         } else {
@@ -302,6 +301,7 @@ pub fn convert_openai_chat_to_anthropic_request(
         }
     }
 
+    normalize_for_model(&mut req);
     req
 }
 
@@ -2025,6 +2025,25 @@ mod tests {
         );
         assert_eq!(req["thinking"]["type"], "disabled");
         assert!(req.get("output_config").is_none());
+    }
+
+    #[test]
+    fn openai_required_tool_choice_relaxes_on_models_that_reject_forcing() {
+        let body = json!({
+            "model": "claude-sonnet-5-5",
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [{"type": "function", "function": {"name": "f", "parameters": {}}}],
+            "tool_choice": "required",
+            "reasoning_effort": "none"
+        });
+        let req = convert_openai_chat_to_anthropic_request(
+            &body,
+            &OpenAIToAnthropicChatConfig {
+                default_model: "claude-sonnet-5-5",
+            },
+        );
+        assert_eq!(req["tool_choice"]["type"], "auto");
+        assert_eq!(req["thinking"]["type"], "between_tools");
     }
 
     #[test]

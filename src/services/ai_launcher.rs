@@ -956,7 +956,7 @@ impl AILauncher {
             Vec::new()
         };
         // Per-model limits for the tools that can consume them: pi models.json,
-        // opencode `limit`, claude CLAUDE_CODE_MAX_OUTPUT_TOKENS.
+        // opencode `limit`, claude CLAUDE_CODE_MAX_{OUTPUT,CONTEXT}_TOKENS.
         let catalog_ids: Vec<&str> = match options.tool {
             AIToolType::Pi => pi_models.iter().map(String::as_str).collect(),
             AIToolType::Opencode => opencode_models
@@ -1232,12 +1232,18 @@ impl AILauncher {
                         .for_claude_with_overrides(key, model, claude_overrides);
                 // Claude Code's per-request output cap; user `--env` still
                 // wins at the runtime merge.
-                if let Some(output) = model
-                    .and_then(|m| model_limits.get(m))
-                    .and_then(|l| l.output)
-                {
+                let limits = model.and_then(|m| model_limits.get(m));
+                if let Some(output) = limits.and_then(|l| l.output) {
                     env.entry("CLAUDE_CODE_MAX_OUTPUT_TOKENS".to_string())
                         .or_insert_with(|| output.to_string());
+                }
+                // Else Claude Code compacts an unknown model at a guessed window.
+                if let Some(context) = limits.and_then(|l| l.context)
+                    && claude_overrides.max_context.is_none()
+                    && std::env::var_os("CLAUDE_CODE_MAX_CONTEXT_TOKENS").is_none()
+                {
+                    env.entry("CLAUDE_CODE_MAX_CONTEXT_TOKENS".to_string())
+                        .or_insert_with(|| context.to_string());
                 }
                 env
             }
@@ -2538,6 +2544,29 @@ mod tests {
             config.env_vars.get("CLAUDE_CODE_MAX_OUTPUT_TOKENS"),
             Some(&"8000".to_string())
         );
+        assert_eq!(
+            config.env_vars.get("CLAUDE_CODE_MAX_CONTEXT_TOKENS"),
+            Some(&"128000".to_string())
+        );
+
+        let tagged = ClaudeModelOverrides {
+            max_context: Some("1m".to_string()),
+            ..Default::default()
+        };
+        let config = launcher.get_tool_config(
+            AIToolType::Claude,
+            &key,
+            Some("deepseek-chat"),
+            None,
+            &[],
+            &limits,
+            &tagged,
+        );
+        assert!(
+            !config
+                .env_vars
+                .contains_key("CLAUDE_CODE_MAX_CONTEXT_TOKENS")
+        );
 
         // Output unknown → the var stays unset so Claude's default applies.
         let config = launcher.get_tool_config(
@@ -2553,6 +2582,11 @@ mod tests {
             !config
                 .env_vars
                 .contains_key("CLAUDE_CODE_MAX_OUTPUT_TOKENS")
+        );
+        assert!(
+            !config
+                .env_vars
+                .contains_key("CLAUDE_CODE_MAX_CONTEXT_TOKENS")
         );
     }
 

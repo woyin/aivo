@@ -63,6 +63,7 @@ impl RouterPipeline {
             Box::new(ModelNamePatch),
             Box::new(AnthropicVersionPatch),
             Box::new(ThinkingNormalizationPatch),
+            Box::new(ForcedToolChoicePatch),
         ])
     }
 
@@ -295,7 +296,7 @@ impl RequestPatch for AnthropicVersionPatch {
 /// Reconciles `thinking` with per-model capabilities (version cuts delegate to
 /// `crate::services::effort`, so this native path and the bridge stay in sync):
 /// strip adaptive where unsupported (with its paired effort), rewrite
-/// `enabled`+`budget_tokens` → `adaptive`, and omit `disabled` on Fable/Mythos.
+/// `enabled`+`budget_tokens` → `adaptive`, and map "off" to the form the model accepts.
 pub struct ThinkingNormalizationPatch;
 
 impl RequestPatch for ThinkingNormalizationPatch {
@@ -329,14 +330,57 @@ impl RequestPatch for ThinkingNormalizationPatch {
             "enabled" if effort::anthropic_thinking_uses_adaptive(&model) => {
                 rewrite_enabled_to_adaptive(obj);
             }
-            "disabled" if effort::anthropic_rejects_disabled_thinking(&model) => {
-                obj.remove("thinking");
+            "disabled" | "between_tools" => {
+                let effort = obj
+                    .get("output_config")
+                    .and_then(|o| o.get("effort"))
+                    .and_then(|e| e.as_str());
+                match effort::anthropic_thinking_off(&model, effort) {
+                    Some(off) if off["type"] == type_str => {}
+                    Some(off) => {
+                        obj.insert("thinking".to_string(), off);
+                    }
+                    None => {
+                        obj.remove("thinking");
+                    }
+                }
             }
             _ => {}
         }
 
         Ok(())
     }
+}
+
+/// Forced `tool_choice` → `auto` where the model 400s on it.
+pub struct ForcedToolChoicePatch;
+
+impl RequestPatch for ForcedToolChoicePatch {
+    fn patch_json(&self, _route: &str, body: &mut Value, _ctx: &RequestContext<'_>) -> Result<()> {
+        let rejects = body
+            .get("model")
+            .and_then(|m| m.as_str())
+            .is_some_and(effort::anthropic_rejects_forced_tool_choice);
+        if !rejects {
+            return Ok(());
+        }
+        if let Some(tc) = body.get_mut("tool_choice").and_then(|v| v.as_object_mut())
+            && matches!(
+                tc.get("type").and_then(|t| t.as_str()),
+                Some("any" | "tool")
+            )
+        {
+            tc.insert("type".to_string(), json!("auto"));
+            tc.remove("name");
+        }
+        Ok(())
+    }
+}
+
+pub(crate) fn normalize_for_model(body: &mut Value) {
+    let ctx = RequestContext::new("");
+    let _ = ThinkingNormalizationPatch.patch_json("messages", body, &ctx);
+    let _ = ForcedToolChoicePatch.patch_json("messages", body, &ctx);
 }
 
 fn drop_output_config_effort(obj: &mut serde_json::Map<String, Value>) {
@@ -940,6 +984,50 @@ mod tests {
         });
         run_thinking_patch(&mut body);
         assert_eq!(body["thinking"], json!({"type": "disabled"}));
+    }
+
+    #[test]
+    fn thinking_patch_maps_off_to_the_form_each_model_accepts() {
+        let cases = [
+            ("claude-opus-5-5", "disabled", None, None),
+            ("claude-sonnet-5-5", "disabled", None, Some("between_tools")),
+            ("claude-sonnet-5-5", "disabled", Some("max"), None),
+            ("claude-opus-5", "disabled", Some("xhigh"), None),
+            ("claude-opus-5", "disabled", Some("high"), Some("disabled")),
+            ("claude-sonnet-5", "between_tools", None, Some("disabled")),
+            ("claude-fable-5-1", "between_tools", None, None),
+        ];
+        for (model, sent, effort, want) in cases {
+            let mut body = json!({"model": model, "thinking": {"type": sent}});
+            if let Some(e) = effort {
+                body["output_config"] = json!({"effort": e});
+            }
+            run_thinking_patch(&mut body);
+            let got = body.get("thinking").map(|t| t["type"].as_str().unwrap());
+            assert_eq!(got, want, "{model} {sent} {effort:?}");
+        }
+    }
+
+    #[test]
+    fn forced_tool_choice_relaxes_to_auto_only_where_rejected() {
+        let ctx = RequestContext::new("https://api.anthropic.com");
+        let mut body = json!({
+            "model": "claude-opus-5-5",
+            "tool_choice": {"type": "tool", "name": "x", "disable_parallel_tool_use": true}
+        });
+        ForcedToolChoicePatch
+            .patch_json("messages", &mut body, &ctx)
+            .unwrap();
+        assert_eq!(
+            body["tool_choice"],
+            json!({"type": "auto", "disable_parallel_tool_use": true})
+        );
+
+        let mut body = json!({"model": "claude-opus-5", "tool_choice": {"type": "any"}});
+        ForcedToolChoicePatch
+            .patch_json("messages", &mut body, &ctx)
+            .unwrap();
+        assert_eq!(body["tool_choice"], json!({"type": "any"}));
     }
 
     #[test]

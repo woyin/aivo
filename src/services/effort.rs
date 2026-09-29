@@ -178,57 +178,75 @@ fn normalize_claude_model(model: &str) -> String {
     bare.replace('.', "-")
 }
 
-/// `(major, minor)` of a normalized `claude-opus-…` id; a trailing date suffix
-/// is ignored (only the first two numeric components are read).
-fn claude_opus_version(name: &str) -> Option<(u32, u32)> {
-    let rest = name.strip_prefix("claude-opus-")?;
-    let mut nums = rest.split('-').filter_map(|s| s.parse::<u32>().ok());
-    Some((nums.next().unwrap_or(0), nums.next().unwrap_or(0)))
+/// `(major, minor)` of a normalized `claude-<family>-…` id; a date suffix isn't a minor.
+fn claude_family_version(name: &str, family: &str) -> Option<(u32, u32)> {
+    let rest = name.strip_prefix("claude-")?.strip_prefix(family)?;
+    let mut parts = rest.strip_prefix('-')?.split('-');
+    let major = parts.next()?.parse::<u32>().ok()?;
+    let minor = parts
+        .next()
+        .filter(|p| p.len() <= 2)
+        .and_then(|p| p.parse::<u32>().ok())
+        .unwrap_or(0);
+    Some((major, minor))
 }
 
-/// `prefix` match at a component boundary (so `claude-sonnet-4-6` ≠ `…-4-60`).
-fn claude_prefix_at_boundary(name: &str, prefix: &str) -> bool {
-    name.starts_with(prefix) && matches!(name.as_bytes().get(prefix.len()), None | Some(b'-'))
+fn claude_at_least(name: &str, family: &str, min: (u32, u32)) -> bool {
+    claude_family_version(name, family).is_some_and(|v| v >= min)
 }
 
-/// Reject `thinking.budget_tokens` (400) → must use adaptive: Fable/Mythos and
-/// Opus 4.7+. Single source of truth; `ThinkingNormalizationPatch` delegates here.
+fn is_fable_or_mythos(name: &str) -> bool {
+    name.contains("fable") || name.contains("mythos")
+}
+
+/// Reject `thinking.budget_tokens` (400) → must use adaptive: Fable/Mythos,
+/// Opus 4.7+, Sonnet 5+. Single source of truth; `ThinkingNormalizationPatch`
+/// delegates here.
 pub(crate) fn anthropic_thinking_uses_adaptive(model: &str) -> bool {
     let name = normalize_claude_model(model);
-    if name.contains("fable") || name.contains("mythos") {
-        return true;
-    }
-    matches!(claude_opus_version(&name), Some((major, minor)) if major > 4 || (major == 4 && minor >= 7))
+    is_fable_or_mythos(&name)
+        || claude_at_least(&name, "opus", (4, 7))
+        || claude_at_least(&name, "sonnet", (5, 0))
 }
 
 /// Accept `thinking:{type:"adaptive"}` — Claude 4.6+ (pre-4.6 400s on it).
 pub(crate) fn anthropic_supports_adaptive_thinking(model: &str) -> bool {
     let name = normalize_claude_model(model);
-    if name.contains("fable") || name.contains("mythos") {
-        return true;
-    }
-    if claude_prefix_at_boundary(&name, "claude-sonnet-4-6") {
-        return true;
-    }
-    matches!(claude_opus_version(&name), Some((major, minor)) if major > 4 || (major == 4 && minor >= 6))
+    is_fable_or_mythos(&name)
+        || claude_at_least(&name, "opus", (4, 6))
+        || claude_at_least(&name, "sonnet", (4, 6))
 }
 
-/// Accept `output_config.effort` — Fable/Mythos, Sonnet 4.6, Opus 4.5+.
+/// Accept `output_config.effort` — Fable/Mythos, Sonnet 4.6+, Opus 4.5+.
 pub(crate) fn anthropic_supports_output_effort(model: &str) -> bool {
     let name = normalize_claude_model(model);
-    if name.contains("fable") || name.contains("mythos") {
-        return true;
-    }
-    if claude_prefix_at_boundary(&name, "claude-sonnet-4-6") {
-        return true;
-    }
-    matches!(claude_opus_version(&name), Some((major, minor)) if major > 4 || (major == 4 && minor >= 5))
+    is_fable_or_mythos(&name)
+        || claude_at_least(&name, "opus", (4, 5))
+        || claude_at_least(&name, "sonnet", (4, 6))
 }
 
-/// Reject `thinking:{type:"disabled"}` (400) → omit instead: Fable/Mythos.
-pub(crate) fn anthropic_rejects_disabled_thinking(model: &str) -> bool {
+/// The "thinking off" form `model` accepts at `effort`; `None` = omit `thinking`.
+pub(crate) fn anthropic_thinking_off(model: &str, effort: Option<&str>) -> Option<Value> {
     let name = normalize_claude_model(model);
-    name.contains("fable") || name.contains("mythos")
+    let at_most_high = !matches!(effort, Some("xhigh" | "max"));
+    if is_fable_or_mythos(&name) || claude_at_least(&name, "opus", (5, 5)) {
+        None
+    } else if claude_at_least(&name, "sonnet", (5, 5)) {
+        at_most_high.then(|| json!({ "type": "between_tools" }))
+    } else if claude_at_least(&name, "opus", (5, 0)) {
+        at_most_high.then(|| json!({ "type": "disabled" }))
+    } else {
+        Some(json!({ "type": "disabled" }))
+    }
+}
+
+/// Forced `tool_choice` (`any` / `tool`) 400s: Opus/Sonnet 5.5+, Fable/Mythos 5.1+.
+pub(crate) fn anthropic_rejects_forced_tool_choice(model: &str) -> bool {
+    let name = normalize_claude_model(model);
+    claude_at_least(&name, "opus", (5, 5))
+        || claude_at_least(&name, "sonnet", (5, 5))
+        || claude_at_least(&name, "fable", (5, 1))
+        || claude_at_least(&name, "mythos", (5, 1))
 }
 
 /// Extract a canonical effort from an OpenAI request body. Looks at:
@@ -541,6 +559,7 @@ mod tests {
         assert!(anthropic_thinking_uses_adaptive(
             "anthropic/claude-mythos-5"
         ));
+        assert!(anthropic_thinking_uses_adaptive("claude-sonnet-5"));
         // Older Claude keeps the numeric budget.
         assert!(!anthropic_thinking_uses_adaptive("claude-opus-4-6"));
         assert!(!anthropic_thinking_uses_adaptive("claude-opus-4-5"));
@@ -575,6 +594,8 @@ mod tests {
             "anthropic/claude-opus-4.6",
             "us.anthropic.claude-sonnet-4-6",
             "claude-opus-4-6-20260120",
+            "claude-sonnet-5",
+            "claude-sonnet-5-5",
         ] {
             assert!(anthropic_supports_adaptive_thinking(m), "{m} → adaptive");
         }
@@ -583,7 +604,6 @@ mod tests {
             "claude-sonnet-4-5",
             "claude-haiku-4-5",
             "claude-3-5-sonnet",
-            "claude-sonnet-4-60",
             "gpt-5",
         ] {
             assert!(
@@ -601,6 +621,7 @@ mod tests {
             "claude-sonnet-4-6",
             "claude-fable-5",
             "anthropic/claude-mythos-5",
+            "claude-sonnet-5-5",
         ] {
             assert!(anthropic_supports_output_effort(m), "{m} → effort");
         }
@@ -610,14 +631,80 @@ mod tests {
     }
 
     #[test]
-    fn anthropic_rejects_disabled_thinking_only_fable_mythos() {
-        assert!(anthropic_rejects_disabled_thinking("claude-fable-5"));
-        assert!(anthropic_rejects_disabled_thinking(
-            "anthropic/claude-mythos-5"
+    fn anthropic_thinking_off_follows_per_model_table() {
+        let disabled = Some(json!({"type": "disabled"}));
+        let between = Some(json!({"type": "between_tools"}));
+        for m in [
+            "claude-fable-5",
+            "claude-fable-5-1",
+            "anthropic/claude-mythos-5",
+        ] {
+            assert_eq!(anthropic_thinking_off(m, None), None, "{m}");
+        }
+        assert_eq!(anthropic_thinking_off("claude-opus-5-5", Some("low")), None);
+        assert_eq!(anthropic_thinking_off("claude-opus-5.5-fast", None), None);
+        assert_eq!(anthropic_thinking_off("claude-sonnet-5-5", None), between);
+        assert_eq!(
+            anthropic_thinking_off("claude-sonnet-5-5", Some("high")),
+            between
+        );
+        assert_eq!(
+            anthropic_thinking_off("claude-sonnet-5-5", Some("xhigh")),
+            None
+        );
+        assert_eq!(
+            anthropic_thinking_off("claude-opus-5", Some("high")),
+            disabled
+        );
+        assert_eq!(anthropic_thinking_off("claude-opus-5", Some("max")), None);
+        for m in [
+            "claude-sonnet-5",
+            "claude-opus-4-8",
+            "claude-opus-4-7",
+            "claude-haiku-4-5",
+        ] {
+            assert_eq!(anthropic_thinking_off(m, Some("max")), disabled, "{m}");
+        }
+    }
+
+    #[test]
+    fn anthropic_forced_tool_choice_rejected_from_5_5_and_fable_5_1() {
+        for m in [
+            "claude-opus-5-5",
+            "anthropic/claude-sonnet-5.5",
+            "claude-fable-5-1",
+            "claude-mythos-5-1",
+        ] {
+            assert!(anthropic_rejects_forced_tool_choice(m), "{m} → rejects");
+        }
+        for m in [
+            "claude-opus-5",
+            "claude-sonnet-5",
+            "claude-fable-5",
+            "claude-mythos-preview",
+            "claude-opus-4-8",
+            "gpt-5",
+        ] {
+            assert!(!anthropic_rejects_forced_tool_choice(m), "{m} → accepts");
+        }
+    }
+
+    #[test]
+    fn claude_version_ignores_date_suffix() {
+        assert_eq!(
+            claude_family_version("claude-opus-4-20250514", "opus"),
+            Some((4, 0))
+        );
+        assert_eq!(
+            claude_family_version("claude-opus-4-6-20260120", "opus"),
+            Some((4, 6))
+        );
+        assert!(!anthropic_supports_adaptive_thinking(
+            "claude-opus-4-20250514"
         ));
-        assert!(!anthropic_rejects_disabled_thinking("claude-opus-4-8"));
-        assert!(!anthropic_rejects_disabled_thinking("claude-opus-4-7"));
-        assert!(!anthropic_rejects_disabled_thinking("claude-haiku-4-5"));
+        assert!(!anthropic_thinking_uses_adaptive(
+            "claude-sonnet-4-20250514"
+        ));
     }
 
     #[test]
