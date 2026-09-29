@@ -204,21 +204,33 @@ async fn handle_router_request(request: String, state: Arc<GeminiRouterState>) -
     response
 }
 
-/// Gemini CLI 0.61+ promotes flash ids to the newest flash on API-key auth;
-/// map a same-tier flash id back to the launch model.
+/// Gemini CLI 0.61 `resolveModel` on API-key auth: `(promoted to, promotable
+/// ids)`. `gemini-3-flash-preview` is exempt.
+const GEMINI_CLI_FLASH_PROMOTIONS: [(&str, &[&str]); 2] = [
+    (
+        "gemini-3.8-flash",
+        &["gemini-3.5-flash", "gemini-3-flash", "flash"],
+    ),
+    (
+        "gemini-3.5-flash-lite",
+        &["gemini-3.1-flash-lite", "flash-lite"],
+    ),
+];
+
+/// Maps the CLI's forced flash promotion back to the launch model. Only the
+/// exact promotion is undone, so a `/model` pick of any other id goes through.
 fn undo_flash_promotion(requested: String, launch: Option<&str>) -> String {
     let Some(launch) = launch else {
         return requested;
     };
-    let tier = |m: &str| {
-        let m = m.rsplit('/').next().unwrap_or(m);
-        m.starts_with("gemini-")
-            .then(|| m.contains("flash-lite"))
-            .filter(|_| m.contains("flash"))
-    };
-    match (tier(&requested), tier(launch)) {
-        (Some(a), Some(b)) if a == b && requested != launch => launch.to_string(),
-        _ => requested,
+    let launch_id = launch.rsplit('/').next().unwrap_or(launch);
+    let promoted = GEMINI_CLI_FLASH_PROMOTIONS
+        .iter()
+        .any(|(to, from)| requested == *to && from.contains(&launch_id));
+    if promoted {
+        launch.to_string()
+    } else {
+        requested
     }
 }
 
@@ -789,6 +801,20 @@ mod tests {
             "gemini-3-pro-preview"
         );
         assert_eq!(undo("gemini-3.8-flash", None), "gemini-3.8-flash");
+        // The CLI never promotes to these, so they're a `/model` pick.
+        assert_eq!(
+            undo("gemini-3-flash-preview", Some("gemini-3.5-flash")),
+            "gemini-3-flash-preview"
+        );
+        assert_eq!(
+            undo("gemini-3.5-flash", Some("gemini-3-flash")),
+            "gemini-3.5-flash"
+        );
+        // Not a promotable launch id, so a 3.8 request came from the user.
+        assert_eq!(
+            undo("gemini-3.8-flash", Some("gemini-2.5-flash")),
+            "gemini-3.8-flash"
+        );
     }
 
     #[test]

@@ -8,6 +8,9 @@
 //! This module consolidates the version conversion logic that was previously
 //! duplicated across Anthropic router code, copilot_router, and chat.rs.
 
+use std::cmp::Reverse;
+
+use crate::services::model_metadata::snapshot_limits;
 use crate::services::provider_profile::{is_aivo_starter_base, is_openrouter_base};
 use crate::services::provider_protocol::ProviderProtocol;
 
@@ -299,13 +302,15 @@ pub fn select_model_for_provider_attempt(
         .unwrap_or_else(|| model.to_string())
 }
 
-/// Newest listed id, preferring the protocol's family; `gpt-5.5` beats `gpt-5.5-nano`.
+/// Newest listed agent model, preferring the protocol's family. Ids models.dev
+/// knows can't call tools (image, embedding, TTS) are a last resort, and ids
+/// it doesn't know rank below ones it does. `gpt-5.5` beats `gpt-5.5-nano`.
 pub(crate) fn pick_catalog_default(
     catalog: &[String],
     protocol: ProviderProtocol,
 ) -> Option<String> {
     let family = model_family(protocol);
-    let rank = |m: &str| {
+    let family_rank = |m: &str| {
         if family == ProviderProtocol::Openai && is_gpt_chat_model_name(m) {
             2
         } else if infer_model_protocol(m).is_some_and(|p| model_family(p) == family) {
@@ -324,8 +329,48 @@ pub(crate) fn pick_catalog_default(
     catalog
         .iter()
         .filter(|m| !is_variant(m))
-        .max_by(|a, b| rank(a).cmp(&rank(b)).then(a.cmp(b)))
+        .max_by_key(|m| {
+            let caps = snapshot_limits(m);
+            let usable = !caps.is_some_and(|l| !l.tool_call || l.image_only);
+            let known = caps.is_some_and(|l| !l.deprecated);
+            let name = m.rsplit('/').next().unwrap_or(m);
+            (
+                usable,
+                known,
+                family_rank(m),
+                leading_version(name),
+                !m.contains(':'),
+                Reverse(m.len()),
+                m.as_str(),
+            )
+        })
         .cloned()
+}
+
+/// The version at the first digit run, compared numerically: `gpt-5.10` →
+/// [5, 10]. A date (`-20251101`) or a size (`-70b`, `-300m`) ends it.
+fn leading_version(name: &str) -> Vec<u32> {
+    let mut version = Vec::new();
+    let Some(start) = name.find(|c: char| c.is_ascii_digit()) else {
+        return version;
+    };
+    for part in name[start..].split(['.', '-']) {
+        let digits = part.len() - part.trim_start_matches(|c: char| c.is_ascii_digit()).len();
+        let suffix = &part[digits..];
+        let is_size = suffix.eq_ignore_ascii_case("b") || suffix.eq_ignore_ascii_case("m");
+        if digits == 0 || digits > 3 || is_size {
+            break;
+        }
+        if !suffix.is_empty() && !version.is_empty() {
+            break;
+        }
+        version.push(part[..digits].parse().unwrap_or(0));
+        // `4o`: the version stops at the first letter.
+        if !suffix.is_empty() {
+            break;
+        }
+    }
+    version
 }
 
 /// Normalize protocol for model comparison — ResponsesApi uses the same models as Openai.
@@ -840,7 +885,7 @@ mod tests {
                 None,
                 ProviderProtocol::Openai
             ),
-            "deepseek-reasoner"
+            "deepseek-chat"
         );
         let catalog = vec![
             "gpt-4o".to_string(),
@@ -888,6 +933,57 @@ mod tests {
             Some("gpt-5.5-codex")
         );
         assert_eq!(pick_catalog_default(&[], ProviderProtocol::Openai), None);
+    }
+
+    #[test]
+    fn test_pick_catalog_default_skips_non_agent_models() {
+        let ids = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        // Real OpenAI-style listing: alphabetically last is realtime/image/TTS.
+        let openai = ids(&[
+            "gpt-4o",
+            "gpt-4o-mini-tts",
+            "gpt-5.5",
+            "gpt-image-2",
+            "gpt-realtime",
+            "gpt-realtime-2025-08-28",
+            "text-embedding-3-large",
+            "whisper-1",
+        ]);
+        assert_eq!(
+            pick_catalog_default(&openai, ProviderProtocol::Openai).as_deref(),
+            Some("gpt-5.5")
+        );
+        let gateway = ids(&[
+            "openai/gpt-5",
+            "openai/gpt-5:priority",
+            "~openai/gpt-mini-latest",
+            "@cf/google/embeddinggemma-300m",
+            "@cf/zai-org/glm-5.2",
+        ]);
+        assert_eq!(
+            pick_catalog_default(&gateway, ProviderProtocol::Openai).as_deref(),
+            Some("openai/gpt-5")
+        );
+        assert_eq!(
+            pick_catalog_default(&gateway, ProviderProtocol::Anthropic).as_deref(),
+            Some("@cf/zai-org/glm-5.2")
+        );
+    }
+
+    #[test]
+    fn test_leading_version_compares_numerically() {
+        assert_eq!(leading_version("gpt-5.10"), vec![5, 10]);
+        assert!(leading_version("gpt-5.10") > leading_version("gpt-5.9"));
+        assert_eq!(leading_version("gpt-4o-2024-08-06"), vec![4]);
+        assert_eq!(leading_version("claude-opus-4-5-20251101"), vec![4, 5]);
+        assert_eq!(leading_version("llama-3.3-70b-instruct"), vec![3, 3]);
+        assert_eq!(leading_version("qwen3-coder-480b"), vec![3]);
+        assert_eq!(leading_version("gpt-oss-120b"), Vec::<u32>::new());
+        assert_eq!(
+            leading_version("gpt-realtime-2025-08-28"),
+            Vec::<u32>::new()
+        );
+        assert_eq!(leading_version("gpt-mini-latest"), Vec::<u32>::new());
     }
 
     #[test]
