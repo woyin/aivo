@@ -66,8 +66,13 @@ struct FileEntry {
     has_session: bool,
 }
 
+/// Bump when parsed totals change meaning; size-keyed entries never re-parse.
+const CACHE_VERSION: u32 = 1;
+
 #[derive(Serialize, Deserialize, Default)]
 struct StatsCache {
+    #[serde(default)]
+    version: u32,
     files: HashMap<String, FileEntry>,
 }
 
@@ -75,6 +80,8 @@ struct StatsCache {
 /// a recomputed date invalidates them all.
 #[derive(Serialize, Deserialize, Default)]
 struct DeltaCache {
+    #[serde(default)]
+    version: u32,
     cutoff_date: String,
     files: HashMap<String, FileEntry>,
 }
@@ -177,8 +184,12 @@ async fn collect_with_step(
     let mut cache = if cutoff.is_some() || refresh {
         StatsCache::default()
     } else {
-        read_cache(&cache_path).await.unwrap_or_default()
+        read_cache(&cache_path)
+            .await
+            .filter(|c: &StatsCache| c.version == CACHE_VERSION)
+            .unwrap_or_default()
     };
+    cache.version = CACHE_VERSION;
 
     // Walk files and collect paths + sizes
     let all_files = walk_files_with_size(&data_dir, filter).await;
@@ -521,11 +532,15 @@ async fn merge_claude_jsonl_deltas(
     let mut cache: DeltaCache = if refresh {
         DeltaCache::default()
     } else {
-        read_cache(delta_cache_path).await.unwrap_or_default()
+        read_cache(delta_cache_path)
+            .await
+            .filter(|c: &DeltaCache| c.version == CACHE_VERSION)
+            .unwrap_or_default()
     };
     let date_reset = cache.cutoff_date != cutoff_date;
     if date_reset {
         cache = DeltaCache {
+            version: CACHE_VERSION,
             cutoff_date: cutoff_date.to_string(),
             files: HashMap::new(),
         };
@@ -681,6 +696,7 @@ async fn parse_claude_file_with_cutoff(
 
     let mut entry = FileEntry::default();
     let mut seen_session = false;
+    let mut per_message: HashMap<String, (ModelTokens, Option<String>)> = HashMap::new();
 
     while let Ok(Some(line)) = lines.next_line().await {
         // Fast pre-filter: skip full JSON parse for non-assistant lines
@@ -701,38 +717,30 @@ async fn parse_claude_file_with_cutoff(
                 continue;
             }
         }
-        let usage = match v.get("message").and_then(|m| m.get("usage")) {
-            Some(u) => u,
-            None => continue,
+        let Some(msg) = v.get("message") else {
+            continue;
         };
-        let input = usage
-            .get("input_tokens")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0);
-        let output = usage
-            .get("output_tokens")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0);
-        let cache_read = usage
-            .get("cache_read_input_tokens")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0);
-        let cache_write = usage
-            .get("cache_creation_input_tokens")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0);
-
-        entry.input_tokens += input;
-        entry.output_tokens += output;
-        entry.cache_read_tokens += cache_read;
-        entry.cache_write_tokens += cache_write;
+        let Some(usage) = msg.get("usage") else {
+            continue;
+        };
+        let field = |k: &str| usage.get(k).and_then(|v| v.as_u64()).unwrap_or(0);
+        let tokens = ModelTokens {
+            input_tokens: field("input_tokens"),
+            output_tokens: field("output_tokens"),
+            cache_read_tokens: field("cache_read_input_tokens"),
+            cache_write_tokens: field("cache_creation_input_tokens"),
+        };
+        let model = msg
+            .get("model")
+            .and_then(|m| m.as_str())
+            .map(normalize_model_for_display);
 
         // Skip sidechain (subagent) assistant lines when deciding whether
         // this file represents a real user-facing session. Claude Code
         // stores each Task subagent conversation in its own `agent-*.jsonl`
         // file under `<session>/subagents/`, tagged `isSidechain: true`.
         // Counting those inflates the session count by the number of
-        // subagent invocations. Tokens above are still accumulated because
+        // subagent invocations. Tokens are still accumulated because
         // subagent calls are real API spend.
         let is_sidechain = v
             .get("isSidechain")
@@ -742,21 +750,35 @@ async fn parse_claude_file_with_cutoff(
             seen_session = true;
             entry.has_session = true;
         }
-        if let Some(model) = v
-            .get("message")
-            .and_then(|m| m.get("model"))
-            .and_then(|m| m.as_str())
-        {
-            let key = normalize_model_for_display(model);
-            let e = entry.models.entry(key).or_default();
-            e.input_tokens += input;
-            e.output_tokens += output;
-            e.cache_read_tokens += cache_read;
-            e.cache_write_tokens += cache_write;
+
+        // One line per content block, each repeating the message's (growing) usage.
+        match msg.get("id").and_then(|id| id.as_str()) {
+            Some(id) => {
+                per_message.insert(id.to_string(), (tokens, model));
+            }
+            None => add_file_tokens(&mut entry, &tokens, model),
         }
     }
 
+    for (tokens, model) in per_message.into_values() {
+        add_file_tokens(&mut entry, &tokens, model);
+    }
+
     Some(entry)
+}
+
+fn add_file_tokens(entry: &mut FileEntry, tokens: &ModelTokens, model: Option<String>) {
+    entry.input_tokens += tokens.input_tokens;
+    entry.output_tokens += tokens.output_tokens;
+    entry.cache_read_tokens += tokens.cache_read_tokens;
+    entry.cache_write_tokens += tokens.cache_write_tokens;
+    if let Some(model) = model {
+        let e = entry.models.entry(model).or_default();
+        e.input_tokens += tokens.input_tokens;
+        e.output_tokens += tokens.output_tokens;
+        e.cache_read_tokens += tokens.cache_read_tokens;
+        e.cache_write_tokens += tokens.cache_write_tokens;
+    }
 }
 
 fn parse_rfc3339_utc(value: &Value, key: &str) -> Option<chrono::DateTime<chrono::Utc>> {
@@ -1433,6 +1455,53 @@ mod tests {
         // Tokens are still real API spend and should be preserved.
         assert_eq!(entry.input_tokens, 10);
         assert_eq!(entry.output_tokens, 5);
+    }
+
+    #[tokio::test]
+    async fn parse_claude_file_counts_each_message_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let lines = [
+            r#"{"type":"assistant","requestId":"req_1","message":{"id":"msg_1","model":"claude-opus-4-6","usage":{"input_tokens":4,"output_tokens":38,"cache_read_input_tokens":1000}}}"#,
+            r#"{"type":"assistant","requestId":"req_1","message":{"id":"msg_1","model":"claude-opus-4-6","usage":{"input_tokens":4,"output_tokens":90,"cache_read_input_tokens":1000}}}"#,
+            r#"{"type":"assistant","requestId":"req_1","message":{"id":"msg_1","model":"claude-opus-4-6","usage":{"input_tokens":4,"output_tokens":153,"cache_read_input_tokens":1000}}}"#,
+            r#"{"type":"assistant","requestId":"req_2","message":{"id":"msg_2","model":"claude-opus-4-6","usage":{"input_tokens":2,"output_tokens":7,"cache_read_input_tokens":1200}}}"#,
+            r#"{"type":"assistant","message":{"model":"claude-opus-4-6","usage":{"input_tokens":1,"output_tokens":1}}}"#,
+        ];
+        let path = write_jsonl(&dir, "main.jsonl", &lines).await;
+        let entry = parse_claude_file_with_cutoff(&path, None).await.unwrap();
+        assert_eq!(entry.input_tokens, 4 + 2 + 1);
+        assert_eq!(entry.output_tokens, 153 + 7 + 1);
+        assert_eq!(entry.cache_read_tokens, 1000 + 1200);
+        assert_eq!(entry.models.len(), 1);
+        let model = entry.models.values().next().unwrap();
+        assert_eq!(model.output_tokens, 153 + 7 + 1);
+    }
+
+    #[tokio::test]
+    async fn stats_cache_from_older_version_is_rebuilt() {
+        let home = tempfile::tempdir().unwrap();
+        let cache_dir = tempfile::tempdir().unwrap();
+        let projects = home.path().join(".claude").join("projects").join("p");
+        std::fs::create_dir_all(&projects).unwrap();
+        let line = r#"{"type":"assistant","sessionId":"s","requestId":"r","message":{"id":"m","model":"claude-opus-4-6","usage":{"input_tokens":3,"output_tokens":4}}}"#;
+        let path = projects.join("s.jsonl");
+        std::fs::write(&path, format!("{line}\n{line}\n")).unwrap();
+        let size = std::fs::metadata(&path).unwrap().len();
+
+        let stale = serde_json::json!({"files": {path.to_string_lossy(): {
+            "size": size, "input_tokens": 6, "output_tokens": 8,
+            "models": {}, "has_session": true
+        }}});
+        let cache_path = crate::services::paths::stats_cache(cache_dir.path(), "claude");
+        std::fs::create_dir_all(cache_path.parent().unwrap()).unwrap();
+        std::fs::write(&cache_path, stale.to_string()).unwrap();
+
+        let stats = collect_with_step(home.path(), cache_dir.path(), "claude", false, None, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stats.input_tokens, 3);
+        assert_eq!(stats.output_tokens, 4);
     }
 
     #[tokio::test]
