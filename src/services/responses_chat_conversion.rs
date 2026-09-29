@@ -1898,12 +1898,39 @@ impl ResponsesToChatStreamConverter {
                     );
                 }
             }
-            "response.completed" => {
-                self.usage = ev
-                    .get("response")
+            "response.completed" | "response.incomplete" => {
+                let response = ev.get("response");
+                self.usage = response
                     .and_then(|r| r.get("usage"))
                     .filter(|u| !u.is_null())
                     .map(responses_usage_to_chat_usage);
+                if let Some(reason) = response
+                    .and_then(|r| r.get("incomplete_details"))
+                    .and_then(|d| d.get("reason"))
+                    .and_then(|r| r.as_str())
+                {
+                    self.finish_reason = if reason == "content_filter" {
+                        "content_filter"
+                    } else {
+                        "length"
+                    };
+                }
+            }
+            // No `[DONE]` after the error chunk, so the client sees a failed stream.
+            "response.failed" | "error" => {
+                let err = ev
+                    .pointer("/response/error")
+                    .or_else(|| ev.get("error"))
+                    .unwrap_or(&ev);
+                let field = |k: &str| err.get(k).cloned().unwrap_or(Value::Null);
+                let message = err
+                    .get("message")
+                    .and_then(|m| m.as_str())
+                    .unwrap_or("upstream response failed");
+                out.push_str(&data_line(&json!({
+                    "error": { "message": message, "type": field("type"), "code": field("code") }
+                })));
+                self.finished = true;
             }
             _ => {}
         }
@@ -4228,6 +4255,40 @@ mod tests {
         assert_eq!(usage_line["usage"]["prompt_tokens"], 10);
         assert_eq!(usage_line["usage"]["completion_tokens"], 5);
         assert_eq!(usage_line["usage"]["total_tokens"], 15);
+    }
+
+    #[test]
+    fn responses_to_chat_stream_incomplete_finishes_with_length() {
+        let mut c = ResponsesToChatStreamConverter::new("gpt-5.4", false);
+        let mut out = c
+            .push_bytes(concat!(
+                "data: {\"type\":\"response.output_text.delta\",\"delta\":\"half\"}\n\n",
+                "data: {\"type\":\"response.incomplete\",\"response\":{\"status\":\"incomplete\",",
+                "\"incomplete_details\":{\"reason\":\"max_output_tokens\"}}}\n\n",
+            ).as_bytes())
+            .unwrap();
+        out.push_str(&c.finish());
+        assert_eq!(
+            accumulate_chat_sse(&out)["choices"][0]["finish_reason"],
+            "length"
+        );
+    }
+
+    #[test]
+    fn responses_to_chat_stream_failure_emits_error_without_done() {
+        let mut c = ResponsesToChatStreamConverter::new("gpt-5.4", false);
+        let mut out = c
+            .push_bytes(
+                concat!(
+                    "data: {\"type\":\"response.failed\",\"response\":{\"status\":\"failed\",",
+                    "\"error\":{\"code\":\"server_is_overloaded\",\"message\":\"try later\"}}}\n\n",
+                )
+                .as_bytes(),
+            )
+            .unwrap();
+        out.push_str(&c.finish());
+        assert!(out.contains("\"code\":\"server_is_overloaded\""), "{out}");
+        assert!(!out.contains("[DONE]"), "{out}");
     }
 
     /// A plain text turn yields content + a `stop` finish and a clean terminator.

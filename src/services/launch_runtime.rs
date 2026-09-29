@@ -319,6 +319,10 @@ async fn prepare_grok_home(env: &mut HashMap<String, String>) {
     let max_output = env
         .remove("AIVO_GROK_MODEL_MAX_OUTPUT_TOKENS")
         .and_then(|v| v.parse::<u64>().ok());
+    let efforts: Vec<String> = env
+        .remove("AIVO_GROK_MODEL_REASONING_EFFORTS")
+        .map(|v| v.split(',').map(str::to_string).collect())
+        .unwrap_or_default();
     if !manage {
         return;
     }
@@ -330,6 +334,7 @@ async fn prepare_grok_home(env: &mut HashMap<String, String>) {
             model.as_deref(),
             context,
             max_output,
+            &efforts,
         )
     })
     .await;
@@ -551,8 +556,8 @@ pub(crate) fn is_oauth_invalid_grant(e: &anyhow::Error) -> bool {
         || s.contains("refresh failed (404")
 }
 
-/// 0.60+ skips a user-owned `GEMINI_CLI_SYSTEM_SETTINGS_PATH`, so we also pin
-/// `selectedType` via a `GEMINI_CLI_HOME` shadow. Drop restores the real file.
+/// Pins `selectedType` via a `GEMINI_CLI_HOME` shadow — 0.60+ skips (and warns
+/// about) a user-owned `GEMINI_CLI_SYSTEM_SETTINGS_PATH`. Drop restores the real file.
 pub(crate) struct GeminiSettingsOverride {
     #[allow(dead_code)]
     dir: tempfile::TempDir,
@@ -627,25 +632,9 @@ async fn prepare_gemini_api_key_settings_override_with_real(
         .tempdir()
         .context("create aivo gemini settings override temp dir")?;
 
-    let mut settings = serde_json::json!({
-        "security": {
-            "auth": {
-                "selectedType": "gemini-api-key"
-            }
-        }
-    });
-    if let Some(model) = model_config_model.filter(|m| !m.trim().is_empty()) {
-        settings["modelConfigs"] = gemini_internal_model_config_override(&model);
-    }
-    let system_path = dir.path().join("settings.json");
-    tokio::fs::write(&system_path, serde_json::to_vec(&settings)?)
-        .await
-        .context("write aivo gemini system settings override")?;
-    env.insert(
-        "GEMINI_CLI_SYSTEM_SETTINGS_PATH".to_string(),
-        system_path.to_string_lossy().to_string(),
-    );
-
+    let model_configs = model_config_model
+        .filter(|m| !m.trim().is_empty())
+        .map(|m| gemini_internal_model_config_override(&m));
     let fake_home = dir.path().join("home");
     let shadow_gemini = fake_home.join(".gemini");
     tokio::fs::create_dir_all(&shadow_gemini)
@@ -661,7 +650,7 @@ async fn prepare_gemini_api_key_settings_override_with_real(
     let had_selected_type = original_selected_type.is_some();
     let original_model_configs = user_settings.get("modelConfigs").cloned();
     let had_model_configs = original_model_configs.is_some();
-    pin_gemini_api_key_auth(&mut user_settings, settings.get("modelConfigs"));
+    pin_gemini_api_key_auth(&mut user_settings, model_configs.as_ref());
 
     let shadow_user_settings = shadow_gemini.join("settings.json");
     tokio::fs::write(
@@ -2196,10 +2185,7 @@ mod tests {
         assert!(!env.contains_key("AIVO_GEMINI_FORCE_API_KEY_AUTH"));
         assert!(!env.contains_key("AIVO_GEMINI_MODEL_CONFIG_MODEL"));
 
-        let path = env.get("GEMINI_CLI_SYSTEM_SETTINGS_PATH").unwrap().clone();
-        let parsed: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-        assert_gemini_api_key_pin(&parsed);
+        assert!(!env.contains_key("GEMINI_CLI_SYSTEM_SETTINGS_PATH"));
 
         let home = env.get("GEMINI_CLI_HOME").unwrap();
         let user_path = std::path::Path::new(home).join(".gemini/settings.json");
@@ -2208,7 +2194,6 @@ mod tests {
         assert_gemini_api_key_pin(&user);
 
         drop(overlay);
-        assert!(!std::path::Path::new(&path).exists());
         assert!(!user_path.exists());
     }
 

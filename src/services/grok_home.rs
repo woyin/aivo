@@ -267,6 +267,7 @@ fn model_limits_table(
     model: &str,
     context_window: Option<u64>,
     max_output_tokens: Option<u64>,
+    reasoning_efforts: &[String],
 ) -> Option<TomlTable> {
     let mut body = Vec::new();
     if let Some(ctx) = context_window {
@@ -274,6 +275,18 @@ fn model_limits_table(
     }
     if let Some(max) = max_output_tokens {
         body.push(format!("max_completion_tokens = {max}"));
+    }
+    // grok 1.0.40+ builds its effort menu from this, not from our /v1/models.
+    let efforts: Vec<String> = reasoning_efforts
+        .iter()
+        .filter(|e| {
+            e.chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+        })
+        .map(|e| format!("\"{e}\""))
+        .collect();
+    if !efforts.is_empty() {
+        body.push(format!("reasoning_efforts = [{}]", efforts.join(", ")));
     }
     if body.is_empty() || model.is_empty() {
         return None;
@@ -292,8 +305,11 @@ pub fn pin_model_limits(
     model: &str,
     context_window: Option<u64>,
     max_output_tokens: Option<u64>,
+    reasoning_efforts: &[String],
 ) -> bool {
-    let Some(table) = model_limits_table(model, context_window, max_output_tokens) else {
+    let Some(table) =
+        model_limits_table(model, context_window, max_output_tokens, reasoning_efforts)
+    else {
         return false;
     };
     update_toml_tables(&home.join("config.toml"), |tables| tables.set(table))
@@ -451,6 +467,7 @@ pub fn prepare_managed_home(
     model: Option<&str>,
     context_window: Option<u64>,
     max_output_tokens: Option<u64>,
+    reasoning_efforts: &[String],
 ) {
     let home = grok_home_dir(config_dir);
     if std::fs::create_dir_all(&home).is_err() {
@@ -458,7 +475,13 @@ pub fn prepare_managed_home(
     }
     migrate_legacy_homes(config_dir);
     if let Some(model) = model {
-        pin_model_limits(&home, model, context_window, max_output_tokens);
+        pin_model_limits(
+            &home,
+            model,
+            context_window,
+            max_output_tokens,
+            reasoning_efforts,
+        );
     }
     gc_stale_state(config_dir, SystemTime::now());
 }
@@ -491,7 +514,7 @@ mod tests {
             &home.join("config.toml"),
             "[ui]\nscreen_mode = \"minimal\"\n",
         );
-        assert!(pin_model_limits(home, "m1", Some(100), Some(10)));
+        assert!(pin_model_limits(home, "m1", Some(100), Some(10), &[]));
         let first = std::fs::read_to_string(home.join("config.toml")).unwrap();
         assert!(first.contains("[ui]"));
         assert!(first.contains("[model.\"m1\"]"));
@@ -502,7 +525,7 @@ mod tests {
             .unwrap()
             .modified()
             .unwrap();
-        assert!(pin_model_limits(home, "m1", Some(100), Some(10)));
+        assert!(pin_model_limits(home, "m1", Some(100), Some(10), &[]));
         let mtime_after = std::fs::metadata(home.join("config.toml"))
             .unwrap()
             .modified()
@@ -521,7 +544,13 @@ mod tests {
             &home.join("config.toml"),
             "[model.deepseek-v4-flash]\ncontext_window = 1\n\n[ui]\nyolo = false\n",
         );
-        assert!(pin_model_limits(home, "deepseek-v4-flash", Some(2), None));
+        assert!(pin_model_limits(
+            home,
+            "deepseek-v4-flash",
+            Some(2),
+            None,
+            &[]
+        ));
         let text = std::fs::read_to_string(home.join("config.toml")).unwrap();
         assert_eq!(
             text.matches("deepseek-v4-flash").count(),
@@ -574,10 +603,28 @@ mod tests {
     #[test]
     fn pin_model_limits_escapes_exotic_ids_and_skips_without_limits() {
         let dir = TempDir::new().unwrap();
-        assert!(!pin_model_limits(dir.path(), "m", None, None));
-        assert!(pin_model_limits(dir.path(), "we\"ird\\id", Some(1), None));
+        assert!(!pin_model_limits(dir.path(), "m", None, None, &[]));
+        assert!(pin_model_limits(
+            dir.path(),
+            "we\"ird\\id",
+            Some(1),
+            None,
+            &[]
+        ));
         let text = std::fs::read_to_string(dir.path().join("config.toml")).unwrap();
         assert!(text.contains("[model.\"we\\\"ird\\\\id\"]"));
+    }
+
+    #[test]
+    fn pin_model_limits_writes_reasoning_efforts() {
+        let dir = TempDir::new().unwrap();
+        let efforts = ["low", "high", "bad\"level"].map(String::from);
+        assert!(pin_model_limits(dir.path(), "m", None, None, &efforts));
+        let text = std::fs::read_to_string(dir.path().join("config.toml")).unwrap();
+        assert!(
+            text.contains("reasoning_efforts = [\"low\", \"high\"]"),
+            "{text}"
+        );
     }
 
     #[test]

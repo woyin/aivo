@@ -1269,6 +1269,12 @@ impl EnvironmentInjector {
                         output.to_string(),
                     );
                 }
+                if !resolved.reasoning_efforts.is_empty() {
+                    env.insert(
+                        "AIVO_GROK_MODEL_REASONING_EFFORTS".to_string(),
+                        resolved.reasoning_efforts.join(","),
+                    );
+                }
             }
         }
         // grok ignores NO_PROXY — genuinely unset the proxy vars in the child.

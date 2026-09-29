@@ -30,14 +30,14 @@ pub(crate) fn retry_delay(
     std::time::Duration::from_millis(base * (1u64 << attempt.saturating_sub(1)))
 }
 
-/// Retryable on a transient status (408/429/5xx), else by message match. Overflow has
-/// its own recovery path.
+/// Retryable on a transient status (408/429/5xx, Anthropic's 529), else by message
+/// match. Overflow has its own recovery path.
 pub(crate) fn error_is_retryable(e: &serve_client::ServeError) -> bool {
     if is_context_overflow_error(&e.message) {
         return false;
     }
     match e.status {
-        Some(s) => matches!(s, 408 | 429 | 500 | 502 | 503 | 504),
+        Some(s) => matches!(s, 408 | 429 | 500 | 502 | 503 | 504 | 529),
         None => is_retryable_error(&e.message),
     }
 }
@@ -260,6 +260,7 @@ mod tests {
             Some(429)
         )));
         assert!(error_is_retryable(&err("upstream 503", Some(503))));
+        assert!(error_is_retryable(&err("upstream 529", Some(529))));
         assert!(!error_is_retryable(&err(
             "upstream 401: invalid api key",
             Some(401)

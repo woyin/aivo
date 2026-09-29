@@ -130,6 +130,22 @@ pub async fn complete(
             let Ok(v) = serde_json::from_str::<Value>(data) else {
                 continue;
             };
+            if let Some(err) = v.get("error").filter(|_| v.get("choices").is_none()) {
+                if !content.is_empty() && tools.is_empty() {
+                    truncated = true;
+                    break;
+                }
+                let msg = err.get("message").and_then(|m| m.as_str()).map_or_else(
+                    || err.to_string(),
+                    |m| match err.get("code").and_then(|c| c.as_str()) {
+                        Some(code) => format!("{m} ({code})"),
+                        None => m.to_string(),
+                    },
+                );
+                return Err(ServeError::transport(format!(
+                    "upstream stream error: {msg}"
+                )));
+            }
             if let Some(u) = v.get("usage")
                 && !u.is_null()
             {
@@ -801,5 +817,28 @@ data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n";
         .unwrap_err();
         assert!(err.status.is_none(), "a protocol drop is a transport error");
         assert!(err.message.contains("without [DONE]"));
+    }
+    /// An in-band `{"error":…}` chunk fails the call instead of reading as an empty reply.
+    #[tokio::test]
+    async fn in_band_error_chunk_fails_the_stream() {
+        let body = "data: {\"error\":{\"message\":\"try later\",\"code\":\"server_is_overloaded\"}}\n\n\
+data: [DONE]\n\n";
+        let port = spawn_sse(body);
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let err = complete(
+            &client,
+            &format!("http://127.0.0.1:{port}"),
+            None,
+            &req(),
+            &mut |_| {},
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            err.message.contains("server_is_overloaded"),
+            "{}",
+            err.message
+        );
+        assert!(crate::agent::retry::error_is_retryable(&err));
     }
 }
