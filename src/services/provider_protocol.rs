@@ -383,6 +383,9 @@ pub fn is_format_unsupported_error(body: &str) -> bool {
 /// must be surfaced immediately, the latter should keep probing paths. Works on
 /// bare string errors, which gateways often return here.
 pub fn is_model_not_found_error(body: &str) -> bool {
+    if body.contains("模型不存在") {
+        return true;
+    }
     let lower = body.to_ascii_lowercase();
     if !lower.contains("model") {
         return false;
@@ -398,6 +401,15 @@ pub fn is_model_not_found_error(body: &str) -> bool {
     ]
     .iter()
     .any(|p| lower.contains(p))
+}
+
+/// True when an error body says the key's plan or balance is spent — another
+/// key may still answer, but retrying this one won't.
+pub fn is_quota_error(body: &str) -> bool {
+    let lower = body.to_ascii_lowercase();
+    ["quota", "billing", "credit", "balance", "余额", "额度"]
+        .iter()
+        .any(|k| lower.contains(k))
 }
 
 /// Returns fallback protocol candidates to try after `current` fails.
@@ -692,6 +704,7 @@ mod tests {
             r#"{"error":{"message":"Unknown model: foo"}}"#,
             r#"{"error":"invalid model"}"#,
             r#"{"error":"unsupported model for this endpoint"}"#,
+            r#"{"error":{"code":"1211","message":"模型不存在，请检查模型代码。"}}"#,
         ] {
             assert!(is_model_not_found_error(body), "should match: {body}");
         }

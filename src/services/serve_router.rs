@@ -27,7 +27,8 @@ use crate::services::protocol_fallback::{
     record_request_outcome,
 };
 use crate::services::provider_protocol::{
-    PathVariant, ProviderProtocol, classify_failed_attempt, is_protocol_mismatch,
+    PathVariant, ProviderProtocol, classify_failed_attempt, is_model_not_found_error,
+    is_protocol_mismatch, is_quota_error,
 };
 use crate::services::request_log::RequestLogger;
 use crate::services::responses_to_chat_router::{
@@ -668,11 +669,7 @@ async fn run_accept_loop(listener: tokio::net::TcpListener, state: Arc<ServeStat
                 )),
             };
 
-            let response_status = match &result {
-                Ok(RouterResponse::Buffered { status, .. }) => *status,
-                Ok(RouterResponse::Streaming { status, .. }) => *status,
-                Err(_) => 500,
-            };
+            let response_status = result.as_ref().map_or(500, RouterResponse::status);
 
             let accounting = state.usage_sink.is_some();
             // Peek token usage off a buffered 2xx body before it's moved to the
@@ -1282,10 +1279,36 @@ async fn handle_gemini_anthropic_direct(
 
 /// Returns true if the status code should trigger failover.
 /// - 401/403: auth failure (key revoked, expired, or lacks model access)
-/// - 429: rate limited
+/// - 402: out of credit
+/// - 404: this key's provider doesn't serve the model
+/// - 408/429: timed out / rate limited
 /// - 5xx: server errors
 fn is_failover_status(status: u16) -> bool {
-    matches!(status, 401 | 403 | 429) || (500..600).contains(&status)
+    matches!(status, 401 | 402 | 403 | 404 | 408 | 429) || (500..600).contains(&status)
+}
+
+/// A 400/422 that another key could answer: the plan's allowance is spent or
+/// the provider doesn't serve the model. Vendors that don't use 402/404/429
+/// for these say so only in the body.
+fn is_failover_body(status: u16, body: &[u8]) -> bool {
+    if !matches!(status, 400 | 422) {
+        return false;
+    }
+    let body = String::from_utf8_lossy(body);
+    is_quota_error(&body) || is_model_not_found_error(&body)
+}
+
+/// The status of a primary response that failover keys should retry; streams
+/// are never retried.
+fn failover_trigger(response: &RouterResponse) -> Option<u16> {
+    match response {
+        RouterResponse::Buffered { status, body, .. }
+            if is_failover_status(*status) || is_failover_body(*status, body) =>
+        {
+            Some(*status)
+        }
+        _ => None,
+    }
 }
 
 /// Builds a temporary ServeState from a FailoverEntry, sharing the client.
@@ -1368,8 +1391,10 @@ fn select_model_upstream<'a>(
 }
 
 /// Generates a failover wrapper around a handler function.
-/// Tries the primary handler, then falls through to failover keys on 429/5xx
-/// buffered responses. Streaming responses are never retried.
+/// Tries the primary handler, then falls through to failover keys on a
+/// failover-worthy buffered response, taking the first that succeeds; when
+/// none does, the primary's response stands. Streaming responses are never
+/// retried.
 macro_rules! impl_with_failover {
     ($name:ident, $handler:ident) => {
         async fn $name(request: &str, state: &ServeState) -> Result<RouterResponse> {
@@ -1377,15 +1402,9 @@ macro_rules! impl_with_failover {
             if state.failover_keys.is_empty() {
                 return Ok(response);
             }
-
-            let status = match &response {
-                RouterResponse::Buffered { status, .. } => *status,
-                RouterResponse::Streaming { .. } => return Ok(response),
-            };
-
-            if !is_failover_status(status) {
+            let Some(status) = failover_trigger(&response) else {
                 return Ok(response);
-            }
+            };
 
             if !state.quiet {
                 eprintln!(
@@ -1395,21 +1414,26 @@ macro_rules! impl_with_failover {
             }
             for entry in state.failover_keys.iter() {
                 let fstate = failover_state(entry, &state.client, &state.log_store, state.quiet);
-                if let Ok(resp) = $handler(request, &fstate).await {
-                    let s = match &resp {
-                        RouterResponse::Buffered { status, .. } => *status,
-                        RouterResponse::Streaming { .. } => 200,
-                    };
-                    if !is_failover_status(s) {
-                        if !state.quiet {
-                            eprintln!(
-                                "  \u{2713} Failover to {} succeeded",
-                                entry.key.display_name()
-                            );
-                        }
-                        return Ok(resp);
+                // Only a 2xx replaces the primary: a failover key whose provider
+                // can't serve the request says 400/404, which tells the client
+                // less than the primary's own error.
+                if let Ok(resp) = $handler(request, &fstate).await
+                    && (200..300).contains(&resp.status())
+                {
+                    if !state.quiet {
+                        eprintln!(
+                            "  \u{2713} Failover to {} succeeded",
+                            entry.key.display_name()
+                        );
                     }
+                    return Ok(resp);
                 }
+            }
+            if !state.quiet {
+                eprintln!(
+                    "  \u{2717} No failover key succeeded; returning the primary's {}",
+                    status
+                );
             }
             Ok(response)
         }
@@ -2444,9 +2468,36 @@ mod tests {
         // Client errors that indicate a bad request — retrying with a different
         // key won't help.
         assert!(!is_failover_status(400));
-        assert!(!is_failover_status(404));
         assert!(!is_failover_status(405));
         assert!(!is_failover_status(422));
+    }
+
+    #[test]
+    fn is_failover_status_triggers_on_credit_missing_model_and_timeout() {
+        assert!(is_failover_status(402));
+        assert!(is_failover_status(404));
+        assert!(is_failover_status(408));
+    }
+
+    #[test]
+    fn is_failover_body_matches_quota_and_unserved_model_wording() {
+        assert!(is_failover_body(
+            400,
+            br#"{"error":{"code":"insufficient_quota","message":"x"}}"#
+        ));
+        assert!(is_failover_body(
+            422,
+            br#"{"error":"Model Not Found: foo"}"#
+        ));
+        assert!(is_failover_body(
+            400,
+            "{\"error\":\"账户余额不足\"}".as_bytes()
+        ));
+        assert!(!is_failover_body(
+            400,
+            br#"{"error":"messages: field required"}"#
+        ));
+        assert!(!is_failover_body(500, br#"{"error":"insufficient_quota"}"#));
     }
 
     #[test]

@@ -4,7 +4,7 @@ use std::collections::HashMap;
 
 use crate::services::bridge_defaults::BRIDGE_FALLBACK_OPENAI_RESPONSE_ID;
 use crate::services::http_utils::{SseLineBuffer, current_unix_ts, sse_data_payload};
-use crate::services::openai_anthropic_bridge::ANTHROPIC_THINKING_EXT;
+use crate::services::openai_anthropic_bridge::{ANTHROPIC_THINKING_EXT, anthropic_finish_reason};
 
 #[derive(Default)]
 struct AnthropicToolCallState {
@@ -372,16 +372,22 @@ impl AnthropicToOpenAIStreamConverter {
                     .and_then(|v| v.get("stop_reason"))
                     .and_then(|v| v.as_str())
                 {
-                    self.emit_finish(output, map_anthropic_stop_reason(stop_reason));
+                    self.emit_finish(
+                        output,
+                        anthropic_finish_reason(stop_reason, self.saw_tool_call),
+                    );
                 }
             }
             "message_stop" if !self.finished => {
-                let finish_reason = if self.saw_tool_call {
-                    "tool_calls"
-                } else {
-                    "stop"
-                };
-                self.emit_finish(output, finish_reason);
+                self.emit_finish(output, anthropic_finish_reason("", self.saw_tool_call));
+            }
+            // An in-band error (e.g. overloaded_error mid-reply): an error chunk
+            // and no `[DONE]`, so the client sees a failed stream rather than a
+            // short answer that looks complete.
+            "error" if !self.finished => {
+                let err = event.get("error").unwrap_or(&event);
+                output.push_str(&openai_error_chunk(err, "type"));
+                self.finished = true;
             }
             _ => {}
         }
@@ -515,6 +521,16 @@ impl GeminiToOpenAIStreamConverter {
             Ok(value) => value,
             Err(_) => return Ok(()),
         };
+
+        // A mid-stream failure arrives as `{"error": {code, message, status}}`;
+        // like the Anthropic converter, fail the stream instead of finishing it.
+        if let Some(err) = event.get("error").filter(|e| e.is_object()) {
+            if !self.finished {
+                output.push_str(&openai_error_chunk(err, "status"));
+                self.finished = true;
+            }
+            return Ok(());
+        }
 
         if let Some(id) = event.get("responseId").and_then(|v| v.as_str())
             && !id.is_empty()
@@ -719,12 +735,22 @@ fn openai_usage_json(
     usage
 }
 
-fn map_anthropic_stop_reason(stop_reason: &str) -> &'static str {
-    match stop_reason {
-        "tool_use" => "tool_calls",
-        "max_tokens" => "length",
-        _ => "stop",
-    }
+/// An OpenAI-style in-band error chunk for an upstream's mid-stream error
+/// object, sent with no `[DONE]` after it. `type_field` names the upstream's
+/// error-kind field (Anthropic `type`, Gemini `status`).
+fn openai_error_chunk(err: &Value, type_field: &str) -> String {
+    let message = err
+        .get("message")
+        .and_then(|m| m.as_str())
+        .unwrap_or("upstream stream failed");
+    let chunk = json!({
+        "error": {
+            "message": message,
+            "type": err.get(type_field).cloned().unwrap_or(Value::Null),
+            "code": err.get("code").cloned().unwrap_or(Value::Null),
+        }
+    });
+    format!("data: {chunk}\n\n")
 }
 
 fn map_gemini_finish_reason(finish_reason: &str, saw_tool_call: bool) -> &'static str {
@@ -1028,5 +1054,72 @@ mod tests {
         assert!(output.contains("\"id\":\"call_2\""));
         assert!(output.contains("\"name\":\"write_file\""));
         assert!(output.contains("\"finish_reason\":\"tool_calls\""));
+    }
+
+    #[test]
+    fn test_anthropic_stream_error_event_fails_the_stream() {
+        let mut converter = AnthropicToOpenAIStreamConverter::new("claude-sonnet-5");
+        let input = concat!(
+            "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"model\":\"claude-sonnet-5\",\"usage\":{\"input_tokens\":3}}}\n\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"half\"}}\n\n",
+            "event: error\n",
+            "data: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"Overloaded\"}}\n\n",
+        );
+        let mut output = converter.push_bytes(input.as_bytes()).unwrap();
+        output.push_str(&converter.finish().unwrap());
+
+        assert!(output.contains("\"content\":\"half\""), "{output}");
+        assert!(output.contains("\"type\":\"overloaded_error\""), "{output}");
+        assert!(output.contains("\"message\":\"Overloaded\""), "{output}");
+        assert!(!output.contains("finish_reason\":\"stop"), "{output}");
+        assert!(!output.contains("[DONE]"), "{output}");
+    }
+
+    #[test]
+    fn test_anthropic_stream_context_window_exceeded_is_length() {
+        let mut converter = AnthropicToOpenAIStreamConverter::new("claude-sonnet-5");
+        let input = concat!(
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"cut\"}}\n\n",
+            "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"model_context_window_exceeded\"},\"usage\":{\"output_tokens\":9}}\n\n",
+            "data: {\"type\":\"message_stop\"}\n\n",
+        );
+        let output = converter.push_bytes(input.as_bytes()).unwrap();
+        assert!(output.contains("\"finish_reason\":\"length\""), "{output}");
+    }
+
+    #[test]
+    fn test_anthropic_stream_stop_reasons_match_json_bridge() {
+        let run = |stop_reason: &str, with_tool: bool| {
+            let mut converter = AnthropicToOpenAIStreamConverter::new("m");
+            let mut input = String::new();
+            if with_tool {
+                input.push_str("data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"t1\",\"name\":\"ls\",\"input\":{}}}\n\n");
+            }
+            input.push_str(&format!(
+                "data: {{\"type\":\"message_delta\",\"delta\":{{\"stop_reason\":\"{stop_reason}\"}}}}\n\n"
+            ));
+            converter.push_bytes(input.as_bytes()).unwrap()
+        };
+        assert!(run("refusal", false).contains("\"finish_reason\":\"content_filter\""));
+        assert!(run("pause_turn", true).contains("\"finish_reason\":\"tool_calls\""));
+        // Lenient Anthropic-compat upstreams end tool turns with end_turn.
+        assert!(run("end_turn", true).contains("\"finish_reason\":\"tool_calls\""));
+        assert!(run("end_turn", false).contains("\"finish_reason\":\"stop\""));
+    }
+
+    #[test]
+    fn test_gemini_stream_error_object_fails_the_stream() {
+        let mut converter = GeminiToOpenAIStreamConverter::new("gemini-3-pro");
+        let input = concat!(
+            "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"half\"}],\"role\":\"model\"}}]}\n\n",
+            "data: {\"error\":{\"code\":503,\"message\":\"The model is overloaded.\",\"status\":\"UNAVAILABLE\"}}\n\n",
+        );
+        let mut output = converter.push_bytes(input.as_bytes()).unwrap();
+        output.push_str(&converter.finish().unwrap());
+
+        assert!(output.contains("\"type\":\"UNAVAILABLE\""), "{output}");
+        assert!(output.contains("\"code\":503"), "{output}");
+        assert!(!output.contains("finish_reason\":\"stop"), "{output}");
+        assert!(!output.contains("[DONE]"), "{output}");
     }
 }

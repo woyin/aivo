@@ -305,6 +305,32 @@ pub fn convert_openai_chat_to_anthropic_request(
     req
 }
 
+/// Anthropic stop_reason → OpenAI finish_reason, shared by the JSON and SSE
+/// converters so the two can't drift. Newer Anthropic values (refusal,
+/// pause_turn, model_context_window_exceeded) used to collapse to "stop".
+pub(crate) fn anthropic_finish_reason(stop_reason: &str, has_tool_calls: bool) -> &'static str {
+    match stop_reason {
+        "tool_use" => "tool_calls",
+        // Claude 4.5+ stops with model_context_window_exceeded when the reply
+        // runs into the context window before max_tokens: still truncated.
+        "max_tokens" | "model_context_window_exceeded" => "length",
+        "refusal" => "content_filter",
+        // "pause_turn" means Claude is pausing the assistant turn pending
+        // external work (typically a tool result). When we already have
+        // tool_calls in the response, map to "tool_calls" so OpenAI-shaped
+        // clients keep the agentic loop alive instead of treating the
+        // conversation as terminated. With no tool_calls present (e.g.,
+        // server-side tool execution we currently drop), fall back to "stop".
+        "pause_turn" if has_tool_calls => "tool_calls",
+        // Lenient Anthropic-compat upstreams (MiniMax, qwen, DeepSeek) emit
+        // tool_use blocks with stop_reason "end_turn" (or none at all);
+        // trusting that leaves finish_reason "stop" and OpenAI agent loops
+        // never execute the tools.
+        "end_turn" | "" if has_tool_calls => "tool_calls",
+        _ => "stop",
+    }
+}
+
 pub fn convert_anthropic_to_openai_chat_response(resp: &Value, fallback_model: &str) -> Value {
     let mut text_parts: Vec<String> = Vec::new();
     let mut thinking_parts: Vec<String> = Vec::new();
@@ -384,34 +410,13 @@ pub fn convert_anthropic_to_openai_chat_response(resp: &Value, fallback_model: &
         }
     }
 
-    // Anthropic stop_reason → OpenAI finish_reason. Newer Anthropic values
-    // (refusal, pause_turn, stop_sequence) used to collapse to "stop"; map
-    // them more precisely so callers can distinguish a refusal from a normal
-    // stop. The original value is also preserved on the OpenAI envelope as
-    // `_anthropic_stop_reason` for callers that need exact semantics.
+    // The raw value is kept on the envelope as `_anthropic_stop_reason` for
+    // callers that need exact semantics.
     let raw_stop_reason = resp
         .get("stop_reason")
         .and_then(|v| v.as_str())
         .unwrap_or("");
-    let finish_reason = match raw_stop_reason {
-        "tool_use" => "tool_calls",
-        "max_tokens" => "length",
-        "refusal" => "content_filter",
-        // "pause_turn" means Claude is pausing the assistant turn pending
-        // external work (typically a tool result). When we already have
-        // tool_calls in the response, map to "tool_calls" so OpenAI-shaped
-        // clients keep the agentic loop alive instead of treating the
-        // conversation as terminated. With no tool_calls present (e.g.,
-        // server-side tool execution we currently drop), fall back to "stop".
-        "pause_turn" if !tool_calls.is_empty() => "tool_calls",
-        // Lenient Anthropic-compat upstreams (MiniMax, qwen, DeepSeek) emit
-        // tool_use blocks with stop_reason "end_turn" (or none at all);
-        // trusting that leaves finish_reason "stop" and OpenAI agent loops
-        // never execute the tools.
-        "end_turn" | "" if !tool_calls.is_empty() => "tool_calls",
-        "stop_sequence" | "end_turn" | "pause_turn" => "stop",
-        _ => "stop",
-    };
+    let finish_reason = anthropic_finish_reason(raw_stop_reason, !tool_calls.is_empty());
 
     let raw_input_tokens = resp
         .get("usage")
@@ -1742,6 +1747,19 @@ mod tests {
         let chat = convert_anthropic_to_openai_chat_response(&resp, "claude-sonnet-4");
         assert_eq!(chat["choices"][0]["finish_reason"], "content_filter");
         assert_eq!(chat["choices"][0]["_anthropic_stop_reason"], "refusal");
+    }
+
+    #[test]
+    fn convert_anthropic_to_openai_stop_reason_context_window_exceeded_maps_to_length() {
+        let resp = json!({
+            "id": "msg_x",
+            "model": "claude-sonnet-5",
+            "content": [{"type": "text", "text": "cut off"}],
+            "stop_reason": "model_context_window_exceeded",
+            "usage": {"input_tokens": 1, "output_tokens": 1}
+        });
+        let chat = convert_anthropic_to_openai_chat_response(&resp, "claude-sonnet-5");
+        assert_eq!(chat["choices"][0]["finish_reason"], "length");
     }
 
     #[test]

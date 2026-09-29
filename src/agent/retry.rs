@@ -3,6 +3,7 @@
 //! (recovered by compaction, not retry), and backoff. Pure functions — the loop calls in.
 
 use crate::agent::serve_client;
+use crate::services::provider_protocol::is_quota_error;
 
 /// Sanity ceiling for a finite step budget.
 pub(crate) const MAX_STEPS_CEILING: usize = 10_000;
@@ -102,10 +103,7 @@ pub(crate) fn retryable_error_label(e: &serve_client::ServeError) -> &'static st
 /// detail. The raw `upstream NNN:` must stay in the text — the headless
 /// exit-code classifier (`classify_agent_error`) parses the status from it.
 pub(crate) fn terminal_error_notice(e: &serve_client::ServeError) -> String {
-    let lower = e.message.to_ascii_lowercase();
-    let quota = ["quota", "billing", "credit", "balance"]
-        .iter()
-        .any(|k| lower.contains(k));
+    let quota = is_quota_error(&e.message);
     let advice = if is_context_overflow_error(&e.message) {
         "the conversation no longer fits the model's context window even after compacting — \
          /compact to shrink it further, or /new to start fresh"

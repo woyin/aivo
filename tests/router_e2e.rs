@@ -58,6 +58,8 @@ enum Mode {
     /// bail. Unlisted endpoints 404 with `{"error":"Not found"}`, a
     /// path-missing mismatch the cascade may walk past.
     SemanticReject,
+    /// 429 rate limit — a failover-worthy status for `aivo serve --failover`.
+    RateLimited,
 }
 
 #[derive(Clone)]
@@ -211,6 +213,13 @@ fn spawn_fake(modes: &[(Endpoint, Mode)]) -> FakeProvider {
                     "Bad Request",
                     "application/json",
                     r#"{"error":{"type":"invalid_request_error","message":"bad request body"}}"#
+                        .to_string(),
+                ),
+                Some(Mode::RateLimited) => (
+                    429,
+                    "Too Many Requests",
+                    "application/json",
+                    r#"{"error":{"type":"rate_limit_error","message":"primary rate limited"}}"#
                         .to_string(),
                 ),
                 None => (
@@ -1591,4 +1600,62 @@ async fn serve_router_claude_oauth_tier_passthrough() {
     assert_eq!(base.hit_count(Endpoint::Chat), 1);
 
     unsafe { std::env::remove_var("AIVO_CLAUDE_OAUTH_UPSTREAM") };
+}
+
+// ── aivo serve --failover ────────────────────────────────────────────────
+
+async fn start_serve_with_failover(primary: &FakeProvider, fallbacks: &[&FakeProvider]) -> u16 {
+    let tmp = tempfile::tempdir().unwrap();
+    let log_store = LogStore::new(tmp.path().to_path_buf());
+    std::mem::forget(tmp);
+    let router = ServeRouter::new(
+        serve_config(primary.base_url(), ProviderProtocol::Openai),
+        test_key(&primary.base_url()),
+        log_store,
+    )
+    .with_failover_keys(fallbacks.iter().map(|f| test_key(&f.base_url())).collect())
+    .quiet(true);
+    let (_handle, _shutdown, port) = router
+        .start_background_with_addr("127.0.0.1", 0)
+        .await
+        .unwrap();
+    port
+}
+
+/// A failover key whose provider doesn't serve the model answers 404; that
+/// must not replace the primary's real error (the 429 is what the client can
+/// act on).
+#[tokio::test]
+async fn serve_failover_keeps_primary_error_when_no_fallback_succeeds() {
+    no_proxy();
+    let primary = spawn_fake(&[(Endpoint::Chat, Mode::RateLimited)]);
+    let unserved = spawn_fake(&[]);
+    let refusing = spawn_fake(&[(Endpoint::Chat, Mode::SemanticReject)]);
+    let port = start_serve_with_failover(&primary, &[&unserved, &refusing]).await;
+
+    let resp = raw_post(port, "/v1/chat/completions", CHAT_REQ).await;
+    assert_eq!(response_status(&resp), 429, "{resp}");
+    assert!(resp.contains("primary rate limited"), "{resp}");
+    assert!(
+        !unserved.hits().is_empty(),
+        "404 fallback must have been tried"
+    );
+    assert!(
+        !refusing.hits().is_empty(),
+        "400 fallback must have been tried"
+    );
+}
+
+#[tokio::test]
+async fn serve_failover_takes_first_successful_fallback() {
+    no_proxy();
+    let primary = spawn_fake(&[(Endpoint::Chat, Mode::RateLimited)]);
+    let refusing = spawn_fake(&[(Endpoint::Chat, Mode::SemanticReject)]);
+    let serving = spawn_fake(&[(Endpoint::Chat, Mode::Ok)]);
+    let port = start_serve_with_failover(&primary, &[&refusing, &serving]).await;
+
+    let resp = raw_post(port, "/v1/chat/completions", CHAT_REQ).await;
+    assert_eq!(response_status(&resp), 200, "{resp}");
+    assert!(resp.contains("hello from openai"), "{resp}");
+    assert_eq!(serving.hit_count(Endpoint::Chat), 1);
 }

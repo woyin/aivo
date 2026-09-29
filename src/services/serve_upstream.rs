@@ -79,6 +79,12 @@ impl RouterResponse {
             body,
         }
     }
+
+    pub(crate) fn status(&self) -> u16 {
+        match self {
+            Self::Buffered { status, .. } | Self::Streaming { status, .. } => *status,
+        }
+    }
 }
 
 pub(crate) async fn send_anthropic_chat(
