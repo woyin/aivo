@@ -1219,13 +1219,10 @@ fn warn_on_model_substitution(requested: &str, selected: &str) {
         return;
     }
     // Snapping a name to its catalog id is the same model; only vendor changes matter.
-    let (Some(from), Some(to)) = (
-        infer_provider_name_from_model(requested),
-        infer_provider_name_from_model(selected),
-    ) else {
+    let Some(from) = infer_provider_name_from_model(requested) else {
         return;
     };
-    if from == to {
+    if infer_provider_name_from_model(selected).as_deref() == Some(from.as_str()) {
         return;
     }
 

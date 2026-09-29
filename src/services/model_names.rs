@@ -269,26 +269,6 @@ pub fn default_model_for_protocol(protocol: ProviderProtocol) -> &'static str {
     }
 }
 
-pub fn select_model_for_protocol(
-    requested_model: Option<&str>,
-    explicit_model: Option<&str>,
-    target_protocol: ProviderProtocol,
-) -> String {
-    if let Some(model) = explicit_model.filter(|model| !model.trim().is_empty()) {
-        return model.to_string();
-    }
-
-    match requested_model.filter(|model| !model.trim().is_empty()) {
-        Some(model) => match infer_model_protocol(model) {
-            Some(protocol) if model_family(protocol) != model_family(target_protocol) => {
-                default_model_for_protocol(target_protocol).to_string()
-            }
-            _ => model.to_string(),
-        },
-        None => default_model_for_protocol(target_protocol).to_string(),
-    }
-}
-
 pub fn select_model_for_provider_attempt(
     catalog: Option<&[String]>,
     base_url: &str,
@@ -301,21 +281,51 @@ pub fn select_model_for_provider_attempt(
         return model.to_string();
     }
 
-    let selected = if let Some(model) = requested_model.filter(|model| !model.trim().is_empty())
-        && should_preserve_cross_protocol_model(base_url, model, target_protocol)
-    {
-        model.to_string()
-    } else {
-        select_model_for_protocol(requested_model, explicit_model, target_protocol)
+    let servable = requested_model.filter(|model| {
+        !model.trim().is_empty()
+            && (should_preserve_cross_protocol_model(base_url, model, target_protocol)
+                || infer_model_protocol(model)
+                    .is_none_or(|p| model_family(p) == model_family(target_protocol)))
+    });
+    let Some(model) = servable else {
+        return catalog
+            .and_then(|c| pick_catalog_default(c, target_protocol))
+            .unwrap_or_else(|| default_model_for_protocol(target_protocol).to_string());
     };
 
     // Snap the tool's default name to the exact catalog id when we have one.
-    if let Some(catalog) = catalog
-        && let Some(hit) = resolve_model_from_catalog(catalog, &selected)
-    {
-        return hit;
-    }
-    selected
+    catalog
+        .and_then(|c| resolve_model_from_catalog(c, model))
+        .unwrap_or_else(|| model.to_string())
+}
+
+/// Newest listed id, preferring the protocol's family; `gpt-5.5` beats `gpt-5.5-nano`.
+pub(crate) fn pick_catalog_default(
+    catalog: &[String],
+    protocol: ProviderProtocol,
+) -> Option<String> {
+    let family = model_family(protocol);
+    let rank = |m: &str| {
+        if family == ProviderProtocol::Openai && is_gpt_chat_model_name(m) {
+            2
+        } else if infer_model_protocol(m).is_some_and(|p| model_family(p) == family) {
+            1
+        } else {
+            0
+        }
+    };
+    let is_variant = |m: &str| {
+        catalog.iter().any(|base| {
+            m.strip_prefix(base.as_str())
+                .and_then(|rest| rest.strip_prefix('-'))
+                .is_some_and(|rest| rest.starts_with(|c: char| c.is_ascii_alphabetic()))
+        })
+    };
+    catalog
+        .iter()
+        .filter(|m| !is_variant(m))
+        .max_by(|a, b| rank(a).cmp(&rank(b)).then(a.cmp(b)))
+        .cloned()
 }
 
 /// Normalize protocol for model comparison — ResponsesApi uses the same models as Openai.
@@ -331,17 +341,6 @@ pub(crate) fn is_gpt_chat_model_name(model: &str) -> bool {
     let lower = model.to_ascii_lowercase();
     let name_only = lower.split('/').next_back().unwrap_or(&lower);
     name_only.starts_with("gpt-")
-}
-
-/// True for any OpenAI-style model: `gpt-*` chat models or the `o1`/`o3`/`o4`
-/// reasoning series. Superset of [`is_gpt_chat_model_name`].
-pub(crate) fn is_openai_style_model_name(model: &str) -> bool {
-    if is_gpt_chat_model_name(model) {
-        return true;
-    }
-    let lower = model.to_ascii_lowercase();
-    let name_only = lower.split('/').next_back().unwrap_or(&lower);
-    name_only.starts_with("o1") || name_only.starts_with("o3") || name_only.starts_with("o4")
 }
 
 /// True for OpenAI models that reject the legacy `max_tokens` field and require
@@ -381,6 +380,8 @@ fn infer_model_protocol(model: &str) -> Option<ProviderProtocol> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const PLAIN_ENDPOINT: &str = "https://api.acme.example/v1";
 
     #[test]
     fn test_normalize_claude_version_basic() {
@@ -595,13 +596,21 @@ mod tests {
     }
 
     #[test]
-    fn test_select_model_for_protocol_keeps_provider_native_models() {
+    fn test_select_model_for_provider_attempt_keeps_provider_native_models() {
         assert_eq!(
-            select_model_for_protocol(Some("MiniMax-M1"), None, ProviderProtocol::Anthropic),
+            select_model_for_provider_attempt(
+                None,
+                PLAIN_ENDPOINT,
+                Some("MiniMax-M1"),
+                None,
+                ProviderProtocol::Anthropic
+            ),
             "MiniMax-M1"
         );
         assert_eq!(
-            select_model_for_protocol(
+            select_model_for_provider_attempt(
+                None,
+                PLAIN_ENDPOINT,
                 Some("google/gemini-2.5-pro"),
                 None,
                 ProviderProtocol::Google
@@ -611,17 +620,35 @@ mod tests {
     }
 
     #[test]
-    fn test_select_model_for_protocol_remaps_cross_protocol_defaults() {
+    fn test_select_model_for_provider_attempt_remaps_cross_protocol_defaults() {
         assert_eq!(
-            select_model_for_protocol(Some("gpt-5-codex"), None, ProviderProtocol::Anthropic),
+            select_model_for_provider_attempt(
+                None,
+                PLAIN_ENDPOINT,
+                Some("gpt-5-codex"),
+                None,
+                ProviderProtocol::Anthropic
+            ),
             "claude-sonnet-4-5"
         );
         assert_eq!(
-            select_model_for_protocol(Some("claude-sonnet-4-5"), None, ProviderProtocol::Google),
+            select_model_for_provider_attempt(
+                None,
+                PLAIN_ENDPOINT,
+                Some("claude-sonnet-4-5"),
+                None,
+                ProviderProtocol::Google
+            ),
             "gemini-2.5-pro"
         );
         assert_eq!(
-            select_model_for_protocol(Some("gemini-2.0-flash"), None, ProviderProtocol::Openai),
+            select_model_for_provider_attempt(
+                None,
+                PLAIN_ENDPOINT,
+                Some("gemini-2.0-flash"),
+                None,
+                ProviderProtocol::Openai
+            ),
             "gpt-4o"
         );
     }
@@ -697,9 +724,11 @@ mod tests {
     }
 
     #[test]
-    fn test_select_model_for_protocol_prefers_explicit_model() {
+    fn test_select_model_for_provider_attempt_prefers_explicit_model() {
         assert_eq!(
-            select_model_for_protocol(
+            select_model_for_provider_attempt(
+                None,
+                PLAIN_ENDPOINT,
                 Some("gpt-5-codex"),
                 Some("claude-3-opus"),
                 ProviderProtocol::Anthropic
@@ -801,6 +830,67 @@ mod tests {
     }
 
     #[test]
+    fn test_select_model_for_provider_attempt_cross_family_picks_from_catalog() {
+        let catalog = vec!["deepseek-chat".to_string(), "deepseek-reasoner".to_string()];
+        assert_eq!(
+            select_model_for_provider_attempt(
+                Some(&catalog),
+                PLAIN_ENDPOINT,
+                Some("claude-opus-5-5"),
+                None,
+                ProviderProtocol::Openai
+            ),
+            "deepseek-reasoner"
+        );
+        let catalog = vec![
+            "gpt-4o".to_string(),
+            "gpt-5.5".to_string(),
+            "gpt-5.5-nano".to_string(),
+            "text-embedding-3-large".to_string(),
+        ];
+        assert_eq!(
+            select_model_for_provider_attempt(
+                Some(&catalog),
+                PLAIN_ENDPOINT,
+                None,
+                None,
+                ProviderProtocol::Openai
+            ),
+            "gpt-5.5"
+        );
+    }
+
+    #[test]
+    fn test_pick_catalog_default_prefers_family_base_ids() {
+        let ids = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let anthropic = ids(&[
+            "claude-haiku-4-5",
+            "claude-opus-5",
+            "claude-opus-5-5",
+            "llama-3",
+        ]);
+        assert_eq!(
+            pick_catalog_default(&anthropic, ProviderProtocol::Anthropic).as_deref(),
+            Some("claude-opus-5-5")
+        );
+        let google = ids(&[
+            "gemini-2.5-flash",
+            "gemini-2.5-pro",
+            "gemini-2.5-pro-preview",
+        ]);
+        assert_eq!(
+            pick_catalog_default(&google, ProviderProtocol::Google).as_deref(),
+            Some("gemini-2.5-pro")
+        );
+        let openai = ids(&["o3", "o4-mini", "gpt-5.5-codex"]);
+        assert_eq!(
+            pick_catalog_default(&openai, ProviderProtocol::ResponsesApi).as_deref(),
+            Some("gpt-5.5-codex")
+        );
+        assert_eq!(pick_catalog_default(&[], ProviderProtocol::Openai), None);
+    }
+
+    #[test]
     fn test_is_gpt_chat_model_name() {
         assert!(is_gpt_chat_model_name("gpt-4o"));
         assert!(is_gpt_chat_model_name("gpt-5.5"));
@@ -833,21 +923,5 @@ mod tests {
         assert!(!requires_max_completion_tokens("gpt-3.5-turbo"));
         assert!(!requires_max_completion_tokens("claude-sonnet-4-6"));
         assert!(!requires_max_completion_tokens("gemini-2.5-pro"));
-    }
-
-    #[test]
-    fn test_is_openai_style_model_name() {
-        assert!(is_openai_style_model_name("gpt-4o"));
-        assert!(is_openai_style_model_name("gpt-5"));
-        assert!(is_openai_style_model_name("openai/gpt-4.1"));
-        assert!(is_openai_style_model_name("o1-preview"));
-        assert!(is_openai_style_model_name("o3-mini"));
-        assert!(is_openai_style_model_name("o4-mini"));
-        assert!(is_openai_style_model_name("GPT-4o"));
-
-        assert!(!is_openai_style_model_name("claude-sonnet-4"));
-        assert!(!is_openai_style_model_name("anthropic/claude-sonnet-4-5"));
-        assert!(!is_openai_style_model_name("gemini-2.5-pro"));
-        assert!(!is_openai_style_model_name("ollama/llama3"));
     }
 }

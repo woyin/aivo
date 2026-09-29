@@ -252,7 +252,7 @@ async fn handle_request(
                 },
             );
             // openai_req already has the model from the Gemini request body — don't pre-select here;
-            // select_model_for_protocol is applied per-attempt inside forward_to_provider.
+            // select_model_for_provider_attempt is applied per-attempt inside forward_to_provider.
             match forward_to_provider(
                 openai_req,
                 config,

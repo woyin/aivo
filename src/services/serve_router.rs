@@ -909,7 +909,7 @@ async fn handle_responses(request: &str, state: &ServeState) -> Result<RouterRes
     // `target_protocol` is snapshotted here, before `handle_chat_body` runs the fallback loop;
     // if the loop switches protocol, any protocol-based model-name transformation done by
     // `convert_responses_to_chat_request` would have used the wrong protocol.  Setting
-    // `actual_model` causes `select_model_for_protocol` to return it verbatim, so the model
+    // `actual_model` causes `select_model_for_provider_attempt` to return it verbatim, so the model
     // field in `chat_body` is always the original string and `handle_chat_body` transforms it
     // for the protocol that is actually selected.
     let mut config = responses_router_config(state, resolve_slot(&body, state).current().0);

@@ -22,7 +22,7 @@ use crate::services::launch_runtime::{
     prepare_runtime_env, process_pi_sessions, record_launch_state,
 };
 use crate::services::log_store::{LogEvent, new_log_id};
-use crate::services::model_names::{is_gpt_chat_model_name, is_openai_style_model_name};
+use crate::services::model_names::pick_catalog_default;
 use crate::services::models_cache::ModelsCache;
 use crate::services::native_session_probe::SessionProbe;
 use crate::services::ollama;
@@ -929,7 +929,7 @@ impl AILauncher {
         let model = if model.is_none() {
             codex_app_models
                 .as_ref()
-                .and_then(|m| pick_default_codex_app_model(m))
+                .and_then(|m| pick_catalog_default(m, ProviderProtocol::Openai))
         } else {
             model
         };
@@ -1161,18 +1161,8 @@ impl AILauncher {
         models.sort();
         models.dedup();
 
-        // Default to a non-reasoning OpenAI-style model so cost/latency match a
-        // typical workhorse session. Reverse iteration over the alphabetically
-        // sorted list yields the newest version (gpt-5.5 over gpt-3.5-turbo).
-        // Falls back to o-series, then to first alphabetical.
-        let selected_model = models
-            .iter()
-            .rev()
-            .find(|m| is_gpt_chat_model_name(m))
-            .or_else(|| models.iter().rev().find(|m| is_openai_style_model_name(m)))
-            .or_else(|| models.first())
-            .cloned()
-            .ok_or_else(|| {
+        let selected_model =
+            pick_catalog_default(&models, ProviderProtocol::Openai).ok_or_else(|| {
                 anyhow::anyhow!(
                     "No models returned by provider. Pass --model <provider/model> for opencode."
                 )
@@ -1386,23 +1376,6 @@ fn sanitize_discovered_slugs(models: Vec<String>) -> Vec<String> {
         .into_iter()
         .filter(|m| !m.is_empty() && !m.chars().any(|c| c.is_control()))
         .collect()
-}
-
-/// Picks a sensible default model from the provider's `/v1/models` listing for
-/// codex-app's GUI when the user didn't pass `-m`. Mirrors the OpenCode logic:
-/// newest GPT-style chat model wins; then any OpenAI-shaped name; else the
-/// first alphabetical. Returns `None` only for an empty list.
-fn pick_default_codex_app_model(models: &[String]) -> Option<String> {
-    let mut sorted = models.to_vec();
-    sorted.sort();
-    sorted.dedup();
-    sorted
-        .iter()
-        .rev()
-        .find(|m| is_gpt_chat_model_name(m))
-        .or_else(|| sorted.iter().rev().find(|m| is_openai_style_model_name(m)))
-        .or_else(|| sorted.first())
-        .cloned()
 }
 
 /// Replaces the shadow `CODEX_HOME`'s `models_cache.json` with aivo's models.
