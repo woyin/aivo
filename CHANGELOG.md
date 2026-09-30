@@ -1,5 +1,22 @@
 # Changelog
 
+## v0.49.11
+
+Serve failover keeps the primary error instead of masking it, and model
+selection picks a model the provider actually lists rather than a hardcoded id;
+catalog defaults now rank by capability and version, and listings that carry
+both `data` and `models` are read correctly. The provider bridges catch up with
+Claude 5.x, Codex 0.158, and Gemini CLI 0.61, failed streams surface as errors
+instead of empty output, and stats count each Claude Code response once.
+
+- fix(models): rank catalog defaults by capability and version, narrow flash undo (545a8258)
+- fix(serve): keep the primary error when failover and streams fail (083dc157)
+- fix(models): pick a listed model instead of a hardcoded one (ec51c02b)
+- fix(stats): count each Claude Code response once (a66e5760)
+- fix(providers): surface failed streams, retry 529, and track grok/gemini CLI changes (654cb8e4)
+- fix(providers): catch up with Claude 5.x, Codex 0.158, and Gemini CLI 0.61 (a6eb3874)
+- fix(models): read serve listings that carry both data and models (b2643857)
+
 ## v0.49.10
 
 Codex launches stay isolated from the shared app-server daemon. The code TUI
